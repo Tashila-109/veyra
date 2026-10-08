@@ -1,0 +1,15 @@
+[package]
+name = "veyra"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+veyra-engine = { path = "../engine", version = "=0.0.1" }
+gpui-kit.workspace = true
+gpui.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

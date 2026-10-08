@@ -1,0 +1,7 @@
+[package]
+name = "veyra-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc.workspace = true
