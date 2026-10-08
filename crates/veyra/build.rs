@@ -1,13 +1,18 @@
 fn main() {
     let rev = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=VEYRA_BUILD_REV={rev}");
-    println!("cargo:rerun-if-changed=../../.git");
-    let mut refs = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+    let mut refs = vec![
+        "HEAD".to_owned(),
+        "logs/HEAD".to_owned(),
+        "packed-refs".to_owned(),
+    ];
     if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
         refs.push(branch);
     }
     for reference in refs {
-        if let Some(path) = git(&["rev-parse", "--git-path", &reference]) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &reference])
+            .filter(|path| std::path::Path::new(path).exists())
+        {
             println!("cargo:rerun-if-changed={path}");
         }
     }

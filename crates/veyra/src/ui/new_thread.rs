@@ -23,14 +23,23 @@ pub fn render(notice: Option<SharedString>, cx: &App) -> impl IntoElement {
                 .h_flex()
                 .items_center()
                 .px(t.space.0[6])
-                .border_b_1()
+                .border_b(t.layout.border)
                 .border_color(t.colors.border)
                 .child("New thread")
                 .child(div().flex_1())
                 .child(
                     Button::new("new-thread")
                         .ghost()
-                        .label("New thread  ⌘N")
+                        .h(t.layout.icon_button)
+                        .px(t.space.0[3])
+                        .accessibility_label("New thread  ⌘N")
+                        .child(
+                            div()
+                                .text_size(t.text.label.size)
+                                .line_height(t.text.label.line_height)
+                                .font_weight(t.text.label.weight)
+                                .child("New thread  ⌘N"),
+                        )
                         .on_click(|_, w, cx| w.dispatch_action(Box::new(NewThread), cx)),
                 ),
         )
@@ -60,13 +69,14 @@ pub fn render(notice: Option<SharedString>, cx: &App) -> impl IntoElement {
                                 .w_full()
                                 .rounded(t.radius.large)
                                 .bg(t.colors.card)
-                                .border_1()
+                                .border(t.layout.border)
                                 .border_color(t.colors.border)
                                 .p(t.space.0[4])
                                 .child(
                                     div()
                                         .h(t.layout.composer_min_height)
                                         .text_size(t.text.read.size)
+                                        .line_height(t.text.read.line_height)
                                         .text_color(t.colors.text_faint)
                                         .child("Describe the task"),
                                 )
@@ -79,29 +89,67 @@ pub fn render(notice: Option<SharedString>, cx: &App) -> impl IntoElement {
                                         .child(
                                             Button::new("provider")
                                                 .ghost()
-                                                .label("Claude Code")
+                                                .h(t.layout.icon_button)
+                                                .px(t.space.0[3])
+                                                .accessibility_label("Claude Code")
+                                                .child(
+                                                    div()
+                                                        .text_size(t.text.label.size)
+                                                        .line_height(t.text.label.line_height)
+                                                        .font_weight(t.text.label.weight)
+                                                        .child("Claude Code"),
+                                                )
                                                 .on_click(|_, w, cx| {
                                                     w.dispatch_action(Box::new(PickProvider), cx)
                                                 }),
                                         )
                                         .child(
-                                            Button::new("model").ghost().label("Model").on_click(
-                                                |_, w, cx| {
+                                            Button::new("model")
+                                                .ghost()
+                                                .h(t.layout.icon_button)
+                                                .px(t.space.0[3])
+                                                .accessibility_label("Model")
+                                                .child(
+                                                    div()
+                                                        .text_size(t.text.label.size)
+                                                        .line_height(t.text.label.line_height)
+                                                        .font_weight(t.text.label.weight)
+                                                        .child("Model"),
+                                                )
+                                                .on_click(|_, w, cx| {
                                                     w.dispatch_action(Box::new(PickModel), cx)
-                                                },
-                                            ),
+                                                }),
                                         )
                                         .child(
-                                            Button::new("effort").ghost().label("High").on_click(
-                                                |_, w, cx| {
+                                            Button::new("effort")
+                                                .ghost()
+                                                .h(t.layout.icon_button)
+                                                .px(t.space.0[3])
+                                                .accessibility_label("High")
+                                                .child(
+                                                    div()
+                                                        .text_size(t.text.label.size)
+                                                        .line_height(t.text.label.line_height)
+                                                        .font_weight(t.text.label.weight)
+                                                        .child("High"),
+                                                )
+                                                .on_click(|_, w, cx| {
                                                     w.dispatch_action(Box::new(PickEffort), cx)
-                                                },
-                                            ),
+                                                }),
                                         )
                                         .child(
                                             Button::new("permission")
                                                 .ghost()
-                                                .label("Ask first")
+                                                .h(t.layout.icon_button)
+                                                .px(t.space.0[3])
+                                                .accessibility_label("Ask first")
+                                                .child(
+                                                    div()
+                                                        .text_size(t.text.label.size)
+                                                        .line_height(t.text.label.line_height)
+                                                        .font_weight(t.text.label.weight)
+                                                        .child("Ask first"),
+                                                )
                                                 .on_click(|_, w, cx| {
                                                     w.dispatch_action(Box::new(PickPermission), cx)
                                                 }),
@@ -114,7 +162,15 @@ pub fn render(notice: Option<SharedString>, cx: &App) -> impl IntoElement {
                                                 .rounded(t.radius.full)
                                                 .w(t.layout.icon_button)
                                                 .h(t.layout.icon_button)
-                                                .label("↑")
+                                                .p(t.space.0[0])
+                                                .accessibility_label("Send")
+                                                .child(
+                                                    div()
+                                                        .text_size(t.text.label.size)
+                                                        .line_height(t.text.label.line_height)
+                                                        .font_weight(t.text.label.weight)
+                                                        .child("↑"),
+                                                )
                                                 .on_click(|_, w, cx| {
                                                     w.dispatch_action(Box::new(Send), cx)
                                                 }),

@@ -13,6 +13,7 @@ actions!(
         Send,
         NarrowSidebar,
         WidenSidebar,
+        ResetSidebar,
         DismissNotice
     ]
 );
@@ -36,11 +37,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-enter", Send, Some("Veyra")),
         KeyBinding::new("secondary-alt-left", NarrowSidebar, Some("Veyra")),
         KeyBinding::new("secondary-alt-right", WidenSidebar, Some("Veyra")),
-        KeyBinding::new(
-            "secondary-alt-0",
-            SetSidebarWidth { width: 256. },
-            Some("Veyra"),
-        ),
+        KeyBinding::new("secondary-alt-0", ResetSidebar, Some("Veyra")),
         KeyBinding::new("escape", DismissNotice, Some("Veyra")),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());

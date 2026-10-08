@@ -95,7 +95,7 @@ impl DataDir {
                 .create(true)
                 .truncate(false),
         )?;
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(4);
         loop {
             match platform::lock_exclusive(&file) {
                 Ok(()) => break,

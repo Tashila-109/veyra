@@ -1,12 +1,14 @@
 # Veyra verification map
 
-[app-launch](app-launch.md) covers the current native window, debug CLI, instance lock, log, and cleanup.
+[app-launch](app-launch.md) covers the current native window, debug CLI, instance lock, log, release exclusion, and cleanup.
 It is the only feature in M0.
 
 ## Preconditions
 
 - Run Launch and Doctor in [verify-veyra](../SKILL.md).
-- Use a fresh short `RUN` and `/tmp/veyra-verify-$RUN`.
+- Launch records a fresh short `RUN` in `target/verify-veyra/latest` and uses `/tmp/veyra-verify-$RUN`.
+- Each later section recovers run, process, and window records in a fresh bash process.
+Export a recorded `RUN` when resuming a run other than `latest`.
 - Drive only the pid this run started.
 - Keep proof in `target/verify-veyra/$RUN/`.
 
@@ -17,6 +19,11 @@ Read the PNG.
 Preserve the app log and proof after Cleanup.
 Report a skipped native entry point as skipped.
 The driver does not prove external keyboard delivery, IME, or pointer input.
+M0's `view`, `sidebar.rows`, and `composer_text` dump fields are fixed placeholders, not evidence of rendered state.
+Use the live identity, appearance, sidebar width, and notice fields for their checks, and inspect the PNG for layout.
+Each key check must reset to a state that its key changes.
+The sidebar recipe checks the theme's 240 px default, 200 to 448 px bounds, and 16 px key step.
+Inspect the 44 px header and the composer capped at 784 px in the PNG.
 
 ## Entry contract
 

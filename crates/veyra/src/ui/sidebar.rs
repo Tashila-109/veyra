@@ -22,12 +22,22 @@ pub fn render(width: Pixels, cx: &App) -> impl IntoElement {
                 .child(
                     Button::new("add-project")
                         .ghost()
-                        .label("+  Add project")
+                        .h(t.layout.icon_button)
+                        .px(t.space.0[3])
+                        .accessibility_label("+  Add project")
+                        .child(
+                            div()
+                                .text_size(t.text.label.size)
+                                .line_height(t.text.label.line_height)
+                                .font_weight(t.text.label.weight)
+                                .child("+  Add project"),
+                        )
                         .on_click(|_, window, cx| window.dispatch_action(Box::new(AddProject), cx)),
                 )
                 .child(
                     div()
                         .text_size(t.text.label.size)
+                        .line_height(t.text.label.line_height)
                         .text_color(t.colors.text_faint)
                         .child("Your projects appear here."),
                 ),

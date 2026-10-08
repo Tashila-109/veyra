@@ -92,7 +92,9 @@ impl Render for Shell {
             .on_action(cx.listener(|s, _: &NarrowSidebar, w, cx| {
                 w.dispatch_action(
                     Box::new(SetSidebarWidth {
-                        width: f32::from(s.sidebar_width) - 16.,
+                        width: f32::from(
+                            s.sidebar_width - cx.global::<Theme>().layout.sidebar_step,
+                        ),
                     }),
                     cx,
                 );
@@ -100,7 +102,17 @@ impl Render for Shell {
             .on_action(cx.listener(|s, _: &WidenSidebar, w, cx| {
                 w.dispatch_action(
                     Box::new(SetSidebarWidth {
-                        width: f32::from(s.sidebar_width) + 16.,
+                        width: f32::from(
+                            s.sidebar_width + cx.global::<Theme>().layout.sidebar_step,
+                        ),
+                    }),
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|_, _: &ResetSidebar, w, cx| {
+                w.dispatch_action(
+                    Box::new(SetSidebarWidth {
+                        width: f32::from(cx.global::<Theme>().layout.sidebar_default),
                     }),
                     cx,
                 );
@@ -123,7 +135,7 @@ impl Render for Shell {
             .child(
                 div()
                     .id("sidebar-resize")
-                    .w(px(1.))
+                    .w(t.layout.border)
                     .h_full()
                     .flex_none()
                     .bg(t.colors.border)
@@ -161,7 +173,10 @@ pub fn run(
                 titlebar: Some(TitlebarOptions {
                     title: Some("Veyra".into()),
                     appears_transparent: true,
-                    traffic_light_position: Some(point(px(16.), px(16.))),
+                    traffic_light_position: Some(point(
+                        layout.traffic_lights.width,
+                        layout.traffic_lights.height,
+                    )),
                 }),
                 ..Default::default()
             };

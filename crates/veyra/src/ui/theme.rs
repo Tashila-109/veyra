@@ -60,66 +60,66 @@ pub struct Colors {
 impl Colors {
     pub fn dark() -> Self {
         Self {
-            bg: rgb(0x0e0e10).into(),
-            shell: rgb(0x131315).into(),
-            card: rgb(0x161619).into(),
-            overlay: rgb(0x1c1c20).into(),
-            raised: rgb(0x26262b).into(),
-            hover: rgba(0xffffff0f).into(),
-            sel: rgba(0xffffff17).into(),
-            bubble: rgba(0xffffff12).into(),
-            code_wash: rgba(0xffffff12).into(),
-            border: rgba(0xffffff14).into(),
-            border_strong: rgba(0xffffff29).into(),
-            text: rgb(0xe8e8ea).into(),
-            text_muted: rgb(0xa3a3aa).into(),
-            text_faint: rgb(0x8a8a92).into(),
-            solid: rgb(0xececef).into(),
-            on_solid: rgb(0x0e0e10).into(),
+            bg: rgb(0x0a0b0c).into(),
+            shell: rgb(0x0f1011).into(),
+            card: rgb(0x141416).into(),
+            overlay: rgb(0x1a1b1c).into(),
+            raised: rgb(0x222224).into(),
+            hover: rgba(0xffffff0b).into(),
+            sel: rgba(0xffffff13).into(),
+            bubble: rgba(0xffffff0f).into(),
+            code_wash: rgba(0xffffff0f).into(),
+            border: rgba(0xffffff11).into(),
+            border_strong: rgba(0xffffff21).into(),
+            text: rgb(0xe7e8ea).into(),
+            text_muted: rgb(0xaaabad).into(),
+            text_faint: rgb(0x909193).into(),
+            solid: rgb(0xf1f1f3).into(),
+            on_solid: rgb(0x0a0b0c).into(),
             accent: rgb(0x8b7cf6).into(),
             accent_selection: rgba(0x8b7cf652).into(),
-            danger: rgb(0xf87171).into(),
-            warning: rgb(0xfbbf24).into(),
-            success: rgb(0x34d399).into(),
-            diff_add: rgb(0x34d399).into(),
-            diff_del: rgb(0xf87171).into(),
-            diff_add_bg: rgba(0x34d3991a).into(),
-            diff_del_bg: rgba(0xf871711a).into(),
-            term_bg: rgb(0x0a0a0c).into(),
-            term_fg: rgb(0xe8e8ea).into(),
-            term_selection: rgba(0xffffff38).into(),
+            danger: rgb(0xf88a82).into(),
+            warning: rgb(0xe6ba60).into(),
+            success: rgb(0x7bc897).into(),
+            diff_add: rgb(0x7bc897).into(),
+            diff_del: rgb(0xf88a82).into(),
+            diff_add_bg: rgba(0x7bc89711).into(),
+            diff_del_bg: rgba(0xf88a8211).into(),
+            term_bg: rgb(0x060608).into(),
+            term_fg: rgb(0xe7e8ea).into(),
+            term_selection: rgba(0xffffff2d).into(),
         }
     }
     pub fn light() -> Self {
         Self {
             bg: rgb(0xffffff).into(),
-            shell: rgb(0xf5f5f7).into(),
+            shell: rgb(0xf6f6f8).into(),
             card: rgb(0xffffff).into(),
             overlay: rgb(0xffffff).into(),
             raised: rgb(0xffffff).into(),
-            hover: rgba(0x0000000a).into(),
-            sel: rgba(0x0000000f).into(),
+            hover: rgba(0x00000008).into(),
+            sel: rgba(0x0000000e).into(),
             bubble: rgba(0x0000000a).into(),
-            code_wash: rgba(0x0000000d).into(),
-            border: rgba(0x0000001a).into(),
-            border_strong: rgba(0x0000002e).into(),
-            text: rgb(0x26262b).into(),
-            text_muted: rgb(0x5f5f67).into(),
-            text_faint: rgb(0x6b6b73).into(),
-            solid: rgb(0x1f1f23).into(),
+            code_wash: rgba(0x0000000b).into(),
+            border: rgba(0x00000017).into(),
+            border_strong: rgba(0x0000002b).into(),
+            text: rgb(0x272729).into(),
+            text_muted: rgb(0x5c5d5e).into(),
+            text_faint: rgb(0x656667).into(),
+            solid: rgb(0x1d1d1f).into(),
             on_solid: rgb(0xffffff).into(),
             accent: rgb(0x5b43e8).into(),
             accent_selection: rgba(0x5b43e838).into(),
-            danger: rgb(0xdc2626).into(),
-            warning: rgb(0xb45309).into(),
-            success: rgb(0x15803d).into(),
-            diff_add: rgb(0x15803d).into(),
-            diff_del: rgb(0xb91c1c).into(),
-            diff_add_bg: rgba(0x15803d14).into(),
-            diff_del_bg: rgba(0xdc262614).into(),
-            term_bg: rgb(0xfafafa).into(),
-            term_fg: rgb(0x303035).into(),
-            term_selection: rgba(0x00000029).into(),
+            danger: rgb(0xa82d2e).into(),
+            warning: rgb(0x7f5d04).into(),
+            success: rgb(0x267147).into(),
+            diff_add: rgb(0x267147).into(),
+            diff_del: rgb(0xa82d2e).into(),
+            diff_add_bg: rgba(0x2671470e).into(),
+            diff_del_bg: rgba(0xa82d2e0e).into(),
+            term_bg: rgb(0xfbfcfe).into(),
+            term_fg: rgb(0x2f2f31).into(),
+            term_selection: rgba(0x00000021).into(),
         }
     }
 }
@@ -144,6 +144,7 @@ pub struct TypeRole {
 }
 #[derive(Clone)]
 pub struct TypeScale {
+    pub base: Pixels,
     pub ui_font: SharedString,
     pub mono_font: SharedString,
     pub meta: TypeRole,
@@ -193,6 +194,9 @@ pub struct Layout {
     pub sidebar_min: Pixels,
     pub sidebar_default: Pixels,
     pub sidebar_max: Pixels,
+    pub sidebar_step: Pixels,
+    pub traffic_lights: Size<Pixels>,
+    pub border: Pixels,
     pub project_row: Pixels,
     pub thread_row: Pixels,
     pub agent_row: Pixels,
@@ -208,10 +212,6 @@ pub struct Layout {
     pub composer_max_height: Pixels,
     pub composer_toolbar: Pixels,
     pub fade: Pixels,
-    pub drawer_min: Pixels,
-    pub drawer_default: Pixels,
-    pub drawer_max_fraction: f32,
-    pub drawer_tab: Pixels,
     pub terminal_padding: Size<Pixels>,
     pub terminal_hint: Pixels,
     pub segment_height: Pixels,
@@ -239,10 +239,12 @@ pub struct Theme {
 }
 impl Global for Theme {}
 
+const TYPE_BASE: f32 = 16.;
+
 fn role(size: f32, line: f32, weight: FontWeight) -> TypeRole {
     TypeRole {
-        size: rems(size / 16.),
-        line_height: rems(line / 16.),
+        size: rems(size / TYPE_BASE),
+        line_height: rems(line / TYPE_BASE),
         weight,
     }
 }
@@ -271,13 +273,13 @@ impl Theme {
         };
         let ansi = if dark {
             [
-                0x242424, 0xf87171, 0x4ade80, 0xfacc15, 0x60a5fa, 0xc084fc, 0x22d3ee, 0xd4d4d8,
-                0x71717a, 0xfca5a5, 0x86efac, 0xfde047, 0x93c5fd, 0xd8b4fe, 0x67e8f9, 0xfafafa,
+                0x28292a, 0xf08f87, 0x70cb92, 0xe6ba60, 0x69a9ed, 0xd497df, 0x3ccdde, 0xd2d2d4,
+                0x828385, 0xfebab3, 0x91ecb2, 0xffdd9c, 0x97c9fe, 0xf3b9fe, 0x69edff, 0xf1f2f4,
             ]
         } else {
             [
-                0x1f1f1f, 0xdc2626, 0x16a34a, 0xb45309, 0x2563eb, 0x9333ea, 0x0e7490, 0x3f3f46,
-                0x71717a, 0xb91c1c, 0x15803d, 0x92400e, 0x1d4ed8, 0x7e22ce, 0x155e75, 0x18181b,
+                0x202122, 0x954440, 0x1a7244, 0x7f5d04, 0x266099, 0x7c4986, 0x056d78, 0x373839,
+                0x717173, 0x833431, 0x056136, 0x6c4e04, 0x145088, 0x6c3a75, 0x045c66, 0x161718,
             ]
         };
         Self {
@@ -302,68 +304,68 @@ impl Theme {
                 },
             },
             text: TypeScale {
+                base: px(TYPE_BASE),
                 ui_font: "Geist".into(),
                 mono_font: "Geist Mono".into(),
-                meta: role(11., 14., FontWeight::NORMAL),
+                meta: role(11., 16., FontWeight::NORMAL),
                 label: role(12., 16., FontWeight::NORMAL),
-                ui: role(13., 18., FontWeight::NORMAL),
-                read: role(14., 22., FontWeight::NORMAL),
-                h3: role(15., 22., FontWeight::SEMIBOLD),
-                h2: role(16., 24., FontWeight::MEDIUM),
-                h1: role(19., 27., FontWeight::SEMIBOLD),
-                code: role(12.5, 18., FontWeight::NORMAL),
+                ui: role(13., 20., FontWeight::NORMAL),
+                read: role(14., 24., FontWeight::NORMAL),
+                h3: role(16., 24., FontWeight::SEMIBOLD),
+                h2: role(18., 28., FontWeight::MEDIUM),
+                h1: role(20., 28., FontWeight::SEMIBOLD),
+                code: role(12., 20., FontWeight::NORMAL),
                 diff: role(12., 20., FontWeight::NORMAL),
-                terminal: role(13., 18., FontWeight::NORMAL),
+                terminal: role(13., 17., FontWeight::NORMAL),
             },
-            space: Spacing([2., 4., 6., 8., 12., 16., 20., 24., 32., 48.].map(px)),
+            space: Spacing([2., 4., 6., 8., 12., 16., 20., 24., 32., 40.].map(px)),
             radius: Radii {
                 inline: px(4.),
                 control: px(6.),
                 track: px(8.),
-                card: px(10.),
+                card: px(8.),
                 large: px(16.),
                 full: px(9999.),
             },
             motion: Motion {
-                hover: transition(150, [0.4, 0., 0.2, 1.]),
-                press: transition(120, [0.22, 1., 0.36, 1.]),
-                collapse: transition(180, [0., 0., 0.58, 1.]),
-                view_switch: transition(150, [0.25, 0.1, 0.25, 1.]),
+                hover: transition(100, [0.25, 0.1, 0.25, 1.]),
+                press: transition(100, [0.25, 0.1, 0.25, 1.]),
+                collapse: transition(200, [0., 0., 0.58, 1.]),
+                view_switch: transition(200, [0.25, 0.1, 0.25, 1.]),
                 menu: [
-                    transition(140, [0.25, 0.1, 0.25, 1.]),
-                    transition(100, [0.25, 0.1, 0.25, 1.]),
+                    transition(200, [0., 0., 0.58, 1.]),
+                    transition(100, [0.42, 0., 1., 1.]),
                 ],
                 resize: transition(200, [0., 0., 0.58, 1.]),
-                stream_reveal: transition(320, [0.16, 1., 0.3, 1.]),
+                stream_reveal: transition(300, [0., 0., 0.58, 1.]),
                 stream_caret: size(px(2.), px(15.)),
-                spinner: transition(750, [0., 0., 1., 1.]),
+                spinner: transition(1000, [0., 0., 1., 1.]),
             },
             layout: Layout {
-                window_default: size(px(1320.), px(880.)),
-                window_min: size(px(900.), px(600.)),
+                window_default: size(px(1280.), px(800.)),
+                window_min: size(px(760.), px(560.)),
                 header: px(44.),
-                sidebar_min: px(224.),
-                sidebar_default: px(256.),
-                sidebar_max: px(400.),
+                sidebar_min: px(200.),
+                sidebar_default: px(240.),
+                sidebar_max: px(448.),
+                sidebar_step: px(16.),
+                traffic_lights: size(px(16.), px(16.)),
+                border: px(1.),
                 project_row: px(28.),
-                thread_row: px(30.),
+                thread_row: px(32.),
                 agent_row: px(28.),
                 agent_margin: px(14.),
                 agent_padding: px(8.),
                 guide: px(1.),
-                transcript_min: px(560.),
-                transcript_default: px(736.),
-                transcript_max: px(1200.),
-                gutter: px(48.),
-                composer_max: px(768.),
+                transcript_min: px(480.),
+                transcript_default: px(752.),
+                transcript_max: px(752.),
+                gutter: px(40.),
+                composer_max: px(784.),
                 composer_min_height: px(48.),
-                composer_max_height: px(260.),
+                composer_max_height: px(240.),
                 composer_toolbar: px(40.),
                 fade: px(24.),
-                drawer_min: px(160.),
-                drawer_default: px(280.),
-                drawer_max_fraction: 0.55,
-                drawer_tab: px(38.),
                 terminal_padding: size(px(14.), px(20.)),
                 terminal_hint: px(30.),
                 segment_height: px(28.),
@@ -418,8 +420,8 @@ impl Theme {
             kit.success = c.success;
             kit.font_family = theme.text.ui_font.clone();
             kit.mono_font_family = theme.text.mono_font.clone();
-            kit.font_size = px(16.);
-            kit.mono_font_size = px(12.5);
+            kit.font_size = theme.text.base;
+            kit.mono_font_size = theme.text.code.size.to_pixels(theme.text.base);
             kit.radius = theme.radius.control;
             kit.shadow = false;
         });
@@ -429,11 +431,11 @@ impl Theme {
 }
 pub fn register_fonts(cx: &mut App) -> anyhow::Result<()> {
     cx.text_system().add_fonts(vec![
-        Cow::Borrowed(include_bytes!("../../assets/fonts/Geist.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-Regular.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-Italic.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-Medium.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-SemiBold.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../../assets/fonts/GeistMono.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../../assets/fonts/GeistMono-Regular.ttf").as_slice()),
     ])
 }
 

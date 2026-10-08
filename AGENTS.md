@@ -31,8 +31,11 @@ Never drive an instance this run did not start.
 The planning documents live in `.tstack/tasks/` of the primary checkout and are never committed.
 - Cross-review every design and plan on the `interrogate reviewers` role before the human's gate.
 Evidence does not replace that approval.
-- Adapt zeron, monocode, and T3 Code internals with source-file and line citations.
-Add every adapted file to `THIRD_PARTY_NOTICES.md`.
+- Learn from zeron, monocode, and T3 Code, but write Veyra's own code, values, fixtures, and assets.
+Never copy them from third parties.
+The one exception is the violet accent the human kept, `accent` `#8b7cf6` in dark and `#5b43e8` in light, with `accent_selection` `#8b7cf652` and `#5b43e838`.
+Keep no third-party notices file.
+Take a third-party asset from its author's official release and keep its licence beside it.
 - Keep the engine crate free of gpui dependencies.
 - Pin direct dependencies exactly and keep `Cargo.lock`.
 - Name the data shape before writing stateful logic.
