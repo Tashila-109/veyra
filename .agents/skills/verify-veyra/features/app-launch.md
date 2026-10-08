@@ -32,7 +32,7 @@ Native mouse and OS key delivery remain manual checks.
 
 Launch and Doctor must pass first.
 Each block runs in its own fresh bash process from the checkout.
-Recover the run from `target/verify-veyra/latest`, or export the `RUN` that Launch printed when another verification may be running in this checkout.
+Export the `RUN` that Launch printed before each block, as [SKILL.md](../SKILL.md) says.
 
 M0's live dump fields are `pid`, `build_rev`, `data_dir`, `appearance`, `sidebar.width`, and `notice`.
 `view`, `sidebar.rows`, and `composer_text` are fixed placeholders until later milestones.
@@ -54,7 +54,7 @@ Run Cleanup even when this block fails.
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
-RUN=${RUN:-$(<target/verify-veyra/latest)}
+RUN=${RUN:?export the RUN that Launch printed}
 DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
 PID=$(<"$PROOF/pid")
@@ -205,8 +205,7 @@ A failure still runs the release cleanup trap.
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
-RUN=${RUN:-$(<target/verify-veyra/latest)}
-DATA=/tmp/veyra-verify-$RUN
+RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 REL_DATA=/tmp/veyra-rel-$RUN
 REL_PROOF=$PROOF/release

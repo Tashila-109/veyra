@@ -10,11 +10,10 @@ Use the debug driver because external Accessibility input is not granted on this
 Read [the feature map](features/README.md) before choosing a recipe.
 Run every block from this checkout in bash.
 Each section works in a fresh bash process.
-Launch prints `RUN` and records it in `target/verify-veyra/latest`.
-Later sections recover that identifier and read the process and window records from its proof folder.
-`latest` names only the newest run in this checkout.
-When another verification may be running in this checkout, export the `RUN` that Launch printed before every later section, so no section drives another run's instance.
-To resume a different run, export its recorded `RUN` the same way.
+Launch prints `RUN=` followed by the run's identifier.
+Export that `RUN` before every later section; each section refuses to start without it, so no section drives another run's instance.
+To resume an earlier run, export its recorded `RUN` the same way.
+Each section reads the process and window records from the run's proof folder.
 Cleanup does not need Launch's job table or `wait`.
 
 ## Launch
@@ -33,7 +32,6 @@ test ! -e "$DATA"
 test ! -e "$PROOF"
 cargo build --workspace
 mkdir -p "$PROOF"
-printf '%s\n' "$RUN" >target/verify-veyra/latest
 printf 'RUN=%s\n' "$RUN"
 set -m
 VEYRA_DATA_DIR="$DATA" target/debug/veyra >"$PROOF/stdout.log" 2>"$PROOF/stderr.log" &
@@ -67,7 +65,7 @@ Do not drive an instance whose pid, revision, data folder, or window does not ma
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
-RUN=${RUN:-$(<target/verify-veyra/latest)}
+RUN=${RUN:?export the RUN that Launch printed}
 DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
 PID=$(<"$PROOF/pid")
@@ -75,17 +73,18 @@ PGID=$(<"$PROOF/pgid")
 ID=$(<"$PROOF/window-id")
 kill -0 "$PID"
 test "$(ps -o pgid= -p "$PID" | tr -d ' ')" = "$PGID"
-TIMEFORMAT=%3R
-{ time VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl dump >"$PROOF/doctor.json"; } 2>"$PROOF/doctor-time.txt"
-python3 - "$PROOF/doctor-time.txt" <<'PY'
-import sys
-seconds = float(open(sys.argv[1]).read().split()[-1])
+python3 - "$PROOF" "$DATA" "$PID" <<'PY'
+import json, os, pathlib, subprocess, sys, time
+proof = pathlib.Path(sys.argv[1])
+start = time.monotonic()
+reply = subprocess.run(["target/debug/veyra", "ctl", "dump"], env={**os.environ, "VEYRA_DATA_DIR": sys.argv[2]},
+                       stdout=subprocess.PIPE, text=True, check=True).stdout
+seconds = time.monotonic() - start
+(proof / "doctor.json").write_text(reply)
+(proof / "doctor-time.txt").write_text(f"{seconds:.3f}\n")
 assert seconds < 2, seconds
 print(f"PASS doctor dump answered in {seconds:.3f} s")
-PY
-python3 - "$PROOF/doctor.json" "$DATA" "$PID" <<'PY'
-import json, pathlib, subprocess, sys
-dump = json.load(open(sys.argv[1]))
+dump = json.loads(reply)
 assert dump["data_dir"] == sys.argv[2]
 assert dump["pid"] == int(sys.argv[3])
 assert pathlib.Path(sys.argv[2], "veyra.lock").read_text().strip() == sys.argv[3]
@@ -133,7 +132,7 @@ Use the pid filter so another Veyra window cannot supply the screenshot.
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
-RUN=${RUN:-$(<target/verify-veyra/latest)}
+RUN=${RUN:?export the RUN that Launch printed}
 DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
 PID=$(<"$PROOF/pid")
@@ -169,7 +168,7 @@ A failed Launch may have no window record, so Cleanup accepts an empty `ID`.
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
-RUN=${RUN:-$(<target/verify-veyra/latest)}
+RUN=${RUN:?export the RUN that Launch printed}
 DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
 PID=$(<"$PROOF/pid")

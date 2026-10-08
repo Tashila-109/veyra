@@ -6,9 +6,9 @@ It is the only feature in M0.
 ## Preconditions
 
 - Run Launch and Doctor in [verify-veyra](../SKILL.md).
-- Launch records a fresh short `RUN` in `target/verify-veyra/latest` and uses `/tmp/veyra-verify-$RUN`.
+- Launch prints a fresh short `RUN` and uses `/tmp/veyra-verify-$RUN`.
 - Each later section recovers run, process, and window records in a fresh bash process.
-Export a recorded `RUN` when resuming a run other than `latest`.
+Every later section needs that `RUN` exported, as [SKILL.md](../SKILL.md) says.
 - Drive only the pid this run started.
 - Keep proof in `target/verify-veyra/$RUN/`.
 
