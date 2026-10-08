@@ -11,8 +11,10 @@ Read [the feature map](features/README.md) before choosing a recipe.
 Run every block from this checkout in bash.
 Each section works in a fresh bash process.
 Launch prints `RUN=` followed by the run's identifier.
-Export that `RUN` before every later section; each section refuses to start without it, so no section drives another run's instance.
-To resume an earlier run, export its recorded `RUN` the same way.
+Export that `RUN` before every later section.
+Each section refuses to start without it.
+This keeps the section on the instance Launch started.
+To resume an earlier run, export the `RUN` Launch printed.
 Each section reads the process and window records from the run's proof folder.
 Cleanup does not need Launch's job table or `wait`.
 
@@ -55,7 +57,8 @@ printf 'PASS launch RUN=%s PID=%s PGID=%s ID=%s\n' "$RUN" "$PID" "$PGID" "$ID"
 The block must exit 0.
 If launch fails after starting a process, run Cleanup before reporting.
 Do not use the default data folder.
-M0 runs no provider and needs no login or database.
+The shell runs no provider and needs no login.
+M1 starts the engine and migrates the database before opening the window.
 
 ## Doctor
 
@@ -111,7 +114,7 @@ Both paths are the same dispatch paths the window uses.
 M0's `text STRING` returns an error because its composer has no input handler.
 `quit` dispatches the menu's Quit action.
 
-M0's live `dump` fields are `pid`, `build_rev`, `data_dir`, `appearance`, `sidebar.width`, and `notice`.
+The live `dump` fields are `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `sidebar.width`, and `notice`.
 They report the process, theme, and entity state.
 `view` is fixed to `new_thread`, `sidebar.rows` to `[]`, and `composer_text` to an empty string until later milestones.
 Do not use those fixed fields as proof of the rendered window or an action.
@@ -134,16 +137,33 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 DATA=/tmp/veyra-verify-$RUN
+DB=$DATA/veyra.db
 PROOF=target/verify-veyra/$RUN
 PID=$(<"$PROOF/pid")
 PGID=$(<"$PROOF/pgid")
 ID=$(<"$PROOF/window-id")
 VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl dump >"$PROOF/dump-after.json"
+{
+    sqlite3 "$DB" "pragma user_version"
+    sqlite3 "$DB" "pragma journal_mode"
+    sqlite3 "$DB" ".tables"
+    sqlite3 "$DB" "select default_mode from settings"
+} | tee "$PROOF/database.txt"
+test "$(sqlite3 "$DB" "pragma user_version")" = 1
+test "$(sqlite3 "$DB" "pragma journal_mode")" = wal
+test "$(sqlite3 "$DB" "select default_mode from settings")" = full_access
+python3 - "$DB" "$PROOF/dump-after.json" <<'PY'
+import json, subprocess, sys
+assert json.load(open(sys.argv[2]))['schema_version'] == 1
+assert subprocess.check_output(['sqlite3', sys.argv[1], '.tables'], text=True).split() == [
+    'grants', 'items', 'projects', 'requests', 'settings', 'tasks', 'threads', 'turns']
+print('PASS migrated database and schema_version')
+PY
 screencapture -x -o -l "$ID" "$PROOF/window.png"
 cp "$DATA/logs/veyra.log" "$PROOF/veyra.log"
 { git rev-parse HEAD; git status --short; } >"$PROOF/git-identity.txt"
 grep -q "veyra ready pid=$PID data_dir=$DATA" "$PROOF/veyra.log"
-for file in dump-before.json dump-after.json window.png veyra.log second-launch.txt drive.log git-identity.txt; do
+for file in dump-before.json dump-after.json window.png veyra.log second-launch.txt drive.log git-identity.txt database.txt; do
     test -s "$PROOF/$file"
 done
 printf 'PASS evidence RUN=%s\n' "$RUN"
@@ -155,7 +175,8 @@ The composer caps at 784 px with a 16 px corner radius.
 The requested window is 1280 by 800 px with a 760 by 560 px minimum.
 A window manager can override those outer bounds, so use Doctor's recorded bounds.
 A dump alone does not prove visible layout or fonts.
-M0 has no database or network side effects.
+M1 creates `veyra.db` with migration 1 and no provider or network side effects.
+`database.txt` keeps the schema version, journal mode, table names and default permission mode.
 Do not count native typing, pointer dragging, or a manual theme change as passed through a driver action.
 
 ## Cleanup

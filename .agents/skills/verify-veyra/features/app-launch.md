@@ -1,5 +1,7 @@
 # App launch
 
+Status: STATE, DATE, COMMIT, MISSING
+
 Veyra opens one window with an empty project sidebar and a new-thread composer shell.
 The same data folder accepts only one instance.
 The debug CLI identifies the window without external Accessibility input.
@@ -8,7 +10,9 @@ The debug CLI identifies the window without external Accessibility input.
 
 - `launch-window` shows the empty sidebar, Add project, header, question, and composer in Geist.
 - `launch-ready` prints `veyra ready pid=PID data_dir=DIR` after the first frame.
-- `launch-identity` reports the live pid, revision, data folder, appearance, sidebar width, and notice.
+- `launch-identity` reports the live pid, revision, data folder, schema_version, appearance, sidebar width, and notice.
+- `launch-database` creates migration 1, WAL, eight tables and the Full access default.
+- `launch-recovery` keeps the schema version across quit and crash relaunches.
 - `launch-lock` refuses a second process on the same data folder.
 - `launch-log` writes the ready line and action notices to `DATA/logs/veyra.log`.
 - `launch-controls` reaches shell controls and sidebar resizing through named actions and individual key bindings.
@@ -34,7 +38,7 @@ Launch and Doctor must pass first.
 Each block runs in its own fresh bash process from the checkout.
 Export the `RUN` that Launch printed before each block, as [SKILL.md](../SKILL.md) says.
 
-M0's live dump fields are `pid`, `build_rev`, `data_dir`, `appearance`, `sidebar.width`, and `notice`.
+The live dump fields are `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `sidebar.width`, and `notice`.
 `view`, `sidebar.rows`, and `composer_text` are fixed placeholders until later milestones.
 No assertion below uses those fixed fields as evidence.
 Inspect the window screenshot for the empty sidebar and composer.
@@ -168,6 +172,20 @@ width width-900-dump 448
 ctl key-width-reset keys secondary-alt-0
 ctl after-width-reset dump
 width after-width-reset 240
+ctl before-narrow action veyra::SetSidebarWidth '{"width":320}'
+ctl narrow-sidebar action veyra::NarrowSidebar
+ctl after-narrow-sidebar dump
+width after-narrow-sidebar 304
+ctl widen-sidebar action veyra::WidenSidebar
+ctl after-widen-sidebar dump
+width after-widen-sidebar 320
+ctl reset-sidebar action veyra::ResetSidebar
+ctl after-reset-sidebar dump
+width after-reset-sidebar 240
+ctl before-dismiss action veyra::Send
+ctl dismiss-notice action veyra::DismissNotice
+ctl after-dismiss-notice dump
+notice after-dismiss-notice '<null>'
 if ctl text-hello text hello; then
     printf '%s\n' 'text unexpectedly accepted' >&2
     exit 1
@@ -193,6 +211,76 @@ for key in secondary-n escape; do
 done
 printf 'PASS app-launch actions and individual keys RUN=%s\n' "$RUN"
 ```
+
+### Migrated database and relaunch
+
+Evidence in SKILL.md reads migration 1 through `sqlite3 "$DB"`.
+This block proves that graceful quit and `kill -9` keep the same database.
+It replaces the process and window records before the next Doctor or Evidence.
+Each pid comes from this run's proof and must match `DATA/veyra.lock` before any signal.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+DATA=/tmp/veyra-verify-$RUN
+DB=$DATA/veyra.db
+PROOF=target/verify-veyra/$RUN
+PID=$(<"$PROOF/pid")
+PGID=$(<"$PROOF/pgid")
+test "$(<"$DATA/veyra.lock")" = "$PID"
+test "$PID" = "$PGID"
+test "$(sqlite3 "$DB" "pragma user_version")" = 1
+wait_gone() {
+    for attempt in $(seq 1 50); do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep .1
+    done
+    printf 'owned pid %s did not exit\n' "$1" >&2
+    return 1
+}
+relaunch() {
+    local label=$1
+    set -m
+    VEYRA_DATA_DIR="$DATA" target/debug/veyra >"$PROOF/$label.stdout" 2>"$PROOF/$label.stderr" &
+    PID=$!
+    PGID=$(ps -o pgid= -p "$PID" | tr -d ' ')
+    printf '%s\n' "$PID" >"$PROOF/pid"
+    printf '%s\n' "$PGID" >"$PROOF/pgid"
+    test "$PID" = "$PGID"
+    for attempt in $(seq 1 100); do
+        grep -q "^veyra ready pid=$PID data_dir=$DATA$" "$PROOF/$label.stderr" && break
+        kill -0 "$PID" 2>/dev/null || break
+        sleep .1
+    done
+    cat "$PROOF/$label.stderr" >>"$PROOF/stderr.log"
+    grep -q "^veyra ready pid=$PID data_dir=$DATA$" "$PROOF/$label.stderr"
+    test "$(<"$DATA/veyra.lock")" = "$PID"
+    ID=$(swift .agents/skills/verify-veyra/bin/winid.swift "$PID")
+    test -n "$ID"
+    printf '%s\n' "$ID" >"$PROOF/window-id"
+    VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl dump >"$PROOF/$label.json"
+    test "$(sqlite3 "$DB" "pragma user_version")" = 1
+    printf 'PASS %s PID=%s schema_version=1\n' "$label" "$PID"
+}
+VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl quit >"$PROOF/relaunch-quit.json"
+printf '%s\n' "$PID" >"$PROOF/quit-old-pid"
+wait_gone "$PID"
+relaunch after-quit
+printf '%s\n' "$PID" >"$PROOF/crash-old-pid"
+test "$(<"$DATA/veyra.lock")" = "$PID"
+kill -9 "$PID"
+wait_gone "$PID"
+relaunch after-crash
+{
+    sqlite3 "$DB" "pragma user_version"
+    sqlite3 "$DB" "pragma journal_mode"
+    sqlite3 "$DB" ".tables"
+    sqlite3 "$DB" "select default_mode from settings"
+} | tee "$PROOF/relaunch-database.txt"
+```
+
+Run Doctor again for the final pid.
 
 ### Release check
 
@@ -276,12 +364,35 @@ The log's ready line must name this pid and data folder.
 `ctl quit` uses the same Quit action as the menu.
 After Cleanup, `/bin/ls "$PROOF"` must still list the proof and `test ! -e "$DATA"` must pass.
 
+## Observable success
+
+- `launch-window` requires `window-launch.png` and `window.png` inspected for the empty sidebar and composer in Geist.
+Doctor's bounds show the actual window size.
+- `launch-ready` requires the exact pid and data folder in `stderr.log` and `veyra.log`.
+- `launch-identity` requires `dump.pid` equal to `DATA/veyra.lock`, `build_rev` equal to Git HEAD, and `data_dir` equal to DATA.
+Doctor times the live dump under two seconds.
+`appearance`, `sidebar.width` and `notice` are live window state.
+- `launch-database` requires `dump.schema_version` and `sqlite3 "$DB" "pragma user_version"` equal to 1.
+`pragma journal_mode` prints `wal`.
+`.tables` lists `grants items projects requests settings tasks threads turns`.
+`select default_mode from settings` prints `full_access`.
+- `launch-recovery` requires `after-quit.stderr` and `after-crash.stderr` to reach the ready line on the same DATA.
+`relaunch-database.txt` keeps version 1 and the other database reads after both relaunches.
+- `launch-lock` requires second-launch exit 1 and the already-running message.
+`doctor-after-second-launch.json` still reports the first pid and DATA.
+- `launch-log` requires ready and action notices in `veyra.log`.
+- `launch-controls` requires each `notice` and `sidebar.width` transition in `drive.log`.
+This includes `NarrowSidebar`, `WidenSidebar`, `ResetSidebar`, `DismissNotice`, their keys, the shell actions and `SetSidebarWidth`.
+`text` must return its no-input-handler error.
+- `launch-release` requires `release/ctl.txt` exit 2, zero release driver strings with a positive debug control, and no release control socket.
+- `launch-quit` requires every owned pid absent and DATA removed, with the PNG, dumps, database reads and log still in PROOF.
+
 ## Gotchas
 
-- M0 is a shell.
+- The window is still the M0 shell in M1.
 Add project, pickers, and Send show notices.
 They do not create projects, threads, or provider sessions.
-- The composer has no text input in M0.
+- The composer has no text input through M1.
 A text-command error is the expected result, not a failed input-handler implementation.
 - Change macOS appearance by hand to check dark and light.
 Veyra must follow in Geist.

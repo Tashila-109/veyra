@@ -1,7 +1,7 @@
 # Veyra verification map
 
-[app-launch](app-launch.md) covers the current native window, debug CLI, instance lock, log, release exclusion, and cleanup.
-It is the only feature in M0.
+[app-launch](app-launch.md) covers the native window, debug CLI, instance lock, migrated database, log, release exclusion, and cleanup.
+It is the only feature page through M1.
 
 ## Preconditions
 
@@ -27,6 +27,18 @@ Inspect the 44 px header and the composer capped at 784 px in the PNG.
 
 ## Entry contract
 
-Each feature has four H2 sections.
-They are `Sub-features`, `How to get to it (user POV)`, `Driving it with veyra ctl`, and `Gotchas`.
+Each feature starts with `Status: STATE, DATE, COMMIT, MISSING` directly under its title.
+STATE is `passed`, `failed`, `blocked`, or `not run`.
+DATE is the last run's date.
+COMMIT is the short SHA of the phase commit that holds the candidate the lanes ran.
+MISSING lists every sub-feature that run did not prove, or `none` when all passed.
+A partial run never counts as passed.
+The lead fills the values from lane results.
+The lead fills COMMIT in a docs-only commit after the phase commit, since a commit cannot contain its own SHA.
+
+Each feature has five H2 sections.
+They are `Sub-features`, `How to get to it (user POV)`, `Driving it with veyra ctl`, `Observable success`, and `Gotchas`.
+Observable success names the `dump` field, `sqlite3` read, or preserved artifact that proves each sub-feature.
+For example, check `dump.pid` against `DATA/veyra.lock` and use `pragma user_version` for the migration.
 Add a feature when a later milestone adds user-facing behavior.
+`verify_map_names` checks every action, `ctl` verb and top-level `dump` key against this map and SKILL.md.

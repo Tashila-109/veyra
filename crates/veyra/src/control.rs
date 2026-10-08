@@ -29,6 +29,7 @@ pub enum Command {
 
 pub struct Request {
     command: Command,
+    schema_version: u32,
     reply: mpsc::SyncSender<Value>,
 }
 
@@ -41,7 +42,7 @@ fn read_line(reader: impl Read) -> anyhow::Result<String> {
     Ok(line)
 }
 
-pub fn listen(data_dir: &Path) -> anyhow::Result<channel::Receiver<Request>> {
+pub fn listen(data_dir: &Path, schema_version: u32) -> anyhow::Result<channel::Receiver<Request>> {
     let socket = data_dir.join("control.sock");
     let listener = platform::bind_socket(&socket).context("bind debug control socket")?;
     let (sender, receiver) = channel::channel(16);
@@ -53,7 +54,7 @@ pub fn listen(data_dir: &Path) -> anyhow::Result<channel::Receiver<Request>> {
                 let response = (|| {
                     stream.set_read_timeout(Some(TIMEOUT))?;
                     stream.set_write_timeout(Some(TIMEOUT))?;
-                    serve(&mut stream, &sender)
+                    serve(&mut stream, &sender, schema_version)
                 })()
                 .unwrap_or_else(|error| json!({"error": error.to_string()}));
                 if let Ok(line) = serde_json::to_string(&response) {
@@ -67,11 +68,16 @@ pub fn listen(data_dir: &Path) -> anyhow::Result<channel::Receiver<Request>> {
 fn serve(
     stream: &mut (impl Read + Write),
     sender: &channel::Sender<Request>,
+    schema_version: u32,
 ) -> anyhow::Result<Value> {
     let command = serde_json::from_str(&read_line(&mut *stream)?)?;
     let (reply, response) = mpsc::sync_channel(1);
     sender
-        .try_send(Request { command, reply })
+        .try_send(Request {
+            command,
+            reply,
+            schema_version,
+        })
         .context("debug UI queue unavailable")?;
     response
         .recv_timeout(TIMEOUT)
@@ -91,7 +97,10 @@ pub fn attach(
                 let response = cx.update(|window, cx| -> anyhow::Result<Value> {
                     match request.command {
                         Command::Dump => {
-                            Ok(shell.update(cx, |shell, cx| shell.dump(&data_dir, cx))?)
+                            let mut dump =
+                                shell.update(cx, |shell, cx| shell.dump(&data_dir, cx))?;
+                            dump["schema_version"] = json!(request.schema_version);
+                            Ok(dump)
                         }
                         Command::Action { name, data } => {
                             let action = cx.build_action(&name, data)?;
