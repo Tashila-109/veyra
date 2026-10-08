@@ -32,7 +32,7 @@ Native mouse and OS key delivery remain manual checks.
 
 Launch and Doctor must pass first.
 Each block runs in its own fresh bash process from the checkout.
-Recover the run from `target/verify-veyra/latest`, or export a previously recorded `RUN`.
+Recover the run from `target/verify-veyra/latest`, or export the `RUN` that Launch printed when another verification may be running in this checkout.
 
 M0's live dump fields are `pid`, `build_rev`, `data_dir`, `appearance`, `sidebar.width`, and `notice`.
 `view`, `sidebar.rows`, and `composer_text` are fixed placeholders until later milestones.
@@ -208,12 +208,10 @@ set -eu
 RUN=${RUN:-$(<target/verify-veyra/latest)}
 DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
-PID=$(<"$PROOF/pid")
-PGID=$(<"$PROOF/pgid")
-ID=$(<"$PROOF/window-id")
 REL_DATA=/tmp/veyra-rel-$RUN
 REL_PROOF=$PROOF/release
-test ! -e "$REL_DATA" && test ! -e "$REL_PROOF"
+test ! -e "$REL_DATA"
+test ! -e "$REL_PROOF"
 mkdir -p "$REL_PROOF"
 cargo build --release
 if target/release/veyra ctl dump >"$REL_PROOF/ctl.txt" 2>&1; then rc=0; else rc=$?; fi
@@ -224,7 +222,8 @@ test "$rc" = 2
 RELEASE_COUNT=$(/usr/bin/strings -a target/release/veyra | grep -c control.sock || true)
 DEBUG_COUNT=$(/usr/bin/strings -a target/debug/veyra | grep -c control.sock || true)
 printf 'release control.sock count=%s\ndebug control.sock count=%s\n' "$RELEASE_COUNT" "$DEBUG_COUNT" | tee "$REL_PROOF/strings.txt"
-test "$RELEASE_COUNT" = 0 && test "$DEBUG_COUNT" -gt 0
+test "$RELEASE_COUNT" = 0
+test "$DEBUG_COUNT" -gt 0
 set -m
 VEYRA_DATA_DIR="$REL_DATA" target/release/veyra >"$REL_PROOF/stdout.log" 2>"$REL_PROOF/stderr.log" &
 REL_PID=$!

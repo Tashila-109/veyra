@@ -12,8 +12,9 @@ Run every block from this checkout in bash.
 Each section works in a fresh bash process.
 Launch prints `RUN` and records it in `target/verify-veyra/latest`.
 Later sections recover that identifier and read the process and window records from its proof folder.
-To resume a different run, export its recorded `RUN` before running the section.
-Do not run two verifications concurrently against `latest`.
+`latest` names only the newest run in this checkout.
+When another verification may be running in this checkout, export the `RUN` that Launch printed before every later section, so no section drives another run's instance.
+To resume a different run, export its recorded `RUN` the same way.
 Cleanup does not need Launch's job table or `wait`.
 
 ## Launch
@@ -28,7 +29,8 @@ set -eu
 RUN=$(uuidgen | cut -c1-8 | tr A-Z a-z)
 DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
-test ! -e "$DATA" && test ! -e "$PROOF"
+test ! -e "$DATA"
+test ! -e "$PROOF"
 cargo build --workspace
 mkdir -p "$PROOF"
 printf '%s\n' "$RUN" >target/verify-veyra/latest
@@ -73,7 +75,14 @@ PGID=$(<"$PROOF/pgid")
 ID=$(<"$PROOF/window-id")
 kill -0 "$PID"
 test "$(ps -o pgid= -p "$PID" | tr -d ' ')" = "$PGID"
-VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl dump >"$PROOF/doctor.json"
+TIMEFORMAT=%3R
+{ time VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl dump >"$PROOF/doctor.json"; } 2>"$PROOF/doctor-time.txt"
+python3 - "$PROOF/doctor-time.txt" <<'PY'
+import sys
+seconds = float(open(sys.argv[1]).read().split()[-1])
+assert seconds < 2, seconds
+print(f"PASS doctor dump answered in {seconds:.3f} s")
+PY
 python3 - "$PROOF/doctor.json" "$DATA" "$PID" <<'PY'
 import json, pathlib, subprocess, sys
 dump = json.load(open(sys.argv[1]))
@@ -89,7 +98,7 @@ swift .agents/skills/verify-veyra/bin/winid.swift "$PID" --bounds >"$PROOF/bound
 printf 'PASS doctor window ID=%s\n' "$ID"
 ```
 
-The client has a two-second read timeout.
+Doctor times the dump and requires an answer within two seconds.
 A wrong identity or unavailable window fails Doctor.
 A build outside Git reports `unknown` instead of HEAD.
 
