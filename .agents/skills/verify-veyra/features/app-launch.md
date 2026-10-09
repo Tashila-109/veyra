@@ -1,6 +1,6 @@
 # App launch
 
-Status: STATE, DATE, COMMIT, MISSING
+Status: passed, 2026-10-09, d2bc228, none
 
 Veyra opens one window with an empty project sidebar and a new-thread composer shell.
 The same data folder accepts only one instance.
