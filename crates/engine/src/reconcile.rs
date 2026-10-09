@@ -1,5 +1,5 @@
 use crate::{
-    commands::{end_turn, queue},
+    commands::{end_turn, queue_wake, set_hold},
     domain::*,
     events::{ChangeEvent as Ev, ChangeSet},
 };
@@ -8,9 +8,7 @@ pub fn decide(p: &Projection, now: Millis) -> ChangeSet {
     let mut c = ChangeSet::default();
     for t in p.turns.values() {
         if matches!(t.state, TurnState::Queued | TurnState::Running { .. }) {
-            let mut thread = p.threads[&t.thread].clone();
-            thread.hold = Some(thread.hold.unwrap_or(HoldReason::Restarted));
-            c.threads.insert(thread.id, thread);
+            set_hold(p, &mut c, t.thread, Some(HoldReason::Restarted));
         }
         if matches!(t.state, TurnState::Running { .. }) {
             end_turn(
@@ -29,69 +27,43 @@ pub fn decide(p: &Projection, now: Millis) -> ChangeSet {
         .values()
         .filter(|r| r.state == RequestState::Pending)
     {
-        let mut req = req.clone();
-        req.state = RequestState::Expired {
-            reason: "Veyra closed while this request waited".into(),
-        };
-        c.events.push(Ev::RequestClosed(req.clone()));
-        c.requests.insert(req.id, req.clone());
-        let mut thread = c.thread(p, req.thread).unwrap().clone();
-        thread.hold = Some(thread.hold.unwrap_or(HoldReason::Restarted));
-        c.threads.insert(thread.id, thread);
+        if !c.requests.contains_key(&req.id) {
+            let mut req = req.clone();
+            req.state = RequestState::Expired {
+                reason: "Veyra closed while this request waited".into(),
+            };
+            c.events.push(Ev::RequestClosed(req.clone()));
+            c.requests.insert(req.id, req);
+        }
+        set_hold(p, &mut c, req.thread, Some(HoldReason::Restarted));
     }
     for t in p.threads.values().filter(|t| t.view == View::Terminal) {
         let mut t = c.thread(p, t.id).unwrap().clone();
         t.view = View::Chat;
         t.import_pending = true;
-        t.hold = Some(t.hold.unwrap_or(HoldReason::Restarted));
-        c.threads.insert(t.id, t);
+        let id = t.id;
+        c.threads.insert(id, t);
+        set_hold(p, &mut c, id, Some(HoldReason::Restarted));
     }
-    for task in p.tasks.values() {
+    let tasks: Vec<_> = c.tasks(p).cloned().collect();
+    for mut task in tasks {
         if let TaskState::Settled {
             delivery: Delivery::Pending { wake },
             ..
         } = task.state
         {
-            if p.turns
-                .get(&wake)
-                .is_some_and(|t| t.state == TurnState::Queued)
+            if c.turns(p, task.parent)
+                .any(|t| t.id == wake && t.state == TurnState::Queued)
             {
                 continue;
             }
-            let existing = c
-                .turns(p, task.parent)
-                .find(|t| {
-                    t.state == TurnState::Queued && matches!(t.origin, TurnOrigin::Wake { .. })
-                })
-                .cloned();
-            let new_wake = match existing {
-                Some(mut turn) => {
-                    if let TurnOrigin::Wake { tasks } = &mut turn.origin
-                        && !tasks.contains(&task.id)
-                    {
-                        tasks.push(task.id);
-                    }
-                    let id = turn.id;
-                    c.turns.insert(id, turn);
-                    id
-                }
-                None => queue(
-                    p,
-                    &mut c,
-                    task.parent,
-                    TurnOrigin::Wake {
-                        tasks: vec![task.id],
-                    },
-                ),
-            };
-            let mut task = task.clone();
+            let wake = queue_wake(p, &mut c, task.parent, [task.id]);
             if let TaskState::Settled { delivery, .. } = &mut task.state {
-                *delivery = Delivery::Pending { wake: new_wake };
+                *delivery = Delivery::Pending { wake };
             }
-            c.tasks.insert(task.id, task.clone());
-            let mut thread = c.thread(p, task.parent).unwrap().clone();
-            thread.hold = Some(thread.hold.unwrap_or(HoldReason::Restarted));
-            c.threads.insert(thread.id, thread);
+            let parent = task.parent;
+            c.tasks.insert(task.id, task);
+            set_hold(p, &mut c, parent, Some(HoldReason::Restarted));
         }
     }
     c

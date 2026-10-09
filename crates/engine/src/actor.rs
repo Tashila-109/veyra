@@ -170,7 +170,7 @@ impl Actor {
                 let start = Instant::now();
                 let result = commands::decide(&self.projection, &self.live, command, now())
                     .and_then(|(mut c, ack)| {
-                        self.complete_ended_items(&mut c);
+                        self.prepare_commit(&mut c);
                         self.write(&c)?;
                         #[cfg(test)]
                         if measure && let Spawner::Scripted(script) = &self.spawner {
@@ -274,24 +274,11 @@ impl Actor {
         }
         let tx = self.db.transaction()?;
         store::apply(&tx, c, now())?;
-        for (id, live) in &c.live {
-            if matches!(live.live, Live::Stopping { .. }) {
-                continue;
-            }
-            let pid = match live.live {
-                Live::Structured { pid, .. } | Live::Terminal { pid, .. } => Some(pid),
-                _ => None,
-            };
-            tx.execute(
-                "UPDATE threads SET live_pid=?1,live_pgid=?1 WHERE id=?2",
-                rusqlite::params![pid, id.to_string()],
-            )?;
-        }
         tx.commit()?;
         Ok(())
     }
     fn commit_event(&mut self, mut c: ChangeSet) {
-        self.complete_ended_items(&mut c);
+        self.prepare_commit(&mut c);
         if let Err(error) = self.write(&c) {
             for live in self.live.values() {
                 if let Live::Starting { session } | Live::Structured { session, .. } = &live.live {
@@ -456,6 +443,7 @@ impl Actor {
                     }
                 },
                 Effect::Control { .. } | Effect::StopTerminal { .. } => {}
+                Effect::StartTurn { .. } => unreachable!("start controls prepared before commit"),
             }
         }
     }
@@ -668,38 +656,8 @@ impl Actor {
             }
             TurnEvent::TurnEnded { outcome } => {
                 commands::end_turn(&self.projection, c, turn.clone(), outcome, now());
-                self.requeue_wake(c, turn.id);
                 commands::settle_idle_child(&self.projection, &self.live, c, thread, false, now());
             }
-        }
-    }
-    fn requeue_wake(&self, c: &mut ChangeSet, ended: TurnId) {
-        let tasks:Vec<_>=self.projection.tasks.values().filter(|t|matches!(t.state,TaskState::Settled {delivery:Delivery::Pending {wake},..} if wake==ended)).cloned().collect();
-        if tasks.is_empty() {
-            return;
-        }
-        let parent = tasks[0].parent;
-        let existing = c
-            .turns(&self.projection, parent)
-            .find(|t| t.state == TurnState::Queued && matches!(t.origin, TurnOrigin::Wake { .. }))
-            .cloned();
-        let ids: Vec<_> = tasks.iter().map(|t| t.id).collect();
-        let wake = match existing {
-            Some(mut t) => {
-                if let TurnOrigin::Wake { tasks } = &mut t.origin {
-                    tasks.extend(ids);
-                }
-                let id = t.id;
-                c.turns.insert(id, t);
-                id
-            }
-            None => commands::queue(&self.projection, c, parent, TurnOrigin::Wake { tasks: ids }),
-        };
-        for mut task in tasks {
-            if let TaskState::Settled { delivery, .. } = &mut task.state {
-                *delivery = Delivery::Pending { wake };
-            }
-            c.tasks.insert(task.id, task);
         }
     }
     fn exited(&self, thread: ThreadId, crash: Option<String>) -> ChangeSet {
@@ -719,7 +677,6 @@ impl Actor {
                 },
             };
             commands::end_turn(&self.projection, &mut c, t.clone(), outcome, now());
-            self.requeue_wake(&mut c, t.id);
         } else if matches!(old.live, Live::Starting { .. }) && crash.is_some() {
             if let Some(t) = self
                 .projection
@@ -738,15 +695,7 @@ impl Actor {
                     now(),
                 );
             }
-            let mut t = self.projection.threads[&thread].clone();
-            if t.hold.is_none() {
-                t.hold = Some(HoldReason::Stopped);
-                c.events.push(Ev::ThreadHoldChanged {
-                    thread,
-                    hold: t.hold,
-                });
-            }
-            c.threads.insert(thread, t);
+            commands::set_hold(&self.projection, &mut c, thread, Some(HoldReason::Stopped));
         }
         for req in self
             .projection
@@ -827,6 +776,22 @@ impl Actor {
         b.unpersisted.push_str(&text);
         b.pending_ui.push_str(&text);
     }
+    fn prepare_commit(&self, c: &mut ChangeSet) {
+        self.complete_ended_items(c);
+        c.effects = std::mem::take(&mut c.effects)
+            .into_iter()
+            .map(|effect| match effect {
+                Effect::StartTurn { thread, turn } => Effect::Control {
+                    thread,
+                    control: SessionControl::StartTurn {
+                        turn,
+                        text: commands::turn_text(&self.projection, c, &c.turns[&turn]),
+                    },
+                },
+                other => other,
+            })
+            .collect();
+    }
     fn complete_ended_items(&self, c: &mut ChangeSet) {
         let ended: std::collections::BTreeSet<_> = c
             .turns
@@ -834,11 +799,16 @@ impl Actor {
             .filter(|t| matches!(t.state, TurnState::Ended { .. }))
             .map(|t| t.id)
             .collect();
-        let items: Vec<_> = self
-            .projection
-            .items
+        let threads: std::collections::BTreeSet<_> = c
+            .turns
             .values()
-            .filter(|i| ended.contains(&i.turn) && !c.items.contains_key(&i.id))
+            .filter(|t| ended.contains(&t.id))
+            .map(|t| t.thread)
+            .collect();
+        let items: Vec<_> = threads
+            .iter()
+            .flat_map(|id| c.items(&self.projection, *id))
+            .filter(|i| ended.contains(&i.turn))
             .cloned()
             .collect();
         for mut item in items {
@@ -864,22 +834,27 @@ impl Actor {
             c.events.insert(index, Ev::ItemCompleted(item.clone()));
             c.items.insert(item.id, item);
         }
-        for task in c.tasks.values_mut() {
-            if let TaskState::Settled { summary, .. } = &mut task.state {
-                *summary = self
-                    .projection
-                    .items
-                    .values()
-                    .filter(|i| !c.items.contains_key(&i.id))
-                    .chain(c.items.values())
-                    .filter(|i| i.thread == task.child)
-                    .filter_map(|i| match &i.body {
-                        ItemBody::AssistantText { text, .. } => Some((i.seq, text)),
-                        _ => None,
-                    })
-                    .max_by_key(|(seq, _)| *seq)
-                    .map(|(_, text)| text.chars().take(4000).collect())
-                    .unwrap_or_default();
+        let summaries: Vec<_> = c
+            .tasks
+            .values()
+            .filter(|task| {
+                matches!(task.state, TaskState::Settled { .. })
+                    && self
+                        .projection
+                        .tasks
+                        .get(&task.id)
+                        .is_some_and(|old| old.state == TaskState::Running)
+            })
+            .map(|task| {
+                (
+                    task.id,
+                    commands::task_summary(&self.projection, c, task.child),
+                )
+            })
+            .collect();
+        for (id, text) in summaries {
+            if let TaskState::Settled { summary, .. } = &mut c.tasks.get_mut(&id).unwrap().state {
+                *summary = text;
             }
         }
         for event in &mut c.events {

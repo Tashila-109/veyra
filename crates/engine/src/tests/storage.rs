@@ -30,9 +30,11 @@ fn spawn_failure_survives_full_actor_mailbox() {
         let _enter = f.runtime.enter();
         f.actor.handle(outcome);
     }
-    assert!(
-        matches!(&f.loaded().turns[&turn].state, TurnState::Ended { outcome: TurnOutcome::Failed { message }, .. } if message.contains("not built"))
-    );
+    assert!(matches!(
+        &f.loaded().turns[&turn].state,
+        TurnState::Ended { outcome: TurnOutcome::Failed { message }, .. }
+            if message.contains("not built")
+    ));
     assert_eq!(
         f.loaded().threads[&f.thread].hold,
         Some(HoldReason::Stopped)
@@ -40,7 +42,12 @@ fn spawn_failure_survives_full_actor_mailbox() {
     assert!(matches!(f.actor.live[&f.thread].live, Live::Parked));
     let mut hold_seen = false;
     while let Ok(event) = events.try_recv() {
-        hold_seen |= matches!(event, UiEvent::Change { event: Ev::ThreadHoldChanged { thread, hold: Some(HoldReason::Stopped) }, .. } if thread == f.thread);
+        hold_seen |= matches!(
+            event,
+            UiEvent::Change {
+                event: Ev::ThreadHoldChanged { thread, hold: Some(HoldReason::Stopped) }, ..
+            } if thread == f.thread
+        );
     }
     assert!(hold_seen);
 }

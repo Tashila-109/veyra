@@ -31,10 +31,13 @@ debug ctl -> private Unix socket -> socket thread
 ### Dependency hierarchy
 
 ```text
-veyra -> veyra-engine -> rusqlite + tokio sync/runtime + serde + uuid
+veyra -> veyra-engine -> rusqlite (bundled) + tokio (sync, rt-multi-thread, time, macros)
+                     -> serde (derive) + serde_json + uuid (v5, v7, serde)
+                     -> thiserror + tracing
                      -> platform -> libc + Rust standard library
-veyra -> gpui-kit -> gpui-pre
-veyra -> tokio sync + serde JSON + tracing
+veyra -> gpui-kit + gpui-pre
+veyra -> tokio (sync, rt-multi-thread, time) + serde (derive) + serde_json
+      -> tracing + tracing-subscriber + anyhow
 ```
 
 Only the `veyra` binary depends on gpui.
@@ -192,12 +195,20 @@ The UI-facing Engine handle sends typed commands and returns oneshot acknowledge
 Once enqueued, a subscription begins with the stored `SettingsChanged` row on an unbounded receiver.
 An enqueued snapshot request returns stored items, unpersisted text, and the thread's event counter.
 If that thread has text awaiting UI delivery, its reply waits for the scheduled text flush, without blocking the actor.
-The snapshot counter then includes that text prefix, so joining the stream does not append it twice.
+The snapshot counter then includes that text prefix.
+The subscription does not filter overlapping events for a snapshot consumer.
+A consumer must enqueue its subscription before requesting the snapshot and retain arriving events while the snapshot waits.
+It installs the stored items plus buffered text, then applies only events for that thread with counters above the snapshot counter.
+It handles settings events and storage-blocked notifications separately because those carry no thread counter.
+`snapshot_joins_buffer_without_duplicate_text` checks this join rule.
 A full or closed actor queue returns `Busy` for a command, closes a subscription without an initial event, and cancels a snapshot reply.
 The current shell does not subscribe to engine events or send conversation commands.
 
 `commands::decide` reads the projection and live state and returns a `ChangeSet` of changed rows, events, runtime replacements, and effects.
-The actor completes buffered text for ended turns, opens one transaction, calls `store::apply`, and commits.
+The actor completes buffered text for ended turns and finalizes summaries only for tasks newly settled in that decision.
+A settled summary remains unchanged when its delivery changes.
+Start effects name their turns until the actor builds their controls from those completed rows.
+The actor then opens one transaction, calls `store::apply`, and commits.
 Only then does it install runtime changes, publish numbered change events, and run effects.
 Thread-scoped changes and text appends each advance that thread's counter.
 Text deltas coalesce per item, normally flushing at most once per 16 ms.
@@ -235,6 +246,12 @@ The eight tables are `projects`, `threads`, `turns`, `items`, `requests`, `grant
 Rows are the source of truth.
 Change events, live states, derived statuses, and wait reasons are not stored as an event log.
 User text lives once in an item, referenced by its turn.
+`store::apply` also owns live pid writes and leaves `live_pgid` null until a process group exists.
+An archived thread's later archived writes preserve its first `archived_at`.
+`ChangeSet` reads items, requests, tasks and turns through one pending-row overlay.
+Wake queueing and hold updates share command helpers with recovery.
+The shared turn-ending path replaces unaccepted wakes for provider events and user commands.
+Archived parents retain queued reports and never restart through Continue.
 
 A root thread stores its own id as `root_thread_id`.
 Two lineage CHECKs and the composite parent/root foreign key refuse grandchildren, roots naming another root, and child-under-child updates.

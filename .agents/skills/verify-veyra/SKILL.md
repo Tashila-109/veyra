@@ -128,6 +128,8 @@ A full-queue error means that request was not enqueued.
 
 ## Evidence
 
+Run this block only after both relaunches, the final Doctor, and Release check.
+A missing relaunch or release artifact fails the block.
 Capture the action and its resulting state.
 Keep dump JSON before and after, the ready line, second-launch stderr and exit code, the app log, and the window.
 Use the pid filter so another Veyra window cannot supply the screenshot.
@@ -163,9 +165,43 @@ screencapture -x -o -l "$ID" "$PROOF/window.png"
 cp "$DATA/logs/veyra.log" "$PROOF/veyra.log"
 { git rev-parse HEAD; git status --short; } >"$PROOF/git-identity.txt"
 grep -q "veyra ready pid=$PID data_dir=$DATA" "$PROOF/veyra.log"
-for file in dump-before.json dump-after.json window.png veyra.log second-launch.txt drive.log git-identity.txt database.txt; do
-    test -s "$PROOF/$file"
+for file in dump-before.json dump-after.json window.png veyra.log second-launch.txt drive.log \
+    git-identity.txt database.txt initial-database.txt initial-inode.txt initial.json \
+    after-quit.stderr after-quit.json after-quit-database.txt after-quit-inode.txt \
+    after-crash.stderr after-crash.json after-crash-database.txt after-crash-inode.txt \
+    relaunch-database.txt release/ctl.txt release/strings.txt release/data-listing.txt release/stderr.log; do
+    test -s "$PROOF/$file" || { printf 'missing proof %s\n' "$file" >&2; exit 1; }
 done
+python3 - "$PROOF" "$DATA" <<'PY'
+import json, pathlib, re, sys
+proof, data = pathlib.Path(sys.argv[1]), sys.argv[2]
+recipe = pathlib.Path('.agents/skills/verify-veyra/features/app-launch.md').read_text()
+keys = recipe.split("done <<'KEYS'\n", 1)[1].split('\nKEYS', 1)[0]
+log = (proof / 'veyra.log').read_text()
+for row in keys.splitlines():
+    message = row.split('|', 2)[2]
+    assert f'shell action {message}' in log, f'missing log notice {message!r}'
+print('PASS all driven action notices logged')
+expected = ['1', 'wal', 'grants', 'items', 'projects', 'requests', 'settings', 'tasks', 'threads', 'turns',
+            'full_access']
+inodes = []
+for label in ['initial', 'after-quit', 'after-crash']:
+    actual = (proof / f'{label}-database.txt').read_text().split()
+    assert actual == expected, f'{label} database reads {actual!r}'
+    inodes.append((proof / f'{label}-inode.txt').read_text().strip())
+    dump = json.loads((proof / f'{label}.json').read_text())
+    assert dump['schema_version'] == 1 and dump['data_dir'] == data, dump
+    ready = f'veyra ready pid={dump["pid"]} data_dir={data}'
+    assert re.search(rf'^{re.escape(ready)}$', (proof / 'stderr.log').read_text(), re.M), ready
+assert len(set(inodes)) == 1 and inodes[0].isdigit(), f'database inodes changed {inodes!r}'
+print('PASS relaunch reads, identities and database inode kept')
+assert re.search(r'^exit=2$', (proof / 'release/ctl.txt').read_text(), re.M)
+strings = (proof / 'release/strings.txt').read_text()
+assert re.search(r'^release control.sock count=0$', strings, re.M)
+assert int(re.search(r'^debug control.sock count=(\d+)$', strings, re.M)[1]) > 0
+assert 'control.sock' not in (proof / 'release/data-listing.txt').read_text()
+print('PASS release proof kept')
+PY
 printf 'PASS evidence RUN=%s\n' "$RUN"
 ```
 
@@ -177,6 +213,9 @@ A window manager can override those outer bounds, so use Doctor's recorded bound
 A dump alone does not prove visible layout or fonts.
 M1 creates `veyra.db` with migration 1 and no provider or network side effects.
 `database.txt` keeps the schema version, journal mode, table names and default permission mode.
+Evidence also rereads all saved relaunch snapshots, matching database inodes, driven log notices and release results.
+M1 offers no driver command that writes a persistent value before relaunch.
+The inode check proves file preservation without adding a database setter.
 Do not count native typing, pointer dragging, or a manual theme change as passed through a driver action.
 
 ## Cleanup

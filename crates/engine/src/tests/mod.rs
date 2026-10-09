@@ -1,5 +1,6 @@
 mod perf;
 mod recovery;
+mod repair;
 mod session_events;
 mod storage;
 mod table;

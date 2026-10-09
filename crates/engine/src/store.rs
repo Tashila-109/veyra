@@ -1,4 +1,4 @@
-use crate::{domain::*, events::ChangeSet, provider::ProviderKind};
+use crate::{domain::*, events::ChangeSet, live::Live, provider::ProviderKind};
 use rusqlite::{Connection, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, time::Duration};
@@ -27,16 +27,22 @@ CREATE TABLE threads (
  UNIQUE (id, root_thread_id),
  FOREIGN KEY (parent_thread_id, root_thread_id) REFERENCES threads(id, root_thread_id));
 CREATE TABLE turns (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id), ordinal INTEGER NOT NULL,
- origin_json TEXT NOT NULL, state TEXT NOT NULL, outcome_json TEXT, queued_at INTEGER NOT NULL, started_at INTEGER, ended_at INTEGER,
+ origin_json TEXT NOT NULL, state TEXT NOT NULL, outcome_json TEXT, queued_at INTEGER NOT NULL,
+  started_at INTEGER, ended_at INTEGER,
  UNIQUE(thread_id,ordinal));
-CREATE TABLE items (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id), turn_id TEXT NOT NULL REFERENCES turns(id),
+CREATE TABLE items (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id),
+  turn_id TEXT NOT NULL REFERENCES turns(id),
  seq INTEGER NOT NULL, kind TEXT NOT NULL, body_json TEXT NOT NULL, done INTEGER NOT NULL, UNIQUE(thread_id,seq));
-CREATE TABLE requests (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id), turn_id TEXT NOT NULL REFERENCES turns(id),
+CREATE TABLE requests (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id),
+  turn_id TEXT NOT NULL REFERENCES turns(id),
  kind TEXT NOT NULL, body_json TEXT NOT NULL, state TEXT NOT NULL, decision_json TEXT);
-CREATE TABLE grants (thread_id TEXT NOT NULL REFERENCES threads(id), tool TEXT NOT NULL, command TEXT NOT NULL, created_at INTEGER NOT NULL,
+CREATE TABLE grants (thread_id TEXT NOT NULL REFERENCES threads(id), tool TEXT NOT NULL,
+  command TEXT NOT NULL, created_at INTEGER NOT NULL,
  PRIMARY KEY(thread_id,tool,command));
-CREATE TABLE tasks (id TEXT PRIMARY KEY, parent_thread_id TEXT NOT NULL REFERENCES threads(id), child_thread_id TEXT NOT NULL REFERENCES threads(id),
- turn_id TEXT NOT NULL REFERENCES turns(id), request_key TEXT NOT NULL, state TEXT NOT NULL, outcome_json TEXT, summary TEXT,
+CREATE TABLE tasks (id TEXT PRIMARY KEY, parent_thread_id TEXT NOT NULL REFERENCES threads(id),
+  child_thread_id TEXT NOT NULL REFERENCES threads(id),
+ turn_id TEXT NOT NULL REFERENCES turns(id), request_key TEXT NOT NULL, state TEXT NOT NULL,
+  outcome_json TEXT, summary TEXT,
  delivery TEXT, wake_turn TEXT REFERENCES turns(id), UNIQUE(parent_thread_id,request_key));
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), default_mode TEXT NOT NULL DEFAULT 'full_access'
  CHECK (default_mode IN ('ask_first','accept_edits','full_access')));
@@ -85,8 +91,11 @@ fn id<T: DeserializeOwned>(text: String) -> Result<T, StoreError> {
 
 pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), StoreError> {
     for p in c.projects.values() {
-        tx.execute("INSERT INTO projects VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET path=excluded.path,name=excluded.name",
-            params![p.id.to_string(),p.path.to_string_lossy(),p.name,now])?;
+        tx.execute(
+            "INSERT INTO projects(id,path,name,created_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(id) DO UPDATE SET path=excluded.path,name=excluded.name",
+            params![p.id.to_string(), p.path.to_string_lossy(), p.name, now],
+        )?;
     }
     let mut threads: Vec<_> = c.threads.values().collect();
     threads.sort_by_key(|t| !matches!(t.lineage, Lineage::Root));
@@ -99,13 +108,39 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
                 ..
             } => (Some(parent.to_string()), Some(word(relationship)?)),
         };
-        tx.execute("INSERT INTO threads(id,project_id,title,parent_thread_id,relationship,root_thread_id,provider,config_json,cwd,native_id,native_cursor,cli_version,hold_reason,view,import_pending,created_at,archived_at)
-          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
-          ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,title=excluded.title,parent_thread_id=excluded.parent_thread_id,relationship=excluded.relationship,
-          root_thread_id=excluded.root_thread_id,provider=excluded.provider,config_json=excluded.config_json,cwd=excluded.cwd,native_id=excluded.native_id,
-          native_cursor=excluded.native_cursor,cli_version=excluded.cli_version,hold_reason=excluded.hold_reason,view=excluded.view,import_pending=excluded.import_pending,archived_at=excluded.archived_at",
-          params![t.id.to_string(),t.project.to_string(),t.title,parent,rel,t.root().to_string(),word(&t.provider)?,json(&t.config)?,t.cwd.to_string_lossy(),
-          t.native.as_ref().map(|n| &n.0),t.native_cursor,t.cli_version,t.hold.as_ref().map(word).transpose()?,word(&t.view)?,t.import_pending,now,t.archived.then_some(now)])?;
+        tx.execute(
+            "INSERT INTO threads(id,project_id,title,parent_thread_id,relationship,root_thread_id,
+             provider,config_json,cwd,native_id,native_cursor,cli_version,hold_reason,view,
+             import_pending,created_at,archived_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,
+             ?14,?15,?16,?17) ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,
+             title=excluded.title,parent_thread_id=excluded.parent_thread_id,
+             relationship=excluded.relationship, root_thread_id=excluded.root_thread_id,
+             provider=excluded.provider,config_json=excluded.config_json,cwd=excluded.cwd,
+             native_id=excluded.native_id, native_cursor=excluded.native_cursor,
+             cli_version=excluded.cli_version,hold_reason=excluded.hold_reason,view=excluded.view,
+             import_pending=excluded.import_pending,
+             archived_at=CASE WHEN excluded.archived_at IS NULL THEN NULL
+             ELSE coalesce(threads.archived_at,excluded.archived_at) END",
+            params![
+                t.id.to_string(),
+                t.project.to_string(),
+                t.title,
+                parent,
+                rel,
+                t.root().to_string(),
+                word(&t.provider)?,
+                json(&t.config)?,
+                t.cwd.to_string_lossy(),
+                t.native.as_ref().map(|n| &n.0),
+                t.native_cursor,
+                t.cli_version,
+                t.hold.as_ref().map(word).transpose()?,
+                word(&t.view)?,
+                t.import_pending,
+                now,
+                t.archived.then_some(now),
+            ],
+        )?;
     }
     for t in c.turns.values() {
         let (state, start, end, outcome) = match &t.state {
@@ -113,8 +148,24 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             TurnState::Running { since } => ("running", Some(*since), None, None),
             TurnState::Ended { outcome, at } => ("ended", None, Some(*at), Some(json(outcome)?)),
         };
-        tx.execute("INSERT INTO turns VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET origin_json=excluded.origin_json,state=excluded.state,outcome_json=excluded.outcome_json,started_at=coalesce(excluded.started_at,turns.started_at),ended_at=excluded.ended_at",
-            params![t.id.to_string(),t.thread.to_string(),t.ordinal,json(&t.origin)?,state,outcome,now,start,end])?;
+        tx.execute(
+            "INSERT INTO turns(id,thread_id,ordinal,origin_json,state,outcome_json,queued_at,
+             started_at,ended_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET origin_json=excluded.origin_json,state=excluded.state,
+             outcome_json=excluded.outcome_json,started_at=coalesce(excluded.started_at,
+             turns.started_at),ended_at=excluded.ended_at",
+            params![
+                t.id.to_string(),
+                t.thread.to_string(),
+                t.ordinal,
+                json(&t.origin)?,
+                state,
+                outcome,
+                now,
+                start,
+                end
+            ],
+        )?;
     }
     for i in c.items.values() {
         let (kind, done) = match &i.body {
@@ -127,8 +178,11 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             ItemBody::TaskCard(_) => ("task_card", true),
             ItemBody::TerminalSpan(_) => ("terminal_span", true),
         };
-        tx.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET body_json=excluded.body_json,done=excluded.done",
-            params![i.id.to_string(),i.thread.to_string(),i.turn.to_string(),i.seq,kind,json(&i.body)?,done])?;
+        tx.execute(
+            "INSERT INTO items(id,thread_id,turn_id,seq,kind,body_json,done) VALUES(?1,?2,?3,?4,?5,?6,
+             ?7) ON CONFLICT(id) DO UPDATE SET body_json=excluded.body_json,done=excluded.done",
+              params![i.id.to_string(),i.thread.to_string(),i.turn.to_string(),i.seq,kind,json(&i.body)?,done],
+        )?;
     }
     for r in c.requests.values() {
         let kind = match r.kind {
@@ -140,8 +194,20 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             RequestState::Answered(d) => ("answered", Some(json(d)?)),
             RequestState::Expired { reason } => ("expired", Some(json(reason)?)),
         };
-        tx.execute("INSERT INTO requests VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET state=excluded.state,decision_json=excluded.decision_json",
-            params![r.id.to_string(),r.thread.to_string(),r.turn.to_string(),kind,json(&(&r.native,&r.kind))?,state,decision])?;
+        tx.execute(
+            "INSERT INTO requests(id,thread_id,turn_id,kind,body_json,state,decision_json) VALUES(?1,
+             ?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET state=excluded.state,
+             decision_json=excluded.decision_json",
+              params![
+                r.id.to_string(),
+                r.thread.to_string(),
+                r.turn.to_string(),
+                kind,
+                json(&(&r.native,&r.kind))?,
+                state,
+                decision,
+            ],
+        )?;
     }
     for t in c.tasks.values() {
         let (state, outcome, summary, delivery, wake) = match &t.state {
@@ -164,12 +230,28 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
                 )
             }
         };
-        tx.execute("INSERT INTO tasks VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO UPDATE SET state=excluded.state,outcome_json=excluded.outcome_json,summary=excluded.summary,delivery=excluded.delivery,wake_turn=excluded.wake_turn",
-            params![t.id.to_string(),t.parent.to_string(),t.child.to_string(),t.turn.to_string(),t.request_key,state,outcome,summary,delivery,wake])?;
+        tx.execute(
+            "INSERT INTO tasks(id,parent_thread_id,child_thread_id,turn_id,request_key,state,
+             outcome_json,summary,delivery,wake_turn) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(id) DO UPDATE SET state=excluded.state,outcome_json=excluded.outcome_json,
+             summary=excluded.summary,delivery=excluded.delivery,wake_turn=excluded.wake_turn",
+            params![
+                t.id.to_string(),
+                t.parent.to_string(),
+                t.child.to_string(),
+                t.turn.to_string(),
+                t.request_key,
+                state,
+                outcome,
+                summary,
+                delivery,
+                wake,
+            ],
+        )?;
     }
     for (thread, key) in &c.grants {
         tx.execute(
-            "INSERT OR IGNORE INTO grants VALUES(?1,?2,?3,?4)",
+            "INSERT OR IGNORE INTO grants(thread_id,tool,command,created_at) VALUES(?1,?2,?3,?4)",
             params![thread.to_string(), key.tool, key.command, now],
         )?;
     }
@@ -177,6 +259,19 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         tx.execute(
             "UPDATE settings SET default_mode=?1 WHERE id=1",
             params![word(&settings.default_mode)?],
+        )?;
+    }
+    for (id, live) in &c.live {
+        if matches!(live.live, Live::Stopping { .. }) {
+            continue;
+        }
+        let pid = match live.live {
+            Live::Structured { pid, .. } | Live::Terminal { pid, .. } => Some(pid),
+            _ => None,
+        };
+        tx.execute(
+            "UPDATE threads SET live_pid=?1,live_pgid=NULL WHERE id=?2",
+            params![pid, id.to_string()],
         )?;
     }
     Ok(())
@@ -205,7 +300,11 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
         };
         p.projects.insert(project.id, project);
     }
-    let mut q = db.prepare("SELECT id,project_id,title,parent_thread_id,relationship,root_thread_id,provider,config_json,cwd,native_id,native_cursor,cli_version,hold_reason,view,import_pending,archived_at FROM threads")?;
+    let mut q = db.prepare(
+        "SELECT id,project_id,title,parent_thread_id,relationship,root_thread_id,provider,
+             config_json,cwd,native_id,native_cursor,cli_version,hold_reason,view,import_pending,
+             archived_at FROM threads",
+    )?;
     let mut rows = q.query([])?;
     while let Some(r) = rows.next()? {
         let parent: Option<String> = r.get(3)?;
@@ -300,7 +399,10 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
         };
         p.requests.insert(req.id, req);
     }
-    let mut q = db.prepare("SELECT id,parent_thread_id,child_thread_id,turn_id,request_key,state,outcome_json,summary,delivery,wake_turn FROM tasks")?;
+    let mut q = db.prepare(
+        "SELECT id,parent_thread_id,child_thread_id,turn_id,request_key,state,outcome_json,summary,
+             delivery,wake_turn FROM tasks",
+    )?;
     let mut rows = q.query([])?;
     while let Some(r) = rows.next()? {
         let state: String = r.get(5)?;

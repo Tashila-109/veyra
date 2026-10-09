@@ -82,7 +82,12 @@ fn child_settlement_keeps_final_buffered_report() {
     assert!(
         matches!(&f.loaded().tasks[&task].state, TaskState::Settled { summary, .. } if summary == "final report")
     );
-    assert!(f.drain().iter().any(|e| matches!(e, UiEvent::Change { event: Ev::TaskSettled(Task { state: TaskState::Settled { summary, .. }, .. }), .. } if summary == "final report")));
+    assert!(f.drain().iter().any(|e| matches!(
+        e,
+        UiEvent::Change {
+            event: Ev::TaskSettled(Task { state: TaskState::Settled { summary, .. }, .. }), ..
+        } if summary == "final report"
+    )));
 }
 #[test]
 fn interrupt_holds_queue() {

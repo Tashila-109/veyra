@@ -57,15 +57,17 @@ impl Engine {
                 .truncate(false),
         )?;
         let db = store::open(&data.path().join("veyra.db"))?;
-        Self::launch(runtime, db, Spawner::Cli, Some(lock)).map_err(StartError::Store)
+        Self::launch(runtime, db, Spawner::Cli, Some(lock))
     }
     fn launch(
         runtime: &Handle,
         db: rusqlite::Connection,
         spawner: Spawner,
         lock: Option<data_dir::InstanceLock>,
-    ) -> Result<Self, store::StoreError> {
-        let version = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ) -> Result<Self, StartError> {
+        let version = db
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(store::StoreError::from)?;
         let (sender, receiver) = mpsc::channel(256);
         let actor = Actor::new(db, sender.clone(), spawner)?;
         let handle = runtime.clone();
@@ -78,6 +80,7 @@ impl Engine {
                 }
             }
         });
+        let tick_abort = tick.abort_handle();
         std::thread::Builder::new()
             .name("veyra-engine".into())
             .spawn(move || {
@@ -85,7 +88,7 @@ impl Engine {
                 actor.run(receiver, handle);
                 tick.abort();
             })
-            .map_err(|e| store::StoreError::Invalid(e.to_string()))?;
+            .inspect_err(|_| tick_abort.abort())?;
         Ok(Self {
             inner: Arc::new(EngineInner {
                 sender,
@@ -130,7 +133,7 @@ impl Engine {
         runtime: &Handle,
         db: rusqlite::Connection,
         script: provider::scripted::Scripted,
-    ) -> Result<Self, store::StoreError> {
+    ) -> Result<Self, StartError> {
         Self::launch(runtime, db, Spawner::Scripted(script), None)
     }
 }

@@ -12,7 +12,7 @@ The debug CLI identifies the window without external Accessibility input.
 - `launch-ready` prints `veyra ready pid=PID data_dir=DIR` after the first frame.
 - `launch-identity` reports the live pid, revision, data folder, schema_version, appearance, sidebar width, and notice.
 - `launch-database` creates migration 1, WAL, eight tables and the Full access default.
-- `launch-recovery` keeps the schema version across quit and crash relaunches.
+- `launch-recovery` keeps the same database inode and all four database reads across quit and crash relaunches.
 - `launch-lock` refuses a second process on the same data folder.
 - `launch-log` writes the ready line and action notices to `DATA/logs/veyra.log`.
 - `launch-controls` reaches shell controls and sidebar resizing through named actions and individual key bindings.
@@ -230,7 +230,29 @@ PID=$(<"$PROOF/pid")
 PGID=$(<"$PROOF/pgid")
 test "$(<"$DATA/veyra.lock")" = "$PID"
 test "$PID" = "$PGID"
-test "$(sqlite3 "$DB" "pragma user_version")" = 1
+database_read() {
+    local label=$1
+    {
+        sqlite3 "$DB" "pragma user_version"
+        sqlite3 "$DB" "pragma journal_mode"
+        sqlite3 "$DB" ".tables"
+        sqlite3 "$DB" "select default_mode from settings"
+    } | tee "$PROOF/$label-database.txt"
+    stat -f %i "$DB" | tee "$PROOF/$label-inode.txt"
+    VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl dump >"$PROOF/$label.json"
+    python3 - "$PROOF" "$label" "$PID" "$DATA" <<'PY'
+import json, pathlib, sys
+proof, label, pid, data = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+actual = (proof / f'{label}-database.txt').read_text().split()
+expected = ['1', 'wal', 'grants', 'items', 'projects', 'requests', 'settings', 'tasks', 'threads', 'turns',
+            'full_access']
+assert actual == expected, f'{label} database reads {actual!r}'
+dump = json.loads((proof / f'{label}.json').read_text())
+assert dump['schema_version'] == 1 and dump['pid'] == int(pid) and dump['data_dir'] == data, dump
+print(f'PASS {label} database reads and dump identity')
+PY
+}
+database_read initial
 wait_gone() {
     for attempt in $(seq 1 50); do
         kill -0 "$1" 2>/dev/null || return 0
@@ -259,9 +281,9 @@ relaunch() {
     ID=$(swift .agents/skills/verify-veyra/bin/winid.swift "$PID")
     test -n "$ID"
     printf '%s\n' "$ID" >"$PROOF/window-id"
-    VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl dump >"$PROOF/$label.json"
-    test "$(sqlite3 "$DB" "pragma user_version")" = 1
-    printf 'PASS %s PID=%s schema_version=1\n' "$label" "$PID"
+    database_read "$label"
+    test "$(<"$PROOF/initial-inode.txt")" = "$(<"$PROOF/$label-inode.txt")"
+    printf 'PASS %s PID=%s schema_version=1 database inode kept\n' "$label" "$PID"
 }
 VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl quit >"$PROOF/relaunch-quit.json"
 printf '%s\n' "$PID" >"$PROOF/quit-old-pid"
@@ -272,12 +294,8 @@ test "$(<"$DATA/veyra.lock")" = "$PID"
 kill -9 "$PID"
 wait_gone "$PID"
 relaunch after-crash
-{
-    sqlite3 "$DB" "pragma user_version"
-    sqlite3 "$DB" "pragma journal_mode"
-    sqlite3 "$DB" ".tables"
-    sqlite3 "$DB" "select default_mode from settings"
-} | tee "$PROOF/relaunch-database.txt"
+cp "$PROOF/initial-database.txt" "$PROOF/database-initial.txt"
+cp "$PROOF/after-crash-database.txt" "$PROOF/relaunch-database.txt"
 ```
 
 Run Doctor again for the final pid.
@@ -377,7 +395,10 @@ Doctor times the live dump under two seconds.
 `.tables` lists `grants items projects requests settings tasks threads turns`.
 `select default_mode from settings` prints `full_access`.
 - `launch-recovery` requires `after-quit.stderr` and `after-crash.stderr` to reach the ready line on the same DATA.
-`relaunch-database.txt` keeps version 1 and the other database reads after both relaunches.
+`initial-database.txt`, `after-quit-database.txt` and `after-crash-database.txt` each assert all four reads.
+Their matching inode files require the same database file across both relaunches.
+Each saved dump asserts schema version, pid and DATA.
+`relaunch-database.txt` keeps the final reads.
 - `launch-lock` requires second-launch exit 1 and the already-running message.
 `doctor-after-second-launch.json` still reports the first pid and DATA.
 - `launch-log` requires ready and action notices in `veyra.log`.

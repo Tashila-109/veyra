@@ -89,6 +89,10 @@ pub enum Effect {
     OpenTerminal {
         thread: ThreadId,
     },
+    StartTurn {
+        thread: ThreadId,
+        turn: TurnId,
+    },
     Control {
         thread: ThreadId,
         control: SessionControl,
@@ -111,6 +115,17 @@ pub struct ChangeSet {
     pub events: Vec<ChangeEvent>,
     pub effects: Vec<Effect>,
 }
+fn overlay<'a, K: Ord, V>(
+    stored: &'a BTreeMap<K, V>,
+    pending: &'a BTreeMap<K, V>,
+) -> impl Iterator<Item = &'a V> {
+    stored
+        .iter()
+        .filter(|(id, _)| !pending.contains_key(id))
+        .map(|(_, row)| row)
+        .chain(pending.values())
+}
+
 impl ChangeSet {
     pub fn install(
         self,
@@ -138,10 +153,20 @@ impl ChangeSet {
         self.threads.get(&id).or_else(|| p.threads.get(&id))
     }
     pub fn turns<'a>(&'a self, p: &'a Projection, id: ThreadId) -> impl Iterator<Item = &'a Turn> {
-        p.turns
-            .values()
-            .filter(move |t| t.thread == id && !self.turns.contains_key(&t.id))
-            .chain(self.turns.values().filter(move |t| t.thread == id))
+        overlay(&p.turns, &self.turns).filter(move |t| t.thread == id)
+    }
+    pub fn items<'a>(&'a self, p: &'a Projection, id: ThreadId) -> impl Iterator<Item = &'a Item> {
+        overlay(&p.items, &self.items).filter(move |i| i.thread == id)
+    }
+    pub fn requests<'a>(
+        &'a self,
+        p: &'a Projection,
+        id: ThreadId,
+    ) -> impl Iterator<Item = &'a Request> {
+        overlay(&p.requests, &self.requests).filter(move |r| r.thread == id)
+    }
+    pub fn tasks<'a>(&'a self, p: &'a Projection) -> impl Iterator<Item = &'a Task> {
+        overlay(&p.tasks, &self.tasks)
     }
     pub fn live<'a>(
         &'a self,
@@ -165,12 +190,9 @@ impl ChangeSet {
             .find(|t| matches!(t.state, TurnState::Running { .. }));
         let queued = self.turns(p, id).any(|t| t.state == TurnState::Queued);
         let last = self.turns(p, id).max_by_key(|t| t.ordinal);
-        let pending_request = p
-            .requests
-            .values()
-            .filter(|r| !self.requests.contains_key(&r.id))
-            .chain(self.requests.values())
-            .any(|r| r.thread == id && r.state == RequestState::Pending);
+        let pending_request = self
+            .requests(p, id)
+            .any(|r| r.state == RequestState::Pending);
         Some(ThreadView {
             thread,
             live: self.live(l, id),

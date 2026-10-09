@@ -300,14 +300,91 @@ fn cell(row: Row, state: LiveState) {
 macro_rules! cells {
     ($row:ident; $($name:ident $state:ident),+) => {$ (#[test] fn $name() {cell(Row::$row,LiveState::$state);})+};
 }
-cells!(Send; table_send_parked Parked,table_send_starting Starting,table_send_idle Idle,table_send_running Running,table_send_terminal Terminal,table_send_stopping Stopping);
-cells!(SendHeld; table_send_held_parked Parked,table_send_held_starting Starting,table_send_held_idle Idle,table_send_held_running Running,table_send_held_terminal Terminal,table_send_held_stopping Stopping);
-cells!(Wake; table_wake_parked Parked,table_wake_starting Starting,table_wake_idle Idle,table_wake_running Running,table_wake_terminal Terminal,table_wake_stopping Stopping);
-cells!(Continue; table_continue_parked Parked,table_continue_starting Starting,table_continue_idle Idle,table_continue_running Running,table_continue_terminal Terminal,table_continue_stopping Stopping);
-cells!(Interrupt; table_interrupt_parked Parked,table_interrupt_starting Starting,table_interrupt_idle Idle,table_interrupt_running Running,table_interrupt_terminal Terminal,table_interrupt_stopping Stopping);
-cells!(Respond; table_respond_parked Parked,table_respond_starting Starting,table_respond_idle Idle,table_respond_running Running,table_respond_terminal Terminal,table_respond_stopping Stopping);
-cells!(Configure; table_configure_parked Parked,table_configure_starting Starting,table_configure_idle Idle,table_configure_running Running,table_configure_terminal Terminal,table_configure_stopping Stopping);
-cells!(Switch; table_switch_parked Parked,table_switch_starting Starting,table_switch_idle Idle,table_switch_running Running,table_switch_terminal Terminal,table_switch_stopping Stopping);
-cells!(Stop; table_stop_parked Parked,table_stop_starting Starting,table_stop_idle Idle,table_stop_running Running,table_stop_terminal Terminal,table_stop_stopping Stopping);
-cells!(Archive; table_archive_parked Parked,table_archive_starting Starting,table_archive_idle Idle,table_archive_running Running,table_archive_terminal Terminal,table_archive_stopping Stopping);
-cells!(Park; table_park_parked Parked,table_park_starting Starting,table_park_idle Idle,table_park_running Running,table_park_terminal Terminal,table_park_stopping Stopping);
+cells!(Send;
+    table_send_parked Parked,
+    table_send_starting Starting,
+    table_send_idle Idle,
+    table_send_running Running,
+    table_send_terminal Terminal,
+    table_send_stopping Stopping
+);
+cells!(SendHeld;
+    table_send_held_parked Parked,
+    table_send_held_starting Starting,
+    table_send_held_idle Idle,
+    table_send_held_running Running,
+    table_send_held_terminal Terminal,
+    table_send_held_stopping Stopping
+);
+cells!(Wake;
+    table_wake_parked Parked,
+    table_wake_starting Starting,
+    table_wake_idle Idle,
+    table_wake_running Running,
+    table_wake_terminal Terminal,
+    table_wake_stopping Stopping
+);
+cells!(Continue;
+    table_continue_parked Parked,
+    table_continue_starting Starting,
+    table_continue_idle Idle,
+    table_continue_running Running,
+    table_continue_terminal Terminal,
+    table_continue_stopping Stopping
+);
+cells!(Interrupt;
+    table_interrupt_parked Parked,
+    table_interrupt_starting Starting,
+    table_interrupt_idle Idle,
+    table_interrupt_running Running,
+    table_interrupt_terminal Terminal,
+    table_interrupt_stopping Stopping
+);
+cells!(Respond;
+    table_respond_parked Parked,
+    table_respond_starting Starting,
+    table_respond_idle Idle,
+    table_respond_running Running,
+    table_respond_terminal Terminal,
+    table_respond_stopping Stopping
+);
+cells!(Configure;
+    table_configure_parked Parked,
+    table_configure_starting Starting,
+    table_configure_idle Idle,
+    table_configure_running Running,
+    table_configure_terminal Terminal,
+    table_configure_stopping Stopping
+);
+cells!(Switch;
+    table_switch_parked Parked,
+    table_switch_starting Starting,
+    table_switch_idle Idle,
+    table_switch_running Running,
+    table_switch_terminal Terminal,
+    table_switch_stopping Stopping
+);
+cells!(Stop;
+    table_stop_parked Parked,
+    table_stop_starting Starting,
+    table_stop_idle Idle,
+    table_stop_running Running,
+    table_stop_terminal Terminal,
+    table_stop_stopping Stopping
+);
+cells!(Archive;
+    table_archive_parked Parked,
+    table_archive_starting Starting,
+    table_archive_idle Idle,
+    table_archive_running Running,
+    table_archive_terminal Terminal,
+    table_archive_stopping Stopping
+);
+cells!(Park;
+    table_park_parked Parked,
+    table_park_starting Starting,
+    table_park_idle Idle,
+    table_park_running Running,
+    table_park_terminal Terminal,
+    table_park_stopping Stopping
+);

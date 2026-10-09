@@ -364,5 +364,12 @@ fn session_exit_expires_requests_and_preserves_epoch() {
         RequestState::Expired { .. }
     ));
     assert_eq!(f.actor.live[&f.thread].epoch, 1);
-    assert!(f.drain().iter().any(|e|matches!(e,UiEvent::Change {event:Ev::TurnEnded(Turn {state:TurnState::Ended {outcome:TurnOutcome::Failed {message},..},..}),..} if message=="session failed")));
+    assert!(f.drain().iter().any(|e| matches!(
+        e,
+        UiEvent::Change {
+            event: Ev::TurnEnded(Turn {
+                state: TurnState::Ended { outcome: TurnOutcome::Failed { message }, .. }, ..
+            }), ..
+        } if message == "session failed"
+    )));
 }

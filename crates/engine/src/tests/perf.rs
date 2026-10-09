@@ -96,7 +96,10 @@ fn perf_decide_commit() {
     let mut sorted = samples;
     sorted.sort_unstable();
     println!(
-        "perf_decide_commit samples=10000 successful=10000 errors=0 user_items=10001 p50={:.3} us p99={:.3} us end_to_end={:.3} s raw={}",
+        concat!(
+            "perf_decide_commit samples=10000 successful=10000 errors=0 user_items=10001 ",
+            "p50={:.3} us p99={:.3} us end_to_end={:.3} s raw={}"
+        ),
         sorted[4999] as f64 / 1000.0,
         sorted[9899] as f64 / 1000.0,
         total.elapsed().as_secs_f64(),
