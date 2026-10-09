@@ -10,6 +10,7 @@ Status: STATE, DATE, COMMIT, MISSING
 - `settings-persistence`: SQLite stores Ask first and a relaunch keeps it, its new-thread chip and both thread configurations.
 - `settings-exit`: Escape, SelectThread and SelectProject leave Settings through actions.
 - `settings-focus-transition`: NewThread immediately after Escape reaches the rendered composer through both its action and key.
+- `settings-header-branch`: Chat shows the run-owned branch; Settings and NewThread clear it.
 
 ## How to get to it (user POV)
 
@@ -38,14 +39,27 @@ PYTHONPATH="$PROOF" python3 - <<'PY'
 from driver import *
 identity()
 assert sql('select default_mode from settings') == 'full_access'
+branch_bin = DATA/'branch-bin'
+branch_bin.mkdir()
+git = branch_bin/'git'
+git.write_text('#!/bin/sh\n'
+    'test "$1" = branch && test "$2" = --show-current || exit 1\n'
+    "printf '%s\\n' fixture-branch\n")
+git.chmod(0o700)
+ENV['PATH'] = str(branch_bin)+os.pathsep+ENV['PATH']
+poll('settings-before-branch-restart',lambda d: sql('select count(*) from threads where live_pgid is not null')=='0')
+restart('settings-branch-restart')
+poll('settings-branch-ready',lambda d: d['providers'][0]['readiness']=='ready')
 action('settings-initial-new','NewThread')
 assert ctl('settings-initial-chip','dump')['composer']['mode'] == 'full_access'
 first = create('settings-full','reply with the word ok')
 ctl('settings-full-done','wait',first,'Done')
+poll('settings-header-chat',lambda d: d['header_branch']=='fixture-branch')
 ctl('settings-open-key','keys','secondary-,')
 initial = poll('settings-first',lambda d: d['view']=='settings')
 assert initial['view'] == 'settings' and initial['settings']['default_mode'] == 'full_access'
 assert initial['selected_thread']['config']['mode'] == 'full_access'
+assert initial['header_branch'] == ''
 capture('settings-full-access')
 ctl('settings-invalid-mode','action','veyra::SetDefaultMode',json.dumps({'mode':'invalid'}),
     expected=1,stderr_contains='veyra ctl driver error:')
@@ -70,8 +84,11 @@ existing = poll('settings-existing',lambda d: d['view']=='chat' and d['selected_
 assert existing['view'] == 'chat' and existing['selected_thread']['id'] == first
 assert existing['composer']['mode'] == 'full_access'
 assert existing['settings']['default_mode'] == 'ask_first'
+poll('settings-header-existing',lambda d: d['header_branch']=='fixture-branch')
 action('settings-next-new','NewThread')
-assert poll('settings-next-chip',lambda d: d['view']=='new_thread')['composer']['mode'] == 'ask_first'
+next_thread = poll('settings-next-chip',lambda d: d['view']=='new_thread')
+assert next_thread['composer']['mode'] == 'ask_first'
+assert next_thread['header_branch'] == ''
 second = create('settings-ask','reply with the word ok')
 new = ctl('settings-new-wait','wait',second,'Done')
 save('settings-new',new)
@@ -131,6 +148,7 @@ PY
 - `settings-relaunch.json` and `settings-persisted-database.txt` retain Ask first after a new pid; both thread rows retain their own modes.
 - Escape, SelectThread and SelectProject each assert the resulting view, and OpenSettings is driven by both its key and named action.
 - `settings-transition-action.json` and `settings-transition-keys.json` show NewThread immediately after Escape, with no selected thread and the Ask first composer.
+- `settings-header-chat.json` shows `header_branch: fixture-branch`; Settings and NewThread dumps assert it is empty.
 - `drive.log` records commands, replies and exits; the text request while Settings is focused exits 1 instead of editing a hidden composer.
 
 ## Gotchas
@@ -139,4 +157,5 @@ Settings is not a second native window.
 The driver dispatches through the same OpenSettings action as the menu, but does not prove a native menu click.
 The helper waits for provider groups to finish before relaunch; it does not add provider reaping.
 The default is stored, not a process-local preference.
+The run-owned git shim answers only the branch read and disappears with DATA during Cleanup.
 The lead fills the Status values after its gate.

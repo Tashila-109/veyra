@@ -596,9 +596,12 @@ impl Shell {
         })
         .detach();
     }
-    fn show(&mut self, view: MainView) {
+    fn forget_branch(&mut self) {
         self.branch_task = Default::default();
         self.branch.clear();
+    }
+    fn show(&mut self, view: MainView) {
+        self.forget_branch();
         self.view = view;
     }
     fn select_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
@@ -974,6 +977,7 @@ impl Shell {
         serde_json::json!({
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
+            "header_branch":self.branch,
             "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows()},
             "selected_thread":self.dump_selected(), "transcript":self.dump_transcript(),
             "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(),
@@ -1160,7 +1164,7 @@ impl Render for Shell {
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, _: &Quit, _, cx| {
-                shell.show(MainView::NewThread);
+                shell.forget_branch();
                 shell.engine.shutdown();
                 cx.quit();
             }))

@@ -172,16 +172,19 @@ The new-thread hint names that behavior.
 One session task owns the child and a process-group guard.
 Its select loop reads stdout lines, controls, output-channel closure and stdin-writer completion.
 A dedicated task writes stdin, so a blocked pipe does not block the control loop.
-The stderr task retains eight lines, each redacted and cut to 500 characters.
+The stderr task retains the last eight lines in memory.
+`with_stderr` redacts the failure and each tail line once, then cuts each redacted line to 500 characters.
 When the loop ends, the task waits up to 500 ms for stderr, runs the group ladder, then emits Failed if a turn is active, then Exited.
 Failed carries the loop failure or Veyra's crash text, followed by the same bounded, redacted stderr tail.
 The crash exit code is read after SIGTERM; a process that closed stdout without exiting reports exit code unknown.
-Exited follows the group's exit and its leader's reap, including an initialize-send failure.
+Exited follows group cleanup and its leader's reap, including an initialize-send failure.
 On Exited, the actor ends any remaining running turn as Failed if crash text exists, otherwise Interrupted.
 At run end or task drop, each owned group receives SIGTERM before its leader is reaped.
 Cleanup checks every 50 ms and waits up to one second for the group to exit.
 It sends SIGKILL if the group remains alive or a child/group check fails, then waits for the leader before returning the error.
-The guard retains the child through that ladder, then waits for the group to disappear after reaping its leader.
+The guard retains the child through that ladder, then waits up to one second for the group to disappear after reaping its leader.
+If that deadline expires, it logs the pgid at WARN and returns so Failed and Exited can arrive.
+Cleanup preserves the first check error if a later check or the leader's reap also fails.
 This also covers probe cancellation and resume fallback.
 A supervisor awaits the session task and every registered group cleanup before emitting Exited with redacted panic text.
 The actor stores pid and group on Ready and parks on Exited.
@@ -214,7 +217,8 @@ After that prompt ends, an uncorrelated result ends a running Provider-origin tu
 Result errors, stop reasons and terminal reasons decide the outcome, not subtype alone.
 Error flags, error subtypes and max_tokens/refusal take precedence.
 Otherwise aborted terminal reasons become Interrupted; other incomplete terminal reasons become Failed.
-Final assistant blocks match the stream's message id, block kind and occurrence within that kind.
+Final assistant blocks count occurrences of each kind per message id across frames and match the stream's blocks in that order.
+`message_start` resets those counts.
 They reuse stream keys even when Claude omits empty reasoning from the final content list.
 Item completion is normalized separately from turn completion.
 Empty reasoning deltas and final reasoning blocks add no transcript item.
@@ -287,8 +291,8 @@ This joins the item snapshot and event stream without duplicated or missing text
 The sidebar reads projects and thread statuses, and all resizing paths dispatch SetSidebarWidth.
 The header reads title, status/elapsed time, project and a separate Git branch task on the tokio runtime.
 That child inherits the app environment, has kill-on-drop and no timeout.
-Selecting another thread, leaving Chat or dropping the Shell cancels it; its reply also checks the selection identity.
-Every view transition cancels the branch task and clears the displayed branch through `Shell::show`.
+`Shell::show` and Quit call `forget_branch` to cancel the task and clear the displayed branch.
+Dropping the Shell also cancels the task, and its reply checks the selection identity.
 The centred transcript uses MessageScroller and selectable Markdown TextView for assistant text, a still stream caret, collapsed reasoning/tools and notices.
 Tool output is bounded to its last 10,000 characters by the actor.
 The failed view shows the cause, next step, Retry and Open Terminal on the project folder.
@@ -328,7 +332,7 @@ An incremental same-user sender can keep a line read occupied inside the per-rea
 A full queue rejects before enqueueing; a reply timeout does not cancel an action already queued.
 
 Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler, and quit dispatches Quit.
-Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status, items, composer, readiness, settings and pump counters.
+Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
 Debug counts are removed when their items leave the projection or the thread is archived.
 The driver adds the engine's schema_version without opening the database.
@@ -347,7 +351,7 @@ The pages log their SQLite assertions and name exit-1 stderr expectations; Evide
 Cleanup first reads live_pgid, quits the app, applies the one-second SIGTERM/SIGKILL ladder to run-owned groups, retries group and effective-user marker checks for five seconds through Darwin sysctl without printing arguments, then removes scratch.
 The fake lane cannot create privileged processes; inaccessible root-effective processes are outside that marker scan.
 Release proof uses a disposable HOME and restricted PATH to avoid running an unauthorized live Claude probe.
-It stops debug before opening release and relaunches debug only after release cleanup.
+Only one owned Veyra window exists during release capture.
 The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals and Terminal opening.
 Its selection rejects unsupported targets with compile_error.
 The textual platform_boundary test is a guard, not proof against every indirect OS call; review still checks indirect commands and strings.
@@ -368,7 +372,7 @@ The textual platform_boundary test is a guard, not proof against every indirect 
 Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
 replay_claude uses the real session task with the fake CLI for text and tools, prompt correlation, provider-turn completion, resume, crash and error outcomes, background replacement and readiness.
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
-crash_text_bounds_and_redacts, claude_args_per_mode, terminal_reason_overrides_success_subtype, snapshot_fence_applies_only_newer_events, snapshot_fence_keeps_metadata_not_carried_by_snapshot, ctl_wait_exit_codes and verify_map_names guard these boundaries.
+Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence and cleanup.
 Their Status lines record the lead's acceptance, independently of the recipes.

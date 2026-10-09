@@ -25,6 +25,8 @@ struct ProcessGroup {
     child: Option<Child>,
     pid: u32,
     reaped: Option<oneshot::Sender<()>>,
+    #[cfg(test)]
+    check: fn(&mut Child, u32) -> std::io::Result<bool>,
 }
 fn process_alive(child: &mut Child, pid: u32) -> std::io::Result<bool> {
     child.try_wait()?;
@@ -54,11 +56,27 @@ async fn end_process(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let status = child.wait().await?;
-    while platform::group_exists(pid)? {
+    let status = child.wait().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match check(&mut child, pid) {
+            Ok(false) => break,
+            Err(error) => {
+                failure.get_or_insert(error);
+                break;
+            }
+            Ok(true) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                pgid = pid,
+                "Provider process group still exists after cleanup deadline"
+            );
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    failure.map_or(Ok(status), Err)
+    failure.map_or(status, Err)
 }
 impl ProcessGroup {
     fn new(child: Child) -> Self {
@@ -66,6 +84,8 @@ impl ProcessGroup {
             pid: child.id().expect("new child"),
             child: Some(child),
             reaped: None,
+            #[cfg(test)]
+            check: process_alive,
         }
     }
     fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
@@ -88,8 +108,12 @@ impl ProcessGroup {
         let child = self.child.take()?;
         let pid = self.pid;
         let reaped = self.reaped.take();
+        #[cfg(test)]
+        let check = self.check;
+        #[cfg(not(test))]
+        let check = process_alive;
         Some(tokio::spawn(async move {
-            let result = end_process(child, pid, process_alive).await;
+            let result = end_process(child, pid, check).await;
             drop(reaped);
             result
         }))
@@ -191,7 +215,16 @@ pub fn spawn(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    let mut process = launch(&spec, &env, None)?;
+    let process = launch(&spec, &env, None)?;
+    Ok(start_session(process, spec, env, out, epoch))
+}
+fn start_session(
+    mut process: Process,
+    spec: SessionSpec,
+    env: ChildEnv,
+    out: mpsc::Sender<EngineMsg>,
+    epoch: u32,
+) -> SessionHandle {
     let (control, receiver) = mpsc::unbounded_channel();
     let (cleanup, reaped) = mpsc::unbounded_channel();
     process.child.watch(&cleanup);
@@ -253,7 +286,7 @@ pub fn spawn(
         }
     });
     tokio::spawn(supervise(task, reaped, supervisor_out, thread, epoch));
-    Ok(SessionHandle { control })
+    SessionHandle { control }
 }
 async fn supervise(
     task: tokio::task::JoinHandle<bool>,
@@ -316,7 +349,6 @@ async fn run_one(
     let stderr_tail = tail.clone();
     let mut stderr = tokio::spawn(async move {
         while let Ok(Some(line)) = errors.next_line().await {
-            let line = record::redact(&line, None).chars().take(500).collect();
             let mut tail = stderr_tail.lock().unwrap();
             tail.push_back(line);
             while tail.len() > 8 {
@@ -455,7 +487,7 @@ async fn run_one(
                 turn: active.id(),
                 event: TurnEvent::TurnEnded {
                     outcome: TurnOutcome::Failed {
-                        message: record::redact(&text, None),
+                        message: text.clone(),
                     },
                 },
             },
@@ -463,7 +495,7 @@ async fn run_one(
         .await;
         Some(text)
     } else if let Some(failure) = failure {
-        Some(record::redact(&failure, None))
+        Some(failure)
     } else if status.is_some_and(|status| !status.success()) {
         Some(crash_text(
             status.and_then(|status| status.code()),
@@ -596,6 +628,103 @@ pub async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cleanup_deadline_delivers_failed_and_exited_when_group_stays_alive() {
+        let env = ChildEnv::load();
+        let cwd = std::path::PathBuf::from("/tmp");
+        let child = env
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "read initialize; read prompt; printf 'not-json\\n'".into(),
+                ],
+                &cwd,
+                None,
+            )
+            .unwrap();
+        let mut group = ProcessGroup::new(child);
+        let pid = group.pid;
+        group.check = |_, _| Ok(true);
+        let process = Process {
+            child: group,
+            native: NativeSessionId("fixture-session".into()),
+            #[cfg(debug_assertions)]
+            recorder: None,
+        };
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let (out, mut events) = mpsc::channel(256);
+        let handle = start_session(
+            process,
+            SessionSpec {
+                thread,
+                cwd,
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: None,
+                import: false,
+            },
+            env,
+            out,
+            1,
+        );
+        handle
+            .control
+            .send(SessionControl::StartTurn {
+                turn,
+                text: "reply".into(),
+            })
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let failed = events.recv().await.unwrap();
+            let exited = events.recv().await.unwrap();
+            (failed, exited)
+        })
+        .await;
+        assert!(!platform::group_exists(pid).unwrap());
+        let (failed, exited) = result.expect("cleanup must return after the two one-second waits");
+        let expected = "Claude protocol: expected ident at line 1 column 2";
+        assert!(matches!(failed, EngineMsg::Provider {
+            event: ProviderEvent::Turn {
+                turn: Some(id), event: TurnEvent::TurnEnded { outcome: TurnOutcome::Failed { message } }
+            }, ..
+        } if id == turn && message == expected));
+        assert!(matches!(exited, EngineMsg::Provider {
+            event: ProviderEvent::Session(SessionEvent::Exited { crash: Some(text) }), ..
+        } if text == expected));
+    }
+    #[tokio::test]
+    async fn cleanup_keeps_the_first_check_error_after_reaping() {
+        let env = ChildEnv::load();
+        let mut child = env
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "trap '' TERM; echo ready; /bin/sleep 30".into(),
+                ],
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
+        let result = end_process(child, pid, |child, _| {
+            let text = if child.try_wait()?.is_none() {
+                "first check failed"
+            } else {
+                "post-reap check failed"
+            };
+            Err(std::io::Error::other(text))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), "first check failed");
+    }
     #[tokio::test]
     async fn session_panic_waits_for_group_cleanup_before_exited() {
         let env = ChildEnv::load();

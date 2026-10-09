@@ -338,7 +338,8 @@ Every exit-1 expectation must also assert its named stderr line.
 A timeout does not cancel an enqueued action; run Doctor before retrying.
 After another Send on an existing thread, gate `wait Done` on the new turn row or a changed status so the preceding Done cannot satisfy it.
 
-The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf` and `notice`.
+The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf` and `notice`.
+`header_branch` is the branch text used by the header and is empty after leaving Chat.
 `view` is `new_thread`, `chat`, `failed_thread` or `settings`.
 `sidebar.rows` holds project and thread rows, with each thread's own status.
 `selected_thread` includes its native id, configuration, failure cause and `header_status`, the rendered status with elapsed seconds.

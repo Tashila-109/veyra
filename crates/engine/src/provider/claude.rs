@@ -310,6 +310,7 @@ pub(crate) struct Codec {
     pid: u32,
     message: String,
     blocks: BTreeMap<u32, Block>,
+    final_blocks: BTreeMap<(String, String), usize>,
     tools: BTreeMap<String, NativeItemKey>,
 }
 #[derive(Default)]
@@ -326,12 +327,14 @@ impl Codec {
             pid,
             message: String::new(),
             blocks: BTreeMap::new(),
+            final_blocks: BTreeMap::new(),
             tools: BTreeMap::new(),
         }
     }
     pub fn start(&mut self, turn: TurnId, text: String) -> Value {
         self.active = Some(ActiveTurn::Veyra(turn));
         self.blocks.clear();
+        self.final_blocks.clear();
         json!({
             "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
             "parent_tool_use_id":null, "message":{"role":"user","content":text}
@@ -421,6 +424,7 @@ impl Codec {
         if ended {
             self.active = None;
             self.blocks.clear();
+            self.final_blocks.clear();
             self.tools.clear();
         }
         Ok(decoded)
@@ -519,6 +523,7 @@ impl Codec {
                 }
                 self.message = message["id"].as_str().unwrap_or_default().into();
                 self.blocks.clear();
+                self.final_blocks.clear();
             }
             Event::ContentBlockStart {
                 index,
@@ -588,17 +593,20 @@ impl Codec {
         Ok(())
     }
     fn assistant(
-        &self,
+        &mut self,
         assistant: Assistant,
         events: &mut Vec<TurnEvent>,
     ) -> Result<(), super::ProviderError> {
         if let Some(content) = assistant.message["content"].as_array() {
-            for (index, value) in content.iter().enumerate() {
+            for value in content {
                 let kind = value["type"].as_str().unwrap_or_default();
-                let ordinal = content[..index]
-                    .iter()
-                    .filter(|block| block["type"] == kind)
-                    .count();
+                let message = assistant.message["id"].as_str().unwrap_or_default();
+                let count = self
+                    .final_blocks
+                    .entry((message.into(), kind.into()))
+                    .or_default();
+                let ordinal = *count;
+                *count += 1;
                 let streamed = (assistant.message["id"].as_str() == Some(self.message.as_str()))
                     .then(|| {
                         self.blocks
@@ -615,7 +623,7 @@ impl Codec {
                 let block: ContentBlock = serde_json::from_value(value.clone())?;
                 let key = streamed.map(|block| block.key.clone()).unwrap_or_else(|| {
                     NativeItemKey(format!(
-                        "{}:{index}:{}",
+                        "{}:{ordinal}:{}",
                         assistant.message["id"].as_str().unwrap_or_default(),
                         block.kind()
                     ))
@@ -834,6 +842,68 @@ mod tests {
             event: TurnEvent::TextDelta { key, text, streamed: false }, ..
         } if key.0 == "second:0:text" && text == "new reply"));
         assert_eq!(decoded.events.len(), 2);
+    }
+    #[test]
+    fn split_final_frames_match_each_same_kind_block_and_reset_on_message_start() {
+        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        codec.start(TurnId::new(), "reply".into());
+        for message in ["first", "second", "first"] {
+            codec
+                .line(
+                    &json!({"type":"stream_event", "event":{
+                        "type":"message_start", "message":{"id":message}
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+            for index in [0, 1] {
+                codec
+                    .line(
+                        &json!({"type":"stream_event", "event":{
+                            "type":"content_block_start", "index":index,
+                            "content_block":{"type":"text", "text":""}
+                        }})
+                        .to_string(),
+                    )
+                    .unwrap();
+            }
+            let streamed = codec
+                .line(
+                    &json!({"type":"stream_event", "event":{
+                        "type":"content_block_delta", "index":1,
+                        "delta":{"type":"text_delta", "text":"reply"}
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+            assert!(matches!(&streamed.events[0], ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { key, text, streamed: true }, ..
+            } if key.0 == format!("{message}:1:text") && text == "reply"));
+            let empty = codec
+                .line(
+                    &json!({"type":"assistant", "message":{
+                        "id":message, "content":[{"type":"text", "text":""}]
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+            assert!(matches!(&empty.events[0], ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { key, text, streamed: false }, ..
+            } if key.0 == format!("{message}:0:text") && text.is_empty()));
+            let final_reply = codec
+                .line(
+                    &json!({"type":"assistant", "message":{
+                        "id":message, "content":[{"type":"text", "text":"reply"}]
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+            assert_eq!(
+                final_reply.events.len(),
+                0,
+                "a streamed block must not be repeated"
+            );
+        }
     }
     #[test]
     fn terminal_reason_overrides_success_subtype() {
