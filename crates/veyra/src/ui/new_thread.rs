@@ -1,7 +1,7 @@
 use super::{Shell, composer, theme::Theme};
 use gpui_kit::component::StyledExt;
 use gpui_kit::*;
-pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
+pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     div()
         .v_flex()

@@ -9,6 +9,7 @@ fn completed_items_and_ended_turns_free_streaming_entries() {
     f.event(turn_event(
         Some(turn),
         TurnEvent::TextDelta {
+            streamed: true,
             key: key.clone(),
             text: "first".into(),
         },
@@ -20,6 +21,7 @@ fn completed_items_and_ended_turns_free_streaming_entries() {
     f.event(turn_event(
         Some(turn),
         TurnEvent::TextDelta {
+            streamed: true,
             key,
             text: "last".into(),
         },
@@ -56,7 +58,7 @@ fn first_ready_starts_queued_turn() {
     let turn = f.user("first prompt");
     f.event(ProviderEvent::Session(SessionEvent::Ready {
         native: NativeSessionId("conversation-ready".into()),
-        cli_version: "test-one".into(),
+        cli_version: Some("test-one".into()),
         pid: 23,
         pgid: 23,
         capabilities: vec![],
@@ -172,6 +174,7 @@ fn interrupt_completes_and_preserves_buffered_text() {
     f.event(turn_event(
         f.running(),
         TurnEvent::TextDelta {
+            streamed: true,
             key: NativeItemKey("interrupted-stream".into()),
             text: "kept text".into(),
         },
@@ -245,6 +248,7 @@ fn provider_turn_join() {
     f.event(turn_event(
         None,
         TurnEvent::TextDelta {
+            streamed: true,
             key: NativeItemKey("provider-item".into()),
             text: "Hello ".into(),
         },
@@ -252,6 +256,7 @@ fn provider_turn_join() {
     f.event(turn_event(
         None,
         TurnEvent::TextDelta {
+            streamed: true,
             key: NativeItemKey("provider-item".into()),
             text: "world".into(),
         },
@@ -292,6 +297,7 @@ fn lone_turn_end_and_wrong_turn_are_dropped() {
     f.event(turn_event(
         Some(TurnId::new()),
         TurnEvent::TextDelta {
+            streamed: true,
             key: NativeItemKey("wrong".into()),
             text: "not this turn".into(),
         },
@@ -315,6 +321,7 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         f.event(turn_event(
             turn,
             TurnEvent::TextDelta {
+                streamed: true,
                 key: NativeItemKey("stream".into()),
                 text: text.into(),
             },
@@ -347,6 +354,7 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         }
     );
     assert_eq!(snapshot.buffered_text[&snapshot.items[0].id], "abc");
+    assert_eq!(snapshot.delta_counts[&snapshot.items[0].id], 3);
     let events = f.drain();
     let appends: Vec<_> = events
         .iter()
@@ -377,6 +385,7 @@ fn snapshot_joins_buffer_without_duplicate_text() {
     f.event(turn_event(
         turn,
         TurnEvent::TextDelta {
+            streamed: true,
             key: NativeItemKey("stream".into()),
             text: "d".into(),
         },
@@ -423,4 +432,57 @@ fn session_exit_expires_requests_and_preserves_epoch() {
             }), ..
         } if message == "session failed"
     )));
+}
+
+#[test]
+fn session_notice_attaches_to_latest_turn() {
+    let mut f = Fixture::new(LiveState::Running);
+    f.event(turn_event(
+        f.running(),
+        TurnEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+        },
+    ));
+    let latest = f.user("next prompt");
+    f.event(ProviderEvent::Session(SessionEvent::Notice {
+        text: "new session".into(),
+    }));
+    let loaded = f.loaded();
+    let notice = loaded
+        .items
+        .values()
+        .find(|item| matches!(item.body, ItemBody::Notice(_)))
+        .unwrap();
+    assert_eq!(notice.turn, latest);
+}
+#[test]
+fn delta_count_excludes_complete_message_fallback() {
+    let mut f = Fixture::new(LiveState::Running);
+    let turn = f.running();
+    f.event(turn_event(
+        turn,
+        TurnEvent::TextDelta {
+            key: NativeItemKey("fallback".into()),
+            text: "complete message".into(),
+            streamed: false,
+        },
+    ));
+    let (reply, rx) = oneshot::channel();
+    {
+        let _enter = f.runtime.enter();
+        f.actor.handle(EngineMsg::Snapshot {
+            thread: f.thread,
+            reply,
+        });
+    }
+    f.actor.handle(EngineMsg::TextFlush);
+    let snapshot = rx.blocking_recv().unwrap();
+    assert_eq!(
+        snapshot
+            .delta_counts
+            .get(&snapshot.items[0].id)
+            .copied()
+            .unwrap_or(0),
+        0
+    );
 }

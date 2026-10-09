@@ -6,7 +6,10 @@ fn identifiers(text: &str) -> impl Iterator<Item = &str> {
 }
 fn dump_keys(source: &str) -> BTreeSet<String> {
     let source = source.split("pub fn dump(").nth(1).expect("Shell::dump");
-    let source = source.split("\nimpl Focusable").next().unwrap();
+    let source = source
+        .split("\n    #[cfg(debug_assertions)]\n    fn view_name")
+        .next()
+        .unwrap();
     let source = source.rsplit("json!({").next().expect("dump object");
     let mut keys = BTreeSet::new();
     let mut depth = 1;

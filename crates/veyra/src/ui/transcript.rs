@@ -43,7 +43,7 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                 })
         }
         ItemBody::Reasoning { text, .. } => {
-            let id = item.id.to_string();
+            let id = item.id;
             row = row
                 .child(
                     labelled_button(
@@ -56,12 +56,7 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                         cx,
                     )
                     .on_click(move |_, window, cx| {
-                        window.dispatch_action(
-                            Box::new(ToggleItem {
-                                item: Some(id.clone()),
-                            }),
-                            cx,
-                        )
+                        window.dispatch_action(Box::new(ToggleItem { item: Some(id) }), cx)
                     }),
                 )
                 .when(expanded, |row| {
@@ -72,7 +67,7 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                 });
         }
         ItemBody::Tool(tool) => {
-            let id = item.id.to_string();
+            let id = item.id;
             let label = format!(
                 "{} {} · {}",
                 if expanded { "▾" } else { "▸" },
@@ -87,12 +82,7 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                 .child(
                     labelled_button(SharedString::from(format!("tool-{id}")), label, cx).on_click(
                         move |_, window, cx| {
-                            window.dispatch_action(
-                                Box::new(ToggleItem {
-                                    item: Some(id.clone()),
-                                }),
-                                cx,
-                            )
+                            window.dispatch_action(Box::new(ToggleItem { item: Some(id) }), cx)
                         },
                     ),
                 )
@@ -139,7 +129,8 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let items = shell
-        .selected
+        .view
+        .chat()
         .map(|thread| shell.state.transcript(thread))
         .unwrap_or_default();
     let expanded = shell.expanded.clone();
@@ -150,7 +141,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         .items_center()
         .px(t.layout.gutter);
     if let Some(message) = shell
-        .selected
+        .view
+        .chat()
         .and_then(|thread| shell.state.failure(thread))
         .map(str::to_owned)
     {

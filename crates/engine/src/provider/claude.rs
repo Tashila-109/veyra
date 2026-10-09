@@ -91,13 +91,13 @@ enum Event {
         #[serde(default)]
         index: u32,
         #[serde(default)]
-        content_block: Value,
+        content_block: ContentBlock,
     },
     ContentBlockDelta {
         #[serde(default)]
         index: u32,
         #[serde(default)]
-        delta: Value,
+        delta: Delta,
     },
     ContentBlockStop {
         #[serde(default)]
@@ -184,12 +184,104 @@ enum EchoMode {
     Unknown,
     Known,
 }
+#[derive(Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentBlock {
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
+    ToolUse {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+impl ContentBlock {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::Thinking { .. } => "thinking",
+            Self::ToolUse { .. } => "tool_use",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+#[derive(Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Delta {
+    #[serde(rename = "text_delta")]
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    #[serde(rename = "thinking_delta")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
+    #[serde(rename = "input_json_delta")]
+    InputJson {
+        #[serde(default)]
+        partial_json: String,
+    },
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
 struct Block {
     key: NativeItemKey,
-    kind: String,
-    name: String,
+    content: ContentBlock,
     input: String,
     streamed: bool,
+}
+impl ResultFrame {
+    fn outcome(self) -> TurnOutcome {
+        let reason = self.terminal_reason.as_deref();
+        let aborted = reason.is_some_and(|reason| reason.starts_with("aborted_"));
+        let incomplete = reason.is_some_and(|reason| {
+            ![
+                "completed",
+                "background_requested",
+                "tool_deferred",
+                "hook_stopped",
+                "stop_hook_prevented",
+            ]
+            .contains(&reason)
+        });
+        if self.is_error
+            || self.subtype.starts_with("error")
+            || (!aborted && incomplete)
+            || matches!(self.stop_reason.as_deref(), Some("max_tokens" | "refusal"))
+        {
+            let message = if !self.errors.is_empty() {
+                self.errors.join("\n")
+            } else if !self.result.is_empty() {
+                self.result
+            } else {
+                format!("Claude ended with {}", reason.unwrap_or(&self.subtype))
+            };
+            TurnOutcome::Failed {
+                message: crate::record::redact(&message, None),
+            }
+        } else if aborted {
+            TurnOutcome::Interrupted {
+                reason: format!("Claude ended with {}", reason.unwrap()),
+            }
+        } else {
+            TurnOutcome::Completed
+        }
+    }
 }
 pub(crate) struct Codec {
     pub current: Option<TurnId>,
@@ -220,9 +312,12 @@ impl Codec {
     pub fn start(&mut self, turn: TurnId, text: String) -> Value {
         self.current = Some(turn);
         self.blocks.clear();
-        json!({"type":"user","uuid":turn.to_string(),"session_id":self.native.0,"parent_tool_use_id":null,"message":{"role":"user","content":text}})
+        json!({
+            "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
+            "parent_tool_use_id":null, "message":{"role":"user","content":text}
+        })
     }
-    fn ready(&self, version: String, capabilities: Vec<String>) -> ProviderEvent {
+    fn ready(&self, version: Option<String>, capabilities: Vec<String>) -> ProviderEvent {
         ProviderEvent::Session(SessionEvent::Ready {
             native: self.native.clone(),
             cli_version: version,
@@ -237,96 +332,42 @@ impl Codec {
         let mut events = Vec::new();
         match frame {
             Frame::ControlResponse(reply) if reply.response.request_id == INITIALIZE_ID => {
-                if reply.response.subtype == "error" { return Err(super::ProviderError::Protocol(reply.response.error)); }
-                decoded.events.push(self.ready(String::new(), reply.response.response.capabilities));
-            }
-            Frame::System(system) => match system.subtype.as_str() {
-                "init" => {
-                    if !system.session_id.is_empty() { self.native = NativeSessionId(system.session_id); }
-                    decoded.events.push(self.ready(system.claude_code_version, system.capabilities));
+                if reply.response.subtype == "error" {
+                    return Err(super::ProviderError::Protocol(reply.response.error));
                 }
-                "background_tasks_changed" => decoded.events.push(ProviderEvent::Session(SessionEvent::BackgroundWork { pending: system.tasks.iter().any(|task| task.get("ambient") != Some(&Value::Bool(true))) })),
-                _ => tracing::debug!(subtype = system.subtype, "ignored Claude system frame"),
-            },
+                decoded
+                    .events
+                    .push(self.ready(None, reply.response.response.capabilities));
+            }
+            Frame::System(system) => self.system(system, &mut decoded),
             Frame::CommandLifecycle(lifecycle) => {
-                if self.current.is_some_and(|turn| lifecycle.command_uuid == turn.to_string()) {
+                if self
+                    .current
+                    .is_some_and(|turn| lifecycle.command_uuid == turn.to_string())
+                {
                     self.echo = EchoMode::Known;
-                    if ["queued", "started"].contains(&lifecycle.state.as_str()) { events.push(TurnEvent::Accepted); }
-                }
-            }
-            Frame::User(user) => {
-                if user.is_replay && self.current.is_some_and(|turn| user.uuid.is_empty() || user.uuid == turn.to_string()) {
-                    if !user.uuid.is_empty() { self.echo = EchoMode::Known; }
-                    events.push(TurnEvent::Accepted);
-                }
-                if let Some(content) = user.message.get("content").and_then(Value::as_array) {
-                    for block in content {
-                        if block["type"] == "tool_result" && let Some(key) = block["tool_use_id"].as_str().and_then(|id| self.tools.remove(id)) {
-                            let output = block["content"].as_str().map(str::to_owned).or_else(|| Some(block["content"].to_string()));
-                            events.push(TurnEvent::ToolFinished { key, ok: block["is_error"] != true, output_tail: output });
-                        }
+                    if ["queued", "started"].contains(&lifecycle.state.as_str()) {
+                        events.push(TurnEvent::Accepted);
                     }
                 }
             }
-            Frame::StreamEvent(stream) => match stream.event {
-                Event::MessageStart { message } => { self.message = message["id"].as_str().unwrap_or_default().into(); self.blocks.clear(); }
-                Event::ContentBlockStart { index, content_block } => {
-                    let kind = content_block["type"].as_str().unwrap_or_default().to_owned();
-                    let key = NativeItemKey(format!("{}:{index}:{kind}", self.message));
-                    let name = content_block["name"].as_str().unwrap_or_default().to_owned();
-                    if kind == "tool_use" && let Some(id) = content_block["id"].as_str() { self.tools.insert(id.into(), key.clone()); }
-                    self.blocks.insert(index, Block { key, kind, name, input: String::new(), streamed: false });
-                }
-                Event::ContentBlockDelta { index, delta } => {
-                    if let Some(block) = self.blocks.get_mut(&index) {
-                        match delta["type"].as_str() {
-                            Some("text_delta") => { block.streamed = true; events.push(TurnEvent::TextDelta { key: block.key.clone(), text: delta["text"].as_str().unwrap_or_default().into() }); }
-                            Some("thinking_delta") => { block.streamed = true; events.push(TurnEvent::ReasoningDelta { key: block.key.clone(), text: delta["thinking"].as_str().unwrap_or_default().into() }); }
-                            Some("input_json_delta") => block.input.push_str(delta["partial_json"].as_str().unwrap_or_default()),
-                            _ => {}
-                        }
-                    }
-                }
-                Event::ContentBlockStop { index } => {
-                    if let Some(block) = self.blocks.get(&index) {
-                        if block.kind == "tool_use" { events.push(TurnEvent::ToolStarted { key: block.key.clone(), call: ToolCall { name: block.name.clone(), arguments: serde_json::from_str(&block.input).unwrap_or(Value::Null) } }); }
-                        else if block.streamed { events.push(TurnEvent::ItemEnded { key: block.key.clone() }); }
-                    }
-                }
-                Event::Unknown => {}
-            },
-            Frame::Assistant(assistant) => {
-                if let Some(content) = assistant.message["content"].as_array() {
-                    for (index, block) in content.iter().enumerate() {
-                        if self.blocks.get(&(index as u32)).is_some_and(|block| block.streamed || block.kind == "tool_use") { continue; }
-                        let key = NativeItemKey(format!("{}:{index}:{}", assistant.message["id"].as_str().unwrap_or_default(), block["type"].as_str().unwrap_or_default()));
-                        match block["type"].as_str() {
-                            Some("text") => events.push(TurnEvent::TextDelta { key: key.clone(), text: block["text"].as_str().unwrap_or_default().into() }),
-                            Some("thinking") => events.push(TurnEvent::ReasoningDelta { key: key.clone(), text: block["thinking"].as_str().unwrap_or_default().into() }),
-                            _ => continue,
-                        }
-                        events.push(TurnEvent::ItemEnded { key });
-                    }
-                }
-            }
+            Frame::User(user) => self.user(user, &mut events),
+            Frame::StreamEvent(stream) => self.stream(stream.event, &mut events),
+            Frame::Assistant(assistant) => self.assistant(assistant, &mut events)?,
             Frame::Result(result) => {
-                let echoes: Vec<_> = result.user_message_uuids.iter().chain(result.user_message_uuid.iter()).collect();
-                let foreign = if !echoes.is_empty() {
-                    self.echo = EchoMode::Known;
-                    !self.current.is_some_and(|turn| echoes.iter().any(|uuid| **uuid == turn.to_string()))
-                } else {
-                    matches!(self.echo, EchoMode::Known) && result.origin.as_ref().is_some_and(|origin| origin["kind"] != "human")
-                };
-                if foreign { return Ok(decoded); }
-                let aborted = result.terminal_reason.as_deref().is_some_and(|reason| reason.starts_with("aborted_"));
-                let incomplete = result.terminal_reason.as_deref().is_some_and(|reason| !["completed","background_requested","tool_deferred","hook_stopped","stop_hook_prevented"].contains(&reason));
-                let outcome = if result.is_error || result.subtype.starts_with("error") || (!aborted && incomplete) || matches!(result.stop_reason.as_deref(), Some("max_tokens" | "refusal")) {
-                    TurnOutcome::Failed { message: crate::record::redact(&if !result.errors.is_empty() { result.errors.join("\n") } else if !result.result.is_empty() { result.result } else { format!("Claude ended with {}", result.terminal_reason.as_deref().unwrap_or(&result.subtype)) },None) }
-                } else if aborted { TurnOutcome::Interrupted { reason:format!("Claude ended with {}",result.terminal_reason.unwrap()) } }
-                else { TurnOutcome::Completed };
-                events.push(TurnEvent::TurnEnded { outcome });
+                if self.owns_result(&result) {
+                    events.push(TurnEvent::TurnEnded {
+                        outcome: result.outcome(),
+                    });
+                }
             }
-            Frame::ControlRequest(request) => decoded.replies.push(json!({"type":"control_response","response":{"subtype":"error","request_id":request.request_id,"error":"This request is not supported by Veyra"}})),
+            Frame::ControlRequest(request) => decoded.replies.push(json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error", "request_id": request.request_id,
+                    "error": "This request is not supported by Veyra"
+                }
+            })),
             Frame::ControlResponse(_) | Frame::Unknown => tracing::debug!("ignored Claude frame"),
         }
         let ended = events
@@ -344,6 +385,192 @@ impl Codec {
             self.tools.clear();
         }
         Ok(decoded)
+    }
+    fn system(&mut self, system: System, decoded: &mut Decoded) {
+        match system.subtype.as_str() {
+            "init" => {
+                if !system.session_id.is_empty() && system.session_id != self.native.0 {
+                    decoded
+                        .events
+                        .push(ProviderEvent::Session(SessionEvent::Notice {
+                            text: "Claude started a new session".into(),
+                        }));
+                    self.native = NativeSessionId(system.session_id);
+                }
+                let version =
+                    (!system.claude_code_version.is_empty()).then_some(system.claude_code_version);
+                decoded
+                    .events
+                    .push(self.ready(version, system.capabilities));
+            }
+            "background_tasks_changed" => {
+                decoded
+                    .events
+                    .push(ProviderEvent::Session(SessionEvent::BackgroundWork {
+                        pending: system
+                            .tasks
+                            .iter()
+                            .any(|task| task.get("ambient") != Some(&Value::Bool(true))),
+                    }));
+            }
+            _ => tracing::debug!(subtype = system.subtype, "ignored Claude system frame"),
+        }
+    }
+    fn user(&mut self, user: User, events: &mut Vec<TurnEvent>) {
+        if user.is_replay
+            && self
+                .current
+                .is_some_and(|turn| user.uuid.is_empty() || user.uuid == turn.to_string())
+        {
+            if !user.uuid.is_empty() {
+                self.echo = EchoMode::Known;
+            }
+            events.push(TurnEvent::Accepted);
+        }
+        if let Some(content) = user.message.get("content").and_then(Value::as_array) {
+            for block in content {
+                if block["type"] == "tool_result"
+                    && let Some(key) = block["tool_use_id"]
+                        .as_str()
+                        .and_then(|id| self.tools.remove(id))
+                {
+                    let output = block["content"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| block["content"].to_string());
+                    events.push(TurnEvent::ToolFinished {
+                        key,
+                        ok: block["is_error"] != true,
+                        output_tail: Some(output),
+                    });
+                }
+            }
+        }
+    }
+    fn stream(&mut self, event: Event, events: &mut Vec<TurnEvent>) {
+        match event {
+            Event::MessageStart { message } => {
+                self.message = message["id"].as_str().unwrap_or_default().into();
+                self.blocks.clear();
+            }
+            Event::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                let kind = content_block.kind();
+                let key = NativeItemKey(format!("{}:{index}:{kind}", self.message));
+                if let ContentBlock::ToolUse { id, .. } = &content_block {
+                    self.tools.insert(id.clone(), key.clone());
+                }
+                self.blocks.insert(
+                    index,
+                    Block {
+                        key,
+                        content: content_block,
+                        input: String::new(),
+                        streamed: false,
+                    },
+                );
+            }
+            Event::ContentBlockDelta { index, delta } => {
+                if let Some(block) = self.blocks.get_mut(&index) {
+                    match delta {
+                        Delta::Text { text } => {
+                            block.streamed = true;
+                            events.push(TurnEvent::TextDelta {
+                                key: block.key.clone(),
+                                text,
+                                streamed: true,
+                            });
+                        }
+                        Delta::Thinking { thinking } => {
+                            block.streamed = true;
+                            events.push(TurnEvent::ReasoningDelta {
+                                key: block.key.clone(),
+                                text: thinking,
+                            });
+                        }
+                        Delta::InputJson { partial_json } => block.input.push_str(&partial_json),
+                        Delta::Unknown => {}
+                    }
+                }
+            }
+            Event::ContentBlockStop { index } => {
+                if let Some(block) = self.blocks.get(&index) {
+                    if let ContentBlock::ToolUse { name, input, .. } = &block.content {
+                        events.push(TurnEvent::ToolStarted {
+                            key: block.key.clone(),
+                            call: ToolCall {
+                                name: name.clone(),
+                                arguments: serde_json::from_str(&block.input)
+                                    .unwrap_or_else(|_| input.clone()),
+                            },
+                        });
+                    } else if block.streamed {
+                        events.push(TurnEvent::ItemEnded {
+                            key: block.key.clone(),
+                        });
+                    }
+                }
+            }
+            Event::Unknown => {}
+        }
+    }
+    fn assistant(
+        &self,
+        assistant: Assistant,
+        events: &mut Vec<TurnEvent>,
+    ) -> Result<(), super::ProviderError> {
+        if let Some(content) = assistant.message["content"].as_array() {
+            for (index, value) in content.iter().enumerate() {
+                if self.blocks.get(&(index as u32)).is_some_and(|block| {
+                    block.streamed || matches!(block.content, ContentBlock::ToolUse { .. })
+                }) {
+                    continue;
+                }
+                let block: ContentBlock = serde_json::from_value(value.clone())?;
+                let key = NativeItemKey(format!(
+                    "{}:{index}:{}",
+                    assistant.message["id"].as_str().unwrap_or_default(),
+                    block.kind()
+                ));
+                match block {
+                    ContentBlock::Text { text } => events.push(TurnEvent::TextDelta {
+                        key: key.clone(),
+                        text,
+                        streamed: false,
+                    }),
+                    ContentBlock::Thinking { thinking } => {
+                        events.push(TurnEvent::ReasoningDelta {
+                            key: key.clone(),
+                            text: thinking,
+                        });
+                    }
+                    _ => continue,
+                }
+                events.push(TurnEvent::ItemEnded { key });
+            }
+        }
+        Ok(())
+    }
+    fn owns_result(&mut self, result: &ResultFrame) -> bool {
+        let echoes: Vec<_> = result
+            .user_message_uuids
+            .iter()
+            .chain(result.user_message_uuid.iter())
+            .collect();
+        if !echoes.is_empty() {
+            self.echo = EchoMode::Known;
+            return self
+                .current
+                .is_some_and(|turn| echoes.iter().any(|uuid| **uuid == turn.to_string()));
+        }
+        self.current.is_none()
+            || !matches!(self.echo, EchoMode::Known)
+            || !result
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin["kind"] != "human")
     }
 }
 
@@ -376,10 +603,29 @@ mod tests {
                         .to_string(),
                 )
                 .unwrap();
-            assert!(
-                matches!(&decoded.events[0],ProviderEvent::Turn { turn:Some(id),event:TurnEvent::TurnEnded { outcome } } if *id==turn && *outcome==expected)
-            );
+            assert!(matches!(
+                &decoded.events[0],
+                ProviderEvent::Turn { turn: Some(id), event: TurnEvent::TurnEnded { outcome } }
+                    if *id == turn && *outcome == expected
+            ));
         }
+    }
+    #[test]
+    fn changed_native_session_emits_notice_before_binding() {
+        let mut codec = Codec::new(NativeSessionId("stored".into()), 1);
+        let turn = TurnId::new();
+        codec.start(turn, "prompt".into());
+        let wire = json!({"type":"system", "subtype":"init", "session_id":"replacement"});
+        let decoded = codec.line(&wire.to_string()).unwrap();
+        assert!(matches!(&decoded.events[0],
+            ProviderEvent::Session(SessionEvent::Notice { text }) if text == "Claude started a new session"
+        ));
+        assert!(matches!(&decoded.events[1],
+            ProviderEvent::Session(SessionEvent::Ready { native, cli_version: None, .. })
+                if native.0 == "replacement"
+        ));
+        assert_eq!(codec.current, Some(turn));
+        assert_eq!(codec.line(&wire.to_string()).unwrap().events.len(), 1);
     }
     #[test]
     fn claude_args_per_mode() {

@@ -1,13 +1,43 @@
 use super::*;
 use crate::events::ChangeEvent as Ev;
 #[test]
+fn provisional_ready_preserves_unknown_and_stored_versions() {
+    for stored in [None, Some("stored-version".to_owned())] {
+        let mut f = Fixture::new(LiveState::Starting);
+        let mut changes = ChangeSet::default();
+        let mut thread = f.actor.projection.threads[&f.thread].clone();
+        thread.cli_version = stored.clone();
+        changes.threads.insert(thread.id, thread);
+        f.save(changes);
+        f.event(ProviderEvent::Session(SessionEvent::Ready {
+            native: NativeSessionId("native".into()),
+            cli_version: None,
+            pid: 23,
+            pgid: 24,
+            capabilities: vec![],
+        }));
+        assert_eq!(f.loaded().threads[&f.thread].cli_version, stored);
+        f.event(ProviderEvent::Session(SessionEvent::Ready {
+            native: NativeSessionId("native".into()),
+            cli_version: Some("new-version".into()),
+            pid: 23,
+            pgid: 24,
+            capabilities: vec![],
+        }));
+        assert_eq!(
+            f.loaded().threads[&f.thread].cli_version.as_deref(),
+            Some("new-version")
+        );
+    }
+}
+#[test]
 fn store_persists_pid_and_pgid_then_clears_both() {
     let mut f = Fixture::new(LiveState::Starting);
     f.event(ProviderEvent::Session(SessionEvent::Ready {
         native: NativeSessionId("pid-check".into()),
-        cli_version: "fixture".into(),
+        cli_version: Some("fixture".into()),
         pid: 23,
-        pgid: 23,
+        pgid: 24,
         capabilities: vec![],
     }));
     let row = f
@@ -19,7 +49,7 @@ fn store_persists_pid_and_pgid_then_clears_both() {
             |r| Ok((r.get::<_, Option<u32>>(0)?, r.get::<_, Option<u32>>(1)?)),
         )
         .unwrap();
-    assert_eq!(row, (Some(23), Some(23)));
+    assert_eq!(row, (Some(23), Some(24)));
     f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
     let row = f
         .actor
@@ -69,7 +99,12 @@ fn spawn_failure_survives_full_actor_mailbox() {
     let db = std::mem::replace(&mut f.actor.db, Connection::open_in_memory().unwrap());
     let (out, mut inbox) = mpsc::channel(1);
     out.try_send(EngineMsg::Tick).unwrap();
-    f.actor = Actor::new(db, out, Spawner::Cli).unwrap();
+    f.actor = Actor::new(
+        db,
+        out,
+        Spawner::Cli(crate::provider::env::ChildEnv::load()),
+    )
+    .unwrap();
     let (event_tx, mut events) = mpsc::unbounded_channel();
     f.actor.handle(EngineMsg::Subscribe(event_tx));
     let Ack::Turn(turn) = f
@@ -255,6 +290,13 @@ fn set_default_mode_persists_and_publishes() {
                 counter: Some(1),
                 event: Ev::ThreadCreated(f.actor.projection.threads[&f.thread].clone())
             },
+            UiEvent::Change {
+                counter: Some(2),
+                event: Ev::ThreadStatusChanged {
+                    thread: f.thread,
+                    status: Status::Idle,
+                },
+            },
         ]
     );
     f.command(Command::SetDefaultMode {
@@ -435,4 +477,21 @@ fn family_status_ignores_archived_child() {
         ),
         Status::Idle
     );
+}
+
+#[test]
+fn startup_normalizes_empty_cli_versions() {
+    let mut f = Fixture::new(LiveState::Parked);
+    f.actor
+        .db
+        .execute("UPDATE threads SET cli_version=''", [])
+        .unwrap();
+    assert_eq!(f.loaded().threads[&f.thread].cli_version, None);
+    store::initialize(&mut f.actor.db).unwrap();
+    let version: Option<String> = f
+        .actor
+        .db
+        .query_row("SELECT cli_version FROM threads", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, None);
 }

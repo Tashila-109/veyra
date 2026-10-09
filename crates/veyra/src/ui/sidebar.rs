@@ -16,7 +16,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let mut rows = Vec::new();
     for project in shell.state.projects.values() {
-        let id = project.id.to_string();
+        let id = project.id;
         rows.push(
             labelled_button(
                 SharedString::from(format!("project-{id}")),
@@ -29,12 +29,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
             .h(t.layout.project_row)
             .selected(shell.project == Some(project.id))
             .on_click(move |_, window, cx| {
-                window.dispatch_action(
-                    Box::new(SelectProject {
-                        project: Some(id.clone()),
-                    }),
-                    cx,
-                )
+                window.dispatch_action(Box::new(SelectProject { project: Some(id) }), cx)
             })
             .into_any_element(),
         );
@@ -44,7 +39,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
             .values()
             .filter(|thread| thread.project == project.id && !thread.archived)
         {
-            let id = thread.id.to_string();
+            let id = thread.id;
             let status = shell.state.status(thread.id);
             rows.push(
                 div()
@@ -73,17 +68,9 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                         .min_w_0()
                         .justify_start()
                         .child(div().flex_1())
-                        .selected(
-                            shell.selected == Some(thread.id)
-                                && shell.view == super::MainView::Chat,
-                        )
+                        .selected(shell.view.chat() == Some(thread.id))
                         .on_click(move |_, window, cx| {
-                            window.dispatch_action(
-                                Box::new(SelectThread {
-                                    thread: Some(id.clone()),
-                                }),
-                                cx,
-                            )
+                            window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
                         }),
                     )
                     .into_any_element(),

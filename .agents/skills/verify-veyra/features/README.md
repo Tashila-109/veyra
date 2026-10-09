@@ -3,7 +3,7 @@
 [app-launch](app-launch.md) covers the native window, debug CLI, instance lock, migrated database, log, release exclusion, and cleanup.
 [new-thread](new-thread.md) covers project selection, startup readiness, Check again, the no-account probe and the live composer choices without creating a thread.
 [chat-send-stream](chat-send-stream.md) covers fake-CLI streaming, Working → Done, failure cause and stderr, Retry and ctl wait.
-[settings](settings.md) covers OpenSettings, all defaults, existing-versus-new thread modes and criterion 19 after relaunch.
+[settings](settings.md) covers OpenSettings, all defaults, existing-versus-new thread modes and default persistence after relaunch.
 
 ## Preconditions
 
@@ -32,11 +32,11 @@ Inspect the 44 px header and the composer capped at 784 px in the PNG.
 Each feature starts with `Status: STATE, DATE, COMMIT, MISSING` directly under its title.
 STATE is `passed`, `failed`, `blocked`, or `not run`.
 DATE is the last run's date.
-COMMIT is the short SHA of the phase commit that holds the candidate the lanes ran.
+COMMIT is the short SHA of the candidate commit that holds the candidate the lanes ran.
 MISSING lists every sub-feature that run did not prove, or `none` when all passed.
 A partial run never counts as passed.
 The lead fills the values from lane results.
-The lead fills COMMIT in a docs-only commit after the phase commit, since a commit cannot contain its own SHA.
+The lead fills COMMIT in a docs-only commit after the candidate commit, since a commit cannot contain its own SHA.
 
 Each feature has five H2 sections.
 They are `Sub-features`, `How to get to it (user POV)`, `Driving it with veyra ctl`, `Observable success`, and `Gotchas`.

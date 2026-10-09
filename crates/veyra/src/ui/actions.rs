@@ -1,4 +1,8 @@
 use gpui_kit::*;
+use veyra_engine::{
+    domain::{ItemId, PermissionMode, ProjectId, ThreadId},
+    provider::ProviderKind,
+};
 
 actions!(
     veyra,
@@ -8,6 +12,7 @@ actions!(
         Send,
         OpenSettings,
         RecheckProviders,
+        OpenProviderPicker,
         Retry,
         OpenTerminal,
         NarrowSidebar,
@@ -18,7 +23,7 @@ actions!(
 );
 
 macro_rules! choice_action {
-    ($name:ident, $field:ident) => {
+    ($name:ident, $field:ident, $kind:ty) => {
         #[derive(
             Clone,
             Default,
@@ -31,19 +36,20 @@ macro_rules! choice_action {
         #[schemars(crate = "::gpui::private::schemars")]
         #[action(namespace = veyra)]
         pub struct $name {
-            pub $field: Option<String>,
+            #[schemars(with = "Option<String>")]
+            pub $field: Option<$kind>,
         }
     };
 }
-choice_action!(AddProject, path);
-choice_action!(PickProvider, provider);
-choice_action!(PickModel, model);
-choice_action!(PickEffort, effort);
-choice_action!(PickPermission, mode);
-choice_action!(SetDefaultMode, mode);
-choice_action!(SelectThread, thread);
-choice_action!(SelectProject, project);
-choice_action!(ToggleItem, item);
+choice_action!(AddProject, path, std::path::PathBuf);
+choice_action!(PickProvider, provider, ProviderKind);
+choice_action!(PickModel, model, String);
+choice_action!(PickEffort, effort, String);
+choice_action!(PickPermission, mode, PermissionMode);
+choice_action!(SetDefaultMode, mode, PermissionMode);
+choice_action!(SelectThread, thread, ThreadId);
+choice_action!(SelectProject, project, ProjectId);
+choice_action!(ToggleItem, item, ItemId);
 
 #[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
 #[schemars(crate = "::gpui::private::schemars")]
@@ -59,6 +65,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("secondary-shift-o", AddProject::default(), Some("Veyra")),
         KeyBinding::new("secondary-n", NewThread, Some("Veyra")),
         KeyBinding::new("secondary-alt-p", PickProvider::default(), Some("Veyra")),
+        KeyBinding::new("secondary-alt-shift-p", OpenProviderPicker, Some("Veyra")),
         KeyBinding::new("secondary-alt-m", PickModel::default(), Some("Veyra")),
         KeyBinding::new("secondary-alt-e", PickEffort::default(), Some("Veyra")),
         KeyBinding::new("secondary-alt-a", PickPermission::default(), Some("Veyra")),

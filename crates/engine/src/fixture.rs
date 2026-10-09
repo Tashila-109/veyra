@@ -39,6 +39,10 @@ pub fn load(path: &Path) -> io::Result<Vec<Record>> {
         .collect()
 }
 
+pub(crate) fn wildcard(value: &str) -> bool {
+    value == "<any>" || value == "<cwd>" || (value.starts_with("<id:") && value.ends_with('>'))
+}
+
 #[derive(Default)]
 pub struct Matcher {
     bindings: BTreeMap<String, Value>,
@@ -50,9 +54,7 @@ impl Matcher {
     pub fn matches(&mut self, expected: &Value, actual: &Value) -> bool {
         match expected {
             Value::String(text) if text == "<any>" => true,
-            Value::String(text)
-                if text == "<cwd>" || (text.starts_with("<id:") && text.ends_with('>')) =>
-            {
+            Value::String(text) if wildcard(text) => {
                 if let Some(value) = self.bindings.get(text) {
                     value == actual
                 } else {

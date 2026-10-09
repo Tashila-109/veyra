@@ -47,8 +47,9 @@ initial = poll('settings-first',lambda d: d['view']=='settings')
 assert initial['view'] == 'settings' and initial['settings']['default_mode'] == 'full_access'
 assert initial['selected_thread']['config']['mode'] == 'full_access'
 capture('settings-full-access')
-action('settings-invalid-mode','SetDefaultMode',{'mode':'invalid'})
-assert ctl('settings-command-error','dump')['notice'] == 'Unknown permission mode'
+ctl('settings-invalid-mode','action','veyra::SetDefaultMode',json.dumps({'mode':'invalid'}),
+    expected=1,stderr_contains='veyra ctl driver error:')
+assert 'unknown variant' in ctl('settings-command-error','dump')['notice']
 capture('settings-command-error')
 for mode in ['ask_first','accept_edits','full_access']:
     ctl('settings-mode-key-'+mode,'keys','secondary-alt-d')
@@ -61,7 +62,9 @@ for mode in ['accept_edits','full_access','ask_first']:
     assert changed['selected_thread']['config']['mode'] == 'full_access'
 save('settings-ask-first',changed)
 capture('settings')
-ctl('settings-no-input','text','not a message',expected=1)
+ctl('settings-no-input','text','not a message',expected=1,
+    stderr_contains='veyra ctl driver error: the focused element has no text input handler')
+assert ctl('settings-no-input-after','dump')['composer_text'] == initial['composer_text']
 ctl('settings-escape','keys','escape')
 existing = poll('settings-existing',lambda d: d['view']=='chat' and d['selected_thread']['id']==first)
 assert existing['view'] == 'chat' and existing['selected_thread']['id'] == first
@@ -111,7 +114,9 @@ for command,argument in [('action','veyra::NewThread'),('keys','secondary-n')]:
 action('settings-final-open','OpenSettings')
 assert poll('settings-final',lambda d: d['view']=='settings')['view'] == 'settings'
 capture('settings-relaunch')
-print('PASS criterion 19: fresh Full access; stored Ask first; old thread Full access; new thread Ask first; relaunch keeps all three')
+page_done('settings')
+print('PASS default persistence: fresh Full access; stored Ask first; old thread Full access; '
+    'new thread Ask first; relaunch keeps all three')
 PY
 ```
 

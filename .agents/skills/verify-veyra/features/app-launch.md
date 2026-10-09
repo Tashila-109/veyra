@@ -46,7 +46,8 @@ assert dump['sidebar']['width'] == 240 and dump['sidebar']['rows'] == []
 assert dump['notice'] is None and dump['view'] == 'new_thread'
 capture('window-launch')
 start = time.monotonic()
-second = subprocess.Popen(['target/debug/veyra'],env=ENV,stdout=(PROOF/'second-launch.txt').open('w'),stderr=subprocess.STDOUT,start_new_session=True)
+second = subprocess.Popen(['target/debug/veyra'],env=ENV,stdout=(PROOF/'second-launch.txt').open('w'),
+    stderr=subprocess.STDOUT,start_new_session=True)
 (PROOF/'second-pid').write_text(str(second.pid)+'\n')
 try: code = second.wait(timeout=10)
 except subprocess.TimeoutExpired:
@@ -57,7 +58,9 @@ with (PROOF/'second-launch.txt').open('a') as out: out.write(f'exit={code}\n')
 assert code == 1 and 'Veyra is already running' in (PROOF/'second-launch.txt').read_text()
 assert ctl('doctor-after-second-launch','dump')['pid'] == pid
 print(f'PASS second launch refused in {time.monotonic()-start:.3f}s; first pid still answers')
-for operation,key,before,after in [('NarrowSidebar','secondary-alt-left',320,304),('WidenSidebar','secondary-alt-right',320,336),('ResetSidebar','secondary-alt-0',320,240)]:
+sizes = [('NarrowSidebar','secondary-alt-left',320,304),('WidenSidebar','secondary-alt-right',320,336),
+    ('ResetSidebar','secondary-alt-0',320,240)]
+for operation,key,before,after in sizes:
     action(operation+'-baseline','SetSidebarWidth',{'width':before})
     action(operation+'-action',operation)
     assert ctl(operation+'-after-action','dump')['sidebar']['width'] == after
@@ -114,6 +117,7 @@ for label,crash in [('after-quit',False),('after-crash',True)]:
     assert sql('select id,path,name from projects order by id') == row, label
     assert (PROOF/(label+'-inode.txt')).read_text() == (PROOF/'initial-inode.txt').read_text(), label
     print(f'PASS {label} project row, migration, WAL and inode kept')
+page_done('app-launch')
 PY
 ```
 
@@ -143,13 +147,15 @@ grep -qx 'usage: veyra \[mcp\]' "$REL_PROOF/ctl.txt"
 for name in control.sock VEYRA_CLAUDE_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD; do
     release=$(/usr/bin/strings -a target/release/veyra | grep -c "$name" || true)
     debug=$(/usr/bin/strings -a target/debug/veyra | grep -c "$name" || true)
-    printf 'release %s count=%s\ndebug %s count=%s\n' "$name" "$release" "$name" "$debug" | tee -a "$REL_PROOF/strings.txt"
+    printf 'release %s count=%s\ndebug %s count=%s\n' "$name" "$release" "$name" "$debug" \
+        | tee -a "$REL_PROOF/strings.txt"
     test "$release" = 0
     test "$debug" -gt 0
 done
 for path in /opt/homebrew/bin/claude /usr/local/bin/claude /usr/bin/claude; do test ! -x "$path"; done
 set -m
-HOME="$REL_DATA/home" SHELL=/usr/bin/false PATH=/usr/bin:/bin:/usr/sbin:/sbin VEYRA_DATA_DIR="$REL_DATA" target/release/veyra >"$REL_PROOF/stdout.log" 2>"$REL_PROOF/stderr.log" &
+HOME="$REL_DATA/home" SHELL=/usr/bin/false PATH=/usr/bin:/bin:/usr/sbin:/sbin VEYRA_DATA_DIR="$REL_DATA" \
+    target/release/veyra >"$REL_PROOF/stdout.log" 2>"$REL_PROOF/stderr.log" &
 REL_PID=$!
 REL_PGID=$(ps -o pgid= -p "$REL_PID" | tr -d ' ')
 printf '%s\n' "$REL_PID" >"$REL_PROOF/pid"

@@ -11,6 +11,7 @@ use actions::*;
 use gpui_kit::component::{
     StyledExt,
     input::{InputEvent, TextareaState},
+    menu::PopupMenu,
     message_scroller::MessageScrollerState,
 };
 use gpui_kit::*;
@@ -29,8 +30,14 @@ use veyra_engine::{
     provider::{Probe, ProviderKind, Readiness},
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SnapshotRequest(u64);
+
 enum Fence {
-    Loading(Vec<UiEvent>),
+    Loading {
+        request: SnapshotRequest,
+        buffered: Vec<UiEvent>,
+    },
     Live(u64),
 }
 #[derive(Default)]
@@ -40,8 +47,11 @@ struct AppState {
     turns: BTreeMap<TurnId, Turn>,
     items: BTreeMap<ThreadId, BTreeMap<ItemId, Item>>,
     live: BTreeMap<ThreadId, LiveState>,
+    delta_counts: BTreeMap<ItemId, u64>,
     fences: BTreeMap<ThreadId, Fence>,
     settings: Settings,
+    statuses: BTreeMap<ThreadId, Status>,
+    snapshot_sequence: u64,
     applied_batches: u64,
     max_batch_gap_ms: f64,
     last_text_batch: Option<Instant>,
@@ -115,6 +125,9 @@ impl AppState {
                 ChangeEvent::ThreadLiveChanged { thread, state } => {
                     self.live.insert(*thread, *state);
                 }
+                ChangeEvent::ThreadStatusChanged { thread, status } => {
+                    self.statuses.insert(*thread, status.clone());
+                }
                 ChangeEvent::NativeSessionBound {
                     thread,
                     native,
@@ -122,7 +135,9 @@ impl AppState {
                 } => {
                     if let Some(row) = self.threads.get_mut(thread) {
                         row.native = Some(native.clone());
-                        row.cli_version = Some(cli_version.clone());
+                        if let Some(version) = cli_version {
+                            row.cli_version = Some(version.clone());
+                        }
                     }
                 }
                 ChangeEvent::TurnQueued(turn)
@@ -152,8 +167,8 @@ impl AppState {
         }
         if let Some((thread, counter)) = event_thread(&event) {
             match self.fences.get_mut(&thread) {
-                Some(Fence::Loading(buffer)) => {
-                    buffer.push(event);
+                Some(Fence::Loading { buffered, .. }) => {
+                    buffered.push(event);
                     return;
                 }
                 Some(Fence::Live(applied)) if counter <= *applied => return,
@@ -177,8 +192,13 @@ impl AppState {
                     .insert(item.id, item);
             }
             UiEvent::TextAppended {
-                thread, item, text, ..
+                thread,
+                item,
+                text,
+                delta_count,
+                ..
             } => {
+                self.delta_counts.insert(item, delta_count);
                 if let Some(item) = self
                     .items
                     .get_mut(&thread)
@@ -192,13 +212,43 @@ impl AppState {
             _ => {}
         }
     }
-    fn begin_snapshot(&mut self, thread: ThreadId) {
-        self.fences.insert(thread, Fence::Loading(vec![]));
-    }
-    fn finish_snapshot(&mut self, thread: ThreadId, snapshot: ThreadSnapshot) {
+    fn begin_snapshot(&mut self, thread: ThreadId) -> SnapshotRequest {
+        self.snapshot_sequence += 1;
+        let request = SnapshotRequest(self.snapshot_sequence);
         let buffered = match self.fences.remove(&thread) {
-            Some(Fence::Loading(buffer)) => buffer,
-            _ => return,
+            Some(Fence::Loading { buffered, .. }) => buffered,
+            _ => vec![],
+        };
+        self.fences
+            .insert(thread, Fence::Loading { request, buffered });
+        request
+    }
+    fn current_snapshot(&self, thread: ThreadId, request: SnapshotRequest) -> bool {
+        matches!(self.fences.get(&thread), Some(Fence::Loading { request: current, .. }) if *current == request)
+    }
+    fn fail_snapshot(&mut self, thread: ThreadId, request: SnapshotRequest) -> bool {
+        if !self.current_snapshot(thread, request) {
+            return false;
+        }
+        if let Some(Fence::Loading { buffered, .. }) = self.fences.remove(&thread) {
+            for event in buffered {
+                self.apply(event);
+            }
+        }
+        true
+    }
+    fn finish_snapshot(
+        &mut self,
+        thread: ThreadId,
+        request: SnapshotRequest,
+        snapshot: ThreadSnapshot,
+    ) -> bool {
+        if !self.current_snapshot(thread, request) {
+            return false;
+        }
+        let buffered = match self.fences.remove(&thread) {
+            Some(Fence::Loading { buffered, .. }) => buffered,
+            _ => return false,
         };
         let mut items = BTreeMap::new();
         for mut item in snapshot.items {
@@ -211,6 +261,7 @@ impl AppState {
             items.insert(item.id, item);
         }
         self.items.insert(thread, items);
+        self.delta_counts.extend(snapshot.delta_counts);
         self.fences.insert(thread, Fence::Live(snapshot.counter));
         for event in buffered {
             if let Some((_, counter)) = event_thread(&event)
@@ -220,6 +271,7 @@ impl AppState {
                 self.fences.insert(thread, Fence::Live(counter));
             }
         }
+        true
     }
     fn transcript(&self, thread: ThreadId) -> Vec<Item> {
         let mut items: Vec<_> = self
@@ -241,48 +293,7 @@ impl AppState {
         items
     }
     fn status(&self, id: ThreadId) -> Status {
-        let row = &self.threads[&id];
-        let turns = self.turns.values().filter(|turn| turn.thread == id);
-        if row.hold.is_some() && turns.clone().any(|turn| turn.state == TurnState::Queued) {
-            return Status::Held;
-        }
-        if let Some(turn) = turns
-            .clone()
-            .find(|turn| matches!(turn.state, TurnState::Running { .. }))
-        {
-            return Status::Working {
-                since: turn.state.started().unwrap_or_default(),
-            };
-        }
-        if matches!(
-            self.live.get(&id),
-            Some(LiveState::Starting | LiveState::Running)
-        ) {
-            return Status::Working { since: 0 };
-        }
-        match turns
-            .max_by_key(|turn| turn.ordinal)
-            .map(|turn| &turn.state)
-        {
-            Some(TurnState::Ended {
-                outcome: TurnOutcome::Completed,
-                started,
-                at,
-            }) => Status::Done {
-                took: started
-                    .map(|start| at.saturating_sub(start))
-                    .unwrap_or_default(),
-            },
-            Some(TurnState::Ended {
-                outcome: TurnOutcome::Failed { .. },
-                ..
-            }) => Status::Failed,
-            Some(TurnState::Ended {
-                outcome: TurnOutcome::Interrupted { .. },
-                ..
-            }) => Status::Interrupted,
-            _ => Status::Idle,
-        }
+        self.statuses.get(&id).cloned().unwrap_or(Status::Idle)
     }
     fn failure(&self, thread: ThreadId) -> Option<&str> {
         self.turns
@@ -313,8 +324,30 @@ fn status_name(status: &Status) -> &'static str {
 #[derive(Clone, Copy, PartialEq)]
 enum MainView {
     NewThread,
-    Chat,
-    Settings,
+    Chat(ThreadId),
+    Settings { back: Option<ThreadId> },
+}
+impl MainView {
+    fn chat(self) -> Option<ThreadId> {
+        match self {
+            Self::Chat(thread) => Some(thread),
+            _ => None,
+        }
+    }
+    fn selected(self) -> Option<ThreadId> {
+        match self {
+            Self::Chat(thread) => Some(thread),
+            Self::Settings { back } => back,
+            Self::NewThread => None,
+        }
+    }
+}
+fn cycle<'a, T>(values: &'a [T], current: Option<&T>) -> Option<&'a T>
+where
+    T: PartialEq,
+{
+    let index = current.and_then(|current| values.iter().position(|value| value == current));
+    values.get(index.map(|index| (index + 1) % values.len()).unwrap_or(0))
 }
 pub struct Shell {
     focus: FocusHandle,
@@ -325,7 +358,9 @@ pub struct Shell {
     runtime: tokio::runtime::Handle,
     state: AppState,
     view: MainView,
-    selected: Option<ThreadId>,
+    probe_cwd: PathBuf,
+    probes: veyra_engine::provider::Probes,
+    probe_generation: u64,
     project: Option<ProjectId>,
     provider: ProviderKind,
     config: ThreadConfig,
@@ -334,6 +369,7 @@ pub struct Shell {
     scroller: Entity<MessageScrollerState>,
     expanded: BTreeSet<ItemId>,
     branch: String,
+    provider_picker: Option<Entity<PopupMenu>>,
     _input_subscription: Subscription,
 }
 impl Shell {
@@ -341,6 +377,7 @@ impl Shell {
         engine: Engine,
         runtime: tokio::runtime::Handle,
         mut events: tokio::sync::mpsc::UnboundedReceiver<UiEvent>,
+        probe_cwd: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -383,12 +420,13 @@ impl Shell {
                             shell.project = shell.state.projects.keys().next().copied();
                         }
                         if old_default != shell.state.settings.default_mode
-                            && shell.view != MainView::Chat
+                            && shell.view.chat().is_none()
                         {
                             shell.config.mode = shell.state.settings.default_mode;
                         }
                         let count = shell
-                            .selected
+                            .view
+                            .chat()
                             .map(|thread| shell.state.transcript(thread).len())
                             .unwrap_or_default();
                         shell.scroller.update(cx, |state, cx| {
@@ -414,7 +452,7 @@ impl Shell {
                 cx.background_executor().timer(cadence).await;
                 if this
                     .update(cx, |shell, cx| {
-                        if shell.selected.is_some_and(|thread| {
+                        if shell.view.chat().is_some_and(|thread| {
                             matches!(shell.state.status(thread), Status::Working { .. })
                         }) {
                             cx.notify();
@@ -436,7 +474,9 @@ impl Shell {
             runtime,
             state: AppState::default(),
             view: MainView::NewThread,
-            selected: None,
+            probe_cwd,
+            probes: Default::default(),
+            probe_generation: 0,
             project: None,
             provider: ProviderKind::Claude,
             config: ThreadConfig {
@@ -449,12 +489,52 @@ impl Shell {
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             expanded: BTreeSet::new(),
             branch: String::new(),
+            provider_picker: None,
             _input_subscription: subscription,
         };
         shell.recheck(false, window, cx);
         shell
     }
-    fn notice(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+    fn set_provider_picker(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.provider_picker = open.then(|| {
+            let rows = [
+                ProviderKind::Claude,
+                ProviderKind::Codex,
+                ProviderKind::Grok,
+            ]
+            .map(|provider| {
+                let readiness = match self.probe(provider).map(|probe| &probe.readiness) {
+                    Some(Readiness::Ready) => "Ready",
+                    Some(Readiness::NotInstalled) => "Not installed",
+                    Some(Readiness::SignedOut) => "Signed out",
+                    _ => "Checking…",
+                };
+                (provider, format!("{} · {readiness}", provider.label()))
+            });
+            let focus = self.focus.clone();
+            let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
+                menu = menu.action_context(focus);
+                for (provider, label) in rows {
+                    menu = menu.menu(
+                        label,
+                        Box::new(PickProvider {
+                            provider: Some(provider),
+                        }),
+                    );
+                }
+                menu
+            });
+            cx.subscribe_in(&menu, window, |shell, _, _: &DismissEvent, window, cx| {
+                shell.provider_picker = None;
+                shell.input.update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+            })
+            .detach();
+            menu
+        });
+        cx.notify();
+    }
+    pub(crate) fn notice(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         let message = message.into();
         tracing::info!(message = message.as_ref(), "window notice");
         self.notice = Some(message);
@@ -494,10 +574,9 @@ impl Shell {
         .detach();
     }
     fn select_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
-        self.view = MainView::Chat;
-        self.selected = Some(thread);
+        self.view = MainView::Chat(thread);
         self.notice = None;
-        self.state.begin_snapshot(thread);
+        let request = self.state.begin_snapshot(thread);
         let reply = self.engine.snapshot(thread);
         self.scroller.update(cx, |state, cx| state.reset(0, cx));
         self.input.update(cx, |input, cx| input.focus(window, cx));
@@ -518,12 +597,17 @@ impl Shell {
             let snapshot = reply.await;
             let branch = branch.await;
             let _ = this.update(cx, |shell, cx| {
-                if let Ok(snapshot) = snapshot {
-                    shell.state.finish_snapshot(thread, snapshot);
-                } else {
-                    shell.notice = Some("The transcript could not be loaded".into());
-                }
-                if shell.selected == Some(thread) {
+                let applied = match snapshot {
+                    Ok(snapshot) => shell.state.finish_snapshot(thread, request, snapshot),
+                    Err(_) => {
+                        let current = shell.state.fail_snapshot(thread, request);
+                        if current {
+                            shell.notice = Some("The transcript could not be loaded".into());
+                        }
+                        current
+                    }
+                };
+                if applied && shell.view.chat() == Some(thread) {
                     shell.branch = branch;
                     let count = shell.state.transcript(thread).len();
                     shell
@@ -538,76 +622,88 @@ impl Shell {
     }
     fn recheck(&mut self, retry: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.providers.clear();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.runtime.spawn(async move {
-            let env = veyra_engine::provider::env::ChildEnv::load();
-            let mut probes = Vec::new();
-            for provider in [
-                ProviderKind::Claude,
-                ProviderKind::Codex,
-                ProviderKind::Grok,
-            ] {
-                probes.push(provider.probe(&env).await);
-            }
-            let _ = tx.send(probes);
-        });
-        let retry_thread = retry.then_some(self.selected).flatten();
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(probes) = rx.await {
-                let _ = this.update_in(cx, |shell, window, cx| {
-                    shell.providers = probes;
-                    if let Some(thread) = retry_thread
-                        && shell.ready(shell.state.threads[&thread].provider)
-                    {
-                        let text =
-                            shell.state.transcript(thread).iter().rev().find_map(
-                                |item| match &item.body {
-                                    ItemBody::UserText(text) => Some(text.clone()),
-                                    _ => None,
-                                },
-                            );
-                        if let Some(text) = text {
-                            if shell.state.threads[&thread].hold.is_some() {
-                                shell.send_command(
-                                    Command::Continue {
-                                        thread,
-                                        drop_queued: false,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
-                            shell.send_command(Command::Send { thread, text }, window, cx);
+        self.probe_generation += 1;
+        let generation = self.probe_generation;
+        let retry_thread = retry.then(|| self.view.chat()).flatten();
+        let env = veyra_engine::provider::env::ChildEnv::load();
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Grok,
+        ] {
+            let reply =
+                self.probes
+                    .check(&self.runtime, provider, env.clone(), self.probe_cwd.clone());
+            cx.spawn_in(window, async move |this, cx| {
+                if let Ok(probe) = reply.await {
+                    let _ = this.update_in(cx, |shell, window, cx| {
+                        if shell.probe_generation != generation {
+                            return;
                         }
-                    }
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+                        shell.providers.push(probe);
+                        if let Some(thread) = retry_thread
+                            && shell.state.threads[&thread].provider == provider
+                            && shell.ready(provider)
+                        {
+                            shell.retry_turn(thread, window, cx);
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
         cx.notify();
     }
-    fn ready(&self, provider: ProviderKind) -> bool {
+    fn retry_turn(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .state
+            .transcript(thread)
+            .iter()
+            .rev()
+            .find_map(|item| match &item.body {
+                ItemBody::UserText(text) => Some(text.clone()),
+                _ => None,
+            });
+        if let Some(text) = text {
+            if self.state.threads[&thread].hold.is_some() {
+                self.send_command(
+                    Command::Continue {
+                        thread,
+                        drop_queued: false,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            self.send_command(Command::Send { thread, text }, window, cx);
+        }
+    }
+    fn probe(&self, provider: ProviderKind) -> Option<&Probe> {
         self.providers
             .iter()
-            .any(|probe| probe.provider == provider && probe.readiness == Readiness::Ready)
+            .find(|probe| probe.provider == provider)
+    }
+    fn ready(&self, provider: ProviderKind) -> bool {
+        self.probe(provider)
+            .is_some_and(|probe| probe.readiness == Readiness::Ready)
     }
     fn composer_config(&self) -> &ThreadConfig {
-        self.selected
-            .filter(|_| self.view == MainView::Chat)
+        self.view
+            .chat()
             .and_then(|id| self.state.threads.get(&id))
             .map(|row| &row.config)
             .unwrap_or(&self.config)
     }
     fn chosen_provider(&self) -> ProviderKind {
-        self.selected
-            .filter(|_| self.view == MainView::Chat)
+        self.view
+            .chat()
             .and_then(|id| self.state.threads.get(&id))
             .map(|row| row.provider)
             .unwrap_or(self.provider)
     }
     fn disabled_reason(&self) -> Option<String> {
-        if self.view == MainView::Settings {
+        if matches!(self.view, MainView::Settings { .. }) {
             return Some("Close Settings to send a message".into());
         }
         if self.project.is_none() && self.view == MainView::NewThread {
@@ -615,24 +711,18 @@ impl Shell {
         }
         if !self.ready(self.chosen_provider()) {
             let provider = self.chosen_provider();
-            return Some(
-                match self
-                    .providers
-                    .iter()
-                    .find(|probe| probe.provider == provider)
-                    .map(|probe| &probe.readiness)
-                {
-                    Some(Readiness::NotInstalled) => format!(
-                        "{} is not installed. Run npm install -g @anthropic-ai/claude-code and check again.",
-                        provider.label()
-                    ),
-                    Some(Readiness::SignedOut) => format!(
-                        "Sign in with {} and check again.",
-                        provider.sign_in_command()
-                    ),
-                    _ => format!("Checking {}…", provider.label()),
-                },
-            );
+            return Some(match self.probe(provider).map(|probe| &probe.readiness) {
+                Some(Readiness::NotInstalled) => format!(
+                    "{} is not installed. {}",
+                    provider.label(),
+                    provider.install_hint()
+                ),
+                Some(Readiness::SignedOut) => format!(
+                    "Sign in with {} and check again.",
+                    provider.sign_in_command()
+                ),
+                _ => format!("Checking {}…", provider.label()),
+            });
         }
         None
     }
@@ -646,11 +736,8 @@ impl Shell {
             self.notice("Write a message before sending", cx);
             return;
         }
-        let command = if self.view == MainView::Chat {
-            Command::Send {
-                thread: self.selected.expect("selected chat"),
-                text,
-            }
+        let command = if let MainView::Chat(thread) = self.view {
+            Command::Send { thread, text }
         } else {
             Command::CreateThread {
                 project: self.project.expect("chosen project"),
@@ -663,7 +750,7 @@ impl Shell {
     }
     fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.view = MainView::NewThread;
-        self.selected = None;
+        self.provider_picker = None;
         self.config.mode = self.state.settings.default_mode;
         self.notice = None;
         self.input.update(cx, |input, cx| {
@@ -704,29 +791,27 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current = self.composer_config().mode;
-        let mode = match settings::parse_mode(action.mode.as_deref(), current) {
-            Ok(mode) => mode,
-            Err(error) => {
-                self.notice(error, cx);
-                return;
-            }
-        };
-        if self.view == MainView::Settings {
+        let mode = action.mode.unwrap_or_else(|| {
+            *cycle(&settings::MODES, Some(&self.composer_config().mode)).unwrap()
+        });
+        if matches!(self.view, MainView::Settings { .. }) {
             self.send_command(Command::SetDefaultMode { mode }, window, cx);
-        } else if self.view == MainView::Chat {
-            let mut config = self.composer_config().clone();
-            config.mode = mode;
-            self.send_command(
-                Command::Configure {
-                    thread: self.selected.unwrap(),
-                    config,
-                },
-                window,
-                cx,
-            );
         } else {
-            self.config.mode = mode;
+            self.update_config(window, cx, |config| config.mode = mode);
+        }
+    }
+    fn update_config(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut ThreadConfig),
+    ) {
+        let mut config = self.composer_config().clone();
+        update(&mut config);
+        if let MainView::Chat(thread) = self.view {
+            self.send_command(Command::Configure { thread, config }, window, cx);
+        } else {
+            self.config = config;
             cx.notify();
         }
     }
@@ -737,7 +822,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        if self.view == MainView::Settings || !self.input.focus_handle(cx).is_focused(window) {
+        if matches!(self.view, MainView::Settings { .. })
+            || !self.input.focus_handle(cx).is_focused(window)
+        {
             anyhow::bail!("the focused element has no text input handler");
         }
         self.input.update(cx, |input, cx| {
@@ -746,61 +833,121 @@ impl Shell {
         Ok(())
     }
     #[cfg(debug_assertions)]
-    pub fn dump(&self, data_dir: &std::path::Path, cx: &App) -> serde_json::Value {
+    fn dump_rows(&self) -> Vec<serde_json::Value> {
         let mut rows = Vec::new();
         for project in self.state.projects.values() {
-            rows.push(serde_json::json!({"kind":"project","id":project.id,"name":project.name,"path":project.path}));
+            rows.push(serde_json::json!({
+                "kind":"project", "id":project.id, "name":project.name, "path":project.path
+            }));
             for thread in self
                 .state
                 .threads
                 .values()
                 .filter(|thread| thread.project == project.id && !thread.archived)
             {
-                rows.push(serde_json::json!({"kind":"thread","id":thread.id,"title":thread.title,"status":status_name(&self.state.status(thread.id)),"archived":thread.archived,"mode":thread.config.mode}));
+                rows.push(serde_json::json!({
+                    "kind":"thread", "id":thread.id, "title":thread.title,
+                    "status":status_name(&self.state.status(thread.id)),
+                    "archived":thread.archived, "mode":thread.config.mode
+                }));
             }
         }
-        let selected = self.selected.and_then(|id| self.state.threads.get(&id)).map(|thread| serde_json::json!({"id":thread.id,"title":thread.title,"native_id":thread.native.as_ref().map(|native| &native.0),"cli_version":thread.cli_version,"config":thread.config,"status":status_name(&self.state.status(thread.id)),"failure":self.state.failure(thread.id)}));
-        let providers: Vec<_> = [ProviderKind::Claude,ProviderKind::Codex,ProviderKind::Grok].into_iter().map(|provider| {
-            let probe = self.providers.iter().find(|probe| probe.provider == provider);
-            serde_json::json!({"provider":provider,"readiness":probe.map(|probe| &probe.readiness).unwrap_or(&Readiness::Checking),"path":probe.and_then(|probe| probe.path.as_ref()),"version":probe.and_then(|probe| probe.version.as_ref()),"models":probe.map(|probe| &probe.models)})
-        }).collect();
-        let transcript: Vec<_> = self
-            .selected
+        rows
+    }
+    #[cfg(debug_assertions)]
+    fn dump_selected(&self) -> Option<serde_json::Value> {
+        self.view
+            .selected()
+            .and_then(|id| self.state.threads.get(&id))
+            .map(|thread| {
+                let status = self.state.status(thread.id);
+                serde_json::json!({
+                    "id":thread.id, "title":thread.title,
+                    "native_id":thread.native.as_ref().map(|native| &native.0),
+                    "cli_version":thread.cli_version, "config":thread.config,
+                    "status":status_name(&status), "header_status":header::status_text(&status),
+                    "failure":self.state.failure(thread.id)
+                })
+            })
+    }
+    #[cfg(debug_assertions)]
+    fn dump_providers(&self) -> Vec<serde_json::Value> {
+        [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Grok,
+        ]
+        .into_iter()
+        .map(|provider| {
+            let probe = self.probe(provider);
+            serde_json::json!({
+                "provider":provider,
+                "readiness":probe.map(|probe| &probe.readiness).unwrap_or(&Readiness::Checking),
+                "path":probe.and_then(|probe| probe.path.as_ref()),
+                "version":probe.and_then(|probe| probe.version.as_ref()),
+                "models":probe.map(|probe| &probe.models),
+                "account":probe.map(Probe::account_presence).unwrap_or("unknown")
+            })
+        })
+        .collect()
+    }
+    #[cfg(debug_assertions)]
+    fn dump_transcript(&self) -> Vec<serde_json::Value> {
+        self.view
+            .selected()
             .map(|thread| self.state.transcript(thread))
             .unwrap_or_default()
             .iter()
             .map(|item| {
                 let mut row = transcript::dump_item(item);
                 row["expanded"] = serde_json::json!(self.expanded.contains(&item.id));
+                row["delta_count"] = self
+                    .state
+                    .delta_counts
+                    .get(&item.id)
+                    .copied()
+                    .unwrap_or_default()
+                    .into();
                 row
             })
-            .collect();
+            .collect()
+    }
+    #[cfg(debug_assertions)]
+    fn dump_composer(&self) -> serde_json::Value {
         let reason = self.disabled_reason();
         serde_json::json!({
-            "pid":std::process::id(),"build_rev":env!("VEYRA_BUILD_REV"),"data_dir":data_dir,
-            "appearance":cx.global::<Theme>().appearance.name(),"view":self.view_name(),
-            "sidebar":{"width":f32::from(self.sidebar_width),"rows":rows},"selected_thread":selected,
-            "transcript":transcript,"composer_text":self.input.read(cx).value().to_string(),
-            "composer":{"provider":self.chosen_provider(),"mode":self.composer_config().mode,"model":self.composer_config().model,"effort":self.composer_config().effort,"send_enabled":reason.is_none(),"disabled_reason":reason},
-            "providers":providers,"settings":{"default_mode":self.state.settings.default_mode},
-            "perf":{"applied_batches":self.state.applied_batches,"max_batch_gap_ms":self.state.max_batch_gap_ms},
+            "provider":self.chosen_provider(), "mode":self.composer_config().mode,
+            "model":self.composer_config().model, "effort":self.composer_config().effort,
+            "send_enabled":reason.is_none(), "disabled_reason":reason,
+            "provider_picker_open":self.provider_picker.is_some()
+        })
+    }
+    #[cfg(debug_assertions)]
+    pub fn dump(&self, data_dir: &std::path::Path, cx: &App) -> serde_json::Value {
+        serde_json::json!({
+            "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
+            "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
+            "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows()},
+            "selected_thread":self.dump_selected(), "transcript":self.dump_transcript(),
+            "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(),
+            "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
+            "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.max_batch_gap_ms},
             "notice":self.notice.as_ref().map(|notice| notice.as_ref())
         })
     }
     #[cfg(debug_assertions)]
     fn view_name(&self) -> &'static str {
         match self.view {
-            MainView::Settings => "settings",
+            MainView::Settings { .. } => "settings",
             MainView::NewThread => "new_thread",
-            MainView::Chat
-                if self
-                    .selected
-                    .is_some_and(|thread| self.state.failure(thread).is_some()) =>
-            {
-                "failed_thread"
-            }
-            MainView::Chat => "chat",
+            MainView::Chat(thread) if self.state.failure(thread).is_some() => "failed_thread",
+            MainView::Chat(_) => "chat",
         }
+    }
+}
+impl Focusable for Shell {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 impl Render for Shell {
@@ -822,18 +969,22 @@ impl Render for Shell {
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
             .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
             .on_action(cx.listener(|shell, _: &OpenSettings, window, cx| {
-                shell.view = MainView::Settings;
+                shell.view = MainView::Settings {
+                    back: shell.view.selected(),
+                };
                 shell.notice = None;
                 window.focus(&shell.focus, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, action: &SetDefaultMode, window, cx| {
-                match settings::parse_mode(
-                    action.mode.as_deref(),
-                    shell.state.settings.default_mode,
-                ) {
-                    Ok(mode) => shell.send_command(Command::SetDefaultMode { mode }, window, cx),
-                    Err(error) => shell.notice(error, cx),
+                let mode = action.mode.unwrap_or_else(|| {
+                    *cycle(&settings::MODES, Some(&shell.state.settings.default_mode)).unwrap()
+                });
+                shell.send_command(Command::SetDefaultMode { mode }, window, cx);
+            }))
+            .on_action(cx.listener(|shell, _: &OpenProviderPicker, window, cx| {
+                if shell.view == MainView::NewThread {
+                    shell.set_provider_picker(shell.provider_picker.is_none(), window, cx);
                 }
             }))
             .on_action(cx.listener(|shell, _: &RecheckProviders, window, cx| {
@@ -841,7 +992,7 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &Retry, window, cx| shell.recheck(true, window, cx)))
             .on_action(cx.listener(|shell, _: &OpenTerminal, _, cx| {
-                if let Some(thread) = shell.selected
+                if let Some(thread) = shell.view.selected()
                     && let Err(error) =
                         veyra_engine::platform::open_terminal_app(&shell.state.threads[&thread].cwd)
                 {
@@ -851,7 +1002,7 @@ impl Render for Shell {
             .on_action(cx.listener(|shell, action: &PickPermission, window, cx| {
                 shell.pick_permission(action, window, cx)
             }))
-            .on_action(cx.listener(|shell, action: &PickProvider, _, cx| {
+            .on_action(cx.listener(|shell, action: &PickProvider, window, cx| {
                 if shell.view != MainView::NewThread {
                     shell.notice("Create a new thread to choose a provider", cx);
                     return;
@@ -861,60 +1012,28 @@ impl Render for Shell {
                     ProviderKind::Codex => ProviderKind::Grok,
                     ProviderKind::Grok => ProviderKind::Claude,
                 };
-                match action
-                    .provider
-                    .as_deref()
-                    .map(|value| serde_json::from_value::<ProviderKind>(serde_json::json!(value)))
-                {
-                    Some(Ok(provider)) => shell.provider = provider,
-                    Some(Err(_)) => shell.notice("Unknown provider", cx),
-                    None => shell.provider = next,
-                }
+                shell.provider = action.provider.unwrap_or(next);
+                shell.provider_picker = None;
+                shell.input.update(cx, |input, cx| input.focus(window, cx));
                 shell.config.model = None;
                 shell.config.effort = None;
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, action: &PickModel, window, cx| {
-                let models = shell
-                    .providers
-                    .iter()
-                    .find(|probe| probe.provider == shell.chosen_provider())
-                    .map(|probe| &probe.models);
-                let model = action.model.clone().or_else(|| {
-                    models.and_then(|models| {
-                        let current = shell.composer_config().model.as_ref().and_then(|value| {
-                            models.iter().position(|model| &model.value == value)
-                        });
-                        models
-                            .get(
-                                current
-                                    .map(|index| (index + 1) % models.len().max(1))
-                                    .unwrap_or(0),
-                            )
-                            .map(|model| model.value.clone())
-                    })
-                });
-                if shell.view == MainView::Chat {
-                    let mut config = shell.composer_config().clone();
-                    config.model = model;
-                    shell.send_command(
-                        Command::Configure {
-                            thread: shell.selected.unwrap(),
-                            config,
-                        },
-                        window,
-                        cx,
-                    );
-                } else {
-                    shell.config.model = model;
-                    cx.notify();
-                }
+                let models: Vec<_> = shell
+                    .probe(shell.chosen_provider())
+                    .into_iter()
+                    .flat_map(|probe| probe.models.iter().map(|model| model.value.clone()))
+                    .collect();
+                let model = action
+                    .model
+                    .clone()
+                    .or_else(|| cycle(&models, shell.composer_config().model.as_ref()).cloned());
+                shell.update_config(window, cx, |config| config.model = model);
             }))
             .on_action(cx.listener(|shell, action: &PickEffort, window, cx| {
                 let levels = shell
-                    .providers
-                    .iter()
-                    .find(|probe| probe.provider == shell.chosen_provider())
+                    .probe(shell.chosen_provider())
                     .and_then(|probe| {
                         probe
                             .models
@@ -927,43 +1046,14 @@ impl Render for Shell {
                     .map(|model| &model.effort_levels);
                 let effort = action.effort.clone().or_else(|| {
                     levels.and_then(|levels| {
-                        let current = shell
-                            .composer_config()
-                            .effort
-                            .as_ref()
-                            .and_then(|value| levels.iter().position(|level| level == value));
-                        levels
-                            .get(
-                                current
-                                    .map(|index| (index + 1) % levels.len().max(1))
-                                    .unwrap_or(0),
-                            )
-                            .cloned()
+                        cycle(levels, shell.composer_config().effort.as_ref()).cloned()
                     })
                 });
-                if shell.view == MainView::Chat {
-                    let mut config = shell.composer_config().clone();
-                    config.effort = effort;
-                    shell.send_command(
-                        Command::Configure {
-                            thread: shell.selected.unwrap(),
-                            config,
-                        },
-                        window,
-                        cx,
-                    );
-                } else {
-                    shell.config.effort = effort;
-                    cx.notify();
-                }
+                shell.update_config(window, cx, |config| config.effort = effort);
             }))
             .on_action(cx.listener(|shell, action: &SelectThread, window, cx| {
                 if let Some(id) = action
                     .thread
-                    .as_ref()
-                    .and_then(|value| {
-                        serde_json::from_value::<ThreadId>(serde_json::json!(value)).ok()
-                    })
                     .or_else(|| {
                         action
                             .thread
@@ -992,10 +1082,6 @@ impl Render for Shell {
             .on_action(cx.listener(|shell, action: &SelectProject, window, cx| {
                 if let Some(id) = action
                     .project
-                    .as_ref()
-                    .and_then(|value| {
-                        serde_json::from_value::<ProjectId>(serde_json::json!(value)).ok()
-                    })
                     .or_else(|| {
                         action
                             .project
@@ -1010,35 +1096,28 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|shell, action: &ToggleItem, _, cx| {
-                if let Some(id) = action
-                    .item
-                    .as_ref()
-                    .and_then(|value| {
-                        serde_json::from_value::<ItemId>(serde_json::json!(value)).ok()
-                    })
-                    .or_else(|| {
-                        action
-                            .item
-                            .is_none()
-                            .then(|| {
-                                shell.selected.and_then(|thread| {
-                                    shell
-                                        .state
-                                        .transcript(thread)
-                                        .iter()
-                                        .rev()
-                                        .find(|item| {
-                                            matches!(
-                                                item.body,
-                                                ItemBody::Reasoning { .. } | ItemBody::Tool(_)
-                                            )
-                                        })
-                                        .map(|item| item.id)
-                                })
+                if let Some(id) = action.item.or_else(|| {
+                    action
+                        .item
+                        .is_none()
+                        .then(|| {
+                            shell.view.selected().and_then(|thread| {
+                                shell
+                                    .state
+                                    .transcript(thread)
+                                    .iter()
+                                    .rev()
+                                    .find(|item| {
+                                        matches!(
+                                            item.body,
+                                            ItemBody::Reasoning { .. } | ItemBody::Tool(_)
+                                        )
+                                    })
+                                    .map(|item| item.id)
                             })
-                            .flatten()
-                    })
-                    && !shell.expanded.remove(&id)
+                        })
+                        .flatten()
+                }) && !shell.expanded.remove(&id)
                 {
                     shell.expanded.insert(id);
                 }
@@ -1047,8 +1126,9 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &DismissNotice, window, cx| {
                 shell.notice = None;
-                if shell.view == MainView::Settings {
-                    if let Some(thread) = shell.selected {
+                shell.provider_picker = None;
+                if matches!(shell.view, MainView::Settings { .. }) {
+                    if let Some(thread) = shell.view.selected() {
                         shell.select_thread(thread, window, cx);
                     } else {
                         shell.new_thread(window, cx);
@@ -1134,11 +1214,11 @@ impl Render for Shell {
                     .child(header::render(self, cx))
                     .child(match self.view {
                         MainView::NewThread => new_thread::render(self, cx).into_any_element(),
-                        MainView::Settings => {
+                        MainView::Settings { .. } => {
                             settings::render(self.state.settings, self.notice.clone(), cx)
                                 .into_any_element()
                         }
-                        MainView::Chat => transcript::render(self, cx).into_any_element(),
+                        MainView::Chat(_) => transcript::render(self, cx).into_any_element(),
                     }),
             )
     }
@@ -1178,7 +1258,8 @@ pub fn run(
                         Theme::apply(Appearance::from_window(window.appearance()), window, cx)
                     })
                     .detach();
-                let shell = cx.new(|cx| Shell::new(engine, runtime, events, window, cx));
+                let shell =
+                    cx.new(|cx| Shell::new(engine, runtime, events, data_dir.clone(), window, cx));
                 #[cfg(debug_assertions)]
                 crate::control::attach(&shell, requests, data_dir.clone(), window, cx);
                 window.on_next_frame(move |_, _| {
@@ -1207,6 +1288,148 @@ mod tests {
         live::LiveState,
         provider::ProviderKind,
     };
+
+    #[test]
+    fn window_projection_shows_pending_background_work() {
+        use veyra_engine::{
+            events::ChangeSet,
+            live::{Live, LiveThread},
+            provider::SessionHandle,
+        };
+        let thread = ThreadId::new();
+        let turn = Turn {
+            id: TurnId::new(),
+            thread,
+            ordinal: 1,
+            origin: TurnOrigin::Provider,
+            state: TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                started: Some(1),
+                at: 2,
+            },
+        };
+        let row = Thread {
+            id: thread,
+            project: ProjectId::new(),
+            title: "background".into(),
+            lineage: Lineage::Root,
+            provider: ProviderKind::Claude,
+            config: ThreadConfig {
+                model: None,
+                effort: None,
+                mode: PermissionMode::FullAccess,
+            },
+            cwd: "/tmp".into(),
+            native: None,
+            native_cursor: None,
+            cli_version: None,
+            hold: None,
+            view: View::Chat,
+            import_pending: false,
+            archived: false,
+        };
+        let mut state = AppState::default();
+        state.apply(UiEvent::Change {
+            counter: Some(1),
+            event: ChangeEvent::ThreadCreated(row.clone()),
+        });
+        state.apply(UiEvent::Change {
+            counter: Some(2),
+            event: ChangeEvent::TurnEnded(turn.clone()),
+        });
+        let mut projection = Projection::default();
+        projection.threads.insert(thread, row);
+        projection.insert_turn(turn);
+        let (control, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut changes = ChangeSet::default();
+        changes.live.insert(
+            thread,
+            LiveThread {
+                live: Live::Structured {
+                    session: SessionHandle { control },
+                    pid: 1,
+                    pgid: 1,
+                },
+                background_work: true,
+                ..Default::default()
+            },
+        );
+        let (events, _) = changes.install(&mut projection, &mut BTreeMap::new());
+        for event in events {
+            state.apply(UiEvent::Change {
+                counter: Some(3),
+                event,
+            });
+        }
+        assert_eq!(state.status(thread), Status::Working { since: 0 });
+    }
+    #[test]
+    fn snapshot_failure_releases_only_its_own_fence() {
+        let thread = ThreadId::new();
+        let item = Item {
+            id: ItemId::new(),
+            thread,
+            turn: TurnId::new(),
+            seq: 1,
+            body: ItemBody::AssistantText {
+                text: "retained".into(),
+                done: true,
+            },
+        };
+        let mut state = AppState::default();
+        let old = state.begin_snapshot(thread);
+        state.apply(UiEvent::Change {
+            counter: Some(2),
+            event: ChangeEvent::ItemCompleted(item.clone()),
+        });
+        let current = state.begin_snapshot(thread);
+        assert!(!state.fail_snapshot(thread, old));
+        assert!(state.fail_snapshot(thread, current));
+        assert_eq!(state.transcript(thread), vec![item]);
+        assert!(matches!(state.fences[&thread], super::Fence::Live(2)));
+    }
+    #[test]
+    fn snapshot_reselection_keeps_the_current_reply() {
+        let thread = ThreadId::new();
+        let item = Item {
+            id: ItemId::new(),
+            thread,
+            turn: TurnId::new(),
+            seq: 1,
+            body: ItemBody::AssistantText {
+                text: "complete".into(),
+                done: true,
+            },
+        };
+        let mut state = AppState::default();
+        let first = state.begin_snapshot(thread);
+        state.apply(UiEvent::Change {
+            counter: Some(2),
+            event: ChangeEvent::ItemCompleted(item.clone()),
+        });
+        let second = state.begin_snapshot(thread);
+        state.finish_snapshot(
+            thread,
+            first,
+            ThreadSnapshot {
+                items: vec![],
+                buffered_text: BTreeMap::new(),
+                delta_counts: BTreeMap::new(),
+                counter: 1,
+            },
+        );
+        state.finish_snapshot(
+            thread,
+            second,
+            ThreadSnapshot {
+                items: vec![item.clone()],
+                buffered_text: BTreeMap::new(),
+                delta_counts: BTreeMap::new(),
+                counter: 2,
+            },
+        );
+        assert_eq!(state.transcript(thread), vec![item]);
+    }
     #[test]
     fn snapshot_fence_keeps_metadata_not_carried_by_snapshot() {
         let thread = ThreadId::new();
@@ -1234,7 +1457,7 @@ mod tests {
                 archived: false,
             }),
         });
-        state.begin_snapshot(thread);
+        let request = state.begin_snapshot(thread);
         state.apply(UiEvent::Change {
             counter: Some(3),
             event: ChangeEvent::ThreadLiveChanged {
@@ -1245,9 +1468,11 @@ mod tests {
         assert_eq!(state.live[&thread], LiveState::Starting);
         state.finish_snapshot(
             thread,
+            request,
             ThreadSnapshot {
                 items: vec![],
                 buffered_text: BTreeMap::new(),
+                delta_counts: BTreeMap::new(),
                 counter: 10,
             },
         );
@@ -1257,7 +1482,7 @@ mod tests {
             event: ChangeEvent::NativeSessionBound {
                 thread,
                 native: native.clone(),
-                cli_version: "2.1.295".into(),
+                cli_version: Some("2.1.295".into()),
             },
         });
         state.apply(UiEvent::Change {
@@ -1286,6 +1511,13 @@ mod tests {
             state.threads[&thread].cli_version.as_deref(),
             Some("2.1.295")
         );
+        state.apply(UiEvent::Change {
+            counter: Some(8),
+            event: ChangeEvent::ThreadStatusChanged {
+                thread,
+                status: Status::Done { took: 5 },
+            },
+        });
         assert_eq!(state.status(thread), Status::Done { took: 5 });
     }
     #[test]
@@ -1304,14 +1536,16 @@ mod tests {
             },
         };
         let mut state = AppState::default();
-        state.begin_snapshot(thread);
+        let request = state.begin_snapshot(thread);
         state.apply(UiEvent::TextAppended {
+            delta_count: 1,
             thread,
             item: id,
             counter: 2,
             text: "b".into(),
         });
         state.apply(UiEvent::TextAppended {
+            delta_count: 1,
             thread,
             item: id,
             counter: 4,
@@ -1319,19 +1553,23 @@ mod tests {
         });
         state.finish_snapshot(
             thread,
+            request,
             ThreadSnapshot {
                 items: vec![item],
                 buffered_text: BTreeMap::from([(id, "bc".into())]),
+                delta_counts: BTreeMap::new(),
                 counter: 3,
             },
         );
         state.apply(UiEvent::TextAppended {
+            delta_count: 1,
             thread,
             item: id,
             counter: 3,
             text: "duplicate".into(),
         });
         state.apply(UiEvent::TextAppended {
+            delta_count: 1,
             thread,
             item: id,
             counter: 5,

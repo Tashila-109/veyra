@@ -59,8 +59,8 @@ impl Engine {
                 .truncate(false),
         )?;
         let db = store::open(&data.path().join("veyra.db"))?;
-        provider::env::ChildEnv::load();
-        Self::launch(runtime, db, Spawner::Cli, Some(lock))
+        let env = provider::env::ChildEnv::load();
+        Self::launch(runtime, db, Spawner::Cli(env), Some(lock))
     }
     fn launch(
         runtime: &Handle,

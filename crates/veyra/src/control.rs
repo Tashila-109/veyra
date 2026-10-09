@@ -1,7 +1,7 @@
 #![cfg(debug_assertions)]
 
 use anyhow::{Context as _, bail};
-use gpui_kit::{App, Entity, KeyDownEvent, Keystroke, PlatformInput, Window};
+use gpui_kit::{App, Entity, Focusable, KeyDownEvent, Keystroke, PlatformInput, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -103,8 +103,17 @@ pub fn attach(
                             Ok(dump)
                         }
                         Command::Action { name, data } => {
-                            let action = cx.build_action(&name, data)?;
-                            window.dispatch_action(action, cx);
+                            let action = match cx.build_action(&name, data) {
+                                Ok(action) => action,
+                                Err(error) => {
+                                    shell.update(cx, |shell, cx| {
+                                        shell.notice(error.to_string(), cx)
+                                    })?;
+                                    return Err(error.into());
+                                }
+                            };
+                            let root = shell.update(cx, |shell, cx| shell.focus_handle(cx))?;
+                            root.dispatch_action(action.as_ref(), window, cx);
                             Ok(json!({"ok": true}))
                         }
                         Command::Keys { keystrokes } => {
@@ -209,9 +218,10 @@ fn parse_args(args: &[String]) -> anyhow::Result<ClientCommand> {
                 seconds,
             })
         }
-        _ => bail!(
-            "usage: veyra ctl action NAME [JSON] | keys KEYSTROKES | text STRING | dump | wait THREAD STATUS [SECONDS] | quit"
-        ),
+        _ => bail!(concat!(
+            "usage: veyra ctl action NAME [JSON] | keys KEYSTROKES | text STRING | ",
+            "dump | wait THREAD STATUS [SECONDS] | quit"
+        )),
     }
 }
 fn wait_exit_code(dump: &Value, thread: &str, status: &str) -> Option<i32> {
@@ -233,6 +243,10 @@ fn wait_exit_code(dump: &Value, thread: &str, status: &str) -> Option<i32> {
     }
 }
 fn request(data_dir: &Path, command: &Command) -> anyhow::Result<Value> {
+    request_inner(data_dir, command)
+        .map_err(|error| anyhow::anyhow!("veyra ctl driver error: {error:#}"))
+}
+fn request_inner(data_dir: &Path, command: &Command) -> anyhow::Result<Value> {
     let mut stream = platform::connect_socket(&data_dir.join("control.sock"))
         .context("connect to Veyra debug driver")?;
     stream.set_read_timeout(Some(TIMEOUT))?;
@@ -273,6 +287,9 @@ pub fn client() -> anyhow::Result<()> {
                 let code = wait_exit_code(&dump, &id, &status)
                     .or_else(|| (start.elapsed() >= Duration::from_secs(seconds)).then_some(1));
                 if let Some(code) = code {
+                    if code == 1 {
+                        eprintln!("veyra ctl wait timed out: thread={id} status={status}");
+                    }
                     println!("{}", serde_json::to_string_pretty(&dump)?);
                     std::process::exit(code);
                 }
@@ -313,15 +330,23 @@ mod tests {
             parse_args(&["quit".into()]).unwrap(),
             ClientCommand::Request(Command::Quit)
         ));
-        assert!(
-            matches!(parse_args(&["text".into(), "hello".into()]).unwrap(), ClientCommand::Request(Command::Text { text }) if text == "hello")
-        );
-        assert!(
-            matches!(parse_args(&["keys".into(), "secondary-n".into()]).unwrap(), ClientCommand::Request(Command::Keys { keystrokes }) if keystrokes == "secondary-n")
-        );
-        assert!(
-            matches!(parse_args(&["action".into(), "veyra::SetSidebarWidth".into(), "{\"width\":300}".into()]).unwrap(), ClientCommand::Request(Command::Action { data: Some(data), .. }) if data == json!({"width":300}))
-        );
+        assert!(matches!(
+            parse_args(&["text".into(), "hello".into()]).unwrap(),
+            ClientCommand::Request(Command::Text { text }) if text == "hello"
+        ));
+        assert!(matches!(
+            parse_args(&["keys".into(), "secondary-n".into()]).unwrap(),
+            ClientCommand::Request(Command::Keys { keystrokes }) if keystrokes == "secondary-n"
+        ));
+        let action = [
+            "action".into(),
+            "veyra::SetSidebarWidth".into(),
+            "{\"width\":300}".into(),
+        ];
+        assert!(matches!(
+            parse_args(&action).unwrap(),
+            ClientCommand::Request(Command::Action { data: Some(data), .. }) if data == json!({"width":300})
+        ));
         assert!(parse_args(&["dump".into(), "extra".into()]).is_err());
         assert!(parse_args(&["action".into(), "name".into(), "bad json".into()]).is_err());
     }

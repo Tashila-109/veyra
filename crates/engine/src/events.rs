@@ -24,10 +24,14 @@ pub enum ChangeEvent {
         thread: ThreadId,
         state: LiveState,
     },
+    ThreadStatusChanged {
+        thread: ThreadId,
+        status: Status,
+    },
     NativeSessionBound {
         thread: ThreadId,
         native: NativeSessionId,
-        cli_version: String,
+        cli_version: Option<String>,
     },
     TurnQueued(Turn),
     TurnStarted(Turn),
@@ -50,7 +54,8 @@ impl ChangeEvent {
             | Self::ThreadConfigured { thread, .. }
             | Self::ThreadHoldChanged { thread, .. }
             | Self::ThreadLiveChanged { thread, .. }
-            | Self::NativeSessionBound { thread, .. } => Some(*thread),
+            | Self::NativeSessionBound { thread, .. }
+            | Self::ThreadStatusChanged { thread, .. } => Some(*thread),
             Self::TurnQueued(t) | Self::TurnStarted(t) | Self::TurnEnded(t) => Some(t.thread),
             Self::ItemAdded(i) | Self::ItemCompleted(i) => Some(i.thread),
             Self::RequestOpened(r) | Self::RequestClosed(r) => Some(r.thread),
@@ -69,6 +74,7 @@ pub enum UiEvent {
         item: ItemId,
         counter: u64,
         text: String,
+        delta_count: u64,
     },
     StorageBlocked {
         error: Option<String>,
@@ -78,6 +84,7 @@ pub enum UiEvent {
 pub struct ThreadSnapshot {
     pub items: Vec<Item>,
     pub buffered_text: BTreeMap<ItemId, String>,
+    pub delta_counts: BTreeMap<ItemId, u64>,
     pub counter: u64,
 }
 #[derive(Clone, Debug)]
@@ -177,11 +184,17 @@ impl ChangeSet {
             .keys()
             .copied()
             .chain(self.turns.values().map(|turn| turn.thread))
+            .chain(self.threads.keys().copied())
+            .chain(self.requests.values().map(|request| request.thread))
             .collect();
         for id in changed {
             let running = self
                 .turns(p, id)
                 .any(|turn| matches!(turn.state, TurnState::Running { .. }));
+            events.push(ChangeEvent::ThreadStatusChanged {
+                thread: id,
+                status: thread_status(&self.view(p, live, id).expect("changed thread")),
+            });
             events.push(ChangeEvent::ThreadLiveChanged {
                 thread: id,
                 state: self.live(live, id).state(running),

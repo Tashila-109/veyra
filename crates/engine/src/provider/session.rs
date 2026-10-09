@@ -1,5 +1,3 @@
-#[cfg(debug_assertions)]
-use super::env;
 use super::{
     ProviderError, ProviderEvent, ProviderKind, SessionControl, SessionEvent, SessionHandle,
     SessionSpec, TurnEvent,
@@ -23,17 +21,76 @@ use tokio::{
     sync::mpsc,
 };
 
-struct ProcessGroup(u32);
+struct ProcessGroup {
+    child: Option<Child>,
+    pid: u32,
+}
+impl std::ops::Deref for ProcessGroup {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        self.child.as_ref().expect("owned child")
+    }
+}
+impl std::ops::DerefMut for ProcessGroup {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("owned child")
+    }
+}
+async fn end_process(mut child: Child, pid: u32) {
+    let _ = platform::signal_group(pid, Signal::Terminate);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let _ = platform::signal_group(pid, Signal::Kill);
+    let _ = child.wait().await;
+}
+impl ProcessGroup {
+    fn new(child: Child) -> Self {
+        Self {
+            pid: child.id().expect("new child"),
+            child: Some(child),
+        }
+    }
+    async fn stop(&mut self) {
+        if let Some(child) = self.child.take() {
+            end_process(child, self.pid).await;
+        }
+    }
+}
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        let _ = platform::signal_group(self.0, Signal::Kill);
+        if let Some(child) = self.child.take() {
+            tokio::spawn(end_process(child, self.pid));
+        }
     }
 }
 struct Process {
-    child: Child,
+    child: ProcessGroup,
     native: NativeSessionId,
     #[cfg(debug_assertions)]
     recorder: Option<record::Recorder>,
+}
+impl Process {
+    fn send(
+        &mut self,
+        writer: &mpsc::UnboundedSender<serde_json::Value>,
+        line: serde_json::Value,
+    ) -> Result<(), ProviderError> {
+        #[cfg(debug_assertions)]
+        if let Some(recorder) = &mut self.recorder {
+            recorder.line(true, line.clone())?;
+        }
+        writer
+            .send(line)
+            .map_err(|_| ProviderError::Protocol("Claude stdin writer closed".into()))
+    }
+    fn record_inbound(&mut self, line: &str) -> Result<(), ProviderError> {
+        #[cfg(debug_assertions)]
+        if let Some(recorder) = &mut self.recorder {
+            recorder.line(false, serde_json::from_str(line)?)?;
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = line;
+        Ok(())
+    }
 }
 fn launch(
     spec: &SessionSpec,
@@ -42,7 +99,7 @@ fn launch(
 ) -> Result<Process, ProviderError> {
     let binary = env.resolve(ProviderKind::Claude)?;
     #[cfg(debug_assertions)]
-    let (n, epoch) = env::next_lane(spec.thread);
+    let (n, epoch) = env.next_lane(spec.thread);
     let mut args = claude::args(Some(spec));
     let native = fresh.unwrap_or_else(|| {
         spec.native
@@ -77,7 +134,7 @@ fn launch(
         .transpose()?;
     let child = env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?;
     Ok(Process {
-        child,
+        child: ProcessGroup::new(child),
         native,
         #[cfg(debug_assertions)]
         recorder,
@@ -113,7 +170,12 @@ pub fn spawn(
                     let native = NativeSessionId(ThreadId::new().to_string());
                     match launch(&spec, &env, Some(native)) {
                         Ok(next) => {
-                            if !emit(&out, thread, epoch, ProviderEvent::Session(SessionEvent::Notice { text: "The earlier conversation could not be resumed; this is a new session".into() })).await { return false; }
+                            let notice = ProviderEvent::Session(SessionEvent::Notice {
+                                text: "The earlier conversation could not be resumed; this is a new session".into(),
+                            });
+                            if !emit(&out, thread, epoch, notice).await {
+                                return false;
+                            }
                             process = next;
                         }
                         Err(error) => {
@@ -189,7 +251,6 @@ async fn run_one(
     resume: bool,
 ) -> Completion {
     let pid = process.child.id().expect("newly spawned child");
-    let _group = ProcessGroup(pid);
     let mut lines = BufReader::new(process.child.stdout.take().expect("piped stdout")).lines();
     let mut errors = BufReader::new(process.child.stderr.take().expect("piped stderr")).lines();
     let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
@@ -216,15 +277,13 @@ async fn run_one(
         Ok::<_, std::io::Error>(())
     });
     let mut codec = Codec::new(process.native.clone(), pid);
-    let initialize = claude::initialize();
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder {
-        recorder.bind(process.native.0, "<id:session>".into());
-        if let Err(error) = recorder.line(true, initialize.clone()) {
-            return Completion::Exited(Some(error.to_string()));
-        }
+        recorder.bind(process.native.0.clone(), "<id:session>".into());
     }
-    let _ = writer.send(initialize);
+    if let Err(error) = process.send(&writer, claude::initialize()) {
+        return Completion::Exited(Some(error.to_string()));
+    }
     let mut failure = None;
     let mut consumer_gone = false;
     let mut writer_done = false;
@@ -233,7 +292,11 @@ async fn run_one(
             _ = out.closed() => { consumer_gone = true; break; }
             result = &mut write_task => {
                 writer_done = true;
-                failure = Some(match result { Ok(Err(error)) => format!("Claude stdin writer failed: {error}"),Err(error) => format!("Claude stdin writer task failed: {error}"),Ok(Ok(())) => "Claude stdin writer closed".into() });
+                failure = Some(match result {
+                    Ok(Err(error)) => format!("Claude stdin writer failed: {error}"),
+                    Err(error) => format!("Claude stdin writer task failed: {error}"),
+                    Ok(Ok(())) => "Claude stdin writer closed".into(),
+                });
                 break;
             }
             message = control.recv() => match message {
@@ -242,33 +305,38 @@ async fn run_one(
                     #[cfg(debug_assertions)]
                     if let Some(recorder) = &mut process.recorder {
                         recorder.bind(turn.to_string(), format!("<id:turn:{turn}>"));
-                        if let Err(error) = recorder.line(true, line.clone()) { failure = Some(error.to_string()); break; }
                     }
-                    if writer.send(line).is_err() { failure = Some("Claude stdin writer closed".into()); break; }
+                    if let Err(error) = process.send(&writer, line) {
+                        failure = Some(error.to_string());
+                        break;
+                    }
                 }
                 Some(SessionControl::Shutdown) | None => break,
                 Some(SessionControl::Interrupt) => {
-                    let line = serde_json::json!({"type":"control_request","request_id":"veyra-interrupt","request":{"subtype":"interrupt"}});
-                    #[cfg(debug_assertions)]
-                    if let Some(recorder) = &mut process.recorder && let Err(error) = recorder.line(true,line.clone()) { failure = Some(error.to_string()); break; }
-                    let _ = writer.send(line);
+                    let line = serde_json::json!({
+                        "type":"control_request", "request_id":"veyra-interrupt",
+                        "request":{"subtype":"interrupt"}
+                    });
+                    if let Err(error) = process.send(&writer, line) {
+                        failure = Some(error.to_string());
+                        break;
+                    }
                 }
                 Some(SessionControl::Answer { .. }) => {}
             },
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
-                    #[cfg(debug_assertions)]
-                    if let Some(recorder) = &mut process.recorder {
-                        match serde_json::from_str(&line).map_err(std::io::Error::from).and_then(|value| recorder.line(false, value)) {
-                            Ok(()) => {}, Err(error) => { failure = Some(error.to_string()); break; }
-                        }
+                    if let Err(error) = process.record_inbound(&line) {
+                        failure = Some(error.to_string());
+                        break;
                     }
                     match codec.line(&line) {
                         Ok(decoded) => {
                             for reply in decoded.replies {
-                                #[cfg(debug_assertions)]
-                                if let Some(recorder) = &mut process.recorder && let Err(error) = recorder.line(true,reply.clone()) { failure = Some(error.to_string()); break; }
-                                let _ = writer.send(reply);
+                                if let Err(error) = process.send(&writer, reply) {
+                                    failure = Some(error.to_string());
+                                    break;
+                                }
                             }
                             if failure.is_some() { break; }
                             for event in decoded.events {
@@ -307,6 +375,7 @@ async fn run_one(
         );
     }
     if consumer_gone {
+        process.child.stop().await;
         return Completion::ConsumerGone;
     }
     if resume
@@ -314,6 +383,7 @@ async fn run_one(
             .iter()
             .any(|line| line.contains("No conversation found with session ID"))
     {
+        process.child.stop().await;
         return Completion::MissingSession;
     }
     let crash = if let Some(turn) = codec.current {
@@ -345,8 +415,7 @@ async fn run_one(
     } else {
         None
     };
-    let _ = process.child.start_kill();
-    let _ = process.child.wait().await;
+    process.child.stop().await;
     Completion::Exited(crash)
 }
 
@@ -368,7 +437,11 @@ pub fn crash_text(code: Option<i32>, lines: &[String], token: Option<&str>) -> S
     text
 }
 
-pub async fn probe(env: &ChildEnv) -> Result<super::Probe, ProviderError> {
+pub async fn probe(
+    env: &ChildEnv,
+    cwd: &std::path::Path,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
+) -> Result<super::Probe, ProviderError> {
     let binary = env.resolve(ProviderKind::Claude)?;
     #[cfg(debug_assertions)]
     let fixture = env.fixtures.as_ref().map(|root| root.join("probe.jsonl"));
@@ -383,52 +456,76 @@ pub async fn probe(env: &ChildEnv) -> Result<super::Probe, ProviderError> {
             })
             .unwrap_or_default()
     } else {
-        let mut child = env
-            .command(&binary, &["--version".into()], &std::env::current_dir()?)
-            .spawn()?;
-        let _group = ProcessGroup(child.id().expect("newly spawned version probe"));
+        let mut child =
+            ProcessGroup::new(env.command(&binary, &["--version".into()], cwd).spawn()?);
         let mut stdout = BufReader::new(child.stdout.take().expect("piped version stdout")).lines();
-        let line = stdout.next_line().await?.unwrap_or_default();
-        let _ = child.wait().await;
-        line
+        let result = tokio::select! {
+            _ = &mut cancelled => Err(ProviderError::Cancelled),
+            result = async {
+                let line = stdout.next_line().await?.unwrap_or_default();
+                child.wait().await?;
+                Ok::<_, ProviderError>(line)
+            } => result,
+        };
+        child.stop().await;
+        result?
     };
-    let mut child = env.spawn(
-        &binary,
-        &claude::args(None),
-        &std::env::current_dir()?,
-        fixture.as_deref(),
-    )?;
-    let _group = ProcessGroup(child.id().expect("newly spawned probe"));
+    #[cfg(debug_assertions)]
+    let mut recorder = env
+        .record
+        .as_ref()
+        .map(|root| {
+            let path = root.join("probe.jsonl");
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            record::Recorder::create(&path, "claude", &version, cwd, None)
+        })
+        .transpose()?;
+    let mut child =
+        ProcessGroup::new(env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?);
     let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
     let mut stdin = child.stdin.take().expect("piped stdin");
-    stdin
-        .write_all(format!("{}\n", claude::initialize()).as_bytes())
-        .await?;
-    stdin.flush().await?;
-    let result = loop {
-        match lines.next_line().await? {
-            Some(line) => {
+    let result = tokio::select! {
+        _ = &mut cancelled => Err(ProviderError::Cancelled),
+        result = async {
+            let initialize = claude::initialize();
+            #[cfg(debug_assertions)]
+            if let Some(recorder) = &mut recorder {
+                recorder.line(true, initialize.clone())?;
+            }
+            stdin.write_all(format!("{initialize}\n").as_bytes()).await?;
+            stdin.flush().await?;
+            while let Some(line) = lines.next_line().await? {
+                #[cfg(debug_assertions)]
+                if let Some(recorder) = &mut recorder {
+                    recorder.line(false, serde_json::from_str(&line)?)?;
+                }
                 if let Some(reply) = claude::probe_reply(&line)? {
-                    break Ok(super::Probe {
+                    return Ok(super::Probe {
                         provider: ProviderKind::Claude,
                         path: Some(binary.clone()),
-                        version: Some(version),
+                        version: (!version.is_empty()).then_some(version),
                         readiness: super::Readiness::Ready,
                         models: reply.models,
                         account: reply.account,
                     });
                 }
             }
-            None => {
-                break Err(ProviderError::Protocol(
-                    "Claude initialize ended without a reply".into(),
-                ));
-            }
-        }
+            Err(ProviderError::Protocol("Claude initialize ended without a reply".into()))
+        } => result,
     };
     drop(stdin);
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+    #[cfg(debug_assertions)]
+    let code = child
+        .try_wait()?
+        .and_then(|status| status.code())
+        .unwrap_or(-1);
+    child.stop().await;
+    #[cfg(debug_assertions)]
+    if let Some(recorder) = &mut recorder {
+        recorder.exit(code)?;
+    }
     result
 }
 

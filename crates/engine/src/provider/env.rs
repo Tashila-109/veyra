@@ -3,7 +3,10 @@ use super::{ProviderError, ProviderKind};
 use crate::domain::ThreadId;
 use crate::platform;
 #[cfg(debug_assertions)]
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -20,21 +23,20 @@ static LOGIN_PATH: LazyLock<OsString> = LazyLock::new(|| {
 pub struct ChildEnv {
     pub path: OsString,
     #[cfg(debug_assertions)]
+    lanes: Arc<Mutex<Lanes>>,
+    #[cfg(debug_assertions)]
     pub claude_bin: Option<PathBuf>,
     #[cfg(debug_assertions)]
     pub fixtures: Option<PathBuf>,
     #[cfg(debug_assertions)]
     pub record: Option<PathBuf>,
 }
-impl Default for ChildEnv {
-    fn default() -> Self {
-        Self::load()
-    }
-}
 impl ChildEnv {
     pub fn load() -> Self {
         Self {
             path: LOGIN_PATH.clone(),
+            #[cfg(debug_assertions)]
+            lanes: Arc::default(),
             #[cfg(debug_assertions)]
             claude_bin: std::env::var_os("VEYRA_CLAUDE_BIN").map(PathBuf::from),
             #[cfg(debug_assertions)]
@@ -63,6 +65,7 @@ impl ChildEnv {
         std::env::split_paths(&gui)
             .chain(std::env::split_paths(&self.path))
             .chain(known)
+            .filter(|dir| dir.is_absolute())
             .find_map(|dir| executable(&dir.join(name)))
             .ok_or_else(|| ProviderError::NotInstalled(name.into()))
     }
@@ -120,42 +123,78 @@ fn executable(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(debug_assertions)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Lanes {
     threads: BTreeMap<ThreadId, (usize, u32)>,
 }
 #[cfg(debug_assertions)]
-static LANES: LazyLock<Mutex<Lanes>> = LazyLock::new(|| Mutex::new(Lanes::default()));
-#[cfg(debug_assertions)]
-pub(crate) fn register_thread(thread: ThreadId) {
-    let mut lanes = LANES.lock().unwrap();
-    let next = lanes.threads.len() + 1;
-    lanes.threads.entry(thread).or_insert((next, 0));
-}
-#[cfg(debug_assertions)]
-pub(crate) fn next_lane(thread: ThreadId) -> (usize, u32) {
-    let mut lanes = LANES.lock().unwrap();
-    let next = lanes.threads.len() + 1;
-    let entry = lanes.threads.entry(thread).or_insert((next, 0));
-    entry.1 += 1;
-    *entry
+impl ChildEnv {
+    pub(crate) fn register_thread(&self, thread: ThreadId) {
+        let mut lanes = self.lanes.lock().unwrap();
+        let next = lanes.threads.len() + 1;
+        lanes.threads.entry(thread).or_insert((next, 0));
+    }
+    pub(crate) fn next_lane(&self, thread: ThreadId) -> (usize, u32) {
+        let mut lanes = self.lanes.lock().unwrap();
+        let next = lanes.threads.len() + 1;
+        let entry = lanes.threads.entry(thread).or_insert((next, 0));
+        entry.1 += 1;
+        *entry
+    }
 }
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::{next_lane, register_thread};
+    use super::ChildEnv;
     use crate::domain::ThreadId;
     #[test]
+    fn resolution_skips_relative_and_empty_path_entries() {
+        if let Some(root) = std::env::var_os("VEYRA_TEST_RESOLUTION") {
+            let env = super::ChildEnv {
+                path: "bin::.".into(),
+                lanes: Default::default(),
+                claude_bin: None,
+                fixtures: None,
+                record: None,
+            };
+            let selected = env.resolve(super::ProviderKind::Claude).ok();
+            let planted =
+                std::fs::canonicalize(std::path::PathBuf::from(root).join("bin/claude")).unwrap();
+            assert_ne!(selected, Some(planted));
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("veyra-resolution-{}", ThreadId::new()));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::copy("/bin/echo", root.join("bin/claude")).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "provider::env::tests::resolution_skips_relative_and_empty_path_entries",
+            ])
+            .current_dir(&root)
+            .env("PATH", "bin::.")
+            .env("VEYRA_TEST_RESOLUTION", &root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+    }
+    #[test]
     fn recording_lanes_follow_creation_not_spawn_order() {
+        let env = ChildEnv::load();
         let first = ThreadId::new();
         let second = ThreadId::new();
-        register_thread(first);
-        register_thread(second);
-        let second_first = next_lane(second);
-        let first_first = next_lane(first);
+        env.register_thread(first);
+        env.register_thread(second);
+        let second_first = env.next_lane(second);
+        let first_first = env.next_lane(first);
         assert!(first_first.0 < second_first.0);
         assert_eq!(first_first.1, 1);
         assert_eq!(second_first.1, 1);
-        assert_eq!(next_lane(second), (second_first.0, 2));
+        assert_eq!(env.next_lane(second), (second_first.0, 2));
     }
 }

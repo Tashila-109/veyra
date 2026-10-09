@@ -40,11 +40,34 @@ PYTHONPATH="$PROOF" python3 - <<'PY'
 from driver import *
 identity()
 before = ctl('chat-before','dump')
+if LANE == 'live':
+    thread = create('live-chat','reply with the word ok')
+    working = ctl('chat-working','dump')
+    assert working['selected_thread']['status'] == 'Working'
+    assert working['selected_thread']['header_status'].startswith('Working · ')
+    capture('chat-working')
+    done = ctl('chat-live-done','wait',thread,'Done','120')
+    save('chat-done',done)
+    reply = [item for item in done['transcript'] if item['kind']=='assistant']
+    assert len(reply) == 1 and reply[0]['text'].strip().lower() == 'ok' and reply[0]['done']
+    assert reply[0]['delta_count'] >= 1
+    assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"'")) == 'Completed'
+    assert sql("select json_extract(body_json,'$.AssistantText.text') from items where thread_id='"
+        +thread+"' and kind='assistant_text'").strip().lower() == 'ok'
+    assert sql("select native_id is not null and cli_version is not null and cli_version != '' "
+        +"from threads where id='"+thread+"'") == '1'
+    capture('chat-done')
+    page_done('chat-send-stream-live')
+    print('PASS live streamed reply; Working to Done; stored reply and native metadata')
+    sys.exit(0)
 thread = create('chat','reply with the word ok',slow=True)
 working = ctl('chat-wait-working','wait',thread,'Working')
 assert working['selected_thread']['status'] == 'Working'
-stream = poll('chat-working',lambda d: any(item['kind']=='assistant' and item['text']=='o' and not item['done'] for item in d['transcript']))
+stream = poll('chat-working',lambda d: any(item['kind']=='assistant' and item['text']=='o'
+    and not item['done'] for item in d['transcript']))
 assert stream['selected_thread']['status'] == 'Working'
+assert stream['selected_thread']['header_status'].startswith('Working · ')
+assert next(item for item in stream['transcript'] if item['kind']=='assistant')['delta_count'] >= 1
 assert stream['composer_text'] == ''
 assert stream['selected_thread']['native_id']
 capture('chat-working')
@@ -54,10 +77,14 @@ assert done['view'] == 'chat' and done['selected_thread']['status'] == 'Done'
 assert [item['text'] for item in done['transcript'] if item['kind']=='user'] == ['reply with the word ok']
 assert [(item['text'],item['done']) for item in done['transcript'] if item['kind']=='assistant'] == [('ok',True)]
 assert done['perf']['applied_batches'] > before['perf']['applied_batches']
-assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"' order by ordinal desc limit 1")) == 'Completed'
+assert json.loads(sql("select outcome_json from turns where thread_id='"+thread
+    +"' order by ordinal desc limit 1")) == 'Completed'
+assert sql("select json_extract(body_json,'$.AssistantText.text')||'|'||done from items where thread_id='"
+    +thread+"' and kind='assistant_text'") == 'ok|1'
+assert done['selected_thread']['header_status'].startswith('Done · ')
 capture('chat-done')
 ctl('chat-wait-missing','wait','missing-thread','Done',expected=3)
-ctl('chat-wait-timeout','wait',thread,'Working','0',expected=1)
+ctl('chat-wait-timeout','wait',thread,'Working','0',expected=1,stderr_contains='veyra ctl wait timed out:')
 ctl('chat-wait-bad-usage','wait',thread,'unknown-status',expected=2)
 failed = create('chat-crash','reply with the word ok',scenario='crash-mid-turn')
 crash = ctl('chat-wait-failed','wait',failed,'Failed')
@@ -83,15 +110,30 @@ action('chat-tool-expand','ToggleItem',{'item':tool['id']})
 assert next(item for item in ctl('chat-tool-expanded','dump')['transcript'] if item['id']==tool['id'])['expanded']
 capture('chat-tool-expanded')
 action('chat-tool-collapse','ToggleItem',{'item':tool['id']})
-assert not next(item for item in ctl('chat-tool-collapsed-action','dump')['transcript'] if item['id']==tool['id'])['expanded']
+collapsed = ctl('chat-tool-collapsed-action','dump')['transcript']
+assert not next(item for item in collapsed if item['id']==tool['id'])['expanded']
 latest = next(item['id'] for item in reversed(tools['transcript']) if item['kind'] in ['tool','reasoning'])
 action('chat-detail-default-expand','ToggleItem')
 assert next(item for item in ctl('chat-detail-default-expanded','dump')['transcript'] if item['id']==latest)['expanded']
 action('chat-detail-default-collapse','ToggleItem')
 for expanded in [True,False]:
     ctl('chat-detail-key-'+str(expanded),'keys','secondary-shift-i')
-    assert next(item for item in ctl('chat-detail-key-after-'+str(expanded),'dump')['transcript'] if item['id']==latest)['expanded'] == expanded
+    items = ctl('chat-detail-key-after-'+str(expanded),'dump')['transcript']
+    assert next(item for item in items if item['id']==latest)['expanded'] == expanded
+background = create('chat-background','reply with the word ok',scenario='background-tasks')
+busy = poll('chat-background-working',lambda d: d['selected_thread']['id']==background
+    and d['selected_thread']['status']=='Working'
+    and sql("select count(*) from turns where thread_id='"+background+"' and state='ended'")=='1')
+assert busy['selected_thread']['header_status'].startswith('Working · ')
+ctl('chat-background-done','wait',background,'Done')
+provider = create('chat-provider','reply with the word ok',scenario='provider-turn-after-background')
+provider_done = poll('chat-provider-done',lambda d: d['selected_thread']['id']==provider
+    and d['selected_thread']['status']=='Done'
+    and sql("select count(*) from turns where thread_id='"+provider+"' and state='ended'")=='2')
+assert sql("select group_concat(json_extract(outcome_json,'$')) from turns where thread_id='"
+    +provider+"'") == 'Completed,Completed'
 poll('chat-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null') == '0')
+page_done('chat-send-stream')
 print('PASS chat streamed o → ok, Working → Done; crash cause/tail; Retry; wait exits 0/1/2/3')
 PY
 ```
@@ -100,7 +142,9 @@ PY
 
 - `chat-working.json` has Working, assistant `o` with `done: false`, a native id and cleared composer; inspect its PNG for the caret and Working header.
 - `chat-done.json` has one user prompt and exactly one completed assistant `ok`, Done in the selected thread and sidebar, and an increased applied-batch counter.
-- The SQLite turn outcome is Completed.
+- `sql.log` keeps the SQLite `outcome_json` Completed and stored assistant `ok|1` checks.
+- `selected_thread.header_status` includes elapsed seconds; streamed assistant items have a positive `delta_count`.
+- `chat-background-working.json` stays Working after its foreground turn ends; `chat-provider-done.json` returns Done after the separate provider turn completes.
 - `chat-failed.json` has `view: failed_thread`, Failed and the crash cause with both fixture stderr lines; its PNG shows the cause, next step, Retry and Open Terminal.
 - `chat-retried.json` has Done with the retried completed `ok`.
 - `drive.log` records wait exit 0 for each state, 1 for the zero-second timeout, 2 for bad usage and 3 for a missing thread.
@@ -110,7 +154,7 @@ PY
 ## Gotchas
 
 Replay is not a live permission or tool proof.
-No approvals, questions or Stop UI are implemented in this phase.
+No approvals, questions or Stop UI are implemented.
 A streamed row may complete before the turn ends; the header remains Working until the result.
 Open Terminal and native mouse/keyboard entry points remain manual checks.
 The lead fills the Status values after its gate.

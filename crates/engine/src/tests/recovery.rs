@@ -43,6 +43,7 @@ fn settle_report(f: &mut Fixture) -> (ThreadId, TaskId, TurnId) {
         child,
         turn,
         TurnEvent::TextDelta {
+            streamed: true,
             key: NativeItemKey("report".into()),
             text: "final report".into(),
         },
@@ -96,6 +97,7 @@ fn later_child_reply(f: &mut Fixture, child: ThreadId) {
         child,
         turn,
         TurnEvent::TextDelta {
+            streamed: true,
             key: NativeItemKey("later-reply".into()),
             text: "later child reply".into(),
         },
@@ -304,6 +306,67 @@ fn reconcile_fixture(f: &mut Fixture) {
     f.save(c);
 }
 #[test]
+fn startup_completes_interrupted_transcript_items() {
+    let mut f = Fixture::new(LiveState::Running);
+    let turn = f.running().unwrap();
+    let bodies = [
+        ItemBody::AssistantText {
+            text: "partial reply".into(),
+            done: false,
+        },
+        ItemBody::Reasoning {
+            text: "partial thought".into(),
+            done: false,
+        },
+        ItemBody::Tool(ToolItem {
+            call: ToolCall {
+                name: "Bash".into(),
+                arguments: serde_json::json!({}),
+            },
+            result: None,
+        }),
+    ];
+    let mut changes = ChangeSet::default();
+    for (seq, body) in bodies.into_iter().enumerate() {
+        let item = Item {
+            id: ItemId::new(),
+            thread: f.thread,
+            turn,
+            seq: seq as u32 + 1,
+            body,
+        };
+        changes.items.insert(item.id, item);
+    }
+    f.save(changes);
+    let (out, _rx) = mpsc::channel(256);
+    let recovered = Actor::new(f.actor.db, out, Spawner::Scripted(Scripted::default())).unwrap();
+    let rows = store::load(&recovered.db).unwrap();
+    let items: Vec<_> = rows
+        .items_for(f.thread)
+        .map(|item| item.body.clone())
+        .collect();
+    assert!(items.contains(&ItemBody::AssistantText {
+        text: "partial reply".into(),
+        done: true
+    }));
+    assert!(items.contains(&ItemBody::Reasoning {
+        text: "partial thought".into(),
+        done: true
+    }));
+    assert!(
+        items
+            .iter()
+            .any(|body| matches!(body, ItemBody::Tool(tool) if tool.result.is_some()))
+    );
+    assert!(matches!(
+        rows.turns[&turn].state,
+        TurnState::Ended {
+            outcome: TurnOutcome::Interrupted { .. },
+            ..
+        }
+    ));
+}
+#[test]
 fn send_to_held_empty_queue_clears_hold() {
     let mut f = Fixture::new(LiveState::Idle);
     f.hold(Some(HoldReason::Restarted));
@@ -364,6 +427,7 @@ fn child_settlement_keeps_final_buffered_report() {
     let child_epoch = f.actor.live[&child].epoch;
     for event in [
         TurnEvent::TextDelta {
+            streamed: true,
             key: NativeItemKey("child-report".into()),
             text: "final report".into(),
         },

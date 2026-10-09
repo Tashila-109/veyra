@@ -1,42 +1,46 @@
 use regex::{Captures, Regex};
 use std::sync::LazyLock;
 
-static MATCHES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    [
-        r#"(?i)(Bearer\s+)([^\s",]+)"#,
-        r#"(?i)([\w.-]*(?:token|key|secret|password|auth)[\w.-]*["\s]*[:=]\s*"?)([^\s",]+)"#,
-        r"\b((?:sk-[A-Za-z0-9_-]{17,}|xai-[A-Za-z0-9_-]{16,}))",
-        r"(://[^:/\s]+:)([^@\s]+)(@)",
-    ]
-    .into_iter()
-    .map(|pattern| Regex::new(pattern).expect("redaction expression"))
-    .collect()
+struct Redaction {
+    expression: Regex,
+    secret_group: usize,
+    replacement: &'static str,
+}
+static MATCHES: LazyLock<Vec<Redaction>> =
+    LazyLock::new(|| {
+        [
+        (r#"(?i)(Bearer\s+)([^\s",]+)"#, 2, "${1}[redacted]"),
+        (r#"(?i)([\w.-]*(?:token|key|secret|password|auth)[\w.-]*["\s]*[:=]\s*"?)([^\s",]+)"#,
+            2, "${1}[redacted]"),
+        (r"\b((?:sk-[A-Za-z0-9_-]{17,}|xai-[A-Za-z0-9_-]{16,}))", 1, "[redacted]"),
+        (r"(://[^:/\s]+:)([^@\s]+)(@)", 2, "${1}[redacted]@"),
+    ].into_iter().map(|(pattern, secret_group, replacement)| Redaction {
+        expression: Regex::new(pattern).expect("redaction expression"), secret_group, replacement,
+    }).collect()
+    });
+static HOME_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"/(?:Users|home)/[^/\s"<>]+(?:/|\b)"#).expect("personal home path expression")
 });
-
-fn wildcard(value: &str) -> bool {
-    value == "<any>" || value == "<cwd>" || (value.starts_with("<id:") && value.ends_with('>'))
-}
-
 pub fn secret_shapes(text: &str) -> bool {
-    MATCHES.iter().enumerate().any(|(index, expression)| {
-        expression.captures_iter(text).any(|capture| {
-            let value = &capture[if index == 2 { 1 } else { 2 }];
-            !wildcard(value)
+    HOME_PATH.is_match(text)
+        || MATCHES.iter().any(|rule| {
+            rule.expression
+                .captures_iter(text)
+                .any(|capture| !crate::fixture::wildcard(&capture[rule.secret_group]))
         })
-    })
 }
-
 pub fn redact(text: &str, token: Option<&str>) -> String {
     let mut text = match token.filter(|token| !token.is_empty()) {
         Some(token) => text.replace(token, "[redacted]"),
         None => text.to_owned(),
     };
-    for (index, expression) in MATCHES.iter().enumerate() {
-        text = expression
-            .replace_all(&text, |capture: &Captures<'_>| match index {
-                2 => "[redacted]".to_owned(),
-                3 => format!("{}[redacted]@", &capture[1]),
-                _ => format!("{}[redacted]", &capture[1]),
+    for rule in MATCHES.iter() {
+        text = rule
+            .expression
+            .replace_all(&text, |capture: &Captures<'_>| {
+                let mut replacement = String::new();
+                capture.expand(rule.replacement, &mut replacement);
+                replacement
             })
             .into_owned();
     }
@@ -55,6 +59,33 @@ mod capture {
         path::Path,
     };
 
+    fn mask_account(value: Value) -> Value {
+        match value {
+            Value::Object(object) => Value::Object(
+                object
+                    .into_iter()
+                    .map(|(key, value)| (key, mask_account(value)))
+                    .collect(),
+            ),
+            Value::Array(array) => Value::Array(array.into_iter().map(mask_account).collect()),
+            _ => "<any>".into(),
+        }
+    }
+    fn mask_hook_output(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if ["stdout", "stderr", "output", "content"].contains(&key.as_str()) {
+                        *value = "<hook-output>".into();
+                    } else {
+                        mask_hook_output(value);
+                    }
+                }
+            }
+            Value::Array(array) => array.iter_mut().for_each(mask_hook_output),
+            _ => {}
+        }
+    }
     pub struct Recorder {
         file: File,
         bindings: BTreeMap<String, String>,
@@ -94,7 +125,7 @@ mod capture {
         pub fn bind(&mut self, value: String, replacement: String) {
             self.bindings.insert(value, replacement);
         }
-        pub fn line(&mut self, outbound: bool, value: Value) -> io::Result<()> {
+        pub fn line(&mut self, outbound: bool, mut value: Value) -> io::Result<()> {
             if value["type"] == "system"
                 && value["subtype"] == "init"
                 && let Some(version) = value["claude_code_version"].as_str()
@@ -112,6 +143,13 @@ mod capture {
                 serde_json::to_writer(&mut self.file, &header)?;
                 self.file.write_all(b"\n")?;
                 self.file.write_all(rest.as_bytes())?;
+            }
+            if value["type"] == "system"
+                && value["subtype"]
+                    .as_str()
+                    .is_some_and(|subtype| subtype.starts_with("hook_"))
+            {
+                mask_hook_output(&mut value);
             }
             let line = self.sanitize(value, None);
             self.write(&if outbound {
@@ -139,7 +177,7 @@ mod capture {
                 return "<id:token>".into();
             }
             if key == Some("account") {
-                return "<account>".into();
+                return mask_account(value);
             }
             if key.is_some_and(|key| {
                 ["token", "key", "secret", "password", "auth"]

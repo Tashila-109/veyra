@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Claude,
@@ -53,7 +53,7 @@ pub enum ProviderEvent {
 pub enum SessionEvent {
     Ready {
         native: NativeSessionId,
-        cli_version: String,
+        cli_version: Option<String>,
         pid: u32,
         pgid: u32,
         capabilities: Vec<String>,
@@ -75,6 +75,7 @@ pub enum TurnEvent {
     TextDelta {
         key: NativeItemKey,
         text: String,
+        streamed: bool,
     },
     ReasoningDelta {
         key: NativeItemKey,
@@ -115,6 +116,8 @@ pub enum TerminalEvent {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    #[error("probe cancelled")]
+    Cancelled,
     #[error("this provider is not built yet")]
     NotBuilt,
     #[error("{0} is not installed")]
@@ -154,12 +157,32 @@ pub struct Probe {
     pub models: Vec<Model>,
     pub account: Option<serde_json::Value>,
 }
+impl Probe {
+    pub fn account_presence(&self) -> &'static str {
+        if self.account.as_ref().is_some_and(|account| match account {
+            serde_json::Value::Null => false,
+            serde_json::Value::Object(object) => !object.is_empty(),
+            _ => true,
+        }) {
+            "known"
+        } else {
+            "unknown"
+        }
+    }
+}
 impl ProviderKind {
     pub fn binary(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
+        }
+    }
+    pub fn install_hint(self) -> &'static str {
+        match self {
+            Self::Claude => "Run npm install -g @anthropic-ai/claude-code and check again.",
+            Self::Codex => "Install the Codex CLI and check again.",
+            Self::Grok => "Install the Grok CLI and check again.",
         }
     }
     pub fn sign_in_command(self) -> &'static str {
@@ -176,9 +199,18 @@ impl ProviderKind {
             Self::Grok => "Grok",
         }
     }
-    pub async fn probe(self, env: &env::ChildEnv) -> Probe {
+    pub async fn probe(self, env: &env::ChildEnv, cwd: &std::path::Path) -> Probe {
+        let (_cancel, cancelled) = tokio::sync::oneshot::channel();
+        self.probe_cancellable(env, cwd, cancelled).await
+    }
+    async fn probe_cancellable(
+        self,
+        env: &env::ChildEnv,
+        cwd: &std::path::Path,
+        cancelled: tokio::sync::oneshot::Receiver<()>,
+    ) -> Probe {
         if self == Self::Claude {
-            match session::probe(env).await {
+            match session::probe(env, cwd, cancelled).await {
                 Ok(probe) => probe,
                 Err(error) => {
                     tracing::warn!(error = %crate::record::redact(&error.to_string(),None), "provider probe failed");
@@ -219,10 +251,9 @@ impl ProviderKind {
         }
     }
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub enum Spawner {
-    #[default]
-    Cli,
+    Cli(env::ChildEnv),
     #[cfg(test)]
     Scripted(scripted::Scripted),
 }
@@ -235,16 +266,61 @@ impl Spawner {
         epoch: u32,
     ) -> Result<SessionHandle, ProviderError> {
         match self {
-            Self::Cli => provider.spawn(spec, out, epoch),
+            Self::Cli(env) => match provider {
+                ProviderKind::Claude => session::spawn(spec, env.clone(), out, epoch),
+                ProviderKind::Codex | ProviderKind::Grok => Err(ProviderError::NotBuilt),
+            },
             #[cfg(test)]
             Self::Scripted(script) => Ok(script.spawn(spec, out, epoch)),
         }
     }
     pub fn terminal(&self) -> Result<TerminalHandle, ProviderError> {
         match self {
-            Self::Cli => Err(ProviderError::NotBuilt),
+            Self::Cli(_) => Err(ProviderError::NotBuilt),
             #[cfg(test)]
             Self::Scripted(script) => Ok(script.terminal()),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Probes {
+    tasks: std::collections::BTreeMap<ProviderKind, ProbeTask>,
+}
+struct ProbeTask {
+    cancel: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Probes {
+    pub fn check(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+        provider: ProviderKind,
+        env: env::ChildEnv,
+        cwd: PathBuf,
+    ) -> tokio::sync::oneshot::Receiver<Probe> {
+        let previous = self.tasks.remove(&provider);
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.cancel.send(());
+                let _ = previous.task.await;
+            }
+            if reply.is_closed() {
+                return;
+            }
+            let probe = provider.probe_cancellable(&env, &cwd, cancelled).await;
+            let _ = reply.send(probe);
+        });
+        self.tasks.insert(provider, ProbeTask { cancel, task });
+        result
+    }
+}
+impl Drop for Probes {
+    fn drop(&mut self) {
+        for (_, task) in std::mem::take(&mut self.tasks) {
+            let _ = task.cancel.send(());
         }
     }
 }

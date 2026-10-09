@@ -71,6 +71,10 @@ pub fn initialize(db: &mut Connection) -> Result<(), StoreError> {
         tx.pragma_update(None, "user_version", (index + 1) as u32)?;
         tx.commit()?;
     }
+    db.execute(
+        "UPDATE threads SET cli_version=NULL WHERE cli_version=''",
+        [],
+    )?;
     Ok(())
 }
 fn json(value: &impl Serialize) -> Result<String, StoreError> {
@@ -133,7 +137,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
                 t.cwd.to_string_lossy(),
                 t.native.as_ref().map(|n| &n.0),
                 t.native_cursor,
-                t.cli_version,
+                t.cli_version.as_deref().filter(|version| !version.is_empty()),
                 t.hold.as_ref().map(word).transpose()?,
                 word(&t.view)?,
                 t.import_pending,
@@ -183,8 +187,9 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             ItemBody::TerminalSpan(_) => ("terminal_span", true),
         };
         tx.execute(
-            "INSERT INTO items(id,thread_id,turn_id,seq,kind,body_json,done) VALUES(?1,?2,?3,?4,?5,?6,
-             ?7) ON CONFLICT(id) DO UPDATE SET body_json=excluded.body_json,done=excluded.done",
+            "INSERT INTO items(id,thread_id,turn_id,seq,kind,body_json,done)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(id) DO UPDATE SET body_json=excluded.body_json,done=excluded.done",
             params![
                 i.id.to_string(),
                 i.thread.to_string(),
@@ -207,8 +212,8 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             RequestState::Expired { reason } => ("expired", Some(json(reason)?)),
         };
         tx.execute(
-            "INSERT INTO requests(id,thread_id,turn_id,kind,body_json,state,decision_json) VALUES(?1,
-             ?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET state=excluded.state,
+            "INSERT INTO requests(id,thread_id,turn_id,kind,body_json,state,decision_json)
+             VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET state=excluded.state,
              decision_json=excluded.decision_json",
             params![
                 r.id.to_string(),
@@ -338,7 +343,9 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             cwd: Path::new(&r.get::<_, String>(8)?).to_owned(),
             native: r.get::<_, Option<String>>(9)?.map(NativeSessionId),
             native_cursor: r.get(10)?,
-            cli_version: r.get(11)?,
+            cli_version: r
+                .get::<_, Option<String>>(11)?
+                .filter(|version| !version.is_empty()),
             hold: r
                 .get::<_, Option<String>>(12)?
                 .map(parse_word)

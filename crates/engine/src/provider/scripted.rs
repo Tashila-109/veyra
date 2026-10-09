@@ -29,7 +29,7 @@ impl Scripted {
                 let _ = out
                     .send(emit(ProviderEvent::Session(SessionEvent::Ready {
                         native: NativeSessionId(format!("script-{}", spec.thread)),
-                        cli_version: "scripted".into(),
+                        cli_version: Some("scripted".into()),
                         pid: 1,
                         pgid: 1,
                         capabilities: vec![],

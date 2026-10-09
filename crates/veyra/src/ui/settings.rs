@@ -16,40 +16,23 @@ pub fn mode_label(mode: PermissionMode) -> &'static str {
         PermissionMode::FullAccess => "Full access",
     }
 }
-pub fn mode_word(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::AskFirst => "ask_first",
-        PermissionMode::AcceptEdits => "accept_edits",
-        PermissionMode::FullAccess => "full_access",
-    }
-}
 fn description(mode: PermissionMode) -> &'static str {
     match mode {
         PermissionMode::AskFirst => {
-            "Asks before it edits files. Asks before commands the CLI does not treat as safe. Commands can use the network."
+            concat!(
+                "Asks before it edits files. Asks before commands the CLI does not treat as safe. ",
+                "Commands can use the network."
+            )
         }
         PermissionMode::AcceptEdits => {
-            "Edits files without asking. Asks before commands the CLI does not treat as safe. Commands can use the network."
+            concat!(
+                "Edits files without asking. Asks before commands the CLI does not treat as safe. ",
+                "Commands can use the network."
+            )
         }
         PermissionMode::FullAccess => {
             "Runs every edit and command without asking, inside and outside the project folder, with no sandbox."
         }
-    }
-}
-pub fn parse_mode(
-    word: Option<&str>,
-    current: PermissionMode,
-) -> Result<PermissionMode, &'static str> {
-    match word {
-        Some(word) => MODES
-            .into_iter()
-            .find(|mode| mode_word(*mode) == word)
-            .ok_or("Unknown permission mode"),
-        None => Ok(match current {
-            PermissionMode::AskFirst => PermissionMode::AcceptEdits,
-            PermissionMode::AcceptEdits => PermissionMode::FullAccess,
-            PermissionMode::FullAccess => PermissionMode::AskFirst,
-        }),
     }
 }
 pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> impl IntoElement {
@@ -79,9 +62,7 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                             .selected(mode == settings.default_mode)
                             .on_click(move |_, window, cx| {
                                 window.dispatch_action(
-                                    Box::new(SetDefaultMode {
-                                        mode: Some(mode_word(mode).into()),
-                                    }),
+                                    Box::new(SetDefaultMode { mode: Some(mode) }),
                                     cx,
                                 )
                             })

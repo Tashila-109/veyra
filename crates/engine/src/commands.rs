@@ -791,13 +791,7 @@ pub fn queue_wake(
             }
         }
     }
-    for event in &mut c.events {
-        if let Ev::TurnQueued(queued) = event
-            && queued.id == turn.id
-        {
-            *queued = turn.clone();
-        }
-    }
+
     let id = turn.id;
     c.turns.insert(id, turn);
     id

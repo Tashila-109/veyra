@@ -4,22 +4,8 @@ use super::{
 use gpui_kit::component::StyledExt;
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::Status;
-pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
-    let t = cx.global::<Theme>();
-    let title = match shell.view {
-        MainView::Settings => "Settings".to_owned(),
-        MainView::NewThread => "New thread".to_owned(),
-        MainView::Chat => shell
-            .selected
-            .and_then(|id| shell.state.threads.get(&id))
-            .map(|thread| thread.title.clone())
-            .unwrap_or_default(),
-    };
-    let status = shell
-        .selected
-        .filter(|_| shell.view == MainView::Chat)
-        .map(|thread| shell.state.status(thread));
-    let text = status.as_ref().map(|status| match status {
+pub(super) fn status_text(status: &Status) -> String {
+    match status {
         Status::Working { since } => format!(
             "Working · {}s",
             if *since > 0 {
@@ -30,10 +16,25 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
         ),
         Status::Done { took } => format!("Done · {}s", took / 1000),
         _ => status_name(status).into(),
-    });
+    }
+}
+pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
+    let t = cx.global::<Theme>();
+    let title = match shell.view {
+        MainView::Settings { .. } => "Settings".to_owned(),
+        MainView::NewThread => "New thread".to_owned(),
+        MainView::Chat(thread) => shell
+            .state
+            .threads
+            .get(&thread)
+            .map(|thread| thread.title.clone())
+            .unwrap_or_default(),
+    };
+    let status = shell.view.chat().map(|thread| shell.state.status(thread));
+    let text = status.as_ref().map(status_text);
     let project = shell
-        .selected
-        .filter(|_| shell.view == MainView::Chat)
+        .view
+        .chat()
         .and_then(|id| shell.state.threads.get(&id))
         .and_then(|thread| shell.state.projects.get(&thread.project))
         .or_else(|| shell.project.and_then(|id| shell.state.projects.get(&id)))

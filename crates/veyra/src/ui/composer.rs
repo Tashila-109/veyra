@@ -5,9 +5,9 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     input::Textarea,
     menu::DropdownMenu,
+    popover::Popover,
 };
 use gpui_kit::{prelude::*, *};
-use veyra_engine::provider::{ProviderKind, Readiness};
 
 pub fn labelled_button(
     id: impl Into<ElementId>,
@@ -29,36 +29,12 @@ pub fn labelled_button(
                 .child(label),
         )
 }
-pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
+pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let config = shell.composer_config().clone();
     let provider = shell.chosen_provider();
-    let provider_rows: Vec<_> = [
-        ProviderKind::Claude,
-        ProviderKind::Codex,
-        ProviderKind::Grok,
-    ]
-    .into_iter()
-    .map(|provider| {
-        let state = shell
-            .providers
-            .iter()
-            .find(|probe| probe.provider == provider)
-            .map(|probe| &probe.readiness)
-            .unwrap_or(&Readiness::Checking);
-        let state = match state {
-            Readiness::Ready => "Ready",
-            Readiness::NotInstalled => "Not installed",
-            Readiness::SignedOut => "Signed out",
-            Readiness::Checking => "Checking…",
-        };
-        (provider, format!("{} · {state}", provider.label()))
-    })
-    .collect();
     let models = shell
-        .providers
-        .iter()
-        .find(|probe| probe.provider == provider)
+        .probe(provider)
         .map(|probe| probe.models.clone())
         .unwrap_or_default();
     let efforts = models
@@ -67,19 +43,22 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
         .or_else(|| models.first())
         .map(|model| model.effort_levels.clone())
         .unwrap_or_default();
-    let provider_button = labelled_button("provider", provider.label(), cx)
-        .disabled(shell.view != MainView::NewThread)
-        .dropdown_menu(move |mut menu, _, _| {
-            for (provider, label) in &provider_rows {
-                menu = menu.menu(
-                    label.clone(),
-                    Box::new(PickProvider {
-                        provider: Some(provider.binary().into()),
-                    }),
-                );
-            }
-            menu
-        });
+    let this = cx.entity().downgrade();
+    let menu = shell.provider_picker.clone();
+    let provider_button = Popover::new("provider-picker")
+        .appearance(false)
+        .open(menu.is_some())
+        .when_some(menu.as_ref(), |popover, menu| {
+            popover.track_focus(&menu.focus_handle(cx))
+        })
+        .trigger(
+            labelled_button("provider", provider.label(), cx)
+                .disabled(shell.view != MainView::NewThread),
+        )
+        .on_open_change(move |open, window, cx| {
+            let _ = this.update(cx, |shell, cx| shell.set_provider_picker(*open, window, cx));
+        })
+        .content(move |_, _, _| div().children(menu.clone()));
     let model_button = labelled_button(
         "model",
         config
@@ -120,9 +99,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
             for mode in settings::MODES {
                 menu = menu.menu(
                     settings::mode_label(mode),
-                    Box::new(PickPermission {
-                        mode: Some(settings::mode_word(mode).into()),
-                    }),
+                    Box::new(PickPermission { mode: Some(mode) }),
                 );
             }
             menu

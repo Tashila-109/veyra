@@ -30,7 +30,10 @@ fn capture_never_contains_token() {
     let token = "veyra-test-credential-abcdefgh";
     let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, Some(token)).unwrap();
     recorder.bind("native-session".into(), "<id:session>".into());
-    recorder.line(true, json!({"type":"user","uuid":"prompt-id","session_id":"native-session","cwd":scratch.0,"access_token":token,"password":"my-password","message":"Bearer another-credential"})).unwrap();
+    recorder.line(true, json!({
+        "type":"user", "uuid":"prompt-id", "session_id":"native-session", "cwd":scratch.0,
+        "access_token":token, "password":"my-password", "message":"Bearer another-credential"
+    })).unwrap();
     recorder
         .line(
             false,
@@ -56,7 +59,15 @@ fn capture_binds_token_and_updates_cli_version() {
     let mut recorder =
         Recorder::create(&path, "claude", "unknown", &scratch.0, Some(token)).unwrap();
     recorder.line(true, json!({"access_token":token})).unwrap();
-    recorder.line(false,json!({"type":"system","subtype":"init","claude_code_version":"2.1.295","account":{"email":"private-account-placeholder"}})).unwrap();
+    recorder
+        .line(
+            false,
+            json!({
+                "type":"system", "subtype":"init", "claude_code_version":"2.1.295",
+                "account":{"email":"private-account-placeholder"}
+            }),
+        )
+        .unwrap();
     recorder.exit(0).unwrap();
     let rows: Vec<serde_json::Value> = fs::read_to_string(&path)
         .unwrap()
@@ -65,7 +76,7 @@ fn capture_binds_token_and_updates_cli_version() {
         .collect();
     assert_eq!(rows[0]["cli_version"], "2.1.295");
     assert_eq!(rows[1]["line"]["access_token"], "<id:token>");
-    assert_eq!(rows[2]["line"]["account"], "<account>");
+    assert_eq!(rows[2]["line"]["account"], json!({"email":"<any>"}));
     assert!(
         !fs::read_to_string(&path)
             .unwrap()
@@ -114,4 +125,41 @@ fn fixtures_hold_no_secret_shapes() {
     assert!(!record::secret_shapes(
         "Bearer <id:token> password=<any> url=https://user:<any>@example.invalid"
     ));
+    assert!(record::secret_shapes(
+        "/Users/example-person/private-project"
+    ));
+}
+
+#[test]
+fn capture_hides_hook_output_and_preserves_account_keys() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("capture.jsonl");
+    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None).unwrap();
+    recorder
+        .line(
+            false,
+            json!({
+                "type":"system", "subtype":"hook_response", "stdout":"personal hook prose",
+                "stderr":"personal diagnostic", "output":{"content":"personal nested output"},
+            }),
+        )
+        .unwrap();
+    recorder
+        .line(
+            false,
+            json!({"account":{"organization":{"name":"personal account prose"}}}),
+        )
+        .unwrap();
+    let text = fs::read_to_string(path).unwrap();
+    assert!(!text.contains("personal"));
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows[1]["line"]["stdout"], "<hook-output>");
+    assert_eq!(rows[1]["line"]["stderr"], "<hook-output>");
+    assert_eq!(
+        rows[2]["line"]["account"],
+        json!({"organization":{"name":"<any>"}})
+    );
 }

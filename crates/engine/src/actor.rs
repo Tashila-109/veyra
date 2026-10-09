@@ -71,6 +71,7 @@ pub struct Actor {
     pending_snapshots: Vec<(ThreadId, oneshot::Sender<ThreadSnapshot>)>,
     counters: BTreeMap<ThreadId, u64>,
     buffers: BTreeMap<ItemId, TextBuffer>,
+    delta_counts: BTreeMap<ItemId, u64>,
     item_keys: BTreeMap<(ThreadId, u32, TurnId, NativeItemKey), ItemId>,
     idle_since: BTreeMap<ThreadId, Millis>,
     last_ui: Instant,
@@ -92,23 +93,19 @@ impl Actor {
         (self.item_keys.len(), self.buffers.len())
     }
     pub(crate) fn new(
-        mut db: Connection,
+        db: Connection,
         out: mpsc::Sender<EngineMsg>,
         spawner: Spawner,
     ) -> Result<Self, StoreError> {
-        let mut projection = store::load(&db)?;
+        let projection = store::load(&db)?;
         let c = reconcile::decide(&projection, now());
-        let tx = db.transaction()?;
-        store::apply(&tx, &c, now())?;
-        tx.commit()?;
-        let mut live = projection
+        let live = projection
             .threads
             .keys()
             .map(|id| (*id, LiveThread::default()))
             .collect();
-        c.install(&mut projection, &mut live);
         let idle_since = projection.threads.keys().map(|id| (*id, now())).collect();
-        Ok(Self {
+        let mut actor = Self {
             db,
             projection,
             live,
@@ -118,6 +115,7 @@ impl Actor {
             pending_snapshots: vec![],
             counters: BTreeMap::new(),
             buffers: BTreeMap::new(),
+            delta_counts: BTreeMap::new(),
             item_keys: BTreeMap::new(),
             idle_since,
             last_ui: Instant::now(),
@@ -126,7 +124,12 @@ impl Actor {
             blocked: None,
             #[cfg(test)]
             fail_write: false,
-        })
+        };
+        let mut c = c;
+        actor.prepare_commit(&mut c);
+        actor.write(&c)?;
+        c.install(&mut actor.projection, &mut actor.live);
+        Ok(actor)
     }
     pub(crate) fn run(mut self, mut rx: mpsc::Receiver<EngineMsg>, runtime: Handle) {
         let _entered = runtime.enter();
@@ -292,6 +295,16 @@ impl Actor {
                         TurnState::Ended { .. } => Ev::TurnEnded(turn),
                     },
                 ));
+                initial.extend(self.projection.threads.keys().map(|id| {
+                    Ev::ThreadStatusChanged {
+                        thread: *id,
+                        status: thread_status(
+                            &ChangeSet::default()
+                                .view(&self.projection, &self.live, *id)
+                                .unwrap(),
+                        ),
+                    }
+                }));
                 for event in initial {
                     let counter = event.thread().map(|id| self.next_counter(id));
                     let _ = tx.send(UiEvent::Change { counter, event });
@@ -315,11 +328,7 @@ impl Actor {
         self.prepare_commit(&mut c);
         if let Err(error) = self.write(&c) {
             for live in self.live.values() {
-                if let Live::Starting {
-                    session: Some(session),
-                }
-                | Live::Structured { session, .. } = &live.live
-                {
+                if let Some(session) = live.live.session() {
                     let _ = session.control.send(SessionControl::Interrupt);
                 }
                 if let Live::Terminal { term, .. } = &live.live {
@@ -361,15 +370,12 @@ impl Actor {
             .effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Control { thread, control } => match &self.live.get(thread)?.live {
-                    Live::Starting {
-                        session: Some(session),
-                    }
-                    | Live::Structured { session, .. } => {
-                        Some(Dispatch::Session(session.control.clone(), control.clone()))
-                    }
-                    _ => None,
-                },
+                Effect::Control { thread, control } => self
+                    .live
+                    .get(thread)?
+                    .live
+                    .session()
+                    .map(|session| Dispatch::Session(session.control.clone(), control.clone())),
                 Effect::StopTerminal { thread } => match &self.live.get(thread)?.live {
                     Live::Terminal { term, .. } => Some(Dispatch::Terminal(term.control.clone())),
                     _ => None,
@@ -433,9 +439,9 @@ impl Actor {
         for event in events {
             #[cfg(debug_assertions)]
             if let Ev::ThreadCreated(row) = &event
-                && matches!(&self.spawner, Spawner::Cli)
+                && let Spawner::Cli(env) = &self.spawner
             {
-                crate::provider::env::register_thread(row.id);
+                env.register_thread(row.id);
             }
             if matches!(
                 event,
@@ -503,7 +509,7 @@ impl Actor {
                         &ChangeSet::default(),
                         &self.projection.turns[&turn],
                     );
-                    if let Live::Structured { session, .. } = &self.live[&thread].live {
+                    if let Some(session) = self.live[&thread].live.session() {
                         let _ = session
                             .control
                             .send(SessionControl::StartTurn { turn, text });
@@ -517,6 +523,16 @@ impl Actor {
                             .turns_for(thread)
                             .any(|turn| matches!(turn.state, TurnState::Running { .. }));
                         let state = self.live[&thread].state(running);
+                        let changes = ChangeSet::default();
+                        let view = changes
+                            .view(&self.projection, &self.live, thread)
+                            .expect("terminal thread");
+                        let status = thread_status(&view);
+                        let counter = self.next_counter(thread);
+                        self.publish(UiEvent::Change {
+                            counter: Some(counter),
+                            event: Ev::ThreadStatusChanged { thread, status },
+                        });
                         let counter = self.next_counter(thread);
                         self.publish(UiEvent::Change {
                             counter: Some(counter),
@@ -566,12 +582,9 @@ impl Actor {
                 pgid,
                 capabilities,
             }) => {
-                let session = match &self.live[&thread].live {
-                    Live::Starting {
-                        session: Some(session),
-                    }
-                    | Live::Structured { session, .. } => session.clone(),
-                    _ => {
+                let session = match self.live[&thread].live.session() {
+                    Some(session) => session.clone(),
+                    None => {
                         tracing::debug!(%thread, "dropped Ready outside active session");
                         return None;
                     }
@@ -582,7 +595,10 @@ impl Actor {
                 c.live.insert(thread, live);
                 let mut t = self.projection.threads[&thread].clone();
                 t.native = Some(native.clone());
-                t.cli_version = Some(cli_version.clone());
+                if let Some(cli_version) = cli_version.filter(|version| !version.is_empty()) {
+                    t.cli_version = Some(cli_version);
+                }
+                let cli_version = t.cli_version.clone();
                 t.import_pending = false;
                 c.threads.insert(thread, t);
                 c.events.push(Ev::NativeSessionBound {
@@ -595,7 +611,7 @@ impl Actor {
                 if let Some(turn) = self
                     .projection
                     .turns_for(thread)
-                    .min_by_key(|turn| turn.ordinal)
+                    .max_by_key(|turn| turn.ordinal)
                 {
                     commands::add_item(
                         &self.projection,
@@ -698,11 +714,18 @@ impl Actor {
                     }
                 }
             }
-            TurnEvent::TextDelta { key, text } => {
-                self.text_delta(c, (thread, epoch, turn.id, key), text, false)
+            TurnEvent::TextDelta {
+                key,
+                text,
+                streamed,
+            } => {
+                let item = self.text_delta(c, (thread, epoch, turn.id, key), text, false);
+                if streamed {
+                    *self.delta_counts.entry(item).or_default() += 1;
+                }
             }
             TurnEvent::ReasoningDelta { key, text } => {
-                self.text_delta(c, (thread, epoch, turn.id, key), text, true)
+                self.text_delta(c, (thread, epoch, turn.id, key), text, true);
             }
             TurnEvent::ItemEnded { key } => {
                 if let Some(id) = self.item_keys.get(&(thread, epoch, turn.id, key))
@@ -861,7 +884,7 @@ impl Actor {
         index: (ThreadId, u32, TurnId, NativeItemKey),
         text: String,
         reasoning: bool,
-    ) {
+    ) -> ItemId {
         let (thread, _, turn, _) = index;
         let id = match self.item_keys.get(&index) {
             Some(id) => *id,
@@ -895,11 +918,9 @@ impl Actor {
         let b = self.buffers.entry(id).or_default();
         b.unpersisted.push_str(&text);
         b.pending_ui.push_str(&text);
+        id
     }
     fn prepare_commit(&self, c: &mut ChangeSet) {
-        self.complete_ended_items(c);
-    }
-    fn complete_ended_items(&self, c: &mut ChangeSet) {
         let ended: std::collections::BTreeSet<_> = c
             .turns
             .values()
@@ -923,13 +944,20 @@ impl Actor {
                 item.body,
                 ItemBody::AssistantText { done: false, .. }
                     | ItemBody::Reasoning { done: false, .. }
-            ) {
+            ) && !matches!(&item.body, ItemBody::Tool(tool) if tool.result.is_none())
+            {
                 continue;
             }
             self.append_buffer(&mut item);
             match &mut item.body {
                 ItemBody::AssistantText { done, .. } | ItemBody::Reasoning { done, .. } => {
                     *done = true
+                }
+                ItemBody::Tool(tool) => {
+                    tool.result = Some(ToolResult {
+                        ok: false,
+                        output_tail: Some("The turn ended before this tool returned".into()),
+                    });
                 }
                 _ => {}
             }
@@ -1028,6 +1056,7 @@ impl Actor {
                 item,
                 counter,
                 text,
+                delta_count: self.delta_counts.get(&item).copied().unwrap_or_default(),
             });
         }
         self.last_ui = Instant::now();
@@ -1055,22 +1084,25 @@ impl Actor {
         ThreadSnapshot {
             items,
             buffered_text,
+            delta_counts: self
+                .projection
+                .items_for(thread)
+                .filter_map(|item| {
+                    self.delta_counts
+                        .get(&item.id)
+                        .map(|count| (item.id, *count))
+                })
+                .collect(),
             counter: *self.counters.get(&thread).unwrap_or(&0),
         }
     }
     fn shutdown(&mut self) {
         for live in self.live.values() {
-            match &live.live {
-                Live::Starting {
-                    session: Some(session),
-                }
-                | Live::Structured { session, .. } => {
-                    let _ = session.control.send(SessionControl::Shutdown);
-                }
-                Live::Terminal { term, .. } => {
-                    let _ = term.control.send(TerminalControl::Stop);
-                }
-                Live::Parked | Live::Starting { session: None } | Live::Stopping { .. } => {}
+            if let Some(session) = live.live.session() {
+                let _ = session.control.send(SessionControl::Shutdown);
+            }
+            if let Live::Terminal { term, .. } = &live.live {
+                let _ = term.control.send(TerminalControl::Stop);
             }
         }
     }

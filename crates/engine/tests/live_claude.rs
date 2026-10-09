@@ -5,6 +5,29 @@ use veyra_engine::{actor::EngineMsg, domain::*, provider::*};
 #[test]
 #[ignore = "requires the human's consent for a live Claude turn"]
 fn live_claude_ok_reply() {
+    let markers: Vec<_> = std::env::vars_os()
+        .filter_map(|(key, _)| {
+            let name = key.to_string_lossy();
+            ((name.starts_with("CLAUDE_CODE_") && !name.starts_with("CLAUDE_CODE_USE_"))
+                || [
+                    "CLAUDE_PID",
+                    "CLAUDE_EFFORT",
+                    "CLAUDECODE",
+                    "CLAUDE_AGENT_SDK_VERSION",
+                ]
+                .contains(&name.as_ref()))
+            .then_some(key)
+        })
+        .collect();
+    if !markers.is_empty() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--ignored", "--exact", "live_claude_ok_reply"]);
+        for marker in markers {
+            command.env_remove(marker);
+        }
+        assert!(command.status().unwrap().success());
+        return;
+    }
     let cwd = std::env::temp_dir().join(format!("veyra-live-{}", ThreadId::new()));
     fs::create_dir(&cwd).unwrap();
     let runtime = Runtime::new().unwrap();
