@@ -17,6 +17,8 @@ Every later section needs that `RUN` exported, as [SKILL.md](../SKILL.md) says.
 ## Proof rules
 
 Capture the action command, its exit code, the dump before and after, and the window PNG.
+Veyra must stay frontmost during captures.
+The debug-only ActivateWindow action activates the owned window before each capture.
 Read the PNG.
 Preserve the app log and proof after Cleanup.
 Report a skipped native entry point as skipped.

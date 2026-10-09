@@ -330,6 +330,9 @@ impl Codec {
             "parent_tool_use_id":null, "message":{"role":"user","content":text}
         })
     }
+    fn prompt(&self) -> Option<TurnId> {
+        self.active.and_then(ActiveTurn::id)
+    }
     fn ready(&self, version: Option<String>, capabilities: Vec<String>) -> ProviderEvent {
         ProviderEvent::Session(SessionEvent::Ready {
             native: self.native.clone(),
@@ -355,8 +358,7 @@ impl Codec {
             Frame::System(system) => self.system(system, &mut decoded),
             Frame::CommandLifecycle(lifecycle) => {
                 if self
-                    .active
-                    .and_then(ActiveTurn::id)
+                    .prompt()
                     .is_some_and(|turn| lifecycle.command_uuid == turn.to_string())
                 {
                     self.echo = EchoMode::Known;
@@ -370,7 +372,30 @@ impl Codec {
                 }
             }
             Frame::User(user) => self.user(user, &mut events),
-            Frame::StreamEvent(stream) => self.stream(stream.event, &mut events),
+            Frame::StreamEvent(stream) => {
+                let unknown = match &stream.event {
+                    Event::Unknown => Some(("stream_event", &["event"][..])),
+                    Event::ContentBlockStart {
+                        content_block: ContentBlock::Unknown,
+                        ..
+                    } => Some(("content_block", &["event", "content_block"][..])),
+                    Event::ContentBlockDelta {
+                        delta: Delta::Unknown,
+                        ..
+                    } => Some(("delta", &["event", "delta"][..])),
+                    _ => None,
+                };
+                if let Some((kind, path)) = unknown {
+                    let wire: Value = serde_json::from_str(line)?;
+                    let value = path.iter().fold(&wire, |value, key| &value[*key]);
+                    tracing::info!(
+                        kind,
+                        frame_type = value["type"].as_str().unwrap_or("unknown"),
+                        "ignored Claude wire type"
+                    );
+                }
+                self.stream(stream.event, &mut events);
+            }
             Frame::Assistant(assistant) => self.assistant(assistant, &mut events)?,
             Frame::Result(result) => {
                 if self.owns_result(&result) {
@@ -395,19 +420,7 @@ impl Codec {
                 );
             }
         }
-        if self.active.is_none()
-            && events.iter().any(|event| {
-                matches!(
-                    event,
-                    TurnEvent::Started
-                        | TurnEvent::TextDelta { .. }
-                        | TurnEvent::ReasoningDelta { .. }
-                        | TurnEvent::ToolStarted { .. }
-                        | TurnEvent::Plan(_)
-                        | TurnEvent::RequestOpened { .. }
-                )
-            })
-        {
+        if self.active.is_none() && events.iter().any(TurnEvent::opens_provider_turn) {
             self.active = Some(ActiveTurn::Provider);
         }
         let ended = events
@@ -416,7 +429,7 @@ impl Codec {
         decoded
             .events
             .extend(events.into_iter().map(|event| ProviderEvent::Turn {
-                turn: self.active.and_then(ActiveTurn::id),
+                turn: self.prompt(),
                 event,
             }));
         if ended {
@@ -463,8 +476,7 @@ impl Codec {
     fn user(&mut self, user: User, events: &mut Vec<TurnEvent>) {
         if user.is_replay
             && self
-                .active
-                .and_then(ActiveTurn::id)
+                .prompt()
                 .is_some_and(|turn| user.uuid.is_empty() || user.uuid == turn.to_string())
         {
             if !user.uuid.is_empty() {
@@ -532,6 +544,9 @@ impl Codec {
                             });
                         }
                         Delta::Thinking { thinking } => {
+                            if thinking.is_empty() {
+                                return;
+                            }
                             block.streamed = true;
                             events.push(TurnEvent::ReasoningDelta {
                                 key: block.key.clone(),
@@ -571,12 +586,14 @@ impl Codec {
     ) -> Result<(), super::ProviderError> {
         if let Some(content) = assistant.message["content"].as_array() {
             for (index, value) in content.iter().enumerate() {
-                if self.blocks.get(&(index as u32)).is_some_and(|block| {
-                    block.streamed || matches!(block.content, ContentBlock::ToolUse { .. })
-                }) {
+                let block: ContentBlock = serde_json::from_value(value.clone())?;
+                if !matches!(block, ContentBlock::Unknown)
+                    && self.blocks.get(&(index as u32)).is_some_and(|block| {
+                        block.streamed || matches!(block.content, ContentBlock::ToolUse { .. })
+                    })
+                {
                     continue;
                 }
-                let block: ContentBlock = serde_json::from_value(value.clone())?;
                 let key = NativeItemKey(format!(
                     "{}:{index}:{}",
                     assistant.message["id"].as_str().unwrap_or_default(),
@@ -589,12 +606,23 @@ impl Codec {
                         streamed: false,
                     }),
                     ContentBlock::Thinking { thinking } => {
+                        if thinking.is_empty() {
+                            continue;
+                        }
                         events.push(TurnEvent::ReasoningDelta {
                             key: key.clone(),
                             text: thinking,
                         });
                     }
-                    _ => continue,
+                    ContentBlock::Unknown => {
+                        tracing::info!(
+                            kind = "content_block",
+                            frame_type = value["type"].as_str().unwrap_or("unknown"),
+                            "ignored Claude wire type"
+                        );
+                        continue;
+                    }
+                    ContentBlock::ToolUse { .. } => continue,
                 }
                 events.push(TurnEvent::ItemEnded { key });
             }
@@ -610,11 +638,10 @@ impl Codec {
         if !echoes.is_empty() {
             self.echo = EchoMode::Known;
             return self
-                .active
-                .and_then(ActiveTurn::id)
+                .prompt()
                 .is_some_and(|turn| echoes.iter().any(|uuid| **uuid == turn.to_string()));
         }
-        self.active.and_then(ActiveTurn::id).is_none()
+        self.prompt().is_none()
             || !matches!(self.echo, EchoMode::Known)
             || !result
                 .origin
@@ -626,6 +653,111 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unknown_wire_types_log_types_without_content() {
+        use std::sync::{Arc, Mutex};
+        use tracing::{
+            Event, Metadata, Subscriber,
+            field::{Field, Visit},
+            span::{Attributes, Id, Record},
+        };
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, String>);
+        impl Visit for Fields {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+        }
+        impl Subscriber for Capture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                *metadata.level() == tracing::Level::INFO
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+            for wire in [
+                json!({"type":"stream_event","event":{"type":"future_event","content":"private-content"}}),
+                json!({"type":"stream_event","event":{"type":"content_block_delta",
+                    "delta":{"type":"future_delta","content":"private-content"}}}),
+                json!({"type":"stream_event","event":{"type":"content_block_start",
+                    "content_block":{"type":"future_block","content":"private-content"}}}),
+                json!({"type":"assistant","message":{"content":[
+                    {"type":"future_final_block","content":"private-content"}]}}),
+            ] {
+                codec.line(&wire.to_string()).unwrap();
+            }
+            let turn = TurnId::new();
+            codec.start(turn, "reply".into());
+            codec
+                .line(&json!({"type":"result","user_message_uuid":"foreign-prompt"}).to_string())
+                .unwrap();
+            codec
+                .line(
+                    &json!({"type":"command_lifecycle","command_uuid":"foreign-prompt",
+                "state":"completed"})
+                    .to_string(),
+                )
+                .unwrap();
+        });
+        let logs = capture.0.lock().unwrap();
+        assert_eq!(
+            logs.iter()
+                .map(|fields| (fields["kind"].as_str(), fields["frame_type"].as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("stream_event", "future_event"),
+                ("delta", "future_delta"),
+                ("content_block", "future_block"),
+                ("content_block", "future_final_block"),
+            ]
+        );
+        assert!(!format!("{logs:?}").contains("private-content"));
+    }
+    #[test]
+    fn empty_final_reasoning_adds_no_item() {
+        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        let turn = TurnId::new();
+        codec.start(turn, "reply".into());
+        let decoded = codec
+            .line(
+                &json!({
+                    "type":"assistant", "message":{"id":"fixture-message", "content":[
+                        {"type":"thinking", "thinking":""}, {"type":"text", "text":"ok"}
+                    ]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(decoded.events.len(), 2);
+        assert!(matches!(&decoded.events[0], ProviderEvent::Turn {
+            turn: Some(id), event: TurnEvent::TextDelta { text, .. }
+        } if *id == turn && text == "ok"));
+        assert!(matches!(
+            decoded.events[1],
+            ProviderEvent::Turn {
+                event: TurnEvent::ItemEnded { .. },
+                ..
+            }
+        ));
+    }
     #[test]
     fn terminal_reason_overrides_success_subtype() {
         for (reason, expected) in [

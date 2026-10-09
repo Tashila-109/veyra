@@ -28,7 +28,8 @@ fn capture_never_contains_token() {
     let scratch = Scratch::new();
     let path = scratch.0.join("t1-s1.jsonl");
     let token = "veyra-test-credential-abcdefgh";
-    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, Some(token)).unwrap();
+    let mut recorder =
+        Recorder::create(&path, "claude", "test", &scratch.0, None, Some(token)).unwrap();
     recorder.bind("native-session".into(), "<id:session>".into());
     recorder.line(true, json!({
         "type":"user", "uuid":"prompt-id", "session_id":"native-session", "cwd":scratch.0,
@@ -57,7 +58,7 @@ fn capture_binds_token_and_updates_cli_version() {
     let path = scratch.0.join("capture.jsonl");
     let token = "session-credential-value";
     let mut recorder =
-        Recorder::create(&path, "claude", "unknown", &scratch.0, Some(token)).unwrap();
+        Recorder::create(&path, "claude", "unknown", &scratch.0, None, Some(token)).unwrap();
     recorder.line(true, json!({"access_token":token})).unwrap();
     recorder
         .line(
@@ -88,7 +89,7 @@ fn capture_binds_token_and_updates_cli_version() {
 fn capture_files_are_0600() {
     let scratch = Scratch::new();
     let path = scratch.0.join("capture.jsonl");
-    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None).unwrap();
+    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None, None).unwrap();
     recorder
         .line(true, json!({"type":"user","message":"ok"}))
         .unwrap();
@@ -103,8 +104,8 @@ fn sweep(path: &Path) {
         } else {
             for (line, text) in fs::read_to_string(&path).unwrap().lines().enumerate() {
                 assert!(
-                    !record::secret_shapes(text),
-                    "{}:{} contains a secret shape",
+                    !private_detail(text),
+                    "{}:{} contains a private or secret shape",
                     path.display(),
                     line + 1
                 );
@@ -134,7 +135,7 @@ fn fixtures_hold_no_secret_shapes() {
 fn capture_hides_hook_output_and_preserves_account_keys() {
     let scratch = Scratch::new();
     let path = scratch.0.join("capture.jsonl");
-    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None).unwrap();
+    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None, None).unwrap();
     recorder
         .line(
             false,
@@ -207,16 +208,14 @@ fn joined_blocks(rows: &[serde_json::Value]) -> Vec<String> {
     blocks.into_values().collect()
 }
 fn private_detail(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    record::secret_shapes(text)
-        || [
-            "github",
-            "figma",
-            "claude.ai connectors",
-            "plugin:data:definite",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    static DETAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?i)\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b|",
+            r#"\b(?:account|org(?:anization)?|user)[_-]?id["\s]*[:=]\s*"?[^\s",<>]+"#,
+        ))
+        .unwrap()
+    });
+    record::secret_shapes(text) || DETAIL.is_match(text) || text.contains("fixture-private-detail")
 }
 #[test]
 fn fixtures_joined_blocks_hold_no_personal_detail_or_secrets() {
@@ -248,8 +247,16 @@ fn fixtures_joined_blocks_hold_no_personal_detail_or_secrets() {
 fn capture_binds_home_folder_in_nested_paths_and_text() {
     let scratch = Scratch::new();
     let path = scratch.0.join("capture.jsonl");
-    let home = std::env::var("HOME").unwrap();
-    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None).unwrap();
+    let home = "/fixture-home";
+    let mut recorder = Recorder::create(
+        &path,
+        "claude",
+        "test",
+        &scratch.0,
+        Some(Path::new(home)),
+        None,
+    )
+    .unwrap();
     recorder
         .line(
             false,
@@ -266,4 +273,29 @@ fn capture_binds_home_folder_in_nested_paths_and_text() {
         rows[1]["line"],
         json!({"paths":["<home>/.config/fixture"], "text":"Read <home>/notes"})
     );
+}
+
+#[test]
+fn privacy_sweep_detects_shapes_and_a_planted_split_needle() {
+    for detail in [
+        format!("fixture-person@{}.invalid", "example"),
+        "account_id=fixture-account-0001".into(),
+        "/Users/fixture-person/notes".into(),
+    ] {
+        assert!(private_detail(&detail), "private shape escaped the sweep");
+    }
+    let scratch = Scratch::new();
+    let path = scratch.0.join("planted.jsonl");
+    let rows = [
+        json!({"line":{"event":{"type":"content_block_delta","delta":{"text":"fixture-private-"}}}}),
+        json!({"line":{"event":{"type":"content_block_delta","delta":{"text":"detail"}}}}),
+    ];
+    fs::write(&path, rows.map(|row| row.to_string()).join("\n")).unwrap();
+    let planted: Vec<serde_json::Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(private_detail(&joined_blocks(&planted)[0]));
+    assert!(!private_detail("Veyra checks the command."));
 }

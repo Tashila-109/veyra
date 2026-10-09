@@ -12,7 +12,8 @@ pub enum StoreError {
     #[error("invalid stored value: {0}")]
     Invalid(String),
 }
-pub const MIGRATIONS: &[&str] = &[r#"
+pub const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE threads (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL,
@@ -47,7 +48,9 @@ CREATE TABLE tasks (id TEXT PRIMARY KEY, parent_thread_id TEXT NOT NULL REFERENC
 CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), default_mode TEXT NOT NULL DEFAULT 'full_access'
  CHECK (default_mode IN ('ask_first','accept_edits','full_access')));
 INSERT INTO settings(id) VALUES(1);
-"#];
+"#,
+    "UPDATE threads SET cli_version=NULL WHERE cli_version='';",
+];
 
 pub fn open(path: &Path) -> Result<Connection, StoreError> {
     let mut db = Connection::open(path)?;
@@ -292,10 +295,6 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
 }
 
 pub fn load(db: &Connection) -> Result<Projection, StoreError> {
-    db.execute(
-        "UPDATE threads SET cli_version=NULL WHERE cli_version=''",
-        [],
-    )?;
     let mut p = Projection::default();
     p.settings.default_mode = parse_word(db.query_row(
         "SELECT default_mode FROM settings WHERE id=1",
@@ -343,7 +342,9 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             cwd: Path::new(&r.get::<_, String>(8)?).to_owned(),
             native: r.get::<_, Option<String>>(9)?.map(NativeSessionId),
             native_cursor: r.get(10)?,
-            cli_version: r.get(11)?,
+            cli_version: r
+                .get::<_, Option<String>>(11)?
+                .filter(|version| !version.is_empty()),
             hold: r
                 .get::<_, Option<String>>(12)?
                 .map(parse_word)

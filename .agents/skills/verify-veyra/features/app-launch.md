@@ -7,7 +7,7 @@ Status: passed, 2026-10-09, d2bc228, none
 - `launch-window`: one native window, Geist, sidebar, header and upper-third new-thread composer.
 - `launch-ready`: exact ready line with this run's pid and data folder.
 - `launch-identity`: live pid, build revision, data folder, schema_version and system appearance.
-- `launch-database`: migration 1, WAL, eight tables and Full access default.
+- `launch-database`: migration 2, WAL, eight tables and Full access default.
 - `launch-recovery`: the project written before quit survives quit and crash relaunches in the same database.
 - `launch-lock`: a second process refuses the same folder while the first still answers.
 - `launch-controls`: live width and notice transitions through actions and individual keys.

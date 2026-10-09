@@ -4,6 +4,9 @@ use veyra_engine::{
     provider::ProviderKind,
 };
 
+#[cfg(debug_assertions)]
+actions!(veyra, [ActivateWindow]);
+
 actions!(
     veyra,
     [

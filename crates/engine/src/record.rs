@@ -107,6 +107,7 @@ mod capture {
             provider: &str,
             version: &str,
             cwd: &Path,
+            home: Option<&Path>,
             token: Option<&str>,
         ) -> io::Result<Self> {
             if let Some(parent) = path.parent() {
@@ -121,7 +122,7 @@ mod capture {
                 bindings: BTreeMap::new(),
             };
             recorder.bind(cwd.to_string_lossy().into_owned(), "<cwd>".into());
-            if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
                 recorder.bind(home.to_string_lossy().into_owned(), "<home>".into());
             }
             if let Some(token) = token {

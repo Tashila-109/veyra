@@ -42,9 +42,9 @@ import AppKit
 import CoreGraphics
 import Foundation
 let args = Array(CommandLine.arguments.dropFirst())
-guard args.count == 3, let pid = Int32(args[0]), let id = UInt32(args[1]) else { exit(2) }
+guard args.count == 2, let pid = Int32(args[0]), let id = UInt32(args[1]) else { exit(2) }
 func fail(_ text: String) -> Never {
-    fputs(text + "\n", stderr)
+    fputs(text + ". Veyra must stay frontmost during captures.\n", stderr)
     exit(1)
 }
 guard let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]],
@@ -63,11 +63,8 @@ CGGetActiveDisplayList(count, &displays, &count)
 guard displays.contains(where: { frame.intersects(CGDisplayBounds($0)) })
 else { fail("owned window is outside the active displays") }
 guard let app = NSRunningApplication(processIdentifier: pid) else { fail("owned app is gone") }
-if args[2] == "activate" {
-    guard app.activate(options: [.activateIgnoringOtherApps]) else { fail("owned window activation failed") }
-    let end = Date().addingTimeInterval(2)
-    while !app.isActive && Date() < end { Thread.sleep(forTimeInterval: 0.05) }
-}
+let end = Date().addingTimeInterval(2)
+while !app.isActive && Date() < end { Thread.sleep(forTimeInterval: 0.05) }
 guard app.isActive else { fail("owned window is covered by another application") }
 SWIFT
 swiftc -O "$PROOF/capture-window.swift" -o "$PROOF/capture-window"
@@ -142,7 +139,8 @@ def capture(name):
     window = (PROOF/'window-id').read_text().strip()
     pid = (PROOF/'pid').read_text().strip()
     helper = str((PROOF/'capture-window').resolve())
-    subprocess.run([helper,pid,window,'activate'],check=True)
+    action(name+'-activate','ActivateWindow')
+    subprocess.run([helper,pid,window],check=True)
     dump = ctl(name+'-capture-state','dump')
     visible = {key:dump[key] for key in ['view','sidebar','selected_thread','transcript','composer_text',
         'composer','settings','notice']}
@@ -150,7 +148,7 @@ def capture(name):
     state = json.dumps(visible,sort_keys=True)
     target = PROOF/(name+'.png')
     subprocess.run(['screencapture','-x','-o','-l',window,str(target)],check=True)
-    subprocess.run([helper,pid,window,'check'],check=True)
+    subprocess.run([helper,pid,window],check=True)
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     previous = PROOF/'capture-last.json'
     if previous.exists():
@@ -177,7 +175,7 @@ def sql(query):
 def database(label, mode):
     values = [sql('pragma user_version'),sql('pragma journal_mode'),
         *sql('.tables').split(),sql('select default_mode from settings')]
-    assert values == ['1','wal',*TABLES,mode], (label,values)
+    assert values == ['2','wal',*TABLES,mode], (label,values)
     (PROOF/(label+'-database.txt')).write_text('\n'.join(values)+'\n')
     (PROOF/(label+'-inode.txt')).write_text(str(DB.stat().st_ino)+'\n')
     save(label,ctl(label+'-dump','dump'))
@@ -342,7 +340,9 @@ The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `ap
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
 `composer.provider_picker_open` reports the picker opened by `OpenProviderPicker` or ⌘⌥⇧P.
 `settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
-Capture checks the owned window is on-screen, activates its application and verifies it remains active.
+Before every capture, the debug-only `ActivateWindow` action activates Veyra from inside the app.
+Capture checks the owned window is on-screen and verifies it remains frontmost.
+Veyra must stay frontmost during captures.
 A changed visible state with an identical PNG fails; Evidence also compares named state pairs.
 Concurrent windows may cause a capture to fail, but cannot make a covered or off-screen frame pass.
 A dump proves state, not layout; inspect each PNG.

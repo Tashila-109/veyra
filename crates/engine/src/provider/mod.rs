@@ -102,6 +102,22 @@ pub enum TurnEvent {
         outcome: TurnOutcome,
     },
 }
+impl TurnEvent {
+    pub fn opens_provider_turn(&self) -> bool {
+        match self {
+            Self::Started
+            | Self::TextDelta { .. }
+            | Self::ReasoningDelta { .. }
+            | Self::ToolStarted { .. }
+            | Self::Plan(_)
+            | Self::RequestOpened { .. } => true,
+            Self::Accepted
+            | Self::ItemEnded { .. }
+            | Self::ToolFinished { .. }
+            | Self::TurnEnded { .. } => false,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct TerminalHandle {
     pub control: mpsc::UnboundedSender<TerminalControl>,
@@ -171,6 +187,7 @@ impl Probe {
     }
 }
 impl ProviderKind {
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
     pub fn binary(self) -> &'static str {
         match self {
             Self::Claude => "claude",

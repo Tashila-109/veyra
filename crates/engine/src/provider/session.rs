@@ -25,13 +25,27 @@ struct ProcessGroup {
     child: Option<Child>,
     pid: u32,
 }
-async fn end_process(mut child: Child, pid: u32) -> std::io::Result<std::process::ExitStatus> {
+fn process_alive(child: &mut Child, pid: u32) -> std::io::Result<bool> {
+    child.try_wait()?;
+    platform::group_exists(pid)
+}
+async fn end_process(
+    mut child: Child,
+    pid: u32,
+    check: fn(&mut Child, u32) -> std::io::Result<bool>,
+) -> std::io::Result<std::process::ExitStatus> {
     let _ = platform::signal_group(pid, Signal::Terminate);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let mut failure = None;
     loop {
-        child.try_wait()?;
-        if !platform::group_exists(pid)? {
-            break;
+        match check(&mut child, pid) {
+            Err(error) => {
+                failure = Some(error);
+                let _ = platform::signal_group(pid, Signal::Kill);
+                break;
+            }
+            Ok(false) => break,
+            Ok(true) => {}
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = platform::signal_group(pid, Signal::Kill);
@@ -39,7 +53,8 @@ async fn end_process(mut child: Child, pid: u32) -> std::io::Result<std::process
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    child.wait().await
+    let status = child.wait().await?;
+    failure.map_or(Ok(status), Err)
 }
 impl ProcessGroup {
     fn new(child: Child) -> Self {
@@ -59,7 +74,7 @@ impl ProcessGroup {
     }
     async fn stop(mut self) -> std::io::Result<std::process::ExitStatus> {
         match self.child.take() {
-            Some(child) => tokio::spawn(end_process(child, self.pid))
+            Some(child) => tokio::spawn(end_process(child, self.pid, process_alive))
                 .await
                 .map_err(std::io::Error::other)?,
             None => Err(std::io::Error::other("process already stopped")),
@@ -69,7 +84,7 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if let Some(child) = self.child.take() {
-            tokio::spawn(end_process(child, self.pid));
+            tokio::spawn(end_process(child, self.pid, process_alive));
         }
     }
 }
@@ -139,6 +154,7 @@ fn launch(
                 "claude",
                 "unknown until system/init",
                 &spec.cwd,
+                env.home.as_deref(),
                 None,
             )
         })
@@ -491,7 +507,7 @@ pub async fn probe(
             if path.exists() {
                 std::fs::remove_file(&path)?;
             }
-            record::Recorder::create(&path, "claude", &version, cwd, None)
+            record::Recorder::create(&path, "claude", &version, cwd, env.home.as_deref(), None)
         })
         .transpose()?;
     let mut child =
@@ -543,6 +559,38 @@ pub async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn process_check_error_still_kills_and_reaps_group() {
+        let env = ChildEnv::load();
+        let mut child = env
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "trap '' TERM; /bin/sleep 30 & echo ready; wait".into(),
+                ],
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
+        let result = end_process(child, pid, |_, _| {
+            Err(std::io::Error::other("check failed"))
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while platform::group_exists(pid).unwrap() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let alive = platform::group_exists(pid).unwrap();
+        if alive {
+            let _ = platform::signal_group(pid, Signal::Kill);
+        }
+        assert_eq!(result.unwrap_err().to_string(), "check failed");
+        assert!(!alive, "cleanup left an owned descendant alive");
+    }
     #[test]
     fn crash_text_bounds_and_redacts() {
         let token = "test-session-credential";

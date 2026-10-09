@@ -486,6 +486,7 @@ fn startup_normalizes_empty_cli_versions() {
         .db
         .execute("UPDATE threads SET cli_version=''", [])
         .unwrap();
+    f.actor.db.pragma_update(None, "user_version", 1).unwrap();
     assert_eq!(f.loaded().threads[&f.thread].cli_version, None);
     store::initialize(&mut f.actor.db).unwrap();
     let version: Option<String> = f
@@ -494,4 +495,41 @@ fn startup_normalizes_empty_cli_versions() {
         .query_row("SELECT cli_version FROM threads", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, None);
+    assert_eq!(
+        f.actor
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        2
+    );
+    f.actor
+        .db
+        .execute("UPDATE threads SET cli_version=''", [])
+        .unwrap();
+    store::initialize(&mut f.actor.db).unwrap();
+    assert_eq!(
+        f.actor
+            .db
+            .query_row("SELECT cli_version FROM threads", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        ""
+    );
+}
+
+#[test]
+fn loading_empty_cli_versions_does_not_write() {
+    let f = Fixture::new(LiveState::Parked);
+    f.actor
+        .db
+        .execute("UPDATE threads SET cli_version=''", [])
+        .unwrap();
+    f.actor.db.pragma_update(None, "query_only", true).unwrap();
+    assert_eq!(f.loaded().threads[&f.thread].cli_version, None);
+    let stored: String = f
+        .actor
+        .db
+        .query_row("SELECT cli_version FROM threads", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored, "");
 }

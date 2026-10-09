@@ -77,7 +77,7 @@ It does not read `RUST_LOG`, so that variable cannot suppress readiness.
 The debug listener binds before the window opens.
 `Window::on_next_frame` prints `veyra ready pid=PID data_dir=DIR` to stderr and the log after the first frame.
 `build.rs` embeds Git HEAD, or `unknown` outside Git, and watches HEAD, its reflog, packed refs and the current loose ref.
-Quit enqueues engine shutdown and calls `cx.quit()` immediately; Quit does not wait for providers.
+Quit cancels the branch task, enqueues engine shutdown and calls `cx.quit()` immediately; Quit does not wait for providers.
 A provider process group running at Quit can outlive the app.
 macOS termination does not promise Rust destructors, so verification explicitly cleans run-owned provider groups.
 
@@ -117,7 +117,6 @@ The UI shows command and acknowledgement failures as notices.
 
 `LiveThread` owns an epoch outside its runtime variants, capabilities and the background-work flag.
 Starting has no session handle until spawn returns one.
-`LiveState` derives from the runtime variant, running turn and background-work flag.
 The engine derives thread status with `domain::thread_status` and publishes `ThreadStatusChanged` after changed thread, turn, request or live rows.
 The window, sidebar, header, dump and ctl wait consume that status, including background work, NeedsYou and InTerminal.
 Spawn increments the epoch; stale session events are ignored.
@@ -126,12 +125,13 @@ Idle structured sessions park after ten minutes without a running turn, pending 
 The existing engine supports holds, queue reasons, cascaded Stop/Archive, wake delivery and task settlement, but those controls and cards have no window UI.
 Tasks cannot arise through the application because the tool server is not implemented.
 
-`store::MIGRATIONS` owns schema 1, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
+`store::MIGRATIONS` owns schema 2, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
 Migrations use `PRAGMA user_version` in transactions and refuse newer schemas.
 The eight tables are projects, threads, turns, items, requests, grants, tasks and settings.
 User text lives once in an item referenced by its turn.
 An ended turn carries both its optional start time and end time, including after load; there is no separate start-time map.
-Loading rows normalizes older empty CLI versions to NULL.
+Migration 2 normalizes older empty CLI versions to NULL once.
+Loading rows is read-only and treats any remaining empty CLI version as unknown.
 Empty versions become unknown at the codec, probe and row-load boundaries; the actor and writes trust that input.
 `store::apply` writes both live pid and group on Ready, clears both when parked, and preserves the first archive time on later archived writes.
 Derived statuses and live state are not persisted as an event log.
@@ -162,7 +162,7 @@ Engine::start initializes it on the startup caller before launching the actor, s
 Resolution tries absolute entries from inherited PATH, that snapshot, then `KNOWN_BIN_DIRS`, returning a canonical absolute executable path.
 Relative and empty search entries are ignored.
 Executable checks and process-group mechanics are platform functions.
-Every owned child has piped stdio, `kill_on_drop(true)`, its own process group and `VEYRA_PARENT_PID` naming the application.
+Every provider and probe child has piped stdio, `kill_on_drop(true)`, its own process group and `VEYRA_PARENT_PID` naming the application.
 It strips CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SSE_PORT, CLAUDE_AGENT_SDK_VERSION and every inherited VEYRA_* variable before adding its own marker and optional replay fixture.
 Veyra inherits the user's hooks/MCP configuration and never edits it.
 The new-thread hint names that behavior.
@@ -171,17 +171,25 @@ One session task owns the child and a process-group guard.
 Its select loop reads stdout lines, controls, output-channel closure and stdin-writer completion.
 A dedicated task writes stdin, so a blocked pipe does not block the control loop.
 The stderr task retains eight lines, each redacted and cut to 500 characters.
-On stdout close while a Veyra prompt or Provider-origin turn is active, the task waits up to 500 ms for stderr, emits Failed with Veyra's crash text and tail, then Exited.
+When the loop ends, the task waits up to 500 ms for stderr, runs the group ladder, then emits Failed if a turn is active, then Exited.
+Failed carries Veyra's crash text and redacted tail.
+The crash exit code is read after SIGTERM; a process that closed stdout without exiting reports exit code unknown.
+Exited means the owned group has been signalled and its leader reaped.
 On Exited, the actor ends any remaining running turn as Failed if crash text exists, otherwise Interrupted.
 At run end or task drop, each owned group receives SIGTERM before its leader is reaped.
-Cleanup checks every 50 ms and waits up to one second for the group to exit, sending SIGKILL only if it remains alive.
+Cleanup checks every 50 ms and waits up to one second for the group to exit.
+It sends SIGKILL if the group remains alive or a child/group check fails, then waits for the leader before returning the error.
 The guard retains the child through that ladder and waits for it, including probe cancellation and resume fallback.
 A supervisor awaits its join handle and emits Exited with redacted panic text on failure.
 The actor stores pid and group on Ready and parks on Exited.
 
 `claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, tool ids and background-work replacement.
 Serde defaults handle missing fields and unknown variants.
-Ignored notifications log only their type and subtype at INFO, never their content; unsupported control requests receive an error reply.
+Unknown top-level frames, non-initialize control responses and unhandled system subtypes log their type and subtype at INFO.
+Unknown stream events, deltas and content blocks log their type and category at INFO.
+These logs never include frame content.
+Foreign results and unmatched lifecycle frames are dropped silently; unsupported control requests get an error reply.
+Unmatched user frames are also dropped silently.
 A non-JSON line or a mistyped known field fails decoding, ends the process and fails its running turn.
 The first spawn uses a Veyra UUID with --session-id; later spawns use --resume.
 Mode maps to default, acceptEdits or bypassPermissions plus --allow-dangerously-skip-permissions.
@@ -204,6 +212,7 @@ Error flags, error subtypes and max_tokens/refusal take precedence.
 Otherwise aborted terminal reasons become Interrupted; other incomplete terminal reasons become Failed.
 Content-block deltas and final assistant messages share keys to avoid duplicated streamed text.
 Item completion is normalized separately from turn completion.
+Empty reasoning deltas and final reasoning blocks add no transcript item.
 Each background_tasks_changed replaces the pending-work set, excluding ambient tasks.
 Every new process starts with no background work pending.
 Only the specific resume-not-found stderr class starts a fresh native session and adds a notice; other errors retain the native id for Retry.
@@ -239,12 +248,13 @@ Missing replay files fail spawn with their path; the child gets the absolute sin
 The standalone fake executable reads that singular variable.
 
 The debug Recorder creates private 0600 captures through platform::private_file.
-It binds cwd, the home folder and known ids and can bind a session token; sessions currently have no MCP token.
+It binds the supplied cwd, optional home folder and known ids and can bind a session token; sessions currently have no MCP token.
+ChildEnv reads HOME once and supplies it to the recorder; `<home>` is a capture placeholder, not a matcher binding.
 It replaces credential fields, redacts secret-shaped text, replaces hook output with a placeholder and keeps account keys with masked values.
 The probe is recorded as probe.jsonl; a later probe replaces that capture only after the earlier probe has ended.
 It records inbound/outbound wires and exit, updating the header's CLI version from system/init.
 The shared crash redactor applies exact token, Bearer word, credential-name value, long sk-/xai- word and URL password matches in that order.
-The fixture privacy sweep also rejects concrete home paths.
+The fixture privacy sweep also rejects concrete home paths, email and account-id shapes, and a neutral planted needle in raw or assembled text.
 Recorder and override read sites are compile-time debug-only; release string checks prove their exclusion from the application binary.
 
 ## Window projection, transcript and Settings
@@ -265,11 +275,14 @@ While it is pending, AppState fences that thread's item events, retaining them a
 Reselecting preserves buffered events; only the current request may install the items and fence.
 An enqueue failure releases only that request's fence, replays buffered events and shows a load notice.
 It installs stored items plus buffered text and replays only item events above the snapshot counter.
+Snapshot installation and fence release do not await the header's Git branch lookup.
 Later stale transcript events are ignored, but metadata stays on the ordered event stream: an items-only snapshot does not carry native-id, turn or live-state rows and cannot fence those updates.
 This joins the item snapshot and event stream without duplicated or missing text.
 
 The sidebar reads projects and thread statuses, and all resizing paths dispatch SetSidebarWidth.
-The header reads title, status/elapsed time, project and a background Git branch lookup.
+The header reads title, status/elapsed time, project and a separate Git branch task on the tokio runtime.
+That child inherits the app environment, has kill-on-drop and no timeout.
+Selecting another thread, leaving Chat or dropping the Shell cancels it; its reply also checks the selection identity.
 The centred transcript uses MessageScroller and selectable Markdown TextView for assistant text, a still stream caret, collapsed reasoning/tools and notices.
 Tool output is bounded to its last 10,000 characters by the actor.
 The failed view shows the cause, next step, Retry and Open Terminal on the project folder.
@@ -282,6 +295,7 @@ OpenProviderPicker and its key open the provider menu through a controlled kit p
 An open menu rebuilds its readiness labels when probing begins and when each reply arrives.
 Not-ready providers disable Send with their repair command.
 CreateThread sends the draft configuration; subsequent Send targets the selected thread.
+On an open thread, model, effort and permission chips send Configure, which is refused while work runs and parks an idle session.
 Enter submits, Shift+Enter inserts a newline, and the textarea propagates Command+Enter to the bound Send action without a second subscription send.
 New thread resets text and reads the current stored default.
 Settings occupies the main column, opens through OpenSettings/Menu/Command-comma and exposes one three-mode row.
@@ -321,8 +335,9 @@ No wait server command exists.
 verify-veyra defaults to an isolated fake lane and keeps proof outside scratch.
 An explicitly authorized live branch drops fake overrides and records the probe and one streamed turn.
 Both branches remove the launching agent's Claude session variables, preserve CLAUDE_CODE_USE_* configuration and use a run-owned app cwd.
-Capture validates the owned window is on-screen, activates its application, checks it remains active and rejects identical PNGs after visible state changes.
-Evidence also requires different PNGs for named states and a session recording for live chat.
+Captures use only the run-owned window and require Veyra to remain frontmost.
+The debug-only ActivateWindow action requests activation from inside the app.
+The verification skill owns PNG capture and evidence mechanics.
 The pages log their SQLite assertions and name exit-1 stderr expectations; Evidence checks only completed pages.
 Cleanup first reads live_pgid, quits the app, applies the one-second SIGTERM/SIGKILL ladder to run-owned groups, retries group and effective-user marker checks for five seconds through Darwin sysctl without printing arguments, then removes scratch.
 The fake lane cannot create privileged processes; inaccessible root-effective processes are outside that marker scan.

@@ -648,17 +648,7 @@ impl Actor {
                 let current = match (turn, running) {
                     (Some(id), Some(t)) if id == t.id => t,
                     (None, Some(t)) if t.origin == TurnOrigin::Provider => t,
-                    (None, None)
-                        if matches!(
-                            event,
-                            TurnEvent::Started
-                                | TurnEvent::TextDelta { .. }
-                                | TurnEvent::ReasoningDelta { .. }
-                                | TurnEvent::ToolStarted { .. }
-                                | TurnEvent::Plan(_)
-                                | TurnEvent::RequestOpened { .. }
-                        ) =>
-                    {
+                    (None, None) if event.opens_provider_turn() => {
                         let id =
                             commands::queue(&self.projection, &mut c, thread, TurnOrigin::Provider);
                         let mut t = c.turns[&id].clone();

@@ -9,7 +9,7 @@ use crate::{
     commands::{Ack, Command, CommandError},
     domain::*,
     events::{ChangeSet, UiEvent},
-    live::{AfterStop, Live, LiveState, LiveThread},
+    live::{AfterStop, Live, LiveThread},
     provider::{scripted::Scripted, *},
     store,
 };
@@ -18,6 +18,16 @@ use tokio::{
     runtime::Runtime,
     sync::{mpsc, oneshot},
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveState {
+    Parked,
+    Starting,
+    Idle,
+    Running,
+    Terminal,
+    Stopping,
+}
 
 struct Fixture {
     actor: Actor,

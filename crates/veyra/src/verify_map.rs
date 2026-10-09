@@ -60,17 +60,11 @@ fn verify_map_names() {
     }
     let mapped: BTreeSet<_> = identifiers(&map).collect();
     let actions = fs::read_to_string(root.join("crates/veyra/src/ui/actions.rs")).unwrap();
-    let list = actions
-        .split("actions!(")
-        .nth(1)
-        .unwrap()
-        .split('[')
-        .nth(1)
-        .unwrap()
-        .split(']')
-        .next()
-        .unwrap();
-    let mut names: BTreeSet<String> = identifiers(list).map(str::to_owned).collect();
+    let mut names = BTreeSet::new();
+    for block in actions.split("actions!(").skip(1) {
+        let list = block.split('[').nth(1).unwrap().split(']').next().unwrap();
+        names.extend(identifiers(list).map(str::to_owned));
+    }
     for part in actions.split("#[action(namespace = veyra)]").skip(1) {
         let name = part
             .split("struct ")

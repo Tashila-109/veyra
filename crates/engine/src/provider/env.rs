@@ -22,6 +22,7 @@ static LOGIN_PATH: LazyLock<OsString> = LazyLock::new(|| {
 #[derive(Clone, Debug)]
 pub struct ChildEnv {
     pub path: OsString,
+    pub home: Option<PathBuf>,
     #[cfg(debug_assertions)]
     lanes: Arc<Mutex<Lanes>>,
     #[cfg(debug_assertions)]
@@ -35,6 +36,7 @@ impl ChildEnv {
     pub fn load() -> Self {
         Self {
             path: LOGIN_PATH.clone(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
             #[cfg(debug_assertions)]
             lanes: Arc::default(),
             #[cfg(debug_assertions)]
@@ -57,7 +59,7 @@ impl ChildEnv {
         let gui = std::env::var_os("PATH").unwrap_or_default();
         let known = platform::KNOWN_BIN_DIRS.iter().map(|dir| {
             if dir.starts_with('.') {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(dir)
+                self.home.as_deref().unwrap_or(Path::new("")).join(dir)
             } else {
                 PathBuf::from(dir)
             }
@@ -152,6 +154,7 @@ mod tests {
         if let Some(root) = std::env::var_os("VEYRA_TEST_RESOLUTION") {
             let env = super::ChildEnv {
                 path: "bin::.".into(),
+                home: None,
                 lanes: Default::default(),
                 claude_bin: None,
                 fixtures: None,

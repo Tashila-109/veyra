@@ -36,33 +36,12 @@ pub enum AfterStop {
     StartStructured { import: bool },
     StartTerminal,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LiveState {
-    Parked,
-    Starting,
-    Idle,
-    Running,
-    Terminal,
-    Stopping,
-}
 impl Live {
     pub fn session(&self) -> Option<&SessionHandle> {
         match self {
             Self::Starting { session } => session.as_ref(),
             Self::Structured { session, .. } => Some(session),
             _ => None,
-        }
-    }
-}
-impl LiveThread {
-    pub fn state(&self, running: bool) -> LiveState {
-        match self.live {
-            Live::Parked => LiveState::Parked,
-            Live::Starting { .. } => LiveState::Starting,
-            Live::Structured { .. } if running || self.background_work => LiveState::Running,
-            Live::Structured { .. } => LiveState::Idle,
-            Live::Terminal { .. } => LiveState::Terminal,
-            Live::Stopping { .. } => LiveState::Stopping,
         }
     }
 }

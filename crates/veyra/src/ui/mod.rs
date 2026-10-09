@@ -380,18 +380,14 @@ pub struct Shell {
     scroller: Entity<MessageScrollerState>,
     expanded: BTreeSet<ItemId>,
     branch: String,
+    branch_task: tokio::task::JoinSet<()>,
     provider_picker: Option<Entity<PopupMenu>>,
     #[cfg(debug_assertions)]
     provider_picker_labels: Vec<String>,
     _input_subscription: Subscription,
 }
 fn provider_rows(probes: &[Probe]) -> [(ProviderKind, String); 3] {
-    [
-        ProviderKind::Claude,
-        ProviderKind::Codex,
-        ProviderKind::Grok,
-    ]
-    .map(|provider| {
+    ProviderKind::ALL.map(|provider| {
         let readiness = match probes
             .iter()
             .find(|probe| probe.provider == provider)
@@ -522,6 +518,7 @@ impl Shell {
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             expanded: BTreeSet::new(),
             branch: String::new(),
+            branch_task: Default::default(),
             provider_picker: None,
             #[cfg(debug_assertions)]
             provider_picker_labels: vec![],
@@ -607,21 +604,44 @@ impl Shell {
         self.scroller.update(cx, |state, cx| state.reset(0, cx));
         self.input.update(cx, |input, cx| input.focus(window, cx));
         let cwd = self.state.threads.get(&thread).map(|row| row.cwd.clone());
-        let branch = cx.background_executor().spawn(async move {
-            cwd.and_then(|cwd| {
-                std::process::Command::new("git")
-                    .args(["branch", "--show-current"])
-                    .current_dir(cwd)
-                    .output()
-                    .ok()
-            })
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .unwrap_or_default()
-        });
+        self.branch.clear();
+        self.branch_task = Default::default();
+        let (sender, branch) = tokio::sync::oneshot::channel();
+        self.branch_task.spawn_on(
+            async move {
+                let branch = if let Some(cwd) = cwd {
+                    tokio::process::Command::new("git")
+                        .args(["branch", "--show-current"])
+                        .current_dir(cwd)
+                        .kill_on_drop(true)
+                        .output()
+                        .await
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let _ = sender.send(branch);
+            },
+            &self.runtime,
+        );
+        cx.spawn(async move |this, cx| {
+            if let Ok(branch) = branch.await {
+                let _ = this.update(cx, |shell, cx| {
+                    if shell.view.chat() == Some(thread)
+                        && shell.state.snapshot_sequence == request.0
+                    {
+                        shell.branch = branch;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let snapshot = reply.await;
-            let branch = branch.await;
             let _ = this.update(cx, |shell, cx| {
                 let applied = match snapshot {
                     Ok(snapshot) => shell.state.finish_snapshot(thread, request, snapshot),
@@ -634,7 +654,6 @@ impl Shell {
                     }
                 };
                 if applied && shell.view.chat() == Some(thread) {
-                    shell.branch = branch;
                     let count = shell.state.transcript(thread).len();
                     shell
                         .scroller
@@ -655,11 +674,7 @@ impl Shell {
         let generation = self.probe_generation;
         let retry_thread = retry.then(|| self.view.chat()).flatten();
         let env = veyra_engine::provider::env::ChildEnv::load();
-        for provider in [
-            ProviderKind::Claude,
-            ProviderKind::Codex,
-            ProviderKind::Grok,
-        ] {
+        for provider in ProviderKind::ALL {
             let reply =
                 self.probes
                     .check(&self.runtime, provider, env.clone(), self.probe_cwd.clone());
@@ -781,6 +796,7 @@ impl Shell {
         self.send_command(command, window, cx);
     }
     fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.branch_task = Default::default();
         self.view = MainView::NewThread;
         self.provider_picker = None;
         self.config.mode = self.state.settings.default_mode;
@@ -904,24 +920,20 @@ impl Shell {
     }
     #[cfg(debug_assertions)]
     fn dump_providers(&self) -> Vec<serde_json::Value> {
-        [
-            ProviderKind::Claude,
-            ProviderKind::Codex,
-            ProviderKind::Grok,
-        ]
-        .into_iter()
-        .map(|provider| {
-            let probe = self.probe(provider);
-            serde_json::json!({
-                "provider":provider,
-                "readiness":probe.map(|probe| &probe.readiness).unwrap_or(&Readiness::Checking),
-                "path":probe.and_then(|probe| probe.path.as_ref()),
-                "version":probe.and_then(|probe| probe.version.as_ref()),
-                "models":probe.map(|probe| &probe.models),
-                "account":probe.map(Probe::account_presence).unwrap_or("unknown")
+        ProviderKind::ALL
+            .into_iter()
+            .map(|provider| {
+                let probe = self.probe(provider);
+                serde_json::json!({
+                    "provider":provider,
+                    "readiness":probe.map(|probe| &probe.readiness).unwrap_or(&Readiness::Checking),
+                    "path":probe.and_then(|probe| probe.path.as_ref()),
+                    "version":probe.and_then(|probe| probe.version.as_ref()),
+                    "models":probe.map(|probe| &probe.models),
+                    "account":probe.map(Probe::account_presence).unwrap_or("unknown")
+                })
             })
-        })
-        .collect()
+            .collect()
     }
     #[cfg(debug_assertions)]
     fn dump_transcript(&self) -> Vec<serde_json::Value> {
@@ -986,7 +998,7 @@ impl Focusable for Shell {
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.global::<Theme>().clone();
-        div()
+        let root = div()
             .h_flex()
             .size_full()
             .bg(theme.colors.bg)
@@ -1002,6 +1014,7 @@ impl Render for Shell {
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
             .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
             .on_action(cx.listener(|shell, _: &OpenSettings, window, cx| {
+                shell.branch_task = Default::default();
                 shell.view = MainView::Settings {
                     back: shell.view.selected(),
                 };
@@ -1149,6 +1162,7 @@ impl Render for Shell {
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, _: &Quit, _, cx| {
+                shell.branch_task = Default::default();
                 shell.engine.shutdown();
                 cx.quit();
             }))
@@ -1232,7 +1246,13 @@ impl Render for Shell {
                         }
                         MainView::Chat(_) => transcript::render(self, cx).into_any_element(),
                     }),
-            )
+            );
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|_, _: &ActivateWindow, window, cx| {
+            cx.activate(true);
+            window.activate_window();
+        }));
+        root
     }
 }
 pub fn run(
@@ -1292,12 +1312,12 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::AppState;
+    use super::{AppState, provider_rows};
     use std::collections::BTreeMap;
     use veyra_engine::{
         domain::*,
         events::{ChangeEvent, ThreadSnapshot, UiEvent},
-        provider::ProviderKind,
+        provider::{Probe, ProviderKind, Readiness},
     };
 
     #[test]
@@ -1602,14 +1622,8 @@ mod tests {
             }
         );
     }
-}
-
-#[cfg(test)]
-mod provider_menu_tests {
-    use super::provider_rows;
-    use veyra_engine::provider::{Probe, ProviderKind, Readiness};
     #[test]
-    fn provider_rows_refresh_readiness_after_probe() {
+    fn provider_rows_label_each_readiness() {
         assert_eq!(provider_rows(&[])[0].1, "Claude Code · Checking…");
         let mut probe = Probe {
             provider: ProviderKind::Claude,
