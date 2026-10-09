@@ -128,6 +128,7 @@ Require the known system-wide install paths to contain no Claude before launch.
 Release still reads VEYRA_DATA_DIR, but excludes the driver, recording and provider overrides at compile time.
 The debug strings are the positive control.
 The cleanup trap owns only this release group and scratch folder.
+This section stops the debug app before opening the release window, then relaunches debug after release cleanup.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -137,7 +138,7 @@ PROOF=target/verify-veyra/$RUN
 REL_DATA=/tmp/veyra-rel-$RUN
 REL_PROOF=$PROOF/release
 test ! -e "$REL_DATA"
-mkdir -p "$REL_PROOF" "$REL_DATA/home"
+mkdir -p "$REL_PROOF"
 cargo build --release -p veyra
 if target/release/veyra ctl dump >"$REL_PROOF/ctl.txt" 2>&1; then rc=0; else rc=$?; fi
 printf 'exit=%s\n' "$rc" >>"$REL_PROOF/ctl.txt"
@@ -153,6 +154,16 @@ for name in control.sock VEYRA_CLAUDE_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD; do
     test "$debug" -gt 0
 done
 for path in /opt/homebrew/bin/claude /usr/local/bin/claude /usr/bin/claude; do test ! -x "$path"; done
+PYTHONPATH="$PROOF" python3 - <<'PY'
+from driver import *
+stop('before-release')
+PY
+DEBUG_PID=$(<"$PROOF/pid")
+if kill -0 "$DEBUG_PID" 2>/dev/null; then
+    printf 'debug app is still running before release launch\n' >&2
+    exit 1
+fi
+mkdir -p "$REL_DATA/home"
 set -m
 HOME="$REL_DATA/home" SHELL=/usr/bin/false PATH=/usr/bin:/bin:/usr/sbin:/sbin VEYRA_DATA_DIR="$REL_DATA" \
     target/release/veyra >"$REL_PROOF/stdout.log" 2>"$REL_PROOF/stderr.log" &
@@ -187,6 +198,11 @@ test ! -e "$REL_DATA/control.sock"
 printf 'PASS release usage exit=2; driver and override strings absent; no socket\n'
 stop_release
 trap - EXIT
+PYTHONPATH="$PROOF" python3 - <<'PY'
+from driver import *
+start('after-release')
+print('PASS debug relaunched after release window ended')
+PY
 ```
 
 ## Observable success

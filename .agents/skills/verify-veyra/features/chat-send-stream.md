@@ -140,6 +140,14 @@ provider_done = poll('chat-provider-done',lambda d: d['selected_thread']['id']==
     and sql("select count(*) from turns where thread_id='"+provider+"' and state='ended'")=='2')
 assert sql("select group_concat(json_extract(outcome_json,'$')) from turns where thread_id='"
     +provider+"'") == 'Completed,Completed'
+provider_turn = sql("select id from turns where thread_id='"+provider+"' and origin_json='\"Provider\"'")
+assert provider_turn
+assert sql("select count(*) from items where turn_id='"+provider_turn+"'") == '1'
+reply = 'The background `sleep 20` finished with exit code 0.'
+assert sql("select kind||'|'||json_extract(body_json,'$.AssistantText.text')||'|'||done "
+    +"from items where turn_id='"+provider_turn+"'") == 'assistant_text|'+reply+'|1'
+assert [(item['kind'],item['text'],item['done']) for item in provider_done['transcript']
+    if item['kind'] in ['assistant','reasoning']] == [('assistant','started',True),('assistant',reply,True)]
 poll('chat-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null') == '0')
 page_done('chat-send-stream')
 print('PASS chat streamed o → ok, Working → Done; crash cause/tail; Retry; wait exits 0/1/2/3')
@@ -155,6 +163,7 @@ PY
 - Streamed assistant items have a positive `delta_count`.
 - `chat-background-working.json` stays Working after its foreground turn ends and `wait Done 1` times out.
 - The ambient-only interval shows Done while the session remains alive; `chat-provider-done.json` shows Done after the separate provider turn completes.
+- The CLI-started turn stores exactly one completed assistant reply and no empty reasoning; `sql.log` and the dump assert the exact items.
 - `chat-failed.json` has `view: failed_thread`, Failed and the crash cause with both fixture stderr lines; its PNG shows the cause, next step, Retry and Open Terminal.
 - `chat-retried.json` has Done with the retried completed `ok`.
 - `drive.log` records wait exit 0 for each state, 1 for the zero-second timeout, 2 for bad usage and 3 for a missing thread.

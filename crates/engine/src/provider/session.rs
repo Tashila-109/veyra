@@ -18,12 +18,13 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Child,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 struct ProcessGroup {
     child: Option<Child>,
     pid: u32,
+    reaped: Option<oneshot::Sender<()>>,
 }
 fn process_alive(child: &mut Child, pid: u32) -> std::io::Result<bool> {
     child.try_wait()?;
@@ -54,6 +55,9 @@ async fn end_process(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let status = child.wait().await?;
+    while platform::group_exists(pid)? {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     failure.map_or(Ok(status), Err)
 }
 impl ProcessGroup {
@@ -61,6 +65,7 @@ impl ProcessGroup {
         Self {
             pid: child.id().expect("new child"),
             child: Some(child),
+            reaped: None,
         }
     }
     fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
@@ -72,20 +77,33 @@ impl ProcessGroup {
     fn stdin(&mut self) -> Option<tokio::process::ChildStdin> {
         self.child.as_mut()?.stdin.take()
     }
+    fn watch(&mut self, cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>) {
+        let (sender, receiver) = oneshot::channel();
+        self.reaped = Some(sender);
+        let _ = cleanup.send(receiver);
+    }
+    fn end(
+        &mut self,
+    ) -> Option<tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>> {
+        let child = self.child.take()?;
+        let pid = self.pid;
+        let reaped = self.reaped.take();
+        Some(tokio::spawn(async move {
+            let result = end_process(child, pid, process_alive).await;
+            drop(reaped);
+            result
+        }))
+    }
     async fn stop(mut self) -> std::io::Result<std::process::ExitStatus> {
-        match self.child.take() {
-            Some(child) => tokio::spawn(end_process(child, self.pid, process_alive))
-                .await
-                .map_err(std::io::Error::other)?,
+        match self.end() {
+            Some(task) => task.await.map_err(std::io::Error::other)?,
             None => Err(std::io::Error::other("process already stopped")),
         }
     }
 }
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        if let Some(child) = self.child.take() {
-            tokio::spawn(end_process(child, self.pid, process_alive));
-        }
+        self.end();
     }
 }
 struct Process {
@@ -173,8 +191,10 @@ pub fn spawn(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    let process = launch(&spec, &env, None)?;
+    let mut process = launch(&spec, &env, None)?;
     let (control, receiver) = mpsc::unbounded_channel();
+    let (cleanup, reaped) = mpsc::unbounded_channel();
+    process.child.watch(&cleanup);
     let thread = spec.thread;
     let supervisor_out = out.clone();
     let task = tokio::spawn(async move {
@@ -196,7 +216,8 @@ pub fn spawn(
                     spec.native = None;
                     let native = NativeSessionId(ThreadId::new().to_string());
                     match launch(&spec, &env, Some(native)) {
-                        Ok(next) => {
+                        Ok(mut next) => {
+                            next.child.watch(&cleanup);
                             let notice = ProviderEvent::Session(SessionEvent::Notice {
                                 text: "The earlier conversation could not be resumed; this is a new session".into(),
                             });
@@ -231,23 +252,34 @@ pub fn spawn(
             }
         }
     });
-    tokio::spawn(async move {
-        if let Err(error) = task.await {
-            let _ = emit(
-                &supervisor_out,
-                thread,
-                epoch,
-                ProviderEvent::Session(SessionEvent::Exited {
-                    crash: Some(record::redact(
-                        &format!("Claude session task failed: {error}"),
-                        None,
-                    )),
-                }),
-            )
-            .await;
-        }
-    });
+    tokio::spawn(supervise(task, reaped, supervisor_out, thread, epoch));
     Ok(SessionHandle { control })
+}
+async fn supervise(
+    task: tokio::task::JoinHandle<bool>,
+    mut reaped: mpsc::UnboundedReceiver<oneshot::Receiver<()>>,
+    out: mpsc::Sender<EngineMsg>,
+    thread: ThreadId,
+    epoch: u32,
+) {
+    let result = task.await;
+    while let Some(done) = reaped.recv().await {
+        let _ = done.await;
+    }
+    if let Err(error) = result {
+        let _ = emit(
+            &out,
+            thread,
+            epoch,
+            ProviderEvent::Session(SessionEvent::Exited {
+                crash: Some(record::redact(
+                    &format!("Claude session task failed: {error}"),
+                    None,
+                )),
+            }),
+        )
+        .await;
+    }
 }
 async fn emit(
     out: &mpsc::Sender<EngineMsg>,
@@ -308,13 +340,13 @@ async fn run_one(
     if let Some(recorder) = &mut process.recorder {
         recorder.bind(process.native.0.clone(), "<id:session>".into());
     }
-    if let Err(error) = process.send(&writer, claude::initialize()) {
-        return Completion::Exited(Some(error.to_string()));
-    }
-    let mut failure = None;
+    let mut failure = process
+        .send(&writer, claude::initialize())
+        .err()
+        .map(|error| error.to_string());
     let mut consumer_gone = false;
     let mut writer_done = false;
-    loop {
+    while failure.is_none() {
         tokio::select! {
             _ = out.closed() => { consumer_gone = true; break; }
             result = &mut write_task => {
@@ -391,6 +423,7 @@ async fn run_one(
         let _ = stderr.await;
     }
     let lines = tail.lock().unwrap().iter().cloned().collect::<Vec<_>>();
+    let failure = failure.map(|text| with_stderr(&text, &lines, None));
     let status = process.child.stop().await.ok();
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder {
@@ -444,11 +477,15 @@ async fn run_one(
 }
 
 pub fn crash_text(code: Option<i32>, lines: &[String], token: Option<&str>) -> String {
-    let mut text = format!(
+    let text = format!(
         "claude exited unexpectedly (exit code {})",
         code.map(|code| code.to_string())
             .unwrap_or_else(|| "unknown".into())
     );
+    with_stderr(&text, lines, token)
+}
+fn with_stderr(text: &str, lines: &[String], token: Option<&str>) -> String {
+    let mut text = record::redact(text, token);
     for line in lines.iter().skip(lines.len().saturating_sub(8)) {
         text.push('\n');
         text.push_str(
@@ -559,6 +596,105 @@ pub async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn session_panic_waits_for_group_cleanup_before_exited() {
+        let env = ChildEnv::load();
+        let child = env
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "trap '' TERM; /bin/sleep 30 & echo ready; wait".into(),
+                ],
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .unwrap();
+        let mut group = ProcessGroup::new(child);
+        let pid = group.pid;
+        let mut output = BufReader::new(group.stdout().unwrap()).lines();
+        assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
+        let (cleanup, reaped) = mpsc::unbounded_channel();
+        group.watch(&cleanup);
+        drop(cleanup);
+        let task = tokio::spawn(async move {
+            let _group = group;
+            panic!("fixture panic");
+        });
+        let (out, mut events) = mpsc::channel(256);
+        supervise(task, reaped, out, ThreadId::new(), 1).await;
+        let alive = platform::group_exists(pid).unwrap();
+        if alive {
+            let _ = platform::signal_group(pid, Signal::Kill);
+        }
+        assert!(!alive, "Exited arrived before the owned group ended");
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            EngineMsg::Provider {
+                event: ProviderEvent::Session(SessionEvent::Exited { crash: Some(text) }), ..
+            } if text.contains("Claude session task failed:") && text.contains("fixture panic")
+        ));
+    }
+    #[tokio::test]
+    async fn decode_failure_reports_bounded_redacted_stderr_tail() {
+        let env = ChildEnv::load();
+        let child = env
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    concat!(
+                        "read initialize; read prompt; ",
+                        "printf 'discarded\\n' >&2; ",
+                        "printf 'discarded too\\nline 1\\nline 2\\nline 3\\nline 4\\nline 5\\n' >&2; ",
+                        "printf 'password=fixture-secret\\nline 7\\nlast diagnostic\\n' >&2; ",
+                        "printf 'not-json\\n'"
+                    )
+                    .into(),
+                ],
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .unwrap();
+        let pid = child.id().unwrap();
+        let process = Process {
+            child: ProcessGroup::new(child),
+            native: NativeSessionId("fixture-session".into()),
+            #[cfg(debug_assertions)]
+            recorder: None,
+        };
+        let (sender, mut control) = mpsc::unbounded_channel();
+        let turn = TurnId::new();
+        sender
+            .send(SessionControl::StartTurn {
+                turn,
+                text: "reply".into(),
+            })
+            .unwrap();
+        let (out, mut events) = mpsc::channel(256);
+        let completion = run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
+        let expected = concat!(
+            "Claude protocol: expected ident at line 1 column 2\n",
+            "line 1\nline 2\nline 3\nline 4\nline 5\n",
+            "password=[redacted]\nline 7\nlast diagnostic"
+        );
+        let Completion::Exited(Some(text)) = completion else {
+            panic!("missing failure")
+        };
+        assert_eq!(text, expected);
+        assert!(!platform::group_exists(pid).unwrap());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            EngineMsg::Provider {
+                event: ProviderEvent::Turn {
+                    turn: Some(id),
+                    event: TurnEvent::TurnEnded {
+                        outcome: TurnOutcome::Failed { message }
+                    }
+                }, ..
+            } if id == turn && message == expected
+        ));
+    }
     #[tokio::test]
     async fn process_check_error_still_kills_and_reaps_group() {
         let env = ChildEnv::load();

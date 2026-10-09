@@ -47,6 +47,11 @@ func fail(_ text: String) -> Never {
     fputs(text + ". Veyra must stay frontmost during captures.\n", stderr)
     exit(1)
 }
+guard NSRunningApplication(processIdentifier: pid) != nil else { fail("owned app is gone") }
+let end = Date().addingTimeInterval(2)
+while NSWorkspace.shared.frontmostApplication?.processIdentifier != pid && Date() < end {
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+}
 guard let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]],
       let window = windows.first(where: {
           ($0[kCGWindowNumber as String] as? UInt32) == id &&
@@ -62,10 +67,8 @@ var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
 CGGetActiveDisplayList(count, &displays, &count)
 guard displays.contains(where: { frame.intersects(CGDisplayBounds($0)) })
 else { fail("owned window is outside the active displays") }
-guard let app = NSRunningApplication(processIdentifier: pid) else { fail("owned app is gone") }
-let end = Date().addingTimeInterval(2)
-while !app.isActive && Date() < end { Thread.sleep(forTimeInterval: 0.05) }
-guard app.isActive else { fail("owned window is covered by another application") }
+guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+else { fail("owned window is covered by another application") }
 SWIFT
 swiftc -O "$PROOF/capture-window.swift" -o "$PROOF/capture-window"
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
@@ -188,13 +191,14 @@ def wait_gone(pid):
         except ProcessLookupError: return
         time.sleep(.05)
     raise AssertionError(f'owned pid {pid} did not exit')
-def restart(label, crash=False):
+def stop(label, crash=False):
     pid = identity()
     live = sql('select count(*) from threads where live_pgid is not null')
     assert live == '0', 'finish provider turns before relaunch'
     if crash: os.kill(pid,signal.SIGKILL)
     else: ctl(label+'-quit','quit')
     wait_gone(pid)
+def start(label):
     app = subprocess.Popen([str(pathlib.Path('target/debug/veyra').resolve())],cwd=DATA/'appcwd',env=ENV,
         stdout=(PROOF/(label+'.stdout')).open('w'),stderr=(PROOF/(label+'.stderr')).open('w'),
         start_new_session=True)
@@ -215,6 +219,9 @@ def restart(label, crash=False):
     (PROOF/'window-id').write_text(window+'\n')
     identity()
     return pid
+def restart(label, crash=False):
+    stop(label,crash)
+    return start(label)
 def stage(scenario, slow=False):
     records = [json.loads(line) for line in (SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
     if slow:

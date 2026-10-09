@@ -294,6 +294,45 @@ fn cli_result_ends_provider_turn() {
 }
 
 #[test]
+fn cli_reply_omitting_empty_reasoning_has_one_item() {
+    let events = replay("provider-turn-after-background", false);
+    let mut items = std::collections::BTreeMap::new();
+    for event in events {
+        if let ProviderEvent::Turn { turn: None, event } = event {
+            match event {
+                TurnEvent::TextDelta { key, text, .. } => {
+                    let item = items
+                        .entry(key)
+                        .or_insert(("assistant", String::new(), false));
+                    item.1.push_str(&text);
+                }
+                TurnEvent::ReasoningDelta { key, text } => {
+                    let item = items
+                        .entry(key)
+                        .or_insert(("reasoning", String::new(), false));
+                    item.1.push_str(&text);
+                }
+                TurnEvent::ItemEnded { key } => {
+                    if let Some(item) = items.get_mut(&key) {
+                        item.2 = true;
+                    }
+                }
+                TurnEvent::Started | TurnEvent::TurnEnded { .. } => {}
+                _ => panic!("unexpected CLI-started item: {event:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        items.into_values().collect::<Vec<_>>(),
+        vec![(
+            "assistant",
+            "The background `sleep 20` finished with exit code 0.".into(),
+            true,
+        )]
+    );
+}
+
+#[test]
 fn claude_probe_records_initialize_with_masked_account_keys() {
     let (scratch, mut env) = environment("ok-reply", false);
     env.record = Some(scratch.0.join("recorded"));

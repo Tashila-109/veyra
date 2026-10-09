@@ -596,16 +596,19 @@ impl Shell {
         })
         .detach();
     }
+    fn show(&mut self, view: MainView) {
+        self.branch_task = Default::default();
+        self.branch.clear();
+        self.view = view;
+    }
     fn select_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
-        self.view = MainView::Chat(thread);
+        self.show(MainView::Chat(thread));
         self.notice = None;
         let request = self.state.begin_snapshot(thread);
         let reply = self.engine.snapshot(thread);
         self.scroller.update(cx, |state, cx| state.reset(0, cx));
         self.input.update(cx, |input, cx| input.focus(window, cx));
         let cwd = self.state.threads.get(&thread).map(|row| row.cwd.clone());
-        self.branch.clear();
-        self.branch_task = Default::default();
         let (sender, branch) = tokio::sync::oneshot::channel();
         self.branch_task.spawn_on(
             async move {
@@ -796,8 +799,7 @@ impl Shell {
         self.send_command(command, window, cx);
     }
     fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.branch_task = Default::default();
-        self.view = MainView::NewThread;
+        self.show(MainView::NewThread);
         self.provider_picker = None;
         self.config.mode = self.state.settings.default_mode;
         self.notice = None;
@@ -1014,10 +1016,9 @@ impl Render for Shell {
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
             .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
             .on_action(cx.listener(|shell, _: &OpenSettings, window, cx| {
-                shell.branch_task = Default::default();
-                shell.view = MainView::Settings {
+                shell.show(MainView::Settings {
                     back: shell.view.selected(),
-                };
+                });
                 shell.notice = None;
                 window.focus(&shell.focus, cx);
                 cx.notify();
@@ -1053,12 +1054,9 @@ impl Render for Shell {
                     shell.notice("Create a new thread to choose a provider", cx);
                     return;
                 }
-                let next = match shell.provider {
-                    ProviderKind::Claude => ProviderKind::Codex,
-                    ProviderKind::Codex => ProviderKind::Grok,
-                    ProviderKind::Grok => ProviderKind::Claude,
-                };
-                shell.provider = action.provider.unwrap_or(next);
+                shell.provider = action.provider.unwrap_or_else(|| {
+                    *cycle(&ProviderKind::ALL, Some(&shell.provider)).expect("providers")
+                });
                 shell.provider_picker = None;
                 shell.input.update(cx, |input, cx| input.focus(window, cx));
                 shell.config.model = None;
@@ -1162,7 +1160,7 @@ impl Render for Shell {
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, _: &Quit, _, cx| {
-                shell.branch_task = Default::default();
+                shell.show(MainView::NewThread);
                 shell.engine.shutdown();
                 cx.quit();
             }))

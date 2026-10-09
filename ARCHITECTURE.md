@@ -25,6 +25,7 @@ main -> tokio runtime -> Engine actor -> veyra.db
                               | normalized events
                               +--------------------> Engine actor
 Shell -> runtime readiness probes -> initialize-only CLI process
+Shell -> runtime branch task -> git child
 
 debug ctl -> private Unix socket -> socket thread -> gpui window actions
                                          debug session -> recorder / fake CLI
@@ -122,7 +123,8 @@ The window, sidebar, header, dump and ctl wait consume that status, including ba
 Spawn increments the epoch; stale session events are ignored.
 Turn events must also match the running turn, unless uncorrelated content starts or joins a Provider-origin turn.
 Idle structured sessions park after ten minutes without a running turn, pending request or background work.
-The existing engine supports holds, queue reasons, cascaded Stop/Archive, wake delivery and task settlement, but those controls and cards have no window UI.
+The engine supports holds, queue reasons, cascaded Stop/Archive, Interrupt, Respond, wake delivery and task settlement.
+Those controls and cards have no window UI.
 Tasks cannot arise through the application because the tool server is not implemented.
 
 `store::MIGRATIONS` owns schema 2, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
@@ -172,15 +174,16 @@ Its select loop reads stdout lines, controls, output-channel closure and stdin-w
 A dedicated task writes stdin, so a blocked pipe does not block the control loop.
 The stderr task retains eight lines, each redacted and cut to 500 characters.
 When the loop ends, the task waits up to 500 ms for stderr, runs the group ladder, then emits Failed if a turn is active, then Exited.
-Failed carries Veyra's crash text and redacted tail.
+Failed carries the loop failure or Veyra's crash text, followed by the same bounded, redacted stderr tail.
 The crash exit code is read after SIGTERM; a process that closed stdout without exiting reports exit code unknown.
-Exited means the owned group has been signalled and its leader reaped.
+Exited follows the group's exit and its leader's reap, including an initialize-send failure.
 On Exited, the actor ends any remaining running turn as Failed if crash text exists, otherwise Interrupted.
 At run end or task drop, each owned group receives SIGTERM before its leader is reaped.
 Cleanup checks every 50 ms and waits up to one second for the group to exit.
 It sends SIGKILL if the group remains alive or a child/group check fails, then waits for the leader before returning the error.
-The guard retains the child through that ladder and waits for it, including probe cancellation and resume fallback.
-A supervisor awaits its join handle and emits Exited with redacted panic text on failure.
+The guard retains the child through that ladder, then waits for the group to disappear after reaping its leader.
+This also covers probe cancellation and resume fallback.
+A supervisor awaits the session task and every registered group cleanup before emitting Exited with redacted panic text.
 The actor stores pid and group on Ready and parks on Exited.
 
 `claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, tool ids and background-work replacement.
@@ -190,7 +193,8 @@ Unknown stream events, deltas and content blocks log their type and category at 
 These logs never include frame content.
 Foreign results and unmatched lifecycle frames are dropped silently; unsupported control requests get an error reply.
 Unmatched user frames are also dropped silently.
-A non-JSON line or a mistyped known field fails decoding, ends the process and fails its running turn.
+Malformed JSON and type errors in parsed frames or final blocks end the process and fail its running turn.
+Final blocks already delivered by the stream are skipped before parsing.
 The first spawn uses a Veyra UUID with --session-id; later spawns use --resume.
 Mode maps to default, acceptEdits or bypassPermissions plus --allow-dangerously-skip-permissions.
 Ask first and Accept edits tool requests that need host approval currently receive the unsupported-request error, so those tools fail.
@@ -210,7 +214,8 @@ After that prompt ends, an uncorrelated result ends a running Provider-origin tu
 Result errors, stop reasons and terminal reasons decide the outcome, not subtype alone.
 Error flags, error subtypes and max_tokens/refusal take precedence.
 Otherwise aborted terminal reasons become Interrupted; other incomplete terminal reasons become Failed.
-Content-block deltas and final assistant messages share keys to avoid duplicated streamed text.
+Final assistant blocks match the stream's message id, block kind and occurrence within that kind.
+They reuse stream keys even when Claude omits empty reasoning from the final content list.
 Item completion is normalized separately from turn completion.
 Empty reasoning deltas and final reasoning blocks add no transcript item.
 Each background_tasks_changed replaces the pending-work set, excluding ambient tasks.
@@ -283,6 +288,7 @@ The sidebar reads projects and thread statuses, and all resizing paths dispatch 
 The header reads title, status/elapsed time, project and a separate Git branch task on the tokio runtime.
 That child inherits the app environment, has kill-on-drop and no timeout.
 Selecting another thread, leaving Chat or dropping the Shell cancels it; its reply also checks the selection identity.
+Every view transition cancels the branch task and clears the displayed branch through `Shell::show`.
 The centred transcript uses MessageScroller and selectable Markdown TextView for assistant text, a still stream caret, collapsed reasoning/tools and notices.
 Tool output is bounded to its last 10,000 characters by the actor.
 The failed view shows the cause, next step, Retry and Open Terminal on the project folder.
@@ -306,7 +312,6 @@ The Theme global owns all colours, geometry, type, radii and motion tokens.
 Theme::apply projects them through the kit and follows macOS appearance.
 Violet is restricted to interaction roles; selected controls and hover remain neutral.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
-Traffic-light position is a point.
 The requested window is 1280 by 800 with a 760 by 560 minimum; a window manager can override it.
 
 ## Debug protocol and verification trust
@@ -342,6 +347,7 @@ The pages log their SQLite assertions and name exit-1 stderr expectations; Evide
 Cleanup first reads live_pgid, quits the app, applies the one-second SIGTERM/SIGKILL ladder to run-owned groups, retries group and effective-user marker checks for five seconds through Darwin sysctl without printing arguments, then removes scratch.
 The fake lane cannot create privileged processes; inaccessible root-effective processes are outside that marker scan.
 Release proof uses a disposable HOME and restricted PATH to avoid running an unauthorized live Claude probe.
+It stops debug before opening release and relaunches debug only after release cleanup.
 The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals and Terminal opening.
 Its selection rejects unsupported targets with compile_error.
 The textual platform_boundary test is a guard, not proof against every indirect OS call; review still checks indirect commands and strings.
@@ -370,4 +376,5 @@ The release page scans driver/override strings with a debug positive control and
 The ignored live test requires fresh human consent; it is not a workspace-test live invocation.
 No signed-out account shape has been captured.
 Live CLI behavior and performance need their authorized lanes; fake replay and structural checks cannot establish them.
-Permission/approval behavior, Stop/interrupt continuation, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.
+Permission/approval behavior, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.
+Stop and Interrupt have no window path, so their live continuation is unproved.

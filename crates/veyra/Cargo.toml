@@ -7,7 +7,7 @@ edition.workspace = true
 veyra-engine = { path = "../engine", version = "=0.0.1" }
 gpui-kit.workspace = true
 gpui.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "process"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true

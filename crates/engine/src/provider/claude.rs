@@ -245,6 +245,13 @@ struct Block {
     input: String,
     streamed: bool,
 }
+fn log_ignored(kind: &str, value: &Value) {
+    tracing::info!(
+        kind,
+        frame_type = value["type"].as_str().unwrap_or("unknown"),
+        "ignored Claude wire type"
+    );
+}
 impl ResultFrame {
     fn outcome(self) -> TurnOutcome {
         let reason = self.terminal_reason.as_deref();
@@ -373,28 +380,7 @@ impl Codec {
             }
             Frame::User(user) => self.user(user, &mut events),
             Frame::StreamEvent(stream) => {
-                let unknown = match &stream.event {
-                    Event::Unknown => Some(("stream_event", &["event"][..])),
-                    Event::ContentBlockStart {
-                        content_block: ContentBlock::Unknown,
-                        ..
-                    } => Some(("content_block", &["event", "content_block"][..])),
-                    Event::ContentBlockDelta {
-                        delta: Delta::Unknown,
-                        ..
-                    } => Some(("delta", &["event", "delta"][..])),
-                    _ => None,
-                };
-                if let Some((kind, path)) = unknown {
-                    let wire: Value = serde_json::from_str(line)?;
-                    let value = path.iter().fold(&wire, |value, key| &value[*key]);
-                    tracing::info!(
-                        kind,
-                        frame_type = value["type"].as_str().unwrap_or("unknown"),
-                        "ignored Claude wire type"
-                    );
-                }
-                self.stream(stream.event, &mut events);
+                self.stream(stream.event, line, &mut events)?;
             }
             Frame::Assistant(assistant) => self.assistant(assistant, &mut events)?,
             Frame::Result(result) => {
@@ -504,7 +490,28 @@ impl Codec {
             }
         }
     }
-    fn stream(&mut self, event: Event, events: &mut Vec<TurnEvent>) {
+    fn stream(
+        &mut self,
+        event: Event,
+        line: &str,
+        events: &mut Vec<TurnEvent>,
+    ) -> Result<(), super::ProviderError> {
+        let unknown = match &event {
+            Event::Unknown => Some(("stream_event", &["event"][..])),
+            Event::ContentBlockStart {
+                content_block: ContentBlock::Unknown,
+                ..
+            } => Some(("content_block", &["event", "content_block"][..])),
+            Event::ContentBlockDelta {
+                delta: Delta::Unknown,
+                ..
+            } => Some(("delta", &["event", "delta"][..])),
+            _ => None,
+        };
+        if let Some((kind, path)) = unknown {
+            let wire: Value = serde_json::from_str(line)?;
+            log_ignored(kind, path.iter().fold(&wire, |value, key| &value[*key]));
+        }
         match event {
             Event::MessageStart { message } => {
                 if self.active.is_none() {
@@ -545,7 +552,7 @@ impl Codec {
                         }
                         Delta::Thinking { thinking } => {
                             if thinking.is_empty() {
-                                return;
+                                return Ok(());
                             }
                             block.streamed = true;
                             events.push(TurnEvent::ReasoningDelta {
@@ -578,6 +585,7 @@ impl Codec {
             }
             Event::Unknown => {}
         }
+        Ok(())
     }
     fn assistant(
         &self,
@@ -586,19 +594,32 @@ impl Codec {
     ) -> Result<(), super::ProviderError> {
         if let Some(content) = assistant.message["content"].as_array() {
             for (index, value) in content.iter().enumerate() {
-                let block: ContentBlock = serde_json::from_value(value.clone())?;
-                if !matches!(block, ContentBlock::Unknown)
-                    && self.blocks.get(&(index as u32)).is_some_and(|block| {
-                        block.streamed || matches!(block.content, ContentBlock::ToolUse { .. })
+                let kind = value["type"].as_str().unwrap_or_default();
+                let ordinal = content[..index]
+                    .iter()
+                    .filter(|block| block["type"] == kind)
+                    .count();
+                let streamed = (assistant.message["id"].as_str() == Some(self.message.as_str()))
+                    .then(|| {
+                        self.blocks
+                            .values()
+                            .filter(|block| block.content.kind() == kind)
+                            .nth(ordinal)
                     })
-                {
+                    .flatten();
+                if streamed.is_some_and(|block| {
+                    block.streamed || matches!(block.content, ContentBlock::ToolUse { .. })
+                }) {
                     continue;
                 }
-                let key = NativeItemKey(format!(
-                    "{}:{index}:{}",
-                    assistant.message["id"].as_str().unwrap_or_default(),
-                    block.kind()
-                ));
+                let block: ContentBlock = serde_json::from_value(value.clone())?;
+                let key = streamed.map(|block| block.key.clone()).unwrap_or_else(|| {
+                    NativeItemKey(format!(
+                        "{}:{index}:{}",
+                        assistant.message["id"].as_str().unwrap_or_default(),
+                        block.kind()
+                    ))
+                });
                 match block {
                     ContentBlock::Text { text } => events.push(TurnEvent::TextDelta {
                         key: key.clone(),
@@ -615,11 +636,7 @@ impl Codec {
                         });
                     }
                     ContentBlock::Unknown => {
-                        tracing::info!(
-                            kind = "content_block",
-                            frame_type = value["type"].as_str().unwrap_or("unknown"),
-                            "ignored Claude wire type"
-                        );
+                        log_ignored("content_block", value);
                         continue;
                     }
                     ContentBlock::ToolUse { .. } => continue,
@@ -757,6 +774,66 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn final_blocks_match_message_and_occurrence_within_kind() {
+        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        codec.start(TurnId::new(), "reply".into());
+        codec
+            .line(
+                &json!({"type":"stream_event", "event":{
+                    "type":"message_start", "message":{"id":"first"}
+                }})
+                .to_string(),
+            )
+            .unwrap();
+        for (index, text) in [(1, "one"), (2, "two")] {
+            codec
+                .line(
+                    &json!({"type":"stream_event", "event":{
+                        "type":"content_block_start", "index":index,
+                        "content_block":{"type":"text", "text":""}
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+            let decoded = codec
+                .line(
+                    &json!({"type":"stream_event", "event":{
+                        "type":"content_block_delta", "index":index,
+                        "delta":{"type":"text_delta", "text":text}
+                    }})
+                    .to_string(),
+                )
+                .unwrap();
+            assert!(matches!(&decoded.events[0], ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { text: value, .. }, ..
+            } if value == text));
+        }
+        let content = json!([
+            {"type":"text", "text":42}, {"type":"future_block"}, {"type":"text", "text":"two"}
+        ]);
+        let decoded = codec
+            .line(
+                &json!({"type":"assistant", "message":{
+                    "id":"first", "content":content
+                }})
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(decoded.events.len(), 0);
+        let decoded = codec
+            .line(
+                &json!({"type":"assistant", "message":{
+                    "id":"second", "content":[{"type":"text", "text":"new reply"}]
+                }})
+                .to_string(),
+            )
+            .unwrap();
+        assert!(matches!(&decoded.events[0], ProviderEvent::Turn {
+            event: TurnEvent::TextDelta { key, text, streamed: false }, ..
+        } if key.0 == "second:0:text" && text == "new reply"));
+        assert_eq!(decoded.events.len(), 2);
     }
     #[test]
     fn terminal_reason_overrides_success_subtype() {
