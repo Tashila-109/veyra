@@ -354,6 +354,7 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         }
     );
     assert_eq!(snapshot.buffered_text[&snapshot.items[0].id], "abc");
+    #[cfg(debug_assertions)]
     assert_eq!(snapshot.delta_counts[&snapshot.items[0].id], 3);
     let events = f.drain();
     let appends: Vec<_> = events
@@ -456,6 +457,7 @@ fn session_notice_attaches_to_latest_turn() {
     assert_eq!(notice.turn, latest);
 }
 #[test]
+#[cfg(debug_assertions)]
 fn delta_count_excludes_complete_message_fallback() {
     let mut f = Fixture::new(LiveState::Running);
     let turn = f.running();
@@ -477,6 +479,30 @@ fn delta_count_excludes_complete_message_fallback() {
     }
     f.actor.handle(EngineMsg::TextFlush);
     let snapshot = rx.blocking_recv().unwrap();
+    f.event(turn_event(
+        turn,
+        TurnEvent::TextDelta {
+            key: NativeItemKey("streamed".into()),
+            text: "streamed text".into(),
+            streamed: true,
+        },
+    ));
+    let (reply, rx) = oneshot::channel();
+    {
+        let _enter = f.runtime.enter();
+        f.actor.handle(EngineMsg::Snapshot {
+            thread: f.thread,
+            reply,
+        });
+    }
+    f.actor.handle(EngineMsg::TextFlush);
+    let streamed = rx.blocking_recv().unwrap();
+    let item = streamed
+        .items
+        .iter()
+        .find(|item| !snapshot.items.iter().any(|old| old.id == item.id))
+        .unwrap();
+    assert_eq!(streamed.delta_counts[&item.id], 1);
     assert_eq!(
         snapshot
             .delta_counts
@@ -484,5 +510,69 @@ fn delta_count_excludes_complete_message_fallback() {
             .copied()
             .unwrap_or(0),
         0
+    );
+}
+
+#[test]
+fn completed_turn_status_reports_five_milliseconds() {
+    let mut f = Fixture::new(LiveState::Idle);
+    f.turn(
+        TurnOrigin::Provider,
+        TurnState::Ended {
+            outcome: TurnOutcome::Completed,
+            started: Some(2),
+            at: 7,
+        },
+    );
+    let event = ChangeSet::default().status_event(&f.actor.projection, &f.actor.live, f.thread);
+    assert_eq!(
+        event,
+        Ev::ThreadStatusChanged {
+            thread: f.thread,
+            status: Status::Done { took: 5 }
+        }
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn archived_items_free_debug_delta_counts() {
+    let mut f = Fixture::new(LiveState::Running);
+    f.event(turn_event(
+        f.running(),
+        TurnEvent::TextDelta {
+            key: NativeItemKey("counted".into()),
+            text: "one delta".into(),
+            streamed: true,
+        },
+    ));
+    fn snapshot(f: &mut Fixture) -> crate::events::ThreadSnapshot {
+        let (reply, rx) = oneshot::channel();
+        {
+            let _enter = f.runtime.enter();
+            f.actor.handle(EngineMsg::Snapshot {
+                thread: f.thread,
+                reply,
+            });
+        }
+        f.actor.handle(EngineMsg::TextFlush);
+        rx.blocking_recv().unwrap()
+    }
+    let before = snapshot(&mut f);
+    let item = before.items[0].id;
+    assert_eq!(before.delta_counts[&item], 1);
+    f.command(Command::ArchiveThread {
+        thread: f.thread,
+        keep_children: false,
+    })
+    .unwrap();
+    let after = snapshot(&mut f);
+    assert!(!after.delta_counts.contains_key(&item));
+    assert_eq!(
+        f.loaded().items[&item].body,
+        ItemBody::AssistantText {
+            text: "one delta".into(),
+            done: true
+        }
     );
 }

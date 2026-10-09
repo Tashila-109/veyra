@@ -25,22 +25,21 @@ struct ProcessGroup {
     child: Option<Child>,
     pid: u32,
 }
-impl std::ops::Deref for ProcessGroup {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        self.child.as_ref().expect("owned child")
-    }
-}
-impl std::ops::DerefMut for ProcessGroup {
-    fn deref_mut(&mut self) -> &mut Child {
-        self.child.as_mut().expect("owned child")
-    }
-}
-async fn end_process(mut child: Child, pid: u32) {
+async fn end_process(mut child: Child, pid: u32) -> std::io::Result<std::process::ExitStatus> {
     let _ = platform::signal_group(pid, Signal::Terminate);
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let _ = platform::signal_group(pid, Signal::Kill);
-    let _ = child.wait().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        child.try_wait()?;
+        if !platform::group_exists(pid)? {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = platform::signal_group(pid, Signal::Kill);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    child.wait().await
 }
 impl ProcessGroup {
     fn new(child: Child) -> Self {
@@ -49,9 +48,21 @@ impl ProcessGroup {
             child: Some(child),
         }
     }
-    async fn stop(&mut self) {
-        if let Some(child) = self.child.take() {
-            end_process(child, self.pid).await;
+    fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.as_mut()?.stdout.take()
+    }
+    fn stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.as_mut()?.stderr.take()
+    }
+    fn stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.child.as_mut()?.stdin.take()
+    }
+    async fn stop(mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self.child.take() {
+            Some(child) => tokio::spawn(end_process(child, self.pid))
+                .await
+                .map_err(std::io::Error::other)?,
+            None => Err(std::io::Error::other("process already stopped")),
         }
     }
 }
@@ -250,9 +261,9 @@ async fn run_one(
     epoch: u32,
     resume: bool,
 ) -> Completion {
-    let pid = process.child.id().expect("newly spawned child");
-    let mut lines = BufReader::new(process.child.stdout.take().expect("piped stdout")).lines();
-    let mut errors = BufReader::new(process.child.stderr.take().expect("piped stderr")).lines();
+    let pid = process.child.pid;
+    let mut lines = BufReader::new(process.child.stdout().expect("piped stdout")).lines();
+    let mut errors = BufReader::new(process.child.stderr().expect("piped stderr")).lines();
     let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
     let stderr_tail = tail.clone();
     let mut stderr = tokio::spawn(async move {
@@ -265,7 +276,7 @@ async fn run_one(
             }
         }
     });
-    let mut stdin = process.child.stdin.take().expect("piped stdin");
+    let mut stdin = process.child.stdin().expect("piped stdin");
     let (writer, mut input) = mpsc::unbounded_channel::<serde_json::Value>();
     let mut write_task = tokio::spawn(async move {
         while let Some(line) = input.recv().await {
@@ -364,7 +375,7 @@ async fn run_one(
         let _ = stderr.await;
     }
     let lines = tail.lock().unwrap().iter().cloned().collect::<Vec<_>>();
-    let status = process.child.try_wait().ok().flatten();
+    let status = process.child.stop().await.ok();
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder {
         let _ = recorder.exit(
@@ -375,7 +386,6 @@ async fn run_one(
         );
     }
     if consumer_gone {
-        process.child.stop().await;
         return Completion::ConsumerGone;
     }
     if resume
@@ -383,10 +393,9 @@ async fn run_one(
             .iter()
             .any(|line| line.contains("No conversation found with session ID"))
     {
-        process.child.stop().await;
         return Completion::MissingSession;
     }
-    let crash = if let Some(turn) = codec.current {
+    let crash = if let Some(active) = codec.active {
         let text = failure
             .unwrap_or_else(|| crash_text(status.and_then(|status| status.code()), &lines, None));
         let _ = emit(
@@ -394,7 +403,7 @@ async fn run_one(
             thread,
             epoch,
             ProviderEvent::Turn {
-                turn: Some(turn),
+                turn: active.id(),
                 event: TurnEvent::TurnEnded {
                     outcome: TurnOutcome::Failed {
                         message: record::redact(&text, None),
@@ -415,7 +424,6 @@ async fn run_one(
     } else {
         None
     };
-    process.child.stop().await;
     Completion::Exited(crash)
 }
 
@@ -458,18 +466,22 @@ pub async fn probe(
     } else {
         let mut child =
             ProcessGroup::new(env.command(&binary, &["--version".into()], cwd).spawn()?);
-        let mut stdout = BufReader::new(child.stdout.take().expect("piped version stdout")).lines();
+        let mut stdout = BufReader::new(child.stdout().expect("piped version stdout")).lines();
         let result = tokio::select! {
             _ = &mut cancelled => Err(ProviderError::Cancelled),
             result = async {
                 let line = stdout.next_line().await?.unwrap_or_default();
-                child.wait().await?;
                 Ok::<_, ProviderError>(line)
             } => result,
         };
-        child.stop().await;
+        child.stop().await?;
         result?
     };
+    let version = version
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
     #[cfg(debug_assertions)]
     let mut recorder = env
         .record
@@ -484,8 +496,8 @@ pub async fn probe(
         .transpose()?;
     let mut child =
         ProcessGroup::new(env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?);
-    let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
-    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut lines = BufReader::new(child.stdout().expect("piped stdout")).lines();
+    let mut stdin = child.stdin().expect("piped stdin");
     let result = tokio::select! {
         _ = &mut cancelled => Err(ProviderError::Cancelled),
         result = async {
@@ -516,12 +528,11 @@ pub async fn probe(
         } => result,
     };
     drop(stdin);
+    let status = child.stop().await?;
     #[cfg(debug_assertions)]
-    let code = child
-        .try_wait()?
-        .and_then(|status| status.code())
-        .unwrap_or(-1);
-    child.stop().await;
+    let code = status.code().unwrap_or(-1);
+    #[cfg(not(debug_assertions))]
+    let _ = status;
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut recorder {
         recorder.exit(code)?;

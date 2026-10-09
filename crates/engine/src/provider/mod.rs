@@ -199,10 +199,6 @@ impl ProviderKind {
             Self::Grok => "Grok",
         }
     }
-    pub async fn probe(self, env: &env::ChildEnv, cwd: &std::path::Path) -> Probe {
-        let (_cancel, cancelled) = tokio::sync::oneshot::channel();
-        self.probe_cancellable(env, cwd, cancelled).await
-    }
     async fn probe_cancellable(
         self,
         env: &env::ChildEnv,
@@ -237,17 +233,6 @@ impl ProviderKind {
                 models: vec![],
                 account: None,
             }
-        }
-    }
-    pub fn spawn(
-        self,
-        spec: SessionSpec,
-        out: mpsc::Sender<EngineMsg>,
-        epoch: u32,
-    ) -> Result<SessionHandle, ProviderError> {
-        match self {
-            Self::Claude => session::spawn(spec, env::ChildEnv::load(), out, epoch),
-            Self::Codex | Self::Grok => Err(ProviderError::NotBuilt),
         }
     }
 }

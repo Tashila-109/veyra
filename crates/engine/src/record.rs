@@ -6,18 +6,29 @@ struct Redaction {
     secret_group: usize,
     replacement: &'static str,
 }
-static MATCHES: LazyLock<Vec<Redaction>> =
-    LazyLock::new(|| {
-        [
+static MATCHES: LazyLock<Vec<Redaction>> = LazyLock::new(|| {
+    [
         (r#"(?i)(Bearer\s+)([^\s",]+)"#, 2, "${1}[redacted]"),
-        (r#"(?i)([\w.-]*(?:token|key|secret|password|auth)[\w.-]*["\s]*[:=]\s*"?)([^\s",]+)"#,
-            2, "${1}[redacted]"),
-        (r"\b((?:sk-[A-Za-z0-9_-]{17,}|xai-[A-Za-z0-9_-]{16,}))", 1, "[redacted]"),
+        (
+            r#"(?i)([\w.-]*(?:token|key|secret|password|auth)[\w.-]*["\s]*[:=]\s*"?)([^\s",]+)"#,
+            2,
+            "${1}[redacted]",
+        ),
+        (
+            r"\b((?:sk-[A-Za-z0-9_-]{17,}|xai-[A-Za-z0-9_-]{16,}))",
+            1,
+            "[redacted]",
+        ),
         (r"(://[^:/\s]+:)([^@\s]+)(@)", 2, "${1}[redacted]@"),
-    ].into_iter().map(|(pattern, secret_group, replacement)| Redaction {
-        expression: Regex::new(pattern).expect("redaction expression"), secret_group, replacement,
-    }).collect()
-    });
+    ]
+    .into_iter()
+    .map(|(pattern, secret_group, replacement)| Redaction {
+        expression: Regex::new(pattern).expect("redaction expression"),
+        secret_group,
+        replacement,
+    })
+    .collect()
+});
 static HOME_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"/(?:Users|home)/[^/\s"<>]+(?:/|\b)"#).expect("personal home path expression")
 });
@@ -110,6 +121,9 @@ mod capture {
                 bindings: BTreeMap::new(),
             };
             recorder.bind(cwd.to_string_lossy().into_owned(), "<cwd>".into());
+            if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+                recorder.bind(home.to_string_lossy().into_owned(), "<home>".into());
+            }
             if let Some(token) = token {
                 recorder.bind(token.into(), "<id:token>".into());
             }

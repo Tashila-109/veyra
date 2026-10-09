@@ -1,6 +1,10 @@
 use std::{fs, time::Duration};
 use tokio::{runtime::Runtime, sync::mpsc};
-use veyra_engine::{actor::EngineMsg, domain::*, provider::*};
+use veyra_engine::{
+    actor::EngineMsg,
+    domain::*,
+    provider::{env::ChildEnv, *},
+};
 
 #[test]
 #[ignore = "requires the human's consent for a live Claude turn"]
@@ -35,8 +39,9 @@ fn live_claude_ok_reply() {
         let (out, mut events) = mpsc::channel(256);
         let thread = ThreadId::new();
         let turn = TurnId::new();
-        let handle = ProviderKind::Claude
+        let handle = Spawner::Cli(ChildEnv::load())
             .spawn(
+                ProviderKind::Claude,
                 SessionSpec {
                     thread,
                     cwd: cwd.clone(),

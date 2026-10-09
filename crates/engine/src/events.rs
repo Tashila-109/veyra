@@ -1,8 +1,4 @@
-use crate::{
-    domain::*,
-    live::{LiveState, LiveThread},
-    provider::SessionControl,
-};
+use crate::{domain::*, live::LiveThread, provider::SessionControl};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,10 +15,6 @@ pub enum ChangeEvent {
     ThreadHoldChanged {
         thread: ThreadId,
         hold: Option<HoldReason>,
-    },
-    ThreadLiveChanged {
-        thread: ThreadId,
-        state: LiveState,
     },
     ThreadStatusChanged {
         thread: ThreadId,
@@ -53,7 +45,6 @@ impl ChangeEvent {
             Self::ThreadArchived { thread }
             | Self::ThreadConfigured { thread, .. }
             | Self::ThreadHoldChanged { thread, .. }
-            | Self::ThreadLiveChanged { thread, .. }
             | Self::NativeSessionBound { thread, .. }
             | Self::ThreadStatusChanged { thread, .. } => Some(*thread),
             Self::TurnQueued(t) | Self::TurnStarted(t) | Self::TurnEnded(t) => Some(t.thread),
@@ -74,6 +65,7 @@ pub enum UiEvent {
         item: ItemId,
         counter: u64,
         text: String,
+        #[cfg(debug_assertions)]
         delta_count: u64,
     },
     StorageBlocked {
@@ -84,6 +76,7 @@ pub enum UiEvent {
 pub struct ThreadSnapshot {
     pub items: Vec<Item>,
     pub buffered_text: BTreeMap<ItemId, String>,
+    #[cfg(debug_assertions)]
     pub delta_counts: BTreeMap<ItemId, u64>,
     pub counter: u64,
 }
@@ -134,6 +127,17 @@ fn overlay<'a, K: Ord, V>(
 }
 
 impl ChangeSet {
+    pub fn status_event(
+        &self,
+        projection: &Projection,
+        live: &BTreeMap<ThreadId, LiveThread>,
+        thread: ThreadId,
+    ) -> ChangeEvent {
+        ChangeEvent::ThreadStatusChanged {
+            thread,
+            status: thread_status(&self.view(projection, live, thread).expect("status thread")),
+        }
+    }
     pub fn install(
         self,
         p: &mut Projection,
@@ -188,17 +192,7 @@ impl ChangeSet {
             .chain(self.requests.values().map(|request| request.thread))
             .collect();
         for id in changed {
-            let running = self
-                .turns(p, id)
-                .any(|turn| matches!(turn.state, TurnState::Running { .. }));
-            events.push(ChangeEvent::ThreadStatusChanged {
-                thread: id,
-                status: thread_status(&self.view(p, live, id).expect("changed thread")),
-            });
-            events.push(ChangeEvent::ThreadLiveChanged {
-                thread: id,
-                state: self.live(live, id).state(running),
-            });
+            events.push(self.status_event(p, live, id));
         }
         p.projects.extend(self.projects);
         p.threads.extend(self.threads);

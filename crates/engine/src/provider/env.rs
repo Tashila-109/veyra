@@ -160,7 +160,15 @@ mod tests {
             let selected = env.resolve(super::ProviderKind::Claude).ok();
             let planted =
                 std::fs::canonicalize(std::path::PathBuf::from(root).join("bin/claude")).unwrap();
-            assert_ne!(selected, Some(planted));
+            assert_ne!(selected, Some(planted.clone()));
+            let absolute = super::ChildEnv {
+                path: planted.parent().unwrap().as_os_str().into(),
+                ..env
+            };
+            assert_eq!(
+                absolute.resolve(super::ProviderKind::Claude).unwrap(),
+                planted
+            );
             return;
         }
         let root = std::env::temp_dir().join(format!("veyra-resolution-{}", ThreadId::new()));

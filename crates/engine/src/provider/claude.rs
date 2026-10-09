@@ -283,8 +283,21 @@ impl ResultFrame {
         }
     }
 }
+#[derive(Clone, Copy)]
+pub(crate) enum ActiveTurn {
+    Veyra(TurnId),
+    Provider,
+}
+impl ActiveTurn {
+    pub fn id(self) -> Option<TurnId> {
+        match self {
+            Self::Veyra(turn) => Some(turn),
+            Self::Provider => None,
+        }
+    }
+}
 pub(crate) struct Codec {
-    pub current: Option<TurnId>,
+    pub active: Option<ActiveTurn>,
     echo: EchoMode,
     native: NativeSessionId,
     pid: u32,
@@ -300,7 +313,7 @@ pub(crate) struct Decoded {
 impl Codec {
     pub fn new(native: NativeSessionId, pid: u32) -> Self {
         Self {
-            current: None,
+            active: None,
             echo: EchoMode::Unknown,
             native,
             pid,
@@ -310,7 +323,7 @@ impl Codec {
         }
     }
     pub fn start(&mut self, turn: TurnId, text: String) -> Value {
-        self.current = Some(turn);
+        self.active = Some(ActiveTurn::Veyra(turn));
         self.blocks.clear();
         json!({
             "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
@@ -342,13 +355,18 @@ impl Codec {
             Frame::System(system) => self.system(system, &mut decoded),
             Frame::CommandLifecycle(lifecycle) => {
                 if self
-                    .current
+                    .active
+                    .and_then(ActiveTurn::id)
                     .is_some_and(|turn| lifecycle.command_uuid == turn.to_string())
                 {
                     self.echo = EchoMode::Known;
                     if ["queued", "started"].contains(&lifecycle.state.as_str()) {
                         events.push(TurnEvent::Accepted);
                     }
+                } else if self.active.is_none()
+                    && ["queued", "started"].contains(&lifecycle.state.as_str())
+                {
+                    events.push(TurnEvent::Started);
                 }
             }
             Frame::User(user) => self.user(user, &mut events),
@@ -368,7 +386,29 @@ impl Codec {
                     "error": "This request is not supported by Veyra"
                 }
             })),
-            Frame::ControlResponse(_) | Frame::Unknown => tracing::debug!("ignored Claude frame"),
+            Frame::ControlResponse(_) | Frame::Unknown => {
+                let wire: Value = serde_json::from_str(line)?;
+                tracing::info!(
+                    frame_type = wire["type"].as_str().unwrap_or("unknown"),
+                    subtype = wire["subtype"].as_str().unwrap_or(""),
+                    "ignored Claude frame"
+                );
+            }
+        }
+        if self.active.is_none()
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    TurnEvent::Started
+                        | TurnEvent::TextDelta { .. }
+                        | TurnEvent::ReasoningDelta { .. }
+                        | TurnEvent::ToolStarted { .. }
+                        | TurnEvent::Plan(_)
+                        | TurnEvent::RequestOpened { .. }
+                )
+            })
+        {
+            self.active = Some(ActiveTurn::Provider);
         }
         let ended = events
             .iter()
@@ -376,11 +416,11 @@ impl Codec {
         decoded
             .events
             .extend(events.into_iter().map(|event| ProviderEvent::Turn {
-                turn: self.current,
+                turn: self.active.and_then(ActiveTurn::id),
                 event,
             }));
         if ended {
-            self.current = None;
+            self.active = None;
             self.blocks.clear();
             self.tools.clear();
         }
@@ -413,13 +453,18 @@ impl Codec {
                             .any(|task| task.get("ambient") != Some(&Value::Bool(true))),
                     }));
             }
-            _ => tracing::debug!(subtype = system.subtype, "ignored Claude system frame"),
+            _ => tracing::info!(
+                frame_type = "system",
+                subtype = system.subtype,
+                "ignored Claude system frame"
+            ),
         }
     }
     fn user(&mut self, user: User, events: &mut Vec<TurnEvent>) {
         if user.is_replay
             && self
-                .current
+                .active
+                .and_then(ActiveTurn::id)
                 .is_some_and(|turn| user.uuid.is_empty() || user.uuid == turn.to_string())
         {
             if !user.uuid.is_empty() {
@@ -450,6 +495,9 @@ impl Codec {
     fn stream(&mut self, event: Event, events: &mut Vec<TurnEvent>) {
         match event {
             Event::MessageStart { message } => {
+                if self.active.is_none() {
+                    events.push(TurnEvent::Started);
+                }
                 self.message = message["id"].as_str().unwrap_or_default().into();
                 self.blocks.clear();
             }
@@ -562,10 +610,11 @@ impl Codec {
         if !echoes.is_empty() {
             self.echo = EchoMode::Known;
             return self
-                .current
+                .active
+                .and_then(ActiveTurn::id)
                 .is_some_and(|turn| echoes.iter().any(|uuid| **uuid == turn.to_string()));
         }
-        self.current.is_none()
+        self.active.and_then(ActiveTurn::id).is_none()
             || !matches!(self.echo, EchoMode::Known)
             || !result
                 .origin
@@ -624,7 +673,7 @@ mod tests {
             ProviderEvent::Session(SessionEvent::Ready { native, cli_version: None, .. })
                 if native.0 == "replacement"
         ));
-        assert_eq!(codec.current, Some(turn));
+        assert_eq!(codec.active.and_then(ActiveTurn::id), Some(turn));
         assert_eq!(codec.line(&wire.to_string()).unwrap().events.len(), 1);
     }
     #[test]

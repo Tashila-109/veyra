@@ -224,20 +224,27 @@ fn parse_args(args: &[String]) -> anyhow::Result<ClientCommand> {
         )),
     }
 }
-fn wait_exit_code(dump: &Value, thread: &str, status: &str) -> Option<i32> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientExit {
+    Success = 0,
+    Timeout = 1,
+    Usage = 2,
+    MissingThread = 3,
+}
+fn wait_exit_code(dump: &Value, thread: &str, status: &str) -> Option<ClientExit> {
     let row = dump["sidebar"]["rows"].as_array().and_then(|rows| {
         rows.iter()
             .find(|row| row["kind"] == "thread" && row["id"].as_str() == Some(thread))
     });
     match row {
-        None => Some(3),
-        Some(row) if row["archived"] == true => Some(3),
+        None => Some(ClientExit::MissingThread),
+        Some(row) if row["archived"] == true => Some(ClientExit::MissingThread),
         Some(row)
             if row["status"]
                 .as_str()
                 .is_some_and(|actual| actual.eq_ignore_ascii_case(status)) =>
         {
-            Some(0)
+            Some(ClientExit::Success)
         }
         Some(_) => None,
     }
@@ -264,7 +271,7 @@ pub fn client() -> anyhow::Result<()> {
         Ok(command) => command,
         Err(error) => {
             eprintln!("{error}");
-            std::process::exit(2);
+            std::process::exit(ClientExit::Usage as i32);
         }
     };
     let data_dir = std::env::var_os("VEYRA_DATA_DIR")
@@ -284,14 +291,15 @@ pub fn client() -> anyhow::Result<()> {
             let start = std::time::Instant::now();
             loop {
                 let dump = request(&data_dir, &Command::Dump)?;
-                let code = wait_exit_code(&dump, &id, &status)
-                    .or_else(|| (start.elapsed() >= Duration::from_secs(seconds)).then_some(1));
+                let code = wait_exit_code(&dump, &id, &status).or_else(|| {
+                    (start.elapsed() >= Duration::from_secs(seconds)).then_some(ClientExit::Timeout)
+                });
                 if let Some(code) = code {
-                    if code == 1 {
+                    if code == ClientExit::Timeout {
                         eprintln!("veyra ctl wait timed out: thread={id} status={status}");
                     }
                     println!("{}", serde_json::to_string_pretty(&dump)?);
-                    std::process::exit(code);
+                    std::process::exit(code as i32);
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -309,9 +317,18 @@ mod tests {
             {"kind":"thread","id":"old","status":"Done","archived":true},
             {"kind":"thread","id":"running","status":"Working","archived":false}
         ]}});
-        assert_eq!(wait_exit_code(&dump, "one", "done"), Some(0));
-        assert_eq!(wait_exit_code(&dump, "missing", "Done"), Some(3));
-        assert_eq!(wait_exit_code(&dump, "old", "Done"), Some(3));
+        assert_eq!(
+            wait_exit_code(&dump, "one", "done"),
+            Some(ClientExit::Success)
+        );
+        assert_eq!(
+            wait_exit_code(&dump, "missing", "Done"),
+            Some(ClientExit::MissingThread)
+        );
+        assert_eq!(
+            wait_exit_code(&dump, "old", "Done"),
+            Some(ClientExit::MissingThread)
+        );
         assert_eq!(wait_exit_code(&dump, "running", "Done"), None);
         assert!(matches!(
             parse_args(&["wait".into(), "one".into(), "Done".into()]).unwrap(),

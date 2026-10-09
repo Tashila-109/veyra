@@ -791,7 +791,6 @@ pub fn queue_wake(
             }
         }
     }
-
     let id = turn.id;
     c.turns.insert(id, turn);
     id

@@ -71,10 +71,6 @@ pub fn initialize(db: &mut Connection) -> Result<(), StoreError> {
         tx.pragma_update(None, "user_version", (index + 1) as u32)?;
         tx.commit()?;
     }
-    db.execute(
-        "UPDATE threads SET cli_version=NULL WHERE cli_version=''",
-        [],
-    )?;
     Ok(())
 }
 fn json(value: &impl Serialize) -> Result<String, StoreError> {
@@ -137,7 +133,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
                 t.cwd.to_string_lossy(),
                 t.native.as_ref().map(|n| &n.0),
                 t.native_cursor,
-                t.cli_version.as_deref().filter(|version| !version.is_empty()),
+                t.cli_version.as_deref(),
                 t.hold.as_ref().map(word).transpose()?,
                 word(&t.view)?,
                 t.import_pending,
@@ -296,6 +292,10 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
 }
 
 pub fn load(db: &Connection) -> Result<Projection, StoreError> {
+    db.execute(
+        "UPDATE threads SET cli_version=NULL WHERE cli_version=''",
+        [],
+    )?;
     let mut p = Projection::default();
     p.settings.default_mode = parse_word(db.query_row(
         "SELECT default_mode FROM settings WHERE id=1",
@@ -343,9 +343,7 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             cwd: Path::new(&r.get::<_, String>(8)?).to_owned(),
             native: r.get::<_, Option<String>>(9)?.map(NativeSessionId),
             native_cursor: r.get(10)?,
-            cli_version: r
-                .get::<_, Option<String>>(11)?
-                .filter(|version| !version.is_empty()),
+            cli_version: r.get(11)?,
             hold: r
                 .get::<_, Option<String>>(12)?
                 .map(parse_word)

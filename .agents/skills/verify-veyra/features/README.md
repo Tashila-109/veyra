@@ -32,7 +32,7 @@ Inspect the 44 px header and the composer capped at 784 px in the PNG.
 Each feature starts with `Status: STATE, DATE, COMMIT, MISSING` directly under its title.
 STATE is `passed`, `failed`, `blocked`, or `not run`.
 DATE is the last run's date.
-COMMIT is the short SHA of the candidate commit that holds the candidate the lanes ran.
+COMMIT is the short SHA of the candidate commit the lanes ran.
 MISSING lists every sub-feature that run did not prove, or `none` when all passed.
 A partial run never counts as passed.
 The lead fills the values from lane results.

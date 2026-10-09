@@ -163,3 +163,107 @@ fn capture_hides_hook_output_and_preserves_account_keys() {
         json!({"organization":{"name":"<any>"}})
     );
 }
+
+fn joined_blocks(rows: &[serde_json::Value]) -> Vec<String> {
+    let mut blocks = std::collections::BTreeMap::<(String, u64), String>::new();
+    let mut message = String::new();
+    for row in rows {
+        let wire = &row["line"];
+        let event = &wire["event"];
+        if event["type"] == "message_start" {
+            message = event["message"]["id"].as_str().unwrap_or_default().into();
+        }
+        let index = event["index"].as_u64().unwrap_or_default();
+        for value in [
+            &event["content_block"]["text"],
+            &event["content_block"]["thinking"],
+            &event["delta"]["text"],
+            &event["delta"]["thinking"],
+            &event["delta"]["partial_json"],
+        ] {
+            if let Some(text) = value.as_str() {
+                blocks
+                    .entry((message.clone(), index))
+                    .or_default()
+                    .push_str(text);
+            }
+        }
+        if let Some(content) = wire["message"]["content"].as_array() {
+            for (index, block) in content.iter().enumerate() {
+                for field in ["text", "thinking", "content"] {
+                    if let Some(text) = block[field].as_str() {
+                        blocks.insert(
+                            (
+                                format!("final:{}:{}", wire["type"], wire["message"]["id"]),
+                                index as u64,
+                            ),
+                            text.into(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    blocks.into_values().collect()
+}
+fn private_detail(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    record::secret_shapes(text)
+        || [
+            "github",
+            "figma",
+            "claude.ai connectors",
+            "plugin:data:definite",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+#[test]
+fn fixtures_joined_blocks_hold_no_personal_detail_or_secrets() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude");
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        let rows: Vec<serde_json::Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for text in joined_blocks(&rows) {
+            assert!(
+                !private_detail(&text),
+                "{} has private assembled block text",
+                path.display()
+            );
+        }
+    }
+    let planted = [
+        json!({"line":{"event":{"type":"content_block_delta","delta":{"text":"Bear"}}}}),
+        json!({"line":{"event":{"type":"content_block_delta","delta":{"text":"er fixture-credential"}}}}),
+    ];
+    assert!(private_detail(&joined_blocks(&planted)[0]));
+    assert!(!private_detail("Veyra checks the command."));
+}
+
+#[test]
+fn capture_binds_home_folder_in_nested_paths_and_text() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("capture.jsonl");
+    let home = std::env::var("HOME").unwrap();
+    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None).unwrap();
+    recorder
+        .line(
+            false,
+            json!({"paths":[format!("{home}/.config/fixture")],
+        "text":format!("Read {home}/notes")}),
+        )
+        .unwrap();
+    let rows: Vec<serde_json::Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows[1]["line"],
+        json!({"paths":["<home>/.config/fixture"], "text":"Read <home>/notes"})
+    );
+}

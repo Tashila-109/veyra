@@ -26,7 +26,6 @@ use veyra_engine::{
     commands::{Ack, Command},
     domain::*,
     events::{ChangeEvent, ThreadSnapshot, UiEvent},
-    live::LiveState,
     provider::{Probe, ProviderKind, Readiness},
 };
 
@@ -46,7 +45,7 @@ struct AppState {
     threads: BTreeMap<ThreadId, Thread>,
     turns: BTreeMap<TurnId, Turn>,
     items: BTreeMap<ThreadId, BTreeMap<ItemId, Item>>,
-    live: BTreeMap<ThreadId, LiveState>,
+    #[cfg(debug_assertions)]
     delta_counts: BTreeMap<ItemId, u64>,
     fences: BTreeMap<ThreadId, Fence>,
     settings: Settings,
@@ -111,6 +110,14 @@ impl AppState {
                     if let Some(row) = self.threads.get_mut(thread) {
                         row.archived = true;
                     }
+                    if let Some(items) = self.items.remove(thread) {
+                        #[cfg(debug_assertions)]
+                        for id in items.keys() {
+                            self.delta_counts.remove(id);
+                        }
+                        #[cfg(not(debug_assertions))]
+                        let _ = items;
+                    }
                 }
                 ChangeEvent::ThreadConfigured { thread, config } => {
                     if let Some(row) = self.threads.get_mut(thread) {
@@ -121,9 +128,6 @@ impl AppState {
                     if let Some(row) = self.threads.get_mut(thread) {
                         row.hold = *hold;
                     }
-                }
-                ChangeEvent::ThreadLiveChanged { thread, state } => {
-                    self.live.insert(*thread, *state);
                 }
                 ChangeEvent::ThreadStatusChanged { thread, status } => {
                     self.statuses.insert(*thread, status.clone());
@@ -195,9 +199,11 @@ impl AppState {
                 thread,
                 item,
                 text,
+                #[cfg(debug_assertions)]
                 delta_count,
                 ..
             } => {
+                #[cfg(debug_assertions)]
                 self.delta_counts.insert(item, delta_count);
                 if let Some(item) = self
                     .items
@@ -261,7 +267,12 @@ impl AppState {
             items.insert(item.id, item);
         }
         self.items.insert(thread, items);
-        self.delta_counts.extend(snapshot.delta_counts);
+        #[cfg(debug_assertions)]
+        {
+            self.delta_counts
+                .retain(|id, _| self.items.values().any(|items| items.contains_key(id)));
+            self.delta_counts.extend(snapshot.delta_counts);
+        }
         self.fences.insert(thread, Fence::Live(snapshot.counter));
         for event in buffered {
             if let Some((_, counter)) = event_thread(&event)
@@ -370,7 +381,29 @@ pub struct Shell {
     expanded: BTreeSet<ItemId>,
     branch: String,
     provider_picker: Option<Entity<PopupMenu>>,
+    #[cfg(debug_assertions)]
+    provider_picker_labels: Vec<String>,
     _input_subscription: Subscription,
+}
+fn provider_rows(probes: &[Probe]) -> [(ProviderKind, String); 3] {
+    [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::Grok,
+    ]
+    .map(|provider| {
+        let readiness = match probes
+            .iter()
+            .find(|probe| probe.provider == provider)
+            .map(|probe| &probe.readiness)
+        {
+            Some(Readiness::Ready) => "Ready",
+            Some(Readiness::NotInstalled) => "Not installed",
+            Some(Readiness::SignedOut) => "Signed out",
+            _ => "Checking…",
+        };
+        (provider, format!("{} · {readiness}", provider.label()))
+    })
 }
 impl Shell {
     fn new(
@@ -490,6 +523,8 @@ impl Shell {
             expanded: BTreeSet::new(),
             branch: String::new(),
             provider_picker: None,
+            #[cfg(debug_assertions)]
+            provider_picker_labels: vec![],
             _input_subscription: subscription,
         };
         shell.recheck(false, window, cx);
@@ -497,20 +532,11 @@ impl Shell {
     }
     fn set_provider_picker(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.provider_picker = open.then(|| {
-            let rows = [
-                ProviderKind::Claude,
-                ProviderKind::Codex,
-                ProviderKind::Grok,
-            ]
-            .map(|provider| {
-                let readiness = match self.probe(provider).map(|probe| &probe.readiness) {
-                    Some(Readiness::Ready) => "Ready",
-                    Some(Readiness::NotInstalled) => "Not installed",
-                    Some(Readiness::SignedOut) => "Signed out",
-                    _ => "Checking…",
-                };
-                (provider, format!("{} · {readiness}", provider.label()))
-            });
+            let rows = provider_rows(&self.providers);
+            #[cfg(debug_assertions)]
+            {
+                self.provider_picker_labels = rows.iter().map(|(_, label)| label.clone()).collect();
+            }
             let focus = self.focus.clone();
             let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
                 menu = menu.action_context(focus);
@@ -622,6 +648,9 @@ impl Shell {
     }
     fn recheck(&mut self, retry: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.providers.clear();
+        if self.provider_picker.is_some() {
+            self.set_provider_picker(true, window, cx);
+        }
         self.probe_generation += 1;
         let generation = self.probe_generation;
         let retry_thread = retry.then(|| self.view.chat()).flatten();
@@ -641,6 +670,9 @@ impl Shell {
                             return;
                         }
                         shell.providers.push(probe);
+                        if shell.provider_picker.is_some() {
+                            shell.set_provider_picker(true, window, cx);
+                        }
                         if let Some(thread) = retry_thread
                             && shell.state.threads[&thread].provider == provider
                             && shell.ready(provider)
@@ -791,9 +823,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mode = action.mode.unwrap_or_else(|| {
-            *cycle(&settings::MODES, Some(&self.composer_config().mode)).unwrap()
-        });
+        let mode = action
+            .mode
+            .unwrap_or_else(|| settings::next_mode(self.composer_config().mode));
         if matches!(self.view, MainView::Settings { .. }) {
             self.send_command(Command::SetDefaultMode { mode }, window, cx);
         } else {
@@ -919,7 +951,8 @@ impl Shell {
             "provider":self.chosen_provider(), "mode":self.composer_config().mode,
             "model":self.composer_config().model, "effort":self.composer_config().effort,
             "send_enabled":reason.is_none(), "disabled_reason":reason,
-            "provider_picker_open":self.provider_picker.is_some()
+            "provider_picker_open":self.provider_picker.is_some(),
+            "provider_picker_labels":self.provider_picker.as_ref().map(|_| &self.provider_picker_labels)
         })
     }
     #[cfg(debug_assertions)]
@@ -977,9 +1010,9 @@ impl Render for Shell {
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, action: &SetDefaultMode, window, cx| {
-                let mode = action.mode.unwrap_or_else(|| {
-                    *cycle(&settings::MODES, Some(&shell.state.settings.default_mode)).unwrap()
-                });
+                let mode = action
+                    .mode
+                    .unwrap_or_else(|| settings::next_mode(shell.state.settings.default_mode));
                 shell.send_command(Command::SetDefaultMode { mode }, window, cx);
             }))
             .on_action(cx.listener(|shell, _: &OpenProviderPicker, window, cx| {
@@ -1055,18 +1088,12 @@ impl Render for Shell {
                 if let Some(id) = action
                     .thread
                     .or_else(|| {
-                        action
-                            .thread
-                            .is_none()
-                            .then(|| {
-                                shell
-                                    .state
-                                    .threads
-                                    .values()
-                                    .find(|thread| !thread.archived)
-                                    .map(|thread| thread.id)
-                            })
-                            .flatten()
+                        shell
+                            .state
+                            .threads
+                            .values()
+                            .find(|thread| !thread.archived)
+                            .map(|thread| thread.id)
                     })
                     .filter(|id| {
                         shell
@@ -1082,13 +1109,7 @@ impl Render for Shell {
             .on_action(cx.listener(|shell, action: &SelectProject, window, cx| {
                 if let Some(id) = action
                     .project
-                    .or_else(|| {
-                        action
-                            .project
-                            .is_none()
-                            .then(|| shell.state.projects.keys().next().copied())
-                            .flatten()
-                    })
+                    .or_else(|| shell.state.projects.keys().next().copied())
                     .filter(|id| shell.state.projects.contains_key(id))
                 {
                     shell.project = Some(id);
@@ -1097,26 +1118,17 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, action: &ToggleItem, _, cx| {
                 if let Some(id) = action.item.or_else(|| {
-                    action
-                        .item
-                        .is_none()
-                        .then(|| {
-                            shell.view.selected().and_then(|thread| {
-                                shell
-                                    .state
-                                    .transcript(thread)
-                                    .iter()
-                                    .rev()
-                                    .find(|item| {
-                                        matches!(
-                                            item.body,
-                                            ItemBody::Reasoning { .. } | ItemBody::Tool(_)
-                                        )
-                                    })
-                                    .map(|item| item.id)
+                    shell.view.selected().and_then(|thread| {
+                        shell
+                            .state
+                            .transcript(thread)
+                            .iter()
+                            .rev()
+                            .find(|item| {
+                                matches!(item.body, ItemBody::Reasoning { .. } | ItemBody::Tool(_))
                             })
-                        })
-                        .flatten()
+                            .map(|item| item.id)
+                    })
                 }) && !shell.expanded.remove(&id)
                 {
                     shell.expanded.insert(id);
@@ -1285,7 +1297,6 @@ mod tests {
     use veyra_engine::{
         domain::*,
         events::{ChangeEvent, ThreadSnapshot, UiEvent},
-        live::LiveState,
         provider::ProviderKind,
     };
 
@@ -1414,6 +1425,7 @@ mod tests {
             ThreadSnapshot {
                 items: vec![],
                 buffered_text: BTreeMap::new(),
+                #[cfg(debug_assertions)]
                 delta_counts: BTreeMap::new(),
                 counter: 1,
             },
@@ -1424,6 +1436,7 @@ mod tests {
             ThreadSnapshot {
                 items: vec![item.clone()],
                 buffered_text: BTreeMap::new(),
+                #[cfg(debug_assertions)]
                 delta_counts: BTreeMap::new(),
                 counter: 2,
             },
@@ -1460,18 +1473,19 @@ mod tests {
         let request = state.begin_snapshot(thread);
         state.apply(UiEvent::Change {
             counter: Some(3),
-            event: ChangeEvent::ThreadLiveChanged {
+            event: ChangeEvent::ThreadStatusChanged {
                 thread,
-                state: LiveState::Starting,
+                status: Status::Working { since: 0 },
             },
         });
-        assert_eq!(state.live[&thread], LiveState::Starting);
+        assert_eq!(state.status(thread), Status::Working { since: 0 });
         state.finish_snapshot(
             thread,
             request,
             ThreadSnapshot {
                 items: vec![],
                 buffered_text: BTreeMap::new(),
+                #[cfg(debug_assertions)]
                 delta_counts: BTreeMap::new(),
                 counter: 10,
             },
@@ -1501,9 +1515,9 @@ mod tests {
         });
         state.apply(UiEvent::Change {
             counter: Some(7),
-            event: ChangeEvent::ThreadLiveChanged {
+            event: ChangeEvent::ThreadStatusChanged {
                 thread,
-                state: LiveState::Parked,
+                status: Status::Done { took: 5 },
             },
         });
         assert_eq!(state.threads[&thread].native, Some(native));
@@ -1538,6 +1552,7 @@ mod tests {
         let mut state = AppState::default();
         let request = state.begin_snapshot(thread);
         state.apply(UiEvent::TextAppended {
+            #[cfg(debug_assertions)]
             delta_count: 1,
             thread,
             item: id,
@@ -1545,6 +1560,7 @@ mod tests {
             text: "b".into(),
         });
         state.apply(UiEvent::TextAppended {
+            #[cfg(debug_assertions)]
             delta_count: 1,
             thread,
             item: id,
@@ -1557,11 +1573,13 @@ mod tests {
             ThreadSnapshot {
                 items: vec![item],
                 buffered_text: BTreeMap::from([(id, "bc".into())]),
+                #[cfg(debug_assertions)]
                 delta_counts: BTreeMap::new(),
                 counter: 3,
             },
         );
         state.apply(UiEvent::TextAppended {
+            #[cfg(debug_assertions)]
             delta_count: 1,
             thread,
             item: id,
@@ -1569,6 +1587,7 @@ mod tests {
             text: "duplicate".into(),
         });
         state.apply(UiEvent::TextAppended {
+            #[cfg(debug_assertions)]
             delta_count: 1,
             thread,
             item: id,
@@ -1582,5 +1601,29 @@ mod tests {
                 done: false
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_menu_tests {
+    use super::provider_rows;
+    use veyra_engine::provider::{Probe, ProviderKind, Readiness};
+    #[test]
+    fn provider_rows_refresh_readiness_after_probe() {
+        assert_eq!(provider_rows(&[])[0].1, "Claude Code · Checking…");
+        let mut probe = Probe {
+            provider: ProviderKind::Claude,
+            path: None,
+            version: None,
+            readiness: Readiness::NotInstalled,
+            models: vec![],
+            account: None,
+        };
+        assert_eq!(
+            provider_rows(&[probe.clone()])[0].1,
+            "Claude Code · Not installed"
+        );
+        probe.readiness = Readiness::Ready;
+        assert_eq!(provider_rows(&[probe])[0].1, "Claude Code · Ready");
     }
 }

@@ -36,6 +36,18 @@ fn environment(name: &str, resumed: bool) -> (Scratch, ChildEnv) {
     env.record = None;
     (Scratch(root), env)
 }
+async fn probe(env: &ChildEnv, cwd: &Path) -> Probe {
+    let mut probes = Probes::default();
+    probes
+        .check(
+            &tokio::runtime::Handle::current(),
+            ProviderKind::Claude,
+            env.clone(),
+            cwd.into(),
+        )
+        .await
+        .unwrap()
+}
 fn replay(name: &str, resume: bool) -> Vec<ProviderEvent> {
     let (_scratch, env) = environment(name, resume);
     Runtime::new().unwrap().block_on(async {
@@ -129,6 +141,10 @@ fn claude_ok_reply() {
 #[test]
 fn claude_bash_echo() {
     let events = replay("bash-echo", false);
+    assert_eq!(
+        text(&events),
+        "Veyra checks the command.\nVeyra confirms the output."
+    );
     assert_eq!(outcomes(&events), vec![TurnOutcome::Completed]);
     assert!(events.iter().any(|event| matches!(
         event, ProviderEvent::Turn { event: TurnEvent::ToolStarted { call, .. }, .. }
@@ -224,9 +240,10 @@ fn claude_background_tasks_report_work() {
 #[test]
 fn claude_probe_reads_models_and_account() {
     let (scratch, env) = environment("ok-reply", false);
-    let probe = Runtime::new()
-        .unwrap()
-        .block_on(ProviderKind::Claude.probe(&env, &scratch.0));
+    let path = scratch.0.join("probe.jsonl");
+    let rows = fs::read_to_string(&path).unwrap();
+    fs::write(&path, rows.replacen("2.1.295", "2.1.295 (Claude Code)", 1)).unwrap();
+    let probe = Runtime::new().unwrap().block_on(probe(&env, &scratch.0));
     assert_eq!(probe.readiness, Readiness::Ready);
     assert_eq!(probe.version.as_deref(), Some("2.1.295"));
     assert_eq!(probe.models[0].value, "default");
@@ -238,9 +255,7 @@ fn claude_probe_again_reaches_ready() {
     env.claude_bin = Some(scratch.0.join("installed-later"));
     let runtime = Runtime::new().unwrap();
     assert_eq!(
-        runtime
-            .block_on(ProviderKind::Claude.probe(&env, &scratch.0))
-            .readiness,
+        runtime.block_on(probe(&env, &scratch.0)).readiness,
         Readiness::NotInstalled
     );
     fs::copy(
@@ -249,13 +264,11 @@ fn claude_probe_again_reaches_ready() {
     )
     .unwrap();
     assert_eq!(
-        runtime
-            .block_on(ProviderKind::Claude.probe(&env, &scratch.0))
-            .readiness,
+        runtime.block_on(probe(&env, &scratch.0)).readiness,
         Readiness::Ready
     );
     fs::copy(fixture("probe-no-account"), scratch.0.join("probe.jsonl")).unwrap();
-    let probe = runtime.block_on(ProviderKind::Claude.probe(&env, &scratch.0));
+    let probe = runtime.block_on(probe(&env, &scratch.0));
     assert_eq!(probe.readiness, Readiness::Ready);
     assert_eq!(probe.account, None);
     assert_eq!(probe.models[0].value, "default");
@@ -301,9 +314,7 @@ fn claude_probe_records_initialize_with_masked_account_keys() {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(scratch.0.join("probe.jsonl"), text + "\n").unwrap();
-    let probe = Runtime::new()
-        .unwrap()
-        .block_on(ProviderKind::Claude.probe(&env, &scratch.0));
+    let probe = Runtime::new().unwrap().block_on(probe(&env, &scratch.0));
     assert_eq!(probe.account, Some(account));
     let path = env.record.unwrap().join("probe.jsonl");
     let captured: Vec<serde_json::Value> = fs::read_to_string(&path)
@@ -327,4 +338,138 @@ fn claude_probe_records_initialize_with_masked_account_keys() {
     );
     assert!(veyra_engine::platform::is_private(&path).unwrap());
     assert!(!fs::read_to_string(path).unwrap().contains("fixture-person"));
+}
+
+#[test]
+fn cli_stream_close_fails_provider_turn_even_on_exit_zero() {
+    let events = replay("provider-turn-exit-zero", false);
+    assert_eq!(text(&events), "okunfinished");
+    let message =
+        "claude exited unexpectedly (exit code 0)\nVeyra stream closed\npassword=[redacted]";
+    assert_eq!(
+        outcomes(&events),
+        vec![
+            TurnOutcome::Completed,
+            TurnOutcome::Failed {
+                message: message.into(),
+            }
+        ]
+    );
+    assert!(
+        matches!(events.last(), Some(ProviderEvent::Session(SessionEvent::Exited {
+        crash: Some(crash),
+    })) if crash == message)
+    );
+}
+
+#[test]
+fn cli_turn_starts_before_text_at_lifecycle_or_message_start() {
+    for scenario in ["provider-turn-lifecycle", "provider-turn-message-start"] {
+        let events = replay(scenario, false);
+        let starts: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                ProviderEvent::Turn {
+                    turn: None,
+                    event: TurnEvent::Started,
+                } => Some(index),
+                _ => None,
+            })
+            .collect();
+        let text_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ProviderEvent::Turn {
+                        turn: None,
+                        event: TurnEvent::TextDelta { .. }
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(starts.len(), 1, "{scenario}");
+        assert!(starts[0] < text_index, "{scenario}");
+        assert_eq!(text(&events), "okunfinished");
+        assert_eq!(
+            outcomes(&events),
+            vec![TurnOutcome::Completed, TurnOutcome::Completed]
+        );
+    }
+}
+
+#[test]
+fn replacing_hung_probe_ends_its_group_before_ready_reply() {
+    let (scratch, mut env) = environment("ok-reply", false);
+    let mut rows: Vec<serde_json::Value> = fs::read_to_string(scratch.0.join("probe.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows.truncate(2);
+    rows.push(serde_json::json!({"type":"expect_outbound", "line":{"type":"user"}}));
+    fs::write(
+        scratch.0.join("probe.jsonl"),
+        rows.iter()
+            .map(|row| row.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let wrapper = scratch.0.join("probe-cli");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\n' \"$$\" > probe-pid\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_veyra-fake-cli")
+        ),
+    )
+    .unwrap();
+    let chmod = std::process::Command::new("/bin/chmod")
+        .args(["700", wrapper.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(chmod.success());
+    env.claude_bin = Some(wrapper);
+    Runtime::new().unwrap().block_on(async {
+        let mut probes = Probes::default();
+        let first = probes.check(
+            &tokio::runtime::Handle::current(),
+            ProviderKind::Claude,
+            env.clone(),
+            scratch.0.clone(),
+        );
+        let pid: u32 = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(text) = fs::read_to_string(scratch.0.join("probe-pid"))
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(veyra_engine::platform::group_exists(pid).unwrap());
+        fs::copy(fixture("probe-initialize"), scratch.0.join("probe.jsonl")).unwrap();
+        env.claude_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra-fake-cli")));
+        let second = probes.check(
+            &tokio::runtime::Handle::current(),
+            ProviderKind::Claude,
+            env,
+            scratch.0.clone(),
+        );
+        let ready = tokio::time::timeout(Duration::from_secs(30), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.readiness, Readiness::Ready);
+        assert_eq!(ready.version.as_deref(), Some("2.1.295"));
+        assert_eq!(ready.models[0].value, "default");
+        assert!(!veyra_engine::platform::group_exists(pid).unwrap());
+        first.await.unwrap();
+    });
 }

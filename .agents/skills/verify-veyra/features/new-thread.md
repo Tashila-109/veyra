@@ -75,9 +75,15 @@ capture('new-thread-provider-menu-key')
 action('new-thread-provider-menu-close','PickProvider',{'provider':'claude'})
 
 (DATA/'fake-cli').symlink_to(pathlib.Path('target/debug/veyra-fake-cli').resolve())
+action('new-thread-recheck-open-menu','OpenProviderPicker')
 action('new-thread-recheck','RecheckProviders')
 ready = poll('new-thread-ready',lambda d: d['providers'][0]['readiness'] == 'ready')
 assert ready['composer']['send_enabled'] and ready['providers'][0]['models']
+assert ready['composer']['provider_picker_open']
+assert ready['composer']['provider_picker_labels'][0] == 'Claude Code · Ready'
+capture('new-thread-provider-menu-ready')
+action('new-thread-recheck-close-menu','PickProvider',{'provider':'claude'})
+capture('new-thread-ready')
 assert ready['providers'][0]['account'] == 'known'
 assert sql('select count(*) from threads') == '0'
 shutil.copy2(SOURCE/'probe-no-account.jsonl',FIXTURES/'probe.jsonl')
@@ -127,7 +133,8 @@ PY
 - `new-thread-ready.json`: Claude `ready`, models present, Send enabled after RecheckProviders.
 - `new-thread-no-account.json`: account presence changes from `known` to `unknown`, models stay non-empty and Claude stays `ready` on the account-free probe; every readiness phase asserts `select count(*) from threads` is 0.
 - `composer.provider`, `model`, `effort` and `mode` assert every choice; `composer_text` asserts typing and NewThread's reset.
-- `new-thread-provider-menu.png` shows the actual Not installed mark after OpenProviderPicker; its key opens the same menu.
+- `new-thread-provider-menu.png` shows Not installed; `new-thread-provider-menu-ready.png` shows Ready after a probe completes while the menu remains open.
+- `composer.provider_picker_labels` holds the labels used to build the open menu; its key opens the same menu.
 - `new-thread.png`: upper-third question and composer, hooks/MCP hint, left-aligned Add project and Geist.
 - `drive.log`: named `PickProvider`, `PickModel`, `PickEffort`, `PickPermission`, `RecheckProviders` and their keys, with exit codes.
 

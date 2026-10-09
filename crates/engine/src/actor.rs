@@ -71,6 +71,7 @@ pub struct Actor {
     pending_snapshots: Vec<(ThreadId, oneshot::Sender<ThreadSnapshot>)>,
     counters: BTreeMap<ThreadId, u64>,
     buffers: BTreeMap<ItemId, TextBuffer>,
+    #[cfg(debug_assertions)]
     delta_counts: BTreeMap<ItemId, u64>,
     item_keys: BTreeMap<(ThreadId, u32, TurnId, NativeItemKey), ItemId>,
     idle_since: BTreeMap<ThreadId, Millis>,
@@ -115,6 +116,7 @@ impl Actor {
             pending_snapshots: vec![],
             counters: BTreeMap::new(),
             buffers: BTreeMap::new(),
+            #[cfg(debug_assertions)]
             delta_counts: BTreeMap::new(),
             item_keys: BTreeMap::new(),
             idle_since,
@@ -296,14 +298,7 @@ impl Actor {
                     },
                 ));
                 initial.extend(self.projection.threads.keys().map(|id| {
-                    Ev::ThreadStatusChanged {
-                        thread: *id,
-                        status: thread_status(
-                            &ChangeSet::default()
-                                .view(&self.projection, &self.live, *id)
-                                .unwrap(),
-                        ),
-                    }
+                    ChangeSet::default().status_event(&self.projection, &self.live, *id)
                 }));
                 for event in initial {
                     let counter = event.thread().map(|id| self.next_counter(id));
@@ -462,6 +457,15 @@ impl Actor {
                     .get(id)
                     .is_some_and(|item| ended.contains(&item.turn))
         });
+        #[cfg(debug_assertions)]
+        self.delta_counts.retain(|id, _| {
+            self.projection.items.get(id).is_some_and(|item| {
+                self.projection
+                    .threads
+                    .get(&item.thread)
+                    .is_some_and(|thread| !thread.archived)
+            })
+        });
         self.schedule_text();
         for control in controls {
             match control {
@@ -518,25 +522,12 @@ impl Actor {
                 Effect::OpenTerminal { thread } => match self.spawner.terminal() {
                     Ok(term) => {
                         self.live.get_mut(&thread).unwrap().live = Live::Terminal { term, pid: 1 };
-                        let running = self
-                            .projection
-                            .turns_for(thread)
-                            .any(|turn| matches!(turn.state, TurnState::Running { .. }));
-                        let state = self.live[&thread].state(running);
-                        let changes = ChangeSet::default();
-                        let view = changes
-                            .view(&self.projection, &self.live, thread)
-                            .expect("terminal thread");
-                        let status = thread_status(&view);
+                        let event =
+                            ChangeSet::default().status_event(&self.projection, &self.live, thread);
                         let counter = self.next_counter(thread);
                         self.publish(UiEvent::Change {
                             counter: Some(counter),
-                            event: Ev::ThreadStatusChanged { thread, status },
-                        });
-                        let counter = self.next_counter(thread);
-                        self.publish(UiEvent::Change {
-                            counter: Some(counter),
-                            event: Ev::ThreadLiveChanged { thread, state },
+                            event,
                         });
                     }
                     Err(error) => {
@@ -595,7 +586,7 @@ impl Actor {
                 c.live.insert(thread, live);
                 let mut t = self.projection.threads[&thread].clone();
                 t.native = Some(native.clone());
-                if let Some(cli_version) = cli_version.filter(|version| !version.is_empty()) {
+                if let Some(cli_version) = cli_version {
                     t.cli_version = Some(cli_version);
                 }
                 let cli_version = t.cli_version.clone();
@@ -720,6 +711,9 @@ impl Actor {
                 streamed,
             } => {
                 let item = self.text_delta(c, (thread, epoch, turn.id, key), text, false);
+                #[cfg(not(debug_assertions))]
+                let _ = (item, streamed);
+                #[cfg(debug_assertions)]
                 if streamed {
                     *self.delta_counts.entry(item).or_default() += 1;
                 }
@@ -1056,6 +1050,7 @@ impl Actor {
                 item,
                 counter,
                 text,
+                #[cfg(debug_assertions)]
                 delta_count: self.delta_counts.get(&item).copied().unwrap_or_default(),
             });
         }
@@ -1084,6 +1079,7 @@ impl Actor {
         ThreadSnapshot {
             items,
             buffered_text,
+            #[cfg(debug_assertions)]
             delta_counts: self
                 .projection
                 .items_for(thread)

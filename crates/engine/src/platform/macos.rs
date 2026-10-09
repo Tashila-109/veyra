@@ -49,6 +49,18 @@ pub fn signal_group(group: u32, signal: super::Signal) -> io::Result<()> {
     }
 }
 
+pub fn group_exists(group: u32) -> io::Result<bool> {
+    if unsafe { libc::killpg(group as i32, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error),
+    }
+}
+
 pub fn is_executable(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)

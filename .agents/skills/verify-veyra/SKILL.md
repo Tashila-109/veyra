@@ -37,10 +37,44 @@ cargo build --workspace
 mkdir -p "$PROOF/fixtures" "$DATA/project" "$DATA/appcwd"
 printf '%s\n' "${VEYRA_VERIFY_LANE:-fake}" >"$PROOF/lane"
 : >"$PROOF/pages-run"
+cat >"$PROOF/capture-window.swift" <<'SWIFT'
+import AppKit
+import CoreGraphics
+import Foundation
+let args = Array(CommandLine.arguments.dropFirst())
+guard args.count == 3, let pid = Int32(args[0]), let id = UInt32(args[1]) else { exit(2) }
+func fail(_ text: String) -> Never {
+    fputs(text + "\n", stderr)
+    exit(1)
+}
+guard let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]],
+      let window = windows.first(where: {
+          ($0[kCGWindowNumber as String] as? UInt32) == id &&
+          ($0[kCGWindowOwnerPID as String] as? Int32) == pid &&
+          ($0[kCGWindowLayer as String] as? Int) == 0
+      }), let bounds = window[kCGWindowBounds as String] as? [String: NSNumber],
+      let x = bounds["X"], let y = bounds["Y"], let width = bounds["Width"], let height = bounds["Height"]
+else { fail("owned window is off-screen") }
+let frame = CGRect(x: x.doubleValue, y: y.doubleValue, width: width.doubleValue, height: height.doubleValue)
+var count: UInt32 = 0
+CGGetActiveDisplayList(0, nil, &count)
+var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+CGGetActiveDisplayList(count, &displays, &count)
+guard displays.contains(where: { frame.intersects(CGDisplayBounds($0)) })
+else { fail("owned window is outside the active displays") }
+guard let app = NSRunningApplication(processIdentifier: pid) else { fail("owned app is gone") }
+if args[2] == "activate" {
+    guard app.activate(options: [.activateIgnoringOtherApps]) else { fail("owned window activation failed") }
+    let end = Date().addingTimeInterval(2)
+    while !app.isActive && Date() < end { Thread.sleep(forTimeInterval: 0.05) }
+}
+guard app.isActive else { fail("owned window is covered by another application") }
+SWIFT
+swiftc -O "$PROOF/capture-window.swift" -o "$PROOF/capture-window"
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
 printf 'RUN=%s\n' "$RUN"
 cat >"$PROOF/driver.py" <<'PY'
-import json, os, pathlib, shutil, signal, sqlite3, subprocess, sys, time
+import hashlib, json, os, pathlib, re, shutil, signal, sqlite3, subprocess, sys, time
 PROOF = pathlib.Path(__file__).resolve().parent
 RUN = os.environ['RUN']
 DATA = pathlib.Path('/tmp/veyra-verify-' + RUN)
@@ -106,7 +140,36 @@ def window_id(pid):
     raise AssertionError('no on-screen window for owned pid '+str(pid))
 def capture(name):
     window = (PROOF/'window-id').read_text().strip()
-    subprocess.run(['screencapture','-x','-o','-l',window,str(PROOF/(name+'.png'))],check=True)
+    pid = (PROOF/'pid').read_text().strip()
+    helper = str((PROOF/'capture-window').resolve())
+    subprocess.run([helper,pid,window,'activate'],check=True)
+    dump = ctl(name+'-capture-state','dump')
+    visible = {key:dump[key] for key in ['view','sidebar','selected_thread','transcript','composer_text',
+        'composer','settings','notice']}
+    visible['providers'] = [probe['readiness'] for probe in dump['providers']]
+    state = json.dumps(visible,sort_keys=True)
+    target = PROOF/(name+'.png')
+    subprocess.run(['screencapture','-x','-o','-l',window,str(target)],check=True)
+    subprocess.run([helper,pid,window,'check'],check=True)
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    previous = PROOF/'capture-last.json'
+    if previous.exists():
+        old = json.loads(previous.read_text())
+        assert state == old['state'] or digest != old['digest'], 'stale screenshot after state change: '+name
+    previous.write_text(json.dumps({'state':state,'digest':digest,'name':name})+'\n')
+def foreground_ended(name, thread):
+    query = "select count(*) from turns where thread_id='"+thread+"' and state='ended'"
+    end = time.monotonic()+30
+    while time.monotonic()<end:
+        if sql(query)=='1': return
+        time.sleep(.05)
+    raise AssertionError(name+' foreground did not end')
+def background_working(name, thread):
+    foreground_ended(name,thread)
+    ctl(name+'-not-done','wait',thread,'Done','1',expected=1,stderr_contains='veyra ctl wait timed out:')
+    busy = ctl(name,'dump')
+    assert busy['selected_thread']['id']==thread and busy['selected_thread']['status']=='Working'
+    return busy
 def sql(query):
     value = subprocess.check_output(['sqlite3',str(DB),query],text=True).strip()
     with (PROOF/'sql.log').open('a') as log: log.write(query+'\n'+value+'\n')
@@ -175,8 +238,10 @@ def stage(scenario, slow=False):
             wire = record.get('line',{})
             ambient_only = wire.get('tasks') == [{'id':'ambient-work','ambient':True}]
             if wire.get('subtype') == 'background_tasks_changed' and ambient_only:
-                record['after_ms'] = 500
-    text = '\n'.join(json.dumps(record) for record in records)+'\n' 
+                record['after_ms'] = 3000
+            if wire.get('subtype') == 'background_tasks_changed' and wire.get('tasks') == []:
+                record['after_ms'] = 3000
+    text = '\n'.join(json.dumps(record) for record in records)+'\n'
     for n in range(1,int(sql('select count(*) from threads'))+2):
         for epoch in range(1,int(sql('select count(*) from turns'))+2):
             (FIXTURES/f't{n}-s{epoch}.jsonl').write_text(text)
@@ -218,6 +283,7 @@ The block must exit 0.
 A failed launch may still own a process: run Cleanup before reporting.
 Relaunches use `start_new_session=True`, preserving the same pid-equals-group invariant without a previous shell's job table.
 The slowed `ok` fixture uses 500 ms, the design's stderr-wait bound, between its two text deltas and before the result.
+The background proof uses three-second intervals, the design's interrupt grace, before ambient-only and empty lists.
 Those delays affect proof copies only; the committed capture-derived fixture is unchanged.
 
 ## Doctor
@@ -276,6 +342,9 @@ The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `ap
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
 `composer.provider_picker_open` reports the picker opened by `OpenProviderPicker` or ⌘⌥⇧P.
 `settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
+Capture checks the owned window is on-screen, activates its application and verifies it remains active.
+A changed visible state with an identical PNG fails; Evidence also compares named state pairs.
+Concurrent windows may cause a capture to fail, but cannot make a covered or off-screen frame pass.
 A dump proves state, not layout; inspect each PNG.
 
 ## Evidence
@@ -305,7 +374,7 @@ required = {
         'after-quit-database.txt','after-crash-database.txt','persisted-project.txt','release/ctl.txt',
         'release/strings.txt','release/data-listing.txt'],
     'new-thread':['new-thread-missing.json','new-thread-ready.json','new-thread-no-account.json',
-        'new-thread-provider-menu.png','new-thread.png'],
+        'new-thread-provider-menu.png','new-thread-provider-menu-ready.png','new-thread-ready.png','new-thread.png'],
     'chat-send-stream':['chat-working.json','chat-working.png','chat-done.json','chat-done.png',
         'chat-failed.json','chat-failed.png','chat-provider-done.json','chat-background-working.json'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
@@ -320,7 +389,19 @@ if 'app-launch' in pages:
     assert len({(PROOF/(label+'-inode.txt')).read_text() for label in ['initial','after-quit','after-crash']}) == 1
 for pid in (PROOF/'owned-app-pids').read_text().split():
     assert f'veyra ready pid={pid} data_dir={DATA}' in (PROOF/'veyra.log').read_text()
-print('PASS evidence identity, database, relaunches, features and release kept')
+pairs = {
+    'new-thread':[('new-thread-missing','new-thread-ready'),
+        ('new-thread-provider-menu','new-thread-provider-menu-ready')],
+    'chat-send-stream':[('chat-working','chat-done'),('chat-tool-collapsed','chat-tool-expanded')],
+    'settings':[('settings-full-access','settings')],
+    'chat-send-stream-live':[('chat-working','chat-done')],
+}
+for page in pages:
+    for first,second in pairs.get(page,[]):
+        assert (PROOF/(first+'.png')).read_bytes() != (PROOF/(second+'.png')).read_bytes(), (first,second)
+if 'chat-send-stream-live' in pages:
+    assert list((PROOF/'rec').glob('t*-s*.jsonl')), 'missing live session recording'
+print('PASS evidence pages='+','.join(sorted(pages))+'; identity, database, relaunches, screenshots and release kept')
 PY
 ```
 
@@ -334,6 +415,7 @@ Do not count native typing, pointer dragging, IME or a manual theme change as dr
 Read `live_pgid` before quitting or removing anything.
 Quit the app, then send SIGTERM to saved provider groups and SIGKILL one second later.
 Signal only groups saved in this run's database and the app group this run started.
+The leftover checks retry for five seconds before failing.
 The marker check uses Darwin's `KERN_PROCARGS2` through `sysctl` in memory, never printing arguments or environment values.
 It checks live processes with this run's effective user for `VEYRA_PARENT_PID` naming any app pid this run started.
 macOS refuses argument reads for privileged processes whose real uid is the user but effective uid is root; a fake CLI lane cannot create such a process.
@@ -373,44 +455,61 @@ for attempt in $(seq 1 50); do
 done
 ! kill -0 "$PID" 2>/dev/null
 python3 - "$PROOF" <<'PY'
-import ctypes, errno, os, pathlib, struct, subprocess, sys
+import ctypes, errno, json, os, pathlib, struct, subprocess, sys, time
 proof = pathlib.Path(sys.argv[1])
 parents = {int(pid) for pid in (proof/'owned-app-pids').read_text().split()}
 groups = {int(group) for group in (proof/'provider-groups.txt').read_text().split()}
-for group in groups:
-    try: os.killpg(group,0)
-    except ProcessLookupError: continue
-    raise AssertionError(f'owned provider group {group} still exists')
+def groups_gone():
+    remaining = []
+    for group in groups:
+        try: os.killpg(group,0)
+        except ProcessLookupError: continue
+        remaining.append(group)
+    return remaining
 lib = ctypes.CDLL(None,use_errno=True)
 lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t]
 def no_environment(pid):
     status = subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
     return not status or status.startswith('Z')
-rows = subprocess.check_output(['ps','-axo','pid=,uid=,stat='],text=True).splitlines()
-for row in rows:
-    text,uid,status = row.split()
-    if int(uid) != os.geteuid() or status.startswith('Z'): continue
-    pid = int(text)
-    mib = (ctypes.c_int*3)(1,49,pid)
-    size = ctypes.c_size_t()
-    if lib.sysctl(mib,3,None,ctypes.byref(size),None,0) != 0:
-        error = ctypes.get_errno()
-        if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
-        raise OSError(error,f'marker size read failed for pid {pid}')
-    buffer = ctypes.create_string_buffer(size.value)
-    if lib.sysctl(mib,3,buffer,ctypes.byref(size),None,0) != 0:
-        error = ctypes.get_errno()
-        if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
-        raise OSError(error,f'marker read failed for pid {pid}')
-    raw = buffer.raw[:size.value]
-    argc = struct.unpack_from('i',raw)[0]
-    offset = raw.index(b'\0',4)+1
-    while offset < len(raw) and raw[offset] == 0: offset += 1
-    for _ in range(argc): offset = raw.index(b'\0',offset)+1
-    markers = [value.split(b'=',1)[1] for value in raw[offset:].split(b'\0') if value.startswith(b'VEYRA_PARENT_PID=')]
-    owned = any(value.decode().isdigit() and int(value) in parents for value in markers)
-    assert not owned, f'owned marker remains on pid {pid}'
+def marked_processes():
+    remaining = []
+    rows = subprocess.check_output(['ps','-axo','pid=,uid=,stat='],text=True).splitlines()
+    for row in rows:
+        text,uid,status = row.split()
+        if int(uid) != os.geteuid() or status.startswith('Z'): continue
+        pid = int(text)
+        mib = (ctypes.c_int*3)(1,49,pid)
+        size = ctypes.c_size_t()
+        if lib.sysctl(mib,3,None,ctypes.byref(size),None,0) != 0:
+            error = ctypes.get_errno()
+            if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
+            raise OSError(error,f'marker size read failed for pid {pid}')
+        buffer = ctypes.create_string_buffer(size.value)
+        if lib.sysctl(mib,3,buffer,ctypes.byref(size),None,0) != 0:
+            error = ctypes.get_errno()
+            if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
+            raise OSError(error,f'marker read failed for pid {pid}')
+        raw = buffer.raw[:size.value]
+        argc = struct.unpack_from('i',raw)[0]
+        offset = raw.index(b'\0',4)+1
+        while offset < len(raw) and raw[offset] == 0: offset += 1
+        for _ in range(argc): offset = raw.index(b'\0',offset)+1
+        markers = [value.split(b'=',1)[1] for value in raw[offset:].split(b'\0')
+            if value.startswith(b'VEYRA_PARENT_PID=')]
+        owned = any(value.decode().isdigit() and int(value) in parents for value in markers)
+        if owned: remaining.append(pid)
+    return remaining
+end = time.monotonic()+5
+while True:
+    remaining_groups = groups_gone()
+    remaining_markers = marked_processes()
+    with (proof/'leftover-checks.jsonl').open('a') as out:
+        out.write(json.dumps({'groups':len(remaining_groups),'markers':len(remaining_markers),
+            'time':time.monotonic()})+'\n')
+    if not remaining_groups and not remaining_markers: break
+    assert time.monotonic()<end, (remaining_groups,remaining_markers)
+    time.sleep(.05)
 (proof/'marker-check.txt').write_text(f'PASS no marked processes for owned app pids {sorted(parents)}\n')
 print('PASS owned pids, provider groups and marker check')
 PY

@@ -9,6 +9,13 @@ pub const MODES: [PermissionMode; 3] = [
     PermissionMode::AcceptEdits,
     PermissionMode::FullAccess,
 ];
+pub fn next_mode(mode: PermissionMode) -> PermissionMode {
+    match mode {
+        PermissionMode::AskFirst => PermissionMode::AcceptEdits,
+        PermissionMode::AcceptEdits => PermissionMode::FullAccess,
+        PermissionMode::FullAccess => PermissionMode::AskFirst,
+    }
+}
 pub fn mode_label(mode: PermissionMode) -> &'static str {
     match mode {
         PermissionMode::AskFirst => "Ask first",
