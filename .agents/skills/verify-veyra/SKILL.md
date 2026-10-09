@@ -5,24 +5,21 @@ description: Verify Veyra's native macOS window and CLI after UI, launch, loggin
 
 # Verify Veyra
 
-The primary user interface is one native macOS gpui window.
-Use the debug driver because external Accessibility input is not granted on this Mac.
 Read [the feature map](features/README.md) before choosing a recipe.
-Run every block from this checkout in bash.
-Each section works in a fresh bash process.
-Launch prints `RUN=` followed by the run's identifier.
-Export that `RUN` before every later section.
-Each section refuses to start without it.
-This keeps the section on the instance Launch started.
-To resume an earlier run, export the `RUN` Launch printed.
-Each section reads the process and window records from the run's proof folder.
-Cleanup does not need Launch's job table or `wait`.
+Run every section in a fresh `bash -c` from this checkout.
+Launch prints `RUN=`; export that `RUN` into every later shell.
+Each section recovers its records from `target/verify-veyra/$RUN`.
+Never drive an instance this run did not start.
+Screen Recording must be granted to the host running `screencapture`.
+External Accessibility input is not granted here; driver keys prove gpui dispatch, not native keyboard delivery.
 
 ## Launch
 
-Screen Recording must be granted to the host that runs `screencapture`.
-Rust comes from Homebrew rustup.
-Each run owns a short scratch path and its process group.
+The default verification lane uses only the fake CLI.
+Its binary path deliberately starts missing, so [new-thread](features/new-thread.md) can prove installation and Check again.
+The launch writes a small driver helper into the proof folder so the feature pages share logging, bounded polling and the one expected database-table list.
+The helper does not set application state; its writes are fixture copies, screenshots and proof.
+A live lane must explicitly replace these overrides and have the human's consent.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -33,14 +30,130 @@ PROOF=target/verify-veyra/$RUN
 test ! -e "$DATA"
 test ! -e "$PROOF"
 cargo build --workspace
-mkdir -p "$PROOF"
+mkdir -p "$PROOF/fixtures" "$DATA/project"
+cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
 printf 'RUN=%s\n' "$RUN"
+cat >"$PROOF/driver.py" <<'PY'
+import json, os, pathlib, shutil, signal, sqlite3, subprocess, time
+PROOF = pathlib.Path(__file__).resolve().parent
+RUN = os.environ['RUN']
+DATA = pathlib.Path('/tmp/veyra-verify-' + RUN)
+DB = DATA / 'veyra.db'
+FIXTURES = PROOF / 'fixtures'
+SOURCE = pathlib.Path('crates/engine/tests/fixtures/claude')
+TABLES = 'grants items projects requests settings tasks threads turns'.split()
+ENV = {**os.environ, 'VEYRA_DATA_DIR': str(DATA), 'VEYRA_CLAUDE_BIN': str(DATA/'fake-cli'),
+       'VEYRA_FAKE_FIXTURES': str(FIXTURES)}
+def save(name, value):
+    (PROOF / (name + '.json')).write_text(json.dumps(value, indent=2) + '\n')
+    return value
+def ctl(name, *args, expected=0):
+    result = subprocess.run(['target/debug/veyra', 'ctl', *args], env=ENV, capture_output=True, text=True)
+    with (PROOF/'drive.log').open('a') as log:
+        log.write('$ veyra ctl ' + ' '.join(args) + '\n' + result.stdout + result.stderr + f'exit={result.returncode}\n')
+    (PROOF/(name+'.json')).write_text(result.stdout)
+    (PROOF/(name+'.stderr')).write_text(result.stderr)
+    assert result.returncode == expected, (name, expected, result.returncode, result.stdout, result.stderr)
+    return json.loads(result.stdout) if result.stdout.startswith('{') else None
+def poll(name, predicate):
+    end = time.monotonic() + 30
+    while time.monotonic() < end:
+        dump = ctl(name, 'dump')
+        if predicate(dump): return dump
+        time.sleep(.05)
+    raise AssertionError(name + ' timed out')
+def action(name, operation, data=None):
+    args = ['action', 'veyra::' + operation]
+    if data is not None: args.append(json.dumps(data))
+    assert ctl(name, *args) == {'ok': True}
+def identity():
+    pid = int((PROOF/'pid').read_text())
+    pgid = int((PROOF/'pgid').read_text())
+    assert os.getpgid(pid) == pgid == pid
+    assert (DATA/'veyra.lock').read_text().strip() == str(pid)
+    dump = ctl('identity', 'dump')
+    assert dump['pid'] == pid and dump['data_dir'] == str(DATA)
+    assert dump['build_rev'] == subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+    return pid
+def capture(name):
+    subprocess.run(['screencapture','-x','-o','-l',(PROOF/'window-id').read_text().strip(),str(PROOF/(name+'.png'))],check=True)
+def sql(query):
+    return subprocess.check_output(['sqlite3',str(DB),query],text=True).strip()
+def database(label, mode):
+    values = [sql('pragma user_version'),sql('pragma journal_mode'),*sql('.tables').split(),sql('select default_mode from settings')]
+    assert values == ['1','wal',*TABLES,mode], (label,values)
+    (PROOF/(label+'-database.txt')).write_text('\n'.join(values)+'\n')
+    (PROOF/(label+'-inode.txt')).write_text(str(DB.stat().st_ino)+'\n')
+    save(label,ctl(label+'-dump','dump'))
+def wait_gone(pid):
+    end = time.monotonic() + 5
+    while time.monotonic() < end:
+        try: os.waitpid(pid,os.WNOHANG)
+        except ChildProcessError: pass
+        try: os.kill(pid,0)
+        except ProcessLookupError: return
+        time.sleep(.05)
+    raise AssertionError(f'owned pid {pid} did not exit')
+def restart(label, crash=False):
+    pid = identity()
+    assert sql('select count(*) from threads where live_pgid is not null') == '0', 'finish provider turns before relaunch'
+    if crash: os.kill(pid,signal.SIGKILL)
+    else: ctl(label+'-quit','quit')
+    wait_gone(pid)
+    app = subprocess.Popen(['target/debug/veyra'],env=ENV,stdout=(PROOF/(label+'.stdout')).open('w'),stderr=(PROOF/(label+'.stderr')).open('w'),start_new_session=True)
+    pid = app.pid
+    (PROOF/'pid').write_text(str(pid)+'\n')
+    (PROOF/'pgid').write_text(str(os.getpgid(pid))+'\n')
+    with (PROOF/'owned-app-pids').open('a') as out: out.write(str(pid)+'\n')
+    end = time.monotonic() + 30
+    ready = f'veyra ready pid={pid} data_dir={DATA}'
+    while time.monotonic() < end:
+        assert app.poll() is None, (label,app.returncode)
+        if ready in (PROOF/(label+'.stderr')).read_text(): break
+        time.sleep(.05)
+    assert ready in (PROOF/(label+'.stderr')).read_text()
+    with (PROOF/'stderr.log').open('a') as out: out.write((PROOF/(label+'.stderr')).read_text())
+    window = subprocess.check_output(['swift','.agents/skills/verify-veyra/bin/winid.swift',str(pid)],text=True).strip()
+    assert window
+    (PROOF/'window-id').write_text(window+'\n')
+    identity()
+    return pid
+def stage(scenario, slow=False):
+    records = [json.loads(line) for line in (SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
+    if slow:
+        expanded = []
+        for record in records:
+            wire = record.get('line',{})
+            if wire.get('event',{}).get('delta',{}).get('text') == 'ok':
+                for text in ['o','k']:
+                    part = json.loads(json.dumps(record))
+                    part['line']['event']['delta']['text'] = text
+                    part['after_ms'] = 500
+                    expanded.append(part)
+            else:
+                if wire.get('type') == 'result': record['after_ms'] = 500
+                expanded.append(record)
+        records = expanded
+    text = '\n'.join(json.dumps(record) for record in records)+'\n'
+    for n in range(1,int(sql('select count(*) from threads'))+2):
+        for epoch in range(1,int(sql('select count(*) from turns'))+2):
+            (FIXTURES/f't{n}-s{epoch}.jsonl').write_text(text)
+def create(name, prompt, slow=False, scenario='ok-reply'):
+    stage(scenario,slow)
+    action(name+'-new','NewThread')
+    assert ctl(name+'-text','text',prompt) == {'ok':True}
+    before = int(sql('select count(*) from threads'))
+    ctl(name+'-send','keys','secondary-enter')
+    dump = poll(name+'-selected',lambda d: d['selected_thread'] is not None and int(sql('select count(*) from threads')) == before+1)
+    return dump['selected_thread']['id']
+PY
 set -m
-VEYRA_DATA_DIR="$DATA" target/debug/veyra >"$PROOF/stdout.log" 2>"$PROOF/stderr.log" &
+VEYRA_DATA_DIR="$DATA" VEYRA_CLAUDE_BIN="$DATA/fake-cli" VEYRA_FAKE_FIXTURES="$PROOF/fixtures" target/debug/veyra >"$PROOF/stdout.log" 2>"$PROOF/stderr.log" &
 PID=$!
 PGID=$(ps -o pgid= -p "$PID" | tr -d ' ')
 printf '%s\n' "$PID" >"$PROOF/pid"
 printf '%s\n' "$PGID" >"$PROOF/pgid"
+printf '%s\n' "$PID" >"$PROOF/owned-app-pids"
 test "$PID" = "$PGID"
 for attempt in $(seq 1 100); do
     grep -q "^veyra ready pid=$PID data_dir=$DATA$" "$PROOF/stderr.log" && break
@@ -55,175 +168,115 @@ printf 'PASS launch RUN=%s PID=%s PGID=%s ID=%s\n' "$RUN" "$PID" "$PGID" "$ID"
 ```
 
 The block must exit 0.
-If launch fails after starting a process, run Cleanup before reporting.
-Do not use the default data folder.
-The shell runs no provider and needs no login.
-M1 starts the engine and migrates the database before opening the window.
+A failed launch may still own a process: run Cleanup before reporting.
+Relaunches use `start_new_session=True`, preserving the same pid-equals-group invariant without a previous shell's job table.
+The slowed `ok` fixture uses 500 ms, the design's stderr-wait bound, between its two text deltas and before the result.
+Those delays affect proof copies only; the committed capture-derived fixture is unchanged.
 
 ## Doctor
 
-Run Doctor first whenever the instance looks wrong.
-Do not drive an instance whose pid, revision, data folder, or window does not match this run.
+Doctor fails on a wrong process, revision, folder, window or appearance.
+The macOS appearance read treats a missing `AppleInterfaceStyle` key as light.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
-DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
-PID=$(<"$PROOF/pid")
-PGID=$(<"$PROOF/pgid")
-ID=$(<"$PROOF/window-id")
-kill -0 "$PID"
-test "$(ps -o pgid= -p "$PID" | tr -d ' ')" = "$PGID"
-python3 - "$PROOF" "$DATA" "$PID" <<'PY'
-import json, os, pathlib, subprocess, sys, time
-proof = pathlib.Path(sys.argv[1])
+PYTHONPATH="$PROOF" python3 - <<'PY'
+from driver import *
 start = time.monotonic()
-reply = subprocess.run(["target/debug/veyra", "ctl", "dump"], env={**os.environ, "VEYRA_DATA_DIR": sys.argv[2]},
-                       stdout=subprocess.PIPE, text=True, check=True).stdout
-seconds = time.monotonic() - start
-(proof / "doctor.json").write_text(reply)
-(proof / "doctor-time.txt").write_text(f"{seconds:.3f}\n")
+pid = identity()
+dump = ctl('doctor','dump')
+seconds = time.monotonic()-start
+(PROOF/'doctor-time.txt').write_text(f'{seconds:.3f}\n')
 assert seconds < 2, seconds
-print(f"PASS doctor dump answered in {seconds:.3f} s")
-dump = json.loads(reply)
-assert dump["data_dir"] == sys.argv[2]
-assert dump["pid"] == int(sys.argv[3])
-assert pathlib.Path(sys.argv[2], "veyra.lock").read_text().strip() == sys.argv[3]
-assert dump["build_rev"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-print("PASS doctor identity")
+style = subprocess.run(['defaults','read','-g','AppleInterfaceStyle'],capture_output=True,text=True)
+expected = 'dark' if style.returncode == 0 and style.stdout.strip().lower() == 'dark' else 'light'
+assert dump['appearance'] == expected, (dump['appearance'],expected)
+end = time.monotonic() + 30
+while time.monotonic() < end:
+    found = subprocess.run(['swift','.agents/skills/verify-veyra/bin/winid.swift',str(pid)],capture_output=True,text=True)
+    if found.returncode == 0: break
+    time.sleep(.05)
+assert found.returncode == 0, found.stderr
+window = found.stdout.strip()
+assert window == (PROOF/'window-id').read_text().strip()
+bounds = subprocess.check_output(['swift','.agents/skills/verify-veyra/bin/winid.swift',str(pid),'--bounds'],text=True)
+(PROOF/'bounds.txt').write_text(bounds)
+print(f'PASS doctor pid={pid} appearance={expected} seconds={seconds:.3f} window={window}')
 PY
-test -n "$ID"
-test "$(swift .agents/skills/verify-veyra/bin/winid.swift "$PID")" = "$ID"
-swift .agents/skills/verify-veyra/bin/winid.swift "$PID" --bounds >"$PROOF/bounds.txt"
-printf 'PASS doctor window ID=%s\n' "$ID"
 ```
-
-Doctor times the dump and requires an answer within two seconds.
-A wrong identity or unavailable window fails Doctor.
-A build outside Git reports `unknown` instead of HEAD.
 
 ## Drive
 
-Run the full commands in [app-launch](features/app-launch.md), including its release check.
-The recipe recovers its own run records in a fresh shell.
+Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.md), [chat-send-stream](features/chat-send-stream.md) and [settings](features/settings.md).
+Use the same exported `RUN` in every fresh shell.
 `action NAME [JSON]` builds a registered gpui action.
-`keys KEYSTROKES` dispatches each space-separated key through the window.
-Both paths are the same dispatch paths the window uses.
-M0's `text STRING` returns an error because its composer has no input handler.
+Action and key replies acknowledge dispatch; poll `dump` for the resulting view or use `ctl wait` for a thread state.
+`keys KEYSTROKES` dispatches each key through the window.
+`text STRING` uses the focused textarea's public input handler; Settings has no text handler.
+Enter or ⌘↵ sends through `veyra::Send`; Shift+Enter inserts a newline.
+`wait THREAD STATUS [SECONDS]` is a client-only loop over `dump`, polling every 50 ms for 30 seconds by default.
+It exits 0 for the status, 1 for timeout, 2 for bad usage and 3 for a missing or archived thread.
 `quit` dispatches the menu's Quit action.
+A timeout does not cancel an enqueued action: run Doctor before retrying.
 
-The live `dump` fields are `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `sidebar.width`, and `notice`.
-They report the process, theme, and entity state.
-`view` is fixed to `new_thread`, `sidebar.rows` to `[]`, and `composer_text` to an empty string until later milestones.
-Do not use those fixed fields as proof of the rendered window or an action.
-A screenshot proves the empty sidebar and composer shell.
-
-No coordinates or direct state setters are needed.
-Shell controls report that M0 does not yet implement the operation.
-A reply timeout does not cancel an enqueued action.
-Run Doctor and inspect the current dump before retrying.
-A full-queue error means that request was not enqueued.
+The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf` and `notice`.
+`view` is `new_thread`, `chat`, `failed_thread` or `settings`.
+`sidebar.rows` holds project and thread rows, with each thread's own status.
+`selected_thread` includes its native id, configuration and failure cause.
+`composer` includes the chosen provider and permission mode, plus Send's readiness and disabled reason.
+`providers` reports each probe's path, version, models and readiness.
+`settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
+A dump proves state, not layout; inspect each PNG.
 
 ## Evidence
 
-Run this block only after both relaunches, the final Doctor, and Release check.
-A missing relaunch or release artifact fails the block.
-Capture the action and its resulting state.
-Keep dump JSON before and after, the ready line, second-launch stderr and exit code, the app log, and the window.
-Use the pid filter so another Veyra window cannot supply the screenshot.
+Run this after all four feature pages and the final Doctor.
+The required files enforce the relaunch, release and feature proofs.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
-DATA=/tmp/veyra-verify-$RUN
-DB=$DATA/veyra.db
 PROOF=target/verify-veyra/$RUN
-PID=$(<"$PROOF/pid")
-PGID=$(<"$PROOF/pgid")
-ID=$(<"$PROOF/window-id")
-VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl dump >"$PROOF/dump-after.json"
-{
-    sqlite3 "$DB" "pragma user_version"
-    sqlite3 "$DB" "pragma journal_mode"
-    sqlite3 "$DB" ".tables"
-    sqlite3 "$DB" "select default_mode from settings"
-} | tee "$PROOF/database.txt"
-test "$(sqlite3 "$DB" "pragma user_version")" = 1
-test "$(sqlite3 "$DB" "pragma journal_mode")" = wal
-test "$(sqlite3 "$DB" "select default_mode from settings")" = full_access
-python3 - "$DB" "$PROOF/dump-after.json" <<'PY'
-import json, subprocess, sys
-assert json.load(open(sys.argv[2]))['schema_version'] == 1
-assert subprocess.check_output(['sqlite3', sys.argv[1], '.tables'], text=True).split() == [
-    'grants', 'items', 'projects', 'requests', 'settings', 'tasks', 'threads', 'turns']
-print('PASS migrated database and schema_version')
+PYTHONPATH="$PROOF" python3 - <<'PY'
+from driver import *
+identity()
+ctl('dump-after','dump')
+database('final','ask_first')
+capture('window')
+shutil.copy2(DATA/'logs/veyra.log',PROOF/'veyra.log')
+(PROOF/'git-identity.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True)+subprocess.check_output(['git','status','--short'],text=True))
+for name in ['window-launch.png','dump-before.json','second-launch.txt','drive.log','initial-database.txt',
+             'after-quit-database.txt','after-crash-database.txt','persisted-project.txt','release/ctl.txt',
+             'release/strings.txt','release/data-listing.txt','new-thread-missing.json','new-thread-ready.json',
+             'new-thread-no-account.json','new-thread.png','chat-working.json','chat-working.png','chat-done.json',
+             'chat-done.png','chat-failed.json','chat-failed.png','settings-first.json','settings-ask-first.json',
+             'settings-relaunch.json','settings.png','settings-existing.json','settings-new.json']:
+    assert (PROOF/name).stat().st_size > 0, name
+assert len({(PROOF/(label+'-inode.txt')).read_text() for label in ['initial','after-quit','after-crash']}) == 1
+for pid in (PROOF/'owned-app-pids').read_text().split():
+    assert f'veyra ready pid={pid} data_dir={DATA}' in (PROOF/'veyra.log').read_text()
+print('PASS evidence identity, database, relaunches, features and release kept')
 PY
-screencapture -x -o -l "$ID" "$PROOF/window.png"
-cp "$DATA/logs/veyra.log" "$PROOF/veyra.log"
-{ git rev-parse HEAD; git status --short; } >"$PROOF/git-identity.txt"
-grep -q "veyra ready pid=$PID data_dir=$DATA" "$PROOF/veyra.log"
-for file in dump-before.json dump-after.json window.png veyra.log second-launch.txt drive.log \
-    git-identity.txt database.txt initial-database.txt initial-inode.txt initial.json \
-    after-quit.stderr after-quit.json after-quit-database.txt after-quit-inode.txt \
-    after-crash.stderr after-crash.json after-crash-database.txt after-crash-inode.txt \
-    relaunch-database.txt release/ctl.txt release/strings.txt release/data-listing.txt release/stderr.log; do
-    test -s "$PROOF/$file" || { printf 'missing proof %s\n' "$file" >&2; exit 1; }
-done
-python3 - "$PROOF" "$DATA" <<'PY'
-import json, pathlib, re, sys
-proof, data = pathlib.Path(sys.argv[1]), sys.argv[2]
-recipe = pathlib.Path('.agents/skills/verify-veyra/features/app-launch.md').read_text()
-keys = recipe.split("done <<'KEYS'\n", 1)[1].split('\nKEYS', 1)[0]
-log = (proof / 'veyra.log').read_text()
-for row in keys.splitlines():
-    message = row.split('|', 2)[2]
-    assert f'shell action {message}' in log, f'missing log notice {message!r}'
-print('PASS all driven action notices logged')
-expected = ['1', 'wal', 'grants', 'items', 'projects', 'requests', 'settings', 'tasks', 'threads', 'turns',
-            'full_access']
-inodes = []
-for label in ['initial', 'after-quit', 'after-crash']:
-    actual = (proof / f'{label}-database.txt').read_text().split()
-    assert actual == expected, f'{label} database reads {actual!r}'
-    inodes.append((proof / f'{label}-inode.txt').read_text().strip())
-    dump = json.loads((proof / f'{label}.json').read_text())
-    assert dump['schema_version'] == 1 and dump['data_dir'] == data, dump
-    ready = f'veyra ready pid={dump["pid"]} data_dir={data}'
-    assert re.search(rf'^{re.escape(ready)}$', (proof / 'stderr.log').read_text(), re.M), ready
-assert len(set(inodes)) == 1 and inodes[0].isdigit(), f'database inodes changed {inodes!r}'
-print('PASS relaunch reads, identities and database inode kept')
-assert re.search(r'^exit=2$', (proof / 'release/ctl.txt').read_text(), re.M)
-strings = (proof / 'release/strings.txt').read_text()
-assert re.search(r'^release control.sock count=0$', strings, re.M)
-assert int(re.search(r'^debug control.sock count=(\d+)$', strings, re.M)[1]) > 0
-assert 'control.sock' not in (proof / 'release/data-listing.txt').read_text()
-print('PASS release proof kept')
-PY
-printf 'PASS evidence RUN=%s\n' "$RUN"
 ```
 
-Inspect the PNG itself.
-Require the empty 240 px sidebar, 44 px header, question, and composer shell in Geist.
-The composer caps at 784 px with a 16 px corner radius.
-The requested window is 1280 by 800 px with a 760 by 560 px minimum.
-A window manager can override those outer bounds, so use Doctor's recorded bounds.
-A dump alone does not prove visible layout or fonts.
-M1 creates `veyra.db` with migration 1 and no provider or network side effects.
-`database.txt` keeps the schema version, journal mode, table names and default permission mode.
-Evidence also rereads all saved relaunch snapshots, matching database inodes, driven log notices and release results.
-M1 offers no driver command that writes a persistent value before relaunch.
-The inode check proves file preservation without adding a database setter.
-Do not count native typing, pointer dragging, or a manual theme change as passed through a driver action.
+Inspect the PNGs themselves for Geist, the 240 px initial sidebar, 44 px header, upper-third new-thread block, centred chat column and composer, collapsed tools/reasoning, failure cause and Settings copy.
+The transcript caps at 752 px, the composer at 784 px, with 40 px gutters.
+Yabai can override the requested 1280 by 800 outer bounds; use Doctor's actual bounds.
+Do not count native typing, pointer dragging, IME or a manual theme change as driver proof.
 
 ## Cleanup
 
-Run cleanup after successful and failed attempts.
-Signal only the processes this run created.
-Copy the log before removing scratch state.
-A failed Launch may have no window record, so Cleanup accepts an empty `ID`.
+Read `live_pgid` before quitting or removing anything.
+Kill only groups saved in this run's database and the app group this run started.
+The marker check uses Darwin's `KERN_PROCARGS2` through `sysctl` in memory, never printing arguments or environment values.
+It checks live processes with this run's effective user for `VEYRA_PARENT_PID` naming any app pid this run started.
+macOS refuses argument reads for privileged processes whose real uid is the user but effective uid is root; a fake CLI lane cannot create such a process.
+Zombies have no argument/environment block on Darwin and are excluded before the read; owned app pids must still be absent.
+A failed database read, group check or marker check leaves DATA for diagnosis.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -233,10 +286,12 @@ DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
 PID=$(<"$PROOF/pid")
 PGID=$(<"$PROOF/pgid")
-ID=
-test ! -f "$PROOF/window-id" || ID=$(<"$PROOF/window-id")
 test "$PID" = "$PGID"
+sqlite3 "$DATA/veyra.db" 'select live_pgid from threads where live_pgid is not null' >"$PROOF/provider-groups.txt"
 test ! -f "$DATA/logs/veyra.log" || cp "$DATA/logs/veyra.log" "$PROOF/veyra.log"
+while read -r group; do
+    test -z "$group" || kill -KILL -- "-$group" 2>/dev/null || true
+done <"$PROOF/provider-groups.txt"
 if kill -0 "$PID" 2>/dev/null; then
     test "$(ps -o pgid= -p "$PID" | tr -d ' ')" = "$PGID"
     VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl quit >"$PROOF/quit.json" 2>"$PROOF/quit.stderr" || true
@@ -245,17 +300,52 @@ for attempt in $(seq 1 50); do
     kill -0 "$PID" 2>/dev/null || break
     sleep .1
 done
-if kill -0 "$PID" 2>/dev/null; then
-    kill -KILL -- "-$PGID"
-fi
+if kill -0 "$PID" 2>/dev/null; then kill -KILL -- "-$PGID"; fi
 for attempt in $(seq 1 50); do
     kill -0 "$PID" 2>/dev/null || break
     sleep .1
 done
-if kill -0 "$PID" 2>/dev/null; then
-    printf '%s\n' "cleanup failed; keep $DATA for diagnosis" >&2
-    exit 1
-fi
+! kill -0 "$PID" 2>/dev/null
+python3 - "$PROOF" <<'PY'
+import ctypes, errno, os, pathlib, struct, subprocess, sys
+proof = pathlib.Path(sys.argv[1])
+parents = {int(pid) for pid in (proof/'owned-app-pids').read_text().split()}
+groups = {int(group) for group in (proof/'provider-groups.txt').read_text().split()}
+for group in groups:
+    try: os.killpg(group,0)
+    except ProcessLookupError: continue
+    raise AssertionError(f'owned provider group {group} still exists')
+lib = ctypes.CDLL(None,use_errno=True)
+lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t]
+def no_environment(pid):
+    status = subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
+    return not status or status.startswith('Z')
+rows = subprocess.check_output(['ps','-axo','pid=,uid=,stat='],text=True).splitlines()
+for row in rows:
+    text,uid,status = row.split()
+    if int(uid) != os.geteuid() or status.startswith('Z'): continue
+    pid = int(text)
+    mib = (ctypes.c_int*3)(1,49,pid)
+    size = ctypes.c_size_t()
+    if lib.sysctl(mib,3,None,ctypes.byref(size),None,0) != 0:
+        error = ctypes.get_errno()
+        if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
+        raise OSError(error,f'marker size read failed for pid {pid}')
+    buffer = ctypes.create_string_buffer(size.value)
+    if lib.sysctl(mib,3,buffer,ctypes.byref(size),None,0) != 0:
+        error = ctypes.get_errno()
+        if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
+        raise OSError(error,f'marker read failed for pid {pid}')
+    raw = buffer.raw[:size.value]
+    argc = struct.unpack_from('i',raw)[0]
+    offset = raw.index(b'\0',4)+1
+    while offset < len(raw) and raw[offset] == 0: offset += 1
+    for _ in range(argc): offset = raw.index(b'\0',offset)+1
+    markers = [value.split(b'=',1)[1] for value in raw[offset:].split(b'\0') if value.startswith(b'VEYRA_PARENT_PID=')]
+    assert not any(value.decode().isdigit() and int(value) in parents for value in markers), f'owned marker remains on pid {pid}'
+(proof/'marker-check.txt').write_text(f'PASS no marked processes for owned app pids {sorted(parents)}\n')
+print('PASS owned pids, provider groups and marker check')
+PY
 test "$DATA" = "/tmp/veyra-verify-$RUN"
 rm -rf "$DATA"
 test ! -e "$DATA"
@@ -263,19 +353,18 @@ test ! -e "$DATA"
 printf 'PASS cleanup PID=%s gone DATA=%s removed PROOF=%s kept\n' "$PID" "$DATA" "$PROOF"
 ```
 
-Cleanup leaves `target/verify-veyra/$RUN/` intact.
-It also works after a failed recipe that never produced a screenshot.
-Never remove that folder as part of scratch cleanup.
-Do not kill by process name.
+Cleanup leaves `target/verify-veyra/$RUN` intact.
+If Launch failed before the database exists, record that failure and stop only its recorded app group; do not claim the normal marker/database cleanup passed.
+Never kill by name.
 
 ## Helpers
 
-`bin/winid.swift` is executable.
-Run `swift .agents/skills/verify-veyra/bin/winid.swift PID` for a window number.
-Add `--bounds` for `x,y,w,h`, suitable for `screencapture -x -V 15 -R BOUNDS`.
-It filters on owner pid and the normal on-screen window layer.
+`bin/winid.swift PID` finds the on-screen window by owner pid and normal window layer.
+Add `--bounds` to get `x,y,w,h`.
+A socket path permits 103 usable bytes; keep RUN short.
 
 ## Maintain the map
 
-Use `/maintain-verification-skill` when commands, actions, or user entry points change.
-Update the matching feature recipe in the same change.
+Update the matching feature page when actions, commands or dump fields change.
+`verify_map_names` checks exact action names, ctl verbs and top-level dump keys.
+The lead owns the `Status: STATE, DATE, COMMIT, MISSING` values and their docs-only update after the phase commit.

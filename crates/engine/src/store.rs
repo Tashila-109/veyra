@@ -146,14 +146,18 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         let (state, start, end, outcome) = match &t.state {
             TurnState::Queued => ("queued", None, None, None),
             TurnState::Running { since } => ("running", Some(*since), None, None),
-            TurnState::Ended { outcome, at } => ("ended", None, Some(*at), Some(json(outcome)?)),
+            TurnState::Ended {
+                outcome,
+                started,
+                at,
+            } => ("ended", *started, Some(*at), Some(json(outcome)?)),
         };
         tx.execute(
             "INSERT INTO turns(id,thread_id,ordinal,origin_json,state,outcome_json,queued_at,
              started_at,ended_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(id) DO UPDATE SET origin_json=excluded.origin_json,state=excluded.state,
-             outcome_json=excluded.outcome_json,started_at=coalesce(excluded.started_at,
-             turns.started_at),ended_at=excluded.ended_at",
+             outcome_json=excluded.outcome_json,started_at=excluded.started_at,
+             ended_at=excluded.ended_at",
             params![
                 t.id.to_string(),
                 t.thread.to_string(),
@@ -181,7 +185,15 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         tx.execute(
             "INSERT INTO items(id,thread_id,turn_id,seq,kind,body_json,done) VALUES(?1,?2,?3,?4,?5,?6,
              ?7) ON CONFLICT(id) DO UPDATE SET body_json=excluded.body_json,done=excluded.done",
-              params![i.id.to_string(),i.thread.to_string(),i.turn.to_string(),i.seq,kind,json(&i.body)?,done],
+            params![
+                i.id.to_string(),
+                i.thread.to_string(),
+                i.turn.to_string(),
+                i.seq,
+                kind,
+                json(&i.body)?,
+                done,
+            ],
         )?;
     }
     for r in c.requests.values() {
@@ -198,12 +210,12 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             "INSERT INTO requests(id,thread_id,turn_id,kind,body_json,state,decision_json) VALUES(?1,
              ?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET state=excluded.state,
              decision_json=excluded.decision_json",
-              params![
+            params![
                 r.id.to_string(),
                 r.thread.to_string(),
                 r.turn.to_string(),
                 kind,
-                json(&(&r.native,&r.kind))?,
+                json(&(&r.native, &r.kind))?,
                 state,
                 decision,
             ],
@@ -265,13 +277,14 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         if matches!(live.live, Live::Stopping { .. }) {
             continue;
         }
-        let pid = match live.live {
-            Live::Structured { pid, .. } | Live::Terminal { pid, .. } => Some(pid),
-            _ => None,
+        let (pid, pgid) = match live.live {
+            Live::Structured { pid, pgid, .. } => (Some(pid), Some(pgid)),
+            Live::Terminal { pid, .. } => (Some(pid), None),
+            _ => (None, None),
         };
         tx.execute(
-            "UPDATE threads SET live_pid=?1,live_pgid=NULL WHERE id=?2",
-            params![pid, id.to_string()],
+            "UPDATE threads SET live_pid=?1,live_pgid=?2 WHERE id=?3",
+            params![pid, pgid, id.to_string()],
         )?;
     }
     Ok(())
@@ -347,6 +360,7 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             "running" => TurnState::Running { since: r.get(6)? },
             "ended" => TurnState::Ended {
                 outcome: parse(r.get(5)?)?,
+                started: r.get(6)?,
                 at: r.get(7)?,
             },
             _ => return Err(StoreError::Invalid(state)),
@@ -358,10 +372,7 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             origin: parse(r.get(3)?)?,
             state,
         };
-        if let Some(started) = r.get::<_, Option<Millis>>(6)? {
-            p.turn_started.insert(t.id, started);
-        }
-        p.turns.insert(t.id, t);
+        p.insert_turn(t);
     }
     let mut q = db.prepare("SELECT id,thread_id,turn_id,seq,body_json FROM items")?;
     let mut rows = q.query([])?;
@@ -373,7 +384,7 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             seq: r.get(3)?,
             body: parse(r.get(4)?)?,
         };
-        p.items.insert(i.id, i);
+        p.insert_item(i);
     }
     let mut q =
         db.prepare("SELECT id,thread_id,turn_id,body_json,state,decision_json FROM requests")?;

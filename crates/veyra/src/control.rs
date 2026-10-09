@@ -127,8 +127,10 @@ pub fn attach(
                             }
                             Ok(json!({"ok": true}))
                         }
-                        Command::Text { .. } => {
-                            bail!("the M0 composer is a shell with no text input")
+                        Command::Text { text } => {
+                            shell
+                                .update(cx, |shell, cx| shell.insert_text(&text, window, cx))??;
+                            Ok(json!({"ok":true}))
                         }
                         Command::Quit => {
                             window.dispatch_action(Box::new(crate::ui::actions::Quit), cx);
@@ -148,28 +150,100 @@ pub fn attach(
     });
 }
 
-fn parse_args(args: &[String]) -> anyhow::Result<Command> {
+enum ClientCommand {
+    Request(Command),
+    Wait {
+        thread: String,
+        status: String,
+        seconds: u64,
+    },
+}
+impl From<Command> for ClientCommand {
+    fn from(command: Command) -> Self {
+        Self::Request(command)
+    }
+}
+fn parse_args(args: &[String]) -> anyhow::Result<ClientCommand> {
     match args {
-        [command] if command == "dump" => Ok(Command::Dump),
-        [command] if command == "quit" => Ok(Command::Quit),
-        [command, text] if command == "text" => Ok(Command::Text { text: text.clone() }),
+        [command] if command == "dump" => Ok(Command::Dump.into()),
+        [command] if command == "quit" => Ok(Command::Quit.into()),
+        [command, text] if command == "text" => Ok(Command::Text { text: text.clone() }.into()),
         [command, keystrokes] if command == "keys" => Ok(Command::Keys {
             keystrokes: keystrokes.clone(),
-        }),
+        }
+        .into()),
         [command, name] if command == "action" => Ok(Command::Action {
             name: name.clone(),
             data: None,
-        }),
+        }
+        .into()),
         [command, name, data] if command == "action" => Ok(Command::Action {
             name: name.clone(),
             data: Some(serde_json::from_str(data)?),
-        }),
+        }
+        .into()),
+        [command, thread, status] | [command, thread, status, _] if command == "wait" => {
+            if thread.is_empty()
+                || ![
+                    "working",
+                    "done",
+                    "failed",
+                    "idle",
+                    "held",
+                    "interrupted",
+                    "needsyou",
+                    "interminal",
+                ]
+                .contains(&status.to_lowercase().as_str())
+            {
+                bail!("usage: veyra ctl wait THREAD STATUS [SECONDS]");
+            }
+            let seconds = if args.len() == 4 {
+                args[3].parse()?
+            } else {
+                30
+            };
+            Ok(ClientCommand::Wait {
+                thread: thread.clone(),
+                status: status.clone(),
+                seconds,
+            })
+        }
         _ => bail!(
-            "usage: veyra ctl action NAME [JSON] | keys KEYSTROKES | text STRING | dump | quit"
+            "usage: veyra ctl action NAME [JSON] | keys KEYSTROKES | text STRING | dump | wait THREAD STATUS [SECONDS] | quit"
         ),
     }
 }
-
+fn wait_exit_code(dump: &Value, thread: &str, status: &str) -> Option<i32> {
+    let row = dump["sidebar"]["rows"].as_array().and_then(|rows| {
+        rows.iter()
+            .find(|row| row["kind"] == "thread" && row["id"].as_str() == Some(thread))
+    });
+    match row {
+        None => Some(3),
+        Some(row) if row["archived"] == true => Some(3),
+        Some(row)
+            if row["status"]
+                .as_str()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(status)) =>
+        {
+            Some(0)
+        }
+        Some(_) => None,
+    }
+}
+fn request(data_dir: &Path, command: &Command) -> anyhow::Result<Value> {
+    let mut stream = platform::connect_socket(&data_dir.join("control.sock"))
+        .context("connect to Veyra debug driver")?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    stream.set_write_timeout(Some(TIMEOUT))?;
+    writeln!(stream, "{}", serde_json::to_string(command)?)?;
+    let reply: Value = serde_json::from_str(&read_line(stream)?)?;
+    if let Some(error) = reply.get("error").and_then(Value::as_str) {
+        bail!("{error}");
+    }
+    Ok(reply)
+}
 pub fn client() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().skip(2).collect();
     let command = match parse_args(&args) {
@@ -179,44 +253,74 @@ pub fn client() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
-    let data_dir = match std::env::var_os("VEYRA_DATA_DIR") {
-        Some(path) => PathBuf::from(path),
-        None => platform::default_data_dir()?,
-    };
-    let mut stream = platform::connect_socket(&data_dir.join("control.sock"))
-        .context("connect to Veyra debug driver")?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
-    stream.set_write_timeout(Some(TIMEOUT))?;
-    writeln!(stream, "{}", serde_json::to_string(&command)?)?;
-    let reply: Value = serde_json::from_str(&read_line(stream)?)?;
-    println!("{}", serde_json::to_string_pretty(&reply)?);
-    if let Some(error) = reply.get("error").and_then(Value::as_str) {
-        bail!("{error}");
+    let data_dir = std::env::var_os("VEYRA_DATA_DIR")
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(platform::default_data_dir)?;
+    match command {
+        ClientCommand::Request(command) => {
+            let reply = request(&data_dir, &command)?;
+            println!("{}", serde_json::to_string_pretty(&reply)?);
+        }
+        ClientCommand::Wait {
+            thread: id,
+            status,
+            seconds,
+        } => {
+            let start = std::time::Instant::now();
+            loop {
+                let dump = request(&data_dir, &Command::Dump)?;
+                let code = wait_exit_code(&dump, &id, &status)
+                    .or_else(|| (start.elapsed() >= Duration::from_secs(seconds)).then_some(1));
+                if let Some(code) = code {
+                    println!("{}", serde_json::to_string_pretty(&dump)?);
+                    std::process::exit(code);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn ctl_wait_exit_codes() {
+        let dump = json!({"sidebar":{"rows":[
+            {"kind":"thread","id":"one","status":"Done","archived":false},
+            {"kind":"thread","id":"old","status":"Done","archived":true},
+            {"kind":"thread","id":"running","status":"Working","archived":false}
+        ]}});
+        assert_eq!(wait_exit_code(&dump, "one", "done"), Some(0));
+        assert_eq!(wait_exit_code(&dump, "missing", "Done"), Some(3));
+        assert_eq!(wait_exit_code(&dump, "old", "Done"), Some(3));
+        assert_eq!(wait_exit_code(&dump, "running", "Done"), None);
+        assert!(matches!(
+            parse_args(&["wait".into(), "one".into(), "Done".into()]).unwrap(),
+            ClientCommand::Wait { seconds: 30, .. }
+        ));
+        assert!(parse_args(&["wait".into(), "one".into(), "Bogus".into()]).is_err());
+        assert!(parse_args(&["wait".into(), "one".into(), "Done".into(), "-1".into()]).is_err());
+    }
+    #[test]
     fn driver_parses_five_commands() {
         assert!(matches!(
             parse_args(&["dump".into()]).unwrap(),
-            Command::Dump
+            ClientCommand::Request(Command::Dump)
         ));
         assert!(matches!(
             parse_args(&["quit".into()]).unwrap(),
-            Command::Quit
+            ClientCommand::Request(Command::Quit)
         ));
         assert!(
-            matches!(parse_args(&["text".into(), "hello".into()]).unwrap(), Command::Text { text } if text == "hello")
+            matches!(parse_args(&["text".into(), "hello".into()]).unwrap(), ClientCommand::Request(Command::Text { text }) if text == "hello")
         );
         assert!(
-            matches!(parse_args(&["keys".into(), "secondary-n".into()]).unwrap(), Command::Keys { keystrokes } if keystrokes == "secondary-n")
+            matches!(parse_args(&["keys".into(), "secondary-n".into()]).unwrap(), ClientCommand::Request(Command::Keys { keystrokes }) if keystrokes == "secondary-n")
         );
         assert!(
-            matches!(parse_args(&["action".into(), "veyra::SetSidebarWidth".into(), "{\"width\":300}".into()]).unwrap(), Command::Action { data: Some(data), .. } if data == json!({"width":300}))
+            matches!(parse_args(&["action".into(), "veyra::SetSidebarWidth".into(), "{\"width\":300}".into()]).unwrap(), ClientCommand::Request(Command::Action { data: Some(data), .. }) if data == json!({"width":300}))
         );
         assert!(parse_args(&["dump".into(), "extra".into()]).is_err());
         assert!(parse_args(&["action".into(), "name".into(), "bad json".into()]).is_err());

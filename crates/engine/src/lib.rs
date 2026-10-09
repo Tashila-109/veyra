@@ -3,10 +3,12 @@ pub mod commands;
 pub mod data_dir;
 pub mod domain;
 pub mod events;
+pub mod fixture;
 pub mod live;
 pub mod platform;
 pub mod provider;
 pub mod reconcile;
+pub mod record;
 pub mod store;
 #[cfg(test)]
 mod tests;
@@ -57,6 +59,7 @@ impl Engine {
                 .truncate(false),
         )?;
         let db = store::open(&data.path().join("veyra.db"))?;
+        provider::env::ChildEnv::load();
         Self::launch(runtime, db, Spawner::Cli, Some(lock))
     }
     fn launch(
@@ -96,6 +99,9 @@ impl Engine {
             }),
         })
     }
+    pub fn shutdown(&self) {
+        let _ = self.inner.sender.try_send(EngineMsg::Shutdown);
+    }
     pub fn schema_version(&self) -> u32 {
         self.inner.schema_version
     }
@@ -108,8 +114,12 @@ impl Engine {
         {
             Ok(()) => {}
             Err(error) => {
+                let cause = match &error {
+                    mpsc::error::TrySendError::Full(_) => CommandError::QueueFull,
+                    mpsc::error::TrySendError::Closed(_) => CommandError::Closed,
+                };
                 if let EngineMsg::Command { reply, .. } = error.into_inner() {
-                    let _ = reply.send(Err(CommandError::Busy("engine command queue".into())));
+                    let _ = reply.send(Err(cause));
                 }
             }
         }

@@ -1,7 +1,9 @@
 # Veyra verification map
 
 [app-launch](app-launch.md) covers the native window, debug CLI, instance lock, migrated database, log, release exclusion, and cleanup.
-It is the only feature page through M1.
+[new-thread](new-thread.md) covers project selection, startup readiness, Check again, the no-account probe and the live composer choices without creating a thread.
+[chat-send-stream](chat-send-stream.md) covers fake-CLI streaming, Working → Done, failure cause and stderr, Retry and ctl wait.
+[settings](settings.md) covers OpenSettings, all defaults, existing-versus-new thread modes and criterion 19 after relaunch.
 
 ## Preconditions
 
@@ -19,8 +21,8 @@ Read the PNG.
 Preserve the app log and proof after Cleanup.
 Report a skipped native entry point as skipped.
 The driver does not prove external keyboard delivery, IME, or pointer input.
-M0's `view`, `sidebar.rows`, and `composer_text` dump fields are fixed placeholders, not evidence of rendered state.
-Use the live identity, appearance, sidebar width, and notice fields for their checks, and inspect the PNG for layout.
+`view`, `sidebar.rows`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings` and `perf` are live state.
+Use their assertions alongside identity, appearance, sidebar width and notice, and inspect the PNG for layout.
 Each key check must reset to a state that its key changes.
 The sidebar recipe checks the theme's 240 px default, 200 to 448 px bounds, and 16 px key step.
 Inspect the 44 px header and the composer capped at 784 px in the PNG.

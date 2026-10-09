@@ -8,17 +8,19 @@ pub struct LiveThread {
     pub epoch: u32,
     pub live: Live,
     pub background_work: bool,
+    pub capabilities: Vec<String>,
 }
 #[derive(Clone, Debug, Default)]
 pub enum Live {
     #[default]
     Parked,
     Starting {
-        session: SessionHandle,
+        session: Option<SessionHandle>,
     },
     Structured {
         session: SessionHandle,
         pid: u32,
+        pgid: u32,
     },
     Terminal {
         term: TerminalHandle,

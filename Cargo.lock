@@ -6853,6 +6853,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -7391,6 +7392,7 @@ name = "veyra-engine"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -1,5 +1,8 @@
+pub mod claude;
+pub mod env;
 #[cfg(test)]
 pub mod scripted;
+pub mod session;
 use crate::{actor::EngineMsg, domain::*};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -52,6 +55,11 @@ pub enum SessionEvent {
         native: NativeSessionId,
         cli_version: String,
         pid: u32,
+        pgid: u32,
+        capabilities: Vec<String>,
+    },
+    Notice {
+        text: String,
     },
     BackgroundWork {
         pending: bool,
@@ -71,6 +79,9 @@ pub enum TurnEvent {
     ReasoningDelta {
         key: NativeItemKey,
         text: String,
+    },
+    ItemEnded {
+        key: NativeItemKey,
     },
     ToolStarted {
         key: NativeItemKey,
@@ -106,16 +117,105 @@ pub enum TerminalEvent {
 pub enum ProviderError {
     #[error("this provider is not built yet")]
     NotBuilt,
+    #[error("{0} is not installed")]
+    NotInstalled(String),
+    #[error("fixture is missing: {0}")]
+    FixtureMissing(PathBuf),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("Claude protocol: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Protocol(String),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    Ready,
+    NotInstalled,
+    SignedOut,
+    Checking,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Model {
+    pub value: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "supportedEffortLevels")]
+    pub effort_levels: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct Probe {
+    pub provider: ProviderKind,
+    pub path: Option<PathBuf>,
+    pub version: Option<String>,
+    pub readiness: Readiness,
+    pub models: Vec<Model>,
+    pub account: Option<serde_json::Value>,
 }
 impl ProviderKind {
+    pub fn binary(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+        }
+    }
+    pub fn sign_in_command(self) -> &'static str {
+        match self {
+            Self::Claude => "claude auth login",
+            Self::Codex => "codex login",
+            Self::Grok => "grok login",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Grok => "Grok",
+        }
+    }
+    pub async fn probe(self, env: &env::ChildEnv) -> Probe {
+        if self == Self::Claude {
+            match session::probe(env).await {
+                Ok(probe) => probe,
+                Err(error) => {
+                    tracing::warn!(error = %crate::record::redact(&error.to_string(),None), "provider probe failed");
+                    Probe {
+                        provider: self,
+                        path: env.resolve(self).ok(),
+                        version: None,
+                        readiness: if matches!(error, ProviderError::NotInstalled(_)) {
+                            Readiness::NotInstalled
+                        } else {
+                            Readiness::Ready
+                        },
+                        models: vec![],
+                        account: None,
+                    }
+                }
+            }
+        } else {
+            Probe {
+                provider: self,
+                path: env.resolve(self).ok(),
+                version: None,
+                readiness: Readiness::Ready,
+                models: vec![],
+                account: None,
+            }
+        }
+    }
     pub fn spawn(
         self,
-        _spec: SessionSpec,
-        _out: mpsc::Sender<EngineMsg>,
-        _epoch: u32,
+        spec: SessionSpec,
+        out: mpsc::Sender<EngineMsg>,
+        epoch: u32,
     ) -> Result<SessionHandle, ProviderError> {
         match self {
-            Self::Claude | Self::Codex | Self::Grok => Err(ProviderError::NotBuilt),
+            Self::Claude => session::spawn(spec, env::ChildEnv::load(), out, epoch),
+            Self::Codex | Self::Grok => Err(ProviderError::NotBuilt),
         }
     }
 }

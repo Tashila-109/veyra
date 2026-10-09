@@ -1,9 +1,71 @@
 use super::*;
 use crate::events::ChangeEvent as Ev;
+#[test]
+fn store_persists_pid_and_pgid_then_clears_both() {
+    let mut f = Fixture::new(LiveState::Starting);
+    f.event(ProviderEvent::Session(SessionEvent::Ready {
+        native: NativeSessionId("pid-check".into()),
+        cli_version: "fixture".into(),
+        pid: 23,
+        pgid: 23,
+        capabilities: vec![],
+    }));
+    let row = f
+        .actor
+        .db
+        .query_row(
+            "SELECT live_pid,live_pgid FROM threads WHERE id=?1",
+            [f.thread.to_string()],
+            |r| Ok((r.get::<_, Option<u32>>(0)?, r.get::<_, Option<u32>>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (Some(23), Some(23)));
+    f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
+    let row = f
+        .actor
+        .db
+        .query_row(
+            "SELECT live_pid,live_pgid FROM threads WHERE id=?1",
+            [f.thread.to_string()],
+            |r| Ok((r.get::<_, Option<u32>>(0)?, r.get::<_, Option<u32>>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (None, None));
+}
+
+#[test]
+fn later_archived_write_keeps_first_archive_time() {
+    let mut f = Fixture::new(LiveState::Parked);
+    let mut c = ChangeSet::default();
+    let mut thread = f.actor.projection.threads[&f.thread].clone();
+    thread.archived = true;
+    c.threads.insert(thread.id, thread);
+    for time in [1000, 2000] {
+        let tx = f.actor.db.transaction().unwrap();
+        store::apply(&tx, &c, time).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            f.actor
+                .db
+                .query_row(
+                    "SELECT archived_at FROM threads WHERE id=?1",
+                    [f.thread.to_string()],
+                    |r| r.get::<_, Millis>(0)
+                )
+                .unwrap(),
+            1000
+        );
+    }
+}
 
 #[test]
 fn spawn_failure_survives_full_actor_mailbox() {
     let mut f = Fixture::new(LiveState::Parked);
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.provider = ProviderKind::Codex;
+    let mut change = ChangeSet::default();
+    change.threads.insert(row.id, row);
+    f.save(change);
     let db = std::mem::replace(&mut f.actor.db, Connection::open_in_memory().unwrap());
     let (out, mut inbox) = mpsc::channel(1);
     out.try_send(EngineMsg::Tick).unwrap();
@@ -68,7 +130,7 @@ fn full_actor_queue_refuses_commands_and_read_requests() {
             })
             .blocking_recv()
             .unwrap(),
-        Err(CommandError::Busy(_))
+        Err(CommandError::QueueFull)
     ));
     assert!(matches!(
         engine.subscribe().try_recv(),
@@ -77,6 +139,26 @@ fn full_actor_queue_refuses_commands_and_read_requests() {
     assert!(matches!(
         engine.snapshot(ThreadId::new()).try_recv(),
         Err(oneshot::error::TryRecvError::Closed)
+    ));
+}
+#[test]
+fn closed_actor_queue_reports_closed_instead_of_full() {
+    let (sender, receiver) = mpsc::channel(1);
+    drop(receiver);
+    let engine = crate::Engine {
+        inner: std::sync::Arc::new(crate::EngineInner {
+            sender,
+            schema_version: 1,
+        }),
+    };
+    assert!(matches!(
+        engine
+            .send(Command::SetDefaultMode {
+                mode: PermissionMode::AskFirst
+            })
+            .blocking_recv()
+            .unwrap(),
+        Err(CommandError::Closed)
     ));
 }
 #[test]
@@ -158,12 +240,22 @@ fn set_default_mode_persists_and_publishes() {
     let mut f = Fixture::new(LiveState::Parked);
     assert_eq!(
         f.drain(),
-        vec![UiEvent::Change {
-            counter: None,
-            event: Ev::SettingsChanged(Settings {
-                default_mode: PermissionMode::FullAccess
-            })
-        }]
+        vec![
+            UiEvent::Change {
+                counter: None,
+                event: Ev::SettingsChanged(Settings {
+                    default_mode: PermissionMode::FullAccess
+                })
+            },
+            UiEvent::Change {
+                counter: None,
+                event: Ev::ProjectAdded(f.actor.projection.projects[&f.project].clone())
+            },
+            UiEvent::Change {
+                counter: Some(1),
+                event: Ev::ThreadCreated(f.actor.projection.threads[&f.thread].clone())
+            },
+        ]
     );
     f.command(Command::SetDefaultMode {
         mode: PermissionMode::AskFirst,

@@ -54,6 +54,8 @@ fn run() -> anyhow::Result<()> {
     #[cfg(debug_assertions)]
     let requests = control::listen(&data_path, _engine.schema_version())?;
     ui::run(
+        _engine,
+        runtime.handle().clone(),
         data_path,
         #[cfg(debug_assertions)]
         requests,

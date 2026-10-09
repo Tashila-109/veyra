@@ -1,6 +1,5 @@
 mod perf;
 mod recovery;
-mod repair;
 mod session_events;
 mod storage;
 mod table;
@@ -71,8 +70,14 @@ impl Fixture {
         let session = SessionHandle { control };
         let live = match state {
             LiveState::Parked => Live::Parked,
-            LiveState::Starting => Live::Starting { session },
-            LiveState::Idle | LiveState::Running => Live::Structured { session, pid: 9 },
+            LiveState::Starting => Live::Starting {
+                session: Some(session),
+            },
+            LiveState::Idle | LiveState::Running => Live::Structured {
+                session,
+                pid: 9,
+                pgid: 9,
+            },
             LiveState::Terminal => {
                 let (control, _rx) = mpsc::unbounded_channel();
                 Live::Terminal {
@@ -93,6 +98,7 @@ impl Fixture {
                 epoch: 1,
                 live,
                 background_work: false,
+                capabilities: vec![],
             },
         );
         let tx = actor.db.transaction().unwrap();
@@ -172,6 +178,7 @@ impl Fixture {
                 TurnOrigin::Provider,
                 TurnState::Ended {
                     outcome: TurnOutcome::Completed,
+                    started: None,
                     at: now(),
                 },
             )

@@ -6,7 +6,8 @@ fn identifiers(text: &str) -> impl Iterator<Item = &str> {
 }
 fn dump_keys(source: &str) -> BTreeSet<String> {
     let source = source.split("pub fn dump(").nth(1).expect("Shell::dump");
-    let source = source.split("json!({").nth(1).expect("dump object");
+    let source = source.split("\nimpl Focusable").next().unwrap();
+    let source = source.rsplit("json!({").next().expect("dump object");
     let mut keys = BTreeSet::new();
     let mut depth = 1;
     let mut chars = source.chars().peekable();
@@ -68,16 +69,21 @@ fn verify_map_names() {
         .unwrap();
     let mut names: BTreeSet<String> = identifiers(list).map(str::to_owned).collect();
     for part in actions.split("#[action(namespace = veyra)]").skip(1) {
-        names.insert(
-            part.split("struct ")
-                .nth(1)
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .to_owned(),
-        );
+        let name = part
+            .split("struct ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        if !name.starts_with('$') {
+            names.insert(name.to_owned());
+        }
     }
+    for part in actions.split("choice_action!(").skip(1) {
+        names.insert(part.split(',').next().unwrap().trim().to_owned());
+    }
+    names.insert("settings".into());
     let control = fs::read_to_string(root.join("crates/veyra/src/control.rs")).unwrap();
     let parser = control
         .split("fn parse_args(")

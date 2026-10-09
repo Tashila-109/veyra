@@ -8,9 +8,63 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    process::Command,
 };
 
 pub const SOCKET_PATH_MAX: usize = 103;
+pub const KNOWN_BIN_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    ".local/bin",
+    ".claude/local",
+];
+
+pub fn login_shell_path() -> io::Result<std::ffi::OsString> {
+    let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    let output = Command::new(shell)
+        .args(["-l", "-c", "printf '%s' \"$PATH\""])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("login shell could not read PATH"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+}
+
+pub fn own_group(cmd: &mut tokio::process::Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.as_std_mut().process_group(0);
+}
+
+pub fn signal_group(group: u32, signal: super::Signal) -> io::Result<()> {
+    let signal = match signal {
+        super::Signal::Hangup => libc::SIGHUP,
+        super::Signal::Terminate => libc::SIGTERM,
+        super::Signal::Kill => libc::SIGKILL,
+    };
+    if unsafe { libc::killpg(group as i32, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+pub fn is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+pub fn open_terminal_app(dir: &Path) -> io::Result<()> {
+    let status = Command::new("open")
+        .args(["-a", "Terminal"])
+        .arg(dir)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("Terminal could not open the project"))
+    }
+}
 
 pub fn default_data_dir() -> io::Result<PathBuf> {
     let home = env::var_os("HOME")

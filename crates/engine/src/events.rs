@@ -132,31 +132,89 @@ impl ChangeSet {
         p: &mut Projection,
         live: &mut BTreeMap<ThreadId, LiveThread>,
     ) -> (Vec<ChangeEvent>, Vec<Effect>) {
-        for t in self.turns.values() {
-            if let TurnState::Running { since } = t.state {
-                p.turn_started.insert(t.id, since);
-            }
+        let mut events = self
+            .events
+            .iter()
+            .cloned()
+            .map(|event| match event {
+                ChangeEvent::ProjectAdded(row) => {
+                    ChangeEvent::ProjectAdded(self.projects[&row.id].clone())
+                }
+                ChangeEvent::ThreadCreated(row) => {
+                    ChangeEvent::ThreadCreated(self.threads[&row.id].clone())
+                }
+                ChangeEvent::TurnQueued(row) => {
+                    ChangeEvent::TurnQueued(self.turns[&row.id].clone())
+                }
+                ChangeEvent::TurnStarted(row) => {
+                    ChangeEvent::TurnStarted(self.turns[&row.id].clone())
+                }
+                ChangeEvent::TurnEnded(row) => ChangeEvent::TurnEnded(self.turns[&row.id].clone()),
+                ChangeEvent::ItemAdded(row) => ChangeEvent::ItemAdded(self.items[&row.id].clone()),
+                ChangeEvent::ItemCompleted(row) => {
+                    ChangeEvent::ItemCompleted(self.items[&row.id].clone())
+                }
+                ChangeEvent::RequestOpened(row) => {
+                    ChangeEvent::RequestOpened(self.requests[&row.id].clone())
+                }
+                ChangeEvent::RequestClosed(row) => {
+                    ChangeEvent::RequestClosed(self.requests[&row.id].clone())
+                }
+                ChangeEvent::TaskStarted(row) => {
+                    ChangeEvent::TaskStarted(self.tasks[&row.id].clone())
+                }
+                ChangeEvent::TaskSettled(row) => {
+                    ChangeEvent::TaskSettled(self.tasks[&row.id].clone())
+                }
+                ChangeEvent::TaskDelivered(row) => {
+                    ChangeEvent::TaskDelivered(self.tasks[&row.id].clone())
+                }
+                other => other,
+            })
+            .collect::<Vec<_>>();
+        let changed: std::collections::BTreeSet<_> = self
+            .live
+            .keys()
+            .copied()
+            .chain(self.turns.values().map(|turn| turn.thread))
+            .collect();
+        for id in changed {
+            let running = self
+                .turns(p, id)
+                .any(|turn| matches!(turn.state, TurnState::Running { .. }));
+            events.push(ChangeEvent::ThreadLiveChanged {
+                thread: id,
+                state: self.live(live, id).state(running),
+            });
         }
         p.projects.extend(self.projects);
         p.threads.extend(self.threads);
-        p.turns.extend(self.turns);
-        p.items.extend(self.items);
+        for turn in self.turns.into_values() {
+            p.insert_turn(turn);
+        }
+        for item in self.items.into_values() {
+            p.insert_item(item);
+        }
         p.requests.extend(self.requests);
         p.tasks.extend(self.tasks);
         if let Some(settings) = self.settings {
             p.settings = settings;
         }
         live.extend(self.live);
-        (self.events, self.effects)
+        (events, self.effects)
     }
     pub fn thread<'a>(&'a self, p: &'a Projection, id: ThreadId) -> Option<&'a Thread> {
         self.threads.get(&id).or_else(|| p.threads.get(&id))
     }
     pub fn turns<'a>(&'a self, p: &'a Projection, id: ThreadId) -> impl Iterator<Item = &'a Turn> {
-        overlay(&p.turns, &self.turns).filter(move |t| t.thread == id)
+        p.turns_for(id)
+            .filter(|t| !self.turns.contains_key(&t.id))
+            .chain(self.turns.values().filter(move |t| t.thread == id))
     }
     pub fn items<'a>(&'a self, p: &'a Projection, id: ThreadId) -> impl Iterator<Item = &'a Item> {
-        overlay(&p.items, &self.items).filter(move |i| i.thread == id)
+        p.items_for(id)
+            .filter(|i| !self.items.contains_key(&i.id))
+            .chain(self.items.values().filter(move |i| i.thread == id))
     }
     pub fn requests<'a>(
         &'a self,
@@ -200,7 +258,6 @@ impl ChangeSet {
             queued,
             pending_request,
             last,
-            last_started: last.and_then(|t| p.turn_started.get(&t.id).copied()),
         })
     }
 }

@@ -2,310 +2,288 @@
 
 ## Executive summary
 
-Veyra currently opens one native macOS window with an empty project sidebar and a new-thread composer shell.
-The gpui `Shell` entity owns the window state.
-The `Theme` global owns its colours, typography, geometry, and motion tokens.
-The engine owns the data folder, instance lock, SQLite projection, and orchestration actor.
-Startup opens and migrates the database before constructing the actor.
-After startup, the actor owns the connection and conversation state and is the sole database writer.
+Veyra is one native macOS chat window backed by an orchestration actor and Claude Code's stream-json process.
+SQLite rows are the source of truth for projects, threads, turns, transcript items and the default permission mode.
+The engine actor is the sole database writer after startup.
+The gpui `Shell` owns window state and a read-only event projection, not another database connection.
 The engine never depends on gpui.
 
-The window is still the M0 shell.
-M1 starts the engine before the window opens.
-There is no real provider process, PTY, or MCP relay.
+Claude sessions, readiness probes, replay fixtures and debug recording are implemented.
+Codex and Grok have placeholder readiness but no codec.
+There is no PTY, tool server, approvals/questions UI, interrupt ladder, startup process reaper, keep-awake guard or notification banner.
 
 ### System architecture
 
 ```text
-User -> macOS window -> Shell + Theme
-                            |
-main -> tokio runtime + Engine::start -> instance lock + migration + reconcile
-                                    -> engine actor -> veyra.db
-main -> logs/veyra.log + macOS window
-engine actor -> normalized provider channels -> test-only scripted sessions
+User -> macOS window -> Shell + Theme + textarea + MessageScroller
+                            | commands / acknowledgements
+                            | subscription / fenced snapshots
+main -> tokio runtime -> Engine actor -> veyra.db
+                              | spawn / controls
+                              v
+                         Claude session -> owned CLI process group
+                              | normalized events
+                              +--------------------> Engine actor
+Shell -> runtime readiness probes -> initialize-only CLI process
 
-debug ctl -> private Unix socket -> socket thread
-          -> tokio mpsc receiver -> gpui task -> window actions and keys
+debug ctl -> private Unix socket -> socket thread -> gpui window actions
+                                         debug session -> recorder / fake CLI
 ```
 
 ### Dependency hierarchy
 
 ```text
-veyra -> veyra-engine -> rusqlite (bundled) + tokio (sync, rt-multi-thread, time, macros)
-                     -> serde (derive) + serde_json + uuid (v5, v7, serde)
-                     -> thiserror + tracing
+veyra -> veyra-engine -> rusqlite (bundled) + tokio
+                     -> serde + serde_json + uuid + thiserror + tracing + regex
                      -> platform -> libc + Rust standard library
 veyra -> gpui-kit + gpui-pre
-veyra -> tokio (sync, rt-multi-thread, time) + serde (derive) + serde_json
-      -> tracing + tracing-subscriber + anyhow
+      -> tokio + serde + serde_json + tracing + tracing-subscriber + anyhow
 ```
 
-Only the `veyra` binary depends on gpui.
-`crates/engine/Cargo.toml` declares that boundary by omitting gpui dependencies.
-The compiler refuses an undeclared crate.
-
-## Platform ownership
-
-`crates/engine/src/platform/` owns the macOS data-folder default, socket path limit, exclusive lock call, private file and folder modes, and socket bind and connect.
-These are plain functions in `macos.rs`.
-Callers choose file-open policy through standard `OpenOptions`.
-`lock_exclusive` reports standard I/O errors, so the data-folder code owns the retry and instance-refusal policy.
-`bind_socket` removes a stale path before binding and applies mode 0600.
-The driver infers socket values and handles protocol I/O through `Read + Write`.
-The platform module owns no UI or command protocol.
-
-`mod.rs` holds the shared `Signal` enum and selects `macos.rs` only for macOS.
-Other targets stop at a `compile_error!` naming `crates/engine/src/platform/`.
-No other file calls macOS APIs directly.
-gpui owns the native window.
-Modified key bindings use gpui's `secondary-` modifier, which means Command on macOS and Control on other platforms.
-Escape remains an unmodified key.
-
-`boundary.rs` enforces the call boundary with `platform_boundary`.
-It scans every Rust file under `crates/` outside the platform folder.
-It blanks line and block comments without removing line breaks, matches `libc` as a whole word, and checks the approved platform-specific needles.
-A violation names its file, line, and matching token.
-`platform_boundary_self_test` covers grouped and aliased imports, conditional compilation, commands, comments, and a portable file-descriptor import.
-This textual check misses indirect commands, full executable paths, generic permission calls, and text after `//` inside a string.
-A `/*` inside a string literal makes the matcher treat later text as a block comment.
-Without a later `*/`, it blanks the rest of the file.
-Review still checks those cases.
-The Swift window finder and `screencapture` in verify-veyra run only on macOS.
-A port replaces those capture tools.
+Direct versions are exact pins and `Cargo.lock` is kept.
+The engine's tokio features are `sync`, `rt-multi-thread`, `time`, `macros`, `process` and `io-util`.
+Only the application crate declares gpui dependencies.
+`crates/engine/Cargo.toml` and `platform_boundary` enforce those boundaries.
 
 ## Startup and data ownership
 
-`main::run` checks arguments before creating folders or starting gpui.
-No argument opens the window.
-Debug builds route `ctl` to the client.
-All other arguments, including `mcp`, print `usage: veyra [mcp]` and exit 2.
+`main::run` handles arguments before creating folders or starting gpui.
+No argument opens the window; debug builds route `ctl` to its client.
+Other arguments, including `mcp`, print `usage: veyra [mcp]` and exit 2.
 
-`DataDir::resolve` uses `VEYRA_DATA_DIR`, or `~/Library/Application Support/Veyra` when unset.
+`DataDir::resolve` reads `VEYRA_DATA_DIR`, or uses `~/Library/Application Support/Veyra`.
 Relative overrides become absolute paths.
-It validates the longest socket path before creating the data folder, `logs/`, and `run/`.
-`platform::private_dir` sets each folder to mode 0700.
-Debug builds validate `control.sock`.
-Release builds validate `veyra.sock` but do not create a listener.
-More than 103 usable bytes is an error that names the path.
+It validates the longest socket path before creating the data folder, `logs/` and `run/` at mode 0700.
+The platform limit is 103 usable socket-path bytes.
+Debug builds validate `control.sock`; release builds validate `veyra.sock` but create no service listener.
 
-`Engine::start` calls `DataDir::lock`, opens and migrates `veyra.db`, reconciles stored work, and starts the actor.
-The engine keeps the instance lock alive on the actor's thread.
-`main` creates a multi-thread tokio runtime for session tasks and passes its handle to the engine.
-The engine does not enter that runtime on the UI thread.
-The runtime stays alive across the UI loop.
-M1 performs no process reaping.
+`Engine::start` locks the folder, opens `veyra.db` through a private 0600 file, migrates, reconciles stored work, then starts the actor on a dedicated `std::thread`.
+The actor keeps the lock file alive.
+`veyra.lock` is mode 0600 and its exclusive-lock retry lasts four seconds.
+Only the lock holder stamps its pid or removes a stale debug socket.
+A second launch refuses the folder and exits 1.
+The OS releases the lock on exit or crash.
+Startup does not signal orphan provider processes.
 
-`DataDir::lock` opens `veyra.lock` through `platform::private_file` at mode 0600 and retries `platform::lock_exclusive` for four seconds.
-That wait allows a relaunch to outlast the planned three-second Quit grace period.
-M0's Quit still exits immediately.
-Only the lock holder writes its pid or removes a stale debug socket.
-A second launch prints `Veyra is already running` and exits 1.
-The actor owns the open lock file across the UI loop.
-The OS releases its lock when the process exits or crashes.
+`main` keeps a multi-thread tokio runtime alive across the gpui loop.
+The actor enters that runtime on its own thread; the UI never enters it.
+The UI awaits runtime-agnostic tokio channels in gpui tasks and uses gpui timers.
+Readiness work is explicitly spawned on the runtime through its handle.
 
-After the engine starts, `main` opens the append-only `logs/veyra.log` through `platform::private_file` at mode 0600 and installs `tracing-subscriber` at INFO.
-M0 does not read `RUST_LOG`, so an environment filter cannot suppress readiness.
-Debug builds bind the driver through `platform::bind_socket` before opening the window.
-`Window::on_next_frame` prints the ready line to stderr and the log after the first rendered frame.
-`build.rs` embeds Git HEAD, or `unknown` without Git.
-It watches existing Git HEAD, HEAD reflog, packed refs, and the current loose branch ref.
-HEAD changes on a branch switch.
-The HEAD reflog changes on a commit even when the loose branch ref did not exist at build time.
+After engine startup, `main` opens `logs/veyra.log` privately and installs INFO tracing.
+It does not read `RUST_LOG`, so that variable cannot suppress readiness.
+The debug listener binds before the window opens.
+`Window::on_next_frame` prints `veyra ready pid=PID data_dir=DIR` to stderr and the log after the first frame.
+`build.rs` embeds Git HEAD, or `unknown` outside Git, and watches HEAD, its reflog, packed refs and the current loose ref.
+Quit enqueues engine shutdown and calls `cx.quit()` immediately; there is no graceful quit deadline yet.
+macOS termination does not promise Rust destructors, so verification explicitly cleans run-owned provider groups.
 
-## Window state and actions
+## Actor decisions, storage and recovery
 
-`Shell` owns its focus handle, sidebar width, resize gesture, and optional notice.
-The sidebar reads its default, bounds, and keyboard step from `Theme::new`.
-Both drag and keyboard resizing dispatch `SetSidebarWidth`.
-The width-reset binding dispatches `ResetSidebar`, whose handler reads the current theme default before dispatching `SetSidebarWidth`.
-There are no sidebar rows.
-The composer has no text input.
-Shell-only controls show a notice instead of creating project or provider state.
-
-Every control dispatches a gpui action.
-`ui/actions.rs` owns their key bindings and the native Quit menu.
-Both the menu and ⌘Q dispatch `Quit`, which calls `cx.quit()`.
-
-`Theme::apply` changes the kit to Dark or Light before projecting Veyra's tokens through the kit's `Theme::update`.
-The kit's hover accent stays neutral.
-Violet paints interaction roles.
-Bundled fonts register through `add_fonts`.
-`crates/veyra/assets/fonts/` holds the regular, italic, medium, and semibold Geist faces and regular Geist Mono from [Vercel's official Geist v1.7.2 release](https://github.com/vercel/geist-font/releases/tag/v1.7.2).
-The release's own `OFL.txt` licence sits beside those files.
-A window-appearance observer reapplies the full theme when macOS changes appearance.
-
-### Theme tokens
-
-`Theme::new` in `ui/theme.rs` owns the window, sidebar, header, composer, transcript, type, spacing, radius, and motion numbers.
-A window manager can override the initial outer bounds.
-The shell does not render a transcript or drawer.
-The theme has no drawer tokens.
-The sidebar, header, native traffic-light inset, structural borders, button geometry, and button labels read theme values rather than owning pixel literals.
-Button labels are styled children with explicit accessibility names, so the kit's default label size does not override Veyra's type role.
-
-`Theme::new` is the source of truth for type roles, spacing, radii, and motion tokens.
-Type roles share a 16 px rem base with the kit.
-M0 stores motion tokens but does not animate its shell.
-The dark surface order is terminal, background, shell, card, overlay, and raised.
-The violet accent and selection colours are the human's named exception in `AGENTS.md`.
-
-## Debug protocol and trust boundary
-
-The whole `control` module and its argument branch exist only under `cfg(debug_assertions)`.
-The socket sits at `DATA/control.sock` with mode 0600 inside the private data folder.
-This restricts it to the current user.
-There is no additional authentication against processes running as that user.
-
-The client connects through `platform::connect_socket` and sends one JSON line containing a tagged `Command`.
-The server limits each line to 65536 bytes.
-One socket thread serves connections serially, including command reading and the UI-reply wait.
-Socket timeouts bound individual blocking I/O waits to two seconds, not the whole line-read duration.
-A same-user client that keeps sending bytes within that timeout blocks later clients until its line completes or exceeds the byte limit.
-UI replies have a separate two-second timeout.
-A bounded tokio channel holds at most 16 requests.
-A full or closed queue rejects the request before enqueueing it.
-A reply timeout does not cancel an enqueued request.
-Its action can still execute later, so inspect the window state before retrying.
-The socket thread performs no gpui work.
-One `cx.spawn_in` task receives each request and uses the window's action builder and key dispatch.
-
-`action` accepts an action name and optional JSON data.
-`keys` parses all keystrokes before dispatch.
-`text` returns an error naming the M0 composer shell.
-`dump` reports the process pid, embedded build revision, data folder, theme appearance, entity sidebar width, current notice, and migrated `schema_version`.
-The driver adds `schema_version` from the engine started in `main`, without opening another database connection.
-In M0, `view` is fixed to `new_thread`, `sidebar.rows` to `[]`, and `composer_text` to an empty string.
-Those fixed fields do not prove rendered state.
-`quit` dispatches the same `Quit` action as the menu.
-The client prints each reply and exits 1 for a driver error.
-
-The ready line and driver are development checks, not external service APIs.
-A stale socket can remain after quit because macOS termination does not promise Rust destructors.
-The next lock holder removes it.
-Verification cleanup stops its own process before deleting its scratch folder.
-
-## Engine actor and provider boundary
-
-`actor::Actor` runs on its own `std::thread` and owns the SQLite connection, projection rows, live-thread map, text buffers, and event counters.
-It blocks on a tokio message receiver with a capacity of 256.
-A tokio timer sends `Tick` every five seconds.
-Streaming text schedules separate flush and write messages.
+`Actor` owns the SQLite connection, projection rows, live-thread map, item-key map, text buffers and per-thread event counters.
+It receives typed messages through a 256-slot tokio channel.
+A timer sends Tick every five seconds; text uses separate flush and write messages.
 The actor never waits for provider I/O.
-The UI-facing Engine handle sends typed commands and returns oneshot acknowledgements.
-Once enqueued, a subscription begins with the stored `SettingsChanged` row on an unbounded receiver.
-An enqueued snapshot request returns stored items, unpersisted text, and the thread's event counter.
-If that thread has text awaiting UI delivery, its reply waits for the scheduled text flush, without blocking the actor.
-The snapshot counter then includes that text prefix.
-The subscription does not filter overlapping events for a snapshot consumer.
-A consumer must enqueue its subscription before requesting the snapshot and retain arriving events while the snapshot waits.
-It installs the stored items plus buffered text, then applies only events for that thread with counters above the snapshot counter.
-It handles settings events and storage-blocked notifications separately because those carry no thread counter.
-`snapshot_joins_buffer_without_duplicate_text` checks this join rule.
-A full or closed actor queue returns `Busy` for a command, closes a subscription without an initial event, and cancels a snapshot reply.
-The current shell does not subscribe to engine events or send conversation commands.
 
-`commands::decide` reads the projection and live state and returns a `ChangeSet` of changed rows, events, runtime replacements, and effects.
-The actor completes buffered text for ended turns and finalizes summaries only for tasks newly settled in that decision.
-A settled summary remains unchanged when its delivery changes.
-Start effects name their turns until the actor builds their controls from those completed rows.
-The actor then opens one transaction, calls `store::apply`, and commits.
-Only then does it install runtime changes, publish numbered change events, and run effects.
-Thread-scoped changes and text appends each advance that thread's counter.
-Text deltas coalesce per item, normally flushing at most once per 16 ms.
-Requests and completion events flush pending text immediately.
-Open item text writes every two seconds and when its turn ends.
-A command write failure returns `CommandError` without publishing its decision.
-A provider or terminal write failure retains the failed changes, interrupts live sessions, refuses commands, and publishes `StorageBlocked`.
-Each Tick retries that write before draining deferred process events.
+`commands::decide` reads rows and runtime state, then produces a `ChangeSet` of row changes, events and effects.
+Projection indexes identify each thread's turn and item ids; command overlays read those keyed rows rather than scanning every stored turn or item.
+The actor completes buffered text for ended turns and finalizes newly settled task summaries before opening one transaction.
+It calls `store::apply`, commits, installs the changed rows/runtime, publishes numbered events, then dispatches effects.
+Row-bearing events resolve from the final changed rows rather than being patched individually.
+StartTurn effects name the turn until install builds its text from committed items and dispatches its control.
 
-`LiveThread` keeps its epoch outside the `Live` variants.
-A spawn increments the epoch, and stale session events do not apply.
-Turn events must also match the running turn.
-Uncorrelated start or content events create a Provider turn only when no turn runs.
-Further uncorrelated content joins that Provider turn.
-Idle structured sessions park after ten minutes without a running turn, pending request, or background work.
-Hold and wait reasons are typed.
-Stop and Archive decide children first in one transaction.
-Continue can discard queued user turns while retaining task and wake turns.
+Text coalesces per item, normally flushing to the UI at most once per 16 ms.
+Requests, item completion and turn completion flush pending UI text immediately.
+Unpersisted text writes every two seconds and at item/turn completion.
+Completed items and ended turns free their item keys and text buffers.
+A command write failure returns an error without publishing the decision.
+A provider write failure retains changes, interrupts live sessions, refuses commands and publishes StorageBlocked; Tick retries before draining deferred process events.
+Full and closed command queues are distinct errors; Busy carries a typed WaitReason and a closed request is distinct from either.
+The UI shows command and acknowledgement failures as notices.
 
-`provider` exposes normalized session and turn events, control channels, and terminal-handle types.
-It does not expose CLI wire data to the actor.
-`ProviderKind::spawn` returns `NotBuilt` for all three providers.
-`Spawner::Scripted` exists only in tests and starts no OS process.
-Agent tool calls return a not-built result in M1.
-There is no real CLI, PTY, interrupt ladder, or keep-awake guard yet.
+`LiveThread` owns an epoch outside its runtime variants, capabilities and the background-work flag.
+Starting has no session handle until spawn returns one.
+Live state is derived from the runtime variant, running turn and background-work flag.
+Spawn increments the epoch; stale session events are ignored.
+Turn events must also match the running turn, unless uncorrelated content starts or joins a Provider-origin turn.
+Idle structured sessions park after ten minutes without a running turn, pending request or background work.
+The existing engine supports holds, queue reasons, cascaded Stop/Archive, wake delivery and task settlement, but those controls/cards have no M2 UI.
 
-## SQLite projection and recovery
+`store::MIGRATIONS` owns schema 1, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
+Migrations use `PRAGMA user_version` in transactions and refuse newer schemas.
+The eight tables are projects, threads, turns, items, requests, grants, tasks and settings.
+User text lives once in an item referenced by its turn.
+An ended turn carries both its optional start time and end time, including after load; there is no separate start-time map.
+`store::apply` writes both live pid and group on Ready, clears both when parked, and preserves the first archive time on later archived writes.
+Derived statuses and live state are not persisted as an event log.
 
-`store::MIGRATIONS` owns schema 1.
-The database uses WAL, `synchronous=NORMAL`, foreign keys, and a two-second busy timeout.
-`Engine::start` creates the database file through `platform::private_file` at mode 0600.
-Migrations run by `PRAGMA user_version` in transactions and refuse a newer schema.
-Times in the projection are unix milliseconds.
-The eight tables are `projects`, `threads`, `turns`, `items`, `requests`, `grants`, `tasks`, and `settings`.
-Rows are the source of truth.
-Change events, live states, derived statuses, and wait reasons are not stored as an event log.
-User text lives once in an item, referenced by its turn.
-`store::apply` also owns live pid writes and leaves `live_pgid` null until a process group exists.
-An archived thread's later archived writes preserve its first `archived_at`.
-`ChangeSet` reads items, requests, tasks and turns through one pending-row overlay.
-Wake queueing and hold updates share command helpers with recovery.
-The shared turn-ending path replaces unaccepted wakes for provider events and user commands.
-Archived parents retain queued reports and never restart through Continue.
+Lineage CHECKs and the parent/root foreign key refuse grandchildren and inconsistent roots.
+The hold CHECK allows only the typed hold reasons or null.
+The singleton settings row starts in Full access and constrains the three modes.
+Thread configuration remains in `config_json`; a default-mode change never rewrites existing threads.
 
-A root thread stores its own id as `root_thread_id`.
-Two lineage CHECKs and the composite parent/root foreign key refuse grandchildren, roots naming another root, and child-under-child updates.
-The hold CHECK permits only the four HoldReason values or null.
-The singleton settings row starts in `full_access` and constrains the three permission modes.
-Thread modes remain in typed `config_json` and do not change when the default changes.
+`reconcile::decide` runs once, transactionally, before commands are accepted.
+It interrupts stored running turns, expires requests and holds affected queues as Restarted without replacing an earlier hold.
+It replaces an already-started unaccepted wake, preserves an unstarted wake, and leaves running child tasks open.
+Terminal view returns to Chat with import_pending.
+No provider work restarts automatically and Veyra writes no user CLI configuration.
 
-`reconcile::decide` runs once in one transaction before commands are accepted.
-Running turns become interrupted, pending requests expire, and affected queues hold as Restarted without replacing an earlier hold reason.
-Running child tasks stay open.
-An unaccepted wake that already started gets a replacement queued wake.
-A wake that never started keeps its id.
-Terminal view returns to Chat with `import_pending`.
-No provider work restarts automatically.
-M1 clears no orphan process by signal and writes no CLI configuration.
+## Claude process boundary
+
+`provider/mod.rs` exposes typed controls and normalized events to the actor, not Claude wire types.
+`ProviderKind::spawn` dispatches Claude to `session`; Codex, Grok and terminal spawn return NotBuilt.
+Scripted sessions exist only in engine tests and start no OS process.
+
+`ChildEnv` shares one login-shell PATH snapshot, with inherited PATH as fallback.
+Engine::start initializes it on the startup caller before launching the actor, so session dispatch never runs a blocking login shell on the actor.
+Resolution tries inherited PATH, that snapshot, then `KNOWN_BIN_DIRS`; executable checks and process-group mechanics are platform functions.
+Every owned child has piped stdio, `kill_on_drop(true)`, its own process group and `VEYRA_PARENT_PID` naming the application.
+It strips CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SSE_PORT, CLAUDE_AGENT_SDK_VERSION and every inherited VEYRA_* variable before adding its own marker and optional replay fixture.
+Veyra inherits the user's hooks/MCP configuration and never edits it.
+The new-thread hint names that behavior.
+
+One session task owns the child and a process-group guard.
+Its select loop reads stdout lines, controls, output-channel closure and stdin-writer completion.
+A dedicated task writes stdin, so a blocked pipe does not block the control loop.
+The stderr task retains eight lines, each redacted and cut to 500 characters.
+On an unfinished turn's stdout close, the task waits up to 500 ms for stderr, emits Failed with Veyra's crash text and tail, then Exited.
+The group guard sends SIGKILL when the session task drops, not just to the leader.
+A supervisor awaits its join handle and emits Exited with redacted panic text on failure.
+The actor stores pid and group on Ready and parks on Exited.
+
+`claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, tool ids and background-work replacement.
+It uses tolerant serde defaults and unknown variants, logs unknown notifications and refuses unsupported control requests with an error reply rather than approving them.
+The first spawn uses a Veyra UUID with --session-id; later spawns use --resume.
+Mode maps to default, acceptEdits or bypassPermissions plus --allow-dangerously-skip-permissions.
+Each prompt has its own UUID.
+A matched initialize reply makes the process ready to accept that first prompt; system/init later supplies the native id, CLI version and capabilities.
+This avoids waiting for system/init before sending the prompt that causes Claude to emit it.
+
+Replayed user frames and matching command_lifecycle frames acknowledge prompts.
+Explicit result UUID echoes decide ownership.
+Without an echo, a non-human-origin result is foreign only once echo mode is known or a lifecycle acknowledgement has arrived; unknown mode assigns the first result to Veyra's one pending prompt.
+Result errors, stop reasons and terminal reasons decide the outcome, not subtype alone.
+Aborted terminal reasons become Interrupted; incomplete/error reasons become Failed.
+Content-block deltas and final assistant messages share keys to avoid duplicated streamed text.
+Item completion is normalized separately from turn completion.
+Each background_tasks_changed replaces the pending-work set, excluding ambient tasks.
+Every new process starts with no background work pending.
+Only the specific resume-not-found stderr class starts a fresh native session and adds a notice; other errors retain the native id for Retry.
+
+## Readiness, fixtures and recording
+
+Startup, Check again and Retry probe all providers on the runtime.
+Claude resolves its path, reads its version, launches stream-json with no session flag, sends initialize and matches the request_id without a turn.
+It reads models and optional account, then kills and waits for the probe process.
+A missing binary is Not installed.
+No signed-out signal has been captured: missing/empty account or another inconclusive probe error stays Ready, with the failed-thread view as fallback.
+Codex and Grok are always Ready placeholders and run no probe command.
+The Shell holds raw probe account metadata in memory but omits it from dump.
+
+`fixture.rs` defines Veyra's transcript_start, expect_outbound, emit_inbound and exit records.
+Headers name provider, protocol, CLI version, scenario and source.
+The matcher compares JSON exactly except <any>, <cwd> and first-use <id:name> bindings.
+emit_inbound supports after_ms; replies expand the same bindings.
+`veyra-fake-cli` consumes one fixture and exits 3 with expected/actual diagnostics on mismatch.
+Capture-derived fixtures come from Veyra's P3 and M2 captures; other cases are Veyra's scripted wires.
+
+Debug `ChildEnv::load` is the only application read site for VEYRA_CLAUDE_BIN, VEYRA_FAKE_FIXTURES and VEYRA_RECORD.
+The override replaces Claude's binary.
+The engine registers new threads in creation order for a run; each thread's spawn E uses tN-sE.jsonl, with probe.jsonl for probes.
+Stored threads register when first spawned in that run.
+Missing replay files fail spawn with their path; the child gets the absolute singular VEYRA_FAKE_FIXTURE only in debug builds.
+The standalone fake executable reads that singular variable.
+
+The debug Recorder creates private 0600 captures through platform::private_file.
+It binds cwd, known ids and the session token, replaces credential fields, redacts secret-shaped text and replaces account metadata with a placeholder.
+It records inbound/outbound wires and exit, updating the header's CLI version from system/init.
+The shared crash redactor applies exact token, Bearer word, credential-name value, long sk-/xai- word and URL password matches in that order.
+The session has no MCP token in this phase.
+Recorder and override read sites are compile-time debug-only; release string checks prove their exclusion from the application binary.
+
+## Window projection, transcript and Settings
+
+`Shell` owns Engine/Handle, AppState, focus, sidebar width/gesture, selected project/thread, view, draft configuration, probes, textarea, scroller, expanded rows, branch and notice.
+It subscribes before requesting snapshots.
+The subscription starts with SettingsChanged, projects, threads and turn rows; initial thread rows advance that thread's counter.
+The gpui pump drains every queued event into one entity update, applies it and notifies once.
+AppState counts applied batches and the largest measured gap between text-bearing batches.
+A theme-cadence task refreshes elapsed Working time without a tokio timer on the UI thread.
+
+Opening a transcript requests an actor snapshot, never SQLite from the UI.
+While it is pending, AppState fences that thread's item events, retaining them and updating global thread metadata.
+It installs stored items plus buffered text and replays only item events above the snapshot counter.
+Later stale transcript events are ignored, but metadata stays on the ordered event stream: an items-only snapshot does not carry native-id, turn or live-state rows and cannot fence those updates.
+This joins the item snapshot and event stream without duplicated or missing text.
+
+The sidebar reads projects and thread statuses, and all resizing paths dispatch SetSidebarWidth.
+The header reads title, status/elapsed time, project and a background Git branch lookup.
+The centred transcript uses MessageScroller and selectable Markdown TextView for assistant text, a still stream caret, collapsed reasoning/tools and notices.
+Tool output is bounded to its last 10,000 characters by the actor.
+The failed view shows the cause, next step, Retry and Open Terminal on the project folder.
+Retry probes again, clears a stopped hold when necessary and sends the prior prompt as a new turn.
+
+The composer uses TextareaState and provider/model/effort/permission chips.
+Not-ready providers disable Send with their repair command.
+CreateThread sends the draft configuration; subsequent Send targets the selected thread.
+Enter submits, Shift+Enter inserts a newline, and the textarea propagates Command+Enter to the bound Send action without a second subscription send.
+New thread resets text and reads the current stored default.
+Settings occupies the main column, opens through OpenSettings/Menu/Command-comma and exposes one three-mode row.
+SetDefaultMode publishes SettingsChanged; Escape or thread/project selection leaves Settings.
+
+`ui/actions.rs` owns actions, keys and the native menu.
+The Theme global owns all colours, geometry, type, radii and motion tokens.
+Theme::apply projects them through the kit and follows macOS appearance.
+Violet is restricted to interaction roles; selected controls and hover remain neutral.
+Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
+Traffic-light position is a point.
+The requested window is 1280 by 800 with a 760 by 560 minimum; a window manager can override it.
+
+## Debug protocol and verification trust
+
+The control module, ctl argument, socket references and UI dump/input methods exist only under cfg(debug_assertions).
+The driver uses DATA/control.sock at mode 0600 inside the private directory.
+It trusts same-user clients and has no additional authentication.
+One socket thread serves tagged JSON-line commands serially; a gpui task dispatches through the window.
+Action dispatch is deferred by gpui; its reply acknowledges dispatch, and verification polls the resulting window state.
+Lines are limited to 65536 bytes, socket reads/writes and UI-reply waits to two seconds, and the request queue to 16.
+An incremental same-user sender can keep a line read occupied inside the per-read timeout.
+A full queue rejects before enqueueing; a reply timeout does not cancel an action already queued.
+
+Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler, and quit dispatches Quit.
+Dump reads live identity, theme, view, sidebar/status rows, selected native id/configuration/failure, items, composer, readiness, settings and pump counters.
+The driver adds the engine's schema_version without opening the database.
+Wait is client-only: it polls dump every 50 ms, for 30 seconds by default, and exits 0 for status, 1 for timeout, 2 for bad usage and 3 for a missing/archived thread.
+No wait server command exists.
+
+verify-veyra launches only its isolated fake lane by default and keeps proof outside scratch.
+Cleanup first reads live_pgid, stops only run-owned groups/pids, checks live effective-user markers through Darwin sysctl without printing arguments, then removes scratch.
+The fake lane cannot create privileged processes; inaccessible root-effective processes are outside that marker scan.
+Release proof uses a disposable HOME and restricted PATH to avoid running an unauthorized live Claude probe.
+The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals and Terminal opening.
+Its selection rejects unsupported targets with compile_error.
+The textual platform_boundary test is a guard, not proof against every indirect OS call; review still checks indirect commands and strings.
 
 ## Source map
 
-- [Data folder and lock](crates/engine/src/data_dir.rs) owns path validation, pid stamping, and launch exclusion.
-- [Platform selection](crates/engine/src/platform/mod.rs) selects macOS, rejects other targets, and holds `Signal`.
-- [macOS mechanisms](crates/engine/src/platform/macos.rs) owns permissions, file locking, and socket operations.
-- [Platform boundary tests](crates/engine/src/platform/boundary.rs) checks Rust files and its own matcher.
-- [Entry point](crates/veyra/src/main.rs) owns argument routing, runtime lifetime, engine startup, and logging.
-- [Engine handle](crates/engine/src/lib.rs) owns startup, channels, subscription and snapshot entry points.
-- [Actor](crates/engine/src/actor.rs) owns the connection, commit/publish order, stream buffers, epochs and storage retry.
-- [Commands](crates/engine/src/commands.rs) owns command decisions, start-rule checks, cascades and task settlement.
-- [Domain](crates/engine/src/domain.rs) owns typed rows, lineage, permission modes and derived statuses.
-- [Live state](crates/engine/src/live.rs) owns runtime variants, start eligibility and parking.
-- [Store](crates/engine/src/store.rs) owns pragmas, migration 1 and typed projection persistence.
-- [Recovery](crates/engine/src/reconcile.rs) owns idempotent startup decisions.
-- [Events](crates/engine/src/events.rs) owns row changes, effects, change events and snapshot data.
-- [Provider boundary](crates/engine/src/provider/mod.rs) owns normalized controls and events.
-- [Engine tests](crates/engine/src/tests/mod.rs) owns fixtures, table cells, recovery, storage, session events and the ignored perf probe.
-- [Verification coverage](crates/veyra/src/verify_map.rs) checks source names against the feature map.
-- [Build identity](crates/veyra/build.rs) embeds Git HEAD.
-- [Window](crates/veyra/src/ui/mod.rs) owns shell state and the ready callback.
-- [Actions](crates/veyra/src/ui/actions.rs) owns keys and the native menu.
-- [Theme](crates/veyra/src/ui/theme.rs) owns all token groups and font registration.
-- [Driver](crates/veyra/src/control.rs) owns the debug socket protocol.
-- [Verification skill](.agents/skills/verify-veyra/SKILL.md) drives the real window and preserves proof.
+- [Entry and runtime](crates/veyra/src/main.rs), [engine handle](crates/engine/src/lib.rs), [data folder](crates/engine/src/data_dir.rs).
+- [Actor](crates/engine/src/actor.rs), [decisions](crates/engine/src/commands.rs), [domain/indexes](crates/engine/src/domain.rs), [live variants](crates/engine/src/live.rs).
+- [Storage/schema](crates/engine/src/store.rs), [recovery](crates/engine/src/reconcile.rs), [events/snapshots](crates/engine/src/events.rs).
+- [Provider boundary](crates/engine/src/provider/mod.rs), [environment](crates/engine/src/provider/env.rs), [sessions/probes](crates/engine/src/provider/session.rs), [Claude codec](crates/engine/src/provider/claude.rs).
+- [Fixture format](crates/engine/src/fixture.rs), [fake CLI](crates/engine/src/bin/veyra-fake-cli.rs), [recording/redaction](crates/engine/src/record.rs).
+- [Window/pump/fence](crates/veyra/src/ui/mod.rs), [transcript](crates/veyra/src/ui/transcript.rs), [composer](crates/veyra/src/ui/composer.rs), [Settings](crates/veyra/src/ui/settings.rs), [actions](crates/veyra/src/ui/actions.rs), [theme](crates/veyra/src/ui/theme.rs).
+- [Platform mechanisms](crates/engine/src/platform/macos.rs), [selection](crates/engine/src/platform/mod.rs), [boundary guard](crates/engine/src/platform/boundary.rs).
+- [Driver](crates/veyra/src/control.rs), [name coverage](crates/veyra/src/verify_map.rs), [verification skill](.agents/skills/verify-veyra/SKILL.md).
 
 ## Verification
 
-`cargo test --workspace` checks `socket_path_limit`, `lock_refuses_second`, private folder, lock-file, and socket modes, stale-socket removal, protocol parsing, `theme_contrast`, `platform_boundary`, and `platform_boundary_self_test`.
-The checked-in `theme_contrast` pair list is the coverage source of truth.
-It checks both appearances with a 4.5 text floor and a 3.0 accent, status, and dim-terminal-colour floor.
-`cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` check the code.
-The `app-launch` feature recipe checks the ready line, driver identity, window, log, instance refusal, actions, migrated database, quit and crash relaunches, and cleanup.
-The engine's 66 `table_` tests cover the command-by-state cells.
-Named session, recovery, storage, lineage, permission, hold and setting tests exercise committed rows and controls.
-`verify_map_names` requires each action, driver verb and top-level dump key in the map.
-The ignored release `perf_decide_commit` runs 10,000 Send commands on a file-backed database with production pragmas and writes raw samples under `target/`.
-The independent architecture review is required before this document counts as approved.
-The [release check in app-launch](.agents/skills/verify-veyra/features/app-launch.md#release-check) verifies that `ctl dump` exits 2, the running release instance creates no `control.sock`, and its binary contains no driver socket name.
-It uses the debug binary as a positive control for the string scan.
-Native keyboard delivery, IME, pointer dragging, and a manual macOS appearance switch need a human check.
-The debug driver does not prove those OS paths.
+Workspace tests cover private paths/modes, launch locking, platform_boundary, all 66 table_ command cells, recovery/storage/session behavior and theme contrast.
+The eleven replay_claude tests use the real session task with the fake CLI for text/tools, correlation, resume, crash/error, background replacement and readiness.
+record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
+crash_text_bounds_and_redacts, claude_args_per_mode, terminal_reason_overrides_success_subtype, snapshot_fence_applies_only_newer_events, snapshot_fence_keeps_metadata_not_carried_by_snapshot, ctl_wait_exit_codes and verify_map_names guard the new boundaries.
+Clippy with -D warnings and cargo fmt --check check source quality.
+The four verify-veyra pages prove the real window, launch/relaunch row preservation, readiness without threads, Working-to-Done streaming, failure/Retry, default-mode persistence and cleanup.
+The release page scans driver/override strings with a debug positive control and runs a socket-free release window.
+The ignored live test requires fresh human consent; it is not a workspace-test live invocation.
+No live background-task signal or signed-out account shape was captured.
+Permission/approval behavior, Stop/interrupt continuation, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.

@@ -1,6 +1,6 @@
 use gpui_kit::component::{Theme as KitTheme, ThemeMode};
 use gpui_kit::{
-    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Rems, SharedString, Size, Window,
+    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Point, Rems, SharedString, Size, Window,
     WindowAppearance, point, px, rems, rgb, rgba, size,
 };
 use std::{borrow::Cow, time::Duration};
@@ -195,7 +195,7 @@ pub struct Layout {
     pub sidebar_default: Pixels,
     pub sidebar_max: Pixels,
     pub sidebar_step: Pixels,
-    pub traffic_lights: Size<Pixels>,
+    pub traffic_lights: Point<Pixels>,
     pub border: Pixels,
     pub project_row: Pixels,
     pub thread_row: Pixels,
@@ -349,7 +349,7 @@ impl Theme {
                 sidebar_default: px(240.),
                 sidebar_max: px(448.),
                 sidebar_step: px(16.),
-                traffic_lights: size(px(16.), px(16.)),
+                traffic_lights: point(px(16.), px(16.)),
                 border: px(1.),
                 project_row: px(28.),
                 thread_row: px(32.),

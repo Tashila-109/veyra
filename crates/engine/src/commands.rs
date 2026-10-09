@@ -2,7 +2,7 @@ use crate::{
     domain::*,
     events::{ChangeEvent as Ev, ChangeSet, Effect},
     live::{AfterStop, Live, LiveThread, can_start, park_due},
-    provider::{ProviderKind, SessionControl, SessionHandle},
+    provider::{ProviderKind, SessionControl},
     store::StoreError,
 };
 use std::{collections::BTreeMap, path::PathBuf};
@@ -61,8 +61,12 @@ pub enum Ack {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
-    #[error("{0} is busy; wait for the turn to end or press Stop")]
-    Busy(String),
+    #[error("{0}")]
+    Busy(WaitReason),
+    #[error("This request is no longer pending")]
+    RequestClosed,
+    #[error("The engine command queue is full; try again")]
+    QueueFull,
     #[error("{0} was not found")]
     NotFound(String),
     #[error("{0}")]
@@ -288,7 +292,7 @@ fn interrupt(
             end_running(p, c, thread, "Interrupted by you", now);
             control(c, thread, SessionControl::Interrupt);
         }
-        Live::Terminal { .. } => return Err(CommandError::Busy("terminal view".into())),
+        Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
         Live::Parked | Live::Structured { .. } | Live::Stopping { .. } => {}
     }
     set_hold(p, c, thread, Some(HoldReason::Interrupted));
@@ -307,8 +311,8 @@ fn respond(
         .ok_or_else(|| CommandError::NotFound(format!("request {request}")))?;
     let thread = r.thread;
     match &l[&thread].live {
-        Live::Parked => return Err(CommandError::Busy("parked thread".into())),
-        Live::Starting { .. } => return Err(CommandError::Busy("starting thread".into())),
+        Live::Parked => return Err(CommandError::RequestClosed),
+        Live::Starting { .. } => return Err(CommandError::Busy(WaitReason::Starting)),
         Live::Structured { .. }
             if c.view(p, l, thread).unwrap().running.map(|t| t.id) == Some(r.turn)
                 && r.state == RequestState::Pending =>
@@ -349,10 +353,10 @@ fn respond(
             );
         }
         Live::Structured { .. } => {
-            return Err(CommandError::Busy("request is no longer pending".into()));
+            return Err(CommandError::RequestClosed);
         }
-        Live::Terminal { .. } => return Err(CommandError::Busy("terminal view".into())),
-        Live::Stopping { .. } => return Err(CommandError::Busy("stopping thread".into())),
+        Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
+        Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
     }
     Ok(())
 }
@@ -365,20 +369,20 @@ fn configure(
 ) -> Result<(), CommandError> {
     let mut t = get_thread(p, thread)?.clone();
     if l[&thread].background_work {
-        return Err(CommandError::Busy("background work".into()));
+        return Err(CommandError::Busy(WaitReason::BackgroundWork));
     }
     match &l[&thread].live {
         Live::Parked => {}
-        Live::Starting { .. } => return Err(CommandError::Busy("starting thread".into())),
+        Live::Starting { .. } => return Err(CommandError::Busy(WaitReason::Starting)),
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
-            return Err(CommandError::Busy("running thread".into()));
+            return Err(CommandError::Busy(WaitReason::TurnRunning));
         }
         Live::Structured { .. } => {
             control(c, thread, SessionControl::Shutdown);
             stopping(l, c, thread, AfterStop::Park);
         }
-        Live::Terminal { .. } => return Err(CommandError::Busy("terminal view".into())),
-        Live::Stopping { .. } => return Err(CommandError::Busy("stopping thread".into())),
+        Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
+        Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
     }
     t.config = config.clone();
     c.threads.insert(thread, t);
@@ -416,7 +420,7 @@ fn switch_view(
 ) -> Result<(), CommandError> {
     let mut t = get_thread(p, thread)?.clone();
     if l[&thread].background_work {
-        return Err(CommandError::Busy("background work".into()));
+        return Err(CommandError::Busy(WaitReason::BackgroundWork));
     }
     match &l[&thread].live {
         Live::Parked if to == View::Terminal => {
@@ -425,9 +429,9 @@ fn switch_view(
             c.live.insert(thread, live);
             c.effects.push(Effect::OpenTerminal { thread });
         }
-        Live::Starting { .. } => return Err(CommandError::Busy("starting thread".into())),
+        Live::Starting { .. } => return Err(CommandError::Busy(WaitReason::Starting)),
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
-            return Err(CommandError::Busy("running thread".into()));
+            return Err(CommandError::Busy(WaitReason::TurnRunning));
         }
         Live::Structured { .. } if to == View::Terminal => {
             control(c, thread, SessionControl::Shutdown);
@@ -438,7 +442,7 @@ fn switch_view(
             stopping(l, c, thread, AfterStop::StartStructured { import: true });
             t.import_pending = true;
         }
-        Live::Stopping { .. } => return Err(CommandError::Busy("stopping thread".into())),
+        Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
         Live::Parked | Live::Structured { .. } | Live::Terminal { .. } => {}
     }
     t.view = to;
@@ -596,10 +600,6 @@ pub fn stopping(
     let mut live = c.live(l, thread).clone();
     live.live = Live::Stopping { then };
     c.live.insert(thread, live);
-    c.events.push(Ev::ThreadLiveChanged {
-        thread,
-        state: crate::live::LiveState::Stopping,
-    });
 }
 pub fn expire_requests(p: &Projection, c: &mut ChangeSet, turn: TurnId, reason: &str) {
     let thread = c
@@ -629,7 +629,11 @@ pub fn end_turn(
     now: Millis,
 ) {
     expire_requests(p, c, turn.id, "The turn ended");
-    turn.state = TurnState::Ended { outcome, at: now };
+    turn.state = TurnState::Ended {
+        outcome,
+        started: turn.state.started(),
+        at: now,
+    };
     c.events.push(Ev::TurnEnded(turn.clone()));
     let ended = turn.id;
     c.turns.insert(ended, turn);
@@ -717,15 +721,9 @@ pub fn start_changed(
 pub fn spawn(l: &BTreeMap<ThreadId, LiveThread>, c: &mut ChangeSet, id: ThreadId, import: bool) {
     let mut live = c.live(l, id).clone();
     live.epoch += 1;
-    let (control, _) = tokio::sync::mpsc::unbounded_channel();
-    live.live = Live::Starting {
-        session: SessionHandle { control },
-    };
+    live.live = Live::Starting { session: None };
+    live.background_work = false;
     c.live.insert(id, live);
-    c.events.push(Ev::ThreadLiveChanged {
-        thread: id,
-        state: crate::live::LiveState::Starting,
-    });
     c.effects.push(Effect::Spawn { thread: id, import });
 }
 pub fn turn_text(p: &Projection, c: &ChangeSet, turn: &Turn) -> String {

@@ -31,6 +31,8 @@ impl Scripted {
                         native: NativeSessionId(format!("script-{}", spec.thread)),
                         cli_version: "scripted".into(),
                         pid: 1,
+                        pgid: 1,
+                        capabilities: vec![],
                     })))
                     .await;
             }

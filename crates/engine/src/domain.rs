@@ -1,6 +1,9 @@
 use crate::{live::LiveThread, provider::ProviderKind};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 use uuid::Uuid;
 
 pub type Millis = i64;
@@ -115,8 +118,14 @@ pub enum TurnOrigin {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnState {
     Queued,
-    Running { since: Millis },
-    Ended { outcome: TurnOutcome, at: Millis },
+    Running {
+        since: Millis,
+    },
+    Ended {
+        outcome: TurnOutcome,
+        started: Option<Millis>,
+        at: Millis,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnOutcome {
@@ -260,12 +269,52 @@ impl Default for Settings {
 pub struct Projection {
     pub projects: BTreeMap<ProjectId, Project>,
     pub threads: BTreeMap<ThreadId, Thread>,
-    pub turn_started: BTreeMap<TurnId, Millis>,
+    pub turn_ids: BTreeMap<ThreadId, BTreeSet<TurnId>>,
+    pub item_ids: BTreeMap<ThreadId, BTreeSet<ItemId>>,
     pub turns: BTreeMap<TurnId, Turn>,
     pub items: BTreeMap<ItemId, Item>,
     pub requests: BTreeMap<RequestId, Request>,
     pub tasks: BTreeMap<TaskId, Task>,
     pub settings: Settings,
+}
+impl Projection {
+    pub fn insert_turn(&mut self, turn: Turn) {
+        self.turn_ids
+            .entry(turn.thread)
+            .or_default()
+            .insert(turn.id);
+        self.turns.insert(turn.id, turn);
+    }
+    pub fn insert_item(&mut self, item: Item) {
+        self.item_ids
+            .entry(item.thread)
+            .or_default()
+            .insert(item.id);
+        self.items.insert(item.id, item);
+    }
+    pub fn turns_for(&self, thread: ThreadId) -> impl Iterator<Item = &Turn> {
+        self.turn_ids
+            .get(&thread)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.turns.get(id))
+    }
+    pub fn items_for(&self, thread: ThreadId) -> impl Iterator<Item = &Item> {
+        self.item_ids
+            .get(&thread)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.items.get(id))
+    }
+}
+impl TurnState {
+    pub fn started(&self) -> Option<Millis> {
+        match self {
+            Self::Queued => None,
+            Self::Running { since } => Some(*since),
+            Self::Ended { started, .. } => *started,
+        }
+    }
 }
 pub struct ThreadView<'a> {
     pub thread: &'a Thread,
@@ -274,7 +323,6 @@ pub struct ThreadView<'a> {
     pub queued: bool,
     pub pending_request: bool,
     pub last: Option<&'a Turn>,
-    pub last_started: Option<Millis>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -333,11 +381,9 @@ pub fn thread_status(v: &ThreadView<'_>) -> Status {
         Some(TurnState::Ended {
             outcome: TurnOutcome::Completed,
             at,
+            started,
         }) => Status::Done {
-            took: v
-                .last_started
-                .map(|start| at.saturating_sub(start))
-                .unwrap_or(0),
+            took: started.map(|start| at.saturating_sub(start)).unwrap_or(0),
         },
         _ => Status::Idle,
     }

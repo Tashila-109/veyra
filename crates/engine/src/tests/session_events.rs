@@ -2,6 +2,55 @@ use super::*;
 use crate::events::ChangeEvent as Ev;
 
 #[test]
+fn completed_items_and_ended_turns_free_streaming_entries() {
+    let mut f = Fixture::new(LiveState::Running);
+    let turn = f.running().unwrap();
+    let key = NativeItemKey("first-text".into());
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::TextDelta {
+            key: key.clone(),
+            text: "first".into(),
+        },
+    ));
+    assert_eq!(f.actor.streaming_entries(), (1, 1));
+    f.event(turn_event(Some(turn), TurnEvent::ItemEnded { key }));
+    assert_eq!(f.actor.streaming_entries(), (0, 0));
+    let key = NativeItemKey("unfinished-text".into());
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::TextDelta {
+            key,
+            text: "last".into(),
+        },
+    ));
+    assert_eq!(f.actor.streaming_entries(), (1, 1));
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+        },
+    ));
+    assert_eq!(f.actor.streaming_entries(), (0, 0));
+    let items = f.loaded();
+    let texts: Vec<_> = items
+        .items_for(f.thread)
+        .filter_map(|item| match &item.body {
+            ItemBody::AssistantText { text, done } => Some((text.as_str(), *done)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, [("first", true), ("last", true)]);
+    assert!(matches!(
+        items.turns[&turn].state,
+        TurnState::Ended {
+            started: Some(_),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn first_ready_starts_queued_turn() {
     let mut f = Fixture::new(LiveState::Starting);
     let turn = f.user("first prompt");
@@ -9,6 +58,8 @@ fn first_ready_starts_queued_turn() {
         native: NativeSessionId("conversation-ready".into()),
         cli_version: "test-one".into(),
         pid: 23,
+        pgid: 23,
+        capabilities: vec![],
     }));
     assert_eq!(f.running(), Some(turn));
     assert_eq!(
