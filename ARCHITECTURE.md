@@ -126,8 +126,10 @@ Idle structured sessions park after ten minutes without a running turn, pending 
 The engine supports holds, queue reasons, cascaded Stop/Archive, Interrupt, Respond, wake delivery and task settlement.
 Those controls and cards have no window UI.
 On a Starting thread, Stop, Archive and Interrupt send Interrupt and wait in Stopping for Exited.
-The Claude session only writes an interrupt request and keeps running, and the actor drops its later Ready.
-The thread stays Stopping with new turns queued and its CLI alive until the app exits; its process group can outlive Quit.
+Replacing Starting with Stopping drops the actor's only session handle.
+The Claude session sees its control channel close, often before the interrupt line reaches stdin, runs the group ladder and emits Exited, and the actor parks the thread; a Ready that arrives first is dropped.
+Stop and Archive also discard queued turns and set a Stopped hold, while Interrupt keeps them and sets an Interrupted hold; all three preserve an existing hold.
+The scripted test session ends silently on channel close, so engine tests observe only Stopping.
 Tasks cannot arise through the application because the tool server is not implemented.
 Requests cannot arise either: the Claude codec answers every control request with an error and emits no RequestOpened, and the session discards Answer controls, so Respond and NeedsYou are reachable only in scripted engine tests.
 
@@ -186,7 +188,7 @@ The crash exit code is read after SIGTERM, so a process that closed stdout while
 Exited follows group cleanup and its leader's reap, including an initialize-send failure.
 On Exited, the actor ends any remaining running turn as Failed if crash text exists, otherwise Interrupted.
 Before Ready, every exit fails the oldest queued turn with its failure or Veyra's crash text and holds the thread as Stopped, including a clean exit, an unknown status or stdout closing while the process remains alive.
-If an exit before Ready carries no failure text, the actor uses "The session exited before it was ready".
+If an exit before Ready carries no failure text, the actor uses "The session exited before it was ready"; only scripted sessions reach that fallback.
 A spawn error never starts a process and is posted back as Exited, so every Codex or Grok thread fails this way.
 After Ready, crash text with no running turn is dropped and any eligible queued turn respawns.
 At run end or task drop, each owned group receives SIGTERM before its leader is reaped.
@@ -309,7 +311,7 @@ The centred transcript uses MessageScroller and selectable Markdown TextView for
 The actor trims stored tool output to its last 10,000 characters.
 The failed view appears when the newest turn failed and shows the cause, next step, Retry and Open Terminal on the project folder.
 Retry probes again; once the thread's provider is Ready it clears any hold and resends the newest user text in the transcript as a new turn.
-If a second message was queued before Ready when the first turn failed, the thread shows Held without the failed view, and Retry resends the second message while the first prompt remains failed.
+If a second message was queued before Ready when the first turn failed, the thread shows Held without the failed view, and Retry clears the hold, so the queued second message runs and is then sent again, while the first prompt remains failed.
 Send also clears a hold when the thread has no queued turn.
 
 The composer uses TextareaState and provider/model/effort/permission chips.

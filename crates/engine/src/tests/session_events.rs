@@ -85,7 +85,7 @@ fn clean_exit_before_ready_fails_oldest_turn_without_respawning() {
 #[cfg(debug_assertions)]
 fn stdout_close_before_ready_fails_oldest_turn_without_respawning() {
     before_ready_exit(
-        "trap 'exit 0' TERM; exec 1>&-; while :; do :; done",
+        "trap 'exit 0' TERM; exec 1>&-; /bin/sleep 30 & wait",
         "claude exited unexpectedly (exit code 0)",
     );
 }

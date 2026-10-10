@@ -862,6 +862,10 @@ mod tests {
     }
     #[test]
     fn crash_text_bounds_and_redacts() {
+        assert_eq!(
+            crash_text(None, &[], None),
+            "claude exited unexpectedly (exit code unknown)"
+        );
         let token = "test-session-credential";
         let mut lines = vec![
             "discarded".into(),
