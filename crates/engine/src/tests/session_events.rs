@@ -85,18 +85,25 @@ fn clean_exit_before_ready_fails_oldest_turn_without_respawning() {
 #[cfg(debug_assertions)]
 fn stdout_close_before_ready_fails_oldest_turn_without_respawning() {
     before_ready_exit(
-        "exec 1>&-; /bin/sleep 30",
-        "claude exited unexpectedly (exit code unknown)",
+        "trap 'exit 0' TERM; exec 1>&-; while :; do :; done",
+        "claude exited unexpectedly (exit code 0)",
     );
 }
 #[cfg(debug_assertions)]
-fn before_ready_exit(script: &str, message: &str) {
-    use std::{fs, time::Duration};
-
+struct Scratch(std::path::PathBuf);
+#[cfg(debug_assertions)]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+#[cfg(debug_assertions)]
+fn stand_in(script: &str) -> (Scratch, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("veyra-before-ready-{}", ThreadId::new()));
-    fs::create_dir(&root).unwrap();
-    let binary = root.join("fake-cli");
-    fs::write(
+    std::fs::create_dir(&root).unwrap();
+    let scratch = Scratch(root);
+    let binary = scratch.0.join("fake-cli");
+    std::fs::write(
         &binary,
         format!("#!/bin/sh\nprintf 'started\\n' >> spawn-marker\nread -r initialize\n{script}\n"),
     )
@@ -109,6 +116,14 @@ fn before_ready_exit(script: &str, message: &str) {
             .unwrap()
             .success()
     );
+    (scratch, binary)
+}
+#[cfg(debug_assertions)]
+fn before_ready_exit(script: &str, message: &str) {
+    use std::{fs, time::Duration};
+
+    let (scratch, binary) = stand_in(script);
+    let root = &scratch.0;
     let mut env = env::ChildEnv::load();
     env.claude_bin = Some(binary);
     env.fixtures = None;
@@ -156,7 +171,6 @@ fn before_ready_exit(script: &str, message: &str) {
         .unwrap();
     });
     let spawns = fs::read_to_string(root.join("spawn-marker")).unwrap();
-    fs::remove_dir_all(root).unwrap();
     assert!(
         matches!(
             &rows.turns[&first].state,
@@ -184,7 +198,7 @@ fn pre_ready_exit_without_crash_fails_and_holds_queue() {
         assert!(matches!(
             &rows.turns[&first].state,
             TurnState::Ended { outcome: TurnOutcome::Failed { message }, started: None, .. }
-                if message == "claude exited unexpectedly (exit code unknown)"
+                if message == "The session exited before it was ready"
         ));
         assert_eq!(rows.turns[&second].state, TurnState::Queued);
         assert_eq!(

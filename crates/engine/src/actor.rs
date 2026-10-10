@@ -820,7 +820,8 @@ impl Actor {
                     &mut c,
                     t.clone(),
                     TurnOutcome::Failed {
-                        message: crash.unwrap_or_else(|| session::crash_text(None, &[], None)),
+                        message: crash
+                            .unwrap_or_else(|| "The session exited before it was ready".into()),
                     },
                     now(),
                 );
