@@ -445,7 +445,7 @@ impl Shell {
                             }
                         }
                         shell.state.apply_all(batch);
-                        shell.refresh_branch(cx);
+                        shell.start_branch_lookup(cx);
                         if shell.project.is_none() {
                             shell.project = shell.state.projects.keys().next().copied();
                         }
@@ -605,7 +605,7 @@ impl Shell {
         self.forget_branch();
         self.view = view;
     }
-    fn refresh_branch(&mut self, cx: &mut Context<Self>) {
+    fn start_branch_lookup(&mut self, cx: &mut Context<Self>) {
         if !self.branch_task.is_empty() {
             return;
         }
@@ -654,7 +654,7 @@ impl Shell {
         let reply = self.engine.snapshot(thread);
         self.scroller.update(cx, |state, cx| state.reset(0, cx));
         self.input.update(cx, |input, cx| input.focus(window, cx));
-        self.refresh_branch(cx);
+        self.start_branch_lookup(cx);
         cx.spawn(async move |this, cx| {
             let snapshot = reply.await;
             let _ = this.update(cx, |shell, cx| {

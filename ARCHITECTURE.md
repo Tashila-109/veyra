@@ -179,6 +179,9 @@ Failed carries the loop failure or Veyra's crash text, followed by the same boun
 The crash exit code is read after SIGTERM; a process that closed stdout without exiting reports exit code unknown.
 Exited follows group cleanup and its leader's reap, including an initialize-send failure.
 On Exited, the actor ends any remaining running turn as Failed if crash text exists, otherwise Interrupted.
+Before Ready, a spawn error or crash fails the oldest queued turn with that text and holds the thread as Stopped.
+A spawn error never starts a process and is posted back as Exited, so every Codex or Grok thread fails this way.
+Crash text with no running or queued turn is dropped.
 At run end or task drop, each owned group receives SIGTERM before its leader is reaped.
 Cleanup checks every 50 ms and waits up to one second for the group to exit.
 It sends SIGKILL if the group remains alive or a child/group check fails, then waits for the leader before returning the error.
@@ -298,12 +301,12 @@ Dropping the Shell also cancels the task, and its reply checks the selection ide
 The centred transcript uses MessageScroller and selectable Markdown TextView for assistant text, a still stream caret, collapsed reasoning/tools and notices.
 Tool output is bounded to its last 10,000 characters by the actor.
 The failed view shows the cause, next step, Retry and Open Terminal on the project folder.
-Retry probes again, clears any hold first and sends the prior prompt as a new turn.
+Retry probes again; once the thread's provider is Ready it clears any hold and sends the prior prompt as a new turn.
 Send also clears a hold when the thread has no queued turn.
 
 The composer uses TextareaState and provider/model/effort/permission chips.
 Typed gpui action payloads reject malformed ids and enum values at dispatch, with a visible error.
-OpenProviderPicker and its key open the provider menu through a controlled kit popover.
+On New thread, OpenProviderPicker and its key open the provider menu through a controlled kit popover.
 An open menu rebuilds its readiness labels when probing begins and when each reply arrives.
 Not-ready providers disable Send with their repair command.
 CreateThread sends the draft configuration; subsequent Send targets the selected thread.
@@ -365,7 +368,7 @@ The textual platform_boundary test is a guard, not proof against every indirect 
 - [Storage/schema](crates/engine/src/store.rs), [recovery](crates/engine/src/reconcile.rs), [events/snapshots](crates/engine/src/events.rs).
 - [Provider boundary](crates/engine/src/provider/mod.rs), [environment](crates/engine/src/provider/env.rs), [sessions/probes](crates/engine/src/provider/session.rs), [Claude codec](crates/engine/src/provider/claude.rs).
 - [Fixture format](crates/engine/src/fixture.rs), [fake CLI](crates/engine/src/bin/veyra-fake-cli.rs), [recording/redaction](crates/engine/src/record.rs).
-- [Window/pump/fence](crates/veyra/src/ui/mod.rs), [transcript](crates/veyra/src/ui/transcript.rs), [composer](crates/veyra/src/ui/composer.rs), [Settings](crates/veyra/src/ui/settings.rs), [actions](crates/veyra/src/ui/actions.rs), [theme](crates/veyra/src/ui/theme.rs).
+- [Window/pump/fence/branch](crates/veyra/src/ui/mod.rs), [transcript](crates/veyra/src/ui/transcript.rs), [composer](crates/veyra/src/ui/composer.rs), [Settings](crates/veyra/src/ui/settings.rs), [actions](crates/veyra/src/ui/actions.rs), [theme](crates/veyra/src/ui/theme.rs).
 - [Platform mechanisms](crates/engine/src/platform/macos.rs), [selection](crates/engine/src/platform/mod.rs), [boundary guard](crates/engine/src/platform/boundary.rs).
 - [Driver](crates/veyra/src/control.rs), [name coverage](crates/veyra/src/verify_map.rs), [verification skill](.agents/skills/verify-veyra/SKILL.md).
 
@@ -376,6 +379,7 @@ replay_claude uses the real session task with the fake CLI for text and tools, p
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
 Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
 Application tests enable gpui test-support to exercise Shell selection and its event pump in a synthetic window.
+Shell tests load the login-shell PATH as the app does, and run no provider CLI.
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence and cleanup.
 Their Status lines record the lead's acceptance, independently of the recipes.

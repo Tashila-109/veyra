@@ -302,14 +302,14 @@ impl Probes {
         cwd: PathBuf,
     ) -> tokio::sync::oneshot::Receiver<Probe> {
         let previous = self.tasks.remove(&provider);
-        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
         let (reply, result) = tokio::sync::oneshot::channel();
         let task = runtime.spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.cancel.send(());
                 let _ = previous.task.await;
             }
-            if reply.is_closed() {
+            if reply.is_closed() || cancelled.try_recv().is_ok() {
                 return;
             }
             let probe = provider.probe_cancellable(&env, &cwd, cancelled).await;

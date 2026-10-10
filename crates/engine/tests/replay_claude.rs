@@ -439,6 +439,54 @@ fn cli_turn_starts_before_text_at_lifecycle_or_message_start() {
 }
 
 #[test]
+fn cancelling_probe_before_it_starts_runs_no_binary() {
+    let (scratch, mut env) = environment("ok-reply", false);
+    let binary = scratch.0.join("probe-cli");
+    let marker = scratch.0.join("probe-marker");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nprintf 'started\\n' >> probe-marker\nprintf 'fixture-version\\n'\n",
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("/bin/chmod")
+            .arg("700")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    env.claude_bin = Some(binary);
+    env.fixtures = None;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            assert_eq!(probe(&env, &scratch.0).await.readiness, Readiness::Ready);
+            assert_eq!(fs::read_to_string(&marker).unwrap(), "started\nstarted\n");
+            fs::remove_file(&marker).unwrap();
+
+            let mut probes = Probes::default();
+            let reply = probes.check(
+                &tokio::runtime::Handle::current(),
+                ProviderKind::Claude,
+                env,
+                scratch.0.clone(),
+            );
+            drop(probes);
+            let result = tokio::time::timeout(Duration::from_secs(30), reply)
+                .await
+                .unwrap();
+            assert!(!marker.exists(), "cancelled probe executed its binary");
+            assert!(
+                result.is_err(),
+                "cancelled probe returned a readiness reply"
+            );
+        });
+}
+
+#[test]
 fn replacing_hung_probe_ends_its_group_before_ready_reply() {
     let (scratch, mut env) = environment("ok-reply", false);
     let mut rows: Vec<serde_json::Value> = fs::read_to_string(scratch.0.join("probe.jsonl"))
