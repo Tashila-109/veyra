@@ -10,7 +10,7 @@ The engine never depends on gpui.
 
 Claude sessions, readiness probes, replay fixtures and debug recording are implemented.
 Codex and Grok have placeholder readiness but no codec.
-There is no PTY, tool server, approvals/questions UI, interrupt ladder, startup process reaper, keep-awake guard or notification banner.
+There is no PTY, tool server, approvals/questions path (codec request mapping, session answer or UI), interrupt ladder, startup process reaper, keep-awake guard or notification banner.
 
 ### System architecture
 
@@ -44,7 +44,7 @@ veyra -> gpui-kit + gpui-pre
 Direct versions are exact pins and `Cargo.lock` is kept.
 The engine's tokio features are `sync`, `rt-multi-thread`, `time`, `macros`, `process` and `io-util`.
 Only the application crate declares gpui dependencies.
-`platform_boundary` confines libc and OS calls to `platform/`.
+`platform_boundary` scans for libc, socket, process-group, target and listed command strings outside `platform/`; the header's `git` child is a reviewed exception.
 Manifest review keeps gpui out of the engine and direct versions exact; no automated manifest check enforces those rules.
 
 ## Startup and data ownership
@@ -99,7 +99,7 @@ StartTurn effects name the turn until install builds its text from committed ite
 The send-to-reply path is ordered as follows.
 
 1. CreateThread stores the thread and user item with a queued turn.
-2. The Spawn effect starts the session on its own process group.
+2. The Spawn effect starts the session on its own process group; an exit before Ready fails the oldest queued turn and holds the thread as Stopped.
 3. The matched initialize reply publishes Ready and changes Starting to Structured.
 4. start_changed makes the queued turn Running and dispatches StartTurn with committed prompt text.
 The first prompt is written only after the initialize reply.
@@ -126,6 +126,7 @@ Idle structured sessions park after ten minutes without a running turn, pending 
 The engine supports holds, queue reasons, cascaded Stop/Archive, Interrupt, Respond, wake delivery and task settlement.
 Those controls and cards have no window UI.
 Tasks cannot arise through the application because the tool server is not implemented.
+Requests cannot arise either: the Claude codec answers every control request with an error and emits no RequestOpened, and the session discards Answer controls, so Respond and NeedsYou are reachable only in scripted engine tests.
 
 `store::MIGRATIONS` owns schema 2, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
 Migrations use `PRAGMA user_version` in transactions and refuse newer schemas.
@@ -179,9 +180,9 @@ Failed carries the loop failure or Veyra's crash text, followed by the same boun
 The crash exit code is read after SIGTERM; a process that closed stdout without exiting reports exit code unknown.
 Exited follows group cleanup and its leader's reap, including an initialize-send failure.
 On Exited, the actor ends any remaining running turn as Failed if crash text exists, otherwise Interrupted.
-Before Ready, a spawn error or crash fails the oldest queued turn with that text and holds the thread as Stopped.
+Before Ready, every exit fails the oldest queued turn with its failure or Veyra's crash text and holds the thread as Stopped, including a clean exit, an unknown status or stdout closing while the process remains alive.
 A spawn error never starts a process and is posted back as Exited, so every Codex or Grok thread fails this way.
-Crash text with no running or queued turn is dropped.
+After Ready, crash text with no running turn is dropped and any eligible queued turn respawns.
 At run end or task drop, each owned group receives SIGTERM before its leader is reaped.
 Cleanup checks every 50 ms and waits up to one second for the group to exit.
 It sends SIGKILL if the group remains alive or a child/group check fails, then waits for the leader before returning the error.
@@ -319,7 +320,7 @@ SetDefaultMode publishes SettingsChanged; Escape or thread/project selection lea
 `ui/actions.rs` owns actions, keys and the native menu.
 The Theme global owns all colours, geometry, type, radii and motion tokens.
 Theme::apply projects them through the kit and follows macOS appearance.
-Violet is restricted to interaction roles; selected controls and hover remain neutral.
+Violet marks focus, caret, selection, streaming and Working status; selected controls and hover remain neutral.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
 The requested window is 1280 by 800 with a 760 by 560 minimum; a window manager can override it.
 

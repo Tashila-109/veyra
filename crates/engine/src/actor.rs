@@ -808,7 +808,7 @@ impl Actor {
                 },
             };
             commands::end_turn(&self.projection, &mut c, t.clone(), outcome, now());
-        } else if matches!(old.live, Live::Starting { .. }) && crash.is_some() {
+        } else if matches!(old.live, Live::Starting { .. }) {
             if let Some(t) = self
                 .projection
                 .turns_for(thread)
@@ -820,7 +820,7 @@ impl Actor {
                     &mut c,
                     t.clone(),
                     TurnOutcome::Failed {
-                        message: crash.clone().unwrap(),
+                        message: crash.unwrap_or_else(|| session::crash_text(None, &[], None)),
                     },
                     now(),
                 );

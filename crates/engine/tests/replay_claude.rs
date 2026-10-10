@@ -36,6 +36,19 @@ fn environment(name: &str, resumed: bool) -> (Scratch, ChildEnv) {
     env.record = None;
     (Scratch(root), env)
 }
+fn stand_in(scratch: &Scratch, name: &str, script: &str) -> PathBuf {
+    let binary = scratch.0.join(name);
+    fs::write(&binary, script).unwrap();
+    assert!(
+        std::process::Command::new("/bin/chmod")
+            .arg("700")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    binary
+}
 async fn probe(env: &ChildEnv, cwd: &Path) -> Probe {
     let mut probes = Probes::default();
     probes
@@ -441,22 +454,17 @@ fn cli_turn_starts_before_text_at_lifecycle_or_message_start() {
 #[test]
 fn cancelling_probe_before_it_starts_runs_no_binary() {
     let (scratch, mut env) = environment("ok-reply", false);
-    let binary = scratch.0.join("probe-cli");
     let marker = scratch.0.join("probe-marker");
-    fs::write(
-        &binary,
+    let binary = stand_in(
+        &scratch,
+        "probe-cli",
         "#!/bin/sh\nprintf 'started\\n' >> probe-marker\nprintf 'fixture-version\\n'\n",
-    )
-    .unwrap();
-    assert!(
-        std::process::Command::new("/bin/chmod")
-            .arg("700")
-            .arg(&binary)
-            .status()
-            .unwrap()
-            .success()
     );
-    env.claude_bin = Some(binary);
+    let untouched = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(978285600);
+    let file = fs::OpenOptions::new().write(true).open(&binary).unwrap();
+    file.set_times(fs::FileTimes::new().set_accessed(untouched))
+        .unwrap();
+    env.claude_bin = Some(binary.clone());
     env.fixtures = None;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -465,7 +473,13 @@ fn cancelling_probe_before_it_starts_runs_no_binary() {
         .block_on(async {
             assert_eq!(probe(&env, &scratch.0).await.readiness, Readiness::Ready);
             assert_eq!(fs::read_to_string(&marker).unwrap(), "started\nstarted\n");
+            assert_ne!(
+                fs::metadata(&binary).unwrap().accessed().unwrap(),
+                untouched
+            );
             fs::remove_file(&marker).unwrap();
+            file.set_times(fs::FileTimes::new().set_accessed(untouched))
+                .unwrap();
 
             let mut probes = Probes::default();
             let reply = probes.check(
@@ -478,6 +492,11 @@ fn cancelling_probe_before_it_starts_runs_no_binary() {
             let result = tokio::time::timeout(Duration::from_secs(30), reply)
                 .await
                 .unwrap();
+            assert_eq!(
+                fs::metadata(&binary).unwrap().accessed().unwrap(),
+                untouched,
+                "cancelled probe executed its binary"
+            );
             assert!(!marker.exists(), "cancelled probe executed its binary");
             assert!(
                 result.is_err(),
@@ -505,20 +524,14 @@ fn replacing_hung_probe_ends_its_group_before_ready_reply() {
             + "\n",
     )
     .unwrap();
-    let wrapper = scratch.0.join("probe-cli");
-    fs::write(
-        &wrapper,
-        format!(
+    let wrapper = stand_in(
+        &scratch,
+        "probe-cli",
+        &format!(
             "#!/bin/sh\nprintf '%s\n' \"$$\" > probe-pid\nexec '{}' \"$@\"\n",
             env!("CARGO_BIN_EXE_veyra-fake-cli")
         ),
-    )
-    .unwrap();
-    let chmod = std::process::Command::new("/bin/chmod")
-        .args(["700", wrapper.to_str().unwrap()])
-        .status()
-        .unwrap();
-    assert!(chmod.success());
+    );
     env.claude_bin = Some(wrapper);
     Runtime::new().unwrap().block_on(async {
         let mut probes = Probes::default();

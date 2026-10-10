@@ -77,6 +77,125 @@ fn first_ready_starts_queued_turn() {
     );
 }
 #[test]
+#[cfg(debug_assertions)]
+fn clean_exit_before_ready_fails_oldest_turn_without_respawning() {
+    before_ready_exit("exit 0", "claude exited unexpectedly (exit code 0)");
+}
+#[test]
+#[cfg(debug_assertions)]
+fn stdout_close_before_ready_fails_oldest_turn_without_respawning() {
+    before_ready_exit(
+        "exec 1>&-; /bin/sleep 30",
+        "claude exited unexpectedly (exit code unknown)",
+    );
+}
+#[cfg(debug_assertions)]
+fn before_ready_exit(script: &str, message: &str) {
+    use std::{fs, time::Duration};
+
+    let root = std::env::temp_dir().join(format!("veyra-before-ready-{}", ThreadId::new()));
+    fs::create_dir(&root).unwrap();
+    let binary = root.join("fake-cli");
+    fs::write(
+        &binary,
+        format!("#!/bin/sh\nprintf 'started\\n' >> spawn-marker\nread -r initialize\n{script}\n"),
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("/bin/chmod")
+            .arg("700")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut env = env::ChildEnv::load();
+    env.claude_bin = Some(binary);
+    env.fixtures = None;
+    env.record = None;
+    let mut f = Fixture::new(LiveState::Parked);
+    let mut c = ChangeSet::default();
+    let mut thread = f.loaded().threads[&f.thread].clone();
+    thread.cwd = root.clone();
+    c.threads.insert(thread.id, thread);
+    f.save(c);
+    let (out, mut messages) = mpsc::channel(256);
+    f.actor = Actor::new(f.actor.db, out, Spawner::Cli(env)).unwrap();
+    let first = match f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "first".into(),
+        })
+        .unwrap()
+    {
+        Ack::Turn(id) => id,
+        ack => panic!("unexpected ack: {ack:?}"),
+    };
+    let second = f.user("second");
+    let exited = f.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), messages.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    {
+        let _entered = f.runtime.enter();
+        f.actor.handle(exited);
+    }
+    let rows = f.loaded();
+    let epoch = f.actor.live[&f.thread].epoch;
+    let parked = matches!(f.actor.live[&f.thread].live, Live::Parked);
+    f.command(Command::StopThread { thread: f.thread }).unwrap();
+    f.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !matches!(f.actor.live[&f.thread].live, Live::Parked) {
+                f.actor.handle(messages.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+    });
+    let spawns = fs::read_to_string(root.join("spawn-marker")).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(
+        matches!(
+            &rows.turns[&first].state,
+            TurnState::Ended { outcome: TurnOutcome::Failed { message: text }, started: None, .. }
+                if text == message
+        ),
+        "oldest queued turn: {:?}",
+        rows.turns[&first].state
+    );
+    assert_eq!(rows.turns[&second].state, TurnState::Queued);
+    assert_eq!(rows.threads[&f.thread].hold, Some(HoldReason::Stopped));
+    assert!(parked);
+    assert_eq!(epoch, 1);
+    assert_eq!(spawns, "started\n");
+}
+#[test]
+fn pre_ready_exit_without_crash_fails_and_holds_queue() {
+    for hold in [None, Some(HoldReason::Restarted)] {
+        let mut f = Fixture::new(LiveState::Starting);
+        f.hold(hold);
+        let first = f.user("first");
+        let second = f.user("second");
+        f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
+        let rows = f.loaded();
+        assert!(matches!(
+            &rows.turns[&first].state,
+            TurnState::Ended { outcome: TurnOutcome::Failed { message }, started: None, .. }
+                if message == "claude exited unexpectedly (exit code unknown)"
+        ));
+        assert_eq!(rows.turns[&second].state, TurnState::Queued);
+        assert_eq!(
+            rows.threads[&f.thread].hold,
+            hold.or(Some(HoldReason::Stopped))
+        );
+        assert!(matches!(f.actor.live[&f.thread].live, Live::Parked));
+        assert_eq!(f.actor.live[&f.thread].epoch, 1);
+    }
+}
+#[test]
 fn idle_exited_parks() {
     let mut f = Fixture::new(LiveState::Idle);
     f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));

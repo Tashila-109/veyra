@@ -368,6 +368,7 @@ async fn run_one(
         Ok::<_, std::io::Error>(())
     });
     let mut codec = Codec::new(process.native.clone(), pid);
+    let mut ready = false;
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder {
         recorder.bind(process.native.0.clone(), "<id:session>".into());
@@ -431,6 +432,9 @@ async fn run_one(
                             }
                             if failure.is_some() { break; }
                             for event in decoded.events {
+                                if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
+                                    ready = true;
+                                }
                                 if !emit(out, thread, epoch, event).await { consumer_gone = true; break; }
                             }
                             if consumer_gone { break; }
@@ -496,7 +500,7 @@ async fn run_one(
         Some(text)
     } else if let Some(failure) = failure {
         Some(failure)
-    } else if status.is_some_and(|status| !status.success()) {
+    } else if !ready || status.is_some_and(|status| !status.success()) {
         Some(crash_text(
             status.and_then(|status| status.code()),
             &lines,
