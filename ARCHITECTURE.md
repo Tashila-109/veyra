@@ -290,6 +290,8 @@ This joins the item snapshot and event stream without duplicated or missing text
 
 The sidebar reads projects and thread statuses, and all resizing paths dispatch SetSidebarWidth.
 The header reads title, status/elapsed time, project and a separate Git branch task on the tokio runtime.
+Branch lookup starts once the selected Chat thread's cwd is known, either at selection or after an event batch supplies its row.
+The retained task prevents another lookup until Chat is left or a thread is reselected.
 That child inherits the app environment, has kill-on-drop and no timeout.
 `Shell::show` and Quit call `forget_branch` to cancel the task and clear the displayed branch.
 Dropping the Shell also cancels the task, and its reply checks the selection identity.
@@ -373,6 +375,7 @@ Workspace tests cover private paths and modes, launch locking, platform_boundary
 replay_claude uses the real session task with the fake CLI for text and tools, prompt correlation, provider-turn completion, resume, crash and error outcomes, background replacement and readiness.
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
 Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
+Application tests enable gpui test-support to exercise Shell selection and its event pump in a synthetic window.
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence and cleanup.
 Their Status lines record the lead's acceptance, independently of the recipes.

@@ -445,6 +445,7 @@ impl Shell {
                             }
                         }
                         shell.state.apply_all(batch);
+                        shell.refresh_branch(cx);
                         if shell.project.is_none() {
                             shell.project = shell.state.projects.keys().next().copied();
                         }
@@ -604,31 +605,30 @@ impl Shell {
         self.forget_branch();
         self.view = view;
     }
-    fn select_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
-        self.show(MainView::Chat(thread));
-        self.notice = None;
-        let request = self.state.begin_snapshot(thread);
-        let reply = self.engine.snapshot(thread);
-        self.scroller.update(cx, |state, cx| state.reset(0, cx));
-        self.input.update(cx, |input, cx| input.focus(window, cx));
-        let cwd = self.state.threads.get(&thread).map(|row| row.cwd.clone());
+    fn refresh_branch(&mut self, cx: &mut Context<Self>) {
+        if !self.branch_task.is_empty() {
+            return;
+        }
+        let Some(thread) = self.view.chat() else {
+            return;
+        };
+        let Some(cwd) = self.state.threads.get(&thread).map(|row| row.cwd.clone()) else {
+            return;
+        };
+        let selection = self.state.snapshot_sequence;
         let (sender, branch) = tokio::sync::oneshot::channel();
         self.branch_task.spawn_on(
             async move {
-                let branch = if let Some(cwd) = cwd {
-                    tokio::process::Command::new("git")
-                        .args(["branch", "--show-current"])
-                        .current_dir(cwd)
-                        .kill_on_drop(true)
-                        .output()
-                        .await
-                        .ok()
-                        .filter(|output| output.status.success())
-                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
+                let branch = tokio::process::Command::new("git")
+                    .args(["branch", "--show-current"])
+                    .current_dir(cwd)
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                    .unwrap_or_default();
                 let _ = sender.send(branch);
             },
             &self.runtime,
@@ -637,7 +637,7 @@ impl Shell {
             if let Ok(branch) = branch.await {
                 let _ = this.update(cx, |shell, cx| {
                     if shell.view.chat() == Some(thread)
-                        && shell.state.snapshot_sequence == request.0
+                        && shell.state.snapshot_sequence == selection
                     {
                         shell.branch = branch;
                         cx.notify();
@@ -646,6 +646,15 @@ impl Shell {
             }
         })
         .detach();
+    }
+    fn select_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        self.show(MainView::Chat(thread));
+        self.notice = None;
+        let request = self.state.begin_snapshot(thread);
+        let reply = self.engine.snapshot(thread);
+        self.scroller.update(cx, |state, cx| state.reset(0, cx));
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+        self.refresh_branch(cx);
         cx.spawn(async move |this, cx| {
             let snapshot = reply.await;
             let _ = this.update(cx, |shell, cx| {
@@ -1321,6 +1330,98 @@ mod tests {
         events::{ChangeEvent, ThreadSnapshot, UiEvent},
         provider::{Probe, ProviderKind, Readiness},
     };
+
+    #[gpui::test]
+    fn chat_branch_loads_when_the_thread_row_follows_selection(cx: &mut gpui::TestAppContext) {
+        use std::{path::PathBuf, process::Command, time::Duration};
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).expect("remove owned scratch");
+            }
+        }
+
+        let thread = ThreadId::new();
+        let path = PathBuf::from("/tmp").join(format!("veyra-branch-{thread}"));
+        std::fs::create_dir(&path).unwrap();
+        let scratch = Scratch(path);
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "fixture-branch"])
+                .current_dir(&scratch.0)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = veyra_engine::Engine::start(
+            runtime.handle(),
+            veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+        )
+        .unwrap();
+        let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+        cx.update(gpui_kit::init);
+        cx.skip_drawing();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(super::Appearance::Dark, window, cx);
+            let mut shell = super::Shell::new(
+                engine,
+                runtime.handle().clone(),
+                events,
+                scratch.0.clone(),
+                window,
+                cx,
+            );
+            shell.probes = Default::default();
+            shell
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            shell.select_thread(thread, window, cx)
+        });
+        cx.run_until_parked();
+        sender
+            .send(UiEvent::Change {
+                counter: Some(1),
+                event: ChangeEvent::ThreadCreated(Thread {
+                    id: thread,
+                    project: ProjectId::new(),
+                    title: "chat".into(),
+                    lineage: Lineage::Root,
+                    provider: ProviderKind::Claude,
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode: PermissionMode::FullAccess,
+                    },
+                    cwd: scratch.0.clone(),
+                    native: None,
+                    native_cursor: None,
+                    cli_version: None,
+                    hold: None,
+                    view: View::Chat,
+                    import_pending: false,
+                    archived: false,
+                }),
+            })
+            .unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < end {
+            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+            cx.run_until_parked();
+            if shell.read_with(cx, |shell, _| shell.branch == "fixture-branch") {
+                break;
+            }
+        }
+        shell.update(cx, |shell, _| shell.engine.shutdown());
+        assert_eq!(
+            shell.read_with(cx, |shell, cx| shell.dump(&scratch.0, cx))["header_branch"],
+            "fixture-branch"
+        );
+    }
 
     #[test]
     fn window_projection_shows_pending_background_work() {
