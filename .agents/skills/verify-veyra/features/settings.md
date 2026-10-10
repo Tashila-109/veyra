@@ -1,6 +1,6 @@
 # Settings
 
-Status: STATE, DATE, COMMIT, MISSING
+Status: passed, 2026-10-11, c4de743, none
 
 ## Sub-features
 
