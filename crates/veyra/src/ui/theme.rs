@@ -467,6 +467,73 @@ mod tests {
         let b = luminance(bg);
         (f.max(b) + 0.05) / (f.min(b) + 0.05)
     }
+    fn token_call_count(source: &str) -> usize {
+        let bytes = source.as_bytes();
+        let mut index = 0;
+        let mut block = 0;
+        let mut line = false;
+        let mut quoted = false;
+        let mut count = 0;
+        while index < bytes.len() {
+            let rest = &bytes[index..];
+            if line {
+                line = bytes[index] != b'\n';
+            } else if block > 0 {
+                if rest.starts_with(b"/*") {
+                    block += 1;
+                    index += 1;
+                } else if rest.starts_with(b"*/") {
+                    block -= 1;
+                    index += 1;
+                }
+            } else if quoted && bytes[index] == b'\\' {
+                index += 1;
+            } else if bytes[index] == b'"' {
+                quoted = !quoted;
+            } else if !quoted && rest.starts_with(b"//") {
+                line = true;
+                index += 1;
+            } else if !quoted && rest.starts_with(b"/*") {
+                block = 1;
+                index += 1;
+            } else if [b"px(".as_slice(), b"rgb(", b"hsla("]
+                .iter()
+                .any(|needle| rest.starts_with(needle))
+            {
+                count += 1;
+            }
+            index += 1;
+        }
+        count
+    }
+    #[test]
+    fn theme_tokens_only() {
+        use std::{fs, path::PathBuf};
+        let mut folders = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut count = 0;
+        while let Some(folder) = folders.pop() {
+            for entry in fs::read_dir(folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs")
+                    && path.file_name().unwrap() != "theme.rs"
+                {
+                    count += token_call_count(&fs::read_to_string(path).unwrap());
+                }
+            }
+        }
+        const M3_INITIAL_TOKEN_CALLS: usize = 7;
+        assert!(
+            count <= M3_INITIAL_TOKEN_CALLS,
+            "theme token calls increased from the M3 starting count of 7 to {count}"
+        );
+        assert_eq!(
+            token_call_count("px(1) // rgb(2)\n/* hsla(3) /* px(4) */ */ rgb(5)"),
+            2
+        );
+        assert_eq!(token_call_count("\"//\" px(1)"), 1);
+    }
     #[test]
     fn theme_contrast() {
         for appearance in [Appearance::Dark, Appearance::Light] {

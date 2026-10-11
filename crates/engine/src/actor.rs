@@ -161,6 +161,7 @@ impl Actor {
         actor.prepare_commit(&mut c);
         actor.write(&c)?;
         c.install(&mut actor.projection, &mut actor.live);
+        actor.update_awake();
         Ok(actor)
     }
     pub(crate) fn run(mut self, mut rx: mpsc::Receiver<EngineMsg>, runtime: Handle) {
@@ -1254,6 +1255,24 @@ impl Actor {
         }
     }
     fn update_awake(&mut self) {
+        *self.state.window_threads.lock().unwrap() = self
+            .projection
+            .threads
+            .keys()
+            .filter_map(|&id| {
+                let changes = ChangeSet::default();
+                let view = changes.view(&self.projection, &self.live, id)?;
+                Some((
+                    id,
+                    crate::WindowThread {
+                        wait_reason: wait_reason(&view),
+                        busy: view.running.is_some()
+                            || view.live.background_work
+                            || matches!(view.live.live, Live::Starting { .. }),
+                    },
+                ))
+            })
+            .collect();
         let needed = crate::live::needs_awake(&self.projection, &self.live);
         if needed && self.awake.is_none() {
             match crate::platform::hold_awake(std::process::id()) {
@@ -1274,24 +1293,6 @@ impl Actor {
         self.shutting_down = true;
         self.state.closing.store(true, Ordering::Release);
         let mut c = ChangeSet::default();
-        let turns: Vec<_> = self
-            .projection
-            .turns
-            .values()
-            .filter(|turn| matches!(turn.state, TurnState::Running { .. }))
-            .cloned()
-            .collect();
-        for turn in turns {
-            commands::end_turn(
-                &self.projection,
-                &mut c,
-                turn,
-                TurnOutcome::Interrupted {
-                    reason: "Veyra closed while this turn ran".into(),
-                },
-                now(),
-            );
-        }
         for request in self
             .projection
             .requests
@@ -1299,6 +1300,37 @@ impl Actor {
             .filter(|r| r.state == RequestState::Pending)
         {
             commands::expire_requests(&self.projection, &mut c, request.turn, "Veyra is closing");
+        }
+        let active: std::collections::BTreeSet<_> = self
+            .projection
+            .turns
+            .values()
+            .filter(|turn| matches!(turn.state, TurnState::Running { .. }))
+            .map(|turn| turn.thread)
+            .chain(
+                self.live
+                    .iter()
+                    .filter(|(_, live)| {
+                        live.background_work || matches!(live.live, Live::Starting { .. })
+                    })
+                    .map(|(&id, _)| id),
+            )
+            .collect();
+        let now = now();
+        for thread in active {
+            commands::set_hold(
+                &self.projection,
+                &mut c,
+                thread,
+                Some(HoldReason::Restarted),
+            );
+            commands::end_running(
+                &self.projection,
+                &mut c,
+                thread,
+                crate::provider::StopReason::AppClosing.text(),
+                now,
+            );
         }
         for (&thread, live) in &self.live {
             if live.live.session().is_some() {

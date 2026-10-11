@@ -142,7 +142,7 @@ pub fn attach(
                             Ok(json!({"ok":true}))
                         }
                         Command::Quit => {
-                            window.dispatch_action(Box::new(crate::ui::actions::Quit), cx);
+                            window.dispatch_action(Box::new(crate::ui::actions::ConfirmQuit), cx);
                             Ok(json!({"ok": true}))
                         }
                     }

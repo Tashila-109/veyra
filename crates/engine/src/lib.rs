@@ -1,5 +1,6 @@
+use std::sync::Mutex;
 #[cfg(debug_assertions)]
-use std::{sync::Mutex, time::Instant};
+use std::time::Instant;
 pub mod actor;
 pub mod commands;
 pub mod data_dir;
@@ -55,10 +56,16 @@ struct EngineInner {
 pub(crate) struct RuntimeState {
     pub awake: AtomicBool,
     pub closing: AtomicBool,
+    pub window_threads: Mutex<std::collections::BTreeMap<ThreadId, WindowThread>>,
     #[cfg(debug_assertions)]
     pub counters: Mutex<ProbeCounters>,
     #[cfg(debug_assertions)]
     pub processes: Mutex<std::collections::BTreeMap<ThreadId, u32>>,
+}
+#[derive(Clone, Copy)]
+pub struct WindowThread {
+    pub wait_reason: Option<domain::WaitReason>,
+    pub busy: bool,
 }
 #[cfg(debug_assertions)]
 #[derive(Default)]
@@ -187,6 +194,9 @@ impl Engine {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             })
             .await;
+    }
+    pub fn window_threads(&self) -> std::collections::BTreeMap<ThreadId, WindowThread> {
+        self.inner.state.window_threads.lock().unwrap().clone()
     }
     pub fn awake(&self) -> bool {
         self.inner.state.awake.load(Ordering::Acquire)

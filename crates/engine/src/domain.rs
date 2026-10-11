@@ -201,6 +201,23 @@ pub enum RequestKind {
         questions: Vec<Question>,
     },
 }
+impl RequestKind {
+    pub fn accepts(&self, decision: &Decision) -> bool {
+        match (self, decision) {
+            (Self::Approval { .. }, Decision::AllowOnce | Decision::Deny) => true,
+            (
+                Self::Approval {
+                    grant_key: Some(_), ..
+                },
+                Decision::AllowInThread,
+            ) => true,
+            (Self::Question { questions }, Decision::Answers(answers)) => {
+                questions.len() == answers.len()
+            }
+            _ => false,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedAction {
     pub tool: String,
@@ -356,7 +373,7 @@ pub fn thread_status(v: &ThreadView<'_>) -> Status {
     if v.pending_request {
         return Status::NeedsYou;
     }
-    if v.thread.hold.is_some() && v.queued {
+    if v.thread.hold == Some(HoldReason::Restarted) || (v.thread.hold.is_some() && v.queued) {
         return Status::Held;
     }
     if let Some(Turn {

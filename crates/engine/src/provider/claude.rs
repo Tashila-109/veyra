@@ -1,8 +1,8 @@
-use super::{Model, ProviderEvent, SessionEvent, SessionSpec, TurnEvent};
+use super::{Model, ProviderEvent, SessionEvent, SessionSpec, StopReason, TurnEvent};
 use crate::domain::*;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const INITIALIZE_ID: &str = "veyra-initialize";
 pub fn initialize() -> Value {
@@ -295,7 +295,7 @@ impl TextFilter {
         }
     }
 }
-pub(crate) enum InterruptPhase {
+enum InterruptPhase {
     Protocol(tokio::time::Instant),
     Terminate(tokio::time::Instant),
 }
@@ -307,7 +307,7 @@ impl InterruptPhase {
     }
 }
 pub(crate) struct Interruption {
-    pub phase: InterruptPhase,
+    phase: InterruptPhase,
     pub reason: String,
 }
 fn log_ignored(kind: &str, value: &Value) {
@@ -459,6 +459,7 @@ pub(crate) struct Codec {
     error: Option<AssistantError>,
     pub interrupted: Option<Interruption>,
     requests: BTreeMap<String, PendingRequest>,
+    seen_requests: BTreeSet<String>,
 }
 #[derive(Default)]
 pub(crate) struct Decoded {
@@ -477,6 +478,7 @@ impl Codec {
             interrupted: None,
             tools: BTreeMap::new(),
             requests: BTreeMap::new(),
+            seen_requests: BTreeSet::new(),
         }
     }
     pub fn start(&mut self, turn: TurnId, text: String) -> Value {
@@ -505,8 +507,20 @@ impl Codec {
     pub fn line(&mut self, line: &str) -> Result<Decoded, super::ProviderError> {
         self.value(serde_json::from_str(line)?)
     }
-    pub fn value(&mut self, mut wire: Value) -> Result<Decoded, super::ProviderError> {
-        let frame: Frame = serde_json::from_value(wire.clone())?;
+    pub fn value(&mut self, wire: Value) -> Result<Decoded, super::ProviderError> {
+        let metadata = json!({
+            "type":wire["type"].as_str().unwrap_or("unknown"),
+            "subtype":wire["subtype"].as_str().unwrap_or(""),
+            "event":{
+                "type":wire["event"]["type"].as_str().unwrap_or("unknown"),
+                "content_block":{"type":wire["event"]["content_block"]["type"].as_str().unwrap_or("unknown")},
+                "delta":{"type":wire["event"]["delta"]["type"].as_str().unwrap_or("unknown")}
+            }
+        });
+        let frame = serde_json::from_value(wire)?;
+        self.frame(metadata, frame)
+    }
+    fn frame(&mut self, wire: Value, mut frame: Frame) -> Result<Decoded, super::ProviderError> {
         let mut decoded = Decoded::default();
         let parent = match &frame {
             Frame::Assistant(frame) => frame.parent_tool_use_id.as_deref(),
@@ -518,8 +532,8 @@ impl Codec {
             if let Some(tool) = self.tools.get_mut(parent)
                 && let Some(codec) = &mut tool.subagent
             {
-                if matches!(frame, Frame::User(_)) {
-                    if let Some(content) = wire["message"]["content"].as_array() {
+                if let Frame::User(user) = &frame {
+                    if let Some(content) = user.message["content"].as_array() {
                         for block in content {
                             let text = block["text"].as_str().or_else(|| block["content"].as_str());
                             if let Some(text) = text {
@@ -534,8 +548,13 @@ impl Codec {
                         }
                     }
                 } else {
-                    wire["parent_tool_use_id"] = Value::Null;
-                    for event in codec.value(wire)?.events {
+                    match &mut frame {
+                        Frame::Assistant(frame) => frame.parent_tool_use_id = None,
+                        Frame::User(frame) => frame.parent_tool_use_id = None,
+                        Frame::StreamEvent(frame) => frame.parent_tool_use_id = None,
+                        _ => {}
+                    }
+                    for event in codec.frame(wire, frame)?.events {
                         if let ProviderEvent::Turn {
                             event: TurnEvent::TextDelta { text, .. },
                             ..
@@ -609,7 +628,9 @@ impl Codec {
                 }
             }
             Frame::ControlRequest(request) => {
-                if let Some(kind) = self.request(&request) {
+                if self.seen_requests.insert(request.request_id.clone())
+                    && let Some(kind) = self.request(&request)
+                {
                     self.requests.insert(request.request_id.clone(), PendingRequest {
                         input: request.request.input,
                         kind: kind.clone(),
@@ -659,9 +680,9 @@ impl Codec {
     }
     #[cfg(test)]
     pub fn interrupt(&mut self) -> bool {
-        self.interrupt_for("Stopped by you")
+        self.interrupt_for(StopReason::User)
     }
-    pub fn interrupt_for(&mut self, reason: &str) -> bool {
+    pub fn interrupt_for(&mut self, reason: StopReason) -> bool {
         if self.active.is_none() {
             return false;
         }
@@ -669,9 +690,26 @@ impl Codec {
             phase: InterruptPhase::Protocol(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(3),
             ),
-            reason: reason.into(),
+            reason: reason.text().into(),
         });
         true
+    }
+    pub fn interrupt_deadline(&self) -> Option<tokio::time::Instant> {
+        self.interrupted
+            .as_ref()
+            .map(|interrupt| interrupt.phase.deadline())
+    }
+    pub fn escalate_interrupt(&mut self) -> Option<crate::platform::Signal> {
+        let interrupt = self.interrupted.as_mut()?;
+        Some(match interrupt.phase {
+            InterruptPhase::Protocol(_) => {
+                interrupt.phase = InterruptPhase::Terminate(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                );
+                crate::platform::Signal::Terminate
+            }
+            InterruptPhase::Terminate(_) => crate::platform::Signal::Kill,
+        })
     }
     fn request(&self, request: &ControlRequest) -> Option<RequestKind> {
         let tool = &request.request;
@@ -700,7 +738,8 @@ impl Codec {
                     Some(Question { text, options })
                 })
                 .collect::<Option<Vec<_>>>()?;
-            if questions.is_empty() {
+            let texts: BTreeSet<_> = questions.iter().map(|question| &question.text).collect();
+            if questions.is_empty() || texts.len() != questions.len() {
                 return None;
             }
             Some(RequestKind::Question { questions })
@@ -711,14 +750,23 @@ impl Codec {
                     tool: tool.tool_name.clone(),
                     command: command.map_or_else(|| tool.input.to_string(), str::to_owned),
                 },
-                grant_key: command.map(|command| GrantKey {
-                    tool: tool.tool_name.clone(),
-                    command: command.into(),
-                }),
+                grant_key: command
+                    .filter(|_| {
+                        tool.input.as_object().unwrap().keys().all(|key| {
+                            ["command", "description", "timeout"].contains(&key.as_str())
+                        })
+                    })
+                    .map(|command| GrantKey {
+                        tool: tool.tool_name.clone(),
+                        command: command.into(),
+                    }),
             })
         }
     }
     pub fn answer(&mut self, native: NativeRequestRef, decision: Decision) -> Option<Value> {
+        if !self.requests.get(&native.0)?.kind.accepts(&decision) {
+            return None;
+        }
         let request = self.requests.remove(&native.0)?;
         let response = match decision {
             Decision::AllowOnce | Decision::AllowInThread => json!({"behavior":"allow"}),
@@ -972,24 +1020,24 @@ impl Codec {
     }
     fn assistant(
         &mut self,
-        assistant: Assistant,
+        mut assistant: Assistant,
         events: &mut Vec<TurnEvent>,
     ) -> Result<(), super::ProviderError> {
         if let Some(error) = &assistant.error {
             self.error = Some(AssistantError::new(error));
         }
-        let message = assistant.message["id"].as_str();
-        if let Some(content) = assistant.message["content"].as_array() {
+        let message = assistant.message["id"].as_str().map(str::to_owned);
+        if let Some(Value::Array(content)) = assistant.message.get_mut("content").map(Value::take) {
             for value in content {
-                let kind = value["type"].as_str().unwrap_or_default();
+                let kind = value["type"].as_str().unwrap_or_default().to_owned();
                 let count = self
                     .stream
                     .final_blocks
-                    .entry((message.unwrap_or_default().into(), kind.into()))
+                    .entry((message.clone().unwrap_or_default(), kind.clone()))
                     .or_default();
                 let ordinal = *count;
                 *count += 1;
-                let streamed = (message == Some(self.stream.message.as_str()))
+                let streamed = (message.as_deref() == Some(self.stream.message.as_str()))
                     .then(|| {
                         self.stream
                             .blocks
@@ -1003,11 +1051,11 @@ impl Codec {
                 }) {
                     continue;
                 }
-                let block: ContentBlock = serde_json::from_value(value.clone())?;
+                let block: ContentBlock = serde_json::from_value(value)?;
                 let key = streamed.map(|block| block.key.clone()).unwrap_or_else(|| {
                     NativeItemKey(format!(
                         "{}:{ordinal}:{}",
-                        message.unwrap_or_default(),
+                        message.as_deref().unwrap_or_default(),
                         block.kind()
                     ))
                 });
@@ -1032,7 +1080,7 @@ impl Codec {
                         });
                     }
                     ContentBlock::Unknown => {
-                        log_ignored("content_block", value);
+                        log_ignored("content_block", &json!({"type":kind}));
                         continue;
                     }
                     ContentBlock::ToolUse { id, name, input } => {
@@ -1237,7 +1285,7 @@ mod tests {
     fn storage_interruption_names_database() {
         let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
         codec.start(TurnId::new(), "reply".into());
-        assert!(codec.interrupt_for("Stopped because the database is blocked"));
+        assert!(codec.interrupt_for(StopReason::StorageBlocked));
         let decoded = codec
             .value(json!({"type":"result", "subtype":"success"}))
             .unwrap();
@@ -1250,7 +1298,7 @@ mod tests {
         } if reason == "Stopped because the database is blocked"))
         );
         assert!(codec.interrupted.is_none());
-        assert!(!codec.interrupt_for("Stopped by you"));
+        assert!(!codec.interrupt_for(StopReason::User));
     }
     #[test]
     fn empty_final_reasoning_adds_no_item() {

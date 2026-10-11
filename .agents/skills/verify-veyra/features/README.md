@@ -5,6 +5,11 @@
 [chat-send-stream](chat-send-stream.md) covers fake-CLI streaming, Working → Done, failure cause and stderr, Retry and ctl wait.
 [settings](settings.md) covers OpenSettings, all defaults, existing-versus-new thread modes and default persistence after relaunch.
 
+[approvals-questions](approvals-questions.md) covers approval decisions, exact grants, question keys and NextNeedsYou.
+[stop-interrupt](stop-interrupt.md) covers Stop, held queues, awake and banners.
+[restart-recovery](restart-recovery.md) covers the quit sheet, ConfirmQuit, ctl quit and recovery.
+[permission-matrix](permission-matrix.md) records the live provider permission grid.
+
 ## Preconditions
 
 - Run Launch and Doctor in [verify-veyra](../SKILL.md).

@@ -5,9 +5,101 @@ use super::{
     theme::Theme,
 };
 use gpui_kit::component::StyledExt;
-use gpui_kit::component::{message_scroller::MessageScroller, text::TextView};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::text::TextView;
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::*;
+pub(super) struct MessageScrollerState {
+    list: ListState,
+    follow: bool,
+}
+impl MessageScrollerState {
+    pub fn new(count: usize, cx: &mut Context<Self>) -> Self {
+        let list = ListState::new(
+            count,
+            ListAlignment::Top,
+            cx.global::<Theme>().layout.window_default.height,
+        );
+        list.set_follow_mode(FollowMode::Tail);
+        let this = cx.weak_entity();
+        list.set_scroll_handler(move |_, _, cx| {
+            let this = this.clone();
+            cx.defer(move |cx| {
+                let _ = this.update(cx, |state, cx| {
+                    state.follow = state.distance_to_bottom() <= cx.global::<Theme>().layout.fade;
+                    if state.follow {
+                        state.list.set_follow_mode(FollowMode::Tail);
+                    } else {
+                        state.list.set_follow_mode(FollowMode::Normal);
+                    }
+                    cx.notify();
+                });
+            });
+        });
+        Self { list, follow: true }
+    }
+    fn distance_to_bottom(&self) -> Pixels {
+        self.list.max_offset_for_scrollbar().y + self.list.scroll_px_offset_for_scrollbar().y
+    }
+    pub fn item_count(&self) -> usize {
+        self.list.item_count()
+    }
+    pub fn reset(&mut self, count: usize, cx: &mut Context<Self>) {
+        self.list.reset(count);
+        self.scroll_to_end(cx);
+    }
+    pub fn append(&mut self, count: usize, cx: &mut Context<Self>) {
+        let end = self.item_count();
+        self.list.splice(end..end, count);
+        cx.notify();
+    }
+    pub fn remeasure(&mut self, cx: &mut Context<Self>) {
+        let count = self.item_count();
+        self.list.remeasure_items(0..count);
+        cx.notify();
+    }
+    pub fn expand(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.follow = false;
+        self.list.set_follow_mode(FollowMode::Normal);
+        self.list.remeasure_items(index..index + 1);
+        cx.notify();
+    }
+    pub fn scroll_to_item(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.follow = false;
+        self.list.set_follow_mode(FollowMode::Normal);
+        self.list.scroll_to(ListOffset {
+            item_ix: index,
+            offset_in_item: Pixels::ZERO,
+        });
+        cx.notify();
+    }
+    pub fn scroll_by(&mut self, distance: Pixels, cx: &mut Context<Self>) {
+        self.list.set_follow_mode(FollowMode::Normal);
+        self.list.scroll_by(distance);
+        self.follow = self.distance_to_bottom() <= cx.global::<Theme>().layout.fade;
+        if self.follow {
+            self.scroll_to_end(cx);
+        }
+        cx.notify();
+    }
+    pub fn scroll_down(&mut self, cx: &mut Context<Self>) {
+        self.scroll_by(cx.global::<Theme>().layout.window_min.height, cx);
+    }
+    #[cfg(debug_assertions)]
+    pub fn dump(&self) -> serde_json::Value {
+        let top = self.list.logical_scroll_top();
+        serde_json::json!({"follow":self.follow, "gap":f32::from(self.distance_to_bottom()),
+            "top_item":top.item_ix, "top_offset":f32::from(top.offset_in_item),
+            "item_tops":(0..self.item_count()).map(|index|
+                self.list.bounds_for_item(index).map(|bounds| f32::from(bounds.origin.y))).collect::<Vec<_>>()})
+    }
+    pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
+        self.follow = true;
+        self.list.set_follow_mode(FollowMode::Tail);
+        self.list.scroll_to_end();
+        cx.notify();
+    }
+}
 fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
     let t = cx.global::<Theme>();
     let mut row = div()
@@ -28,19 +120,14 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
             )
         }
         ItemBody::AssistantText { text, done } => {
-            row = row
-                .child(TextView::markdown(
-                    SharedString::from(format!("assistant-{}", item.id)),
-                    text.clone(),
-                ))
-                .when(!done, |row| {
-                    row.child(
-                        div()
-                            .w(t.motion.stream_caret.width)
-                            .h(t.motion.stream_caret.height)
-                            .bg(t.colors.accent),
-                    )
-                })
+            row = row.child(TextView::markdown(
+                SharedString::from(format!("assistant-{}", item.id)),
+                if *done {
+                    text.clone()
+                } else {
+                    format!("{text} ▏")
+                },
+            ));
         }
         ItemBody::Reasoning { text, .. } => {
             let id = item.id;
@@ -55,6 +142,8 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                         },
                         cx,
                     )
+                    .justify_start()
+                    .child(div().flex_1())
                     .on_click(move |_, window, cx| {
                         window.dispatch_action(Box::new(ToggleItem { item: Some(id) }), cx)
                     }),
@@ -80,19 +169,29 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
             );
             row = row
                 .child(
-                    labelled_button(SharedString::from(format!("tool-{id}")), label, cx).on_click(
-                        move |_, window, cx| {
+                    labelled_button(SharedString::from(format!("tool-{id}")), label, cx)
+                        .justify_start()
+                        .child(div().flex_1())
+                        .on_click(move |_, window, cx| {
                             window.dispatch_action(Box::new(ToggleItem { item: Some(id) }), cx)
-                        },
-                    ),
+                        }),
                 )
+                .when_some(failed_tool_last_line(tool), |row, line| {
+                    row.child(
+                        div()
+                            .w_full()
+                            .text_size(t.text.label.size)
+                            .text_color(t.colors.danger)
+                            .child(line.to_owned()),
+                    )
+                })
                 .when(expanded, |row| {
                     row.child(
                         div()
                             .font_family(t.text.mono_font.clone())
                             .text_size(t.text.code.size)
                             .line_height(t.text.code.line_height)
-                            .child(tool.call.arguments.to_string()),
+                            .child(tool_input(&tool.call.arguments)),
                     )
                     .when_some(
                         tool.result
@@ -126,6 +225,62 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
     }
     row.into_any_element()
 }
+pub fn turn_outcome_line(turn: &Turn) -> Option<String> {
+    let TurnState::Ended {
+        outcome,
+        started,
+        at,
+    } = &turn.state
+    else {
+        return None;
+    };
+    let seconds = started.map(|started| at.saturating_sub(started) / 1000);
+    Some(match outcome {
+        TurnOutcome::Completed => {
+            seconds.map_or_else(|| "Done".into(), |seconds| format!("Done in {seconds}s"))
+        }
+        TurnOutcome::Interrupted { reason } => seconds.map_or_else(
+            || reason.clone(),
+            |seconds| format!("{reason} after {seconds}s"),
+        ),
+        TurnOutcome::Failed { message } => {
+            format!("Failed · {}", message.lines().next().unwrap_or_default())
+        }
+    })
+}
+pub fn failed_tool_last_line(tool: &ToolItem) -> Option<&str> {
+    let result = tool.result.as_ref().filter(|result| !result.ok)?;
+    result
+        .output_tail
+        .as_ref()?
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim_end)
+}
+fn tool_input(arguments: &serde_json::Value) -> String {
+    if let Some(command) = arguments.get("command").and_then(serde_json::Value::as_str) {
+        return command.to_owned();
+    }
+    arguments
+        .as_object()
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    format!(
+                        "{name}: {}",
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| arguments.to_string())
+}
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let items = shell
@@ -134,6 +289,18 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         .map(|thread| shell.state.transcript(thread))
         .unwrap_or_default();
     let expanded = shell.expanded.clone();
+    let turns = shell.state.turns.clone();
+    let wait_reason = shell
+        .view
+        .chat()
+        .and_then(|thread| {
+            shell
+                .engine
+                .window_threads()
+                .get(&thread)
+                .and_then(|state| state.wait_reason)
+        })
+        .map(|reason| reason.to_string());
     let mut content = div()
         .v_flex()
         .flex_1()
@@ -205,21 +372,61 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .min_h_0()
                 .w_full()
                 .max_w(t.layout.transcript_max)
+                .vertical_scrollbar(&shell.scroller.read(cx).list)
                 .child(
-                    MessageScroller::new(
-                        "transcript",
-                        shell.scroller.clone(),
-                        move |index, _, cx| {
-                            items
-                                .get(index)
-                                .map(|item| row(item, expanded.contains(&item.id), cx))
-                                .unwrap_or_else(|| div().into_any_element())
-                        },
-                    )
+                    list(shell.scroller.read(cx).list.clone(), move |index, _, cx| {
+                        items
+                            .get(index)
+                            .map(|item| {
+                                let t = cx.global::<Theme>();
+                                let turn = turns.get(&item.turn);
+                                let outcome = turn
+                                    .filter(|_| {
+                                        items
+                                            .get(index + 1)
+                                            .is_none_or(|next| next.turn != item.turn)
+                                    })
+                                    .and_then(turn_outcome_line);
+                                div()
+                                    .v_flex()
+                                    .w_full()
+                                    .gap(t.space.0[3])
+                                    .child(row(item, expanded.contains(&item.id), cx))
+                                    .when_some(
+                                        turn.filter(|turn| turn.state == TurnState::Queued)
+                                            .and(wait_reason.as_ref()),
+                                        |row, reason| {
+                                            row.child(
+                                                div()
+                                                    .text_size(t.text.meta.size)
+                                                    .text_color(t.colors.text_muted)
+                                                    .child(reason.clone()),
+                                            )
+                                        },
+                                    )
+                                    .when_some(outcome, |row, outcome| {
+                                        row.child(
+                                            div()
+                                                .text_size(t.text.meta.size)
+                                                .text_color(t.colors.text_muted)
+                                                .child(outcome),
+                                        )
+                                    })
+                                    .into_any_element()
+                            })
+                            .unwrap_or_else(|| div().into_any_element())
+                    })
                     .size_full()
-                    .with_jump_button_transition(t.motion.menu[0].duration),
+                    .into_any_element(),
                 ),
         )
+        .when(!shell.scroller.read(cx).follow, |content| {
+            content.child(
+                labelled_button("latest", "Latest", cx).on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(ScrollTranscriptEnd), cx)
+                }),
+            )
+        })
         .child(
             div()
                 .w_full()
@@ -246,4 +453,67 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
         _ => ("other", String::new(), true),
     };
     serde_json::json!({"id":item.id,"turn":item.turn,"kind":kind,"text":text,"done":done,"body":item.body})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_input;
+    use veyra_engine::domain::*;
+    #[test]
+    fn turn_outcome_line() {
+        let mut turn = Turn {
+            id: TurnId::new(),
+            thread: ThreadId::new(),
+            ordinal: 1,
+            origin: TurnOrigin::Provider,
+            state: TurnState::Running { since: 1000 },
+        };
+        assert_eq!(super::turn_outcome_line(&turn), None);
+        turn.state = TurnState::Ended {
+            outcome: TurnOutcome::Completed,
+            started: Some(1000),
+            at: 43_000,
+        };
+        assert_eq!(super::turn_outcome_line(&turn), Some("Done in 42s".into()));
+        turn.state = TurnState::Ended {
+            outcome: TurnOutcome::Interrupted {
+                reason: "Stopped by you".into(),
+            },
+            started: Some(1000),
+            at: 17_000,
+        };
+        assert_eq!(
+            super::turn_outcome_line(&turn),
+            Some("Stopped by you after 16s".into())
+        );
+        turn.state = TurnState::Ended {
+            outcome: TurnOutcome::Failed {
+                message: "No account\nprivate tail".into(),
+            },
+            started: None,
+            at: 10,
+        };
+        assert_eq!(
+            super::turn_outcome_line(&turn),
+            Some("Failed · No account".into())
+        );
+    }
+    #[test]
+    fn failed_tool_last_line() {
+        let mut tool = ToolItem {
+            call: ToolCall {
+                name: "Bash".into(),
+                arguments: serde_json::json!({"command":"false"}),
+            },
+            output_tail: String::new(),
+            result: Some(ToolResult {
+                ok: false,
+                output_tail: Some("first\nlast line  \n\n".into()),
+            }),
+        };
+        assert_eq!(super::failed_tool_last_line(&tool), Some("last line"));
+        tool.result.as_mut().unwrap().ok = true;
+        assert_eq!(super::failed_tool_last_line(&tool), None);
+        assert_eq!(tool_input(&tool.call.arguments), "false");
+    }
 }

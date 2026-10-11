@@ -49,7 +49,7 @@ if LANE == 'live':
     capture('chat-working')
     done = ctl('chat-live-done','wait',thread,'Done','120')
     save('chat-done',done)
-    reply = [item for item in done['transcript'] if item['kind']=='assistant']
+    reply = [item for item in done['transcript']['items'] if item['kind']=='assistant']
     assert len(reply) == 1 and reply[0]['text'].strip().lower() == 'ok' and reply[0]['done']
     assert reply[0]['delta_count'] >= 1
     assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"'")) == 'Completed'
@@ -67,10 +67,10 @@ thread = create('chat','reply with the word ok',slow=True)
 working = ctl('chat-wait-working','wait',thread,'Working')
 assert working['selected_thread']['status'] == 'Working'
 stream = poll('chat-working',lambda d: any(item['kind']=='assistant' and item['text']=='o'
-    and not item['done'] for item in d['transcript']))
+    and not item['done'] for item in d['transcript']['items']))
 assert stream['selected_thread']['status'] == 'Working'
 assert stream['selected_thread']['header_status'].startswith('Working · ')
-assert next(item for item in stream['transcript'] if item['kind']=='assistant')['delta_count'] >= 1
+assert next(item for item in stream['transcript']['items'] if item['kind']=='assistant')['delta_count'] >= 1
 assert stream['composer_text'] == ''
 assert stream['selected_thread']['native_id']
 capture('chat-working')
@@ -81,8 +81,8 @@ assert advanced['selected_thread']['header_status'] != stream['selected_thread']
 done = ctl('chat-wait-done','wait',thread,'Done')
 save('chat-done',done)
 assert done['view'] == 'chat' and done['selected_thread']['status'] == 'Done'
-assert [item['text'] for item in done['transcript'] if item['kind']=='user'] == ['reply with the word ok']
-assert [(item['text'],item['done']) for item in done['transcript'] if item['kind']=='assistant'] == [('ok',True)]
+assert [item['text'] for item in done['transcript']['items'] if item['kind']=='user'] == ['reply with the word ok']
+assert [(item['text'],item['done']) for item in done['transcript']['items'] if item['kind']=='assistant'] == [('ok',True)]
 assert done['perf']['applied_batches'] > before['perf']['applied_batches']
 assert json.loads(sql("select outcome_json from turns where thread_id='"+thread
     +"' order by ordinal desc limit 1")) == 'Completed'
@@ -107,25 +107,25 @@ ctl('chat-retry-key','keys','secondary-r')
 retry = ctl('chat-retry-wait','wait',failed,'Done')
 save('chat-retried',retry)
 assert retry['view'] == 'chat'
-assert [(item['text'],item['done']) for item in retry['transcript'] if item['kind']=='assistant'][-1] == ('ok',True)
+assert [(item['text'],item['done']) for item in retry['transcript']['items'] if item['kind']=='assistant'][-1] == ('ok',True)
 tool_thread = create('chat-tool','Run echo veyra-probe',scenario='bash-echo')
 tools = ctl('chat-tool-done','wait',tool_thread,'Done')
-tool = next(item for item in tools['transcript'] if item['kind']=='tool')
+tool = next(item for item in tools['transcript']['items'] if item['kind']=='tool')
 assert tool['done'] and tool['text'] == 'veyra-probe' and not tool['expanded']
 capture('chat-tool-collapsed')
 action('chat-tool-expand','ToggleItem',{'item':tool['id']})
-assert next(item for item in ctl('chat-tool-expanded','dump')['transcript'] if item['id']==tool['id'])['expanded']
+assert next(item for item in ctl('chat-tool-expanded','dump')['transcript']['items'] if item['id']==tool['id'])['expanded']
 capture('chat-tool-expanded')
 action('chat-tool-collapse','ToggleItem',{'item':tool['id']})
-collapsed = ctl('chat-tool-collapsed-action','dump')['transcript']
+collapsed = ctl('chat-tool-collapsed-action','dump')['transcript']['items']
 assert not next(item for item in collapsed if item['id']==tool['id'])['expanded']
-latest = next(item['id'] for item in reversed(tools['transcript']) if item['kind'] in ['tool','reasoning'])
+latest = next(item['id'] for item in reversed(tools['transcript']['items']) if item['kind'] in ['tool','reasoning'])
 action('chat-detail-default-expand','ToggleItem')
-assert next(item for item in ctl('chat-detail-default-expanded','dump')['transcript'] if item['id']==latest)['expanded']
+assert next(item for item in ctl('chat-detail-default-expanded','dump')['transcript']['items'] if item['id']==latest)['expanded']
 action('chat-detail-default-collapse','ToggleItem')
 for expanded in [True,False]:
     ctl('chat-detail-key-'+str(expanded),'keys','secondary-shift-i')
-    items = ctl('chat-detail-key-after-'+str(expanded),'dump')['transcript']
+    items = ctl('chat-detail-key-after-'+str(expanded),'dump')['transcript']['items']
     assert next(item for item in items if item['id']==latest)['expanded'] == expanded
 background = create('chat-background','reply with the word ok',scenario='background-tasks')
 busy = background_working('chat-background-working',background)
@@ -146,13 +146,122 @@ assert sql("select count(*) from items where turn_id='"+provider_turn+"'") == '1
 reply = 'The background `sleep 20` finished with exit code 0.'
 assert sql("select kind||'|'||json_extract(body_json,'$.AssistantText.text')||'|'||done "
     +"from items where turn_id='"+provider_turn+"'") == 'assistant_text|'+reply+'|1'
-assert [(item['kind'],item['text'],item['done']) for item in provider_done['transcript']
+assert [(item['kind'],item['text'],item['done']) for item in provider_done['transcript']['items']
     if item['kind'] in ['assistant','reasoning']] == [('assistant','started',True),('assistant',reply,True)]
+# The failed turn's own prompt survives a newer queued message.
+records = [json.loads(line) for line in (SOURCE/'crash-mid-turn.jsonl').read_text().splitlines()]
+records[2]['line']['response']={'subtype':'error','request_id':'<id:initialize>',
+    'error':'fixture first-turn failure'}
+records[2]['after_ms']=3000
+records = records[:3]+[records[-1]]
+stage_records(records)
+retry_thread = create('chat-retry-queued','failed prompt',scenario=None)
+ctl('chat-retry-queued-working','wait',retry_thread,'Working')
+ctl('chat-retry-newer-text','text','queued prompt')
+action('chat-retry-newer-send','Send')
+poll('chat-retry-original-failed',lambda d: sql("select count(*) from turns where thread_id='"+retry_thread
+    +"' and json_type(outcome_json,'$.Failed') is not null")=='1')
+stage('ok-reply',slow=True,turns=2)
+action('chat-retry-own-prompt','Retry')
+poll('chat-retry-both-done',lambda d: sql("select count(*) from turns where thread_id='"+retry_thread
+    +"' and outcome_json='\"Completed\"'")=='2')
+assert sql("select group_concat(json_extract(i.body_json,'$.UserText'),'|') from turns t "
+    +"join items i on i.id=json_extract(t.origin_json,'$.User.item') where t.thread_id='"+retry_thread+"'") == 'failed prompt|queued prompt|failed prompt'
+# Make a long streaming row from Veyra's own ok fixture, then drive the actual list scroll API.
+records = [json.loads(line) for line in (SOURCE/'ok-reply.jsonl').read_text().splitlines()]
+long_text = '\n\n'.join('Line '+str(i)+': Veyra follow probe' for i in range(200))
+for record in records:
+    wire = record.get('line',{})
+    if wire.get('event',{}).get('delta',{}).get('text')=='ok':
+        wire['event']['delta']['text']=long_text
+    if wire.get('type')=='result': record['after_ms']=3000
+delta = next(i for i,record in enumerate(records) if record.get('line',{}).get('event',{}).get('delta',{}).get('type')=='text_delta')
+part = json.loads(json.dumps(records[delta]))
+part['line']['event']['delta']['text']='\n\nAfter scroll'
+part['after_ms']=500
+records.insert(delta+1,part)
+stage_records(records)
+follow_thread = create('chat-follow','Show a long reply',scenario=None)
+poll('chat-follow-streaming',lambda d: any(item['kind']=='assistant' and len(item['text'])>1000 for item in d['transcript']['items']))
+assert ctl('chat-follow-attached','dump')['transcript']['follow']
+action('chat-follow-scroll','DebugScrollTranscript',{'pixels':-200})
+detached = poll('chat-follow-detached',lambda d: not d['transcript']['follow'])
+capture('chat-follow-detached')
+ctl('chat-follow-ended','wait',follow_thread,'Done')
+assert not ctl('chat-follow-after-new-text','dump')['transcript']['follow']
+gap = ctl('chat-follow-gap','dump')['transcript']['gap']
+action('chat-follow-outside-line','DebugScrollTranscript',{'pixels':gap-25})
+outside = poll('chat-follow-25',lambda d: 24.5 < d['transcript']['gap'] < 25.5)
+assert not outside['transcript']['follow']
+action('chat-follow-within-line','DebugScrollTranscript',{'pixels':1})
+poll('chat-follow-24',lambda d: d['transcript']['follow'])
+capture('chat-follow-latest')
+action('chat-follow-focus-up','ScrollTranscriptUp')
+ctl('chat-follow-up-key','keys','pageup')
+assert not ctl('chat-follow-up','dump')['transcript']['follow']
+ctl('chat-follow-down-key','keys','pagedown')
+ctl('chat-follow-end-key','keys','secondary-end')
+assert ctl('chat-follow-end','dump')['transcript']['follow']
+# Failed tool output is visible without expanding; expansion keeps its top edge.
+records = [json.loads(line) for line in (SOURCE/'bash-echo.jsonl').read_text().splitlines()]
+for record in records:
+    wire = record.get('line',{})
+    if wire.get('type')=='user':
+        for block in wire.get('message',{}).get('content',[]):
+            if isinstance(block,dict) and block.get('type')=='tool_result':
+                block['is_error']=True
+                block['content']='first diagnostic\nlast tool error\n'
+stage_records(records)
+failed_tool = create('chat-failed-tool','Show a failed tool',scenario=None)
+tool_dump = ctl('chat-failed-tool-done','wait',failed_tool,'Done')
+failed_row = next(item for item in tool_dump['transcript']['items'] if item['kind']=='tool')
+assert failed_row['failed_last_line']=='last tool error' and not failed_row['expanded']
+capture('chat-failed-tool')
+index = next(i for i,item in enumerate(tool_dump['transcript']['items']) if item['id']==failed_row['id'])
+old_top = tool_dump['transcript']['item_tops'][index]
+action('chat-failed-tool-expand','ToggleItem',{'item':failed_row['id']})
+expanded = poll('chat-failed-tool-expanded',lambda d: next(item for item in d['transcript']['items'] if item['id']==failed_row['id'])['expanded'])
+assert abs(expanded['transcript']['item_tops'][index]-old_top)<1
+capture('chat-failed-tool-expanded')
+signed = create('chat-signed-out','Sign-in failure',scenario='assistant-error-signed-out')
+signed_dump = ctl('chat-signed-out-failed','wait',signed,'Failed')
+assert 'Claude is signed out. Sign in from a terminal' in signed_dump['selected_thread']['failure']
+capture('chat-signed-out')
+records = [json.loads(line) for line in (SOURCE/'assistant-error-signed-out.jsonl').read_text().splitlines()]
+records[4]['after_ms']=3000
+stage_records(records)
+retire = create('chat-retire','Fail then queue',scenario=None)
+old_pid = int(sql("select live_pid from threads where id='"+retire+"'"))
+ctl('chat-retire-queue-text','text','after sign-in failure')
+action('chat-retire-queue-send','Send')
+stage('ok-reply',slow=True)
+new_pid = poll('chat-retire-new-pid',lambda d: sql("select live_pid from threads where id='"+retire+"'") not in ['',str(old_pid)])
+ctl('chat-retire-done','wait',retire,'Done')
+assert sql("select count(*) from turns where thread_id='"+retire+"' and outcome_json='\"Completed\"'")=='1'
+compact = create('chat-compact','Compact',scenario='compact-and-clear')
+ctl('chat-compact-done','wait',compact,'Done')
+ctl('chat-clear-text','text','Clear')
+action('chat-clear-send','Send')
+clear = poll('chat-clear-done',lambda d: d['selected_thread']['id']==compact
+    and sql("select count(*) from turns where thread_id='"+compact+"' and state='ended'")=='2')
+assert len([item for item in clear['transcript']['items'] if item['kind']=='notice'])==2
+capture('chat-compact-clear')
+action('chat-compact-close','StopThread',{'thread':compact})
+for scenario, count in [('bad-lines',1),('notices',3)]:
+    thread = create('chat-'+scenario,'reply with the word ok',scenario=scenario)
+    dump = ctl('chat-'+scenario+'-done','wait',thread,'Done')
+    assert len([item for item in dump['transcript']['items'] if item['kind']=='notice'])==count
+    if scenario=='bad-lines': assert any(item['kind']=='assistant' and item['text']=='ok' for item in dump['transcript']['items'])
+    capture('chat-'+scenario)
 poll('chat-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null') == '0')
 page_done('chat-send-stream')
 print('PASS chat streamed o → ok, Working → Done; crash cause/tail; Retry; wait exits 0/1/2/3')
 PY
 ```
+
+DebugScrollTranscript scrolls the same public gpui list state used by keys and the wheel; its pixels payload tests the 24 px boundary.
+ScrollTranscriptUp, ScrollTranscriptDown and ScrollTranscriptEnd use Page Up, Page Down and Command+End.
+The debug transcript also reports gap, top_item, top_offset and item_tops for scroll and expansion assertions.
 
 ## Observable success
 
@@ -170,10 +279,14 @@ PY
 - `chat-tool-done.json` has a completed collapsed tool with captured output `veyra-probe`; the action and key assert its expanded state, with collapsed/expanded PNGs.
 - Thread selection and transcript loading use the snapshot fence, not a UI database read.
 
+`chat-follow-25.json` remains detached at 25 px and `chat-follow-24.json` reattaches within one read line.
+The failed-tool PNG shows the last diagnostic while collapsed; its expansion assertion compares the same row top.
+The signed-out, retirement and notice dumps cover M3's account and notice window behavior.
+
 ## Gotchas
 
 Replay is not a live permission or tool proof.
-No approvals, questions or Stop UI are implemented.
+Approvals, questions and Stop are covered by their M3 pages.
 A streamed row may complete before the turn ends; the header remains Working until the result.
 Open Terminal and native mouse/keyboard entry points remain manual checks.
 The lead fills the Status values after its gate.

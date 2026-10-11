@@ -19,3 +19,24 @@ fn interrupt_reason_names_you() {
         } if reason == "Stopped by you"));
     }
 }
+
+#[test]
+fn stop_drops_queued_user_turns() {
+    let mut f = Fixture::new(LiveState::Running);
+    let first = f.user("one");
+    let second = f.user("two");
+    f.command(Command::StopThread { thread: f.thread }).unwrap();
+    for id in [first, second] {
+        assert!(matches!(
+            f.loaded().turns[&id].state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Interrupted { .. },
+                ..
+            }
+        ));
+    }
+    assert_eq!(
+        f.loaded().threads[&f.thread].hold,
+        Some(HoldReason::Stopped)
+    );
+}

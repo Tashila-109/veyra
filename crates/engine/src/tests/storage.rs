@@ -545,3 +545,40 @@ fn loading_empty_cli_versions_does_not_write() {
         .unwrap();
     assert_eq!(stored, "");
 }
+#[test]
+fn storage_failure_stops_starting_spawn() {
+    let mut f = Fixture::new(LiveState::Starting);
+    f.actor.fail_write = true;
+    f.event(ProviderEvent::Session(SessionEvent::BackgroundWork {
+        pending: true,
+    }));
+    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Shutdown);
+    assert!(matches!(
+        f.command(Command::Send {
+            thread: f.thread,
+            text: "later".into()
+        }),
+        Err(CommandError::StorageBlocked(_))
+    ));
+}
+#[test]
+fn storage_failure_uses_storage_control() {
+    let mut f = Fixture::new(LiveState::Running);
+    f.actor.fail_write = true;
+    f.event(turn_event(
+        f.running(),
+        TurnEvent::TextDelta {
+            key: NativeItemKey("blocked-item".into()),
+            text: "partial".into(),
+            streamed: true,
+        },
+    ));
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::StorageBlocked
+    );
+    assert!(matches!(
+        f.loaded().turns[&f.running().unwrap()].state,
+        TurnState::Running { .. }
+    ));
+}

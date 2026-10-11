@@ -48,6 +48,36 @@ fn dump_keys(source: &str) -> BTreeSet<String> {
     keys
 }
 #[test]
+fn verify_m3_nested_dump_names() {
+    let skill =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.agents/skills/verify-veyra/SKILL.md");
+    let map = fs::read_to_string(skill).unwrap();
+    let mapped: BTreeSet<_> = identifiers(&map).collect();
+    for name in [
+        "follow",
+        "gap",
+        "top_item",
+        "top_offset",
+        "item_tops",
+        "outcome",
+        "wait_reason",
+        "failed_last_line",
+        "stop_visible",
+        "dock",
+        "request",
+        "position",
+        "count",
+        "focused",
+        "question_index",
+        "posted",
+        "open",
+        "threads",
+        "hold",
+    ] {
+        assert!(mapped.contains(name), "verify-veyra map is missing {name}");
+    }
+}
+#[test]
 fn verify_map_names() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let skill = root.join(".agents/skills/verify-veyra");

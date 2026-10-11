@@ -10,9 +10,12 @@ The engine never depends on gpui.
 
 Claude sessions, readiness probes, replay fixtures and debug recording are implemented.
 Codex and Grok have placeholder readiness but no codec.
-Claude approvals, questions, cancel replies and exact thread grants reach the engine; their window dock is not implemented.
-Startup reaps marked orphan CLI groups, and the actor owns keep-awake and debug performance counters.
-There is no PTY, tool server, notification banner or quit sheet.
+Claude approvals and questions reach a window dock whose actions send typed decisions through the engine.
+Exact thread grants and deny/cancel replies are persisted before their provider controls run.
+Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
+The window owns render and event-batch counters.
+Inactive-window family changes post system banners, and busy Quit opens a sheet.
+There is no PTY or tool server.
 
 ### System architecture
 
@@ -28,6 +31,8 @@ main -> tokio runtime -> Engine actor -> veyra.db
                               +--------------------> Engine actor
 Shell -> runtime readiness probes -> initialize-only CLI process
 Shell -> runtime branch task -> git child
+Engine startup -> validated orphan sweep -> veyra-reaper thread
+Engine actor -> owned caffeinate idle-sleep assertion
 
 debug ctl -> private Unix socket -> socket thread -> gpui window actions
                                          debug session -> recorder / fake CLI
@@ -73,6 +78,8 @@ A second launch refuses the folder and exits 1.
 The OS releases the lock on exit or crash.
 `process::start` validates stored pid/group pairs against a provider leader's argv and its dead-parent `VEYRA_PARENT_PID` marker before signalling.
 A background sweep lists argv first and reads environments only for Claude, Codex, Grok or Veyra leaders.
+The sweep covers every same-user marked agent or Veyra group whose marker parent is dead, from any data folder.
+Every launch runs it, including disposable verification instances and tests that call Engine::start.
 It sends SIGTERM to validated orphans and revalidates them before SIGKILL one second later.
 Live parents, missing or invalid markers, reused non-agent pids and unrelated processes are left alone.
 Process arguments and environment values are never logged; the macOS environment read uses `KERN_PROCARGS2`.
@@ -87,15 +94,21 @@ It does not read `RUST_LOG`, so that variable cannot suppress readiness.
 The debug listener binds before the window opens.
 `Window::on_next_frame` prints `veyra ready pid=PID data_dir=DIR` to stderr and the log after the first frame.
 `build.rs` embeds Git HEAD, or `unknown` outside Git, and watches HEAD, its reflog, packed refs and the current loose ref.
-Quit cancels the branch task, enqueues engine shutdown and calls `cx.quit()` immediately; Quit does not wait for providers.
+Quit opens a sheet listing running, Starting and background-busy threads, or runs ConfirmQuit immediately when none are busy.
+CancelQuit dismisses it and restores composer focus.
+ConfirmQuit cancels the branch task, awaits Engine::shutdown_wait in a gpui task, then calls cx.quit.
+The debug ctl quit verb dispatches ConfirmQuit directly.
 `Engine::shutdown_wait` refuses new commands, ends running turns, expires pending requests and asks every session to shut down.
+Shutdown persists Restarted holds for running, Starting and background-busy threads in its own transaction.
+It expires pending requests with "Veyra is closing" before ending turns.
+A Restarted hold remains Held even without a queued turn; Send with an empty queue or Continue clears it.
 Sessions queue deny/cancel replies before the protocol interrupt and give the writer up to one second to drain before group cleanup.
 Cleanup terminates their owned groups and kills survivors one second later.
 After the shutdown commit attempt, a three-second deadline ends the actor's session wait when its message is handled.
 If that write fails, pending row changes remain blocked while sessions still receive Shutdown.
 Database work and queued messages can delay handling that deadline; shutdown_wait bounds its own wait with a three-second runtime timeout.
 `Engine::on_app_quit` sends SIGTERM to every registered provider/probe group, enqueues shutdown and waits 100 ms on the runtime.
-The current window Quit action does not call on_app_quit or await shutdown_wait, so its provider groups can outlive the app.
+The application registers on_app_quit with gpui, covering native termination as well as ConfirmQuit.
 macOS termination does not promise Rust destructors, so verification explicitly cleans run-owned provider groups.
 
 ## Actor decisions, storage and recovery
@@ -117,7 +130,8 @@ StartTurn effects name the turn until install builds its text from committed ite
 The send-to-reply path is ordered as follows.
 
 1. CreateThread stores the thread and user item with a queued turn.
-2. The Spawn effect starts the session on its own process group; an exit before Ready fails the oldest queued turn and holds the thread as Stopped.
+2. The Spawn effect starts the session on its own process group.
+While the thread is still Starting, an exit before Ready fails the oldest queued turn and holds the thread as Stopped.
 3. A matched initialize reply or system/init publishes Ready and changes Starting to Structured.
 4. start_changed makes the queued turn Running and dispatches StartTurn with committed prompt text.
 The first prompt waits for Ready.
@@ -148,23 +162,34 @@ The actor waits for Exited before parking and spawning eligible queued work.
 A late end cannot settle another turn.
 Idle structured sessions park after ten minutes without a running turn, pending request or background work.
 The engine supports holds, queue reasons, cascaded Stop/Archive, Interrupt, Respond, wake delivery and task settlement.
-Those controls and cards have no window UI.
+The window exposes Stop, StopThread, Respond, Continue and DiscardQueued; task cards remain unimplemented.
 On a Starting thread, Stop, Archive and Interrupt send Shutdown and wait in Stopping for Exited.
 The session receives that control before stdout; if the child has not launched yet it stops the group once launch returns and emits no Ready.
 A Ready from an already-running initialization is ignored after the actor leaves Starting.
 On a running Structured thread, those controls end the engine turn with Interrupted and "Stopped by you", keep its session and send the protocol interrupt.
 `Live::Structured.draining` keeps that ended turn's id until its own CLI end arrives.
 Queued work with no hold waits with `WaitReason::Stopping` during the drain.
-Send preserves an existing hold, and Continue clears it without adding a turn.
+Send keeps an existing hold only while a turn is queued.
+With no queued turn it clears the hold, so a Send after Stop waits with WaitReason::Stopping for the drain.
+Continue clears a hold without adding a turn.
 An uncorrelated tail from a drained Provider-origin turn is logged and dropped before it can open another turn.
 The old CLI end clears the drain; the same change applies the start rule, which still refuses Stopping sessions.
-Stop and Archive also discard queued turns and set a Stopped hold, while Interrupt keeps them and sets an Interrupted hold.
+Stop and Archive also discard queued user and task turns and set a Stopped hold, while Interrupt keeps them and sets an Interrupted hold.
 All three preserve an existing hold.
-Command-table fixtures retain a bare control receiver with no task to answer it, so their stop transitions remain Stopping.
 Tasks cannot arise through the application because the tool server is not implemented.
-`can_use_tool` opens a typed approval or AskUserQuestion request; unknown control subtypes receive an error response.
-A pending request makes the thread NeedsYou in the engine, but no window control can answer it yet.
+`can_use_tool` opens a typed approval or AskUserQuestion request.
+Unknown subtypes and malformed requests receive an error response without opening a request.
+Malformed includes empty tool names or ids, ids reused within the process lifetime, non-object input, missing question text or option labels, and duplicate question texts.
+A pending request makes the thread NeedsYou and docks its exact command or question above the composer.
+AllowOnce, AllowInThread and Deny answer approvals; AnswerQuestion collects one answer per question.
+Only an input whose keys are command, description or timeout may offer an exact-command thread grant.
+Inputs with any other field always dock without a grant offer.
+The dock shows 1 of N for multiple pending requests, and number keys answer only while it has focus.
+Stop expires pending requests, and the provider queues cancel replies before interrupt.
+There is no automatic request timeout.
 Respond persists an answer before dispatching the native reply; question answers also add a user transcript item.
+The command and codec boundaries share RequestKind::accepts; a mismatched codec answer sends nothing and leaves its request pending.
+The codec keeps used native request ids for the process lifetime so delayed replies cannot authorize a later request.
 AllowInThread stores the exact thread, tool and command in grants, and a later identical request is allowed without RequestOpened.
 Other commands, tools and threads still dock, including compound commands and requests in Full access.
 Turn completion and process exit expire pending requests and publish RequestClosed in the same transaction.
@@ -219,7 +244,8 @@ Oversized lines and invalid JSON are skipped; diagnostics reveal lengths rather 
 Each accepted stdout line is parsed once and its value passes through recording, root decoding and subagent decoding.
 The bounded stderr tail is redacted before display and supplies failures when the CLI exits unexpectedly.
 Interrupt and Shutdown queue deny replies for every open approval and question with `interrupt: true` before the protocol interrupt.
-An interrupt ladder belongs to the active turn: it sends group SIGTERM after three seconds and SIGKILL one second later.
+The codec owns an active turn's interrupt ladder and both deadlines: group SIGTERM after three seconds, then SIGKILL one second later.
+Typed StopReason values distinguish user, storage-blocked and app-closing interruptions.
 An ended turn ignores a late interrupt, and both a turn end and a new prompt clear the old ladder.
 Human interrupts use "Stopped by you"; storage and shutdown carry their own reasons.
 A session without a turn never arms that ladder.
@@ -230,10 +256,11 @@ A group still present after the final cleanup deadline produces a bounded warnin
 The normal session path discards other cleanup errors.
 A supervisor waits for registered cleanup even if the session task panics.
 The actor stores pid and group on Ready and parks on Exited.
-An exit before Ready fails the oldest queued turn and holds the thread as Stopped.
+While the thread is still Starting, an exit before Ready fails the oldest queued turn and holds the thread as Stopped.
+After Stop, Archive or Interrupt it only parks.
 
 `claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, request references and background-work replacement.
-Unknown protocol metadata logs its category without frame content, and unsupported control subtypes get an error reply.
+Unknown protocol metadata logs its category without frame content, and unsupported or malformed control requests get an error reply.
 The first spawn uses a Veyra UUID with --session-id; later spawns use --resume.
 Mode maps to default, acceptEdits or bypassPermissions plus --allow-dangerously-skip-permissions.
 An initialize reply can open the Ready gate before the prompt causes system/init to supply native id, version and capabilities.
@@ -243,6 +270,7 @@ Assistant error words latch per prompt, and account-related classes park the pro
 An active Veyra interrupt overrides that error outcome and suppresses newly arriving diagnostic text, including streamed blocks.
 Without an active Veyra interruption or latched assistant error, externally observed SIGHUP, SIGINT, SIGTERM or conventional signal exit codes produce Interrupted.
 Cleanup-generated signals do not change the outcome.
+After stdout EOF, the session waits up to one second for the natural leader status before beginning cleanup, avoiding an exit-status race.
 Other abnormal exits produce Failed with Veyra's bounded, redacted crash text.
 Streamed and final blocks share native keys so final frames do not duplicate delivered text.
 Each background_tasks_changed replaces the pending set; ambient tasks never keep the thread Working.
@@ -326,13 +354,21 @@ The header reads title, status/elapsed time, project and a separate Git branch t
 Branch lookup starts once the selected Chat thread's cwd is known, either at selection or after an event batch supplies its row.
 The retained task prevents another lookup until Chat is left or a thread is reselected.
 That child inherits the app environment, has kill-on-drop and no timeout.
-`Shell::show` and Quit call `forget_branch` to cancel the task and clear the displayed branch.
+Entering Settings clears the displayed branch and lets an in-flight lookup finish; its selection and view checks discard that late reply.
+Other view changes and Quit call `forget_branch` to cancel the task and clear the displayed branch.
 Dropping the Shell also cancels the task, and its reply checks the selection identity.
-The centred transcript uses MessageScroller and selectable Markdown TextView for assistant text, a still stream caret, collapsed reasoning/tools and notices.
+The centred transcript uses a window-owned MessageScrollerState over gpui ListState and selectable Markdown TextView.
+The still stream caret follows assistant text; reasoning and tool toggles align left and tool input uses readable command or field lines.
+Failed tools show their last nonempty output line while collapsed, and each ended turn's final item carries its outcome and elapsed seconds.
+A user scroll detaches following; new text, requests and tool rows preserve that state.
+Scrolling within the theme's 24 px read line of the bottom or choosing Latest reattaches.
+Expanding a row remeasures it without moving its top anchor.
 The actor trims stored tool output to its last 10,000 characters.
-The failed view appears when the newest turn failed and shows the cause, next step, Retry and Open Terminal on the project folder.
-Retry probes again; once the thread's provider is Ready it clears any hold and resends the newest user text in the transcript as a new turn.
-If a second message was queued before Ready when the first turn failed, the thread shows Held without the failed view, and Retry clears the hold, so the queued second message runs and is then sent again, while the first prompt remains failed.
+The actor publishes each window thread's wait reason and busy flag after reconciliation and every installed change; Engine::window_threads reads that snapshot.
+Streamed text and tool input remain unbounded outside the 4 MiB wire-line cap.
+The failed view uses the latest nonqueued turn and shows the cause, next step, Retry and Open Terminal on the project folder.
+Retry probes again; once the thread's provider is Ready it clears any hold and resends the failed turn's own user item as a new turn.
+A newer queued message remains queued and is never reused as the Retry prompt.
 Send also clears a hold when the thread has no queued turn.
 
 The composer uses TextareaState and provider/model/effort/permission chips.
@@ -347,12 +383,23 @@ New thread resets text and reads the current stored default.
 Settings occupies the main column, opens through OpenSettings/Menu/Command-comma and exposes one three-mode row.
 SetDefaultMode publishes SettingsChanged; Escape or thread/project selection leaves Settings.
 
-`ui/actions.rs` owns actions, keys and the native menu.
+`ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
+Ctrl+C is literal control in the composer and preserves its draft while interrupting the turn.
+Approval chords are Command+Return, Command+Option+Return and Command+period.
+NextNeedsYou scans sidebar order for NeedsYou before Failed, wrapping once and including child rows.
+The composer shows Stop while a turn runs and its draft is empty, plus held reasons, Continue and Discard queued.
 The Theme global owns all colours, geometry, type, radii and motion tokens.
 Theme::apply projects them through the kit and follows macOS appearance.
 Violet marks focus, caret, selection, streaming and Working status; selected controls and hover remain neutral.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
 The requested window is 1280 by 800 with a 760 by 560 minimum; a window manager can override it.
+
+`ui/notify.rs` derives banners only when an inactive window's family enters NeedsYou, Done or Failed.
+Family status includes unarchived children, so pending background work prevents a Done banner.
+The banner contains only the family root title and status, never transcript text.
+Its root-id tag lets a click activate the window and select the root or the first child needing attention.
+`scripts/bundle-app.sh` builds an unsigned macOS app bundle with dev.veyra.app identity for system notification delivery.
+System permission and native banner clicks require operator verification.
 
 ## Debug protocol and verification trust
 
@@ -367,7 +414,7 @@ Lines are limited to 65536 bytes, socket reads/writes and UI-reply waits to two 
 An incremental same-user sender can keep a line read occupied inside the per-read timeout.
 A full queue rejects before enqueueing; a reply timeout does not cancel an action already queued.
 
-Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler, and quit dispatches Quit.
+Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler, and quit dispatches ConfirmQuit.
 Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
 Debug counts are removed when their items leave the projection or the thread is archived.
@@ -392,9 +439,11 @@ The pure needs_awake predicate controls that guard, whose drop stops its owned c
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, repaints and max_batch_events.
+actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
+Dump includes pending requests, quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
 Every actor message is timed, and a message over 50 ms logs its kind and duration.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
-Its selection rejects unsupported targets with compile_error.
+Platform module selection rejects unsupported targets with compile_error.
 The textual platform_boundary test is a guard, not proof against every indirect OS call; review still checks indirect commands and strings.
 
 ## Source map
@@ -405,6 +454,7 @@ The textual platform_boundary test is a guard, not proof against every indirect 
 - [Provider boundary](crates/engine/src/provider/mod.rs), [environment](crates/engine/src/provider/env.rs), [sessions/probes](crates/engine/src/provider/session.rs), [Claude codec](crates/engine/src/provider/claude.rs).
 - [Fixture format](crates/engine/src/fixture.rs), [fake CLI](crates/engine/src/bin/veyra-fake-cli.rs), [recording/redaction](crates/engine/src/record.rs).
 - [Window/pump/fence/branch](crates/veyra/src/ui/mod.rs), [transcript](crates/veyra/src/ui/transcript.rs), [composer](crates/veyra/src/ui/composer.rs), [Settings](crates/veyra/src/ui/settings.rs), [actions](crates/veyra/src/ui/actions.rs), [theme](crates/veyra/src/ui/theme.rs).
+- [Banner decisions](crates/veyra/src/ui/notify.rs), [macOS app bundle](scripts/bundle-app.sh).
 - [Process supervision](crates/engine/src/process.rs), [Platform mechanisms](crates/engine/src/platform/macos.rs), [selection](crates/engine/src/platform/mod.rs), [boundary guard](crates/engine/src/platform/boundary.rs).
 - [Driver](crates/veyra/src/control.rs), [name coverage](crates/veyra/src/verify_map.rs), [verification skill](.agents/skills/verify-veyra/SKILL.md).
 
@@ -412,24 +462,24 @@ The textual platform_boundary test is a guard, not proof against every indirect 
 
 Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
 replay_claude uses the real session task with the fake CLI for text and tools, prompt correlation, provider-turn completion, resume, crash and error outcomes, background replacement and readiness.
+It covers approvals, questions, unknown requests, Stop with a pending approval and late interrupts.
 It also checks assistant-error parking, interrupt outcomes and ladder cancellation, subagent isolation against the live Agent recording, notices and malformed-byte recovery.
 Actor tests cover retirement before queued work, the Stop drain, Provider-tail rejection and skipped text-only transactions.
 Platform tests check the two-second login-shell bound, inherited-pipe deadline and group nice value.
 Session tests check process exit classification and cleanup ordering.
-Grant and awake tests check request expiry, exact matching, thread isolation, needs_awake and retained-guard flags.
+Request, grant and awake tests check request expiry, exact matching, thread isolation, needs_awake and retained-guard flags.
 They do not inspect caffeinate liveness or the OS assertion lifetime.
 Reaper tests check live parents, non-agent argv and the environment-read boundary.
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
 Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
 Application tests enable gpui test-support to exercise Shell selection and its event pump in a synthetic window.
-Shell tests load the login-shell PATH as the app does, and run no provider CLI.
+Shell tests load the login-shell PATH as the app does, run no provider CLI and run the startup orphan sweep.
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence, header-branch clearing and cleanup.
 Their Status lines record the lead's acceptance, independently of the recipes.
 The release page scans driver/override strings with a debug positive control and runs a socket-free release window.
 The ignored live test requires fresh human consent; it is not a workspace-test live invocation.
-A fake actor test constructs authentication_failed followed by is_error true and a cancelled lifecycle while the process waits for another prompt.
-It checks retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.
+Actor tests check account-error retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.
 Live CLI behavior and performance need their authorized lanes; fake replay and structural checks cannot establish them.
 Real provider permission behavior, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.
-Stop and Interrupt have no window path, so their live continuation is unproved.
+Stop and Interrupt have window actions; their real-provider continuation still requires the lead's live lane.

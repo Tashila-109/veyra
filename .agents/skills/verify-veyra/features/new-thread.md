@@ -138,6 +138,9 @@ PY
 - `new-thread.png`: upper-third question and composer, hooks/MCP hint, left-aligned Add project and Geist.
 - `drive.log`: named `PickProvider`, `PickModel`, `PickEffort`, `PickPermission`, `RecheckProviders` and their keys, with exit codes.
 
+The open provider picker keeps the Not installed repair hint above the input, where the popover cannot cover it.
+Inspect the provider-menu PNG for that text before accepting the page.
+
 ## Gotchas
 
 A missing account is unknown, not proof of sign-out.

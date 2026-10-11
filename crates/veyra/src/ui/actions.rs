@@ -11,6 +11,20 @@ actions!(
     veyra,
     [
         Quit,
+        ConfirmQuit,
+        CancelQuit,
+        Stop,
+        Continue,
+        DiscardQueued,
+        NextNeedsYou,
+        AllowOnce,
+        AllowInThread,
+        Deny,
+        FocusDock,
+        FocusComposer,
+        ScrollTranscriptUp,
+        ScrollTranscriptDown,
+        ScrollTranscriptEnd,
         NewThread,
         Send,
         OpenSettings,
@@ -51,6 +65,8 @@ choice_action!(PickEffort, effort, String);
 choice_action!(PickPermission, mode, PermissionMode);
 choice_action!(SetDefaultMode, mode, PermissionMode);
 choice_action!(SelectThread, thread, ThreadId);
+choice_action!(StopThread, thread, ThreadId);
+choice_action!(AnswerQuestion, option, usize);
 choice_action!(SelectProject, project, ProjectId);
 choice_action!(ToggleItem, item, ItemId);
 
@@ -68,34 +84,134 @@ pub struct DebugStallUi {
     pub milliseconds: u64,
 }
 
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugScrollTranscript {
+    pub pixels: f32,
+}
+
+pub struct Binding {
+    pub action: &'static str,
+    pub chord: &'static str,
+    pub context: Option<&'static str>,
+    build: fn() -> Box<dyn Action>,
+}
+macro_rules! binding {
+    ($action:ident, $chord:literal, $context:expr, $field:ident: $value:expr) => {
+        Binding {
+            action: stringify!($action),
+            chord: $chord,
+            context: $context,
+            build: || {
+                Box::new($action {
+                    $field: Some($value),
+                })
+            },
+        }
+    };
+    ($action:ident, $chord:literal, $context:expr) => {
+        Binding {
+            action: stringify!($action),
+            chord: $chord,
+            context: $context,
+            build: || Box::new($action::default()),
+        }
+    };
+}
+pub fn bindings() -> Vec<Binding> {
+    vec![
+        binding!(Quit, "secondary-q", None),
+        binding!(ConfirmQuit, "secondary-enter", Some("VeyraQuit")),
+        binding!(CancelQuit, "escape", Some("VeyraQuit")),
+        binding!(OpenSettings, "secondary-,", Some("Veyra")),
+        binding!(AddProject, "secondary-shift-o", Some("Veyra")),
+        binding!(NewThread, "secondary-n", Some("Veyra")),
+        binding!(PickProvider, "secondary-alt-p", Some("Veyra")),
+        binding!(OpenProviderPicker, "secondary-alt-shift-p", Some("Veyra")),
+        binding!(PickModel, "secondary-alt-m", Some("Veyra")),
+        binding!(PickEffort, "secondary-alt-e", Some("Veyra")),
+        binding!(PickPermission, "secondary-alt-a", Some("Veyra")),
+        binding!(Send, "secondary-enter", Some("Veyra")),
+        binding!(Stop, "ctrl-c", Some("VeyraComposer")),
+        binding!(Continue, "secondary-shift-enter", Some("Veyra")),
+        binding!(DiscardQueued, "secondary-shift-backspace", Some("Veyra")),
+        binding!(StopThread, "secondary-alt-shift-s", Some("Veyra")),
+        binding!(NextNeedsYou, "secondary-shift-j", Some("Veyra")),
+        binding!(AllowOnce, "secondary-enter", Some("VeyraApproval")),
+        binding!(AllowInThread, "secondary-alt-enter", Some("VeyraApproval")),
+        binding!(Deny, "secondary-.", Some("VeyraApproval")),
+        binding!(FocusDock, "secondary-shift-y", Some("Veyra")),
+        binding!(FocusComposer, "escape", Some("VeyraDock")),
+        binding!(ScrollTranscriptUp, "pageup", Some("Veyra")),
+        binding!(ScrollTranscriptDown, "pagedown", Some("Veyra")),
+        binding!(ScrollTranscriptEnd, "secondary-end", Some("Veyra")),
+        binding!(RecheckProviders, "secondary-alt-r", Some("Veyra")),
+        binding!(SetDefaultMode, "secondary-alt-d", Some("Veyra")),
+        binding!(SelectThread, "secondary-alt-1", Some("Veyra")),
+        binding!(SelectProject, "secondary-alt-shift-1", Some("Veyra")),
+        binding!(ToggleItem, "secondary-shift-i", Some("Veyra")),
+        binding!(Retry, "secondary-r", Some("Veyra")),
+        binding!(OpenTerminal, "secondary-alt-t", Some("Veyra")),
+        binding!(NarrowSidebar, "secondary-alt-left", Some("Veyra")),
+        binding!(WidenSidebar, "secondary-alt-right", Some("Veyra")),
+        binding!(ResetSidebar, "secondary-alt-0", Some("Veyra")),
+        binding!(DismissNotice, "escape", Some("Veyra")),
+        binding!(AnswerQuestion, "1", Some("VeyraDock"), option: 0),
+        binding!(AnswerQuestion, "2", Some("VeyraDock"), option: 1),
+        binding!(AnswerQuestion, "3", Some("VeyraDock"), option: 2),
+        binding!(AnswerQuestion, "4", Some("VeyraDock"), option: 3),
+        binding!(AnswerQuestion, "5", Some("VeyraDock"), option: 4),
+        binding!(AnswerQuestion, "6", Some("VeyraDock"), option: 5),
+        binding!(AnswerQuestion, "7", Some("VeyraDock"), option: 6),
+        binding!(AnswerQuestion, "8", Some("VeyraDock"), option: 7),
+        binding!(AnswerQuestion, "9", Some("VeyraDock"), option: 8),
+    ]
+}
+pub fn shortcut(action: &str) -> Option<String> {
+    bindings()
+        .iter()
+        .find(|binding| binding.action == action)
+        .map(|binding| {
+            binding
+                .chord
+                .replace("secondary-", "⌘")
+                .replace("ctrl-", "⌃")
+                .replace("alt-", "⌥")
+                .replace("shift-", "⇧")
+                .replace("enter", "↵")
+                .replace("backspace", "⌫")
+                .replace("escape", "Esc")
+        })
+}
+pub fn shortcut_chip(action: &str, cx: &App) -> impl IntoElement {
+    let t = cx.global::<super::theme::Theme>();
+    div()
+        .text_size(t.text.meta.size)
+        .line_height(t.text.meta.line_height)
+        .text_color(t.colors.text_muted)
+        .pl(t.space.0[1])
+        .pr(t.space.0[1])
+        .rounded(t.radius.inline)
+        .border(t.layout.border)
+        .border_color(t.colors.border)
+        .child(shortcut(action).expect("a shortcut chip needs a binding"))
+}
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-,", OpenSettings, Some("Veyra")),
-        KeyBinding::new("secondary-shift-o", AddProject::default(), Some("Veyra")),
-        KeyBinding::new("secondary-n", NewThread, Some("Veyra")),
-        KeyBinding::new("secondary-alt-p", PickProvider::default(), Some("Veyra")),
-        KeyBinding::new("secondary-alt-shift-p", OpenProviderPicker, Some("Veyra")),
-        KeyBinding::new("secondary-alt-m", PickModel::default(), Some("Veyra")),
-        KeyBinding::new("secondary-alt-e", PickEffort::default(), Some("Veyra")),
-        KeyBinding::new("secondary-alt-a", PickPermission::default(), Some("Veyra")),
-        KeyBinding::new("secondary-enter", Send, Some("Veyra")),
-        KeyBinding::new("secondary-alt-r", RecheckProviders, Some("Veyra")),
-        KeyBinding::new("secondary-alt-d", SetDefaultMode::default(), Some("Veyra")),
-        KeyBinding::new("secondary-alt-1", SelectThread::default(), Some("Veyra")),
-        KeyBinding::new(
-            "secondary-alt-shift-1",
-            SelectProject::default(),
-            Some("Veyra"),
-        ),
-        KeyBinding::new("secondary-shift-i", ToggleItem::default(), Some("Veyra")),
-        KeyBinding::new("secondary-r", Retry, Some("Veyra")),
-        KeyBinding::new("secondary-alt-t", OpenTerminal, Some("Veyra")),
-        KeyBinding::new("secondary-alt-left", NarrowSidebar, Some("Veyra")),
-        KeyBinding::new("secondary-alt-right", WidenSidebar, Some("Veyra")),
-        KeyBinding::new("secondary-alt-0", ResetSidebar, Some("Veyra")),
-        KeyBinding::new("escape", DismissNotice, Some("Veyra")),
-    ]);
+    cx.bind_keys(bindings().into_iter().map(|binding| {
+        KeyBinding::load(
+            binding.chord,
+            (binding.build)(),
+            binding
+                .context
+                .map(|context| KeyBindingContextPredicate::parse(context).unwrap().into()),
+            false,
+            None,
+            &DummyKeyboardMapper,
+        )
+        .unwrap()
+    }));
     cx.set_menus(vec![Menu {
         name: "Veyra".into(),
         disabled: false,
@@ -105,4 +221,33 @@ pub fn init(cx: &mut App) {
             MenuItem::action("Quit Veyra", Quit),
         ],
     }]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bindings, shortcut};
+    use gpui_kit::Keystroke;
+    #[test]
+    fn shortcut_chips_match_bindings() {
+        for action in [
+            "AllowOnce",
+            "AllowInThread",
+            "Deny",
+            "Continue",
+            "DiscardQueued",
+            "Stop",
+        ] {
+            let binding = bindings()
+                .into_iter()
+                .find(|binding| binding.action == action)
+                .unwrap();
+            assert_eq!((binding.build)().name(), format!("veyra::{action}"));
+            assert!(Keystroke::parse(binding.chord).is_ok());
+            assert!(shortcut(action).is_some());
+        }
+        assert_eq!(shortcut("AllowOnce"), Some("⌘↵".into()));
+        assert_eq!(shortcut("Deny"), Some("⌘.".into()));
+        assert_eq!(shortcut("Stop"), Some("⌃c".into()));
+        assert_eq!(shortcut("Unbound"), None);
+    }
 }

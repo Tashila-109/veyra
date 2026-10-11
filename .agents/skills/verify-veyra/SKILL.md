@@ -33,6 +33,13 @@ DATA=/tmp/veyra-verify-$RUN
 PROOF=target/verify-veyra/$RUN
 test ! -e "$DATA"
 test ! -e "$PROOF"
+test "$(ioreg -n Root -d1 -a | grep -c CGSSessionScreenIsLocked || true)" = 0
+for attempt in $(seq 1 100); do
+    if pgrep -x veyra >/dev/null; then sleep .1; else break; fi
+done
+! pgrep -x veyra >/dev/null
+sleep 10
+! pgrep -x veyra >/dev/null
 cargo build --workspace
 mkdir -p "$PROOF/fixtures" "$DATA/project" "$DATA/appcwd"
 printf '%s\n' "${VEYRA_VERIFY_LANE:-fake}" >"$PROOF/lane"
@@ -139,14 +146,19 @@ def window_id(pid):
         time.sleep(.05)
     raise AssertionError('no on-screen window for owned pid '+str(pid))
 def capture(name):
+    assert subprocess.run(['ioreg','-n','Root','-d1','-a'],capture_output=True,text=True).stdout.count('CGSSessionScreenIsLocked') == 0
     window = (PROOF/'window-id').read_text().strip()
     pid = (PROOF/'pid').read_text().strip()
     helper = str((PROOF/'capture-window').resolve())
-    action(name+'-activate','ActivateWindow')
+    for step in range(2):
+        frame = ctl(name+'-before-frame-'+str(step),'dump')['perf']['repaints']
+        action(name+'-activate-'+str(step),'ActivateWindow')
+        poll(name+'-rendered-'+str(step),lambda d: d['perf']['repaints'] > frame)
+    time.sleep(.1)
     subprocess.run([helper,pid,window],check=True)
     dump = ctl(name+'-capture-state','dump')
     visible = {key:dump[key] for key in ['view','sidebar','selected_thread','transcript','composer_text',
-        'composer','settings','notice']}
+        'composer','settings','notice','quit_sheet']}
     visible['providers'] = [probe['readiness'] for probe in dump['providers']]
     state = json.dumps(visible,sort_keys=True)
     target = PROOF/(name+'.png')
@@ -199,6 +211,14 @@ def stop(label, crash=False):
     else: ctl(label+'-quit','quit')
     wait_gone(pid)
 def start(label):
+    assert subprocess.run(['ioreg','-n','Root','-d1','-a'],capture_output=True,text=True).stdout.count('CGSSessionScreenIsLocked') == 0
+    quiet = time.monotonic()
+    deadline = quiet + 30
+    while time.monotonic()-quiet < 10:
+        assert time.monotonic() < deadline, "another Veyra prevents a quiet launch"
+        if subprocess.run(['pgrep','-x','veyra'],capture_output=True).returncode == 0:
+            quiet = time.monotonic()
+        time.sleep(.1)
     app = subprocess.Popen([str(pathlib.Path('target/debug/veyra').resolve())],cwd=DATA/'appcwd',env=ENV,
         stdout=(PROOF/(label+'.stdout')).open('w'),stderr=(PROOF/(label+'.stderr')).open('w'),
         start_new_session=True)
@@ -222,7 +242,12 @@ def start(label):
 def restart(label, crash=False):
     stop(label,crash)
     return start(label)
-def stage(scenario, slow=False):
+def stage_records(records):
+    text = '\n'.join(json.dumps(record) for record in records)+'\n'
+    for n in range(1,int(sql('select count(*) from threads'))+2):
+        for epoch in range(1,int(sql('select count(*) from turns'))+2):
+            (FIXTURES/f't{n}-s{epoch}.jsonl').write_text(text)
+def stage(scenario, slow=False, turns=1):
     records = [json.loads(line) for line in (SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
     if slow:
         expanded = []
@@ -246,12 +271,20 @@ def stage(scenario, slow=False):
                 record['after_ms'] = 3000
             if wire.get('subtype') == 'background_tasks_changed' and wire.get('tasks') == []:
                 record['after_ms'] = 3000
-    text = '\n'.join(json.dumps(record) for record in records)+'\n'
-    for n in range(1,int(sql('select count(*) from threads'))+2):
-        for epoch in range(1,int(sql('select count(*) from turns'))+2):
-            (FIXTURES/f't{n}-s{epoch}.jsonl').write_text(text)
+    if turns > 1:
+        assert scenario == 'ok-reply'
+        start = next(i for i,record in enumerate(records) if record.get('type')=='expect_outbound'
+            and record.get('line',{}).get('type')=='user')
+        repeat = records[start:-1]
+        ending = records[-1]
+        records = records[:-1]
+        for turn in range(2,turns+1):
+            text = json.dumps(repeat).replace('<id:prompt>', '<id:prompt'+str(turn)+'>')
+            records.extend(json.loads(text))
+        records.append(ending)
+    stage_records(records)
 def create(name, prompt, slow=False, scenario='ok-reply'):
-    if LANE == 'fake': stage(scenario,slow)
+    if LANE == 'fake' and scenario is not None: stage(scenario,slow)
     action(name+'-new','NewThread')
     assert ctl(name+'-text','text',prompt) == {'ok':True}
     before = int(sql('select count(*) from threads'))
@@ -323,6 +356,9 @@ PY
 ## Drive
 
 Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.md), [chat-send-stream](features/chat-send-stream.md) and [settings](features/settings.md).
+M3 adds [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
+The fake lane runs those pages without a provider login.
+[permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
 Use the same exported `RUN` in every fresh shell.
 `action NAME [JSON]` builds a registered gpui action.
 Action and key replies acknowledge dispatch; poll `dump` for the resulting view or use `ctl wait` for a thread state.
@@ -334,17 +370,23 @@ It exits 0 for the status, 1 for timeout or a driver/connection error, 2 for bad
 A timeout writes `veyra ctl wait timed out:` to stderr.
 A connection or driver failure writes `veyra ctl driver error:` with its cause.
 Every exit-1 expectation must also assert its named stderr line.
-`quit` dispatches the menu's Quit action.
+`quit` dispatches `veyra::ConfirmQuit`; `veyra::Quit` opens the sheet while work runs.
 A timeout does not cancel an enqueued action; run Doctor before retrying.
 After another Send on an existing thread, gate `wait Done` on the new turn row or a changed status so the preceding Done cannot satisfy it.
 
-The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes` and `notice`.
+The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
 `header_branch` is the branch text used by the header and is empty after leaving Chat.
 `view` is `new_thread`, `chat`, `failed_thread` or `settings`.
 `sidebar.rows` holds project and thread rows, with each thread's own status.
 `selected_thread` includes its native id, configuration, failure cause and `header_status`, the rendered status with elapsed seconds.
 `composer` includes the chosen provider and permission mode, plus Send's readiness and disabled reason.
 `providers` reports each probe's path, version, models, readiness and `account`, either `known` or `unknown`, with no account value.
+`transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
+`transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
+Items include `outcome`, queued `wait_reason` and a tool's `failed_last_line`.
+`selected_thread.hold` and `wait_reason` describe held work.
+`composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
+`notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
 `composer.provider_picker_open` reports the picker opened by `OpenProviderPicker` or ⌘⌥⇧P.
 `awake` reports the engine's idle-sleep guard.
@@ -354,6 +396,7 @@ Each transcript item carries `delta_count`, the actual text-stream deltas observ
 The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and blocks the main thread for that interval.
 `settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
 Before every capture, the debug-only `ActivateWindow` action activates Veyra from inside the app.
+The helper waits for two separate rendered frames and 100 ms before inspecting and capturing the window.
 Capture checks the owned window is on-screen and verifies it remains frontmost.
 Veyra must stay frontmost during captures.
 A changed visible state with an identical PNG fails; Evidence also compares named state pairs.
@@ -390,6 +433,11 @@ required = {
         'new-thread-provider-menu.png','new-thread-provider-menu-ready.png','new-thread-ready.png','new-thread.png'],
     'chat-send-stream':['chat-working.json','chat-working.png','chat-done.json','chat-done.png',
         'chat-failed.json','chat-failed.png','chat-provider-done.json','chat-background-working.json'],
+    'approvals-questions':['approval-deny.png','approval-allow.png','question.png','question-two.png',
+        'approvals-done.json','questions-done.json'],
+    'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
+        'notifications-background.json'],
+    'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
         'settings-existing.json','settings-new.json'],
     'new-thread-live':['new-thread-live.json','new-thread-live.png'],

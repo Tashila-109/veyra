@@ -37,6 +37,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH="$PROOF" python3 - <<'PY'
 from driver import *
+import shlex
 identity()
 assert sql('select default_mode from settings') == 'full_access'
 branch_bin = DATA/'branch-bin'
@@ -44,6 +45,9 @@ branch_bin.mkdir()
 git = branch_bin/'git'
 git.write_text('#!/bin/sh\n'
     'test "$1" = branch && test "$2" = --show-current || exit 1\n'
+    'touch '+shlex.quote(str(DATA/'branch-started'))+'\n'
+    'sleep 0.5\n'
+    'touch '+shlex.quote(str(DATA/'branch-finished'))+'\n'
     "printf '%s\\n' fixture-branch\n")
 git.chmod(0o700)
 ENV['PATH'] = str(branch_bin)+os.pathsep+ENV['PATH']
@@ -53,6 +57,13 @@ poll('settings-branch-ready',lambda d: d['providers'][0]['readiness']=='ready')
 action('settings-initial-new','NewThread')
 assert ctl('settings-initial-chip','dump')['composer']['mode'] == 'full_access'
 first = create('settings-full','reply with the word ok')
+poll('settings-branch-started',lambda d: (DATA/'branch-started').exists())
+ctl('settings-leave-before-branch','keys','secondary-,')
+poll('settings-late-branch-start',lambda d: d['view']=='settings')
+poll('settings-late-branch-finished',lambda d: (DATA/'branch-finished').exists())
+assert ctl('settings-late-branch-after','dump')['header_branch']==''
+capture('settings-late-branch')
+ctl('settings-late-branch-return','keys','escape')
 ctl('settings-full-done','wait',first,'Done')
 poll('settings-header-chat',lambda d: d['header_branch']=='fixture-branch')
 ctl('settings-open-key','keys','secondary-,')
@@ -148,6 +159,7 @@ PY
 - `settings-relaunch.json` and `settings-persisted-database.txt` retain Ask first after a new pid; both thread rows retain their own modes.
 - Escape, SelectThread and SelectProject each assert the resulting view, and OpenSettings is driven by both its key and named action.
 - `settings-transition-action.json` and `settings-transition-keys.json` show NewThread immediately after Escape, with no selected thread and the Ask first composer.
+- `settings-late-branch-after.json` and its PNG assert Settings keeps an empty header after the delayed branch child finishes.
 - `settings-header-chat.json` shows `header_branch: fixture-branch`; Settings and NewThread dumps assert it is empty.
 - `drive.log` records commands, replies and exits; the text request while Settings is focused exits 1 instead of editing a hidden composer.
 

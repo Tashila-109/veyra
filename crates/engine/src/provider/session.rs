@@ -1,7 +1,7 @@
 use super::{
     ProviderError, ProviderEvent, ProviderKind, SessionControl, SessionEvent, SessionHandle,
-    SessionSpec, TurnEvent,
-    claude::{self, Codec, InterruptPhase},
+    SessionSpec, StopReason, TurnEvent,
+    claude::{self, Codec},
     env::ChildEnv,
 };
 use crate::{
@@ -162,10 +162,10 @@ impl Process {
             .send(line)
             .map_err(|_| ProviderError::Protocol("Claude stdin writer closed".into()))
     }
-    fn record_inbound(&mut self, line: serde_json::Value) -> Result<(), ProviderError> {
+    fn record_inbound(&mut self, line: &serde_json::Value) -> Result<(), ProviderError> {
         #[cfg(debug_assertions)]
         if let Some(recorder) = &mut self.recorder {
-            recorder.line(false, line)?;
+            recorder.line(false, line.clone())?;
         }
         #[cfg(not(debug_assertions))]
         let _ = line;
@@ -457,6 +457,7 @@ async fn run_one(
         .map(|error| error.to_string());
     let mut consumer_gone = false;
     let mut writer_done = false;
+    let mut stdout_closed = false;
     while failure.is_none() {
         tokio::select! {
             biased;
@@ -474,7 +475,7 @@ async fn run_one(
                     }
                 }
                 Some(SessionControl::Shutdown) | None => {
-                    for line in interrupt_lines(&mut codec, "Veyra closed while this turn ran") {
+                    for line in interrupt_lines(&mut codec, StopReason::AppClosing) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
@@ -487,8 +488,7 @@ async fn run_one(
                     break;
                 }
                 Some(message @ (SessionControl::Interrupt | SessionControl::StorageBlocked)) => {
-                    let reason = if message == SessionControl::Interrupt { "Stopped by you" }
-                        else { "Stopped because the database is blocked" };
+                    let reason = message.stop_reason().expect("stop control");
                     for line in interrupt_lines(&mut codec, reason) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
@@ -515,19 +515,15 @@ async fn run_one(
                 break;
             }
             _ = async {
-                match &codec.interrupted {
-                    Some(interrupt) => tokio::time::sleep_until(interrupt.phase.deadline()).await,
+                match codec.interrupt_deadline() {
+                    Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             } => {
-                match codec.interrupted.as_ref().map(|interrupt| &interrupt.phase) {
-                    Some(InterruptPhase::Protocol(_)) => {
-                        let _ = platform::signal_group(pid, Signal::Terminate);
-                        codec.interrupted.as_mut().unwrap().phase =
-                            InterruptPhase::Terminate(tokio::time::Instant::now() + Duration::from_secs(1));
-                    }
-                    Some(InterruptPhase::Terminate(_)) => { let _ = platform::signal_group(pid, Signal::Kill); break; }
-                    None => {}
+                if let Some(signal) = codec.escalate_interrupt() {
+                    let kill = matches!(signal, Signal::Kill);
+                    let _ = platform::signal_group(pid, signal);
+                    if kill { break; }
                 }
             }
             line = lines.next() => match line {
@@ -547,7 +543,7 @@ async fn run_one(
                         }
                     };
                     rejected = None;
-                    if let Err(error) = process.record_inbound(wire.clone()) {
+                    if let Err(error) = process.record_inbound(&wire) {
                         failure = Some(error.to_string());
                         break;
                     }
@@ -571,7 +567,7 @@ async fn run_one(
                         Err(error) => { failure = Some(error.to_string()); break; }
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => { stdout_closed = true; break; },
                 Err(error) => { failure = Some(error.to_string()); break; }
             }
         }
@@ -591,11 +587,14 @@ async fn run_one(
     let failure = failure
         .or(rejected)
         .map(|text| with_stderr(&text, &lines, None));
-    let observed = process
-        .child
-        .child
-        .as_mut()
-        .and_then(|child| child.try_wait().ok().flatten());
+    let observed = match process.child.child.as_mut() {
+        Some(child) if stdout_closed => tokio::time::timeout(Duration::from_secs(1), child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok),
+        Some(child) => child.try_wait().ok().flatten(),
+        None => None,
+    };
     let status = process.child.stop().await.ok();
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder {
@@ -816,11 +815,11 @@ pub async fn probe(
     result
 }
 
-fn interrupt_lines(codec: &mut Codec, reason: &str) -> Vec<serde_json::Value> {
+fn interrupt_lines(codec: &mut Codec, reason: StopReason) -> Vec<serde_json::Value> {
     if !codec.interrupt_for(reason) {
         return Vec::new();
     }
-    let mut lines = codec.cancel_requests(reason);
+    let mut lines = codec.cancel_requests(reason.text());
     lines.push(serde_json::json!({
         "type":"control_request", "request_id":"veyra-interrupt",
         "request":{"subtype":"interrupt"}
@@ -904,6 +903,57 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn exit_after_stdout_eof_uses_natural_status() {
+        let script = "exec 1>&- 2>&-; sleep 0.1; exit 130";
+        let env = ChildEnv::load();
+        let child = env
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    format!("read initialize; read prompt; {script}"),
+                ],
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .unwrap();
+        let pid = child.id().unwrap();
+        let process = Process {
+            child: ProcessGroup::new(child),
+            native: NativeSessionId("fixture-session".into()),
+            #[cfg(debug_assertions)]
+            recorder: None,
+        };
+        let (sender, mut control) = mpsc::unbounded_channel();
+        sender
+            .send(SessionControl::StartTurn {
+                turn: TurnId::new(),
+                text: "reply".into(),
+            })
+            .unwrap();
+        let (out, mut events) = mpsc::channel(256);
+        run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
+        assert!(!platform::group_exists(pid).unwrap());
+        let EngineMsg::Provider {
+            event:
+                ProviderEvent::Turn {
+                    event: TurnEvent::TurnEnded { outcome, .. },
+                    ..
+                },
+            ..
+        } = events.try_recv().unwrap()
+        else {
+            panic!("missing end")
+        };
+        assert_eq!(
+            outcome,
+            TurnOutcome::Interrupted {
+                reason: "Stopped by exit code 130".into(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_deadline_delivers_failed_and_exited_when_group_stays_alive() {
         let env = ChildEnv::load();

@@ -1,0 +1,82 @@
+use gpui_kit::SystemNotification;
+use veyra_engine::domain::{Status, ThreadId};
+
+pub(super) fn priority(status: &Status) -> u8 {
+    match status {
+        Status::NeedsYou => 0,
+        Status::Failed => 1,
+        Status::Held => 2,
+        Status::Interrupted => 3,
+        Status::Working { .. } => 4,
+        Status::InTerminal => 5,
+        Status::Done { .. } => 6,
+        Status::Idle => 7,
+    }
+}
+pub fn banner_for(
+    active: bool,
+    previous: &Status,
+    current: &Status,
+    root: ThreadId,
+    title: &str,
+) -> Option<SystemNotification> {
+    if active || std::mem::discriminant(previous) == std::mem::discriminant(current) {
+        return None;
+    }
+    let body = match current {
+        Status::NeedsYou => "Needs you",
+        Status::Done { .. } => "Done",
+        Status::Failed => "Failed",
+        _ => return None,
+    };
+    Some(SystemNotification {
+        tag: root.to_string().into(),
+        title: title.to_owned().into(),
+        body: body.into(),
+        actions: vec![],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn banner_for_only_when_window_inactive() {
+        let root = ThreadId::new();
+        assert!(banner_for(true, &Status::Idle, &Status::NeedsYou, root, "Work").is_none());
+        let banner = banner_for(false, &Status::Idle, &Status::NeedsYou, root, "Work").unwrap();
+        assert_eq!(banner.title.as_ref(), "Work");
+        assert_eq!(banner.body.as_ref(), "Needs you");
+        assert!(banner_for(false, &Status::NeedsYou, &Status::NeedsYou, root, "Work").is_none());
+    }
+    #[test]
+    fn banner_for_tags_family_root() {
+        let root = ThreadId::new();
+        let banner = banner_for(
+            false,
+            &Status::Working { since: 1 },
+            &Status::Failed,
+            root,
+            "Root",
+        )
+        .unwrap();
+        assert_eq!(banner.tag.as_ref(), root.to_string());
+        assert_eq!(banner.body.as_ref(), "Failed");
+    }
+    #[test]
+    fn banner_for_waits_for_background_work() {
+        let root = ThreadId::new();
+        let working = Status::Working { since: 1 };
+        let background = Status::Working { since: 0 };
+        assert!(banner_for(false, &working, &background, root, "Root").is_none());
+        let banner = banner_for(
+            false,
+            &background,
+            &Status::Done { took: 42_000 },
+            root,
+            "Root",
+        )
+        .unwrap();
+        assert_eq!(banner.body.as_ref(), "Done");
+    }
+}

@@ -2,6 +2,7 @@ pub mod actions;
 mod composer;
 mod header;
 mod new_thread;
+mod notify;
 mod settings;
 mod sidebar;
 pub mod theme;
@@ -12,15 +13,15 @@ use gpui_kit::component::{
     StyledExt,
     input::{InputEvent, TextareaState},
     menu::PopupMenu,
-    message_scroller::MessageScrollerState,
 };
-use gpui_kit::*;
+use gpui_kit::{prelude::*, *};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     time::Instant,
 };
 use theme::{Appearance, Theme};
+use transcript::MessageScrollerState;
 use veyra_engine::{
     Engine,
     commands::{Ack, Command},
@@ -49,6 +50,7 @@ struct AppState {
     delta_counts: BTreeMap<ItemId, u64>,
     fences: BTreeMap<ThreadId, Fence>,
     settings: Settings,
+    requests: Vec<Request>,
     statuses: BTreeMap<ThreadId, Status>,
     snapshot_sequence: u64,
     applied_batches: u64,
@@ -156,10 +158,15 @@ impl AppState {
                     self.turns.insert(turn.id, turn.clone());
                 }
                 ChangeEvent::SettingsChanged(settings) => self.settings = *settings,
+                ChangeEvent::RequestOpened(request) | ChangeEvent::RequestClosed(request) => {
+                    if let Some(row) = self.requests.iter_mut().find(|row| row.id == request.id) {
+                        *row = request.clone();
+                    } else {
+                        self.requests.push(request.clone());
+                    }
+                }
                 ChangeEvent::ItemAdded(_)
                 | ChangeEvent::ItemCompleted(_)
-                | ChangeEvent::RequestOpened(_)
-                | ChangeEvent::RequestClosed(_)
                 | ChangeEvent::TaskStarted(_)
                 | ChangeEvent::TaskSettled(_)
                 | ChangeEvent::TaskDelivered(_) => {}
@@ -309,13 +316,50 @@ impl AppState {
         });
         items
     }
+    fn pending_requests(&self, thread: ThreadId) -> Vec<&Request> {
+        self.requests
+            .iter()
+            .filter(|request| request.thread == thread && request.state == RequestState::Pending)
+            .collect()
+    }
+    fn family_status(&self, root: ThreadId) -> Status {
+        self.threads
+            .values()
+            .filter(|thread| !thread.archived && thread.root() == root)
+            .map(|thread| self.status(thread.id))
+            .min_by_key(notify::priority)
+            .unwrap_or(Status::Idle)
+    }
     fn status(&self, id: ThreadId) -> Status {
         self.statuses.get(&id).cloned().unwrap_or(Status::Idle)
+    }
+    fn retry_prompt(&self, thread: ThreadId) -> Option<String> {
+        let turn = self
+            .turns
+            .values()
+            .filter(|turn| turn.thread == thread && turn.state != TurnState::Queued)
+            .max_by_key(|turn| turn.ordinal)?;
+        if !matches!(
+            turn.state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Failed { .. },
+                ..
+            }
+        ) {
+            return None;
+        }
+        let TurnOrigin::User { item } = turn.origin else {
+            return None;
+        };
+        match &self.items.get(&thread)?.get(&item)?.body {
+            ItemBody::UserText(text) => Some(text.clone()),
+            _ => None,
+        }
     }
     fn failure(&self, thread: ThreadId) -> Option<&str> {
         self.turns
             .values()
-            .filter(|turn| turn.thread == thread)
+            .filter(|turn| turn.thread == thread && turn.state != TurnState::Queued)
             .max_by_key(|turn| turn.ordinal)
             .and_then(|turn| match &turn.state {
                 TurnState::Ended {
@@ -370,6 +414,14 @@ pub struct Shell {
     #[cfg(debug_assertions)]
     repaints: u64,
     focus: FocusHandle,
+    dock_focus: FocusHandle,
+    dock_focused: bool,
+    quit_focus: FocusHandle,
+    quit_sheet: bool,
+    quitting: bool,
+    window_active: bool,
+    notifications_posted: u64,
+    question_draft: Option<(RequestId, Vec<Answer>)>,
     sidebar_width: Pixels,
     resizing: bool,
     notice: Option<SharedString>,
@@ -419,6 +471,16 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
+        cx.observe_window_activation(window, |shell, window, cx| {
+            shell.window_active = window.is_window_active();
+            cx.notify();
+        })
+        .detach();
+        cx.on_app_quit(|shell, _| {
+            let engine = shell.engine.clone();
+            async move { engine.on_app_quit().await }
+        })
+        .detach();
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Describe the task")
@@ -452,7 +514,14 @@ impl Shell {
                                 shell.notice = error.clone().map(Into::into);
                             }
                         }
+                        let families: BTreeMap<_, _> = shell
+                            .state
+                            .threads
+                            .values()
+                            .map(|thread| (thread.root(), shell.state.family_status(thread.root())))
+                            .collect();
                         shell.state.apply_all(batch);
+                        shell.post_banners(&families, cx);
                         shell.start_branch_lookup(cx);
                         if shell.project.is_none() {
                             shell.project = shell.state.projects.keys().next().copied();
@@ -490,9 +559,12 @@ impl Shell {
                 cx.background_executor().timer(cadence).await;
                 if this
                     .update(cx, |shell, cx| {
-                        if shell.view.chat().is_some_and(|thread| {
-                            matches!(shell.state.status(thread), Status::Working { .. })
-                        }) {
+                        if shell
+                            .state
+                            .statuses
+                            .values()
+                            .any(|status| matches!(status, Status::Working { .. }))
+                        {
                             cx.notify();
                         }
                     })
@@ -507,6 +579,14 @@ impl Shell {
             #[cfg(debug_assertions)]
             repaints: 0,
             focus,
+            dock_focus: cx.focus_handle(),
+            dock_focused: false,
+            quit_focus: cx.focus_handle(),
+            quit_sheet: false,
+            quitting: false,
+            window_active: window.is_window_active(),
+            notifications_posted: 0,
+            question_draft: None,
             sidebar_width: cx.global::<Theme>().layout.sidebar_default,
             resizing: false,
             notice: None,
@@ -535,6 +615,16 @@ impl Shell {
             provider_picker_labels: vec![],
             _input_subscription: subscription,
         };
+        cx.on_focus(&shell.dock_focus, window, |shell, _, cx| {
+            shell.dock_focused = true;
+            cx.notify();
+        })
+        .detach();
+        cx.on_focus_out(&shell.dock_focus, window, |shell, _, _, cx| {
+            shell.dock_focused = false;
+            cx.notify();
+        })
+        .detach();
         shell.recheck(false, window, cx);
         shell
     }
@@ -612,7 +702,11 @@ impl Shell {
         self.branch.clear();
     }
     fn show(&mut self, view: MainView) {
-        self.forget_branch();
+        if matches!(view, MainView::Settings { .. }) {
+            self.branch.clear();
+        } else {
+            self.forget_branch();
+        }
         self.view = view;
     }
     fn start_branch_lookup(&mut self, cx: &mut Context<Self>) {
@@ -659,6 +753,7 @@ impl Shell {
     }
     fn select_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         self.show(MainView::Chat(thread));
+        self.question_draft = None;
         self.notice = None;
         let request = self.state.begin_snapshot(thread);
         let reply = self.engine.snapshot(thread);
@@ -728,15 +823,7 @@ impl Shell {
         cx.notify();
     }
     fn retry_turn(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self
-            .state
-            .transcript(thread)
-            .iter()
-            .rev()
-            .find_map(|item| match &item.body {
-                ItemBody::UserText(text) => Some(text.clone()),
-                _ => None,
-            });
+        let text = self.state.retry_prompt(thread);
         if let Some(text) = text {
             if self.state.threads[&thread].hold.is_some() {
                 self.send_command(
@@ -804,6 +891,10 @@ impl Shell {
             return;
         }
         let text = self.input.read(cx).value().to_string();
+        if text.trim().is_empty() && self.view.chat().is_some_and(|thread| self.running(thread)) {
+            self.stop(window, cx);
+            return;
+        }
         if text.trim().is_empty() {
             self.notice("Write a message before sending", cx);
             return;
@@ -819,6 +910,201 @@ impl Shell {
             }
         };
         self.send_command(command, window, cx);
+    }
+    fn running(&self, thread: ThreadId) -> bool {
+        self.state
+            .turns
+            .values()
+            .any(|turn| turn.thread == thread && matches!(turn.state, TurnState::Running { .. }))
+    }
+    fn busy_threads(&self) -> Vec<String> {
+        self.engine
+            .window_threads()
+            .iter()
+            .filter(|(_, state)| state.busy)
+            .filter_map(|(id, _)| {
+                self.state
+                    .threads
+                    .get(id)
+                    .map(|thread| thread.title.clone())
+            })
+            .collect()
+    }
+    fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(thread) = self.view.chat() {
+            self.send_command(Command::Interrupt { thread }, window, cx);
+        }
+    }
+    fn continue_queue(&mut self, drop_queued: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(thread) = self.view.chat() {
+            self.send_command(
+                Command::Continue {
+                    thread,
+                    drop_queued,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+    fn respond(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
+        let request = self.view.chat().and_then(|thread| {
+            self.state
+                .pending_requests(thread)
+                .first()
+                .map(|row| row.id)
+        });
+        if let Some(request) = request {
+            self.send_command(Command::Respond { request, decision }, window, cx);
+        }
+    }
+    fn answer_question(&mut self, option: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let request = self
+            .view
+            .chat()
+            .and_then(|thread| self.state.pending_requests(thread).first().copied())
+            .cloned();
+        let Some(Request {
+            id,
+            kind: RequestKind::Question { questions },
+            ..
+        }) = request
+        else {
+            return;
+        };
+        let index = self
+            .question_draft
+            .as_ref()
+            .filter(|(request, _)| *request == id)
+            .map_or(0, |(_, answers)| answers.len());
+        let Some(text) = questions
+            .get(index)
+            .and_then(|question| question.options.get(option))
+            .cloned()
+        else {
+            return;
+        };
+        self.question_draft.get_or_insert_with(|| (id, vec![]));
+        if self
+            .question_draft
+            .as_ref()
+            .is_some_and(|(request, _)| *request != id)
+        {
+            self.question_draft = Some((id, vec![]));
+        }
+        let (_, answers) = self.question_draft.as_mut().unwrap();
+        answers.push(Answer { text });
+        if answers.len() == questions.len() {
+            let (_, answers) = self.question_draft.take().unwrap();
+            self.send_command(
+                Command::Respond {
+                    request: id,
+                    decision: Decision::Answers(answers),
+                },
+                window,
+                cx,
+            );
+            self.input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+    fn render_quit_sheet(&self, cx: &App) -> impl IntoElement {
+        use gpui_kit::component::button::ButtonVariants;
+        let t = cx.global::<Theme>();
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(t.colors.bg)
+            .track_focus(&self.quit_focus)
+            .key_context("VeyraQuit")
+            .child(
+                div()
+                    .v_flex()
+                    .w(t.layout.transcript_min)
+                    .p(t.space.0[7])
+                    .gap(t.space.0[5])
+                    .rounded(t.radius.large)
+                    .bg(t.colors.card)
+                    .border(t.layout.border)
+                    .border_color(t.colors.border_strong)
+                    .child(div().text_size(t.text.h2.size).child("Quit Veyra?"))
+                    .child("Quitting stops these threads:")
+                    .children(
+                        self.busy_threads()
+                            .into_iter()
+                            .map(|title| div().child(title)),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .justify_end()
+                            .gap(t.space.0[3])
+                            .child(
+                                composer::labelled_button("cancel-quit", "Cancel", cx).on_click(
+                                    |_, window, cx| {
+                                        window.dispatch_action(Box::new(CancelQuit), cx)
+                                    },
+                                ),
+                            )
+                            .child(
+                                composer::labelled_button("confirm-quit", "Quit", cx)
+                                    .primary()
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ConfirmQuit), cx)
+                                    }),
+                            ),
+                    ),
+            )
+    }
+    fn confirm_quit(&mut self, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        self.quitting = true;
+        self.forget_branch();
+        let engine = self.engine.clone();
+        cx.spawn(async move |_, cx| {
+            engine.shutdown_wait().await;
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    }
+    fn post_banners(&mut self, previous: &BTreeMap<ThreadId, Status>, cx: &mut Context<Self>) {
+        let roots: BTreeSet<_> = self
+            .state
+            .threads
+            .values()
+            .filter(|thread| !thread.archived)
+            .map(Thread::root)
+            .collect();
+        for root in roots {
+            let status = self.state.family_status(root);
+            let old = previous.get(&root).unwrap_or(&Status::Idle);
+            if let Some(banner) = self.state.threads.get(&root).and_then(|thread| {
+                notify::banner_for(self.window_active, old, &status, root, &thread.title)
+            }) {
+                self.notifications_posted += 1;
+                cx.show_system_notification(banner);
+            }
+        }
+    }
+    fn banner_target(&self, root: ThreadId) -> Option<ThreadId> {
+        sidebar::ordered_threads(&self.state)
+            .into_iter()
+            .find(|id| {
+                self.state.threads[id].root() == root && self.state.status(*id) == Status::NeedsYou
+            })
+            .or_else(|| {
+                self.state
+                    .threads
+                    .get(&root)
+                    .filter(|thread| !thread.archived)
+                    .map(|thread| thread.id)
+            })
     }
     fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show(MainView::NewThread);
@@ -938,7 +1224,9 @@ impl Shell {
                     "native_id":thread.native.as_ref().map(|native| &native.0),
                     "cli_version":thread.cli_version, "config":thread.config,
                     "status":status_name(&status), "header_status":header::status_text(&status),
-                    "failure":self.state.failure(thread.id)
+                    "failure":self.state.failure(thread.id), "hold":thread.hold,
+                    "wait_reason":self.engine.window_threads().get(&thread.id)
+                        .and_then(|state| state.wait_reason).map(|reason| reason.to_string())
                 })
             })
     }
@@ -969,6 +1257,28 @@ impl Shell {
             .map(|item| {
                 let mut row = transcript::dump_item(item);
                 row["expanded"] = serde_json::json!(self.expanded.contains(&item.id));
+                row["outcome"] = self
+                    .state
+                    .turns
+                    .get(&item.turn)
+                    .and_then(transcript::turn_outcome_line)
+                    .into();
+                row["wait_reason"] = self
+                    .state
+                    .turns
+                    .get(&item.turn)
+                    .filter(|turn| turn.state == TurnState::Queued)
+                    .and_then(|_| {
+                        self.engine
+                            .window_threads()
+                            .get(&item.thread)
+                            .and_then(|state| state.wait_reason)
+                    })
+                    .map(|reason| reason.to_string())
+                    .into();
+                if let ItemBody::Tool(tool) = &item.body {
+                    row["failed_last_line"] = transcript::failed_tool_last_line(tool).into();
+                }
                 row["delta_count"] = self
                     .state
                     .delta_counts
@@ -981,31 +1291,44 @@ impl Shell {
             .collect()
     }
     #[cfg(debug_assertions)]
-    fn dump_composer(&self) -> serde_json::Value {
+    fn dump_composer(&self, cx: &App) -> serde_json::Value {
         let reason = self.disabled_reason();
         serde_json::json!({
             "provider":self.chosen_provider(), "mode":self.composer_config().mode,
             "model":self.composer_config().model, "effort":self.composer_config().effort,
             "send_enabled":reason.is_none(), "disabled_reason":reason,
             "provider_picker_open":self.provider_picker.is_some(),
-            "provider_picker_labels":self.provider_picker.as_ref().map(|_| &self.provider_picker_labels)
+            "provider_picker_labels":self.provider_picker.as_ref().map(|_| &self.provider_picker_labels),
+            "stop_visible":self.view.chat().is_some_and(|thread| self.running(thread))
+                && self.input.read(cx).value().trim().is_empty(),
+            "dock":self.view.chat().and_then(|thread| self.state.pending_requests(thread).first().map(|request| {
+                serde_json::json!({"request":request, "position":1,
+                    "count":self.state.pending_requests(thread).len(), "focused":self.dock_focused,
+                    "question_index":self.question_draft.as_ref().filter(|(id, _)| *id == request.id)
+                        .map_or(0, |(_, answers)| answers.len())})
+            }))
         })
     }
     #[cfg(debug_assertions)]
     pub fn dump(&self, data_dir: &std::path::Path, cx: &App) -> serde_json::Value {
         let perf = self.engine.perf();
+        let mut transcript = self.scroller.read(cx).dump();
+        transcript["items"] = serde_json::json!(self.dump_transcript());
         serde_json::json!({
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
             "header_branch":self.branch,
             "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows()},
-            "selected_thread":self.dump_selected(), "transcript":self.dump_transcript(),
-            "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(),
+            "selected_thread":self.dump_selected(), "transcript":transcript,
+            "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(cx),
             "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
             "awake":self.engine.awake(), "processes":self.engine.processes(),
             "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.max_batch_gap_ms,
                 "commits":perf.commits, "actor_max_ms":perf.actor_max_ms, "actor_busy_ms":perf.actor_busy_ms,
                 "repaints":self.repaints, "max_batch_events":self.state.max_batch_events},
+            "window_active":self.window_active, "notifications":{"posted":self.notifications_posted},
+            "quit_sheet":{"open":self.quit_sheet, "threads":self.busy_threads()},
+            "requests":self.state.requests,
             "notice":self.notice.as_ref().map(|notice| notice.as_ref())
         })
     }
@@ -1034,6 +1357,7 @@ impl Render for Shell {
         let root = div()
             .h_flex()
             .size_full()
+            .relative()
             .bg(theme.colors.bg)
             .text_color(theme.colors.text)
             .font_family(theme.text.ui_font.clone())
@@ -1046,6 +1370,67 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
             .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
+            .on_action(cx.listener(|shell, _: &Stop, window, cx| shell.stop(window, cx)))
+            .on_action(cx.listener(|shell, _: &Continue, window, cx| {
+                shell.continue_queue(false, window, cx)
+            }))
+            .on_action(cx.listener(|shell, _: &DiscardQueued, window, cx| {
+                shell.continue_queue(true, window, cx)
+            }))
+            .on_action(cx.listener(|shell, action: &StopThread, window, cx| {
+                if let Some(thread) = action.thread.or_else(|| shell.view.chat()) {
+                    shell.send_command(Command::StopThread { thread }, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &NextNeedsYou, window, cx| {
+                if let Some(thread) = sidebar::next_needs_you(
+                    &sidebar::ordered_threads(&shell.state),
+                    shell.view.selected(),
+                    &shell.state.statuses,
+                ) {
+                    shell.select_thread(thread, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &AllowOnce, window, cx| {
+                shell.respond(Decision::AllowOnce, window, cx)
+            }))
+            .on_action(cx.listener(|shell, _: &AllowInThread, window, cx| {
+                shell.respond(Decision::AllowInThread, window, cx)
+            }))
+            .on_action(
+                cx.listener(|shell, _: &Deny, window, cx| {
+                    shell.respond(Decision::Deny, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|shell, action: &AnswerQuestion, window, cx| {
+                shell.answer_question(action.option.unwrap_or(0), window, cx);
+            }))
+            .on_action(cx.listener(|shell, _: &FocusDock, window, cx| {
+                if shell
+                    .view
+                    .chat()
+                    .is_some_and(|thread| !shell.state.pending_requests(thread).is_empty())
+                {
+                    window.focus(&shell.dock_focus, cx);
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &FocusComposer, window, cx| {
+                shell.input.update(cx, |input, cx| input.focus(window, cx));
+            }))
+            .on_action(cx.listener(|shell, _: &ScrollTranscriptUp, window, cx| {
+                window.focus(&shell.focus, cx);
+                shell.scroller.update(cx, |state, cx| {
+                    state.scroll_to_item(0, cx);
+                });
+            }))
+            .on_action(cx.listener(|shell, _: &ScrollTranscriptDown, _, cx| {
+                shell.scroller.update(cx, |state, cx| state.scroll_down(cx));
+            }))
+            .on_action(cx.listener(|shell, _: &ScrollTranscriptEnd, _, cx| {
+                shell
+                    .scroller
+                    .update(cx, |state, cx| state.scroll_to_end(cx));
+            }))
             .on_action(cx.listener(|shell, _: &OpenSettings, window, cx| {
                 shell.show(MainView::Settings {
                     back: shell.view.selected(),
@@ -1159,7 +1544,7 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|shell, action: &ToggleItem, _, cx| {
-                if let Some(id) = action.item.or_else(|| {
+                let item = action.item.or_else(|| {
                     shell.view.selected().and_then(|thread| {
                         shell
                             .state
@@ -1171,11 +1556,25 @@ impl Render for Shell {
                             })
                             .map(|item| item.id)
                     })
-                }) && !shell.expanded.remove(&id)
+                });
+                if let Some(id) = item
+                    && !shell.expanded.remove(&id)
                 {
                     shell.expanded.insert(id);
                 }
-                shell.scroller.update(cx, |state, cx| state.remeasure(cx));
+                shell.scroller.update(cx, |state, cx| {
+                    if let Some(index) = shell.view.chat().and_then(|thread| {
+                        shell
+                            .state
+                            .transcript(thread)
+                            .iter()
+                            .position(|row| Some(row.id) == item)
+                    }) {
+                        state.expand(index, cx);
+                    } else {
+                        state.remeasure(cx);
+                    }
+                });
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, _: &DismissNotice, window, cx| {
@@ -1190,10 +1589,20 @@ impl Render for Shell {
                 }
                 cx.notify();
             }))
-            .on_action(cx.listener(|shell, _: &Quit, _, cx| {
-                shell.forget_branch();
-                shell.engine.shutdown();
-                cx.quit();
+            .on_action(cx.listener(|shell, _: &Quit, window, cx| {
+                if shell.busy_threads().is_empty() {
+                    shell.confirm_quit(cx);
+                } else {
+                    shell.quit_sheet = true;
+                    window.focus(&shell.quit_focus, cx);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|shell, _: &ConfirmQuit, _, cx| shell.confirm_quit(cx)))
+            .on_action(cx.listener(|shell, _: &CancelQuit, window, cx| {
+                shell.quit_sheet = false;
+                shell.input.update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
             }))
             .on_action(cx.listener(|shell, action: &SetSidebarWidth, _, cx| {
                 let layout = &cx.global::<Theme>().layout;
@@ -1276,6 +1685,9 @@ impl Render for Shell {
                         MainView::Chat(_) => transcript::render(self, cx).into_any_element(),
                     }),
             );
+        let root = root.when(self.quit_sheet, |root| {
+            root.child(self.render_quit_sheet(cx))
+        });
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|_, action: &DebugStallUi, window, cx| {
             let milliseconds = action.milliseconds;
@@ -1284,9 +1696,18 @@ impl Render for Shell {
             });
         }));
         #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|shell, action: &DebugScrollTranscript, _, cx| {
+            if action.pixels.is_finite() {
+                shell
+                    .scroller
+                    .update(cx, |state, cx| state.scroll_by(action.pixels.into(), cx));
+            }
+        }));
+        #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|_, _: &ActivateWindow, window, cx| {
             cx.activate(true);
             window.activate_window();
+            window.refresh();
         }));
         root
     }
@@ -1302,6 +1723,7 @@ pub fn run(
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.set_app_identity("dev.veyra.app", "Veyra");
             theme::register_fonts(cx).expect("bundled Geist fonts");
             actions::init(cx);
             let layout = Theme::new(Appearance::Dark).layout;
@@ -1328,6 +1750,23 @@ pub fn run(
                     .detach();
                 let shell =
                     cx.new(|cx| Shell::new(engine, runtime, events, data_dir.clone(), window, cx));
+                let notifications = shell.downgrade();
+                let handle = window.window_handle();
+                cx.on_system_notification_response(move |response, cx| {
+                    if let Ok(root) = serde_json::from_value::<ThreadId>(serde_json::Value::String(
+                        response.tag.to_string(),
+                    )) {
+                        let _ = handle.update(cx, |_, window, cx| {
+                            let _ = notifications.update(cx, |shell, cx| {
+                                if let Some(thread) = shell.banner_target(root) {
+                                    cx.activate(true);
+                                    window.activate_window();
+                                    shell.select_thread(thread, window, cx);
+                                }
+                            });
+                        });
+                    }
+                });
                 #[cfg(debug_assertions)]
                 crate::control::attach(&shell, requests, data_dir.clone(), window, cx);
                 window.on_next_frame(move |_, _| {
@@ -1355,6 +1794,53 @@ mod tests {
         events::{ChangeEvent, ThreadSnapshot, UiEvent},
         provider::{Probe, ProviderKind, Readiness},
     };
+
+    #[gpui::test]
+    fn native_app_quit_closes_engine_without_quit_action(cx: &mut gpui::TestAppContext) {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let scratch = Scratch(
+            std::path::PathBuf::from("/tmp").join(format!("veyra-quit-{}", ThreadId::new())),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let engine = veyra_engine::Engine::start(
+            runtime.handle(),
+            veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+        )
+        .unwrap();
+        let (_, events) = tokio::sync::mpsc::unbounded_channel();
+        cx.update(gpui_kit::init);
+        cx.skip_drawing();
+        let _window = cx.add_window_view(|window, cx| {
+            super::Theme::apply(super::Appearance::Dark, window, cx);
+            let mut shell = super::Shell::new(
+                engine.clone(),
+                runtime.handle().clone(),
+                events,
+                scratch.0.clone(),
+                window,
+                cx,
+            );
+            shell.probes = Default::default();
+            shell
+        });
+        cx.update(|cx| cx.shutdown());
+        let result = runtime.block_on(engine.send(
+            veyra_engine::commands::Command::SetDefaultMode {
+                mode: PermissionMode::AskFirst,
+            },
+        ));
+        runtime.block_on(engine.shutdown_wait());
+        drop(engine);
+        assert!(matches!(
+            result.unwrap(),
+            Err(veyra_engine::commands::CommandError::Closed)
+        ));
+    }
 
     #[gpui::test]
     fn chat_branch_loads_when_the_thread_row_follows_selection(cx: &mut gpui::TestAppContext) {
@@ -1447,6 +1933,50 @@ mod tests {
             shell.read_with(cx, |shell, cx| shell.dump(&scratch.0, cx))["header_branch"],
             "fixture-branch"
         );
+    }
+
+    #[test]
+    fn retry_resends_failed_turn_prompt_with_newer_queued_message() {
+        let thread = ThreadId::new();
+        let mut state = AppState::default();
+        for (ordinal, text, turn_state) in [
+            (
+                1,
+                "failed prompt",
+                TurnState::Ended {
+                    outcome: TurnOutcome::Failed {
+                        message: "failure".into(),
+                    },
+                    started: Some(1),
+                    at: 2,
+                },
+            ),
+            (2, "queued prompt", TurnState::Queued),
+        ] {
+            let turn = TurnId::new();
+            let item = ItemId::new();
+            state.turns.insert(
+                turn,
+                Turn {
+                    id: turn,
+                    thread,
+                    ordinal,
+                    origin: TurnOrigin::User { item },
+                    state: turn_state,
+                },
+            );
+            state.items.entry(thread).or_default().insert(
+                item,
+                Item {
+                    id: item,
+                    thread,
+                    turn,
+                    seq: 0,
+                    body: ItemBody::UserText(text.into()),
+                },
+            );
+        }
+        assert_eq!(state.retry_prompt(thread), Some("failed prompt".into()));
     }
 
     #[test]

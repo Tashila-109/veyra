@@ -41,6 +41,31 @@ pub enum SessionControl {
     },
     Shutdown,
 }
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StopReason {
+    User,
+    StorageBlocked,
+    AppClosing,
+}
+impl StopReason {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::User => "Stopped by you",
+            Self::StorageBlocked => "Stopped because the database is blocked",
+            Self::AppClosing => "Veyra closed while this turn ran",
+        }
+    }
+}
+impl SessionControl {
+    pub(crate) fn stop_reason(&self) -> Option<StopReason> {
+        match self {
+            Self::Interrupt => Some(StopReason::User),
+            Self::StorageBlocked => Some(StopReason::StorageBlocked),
+            Self::Shutdown => Some(StopReason::AppClosing),
+            Self::StartTurn { .. } | Self::Answer { .. } => None,
+        }
+    }
+}
 pub type Reply = Decision;
 #[derive(Clone, Debug)]
 pub enum ProviderEvent {

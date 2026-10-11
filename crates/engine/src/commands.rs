@@ -318,37 +318,14 @@ fn respond(
             if c.view(p, l, thread).unwrap().running.map(|t| t.id) == Some(r.turn)
                 && r.state == RequestState::Pending =>
         {
-            match (&r.kind, &decision) {
-                (
-                    RequestKind::Approval { .. },
-                    Decision::AllowOnce | Decision::AllowInThread | Decision::Deny,
-                )
-                | (RequestKind::Question { .. }, Decision::Answers(_)) => {}
-                _ => {
-                    return Err(CommandError::Invalid(
-                        "answer the request with its matching decision".into(),
-                    ));
-                }
-            }
-            if decision == Decision::AllowInThread
-                && matches!(
-                    r.kind,
-                    RequestKind::Approval {
-                        grant_key: None,
-                        ..
-                    }
-                )
-            {
+            if !r.kind.accepts(&decision) {
                 return Err(CommandError::Invalid(
-                    "only commands can be allowed in this thread".into(),
+                    "answer the request with its matching decision".into(),
                 ));
             }
             if let (RequestKind::Question { questions }, Decision::Answers(answers)) =
                 (&r.kind, &decision)
             {
-                if questions.len() != answers.len() {
-                    return Err(CommandError::Invalid("answer every question".into()));
-                }
                 add_item(
                     p,
                     c,
@@ -694,7 +671,13 @@ pub fn end_turn(
     c.turns.insert(ended, turn);
     requeue_wake(p, c, ended);
 }
-fn end_running(p: &Projection, c: &mut ChangeSet, thread: ThreadId, reason: &str, now: Millis) {
+pub(crate) fn end_running(
+    p: &Projection,
+    c: &mut ChangeSet,
+    thread: ThreadId,
+    reason: &str,
+    now: Millis,
+) {
     let turns: Vec<_> = c
         .turns(p, thread)
         .filter(|t| matches!(t.state, TurnState::Running { .. }))
