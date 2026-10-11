@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader},
     process::Child,
     sync::{mpsc, oneshot},
 };
@@ -32,49 +32,46 @@ fn process_alive(child: &mut Child, pid: u32) -> std::io::Result<bool> {
     child.try_wait()?;
     platform::group_exists(pid)
 }
+async fn wait_for_group(
+    child: &mut Child,
+    pid: u32,
+    check: fn(&mut Child, u32) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if !check(child, pid)? {
+            return Ok(false);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 async fn end_process(
     mut child: Child,
     pid: u32,
     check: fn(&mut Child, u32) -> std::io::Result<bool>,
 ) -> std::io::Result<std::process::ExitStatus> {
     let _ = platform::signal_group(pid, Signal::Terminate);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let mut failure = None;
-    loop {
-        match check(&mut child, pid) {
-            Err(error) => {
-                failure = Some(error);
-                let _ = platform::signal_group(pid, Signal::Kill);
-                break;
-            }
-            Ok(false) => break,
-            Ok(true) => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
+    match wait_for_group(&mut child, pid, check).await {
+        Ok(false) => {}
+        result => {
+            failure = result.err();
             let _ = platform::signal_group(pid, Signal::Kill);
-            break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let status = child.wait().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    loop {
-        match check(&mut child, pid) {
-            Ok(false) => break,
-            Err(error) => {
-                failure.get_or_insert(error);
-                break;
-            }
-            Ok(true) => {}
+    match wait_for_group(&mut child, pid, check).await {
+        Ok(false) => {}
+        Ok(true) => tracing::warn!(
+            pgid = pid,
+            "Provider process group still exists after cleanup deadline"
+        ),
+        Err(error) => {
+            failure.get_or_insert(error);
         }
-        if tokio::time::Instant::now() >= deadline {
-            tracing::warn!(
-                pgid = pid,
-                "Provider process group still exists after cleanup deadline"
-            );
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     failure.map_or(status, Err)
 }
@@ -127,6 +124,9 @@ impl ProcessGroup {
 }
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
+        if self.child.is_some() {
+            let _ = platform::signal_group(self.pid, Signal::Kill);
+        }
         self.end();
     }
 }
@@ -215,11 +215,21 @@ pub fn spawn(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    let process = launch(&spec, &env, None)?;
-    Ok(start_session(process, spec, env, out, epoch))
+    env.resolve(ProviderKind::Claude)?;
+    Ok(start_task(None, spec, env, out, epoch))
 }
+#[cfg(test)]
 fn start_session(
-    mut process: Process,
+    process: Process,
+    spec: SessionSpec,
+    env: ChildEnv,
+    out: mpsc::Sender<EngineMsg>,
+    epoch: u32,
+) -> SessionHandle {
+    start_task(Some(process), spec, env, out, epoch)
+}
+fn start_task(
+    process: Option<Process>,
     spec: SessionSpec,
     env: ChildEnv,
     out: mpsc::Sender<EngineMsg>,
@@ -227,12 +237,28 @@ fn start_session(
 ) -> SessionHandle {
     let (control, receiver) = mpsc::unbounded_channel();
     let (cleanup, reaped) = mpsc::unbounded_channel();
-    process.child.watch(&cleanup);
     let thread = spec.thread;
     let supervisor_out = out.clone();
     let task = tokio::spawn(async move {
         let mut spec = spec;
-        let mut process = process;
+        let mut process = match process {
+            Some(process) => process,
+            None => match launch(&spec, &env, None) {
+                Ok(process) => process,
+                Err(error) => {
+                    return emit(
+                        &out,
+                        thread,
+                        epoch,
+                        ProviderEvent::Session(SessionEvent::Exited {
+                            crash: Some(record::redact(&error.to_string(), None)),
+                        }),
+                    )
+                    .await;
+                }
+            },
+        };
+        process.child.watch(&cleanup);
         let mut receiver = receiver;
         loop {
             match run_one(
@@ -328,6 +354,62 @@ async fn emit(
     .await
     .is_ok()
 }
+const LINE_CAP: usize = 4 * 1024 * 1024;
+enum Line {
+    Text(String),
+    Oversize(usize),
+}
+struct ByteLines<R> {
+    reader: BufReader<R>,
+    bytes: Vec<u8>,
+    length: usize,
+}
+impl<R: AsyncRead + Unpin> ByteLines<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            bytes: Vec::new(),
+            length: 0,
+        }
+    }
+    async fn next(&mut self) -> std::io::Result<Option<Line>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            let end = available.iter().position(|byte| *byte == b'\n');
+            let count = end.unwrap_or(available.len());
+            let eof = available.is_empty();
+            self.length = self.length.saturating_add(count);
+            if self.length <= LINE_CAP {
+                self.bytes.extend_from_slice(&available[..count]);
+            } else {
+                self.bytes.clear();
+            }
+            self.reader.consume(count + usize::from(end.is_some()));
+            if end.is_some() || eof {
+                let length = std::mem::take(&mut self.length);
+                let bytes = std::mem::take(&mut self.bytes);
+                return Ok(if eof && length == 0 {
+                    None
+                } else if length > LINE_CAP {
+                    Some(Line::Oversize(length))
+                } else {
+                    Some(Line::Text(String::from_utf8_lossy(&bytes).into_owned()))
+                });
+            }
+        }
+    }
+}
+enum Ladder {
+    Protocol(tokio::time::Instant),
+    Terminate(tokio::time::Instant),
+}
+impl Ladder {
+    fn deadline(&self) -> tokio::time::Instant {
+        match self {
+            Self::Protocol(at) | Self::Terminate(at) => *at,
+        }
+    }
+}
 enum Completion {
     MissingSession,
     Exited(Option<String>),
@@ -343,12 +425,16 @@ async fn run_one(
     resume: bool,
 ) -> Completion {
     let pid = process.child.pid;
-    let mut lines = BufReader::new(process.child.stdout().expect("piped stdout")).lines();
-    let mut errors = BufReader::new(process.child.stderr().expect("piped stderr")).lines();
+    let mut lines = ByteLines::new(process.child.stdout().expect("piped stdout"));
+    let mut errors = ByteLines::new(process.child.stderr().expect("piped stderr"));
     let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
     let stderr_tail = tail.clone();
     let mut stderr = tokio::spawn(async move {
-        while let Ok(Some(line)) = errors.next_line().await {
+        while let Ok(Some(line)) = errors.next().await {
+            let line = match line {
+                Line::Text(line) => line,
+                Line::Oversize(length) => format!("Claude stderr line skipped ({length} bytes)"),
+            };
             let mut tail = stderr_tail.lock().unwrap();
             tail.push_back(line);
             while tail.len() > 8 {
@@ -369,6 +455,9 @@ async fn run_one(
     });
     let mut codec = Codec::new(process.native.clone(), pid);
     let mut ready = false;
+    let mut ladder: Option<Ladder> = None;
+    let mut stopped = false;
+    let mut rejected = None;
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder {
         recorder.bind(process.native.0.clone(), "<id:session>".into());
@@ -381,16 +470,8 @@ async fn run_one(
     let mut writer_done = false;
     while failure.is_none() {
         tokio::select! {
+            biased;
             _ = out.closed() => { consumer_gone = true; break; }
-            result = &mut write_task => {
-                writer_done = true;
-                failure = Some(match result {
-                    Ok(Err(error)) => format!("Claude stdin writer failed: {error}"),
-                    Err(error) => format!("Claude stdin writer task failed: {error}"),
-                    Ok(Ok(())) => "Claude stdin writer closed".into(),
-                });
-                break;
-            }
             message = control.recv() => match message {
                 Some(SessionControl::StartTurn { turn, text }) => {
                     let line = codec.start(turn, text);
@@ -405,6 +486,8 @@ async fn run_one(
                 }
                 Some(SessionControl::Shutdown) | None => break,
                 Some(SessionControl::Interrupt) => {
+                    codec.interrupt();
+                    ladder.get_or_insert(Ladder::Protocol(tokio::time::Instant::now() + Duration::from_secs(3)));
                     let line = serde_json::json!({
                         "type":"control_request", "request_id":"veyra-interrupt",
                         "request":{"subtype":"interrupt"}
@@ -416,8 +499,43 @@ async fn run_one(
                 }
                 Some(SessionControl::Answer { .. }) => {}
             },
-            line = lines.next_line() => match line {
-                Ok(Some(line)) => {
+            result = &mut write_task => {
+                writer_done = true;
+                failure = Some(match result {
+                    Ok(Err(error)) => format!("Claude stdin writer failed: {error}"),
+                    Err(error) => format!("Claude stdin writer task failed: {error}"),
+                    Ok(Ok(())) => "Claude stdin writer closed".into(),
+                });
+                break;
+            }
+            _ = async {
+                match &ladder { Some(ladder) => tokio::time::sleep_until(ladder.deadline()).await,
+                    None => std::future::pending().await }
+            } => {
+                stopped = true;
+                match ladder {
+                    Some(Ladder::Protocol(_)) => {
+                        let _ = platform::signal_group(pid, Signal::Terminate);
+                        ladder = Some(Ladder::Terminate(tokio::time::Instant::now() + Duration::from_secs(1)));
+                    }
+                    Some(Ladder::Terminate(_)) => { let _ = platform::signal_group(pid, Signal::Kill); break; }
+                    None => {}
+                }
+            }
+            line = lines.next() => match line {
+                Ok(Some(Line::Oversize(length))) => {
+                    tracing::info!(length, "skipped oversized Claude line");
+                    if !emit(out, thread, epoch, ProviderEvent::Session(SessionEvent::Notice {
+                        text: "Claude sent a line larger than 4 MiB; Veyra skipped it.".into()
+                    })).await { consumer_gone = true; break; }
+                }
+                Ok(Some(Line::Text(line))) => {
+                    if let Err(error) = serde_json::from_str::<serde_json::Value>(&line) {
+                        tracing::info!(length = line.len(), "skipped non-JSON Claude line");
+                        rejected = Some(ProviderError::Json(error).to_string());
+                        continue;
+                    }
+                    rejected = None;
                     if let Err(error) = process.record_inbound(&line) {
                         failure = Some(error.to_string());
                         break;
@@ -432,6 +550,10 @@ async fn run_one(
                             }
                             if failure.is_some() { break; }
                             for event in decoded.events {
+                                if matches!(event, ProviderEvent::Turn { event: TurnEvent::TurnEnded { .. }, .. }) {
+                                    ladder = None;
+                                    stopped = false;
+                                }
                                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                                     ready = true;
                                 }
@@ -459,7 +581,14 @@ async fn run_one(
         let _ = stderr.await;
     }
     let lines = tail.lock().unwrap().iter().cloned().collect::<Vec<_>>();
-    let failure = failure.map(|text| with_stderr(&text, &lines, None));
+    let failure = failure
+        .or(rejected)
+        .map(|text| with_stderr(&text, &lines, None));
+    let observed = process
+        .child
+        .child
+        .as_mut()
+        .and_then(|child| child.try_wait().ok().flatten());
     let status = process.child.stop().await.ok();
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder {
@@ -481,8 +610,38 @@ async fn run_one(
         return Completion::MissingSession;
     }
     let crash = if let Some(active) = codec.active {
-        let text = failure
-            .unwrap_or_else(|| crash_text(status.and_then(|status| status.code()), &lines, None));
+        let outside = observed
+            .as_ref()
+            .and_then(|status| match platform::exit_signal(status) {
+                Some(signal @ ("SIGHUP" | "SIGINT" | "SIGTERM")) => {
+                    Some(format!("Stopped by {signal}"))
+                }
+                _ => status
+                    .code()
+                    .filter(|code| [129, 130, 143].contains(code))
+                    .map(|code| format!("Stopped by exit code {code}")),
+            });
+        let outcome = if stopped || ladder.is_some() {
+            TurnOutcome::Interrupted {
+                reason: "Stopped by you".into(),
+            }
+        } else if let Some(text) = codec.failure() {
+            TurnOutcome::Failed {
+                message: text.into(),
+            }
+        } else if let Some(reason) = outside {
+            TurnOutcome::Interrupted { reason }
+        } else {
+            TurnOutcome::Failed {
+                message: failure.unwrap_or_else(|| {
+                    crash_text(observed.and_then(|status| status.code()), &lines, None)
+                }),
+            }
+        };
+        let crash = match &outcome {
+            TurnOutcome::Failed { message } => Some(message.clone()),
+            _ => None,
+        };
         let _ = emit(
             out,
             thread,
@@ -490,14 +649,13 @@ async fn run_one(
             ProviderEvent::Turn {
                 turn: active.id(),
                 event: TurnEvent::TurnEnded {
-                    outcome: TurnOutcome::Failed {
-                        message: text.clone(),
-                    },
+                    outcome,
+                    park: true,
                 },
             },
         )
         .await;
-        Some(text)
+        crash
     } else if let Some(failure) = failure {
         Some(failure)
     } else if !ready || status.is_some_and(|status| !status.success()) {
@@ -633,6 +791,79 @@ pub async fn probe(
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn exit_by_signal_or_code_classifies() {
+        for (script, interrupted, expected) in [
+            ("exit 129", true, "Stopped by exit code 129"),
+            ("exit 130", true, "Stopped by exit code 130"),
+            ("exit 143", true, "Stopped by exit code 143"),
+            (
+                "exit 137",
+                false,
+                "claude exited unexpectedly (exit code 137)",
+            ),
+            ("kill -TERM $$", true, "Stopped by SIGTERM"),
+            (
+                "kill -KILL $$",
+                false,
+                "claude exited unexpectedly (exit code unknown)",
+            ),
+        ] {
+            let env = ChildEnv::load();
+            let child = env
+                .spawn(
+                    std::path::Path::new("/bin/sh"),
+                    &[
+                        "-c".into(),
+                        format!("read initialize; read prompt; {script}"),
+                    ],
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .unwrap();
+            let pid = child.id().unwrap();
+            let process = Process {
+                child: ProcessGroup::new(child),
+                native: NativeSessionId("fixture-session".into()),
+                #[cfg(debug_assertions)]
+                recorder: None,
+            };
+            let (sender, mut control) = mpsc::unbounded_channel();
+            sender
+                .send(SessionControl::StartTurn {
+                    turn: TurnId::new(),
+                    text: "reply".into(),
+                })
+                .unwrap();
+            let (out, mut events) = mpsc::channel(256);
+            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
+            assert!(!platform::group_exists(pid).unwrap());
+            let EngineMsg::Provider {
+                event:
+                    ProviderEvent::Turn {
+                        event: TurnEvent::TurnEnded { outcome, .. },
+                        ..
+                    },
+                ..
+            } = events.try_recv().unwrap()
+            else {
+                panic!("missing end")
+            };
+            assert_eq!(
+                outcome,
+                if interrupted {
+                    TurnOutcome::Interrupted {
+                        reason: expected.into(),
+                    }
+                } else {
+                    TurnOutcome::Failed {
+                        message: expected.into(),
+                    }
+                },
+                "{script}"
+            );
+        }
+    }
+    #[tokio::test]
     async fn cleanup_deadline_delivers_failed_and_exited_when_group_stays_alive() {
         let env = ChildEnv::load();
         let cwd = std::path::PathBuf::from("/tmp");
@@ -694,7 +925,7 @@ mod tests {
         let expected = "Claude protocol: expected ident at line 1 column 2";
         assert!(matches!(failed, EngineMsg::Provider {
             event: ProviderEvent::Turn {
-                turn: Some(id), event: TurnEvent::TurnEnded { outcome: TurnOutcome::Failed { message } }
+                turn: Some(id), event: TurnEvent::TurnEnded { outcome: TurnOutcome::Failed { message }, .. }
             }, ..
         } if id == turn && message == expected));
         assert!(matches!(exited, EngineMsg::Provider {
@@ -822,7 +1053,7 @@ mod tests {
                 event: ProviderEvent::Turn {
                     turn: Some(id),
                     event: TurnEvent::TurnEnded {
-                        outcome: TurnOutcome::Failed { message }
+                        outcome: TurnOutcome::Failed { message }, ..
                     }
                 }, ..
             } if id == turn && message == expected

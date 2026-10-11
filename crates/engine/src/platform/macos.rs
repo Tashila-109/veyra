@@ -22,13 +22,67 @@ pub const KNOWN_BIN_DIRS: &[&str] = &[
 
 pub fn login_shell_path() -> io::Result<std::ffi::OsString> {
     let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-    let output = Command::new(shell)
+    bounded_shell_path(&shell, std::time::Duration::from_secs(2))
+}
+fn bounded_shell_path(
+    shell: &std::ffi::OsStr,
+    bound: std::time::Duration,
+) -> io::Result<std::ffi::OsString> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut child = Command::new(shell)
         .args(["-l", "-c", "printf '%s' \"$PATH\""])
-        .output()?;
-    if !output.status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    let pid = child.id();
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(error) => break Err(error),
+            Ok(None) => {}
+        }
+        if start.elapsed() >= bound {
+            break Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "login shell PATH timed out",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let _ = signal_group(pid, super::Signal::Kill);
+    let _ = child.wait();
+    let output = reader
+        .join()
+        .map_err(|_| io::Error::other("login shell reader failed"))??;
+    if !status?.success() {
         return Err(io::Error::other("login shell could not read PATH"));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    Ok(String::from_utf8_lossy(&output).trim().into())
+}
+pub fn exit_signal(status: &std::process::ExitStatus) -> Option<&'static str> {
+    use std::os::unix::process::ExitStatusExt;
+    match status.signal()? {
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGTERM => Some("SIGTERM"),
+        libc::SIGKILL => Some("SIGKILL"),
+        _ => Some("other signal"),
+    }
+}
+pub fn ignore_terminate() {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
 }
 
 pub fn own_group(cmd: &mut tokio::process::Command) {
@@ -122,4 +176,53 @@ pub fn bind_socket(path: &Path) -> io::Result<UnixListener> {
 
 pub fn connect_socket(path: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn login_shell_bounded_at_2s() {
+        if env::var_os("VEYRA_SHELL_TIMEOUT_CHILD").is_some() {
+            assert!(login_shell_path().is_err());
+            return;
+        }
+        let root = env::temp_dir().join(format!("veyra-shell-{}", crate::domain::ThreadId::new()));
+        fs::create_dir(&root).unwrap();
+        let shell = root.join("shell");
+        fs::write(
+            &shell,
+            "#!/bin/sh\nprintf '%s' \"$$\" > pid\n/bin/sleep 10 & wait\n",
+        )
+        .unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        let start = std::time::Instant::now();
+        let result = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::macos::tests::login_shell_bounded_at_2s",
+            ])
+            .env("SHELL", &shell)
+            .env("VEYRA_SHELL_TIMEOUT_CHILD", "1")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let elapsed = start.elapsed();
+        let pid: u32 = fs::read_to_string(root.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let alive = group_exists(pid).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2500),
+            "{elapsed:?}"
+        );
+        assert!(!alive);
+    }
 }

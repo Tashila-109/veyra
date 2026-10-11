@@ -78,7 +78,7 @@ fn live_claude_ok_reply() {
                         ..
                     } => text.push_str(&delta),
                     ProviderEvent::Turn {
-                        event: TurnEvent::TurnEnded { outcome },
+                        event: TurnEvent::TurnEnded { outcome, .. },
                         ..
                     } => {
                         assert_eq!(outcome, TurnOutcome::Completed);

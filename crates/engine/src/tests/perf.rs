@@ -8,12 +8,6 @@ fn perf_decide_commit() {
     let path =
         std::path::PathBuf::from(format!("/tmp/veyra-perf-{}", uuid::Uuid::now_v7().simple()));
     std::fs::create_dir(&path).unwrap();
-    struct Scratch(std::path::PathBuf);
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
-        }
-    }
     let _scratch = Scratch(path.clone());
     let db_path = path.join("veyra.db");
     let db = store::open(&db_path).unwrap();

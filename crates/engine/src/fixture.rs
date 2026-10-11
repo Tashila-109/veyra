@@ -20,11 +20,20 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after_ms: Option<u64>,
     },
+    EmitRaw {
+        base64: String,
+        #[serde(default = "once")]
+        repeat: usize,
+    },
     Exit {
         code: i32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         stderr: Vec<String>,
     },
+}
+
+fn once() -> usize {
+    1
 }
 
 pub fn load(path: &Path) -> io::Result<Vec<Record>> {

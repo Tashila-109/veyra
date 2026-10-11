@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Millis, ThreadView, wait_reason},
+    domain::{Millis, ThreadView, TurnId, wait_reason},
     provider::{SessionHandle, TerminalHandle},
 };
 
@@ -21,6 +21,7 @@ pub enum Live {
         session: SessionHandle,
         pid: u32,
         pgid: u32,
+        draining: Option<TurnId>,
     },
     Terminal {
         term: TerminalHandle,

@@ -63,6 +63,10 @@ enum Frame {
     CommandLifecycle(Lifecycle),
     ControlResponse(ControlResponse),
     ControlRequest(ControlRequest),
+    ConversationReset,
+    RateLimitEvent {
+        rate_limit_info: RateLimit,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -74,11 +78,14 @@ struct System {
     claude_code_version: String,
     capabilities: Vec<String>,
     tasks: Vec<Value>,
+    attempt: u32,
+    retry_delay_ms: u64,
 }
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Stream {
     event: Event,
+    parent_tool_use_id: Option<String>,
 }
 #[derive(Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -114,11 +121,14 @@ struct User {
     #[serde(rename = "isReplay")]
     is_replay: bool,
     message: Value,
+    parent_tool_use_id: Option<String>,
 }
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Assistant {
     message: Value,
+    error: Option<String>,
+    parent_tool_use_id: Option<String>,
 }
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -266,6 +276,11 @@ impl ResultFrame {
             ]
             .contains(&reason)
         });
+        if aborted {
+            return TurnOutcome::Interrupted {
+                reason: format!("Claude ended with {}", reason.unwrap()),
+            };
+        }
         if self.is_error
             || self.subtype.starts_with("error")
             || (!aborted && incomplete)
@@ -280,10 +295,6 @@ impl ResultFrame {
             };
             TurnOutcome::Failed {
                 message: crate::record::redact(&message, None),
-            }
-        } else if aborted {
-            TurnOutcome::Interrupted {
-                reason: format!("Claude ended with {}", reason.unwrap()),
             }
         } else {
             TurnOutcome::Completed
@@ -303,15 +314,95 @@ impl ActiveTurn {
         }
     }
 }
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RateLimit {
+    status: String,
+    #[serde(rename = "resetsAt")]
+    resets_at: Option<u64>,
+}
+struct AssistantError {
+    message: String,
+    park: bool,
+}
+impl AssistantError {
+    fn new(code: &str) -> Self {
+        let (words, park) = match code {
+            "authentication_failed" => (
+                "Claude is signed out. Sign in from a terminal with `claude`, then send again.",
+                true,
+            ),
+            "oauth_org_not_allowed" => (
+                "Claude cannot use this organization. Choose an allowed organization in a terminal, then send again.",
+                true,
+            ),
+            "account_on_hold" => (
+                "Your Claude account is on hold. Resolve the account hold, then send again.",
+                true,
+            ),
+            "verification_required" => (
+                "Claude requires account verification. Verify your account, then send again.",
+                true,
+            ),
+            "billing_error" => (
+                "Claude could not bill this account. Check billing, then send again.",
+                true,
+            ),
+            "cloud_credential_error" => (
+                "Claude could not use your cloud credentials. Repair those credentials, then send again.",
+                true,
+            ),
+            "rate_limit" => (
+                "Claude reached a usage limit. Wait for the limit to reset, then send again.",
+                false,
+            ),
+            "overloaded" => (
+                "Claude is overloaded. Wait briefly, then send again.",
+                false,
+            ),
+            "invalid_request" => (
+                "Claude rejected this request. Check the prompt and configuration, then send again.",
+                false,
+            ),
+            "model_not_found" => (
+                "Claude could not find this model. Choose another model, then send again.",
+                false,
+            ),
+            "server_error" => ("Claude had a server error. Send again to retry.", false),
+            "max_output_tokens" => (
+                "Claude reached its output limit. Send a shorter request or ask it to continue.",
+                false,
+            ),
+            _ => (
+                "Claude could not finish this request. Check the CLI in a terminal, then send again.",
+                false,
+            ),
+        };
+        Self {
+            message: words.into(),
+            park,
+        }
+    }
+}
+#[derive(Default)]
+struct MessageStream {
+    message: String,
+    blocks: BTreeMap<u32, Block>,
+    final_blocks: BTreeMap<(String, String), usize>,
+}
+struct Tool {
+    key: NativeItemKey,
+    subagent: Option<Box<Codec>>,
+}
 pub(crate) struct Codec {
     pub active: Option<ActiveTurn>,
     echo: EchoMode,
     native: NativeSessionId,
     pid: u32,
-    message: String,
-    blocks: BTreeMap<u32, Block>,
-    final_blocks: BTreeMap<(String, String), usize>,
-    tools: BTreeMap<String, NativeItemKey>,
+    stream: MessageStream,
+    tools: BTreeMap<String, Tool>,
+    error: Option<AssistantError>,
+    interrupted: bool,
 }
 #[derive(Default)]
 pub(crate) struct Decoded {
@@ -325,16 +416,17 @@ impl Codec {
             echo: EchoMode::Unknown,
             native,
             pid,
-            message: String::new(),
-            blocks: BTreeMap::new(),
-            final_blocks: BTreeMap::new(),
+            stream: MessageStream::default(),
+            error: None,
+            interrupted: false,
             tools: BTreeMap::new(),
         }
     }
     pub fn start(&mut self, turn: TurnId, text: String) -> Value {
         self.active = Some(ActiveTurn::Veyra(turn));
-        self.blocks.clear();
-        self.final_blocks.clear();
+        self.stream = MessageStream::default();
+        self.error = None;
+        self.interrupted = false;
         json!({
             "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
             "parent_tool_use_id":null, "message":{"role":"user","content":text}
@@ -355,6 +447,55 @@ impl Codec {
     pub fn line(&mut self, line: &str) -> Result<Decoded, super::ProviderError> {
         let frame: Frame = serde_json::from_str(line)?;
         let mut decoded = Decoded::default();
+        let parent = match &frame {
+            Frame::Assistant(frame) => frame.parent_tool_use_id.as_deref(),
+            Frame::User(frame) => frame.parent_tool_use_id.as_deref(),
+            Frame::StreamEvent(frame) => frame.parent_tool_use_id.as_deref(),
+            _ => None,
+        };
+        if let Some(parent) = parent {
+            let mut wire: Value = serde_json::from_str(line)?;
+            if let Some(tool) = self.tools.get_mut(parent)
+                && let Some(codec) = &mut tool.subagent
+            {
+                if matches!(frame, Frame::User(_)) {
+                    if let Some(content) = wire["message"]["content"].as_array() {
+                        for block in content {
+                            let text = block["text"].as_str().or_else(|| block["content"].as_str());
+                            if let Some(text) = text {
+                                decoded.events.push(ProviderEvent::Turn {
+                                    turn: self.active.and_then(ActiveTurn::id),
+                                    event: TurnEvent::ToolOutput {
+                                        key: tool.key.clone(),
+                                        text: text.into(),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    wire["parent_tool_use_id"] = Value::Null;
+                    for event in codec.line(&wire.to_string())?.events {
+                        if let ProviderEvent::Turn {
+                            event: TurnEvent::TextDelta { text, .. },
+                            ..
+                        } = event
+                        {
+                            decoded.events.push(ProviderEvent::Turn {
+                                turn: self.active.and_then(ActiveTurn::id),
+                                event: TurnEvent::ToolOutput {
+                                    key: tool.key.clone(),
+                                    text,
+                                },
+                            });
+                        }
+                    }
+                }
+            } else {
+                log_ignored("subagent", &wire);
+            }
+            return Ok(decoded);
+        }
         let mut events = Vec::new();
         match frame {
             Frame::ControlResponse(reply) if reply.response.request_id == INITIALIZE_ID => {
@@ -389,8 +530,22 @@ impl Codec {
             Frame::Result(result) => {
                 if self.owns_result(&result) {
                     events.push(TurnEvent::TurnEnded {
-                        outcome: result.outcome(),
+                        outcome: if self.interrupted {
+                            TurnOutcome::Interrupted { reason: "Stopped by you".into() }
+                        } else if let Some(error) = &self.error {
+                            TurnOutcome::Failed { message: error.message.clone() }
+                        } else { result.outcome() },
+                        park: self.error.as_ref().is_some_and(|error| error.park),
                     });
+                }
+            }
+            Frame::ConversationReset => decoded.events.push(Self::notice(
+                "Claude cleared this conversation. The CLI no longer sees the messages above this notice.".into())),
+            Frame::RateLimitEvent { rate_limit_info } => {
+                if rate_limit_info.status != "allowed" {
+                    let reset = rate_limit_info.resets_at.map_or_else(|| "unknown".into(), |at| at.to_string());
+                    decoded.events.push(Self::notice(format!(
+                        "Claude usage limit: {}; resets at {}.", rate_limit_info.status, reset)));
                 }
             }
             Frame::ControlRequest(request) => decoded.replies.push(json!({
@@ -423,11 +578,26 @@ impl Codec {
             }));
         if ended {
             self.active = None;
-            self.blocks.clear();
-            self.final_blocks.clear();
+            self.stream = MessageStream::default();
             self.tools.clear();
+            self.error = None;
+            self.interrupted = false;
         }
         Ok(decoded)
+    }
+    pub fn interrupt(&mut self) {
+        self.interrupted = true;
+    }
+    pub fn failure(&self) -> Option<&str> {
+        self.error.as_ref().map(|error| error.message.as_str())
+    }
+    fn notice(text: String) -> ProviderEvent {
+        ProviderEvent::Session(SessionEvent::Notice { text })
+    }
+    fn tool(&mut self, id: String, name: &str, key: NativeItemKey) {
+        let subagent = matches!(name, "Task" | "Agent")
+            .then(|| Box::new(Self::new(self.native.clone(), self.pid)));
+        self.tools.insert(id, Tool { key, subagent });
     }
     fn system(&mut self, system: System, decoded: &mut Decoded) {
         match system.subtype.as_str() {
@@ -446,6 +616,16 @@ impl Codec {
                     .events
                     .push(self.ready(version, system.capabilities));
             }
+            "compact_boundary" => decoded
+                .events
+                .push(Self::notice("Claude compacted this conversation.".into())),
+            "api_retry" => decoded.events.push(Self::notice(format!(
+                "Claude is retrying the API (attempt {}) in {} ms.",
+                system.attempt, system.retry_delay_ms
+            ))),
+            "model_refusal_fallback" => decoded.events.push(Self::notice(
+                "Claude is falling back to another model.".into(),
+            )),
             "background_tasks_changed" => {
                 decoded
                     .events
@@ -477,7 +657,7 @@ impl Codec {
         if let Some(content) = user.message.get("content").and_then(Value::as_array) {
             for block in content {
                 if block["type"] == "tool_result"
-                    && let Some(key) = block["tool_use_id"]
+                    && let Some(tool) = block["tool_use_id"]
                         .as_str()
                         .and_then(|id| self.tools.remove(id))
                 {
@@ -486,7 +666,7 @@ impl Codec {
                         .map(str::to_owned)
                         .unwrap_or_else(|| block["content"].to_string());
                     events.push(TurnEvent::ToolFinished {
-                        key,
+                        key: tool.key,
                         ok: block["is_error"] != true,
                         output_tail: Some(output),
                     });
@@ -521,20 +701,21 @@ impl Codec {
                 if self.active.is_none() {
                     events.push(TurnEvent::Started);
                 }
-                self.message = message["id"].as_str().unwrap_or_default().into();
-                self.blocks.clear();
-                self.final_blocks.clear();
+                self.stream = MessageStream {
+                    message: message["id"].as_str().unwrap_or_default().into(),
+                    ..MessageStream::default()
+                };
             }
             Event::ContentBlockStart {
                 index,
                 content_block,
             } => {
                 let kind = content_block.kind();
-                let key = NativeItemKey(format!("{}:{index}:{kind}", self.message));
-                if let ContentBlock::ToolUse { id, .. } = &content_block {
-                    self.tools.insert(id.clone(), key.clone());
+                let key = NativeItemKey(format!("{}:{index}:{kind}", self.stream.message));
+                if let ContentBlock::ToolUse { id, name, .. } = &content_block {
+                    self.tool(id.clone(), name, key.clone());
                 }
-                self.blocks.insert(
+                self.stream.blocks.insert(
                     index,
                     Block {
                         key,
@@ -545,7 +726,7 @@ impl Codec {
                 );
             }
             Event::ContentBlockDelta { index, delta } => {
-                if let Some(block) = self.blocks.get_mut(&index) {
+                if let Some(block) = self.stream.blocks.get_mut(&index) {
                     match delta {
                         Delta::Text { text } => {
                             block.streamed = true;
@@ -571,7 +752,7 @@ impl Codec {
                 }
             }
             Event::ContentBlockStop { index } => {
-                if let Some(block) = self.blocks.get(&index) {
+                if let Some(block) = self.stream.blocks.get(&index) {
                     if let ContentBlock::ToolUse { name, input, .. } = &block.content {
                         events.push(TurnEvent::ToolStarted {
                             key: block.key.clone(),
@@ -597,19 +778,24 @@ impl Codec {
         assistant: Assistant,
         events: &mut Vec<TurnEvent>,
     ) -> Result<(), super::ProviderError> {
+        if let Some(error) = &assistant.error {
+            self.error = Some(AssistantError::new(error));
+        }
+        let message = assistant.message["id"].as_str();
         if let Some(content) = assistant.message["content"].as_array() {
             for value in content {
                 let kind = value["type"].as_str().unwrap_or_default();
-                let message = assistant.message["id"].as_str().unwrap_or_default();
                 let count = self
+                    .stream
                     .final_blocks
-                    .entry((message.into(), kind.into()))
+                    .entry((message.unwrap_or_default().into(), kind.into()))
                     .or_default();
                 let ordinal = *count;
                 *count += 1;
-                let streamed = (assistant.message["id"].as_str() == Some(self.message.as_str()))
+                let streamed = (message == Some(self.stream.message.as_str()))
                     .then(|| {
-                        self.blocks
+                        self.stream
+                            .blocks
                             .values()
                             .filter(|block| block.content.kind() == kind)
                             .nth(ordinal)
@@ -624,16 +810,21 @@ impl Codec {
                 let key = streamed.map(|block| block.key.clone()).unwrap_or_else(|| {
                     NativeItemKey(format!(
                         "{}:{ordinal}:{}",
-                        assistant.message["id"].as_str().unwrap_or_default(),
+                        message.unwrap_or_default(),
                         block.kind()
                     ))
                 });
                 match block {
-                    ContentBlock::Text { text } => events.push(TurnEvent::TextDelta {
-                        key: key.clone(),
-                        text,
-                        streamed: false,
-                    }),
+                    ContentBlock::Text { text } => {
+                        if self.interrupted && text.starts_with("[ede_diagnostic]") {
+                            continue;
+                        }
+                        events.push(TurnEvent::TextDelta {
+                            key: key.clone(),
+                            text,
+                            streamed: false,
+                        });
+                    }
                     ContentBlock::Thinking { thinking } => {
                         if thinking.is_empty() {
                             continue;
@@ -647,7 +838,17 @@ impl Codec {
                         log_ignored("content_block", value);
                         continue;
                     }
-                    ContentBlock::ToolUse { .. } => continue,
+                    ContentBlock::ToolUse { id, name, input } => {
+                        self.tool(id, &name, key.clone());
+                        events.push(TurnEvent::ToolStarted {
+                            key,
+                            call: ToolCall {
+                                name,
+                                arguments: input,
+                            },
+                        });
+                        continue;
+                    }
                 }
                 events.push(TurnEvent::ItemEnded { key });
             }
@@ -678,6 +879,23 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aborted_reason_ends_interrupted() {
+        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        let turn = TurnId::new();
+        codec.start(turn, "reply".into());
+        let decoded = codec
+            .line(
+                &json!({"type":"result", "subtype":"error_during_execution",
+            "is_error":false, "errors":["Request was aborted"],
+            "terminal_reason":"aborted_streaming"})
+                .to_string(),
+            )
+            .unwrap();
+        assert!(matches!(&decoded.events[0], ProviderEvent::Turn {
+            event: TurnEvent::TurnEnded { outcome: TurnOutcome::Interrupted { reason }, .. }, ..
+        } if reason == "Claude ended with aborted_streaming"));
+    }
     #[test]
     fn unknown_wire_types_log_types_without_content() {
         use std::sync::{Arc, Mutex};
@@ -716,7 +934,9 @@ mod tests {
             }
         }
         let capture = Capture::default();
+        let parallel_registration = tracing::Dispatch::new(capture.clone());
         tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
             let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
             for wire in [
                 json!({"type":"stream_event","event":{"type":"future_event","content":"private-content"}}),
@@ -742,6 +962,7 @@ mod tests {
                 )
                 .unwrap();
         });
+        drop(parallel_registration);
         let logs = capture.0.lock().unwrap();
         assert_eq!(
             logs.iter()
@@ -933,7 +1154,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 &decoded.events[0],
-                ProviderEvent::Turn { turn: Some(id), event: TurnEvent::TurnEnded { outcome } }
+                ProviderEvent::Turn { turn: Some(id), event: TurnEvent::TurnEnded { outcome, .. } }
                     if *id == turn && *outcome == expected
             ));
         }

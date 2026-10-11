@@ -285,11 +285,12 @@ fn interrupt(
     get_thread(p, thread)?;
     match &l[&thread].live {
         Live::Starting { .. } => {
-            control(c, thread, SessionControl::Interrupt);
+            control(c, thread, SessionControl::Shutdown);
             stopping(l, c, thread, AfterStop::Park);
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
-            end_running(p, c, thread, "Interrupted by you", now);
+            drain_running(p, l, c, thread);
+            end_running(p, c, thread, "Stopped by you", now);
             control(c, thread, SessionControl::Interrupt);
         }
         Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
@@ -531,6 +532,19 @@ fn hold_parent(p: &Projection, c: &mut ChangeSet, thread: ThreadId) {
         set_hold(p, c, parent, Some(HoldReason::ChildReport));
     }
 }
+fn drain_running(
+    p: &Projection,
+    l: &BTreeMap<ThreadId, LiveThread>,
+    c: &mut ChangeSet,
+    thread: ThreadId,
+) {
+    let turn = c.view(p, l, thread).unwrap().running.map(|turn| turn.id);
+    let mut live = c.live(l, thread).clone();
+    if let Live::Structured { draining, .. } = &mut live.live {
+        *draining = turn;
+    }
+    c.live.insert(thread, live);
+}
 fn stop_one(
     p: &Projection,
     l: &BTreeMap<ThreadId, LiveThread>,
@@ -540,10 +554,11 @@ fn stop_one(
 ) {
     match &l[&thread].live {
         Live::Starting { .. } => {
-            control(c, thread, SessionControl::Interrupt);
+            control(c, thread, SessionControl::Shutdown);
             stopping(l, c, thread, AfterStop::Park);
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
+            drain_running(p, l, c, thread);
             control(c, thread, SessionControl::Interrupt);
         }
         Live::Terminal { .. } => {
@@ -557,7 +572,7 @@ fn stop_one(
         }
         Live::Parked | Live::Structured { .. } => {}
     }
-    end_running(p, c, thread, "Thread stopped", now);
+    end_running(p, c, thread, "Stopped by you", now);
     drop_turns(p, c, thread, false, now);
     set_hold(p, c, thread, Some(HoldReason::Stopped));
 }

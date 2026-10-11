@@ -1,0 +1,6 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.294","scenario":"assistant-error-eof","source":"Veyra hand-written SDK 0.3.293 scenario"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:initialize>","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:initialize>","response":{}}}}
+{"type":"expect_outbound","line":{"type":"user","uuid":"<id:prompt>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"<any>"}}}
+{"type":"emit_inbound","line":{"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"server error"}]},"parent_tool_use_id":null,"error":"server_error"}}
+{"type":"exit","code":1}

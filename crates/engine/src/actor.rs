@@ -81,6 +81,8 @@ pub struct Actor {
     blocked: Option<Blocked>,
     #[cfg(test)]
     pub(crate) fail_write: bool,
+    #[cfg(test)]
+    pub(crate) test_commits: usize,
 }
 pub fn now() -> Millis {
     SystemTime::now()
@@ -126,6 +128,8 @@ impl Actor {
             blocked: None,
             #[cfg(test)]
             fail_write: false,
+            #[cfg(test)]
+            test_commits: 0,
         };
         let mut c = c;
         actor.prepare_commit(&mut c);
@@ -314,9 +318,25 @@ impl Actor {
         if self.fail_write {
             return Err(StoreError::Invalid("injected storage failure".into()));
         }
+        if c.projects.is_empty()
+            && c.threads.is_empty()
+            && c.turns.is_empty()
+            && c.items.is_empty()
+            && c.requests.is_empty()
+            && c.tasks.is_empty()
+            && c.grants.is_empty()
+            && c.settings.is_none()
+            && c.live.is_empty()
+        {
+            return Ok(());
+        }
         let tx = self.db.transaction()?;
         store::apply(&tx, c, now())?;
         tx.commit()?;
+        #[cfg(test)]
+        {
+            self.test_commits += 1;
+        }
         Ok(())
     }
     fn commit_event(&mut self, mut c: ChangeSet) {
@@ -581,7 +601,16 @@ impl Actor {
                     }
                 };
                 let mut live = self.live[&thread].clone();
-                live.live = Live::Structured { session, pid, pgid };
+                let draining = match live.live {
+                    Live::Structured { draining, .. } => draining,
+                    _ => None,
+                };
+                live.live = Live::Structured {
+                    session,
+                    pid,
+                    pgid,
+                    draining,
+                };
                 live.capabilities = capabilities;
                 c.live.insert(thread, live);
                 let mut t = self.projection.threads[&thread].clone();
@@ -640,6 +669,28 @@ impl Actor {
                     tracing::debug!(%thread,"dropped turn outside structured session");
                     return None;
                 }
+                let drained = match self.live[&thread].live {
+                    Live::Structured { draining, .. } => draining,
+                    _ => None,
+                };
+                let provider_drain = drained
+                    .is_some_and(|id| self.projection.turns[&id].origin == TurnOrigin::Provider);
+                if matches!(event, TurnEvent::TurnEnded { park: true, .. }) {
+                    commands::control(&mut c, thread, SessionControl::Shutdown);
+                    commands::stopping(&self.live, &mut c, thread, AfterStop::Park);
+                } else if matches!(event, TurnEvent::TurnEnded { .. })
+                    && drained.is_some()
+                    && (turn == drained || turn.is_none() && provider_drain)
+                {
+                    let mut live = self.live[&thread].clone();
+                    if let Live::Structured { draining, .. } = &mut live.live {
+                        *draining = None;
+                    }
+                    c.live.insert(thread, live);
+                } else if turn.is_none() && provider_drain && event.opens_provider_turn() {
+                    tracing::info!(%thread, "dropped stopped Provider turn tail");
+                    return None;
+                }
                 let running = self
                     .projection
                     .turns_for(thread)
@@ -659,7 +710,8 @@ impl Actor {
                     }
                     _ => {
                         tracing::debug!(%thread,"dropped event for non-running turn");
-                        return None;
+                        commands::start_changed(&self.projection, &self.live, &mut c, now());
+                        return Some(c);
                     }
                 };
                 self.turn_event(&mut c, thread, epoch, current, event);
@@ -731,11 +783,26 @@ impl Actor {
                     thread,
                     turn: turn.id,
                     seq: 0,
-                    body: ItemBody::Tool(ToolItem { call, result: None }),
+                    body: ItemBody::Tool(ToolItem {
+                        call,
+                        result: None,
+                        output_tail: String::new(),
+                    }),
                 };
                 self.item_keys
                     .insert((thread, epoch, turn.id, key), item.id);
                 commands::add_item(&self.projection, c, item);
+            }
+            TurnEvent::ToolOutput { key, text } => {
+                if let Some(id) = self.item_keys.get(&(thread, epoch, turn.id, key))
+                    && let Some(mut item) = self.projection.items.get(id).cloned()
+                    && let ItemBody::Tool(tool) = &mut item.body
+                {
+                    tool.output_tail.push_str(&text);
+                    tool.output_tail = tool_tail(std::mem::take(&mut tool.output_tail));
+                    c.events.push(Ev::ItemAdded(item.clone()));
+                    c.items.insert(item.id, item);
+                }
             }
             TurnEvent::ToolFinished {
                 key,
@@ -748,15 +815,15 @@ impl Actor {
                     if let ItemBody::Tool(t) = &mut i.body {
                         t.result = Some(ToolResult {
                             ok,
-                            output_tail: output_tail.map(|s| {
-                                s.chars()
-                                    .rev()
-                                    .take(10000)
-                                    .collect::<String>()
-                                    .chars()
-                                    .rev()
-                                    .collect()
-                            }),
+                            output_tail: if t.output_tail.is_empty() {
+                                output_tail.map(tool_tail)
+                            } else {
+                                let mut text = std::mem::take(&mut t.output_tail);
+                                if let Some(output) = output_tail {
+                                    text.push_str(&output);
+                                }
+                                Some(tool_tail(text))
+                            },
                         });
                     }
                     c.events.push(Ev::ItemCompleted(i.clone()));
@@ -786,7 +853,7 @@ impl Actor {
                 c.events.push(Ev::RequestOpened(r.clone()));
                 c.requests.insert(r.id, r);
             }
-            TurnEvent::TurnEnded { outcome } => {
+            TurnEvent::TurnEnded { outcome, .. } => {
                 commands::end_turn(&self.projection, c, turn.clone(), outcome, now());
                 commands::settle_idle_child(&self.projection, &self.live, c, thread, false, now());
             }
@@ -1093,4 +1160,14 @@ impl Actor {
             }
         }
     }
+}
+
+fn tool_tail(text: String) -> String {
+    text.chars()
+        .rev()
+        .take(10000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
 }

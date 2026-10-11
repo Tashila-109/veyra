@@ -30,6 +30,7 @@ fn completed_items_and_ended_turns_free_streaming_entries() {
     f.event(turn_event(
         Some(turn),
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));
@@ -76,116 +77,7 @@ fn first_ready_starts_queued_turn() {
         }
     );
 }
-#[test]
-#[cfg(debug_assertions)]
-fn clean_exit_before_ready_fails_oldest_turn_without_respawning() {
-    before_ready_exit("exit 0", "claude exited unexpectedly (exit code 0)");
-}
-#[test]
-#[cfg(debug_assertions)]
-fn stdout_close_before_ready_fails_oldest_turn_without_respawning() {
-    before_ready_exit(
-        "trap 'exit 0' TERM; exec 1>&-; /bin/sleep 30 & wait",
-        "claude exited unexpectedly (exit code 0)",
-    );
-}
-#[cfg(debug_assertions)]
-struct Scratch(std::path::PathBuf);
-#[cfg(debug_assertions)]
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-#[cfg(debug_assertions)]
-fn stand_in(script: &str) -> (Scratch, std::path::PathBuf) {
-    let root = std::env::temp_dir().join(format!("veyra-before-ready-{}", ThreadId::new()));
-    std::fs::create_dir(&root).unwrap();
-    let scratch = Scratch(root);
-    let binary = scratch.0.join("fake-cli");
-    std::fs::write(
-        &binary,
-        format!("#!/bin/sh\nprintf 'started\\n' >> spawn-marker\nread -r initialize\n{script}\n"),
-    )
-    .unwrap();
-    assert!(
-        std::process::Command::new("/bin/chmod")
-            .arg("700")
-            .arg(&binary)
-            .status()
-            .unwrap()
-            .success()
-    );
-    (scratch, binary)
-}
-#[cfg(debug_assertions)]
-fn before_ready_exit(script: &str, message: &str) {
-    use std::{fs, time::Duration};
 
-    let (scratch, binary) = stand_in(script);
-    let root = &scratch.0;
-    let mut env = env::ChildEnv::load();
-    env.claude_bin = Some(binary);
-    env.fixtures = None;
-    env.record = None;
-    let mut f = Fixture::new(LiveState::Parked);
-    let mut c = ChangeSet::default();
-    let mut thread = f.loaded().threads[&f.thread].clone();
-    thread.cwd = root.clone();
-    c.threads.insert(thread.id, thread);
-    f.save(c);
-    let (out, mut messages) = mpsc::channel(256);
-    f.actor = Actor::new(f.actor.db, out, Spawner::Cli(env)).unwrap();
-    let first = match f
-        .command(Command::Send {
-            thread: f.thread,
-            text: "first".into(),
-        })
-        .unwrap()
-    {
-        Ack::Turn(id) => id,
-        ack => panic!("unexpected ack: {ack:?}"),
-    };
-    let second = f.user("second");
-    let exited = f.runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(30), messages.recv())
-            .await
-            .unwrap()
-            .unwrap()
-    });
-    {
-        let _entered = f.runtime.enter();
-        f.actor.handle(exited);
-    }
-    let rows = f.loaded();
-    let epoch = f.actor.live[&f.thread].epoch;
-    let parked = matches!(f.actor.live[&f.thread].live, Live::Parked);
-    f.command(Command::StopThread { thread: f.thread }).unwrap();
-    f.runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !matches!(f.actor.live[&f.thread].live, Live::Parked) {
-                f.actor.handle(messages.recv().await.unwrap());
-            }
-        })
-        .await
-        .unwrap();
-    });
-    let spawns = fs::read_to_string(root.join("spawn-marker")).unwrap();
-    assert!(
-        matches!(
-            &rows.turns[&first].state,
-            TurnState::Ended { outcome: TurnOutcome::Failed { message: text }, started: None, .. }
-                if text == message
-        ),
-        "oldest queued turn: {:?}",
-        rows.turns[&first].state
-    );
-    assert_eq!(rows.turns[&second].state, TurnState::Queued);
-    assert_eq!(rows.threads[&f.thread].hold, Some(HoldReason::Stopped));
-    assert!(parked);
-    assert_eq!(epoch, 1);
-    assert_eq!(spawns, "started\n");
-}
 #[test]
 fn pre_ready_exit_without_crash_fails_and_holds_queue() {
     for hold in [None, Some(HoldReason::Restarted)] {
@@ -223,6 +115,7 @@ fn exited_after_turn_ended_is_ignored() {
     f.event(turn_event(
         Some(turn),
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));
@@ -260,6 +153,7 @@ fn background_work_during_user_turn() {
     f.event(turn_event(
         Some(turn),
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));
@@ -279,6 +173,7 @@ fn background_work_keeps_completed_thread_working() {
     f.event(turn_event(
         turn,
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));
@@ -357,6 +252,7 @@ fn stale_epoch_dropped() {
         turn_event(
             Some(turn),
             TurnEvent::TurnEnded {
+                park: false,
                 outcome: TurnOutcome::Failed {
                     message: "old".into(),
                 },
@@ -397,6 +293,7 @@ fn provider_turn_join() {
     f.event(turn_event(
         None,
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));
@@ -417,6 +314,7 @@ fn lone_turn_end_and_wrong_turn_are_dropped() {
     f.event(turn_event(
         None,
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));
@@ -527,6 +425,7 @@ fn snapshot_joins_buffer_without_duplicate_text() {
     f.event(turn_event(
         turn,
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));
@@ -574,6 +473,7 @@ fn session_notice_attaches_to_latest_turn() {
     f.event(turn_event(
         f.running(),
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));
@@ -588,62 +488,6 @@ fn session_notice_attaches_to_latest_turn() {
         .find(|item| matches!(item.body, ItemBody::Notice(_)))
         .unwrap();
     assert_eq!(notice.turn, latest);
-}
-#[test]
-#[cfg(debug_assertions)]
-fn delta_count_excludes_complete_message_fallback() {
-    let mut f = Fixture::new(LiveState::Running);
-    let turn = f.running();
-    f.event(turn_event(
-        turn,
-        TurnEvent::TextDelta {
-            key: NativeItemKey("fallback".into()),
-            text: "complete message".into(),
-            streamed: false,
-        },
-    ));
-    let (reply, rx) = oneshot::channel();
-    {
-        let _enter = f.runtime.enter();
-        f.actor.handle(EngineMsg::Snapshot {
-            thread: f.thread,
-            reply,
-        });
-    }
-    f.actor.handle(EngineMsg::TextFlush);
-    let snapshot = rx.blocking_recv().unwrap();
-    f.event(turn_event(
-        turn,
-        TurnEvent::TextDelta {
-            key: NativeItemKey("streamed".into()),
-            text: "streamed text".into(),
-            streamed: true,
-        },
-    ));
-    let (reply, rx) = oneshot::channel();
-    {
-        let _enter = f.runtime.enter();
-        f.actor.handle(EngineMsg::Snapshot {
-            thread: f.thread,
-            reply,
-        });
-    }
-    f.actor.handle(EngineMsg::TextFlush);
-    let streamed = rx.blocking_recv().unwrap();
-    let item = streamed
-        .items
-        .iter()
-        .find(|item| !snapshot.items.iter().any(|old| old.id == item.id))
-        .unwrap();
-    assert_eq!(streamed.delta_counts[&item.id], 1);
-    assert_eq!(
-        snapshot
-            .delta_counts
-            .get(&snapshot.items[0].id)
-            .copied()
-            .unwrap_or(0),
-        0
-    );
 }
 
 #[test]
@@ -668,18 +512,236 @@ fn completed_turn_status_reports_five_milliseconds() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
-fn archived_items_free_debug_delta_counts() {
-    let mut f = Fixture::new(LiveState::Running);
+fn provider_stop_tail_opens_no_turn() {
+    let mut f = Fixture::new(LiveState::Idle);
+    f.event(turn_event(None, TurnEvent::Started));
+    let first = f.running().unwrap();
     f.event(turn_event(
-        f.running(),
+        None,
         TurnEvent::TextDelta {
-            key: NativeItemKey("counted".into()),
-            text: "one delta".into(),
+            key: NativeItemKey("provider".into()),
+            text: "Hello ".into(),
             streamed: true,
         },
     ));
-    fn snapshot(f: &mut Fixture) -> crate::events::ThreadSnapshot {
+    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.event(turn_event(
+        None,
+        TurnEvent::TextDelta {
+            key: NativeItemKey("provider".into()),
+            text: "dropped tail".into(),
+            streamed: true,
+        },
+    ));
+    assert_eq!(
+        f.loaded()
+            .turns_for(f.thread)
+            .filter(|t| t.origin == TurnOrigin::Provider)
+            .count(),
+        1
+    );
+    let Ack::Turn(second) = f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "next".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(f.loaded().turns[&second].state, TurnState::Queued);
+    assert_eq!(
+        wait_reason(
+            &ChangeSet::default()
+                .view(&f.actor.projection, &f.actor.live, f.thread)
+                .unwrap()
+        ),
+        Some(WaitReason::Stopping)
+    );
+    f.event(turn_event(
+        None,
+        TurnEvent::TurnEnded {
+            park: false,
+            outcome: TurnOutcome::Completed,
+        },
+    ));
+    assert_eq!(f.running(), Some(second));
+    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Interrupt);
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::StartTurn {
+            turn: second,
+            text: "next".into()
+        }
+    );
+    assert!(matches!(&f.loaded().turns[&first].state, TurnState::Ended {
+        outcome: TurnOutcome::Interrupted { reason }, ..
+    } if reason == "Stopped by you"));
+    assert!(f.loaded().items.values().any(|item| matches!(&item.body,
+        ItemBody::AssistantText { text, .. } if text == "Hello ")));
+}
+#[test]
+fn text_deltas_open_no_transaction() {
+    fn stream(parts: usize) -> (usize, String) {
+        let mut f = Fixture::new(LiveState::Running);
+        let mut count = 0;
+        for _ in 0..parts {
+            let turn = f.running();
+            f.event(turn_event(
+                turn,
+                TurnEvent::TextDelta {
+                    key: NativeItemKey("stream".into()),
+                    text: "x".repeat(200 / parts),
+                    streamed: true,
+                },
+            ));
+            count = f.actor.test_commits;
+        }
+        f.event(turn_event(
+            f.running(),
+            TurnEvent::TurnEnded {
+                park: false,
+                outcome: TurnOutcome::Completed,
+            },
+        ));
+        let text = f
+            .loaded()
+            .items
+            .values()
+            .find_map(|i| match &i.body {
+                ItemBody::AssistantText { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap();
+        (count, text)
+    }
+    let many = stream(200);
+    let one = stream(1);
+    assert_eq!(many.0, one.0);
+    assert_eq!(many.1, "x".repeat(200));
+    assert_eq!(many.1, one.1);
+}
+
+#[cfg(debug_assertions)]
+mod cli {
+    use super::*;
+
+    #[test]
+    fn clean_exit_before_ready_fails_oldest_turn_without_respawning() {
+        before_ready_exit("exit 0", "claude exited unexpectedly (exit code 0)");
+    }
+
+    #[test]
+    fn stdout_close_before_ready_fails_oldest_turn_without_respawning() {
+        before_ready_exit(
+            "trap 'exit 0' TERM; exec 1>&-; /bin/sleep 30 & wait",
+            "claude exited unexpectedly (exit code 0)",
+        );
+    }
+
+    fn stand_in(script: &str) -> (Scratch, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("veyra-before-ready-{}", ThreadId::new()));
+        std::fs::create_dir(&root).unwrap();
+        let scratch = Scratch(root);
+        let binary = scratch.0.join("fake-cli");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf 'started\\n' >> spawn-marker\nread -r initialize\n{script}\n"
+            ),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("700")
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        (scratch, binary)
+    }
+
+    fn before_ready_exit(script: &str, message: &str) {
+        use std::{fs, time::Duration};
+
+        let (scratch, binary) = stand_in(script);
+        let root = &scratch.0;
+        let mut env = env::ChildEnv::load();
+        env.claude_bin = Some(binary);
+        env.fixtures = None;
+        env.record = None;
+        let mut f = Fixture::new(LiveState::Parked);
+        let mut c = ChangeSet::default();
+        let mut thread = f.loaded().threads[&f.thread].clone();
+        thread.cwd = root.clone();
+        c.threads.insert(thread.id, thread);
+        f.save(c);
+        let (out, mut messages) = mpsc::channel(256);
+        f.actor = Actor::new(f.actor.db, out, Spawner::Cli(env)).unwrap();
+        let first = match f
+            .command(Command::Send {
+                thread: f.thread,
+                text: "first".into(),
+            })
+            .unwrap()
+        {
+            Ack::Turn(id) => id,
+            ack => panic!("unexpected ack: {ack:?}"),
+        };
+        let second = f.user("second");
+        let exited = f.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), messages.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        {
+            let _entered = f.runtime.enter();
+            f.actor.handle(exited);
+        }
+        let rows = f.loaded();
+        let epoch = f.actor.live[&f.thread].epoch;
+        let parked = matches!(f.actor.live[&f.thread].live, Live::Parked);
+        f.command(Command::StopThread { thread: f.thread }).unwrap();
+        f.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(f.actor.live[&f.thread].live, Live::Parked) {
+                    f.actor.handle(messages.recv().await.unwrap());
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let spawns = fs::read_to_string(root.join("spawn-marker")).unwrap();
+        assert!(
+            matches!(
+                &rows.turns[&first].state,
+                TurnState::Ended { outcome: TurnOutcome::Failed { message: text }, started: None, .. }
+                    if text == message
+            ),
+            "oldest queued turn: {:?}",
+            rows.turns[&first].state
+        );
+        assert_eq!(rows.turns[&second].state, TurnState::Queued);
+        assert_eq!(rows.threads[&f.thread].hold, Some(HoldReason::Stopped));
+        assert!(parked);
+        assert_eq!(epoch, 1);
+        assert_eq!(spawns, "started\n");
+    }
+
+    #[test]
+    fn delta_count_excludes_complete_message_fallback() {
+        let mut f = Fixture::new(LiveState::Running);
+        let turn = f.running();
+        f.event(turn_event(
+            turn,
+            TurnEvent::TextDelta {
+                key: NativeItemKey("fallback".into()),
+                text: "complete message".into(),
+                streamed: false,
+            },
+        ));
         let (reply, rx) = oneshot::channel();
         {
             let _enter = f.runtime.enter();
@@ -689,23 +751,454 @@ fn archived_items_free_debug_delta_counts() {
             });
         }
         f.actor.handle(EngineMsg::TextFlush);
-        rx.blocking_recv().unwrap()
-    }
-    let before = snapshot(&mut f);
-    let item = before.items[0].id;
-    assert_eq!(before.delta_counts[&item], 1);
-    f.command(Command::ArchiveThread {
-        thread: f.thread,
-        keep_children: false,
-    })
-    .unwrap();
-    let after = snapshot(&mut f);
-    assert!(!after.delta_counts.contains_key(&item));
-    assert_eq!(
-        f.loaded().items[&item].body,
-        ItemBody::AssistantText {
-            text: "one delta".into(),
-            done: true
+        let snapshot = rx.blocking_recv().unwrap();
+        f.event(turn_event(
+            turn,
+            TurnEvent::TextDelta {
+                key: NativeItemKey("streamed".into()),
+                text: "streamed text".into(),
+                streamed: true,
+            },
+        ));
+        let (reply, rx) = oneshot::channel();
+        {
+            let _enter = f.runtime.enter();
+            f.actor.handle(EngineMsg::Snapshot {
+                thread: f.thread,
+                reply,
+            });
         }
+        f.actor.handle(EngineMsg::TextFlush);
+        let streamed = rx.blocking_recv().unwrap();
+        let item = streamed
+            .items
+            .iter()
+            .find(|item| !snapshot.items.iter().any(|old| old.id == item.id))
+            .unwrap();
+        assert_eq!(streamed.delta_counts[&item.id], 1);
+        assert_eq!(
+            snapshot
+                .delta_counts
+                .get(&snapshot.items[0].id)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn archived_items_free_debug_delta_counts() {
+        let mut f = Fixture::new(LiveState::Running);
+        f.event(turn_event(
+            f.running(),
+            TurnEvent::TextDelta {
+                key: NativeItemKey("counted".into()),
+                text: "one delta".into(),
+                streamed: true,
+            },
+        ));
+        fn snapshot(f: &mut Fixture) -> crate::events::ThreadSnapshot {
+            let (reply, rx) = oneshot::channel();
+            {
+                let _enter = f.runtime.enter();
+                f.actor.handle(EngineMsg::Snapshot {
+                    thread: f.thread,
+                    reply,
+                });
+            }
+            f.actor.handle(EngineMsg::TextFlush);
+            rx.blocking_recv().unwrap()
+        }
+        let before = snapshot(&mut f);
+        let item = before.items[0].id;
+        assert_eq!(before.delta_counts[&item], 1);
+        f.command(Command::ArchiveThread {
+            thread: f.thread,
+            keep_children: false,
+        })
+        .unwrap();
+        let after = snapshot(&mut f);
+        assert!(!after.delta_counts.contains_key(&item));
+        assert_eq!(
+            f.loaded().items[&item].body,
+            ItemBody::AssistantText {
+                text: "one delta".into(),
+                done: true
+            }
+        );
+    }
+
+    struct CliFixture {
+        f: Fixture,
+        messages: mpsc::Receiver<EngineMsg>,
+        scratch: Scratch,
+    }
+
+    impl CliFixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("veyra-stop-{}", ThreadId::new()));
+            std::fs::create_dir(&root).unwrap();
+            let source =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude");
+            for (fixture, target) in [(name, "t1-s1.jsonl"), ("ok-reply", "t1-s2.jsonl")] {
+                std::fs::copy(source.join(format!("{fixture}.jsonl")), root.join(target)).unwrap();
+            }
+            let mut env = env::ChildEnv::load();
+            env.claude_bin = Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/debug/veyra-fake-cli")
+                    .canonicalize()
+                    .unwrap(),
+            );
+            env.fixtures = Some(root.clone());
+            env.record = None;
+            let mut f = Fixture::new(LiveState::Parked);
+            let mut c = ChangeSet::default();
+            let mut thread = f.loaded().threads[&f.thread].clone();
+            thread.cwd = root.clone();
+            c.threads.insert(thread.id, thread);
+            f.save(c);
+            let (out, messages) = mpsc::channel(256);
+            f.actor = Actor::new(f.actor.db, out, Spawner::Cli(env)).unwrap();
+            Self {
+                f,
+                messages,
+                scratch: Scratch(root),
+            }
+        }
+        fn send(&mut self, text: &str) -> TurnId {
+            match self
+                .f
+                .command(Command::Send {
+                    thread: self.f.thread,
+                    text: text.into(),
+                })
+                .unwrap()
+            {
+                Ack::Turn(id) => id,
+                other => panic!("unexpected ack {other:?}"),
+            }
+        }
+        fn step(&mut self) {
+            self.f.runtime.block_on(async {
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), self.messages.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                self.f.actor.handle(message);
+            });
+        }
+        fn until(&mut self, predicate: impl Fn(&Fixture) -> bool) {
+            let started = std::time::Instant::now();
+            while !predicate(&self.f) {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                self.step();
+            }
+        }
+        fn has_text(f: &Fixture, text: &str) -> bool {
+            f.loaded().items.values().any(|item| {
+                matches!(&item.body,
+            ItemBody::AssistantText { text: value, .. } if value == text)
+            })
+        }
+        fn pid(&self) -> u32 {
+            match self.f.actor.live[&self.f.thread].live {
+                Live::Structured { pid, .. } => pid,
+                _ => panic!("not structured"),
+            }
+        }
+        fn finish(&mut self) {
+            self.until(|f| matches!(f.actor.live[&f.thread].live, Live::Parked));
+            assert!(self.scratch.0.is_dir());
+        }
+    }
+
+    fn assistant_error_queue(name: &str, account: bool, eof: bool) {
+        assistant_error_queue_with(name, account, eof, false);
+    }
+
+    fn assistant_error_queue_with(name: &str, account: bool, eof: bool, alive: bool) {
+        let mut run = CliFixture::new(name);
+        if alive {
+            let path = run.scratch.0.join("t1-s1.jsonl");
+            let mut rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let result = rows
+                .iter_mut()
+                .find(|row| row["line"]["type"] == "result")
+                .unwrap();
+            result["line"]["is_error"] = true.into();
+            result["line"]["terminal_reason"] = "api_error".into();
+            let exit = rows.pop().unwrap();
+            rows.push(serde_json::json!({"type":"emit_inbound", "line":{
+                "type":"command_lifecycle", "command_uuid":"<id:prompt>", "state":"cancelled"
+            }}));
+            rows.push(serde_json::json!({"type":"expect_outbound", "line":{
+                "type":"user", "message":{"content":"must never arrive"}
+            }}));
+            rows.push(exit);
+            let text = rows
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(path, text + "\n").unwrap();
+        }
+        let first = run.send("first");
+        run.until(|f| {
+            CliFixture::has_text(
+                f,
+                if account {
+                    "account error"
+                } else {
+                    "server error"
+                },
+            )
+        });
+        let first_pid = run.pid();
+        let second = run.send("second");
+        run.until(|f| matches!(f.loaded().turns[&first].state, TurnState::Ended { .. }));
+        if account || eof {
+            assert!(matches!(
+                run.f.actor.live[&run.f.thread].live,
+                Live::Stopping {
+                    then: AfterStop::Park
+                }
+            ));
+        }
+        run.until(|f| f.running() == Some(second));
+        let second_pid = run.pid();
+        run.until(|f| matches!(f.loaded().turns[&second].state, TurnState::Ended { .. }));
+        run.finish();
+        let rows = run.f.loaded();
+        let expected = if account {
+            "Claude is signed out. Sign in from a terminal with `claude`, then send again."
+        } else {
+            "Claude had a server error. Send again to retry."
+        };
+        assert!(matches!(&rows.turns[&first].state, TurnState::Ended {
+        outcome: TurnOutcome::Failed { message }, ..
+    } if message == expected));
+        assert!(matches!(
+            rows.turns[&second].state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ));
+        assert!(CliFixture::has_text(&run.f, "ok"));
+        assert_eq!(first_pid == second_pid, !account && !eof);
+    }
+
+    #[test]
+    fn assistant_account_error_parks_before_queued_turn() {
+        assistant_error_queue("assistant-error-signed-out", true, false);
+    }
+
+    #[test]
+    fn assistant_account_error_live_shape_retires_idle_process() {
+        assistant_error_queue_with("assistant-error-signed-out", true, false, true);
+    }
+
+    #[test]
+    fn assistant_error_result_never_ends_queued_turn() {
+        assistant_error_queue("assistant-error-queued", false, false);
+    }
+
+    #[test]
+    fn assistant_error_eof_retires_before_queued_turn() {
+        assistant_error_queue("assistant-error-eof", false, true);
+    }
+
+    #[test]
+    fn stop_after_account_error_retires_session() {
+        let mut run = CliFixture::new("assistant-error-stop");
+        let first = run.send("first");
+        run.until(|f| CliFixture::has_text(f, "account error"));
+        let first_pid = run.pid();
+        let second = run.send("second");
+        run.f
+            .command(Command::Interrupt {
+                thread: run.f.thread,
+            })
+            .unwrap();
+        run.until(|f| {
+            matches!(
+                f.actor.live[&f.thread].live,
+                Live::Stopping {
+                    then: AfterStop::Park
+                }
+            )
+        });
+        run.finish();
+        run.f
+            .command(Command::Continue {
+                thread: run.f.thread,
+                drop_queued: false,
+            })
+            .unwrap();
+        run.until(|f| f.running() == Some(second));
+        assert_ne!(run.pid(), first_pid);
+        run.until(|f| matches!(f.loaded().turns[&second].state, TurnState::Ended { .. }));
+        run.finish();
+        assert!(
+            matches!(&run.f.loaded().turns[&first].state, TurnState::Ended {
+        outcome: TurnOutcome::Interrupted { reason }, ..
+    } if reason == "Stopped by you")
+        );
+        assert!(matches!(
+            run.f.loaded().turns[&second].state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ));
+    }
+
+    fn send_during_stop(name: &str, ignored: bool) {
+        let mut run = CliFixture::new(name);
+        let first = run.send("first");
+        run.until(|f| CliFixture::has_text(f, "partial"));
+        let first_pid = run.pid();
+        let stopped = std::time::Instant::now();
+        run.f
+            .command(Command::Interrupt {
+                thread: run.f.thread,
+            })
+            .unwrap();
+        let second = run.send("second");
+        assert_eq!(run.f.loaded().turns[&second].state, TurnState::Queued);
+        assert_eq!(
+            wait_reason(
+                &ChangeSet::default()
+                    .view(&run.f.actor.projection, &run.f.actor.live, run.f.thread)
+                    .unwrap()
+            ),
+            Some(WaitReason::Stopping)
+        );
+        if ignored {
+            run.until(|f| {
+                matches!(
+                    f.actor.live[&f.thread].live,
+                    Live::Stopping {
+                        then: AfterStop::Park
+                    }
+                )
+            });
+            assert!(stopped.elapsed() < std::time::Duration::from_secs(5));
+        }
+        run.until(|f| f.running() == Some(second));
+        assert_eq!(run.pid() == first_pid, !ignored);
+        run.until(|f| matches!(f.loaded().turns[&second].state, TurnState::Ended { .. }));
+        run.finish();
+        assert!(
+            matches!(&run.f.loaded().turns[&first].state, TurnState::Ended {
+        outcome: TurnOutcome::Interrupted { reason }, ..
+    } if reason == "Stopped by you")
+        );
+        assert!(matches!(
+            run.f.loaded().turns[&second].state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ));
+        assert!(CliFixture::has_text(&run.f, "ok"));
+    }
+
+    #[test]
+    fn send_after_stop_waits_for_stopped_result() {
+        send_during_stop("stop-then-send", false);
+    }
+
+    #[test]
+    fn send_after_ignored_stop_runs_on_fresh_process() {
+        send_during_stop("stop-never-ends", true);
+    }
+}
+
+#[test]
+fn subagent_output_updates_running_tail_and_caps_characters() {
+    let mut f = Fixture::new(LiveState::Running);
+    let turn = f.running().unwrap();
+    let key = NativeItemKey("agent-call".into());
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::ToolStarted {
+            key: key.clone(),
+            call: ToolCall {
+                name: "Agent".into(),
+                arguments: serde_json::json!({}),
+            },
+        },
+    ));
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::ToolOutput {
+            key: key.clone(),
+            text: "é".repeat(10001),
+        },
+    ));
+    let rows = f.loaded();
+    let item = rows
+        .items_for(f.thread)
+        .find(|item| matches!(item.body, ItemBody::Tool(_)))
+        .unwrap();
+    let ItemBody::Tool(tool) = &item.body else {
+        panic!()
+    };
+    assert!(tool.result.is_none());
+    assert_eq!(
+        serde_json::to_value(tool).unwrap()["output_tail"],
+        "é".repeat(10000)
     );
+    assert!(f.drain().iter().any(|event| {
+        matches!(
+            event,
+            UiEvent::Change { event: Ev::ItemAdded(row), .. }
+                if row.id == item.id && row.body == item.body
+        )
+    }));
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::ToolOutput {
+            key: key.clone(),
+            text: "end".into(),
+        },
+    ));
+    let rows = f.loaded();
+    let ItemBody::Tool(tool) = &rows.items[&item.id].body else {
+        panic!()
+    };
+    assert!(tool.result.is_none());
+    assert_eq!(
+        serde_json::to_value(tool).unwrap()["output_tail"],
+        "é".repeat(9997) + "end"
+    );
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::ToolFinished {
+            key,
+            ok: true,
+            output_tail: Some("done".into()),
+        },
+    ));
+    let rows = f.loaded();
+    let ItemBody::Tool(tool) = &rows.items[&item.id].body else {
+        panic!()
+    };
+    assert!(tool.result.as_ref().unwrap().ok);
+    assert_eq!(
+        tool.result.as_ref().unwrap().output_tail.as_deref(),
+        Some(("é".repeat(9993) + "enddone").as_str())
+    );
+    let mut legacy = serde_json::to_value(tool).unwrap();
+    legacy.as_object_mut().unwrap().remove("output_tail");
+    let legacy: ToolItem = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.output_tail.is_empty());
+    assert_eq!(legacy.result, tool.result);
 }

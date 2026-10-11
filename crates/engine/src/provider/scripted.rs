@@ -57,6 +57,7 @@ impl Scripted {
                         for event in [
                             TurnEvent::Accepted,
                             TurnEvent::TurnEnded {
+                                park: false,
                                 outcome: TurnOutcome::Completed,
                             },
                         ] {

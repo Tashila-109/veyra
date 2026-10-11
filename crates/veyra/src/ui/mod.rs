@@ -1483,6 +1483,7 @@ mod tests {
                     session: SessionHandle { control },
                     pid: 1,
                     pgid: 1,
+                    draining: None,
                 },
                 background_work: true,
                 ..Default::default()

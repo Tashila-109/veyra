@@ -1,6 +1,7 @@
 mod perf;
 mod recovery;
 mod session_events;
+mod stop;
 mod storage;
 mod table;
 
@@ -87,6 +88,7 @@ impl Fixture {
                 session,
                 pid: 9,
                 pgid: 9,
+                draining: None,
             },
             LiveState::Terminal => {
                 let (control, _rx) = mpsc::unbounded_channel();
@@ -242,4 +244,11 @@ impl Fixture {
 }
 fn turn_event(turn: Option<TurnId>, event: TurnEvent) -> ProviderEvent {
     ProviderEvent::Turn { turn, event }
+}
+
+struct Scratch(std::path::PathBuf);
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
 }

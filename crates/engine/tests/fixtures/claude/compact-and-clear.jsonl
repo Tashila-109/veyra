@@ -1,0 +1,10 @@
+{"type": "transcript_start", "provider": "claude", "protocol": "stream-json", "cli_version": "2.1.294", "scenario": "compact-and-clear", "source": "Veyra M2 lane-4 t1-s1 /compact and /clear capture"}
+{"type": "expect_outbound", "line": {"type": "control_request", "request_id": "<id:initialize>", "request": {"subtype": "initialize"}}}
+{"type": "emit_inbound", "line": {"type": "control_response", "response": {"subtype": "success", "request_id": "<id:initialize>", "response": {}}}}
+{"type": "expect_outbound", "line": {"type": "user", "uuid": "<id:compact>", "session_id": "<id:session>", "parent_tool_use_id": null, "message": {"role": "user", "content": "<any>"}}}
+{"type": "emit_inbound", "line": {"type": "system", "subtype": "compact_boundary"}}
+{"type": "emit_inbound", "line": {"is_error": false, "stop_reason": null, "subtype": "success", "result": "", "type": "result"}}
+{"type": "expect_outbound", "line": {"type": "user", "uuid": "<id:clear>", "session_id": "<id:session>", "parent_tool_use_id": null, "message": {"role": "user", "content": "<any>"}}}
+{"type": "emit_inbound", "line": {"type": "conversation_reset"}}
+{"type": "emit_inbound", "line": {"is_error": false, "stop_reason": null, "subtype": "success", "result": "", "type": "result"}}
+{"type": "exit", "code": -1}

@@ -13,3 +13,4 @@ serde_json.workspace = true
 thiserror = "=2.0.21"
 tracing.workspace = true
 regex = "=1.13.1"
+base64 = "=0.22.1"

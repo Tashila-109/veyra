@@ -366,6 +366,7 @@ fn failing_store_on_turn_ended_blocks_and_retries() {
     f.event(turn_event(
         Some(turn),
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ));

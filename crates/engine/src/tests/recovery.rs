@@ -53,6 +53,7 @@ fn settle_report(f: &mut Fixture) -> (ThreadId, TaskId, TurnId) {
         child,
         turn,
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     );
@@ -107,6 +108,7 @@ fn later_child_reply(f: &mut Fixture, child: ThreadId) {
         child,
         turn,
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     );
@@ -138,6 +140,7 @@ fn requeued_delivery_keeps_settlement_summary() {
     f.event(turn_event(
         Some(wake),
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Interrupted {
                 reason: "not accepted".into(),
             },
@@ -197,6 +200,7 @@ fn command_requeues_wake(command: impl Fn(ThreadId) -> Command, archived: bool) 
     f.event(turn_event(
         Some(wake),
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Interrupted {
                 reason: "late provider end".into(),
             },
@@ -324,6 +328,7 @@ fn startup_completes_interrupted_transcript_items() {
                 arguments: serde_json::json!({}),
             },
             result: None,
+            output_tail: String::new(),
         }),
     ];
     let mut changes = ChangeSet::default();
@@ -432,6 +437,7 @@ fn child_settlement_keeps_final_buffered_report() {
             text: "final report".into(),
         },
         TurnEvent::TurnEnded {
+            park: false,
             outcome: TurnOutcome::Completed,
         },
     ] {

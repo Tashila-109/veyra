@@ -19,6 +19,12 @@ fn run() -> io::Result<i32> {
         std::env::var_os("VEYRA_FAKE_FIXTURE")
             .ok_or_else(|| io::Error::other("VEYRA_FAKE_FIXTURE is missing"))?,
     );
+    let source = std::fs::read_to_string(&path)?;
+    let header: serde_json::Value =
+        serde_json::from_str(source.lines().next().unwrap_or_default())?;
+    if header["ignore_sigterm"] == true {
+        veyra_engine::platform::ignore_terminate();
+    }
     let mut matcher = Matcher::default();
     matcher.bind("<cwd>", serde_json::json!(std::env::current_dir()?));
     let args: Vec<_> = std::env::args().collect();
@@ -51,6 +57,16 @@ fn run() -> io::Result<i32> {
                     std::thread::sleep(Duration::from_millis(delay));
                 }
                 writeln!(output, "{}", matcher.expand(line))?;
+                output.flush()?;
+            }
+            Record::EmitRaw { base64, repeat } => {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(base64)
+                    .map_err(io::Error::other)?;
+                for _ in 0..repeat {
+                    output.write_all(&bytes)?;
+                }
                 output.flush()?;
             }
             Record::Exit { code, stderr } => {

@@ -161,6 +161,8 @@ pub struct ToolCall {
 pub struct ToolItem {
     pub call: ToolCall,
     pub result: Option<ToolResult>,
+    #[serde(default)]
+    pub output_tail: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -442,7 +444,14 @@ pub fn wait_reason(v: &ThreadView<'_>) -> Option<WaitReason> {
     if v.thread.view == View::Terminal || matches!(v.live.live, Live::Terminal { .. }) {
         return Some(WaitReason::TerminalView);
     }
-    if matches!(v.live.live, Live::Stopping { .. }) {
+    if matches!(
+        v.live.live,
+        Live::Stopping { .. }
+            | Live::Structured {
+                draining: Some(_),
+                ..
+            }
+    ) {
         return Some(WaitReason::Stopping);
     }
     if v.thread.archived {

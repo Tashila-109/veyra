@@ -93,6 +93,10 @@ pub enum TurnEvent {
         ok: bool,
         output_tail: Option<String>,
     },
+    ToolOutput {
+        key: NativeItemKey,
+        text: String,
+    },
     Plan(Vec<PlanStep>),
     RequestOpened {
         native: NativeRequestRef,
@@ -100,6 +104,7 @@ pub enum TurnEvent {
     },
     TurnEnded {
         outcome: TurnOutcome,
+        park: bool,
     },
 }
 impl TurnEvent {
@@ -114,6 +119,7 @@ impl TurnEvent {
             Self::Accepted
             | Self::ItemEnded { .. }
             | Self::ToolFinished { .. }
+            | Self::ToolOutput { .. }
             | Self::TurnEnded { .. } => false,
         }
     }

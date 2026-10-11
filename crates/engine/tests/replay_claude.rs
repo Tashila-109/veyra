@@ -127,7 +127,7 @@ fn outcomes(events: &[ProviderEvent]) -> Vec<TurnOutcome> {
         .iter()
         .filter_map(|event| match event {
             ProviderEvent::Turn {
-                event: TurnEvent::TurnEnded { outcome },
+                event: TurnEvent::TurnEnded { outcome, .. },
                 ..
             } => Some(outcome.clone()),
             _ => None,
@@ -295,7 +295,7 @@ fn cli_result_ends_provider_turn() {
         .filter_map(|event| match event {
             ProviderEvent::Turn {
                 turn,
-                event: TurnEvent::TurnEnded { outcome },
+                event: TurnEvent::TurnEnded { outcome, .. },
             } => Some((*turn, outcome.clone())),
             _ => None,
         })
@@ -572,4 +572,407 @@ fn replacing_hung_probe_ends_its_group_before_ready_reply() {
         assert!(!veyra_engine::platform::group_exists(pid).unwrap());
         first.await.unwrap();
     });
+}
+
+fn controlled_replay(name: &str, prompts: &[&str], interrupt: bool) -> Vec<ProviderEvent> {
+    controlled_replay_with(name, prompts, interrupt, |_| {})
+}
+fn controlled_replay_with(
+    name: &str,
+    prompts: &[&str],
+    interrupt: bool,
+    edit: impl FnOnce(&Scratch),
+) -> Vec<ProviderEvent> {
+    let (scratch, env) = environment(name, false);
+    edit(&scratch);
+    Runtime::new().unwrap().block_on(async {
+        let (out, mut rx) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: None,
+                import: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let mut next = 0;
+        let mut interrupted = false;
+        let events = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut events = Vec::new();
+            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                let start = matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. }))
+                    && next == 0
+                    || matches!(
+                        event,
+                        ProviderEvent::Turn {
+                            event: TurnEvent::TurnEnded { .. },
+                            ..
+                        }
+                    );
+                if start && let Some(text) = prompts.get(next) {
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: TurnId::new(),
+                            text: (*text).into(),
+                        })
+                        .unwrap();
+                    next += 1;
+                }
+                if interrupt
+                    && !interrupted
+                    && matches!(&event, ProviderEvent::Turn {
+                    event: TurnEvent::TextDelta { text, .. }, ..
+                } if text == "partial")
+                {
+                    handle.control.send(SessionControl::Interrupt).unwrap();
+                    interrupted = true;
+                }
+                let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+            events
+        })
+        .await;
+        handle.control.send(SessionControl::Shutdown).ok();
+        events.unwrap()
+    })
+}
+#[test]
+fn claude_assistant_error_fails_and_parks() {
+    let events = replay("assistant-error-signed-out", false);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::Turn {
+            event: TurnEvent::TurnEnded { park: true, .. },
+            ..
+        }
+    )));
+    assert_eq!(
+        outcomes(&events),
+        vec![TurnOutcome::Failed {
+            message:
+                "Claude is signed out. Sign in from a terminal with `claude`, then send again."
+                    .into(),
+        }]
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ProviderEvent::Session(SessionEvent::Exited { crash: None }))
+    ));
+}
+#[test]
+fn claude_interrupt_result_is_interrupted() {
+    let events = controlled_replay("interrupt-error-during-execution", &["first"], true);
+    assert_eq!(
+        outcomes(&events),
+        vec![TurnOutcome::Interrupted {
+            reason: "Stopped by you".into()
+        }]
+    );
+    assert_eq!(text(&events), "partial");
+}
+fn subagent_events(late: bool) -> Vec<ProviderEvent> {
+    controlled_replay_with(
+        "subagent-task",
+        &["reply with the word ok"],
+        false,
+        |scratch| {
+            if !late {
+                return;
+            }
+            let path = scratch.0.join("t1-s1.jsonl");
+            let mut rows: Vec<serde_json::Value> = fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let parent = rows
+                .iter()
+                .find_map(|row| row["line"]["parent_tool_use_id"].as_str())
+                .unwrap()
+                .to_owned();
+            let exit = rows.pop().unwrap();
+            for owner in [&parent, "missing-call"] {
+                for kind in ["assistant", "user", "stream_event"] {
+                    rows.push(serde_json::json!({"type":"emit_inbound", "line":{
+                        "type":kind, "parent_tool_use_id":owner,
+                        "message":{"id":"late", "content":[{"type":"text","text":"late child"}]},
+                        "event":{"type":"content_block_delta","index":0,
+                            "delta":{"type":"text_delta","text":"late child"}}
+                    }}));
+                }
+            }
+            rows.push(exit);
+            let text = rows
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(path, text + "\n").unwrap();
+        },
+    )
+}
+fn assert_subagent_row(events: &[ProviderEvent], root: &str) {
+    assert_eq!(text(events), root);
+    assert_eq!(outcomes(events), vec![TurnOutcome::Completed]);
+    let calls: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Turn {
+                event: TurnEvent::ToolStarted { key, call },
+                ..
+            } => Some((key, call)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert!(matches!(calls[0].1.name.as_str(), "Task" | "Agent"));
+    let output: String = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Turn {
+                event: TurnEvent::ToolOutput { key, text },
+                ..
+            } => {
+                assert_eq!(key, calls[0].0);
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if root == "done" {
+        assert!(output.contains("List the files in <cwd>"));
+        assert!(output.contains("alpha.txt"));
+        assert!(output.contains("beta.txt"));
+    } else {
+        assert!(output.contains("child words"));
+    }
+    assert!(!output.contains("late child"));
+    assert!(!output.contains("unowned words"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ProviderEvent::Turn {
+                    event: TurnEvent::ToolFinished { .. },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Turn { turn: None, .. }))
+    );
+}
+#[test]
+fn claude_subagent_frames_feed_tool_row() {
+    assert_subagent_row(&subagent_events(false), "done");
+}
+#[test]
+fn claude_subagent_late_frames_dropped() {
+    assert_subagent_row(&subagent_events(true), "done");
+    assert_subagent_row(&replay("subagent-late-frames", false), "");
+}
+#[test]
+fn claude_compact_and_clear_add_notices() {
+    let events = controlled_replay("compact-and-clear", &["/compact", "/clear"], false);
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Session(SessionEvent::Notice { text }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        [
+            "Claude compacted this conversation.",
+            "Claude cleared this conversation. The CLI no longer sees the messages above this notice."
+        ]
+    );
+    assert_eq!(
+        outcomes(&events),
+        vec![TurnOutcome::Completed, TurnOutcome::Completed]
+    );
+}
+#[test]
+fn claude_bad_lines_keep_session() {
+    let events = replay("bad-lines", false);
+    assert_eq!(text(&events), "ok");
+    assert_eq!(outcomes(&events), vec![TurnOutcome::Completed]);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ProviderEvent::Session(SessionEvent::Notice { .. })))
+            .count(),
+        1
+    );
+}
+#[test]
+fn claude_retry_limit_fallback_notices() {
+    let events = replay("notices", false);
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Session(SessionEvent::Notice { text }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        [
+            "Claude is retrying the API (attempt 2) in 1000 ms.",
+            "Claude usage limit: rejected; resets at 12345.",
+            "Claude is falling back to another model."
+        ]
+    );
+    assert_eq!(outcomes(&events), vec![TurnOutcome::Completed]);
+}
+#[test]
+fn claude_interrupt_honoured() {
+    let events = controlled_replay("interrupt-honoured", &["first", "second"], true);
+    assert_eq!(text(&events), "partialok");
+    assert_eq!(
+        outcomes(&events),
+        vec![
+            TurnOutcome::Interrupted {
+                reason: "Stopped by you".into()
+            },
+            TurnOutcome::Completed
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })))
+            .count(),
+        1
+    );
+}
+#[test]
+fn claude_interrupt_ignored() {
+    let events = controlled_replay("interrupt-ignored", &["first"], true);
+    assert_eq!(text(&events), "partial");
+    assert_eq!(
+        outcomes(&events),
+        vec![TurnOutcome::Interrupted {
+            reason: "Stopped by you".into()
+        }]
+    );
+}
+
+#[test]
+fn ladder_synthesizes_interrupted_end() {
+    let events = controlled_replay("interrupt-ignored", &["first"], true);
+    assert_eq!(
+        outcomes(&events),
+        vec![TurnOutcome::Interrupted {
+            reason: "Stopped by you".into()
+        }]
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::Turn {
+            event: TurnEvent::TurnEnded { park: true, .. },
+            ..
+        }
+    )));
+    let pid = events
+        .iter()
+        .find_map(|event| match event {
+            ProviderEvent::Session(SessionEvent::Ready { pid, .. }) => Some(*pid),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!veyra_engine::platform::group_exists(pid).unwrap());
+}
+#[test]
+fn ladder_stops_at_cli_turn_end() {
+    let started = std::time::Instant::now();
+    let events = controlled_replay("interrupt-honoured", &["first", "second"], true);
+    assert!(started.elapsed() >= Duration::from_millis(4500));
+    assert_eq!(text(&events), "partialok");
+    assert_eq!(
+        outcomes(&events),
+        vec![
+            TurnOutcome::Interrupted {
+                reason: "Stopped by you".into()
+            },
+            TurnOutcome::Completed
+        ]
+    );
+    assert!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Turn {
+                    event: TurnEvent::TurnEnded { park, .. },
+                    ..
+                } => Some(*park),
+                _ => None,
+            })
+            .all(|park| !park)
+    );
+}
+#[test]
+fn shutdown_during_spawn_never_ready() {
+    let (scratch, env) = environment("ok-reply", false);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (out, mut rx) = mpsc::channel(256);
+            let handle = session::spawn(
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: scratch.0.clone(),
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode: PermissionMode::AskFirst,
+                    },
+                    native: None,
+                    import: false,
+                },
+                env,
+                out,
+                1,
+            )
+            .unwrap();
+            handle.control.send(SessionControl::Shutdown).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let EngineMsg::Provider { event, .. } = rx.recv().await.unwrap() else {
+                        panic!()
+                    };
+                    assert!(!matches!(
+                        event,
+                        ProviderEvent::Session(SessionEvent::Ready { .. })
+                    ));
+                    if matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. })) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        });
 }

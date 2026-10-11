@@ -1,0 +1,17 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.294","scenario":"subagent-late-frames","source":"Veyra hand-written SDK 0.3.293 scenario"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:initialize>","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:initialize>","response":{}}}}
+{"type":"expect_outbound","line":{"type":"user","uuid":"<id:prompt>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"<any>"}}}
+{"type":"emit_inbound","line":{"type":"stream_event","event":{"type":"message_start","message":{"id":"root"}}}}
+{"type":"emit_inbound","line":{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task-call","name":"Task","input":{}}}}}
+{"type":"emit_inbound","line":{"type":"stream_event","event":{"type":"content_block_stop","index":0}}}
+{"type":"emit_inbound","line":{"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"child words"}]},"parent_tool_use_id":"task-call"}}
+{"type":"emit_inbound","line":{"type":"user","parent_tool_use_id":"task-call","message":{"content":[{"type":"text","text":"child user words"}]}}}
+{"type":"emit_inbound","line":{"type":"stream_event","parent_tool_use_id":"task-call","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"child streamed words"}}}}
+{"type":"emit_inbound","line":{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"task-call","content":"task finished","is_error":false}]}}}
+{"type":"emit_inbound","line":{"type":"result","subtype":"success","is_error":false}}
+{"type":"emit_inbound","line":{"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"child words"}]},"parent_tool_use_id":"task-call"}}
+{"type":"emit_inbound","line":{"type":"user","parent_tool_use_id":"task-call","message":{"content":[{"type":"text","text":"child user words"}]}}}
+{"type":"emit_inbound","line":{"type":"stream_event","parent_tool_use_id":"task-call","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"child streamed words"}}}}
+{"type":"emit_inbound","line":{"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"unowned words"}]},"parent_tool_use_id":"missing-call"}}
+{"type":"exit","code":0}

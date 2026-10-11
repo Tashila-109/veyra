@@ -15,8 +15,19 @@ use std::{
 };
 use tokio::process::{Child, Command};
 
-static LOGIN_PATH: LazyLock<OsString> = LazyLock::new(|| {
-    platform::login_shell_path().unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+struct LoginPath {
+    path: OsString,
+    failure: Option<std::io::Error>,
+}
+static LOGIN_PATH: LazyLock<LoginPath> = LazyLock::new(|| match platform::login_shell_path() {
+    Ok(path) => LoginPath {
+        path,
+        failure: None,
+    },
+    Err(error) => LoginPath {
+        path: std::env::var_os("PATH").unwrap_or_default(),
+        failure: Some(error),
+    },
 });
 
 #[derive(Clone, Debug)]
@@ -34,8 +45,11 @@ pub struct ChildEnv {
 }
 impl ChildEnv {
     pub fn load() -> Self {
+        if let Some(error) = &LOGIN_PATH.failure {
+            tracing::warn!(%error, "login shell PATH unavailable; using inherited PATH");
+        }
         Self {
-            path: LOGIN_PATH.clone(),
+            path: LOGIN_PATH.path.clone(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             #[cfg(debug_assertions)]
             lanes: Arc::default(),
