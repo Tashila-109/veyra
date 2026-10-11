@@ -175,3 +175,86 @@ fn shutdown_expires_requests_with_closing_reason() {
         }
     );
 }
+
+#[test]
+fn quit_during_stop_drain_keeps_queued_work_held_after_reload() {
+    let mut f = Fixture::new(LiveState::Running);
+    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    let Ack::Turn(queued) = f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "queued after Stop".into(),
+        })
+        .unwrap()
+    else {
+        panic!("missing queued turn")
+    };
+    assert_eq!(f.running(), None);
+    assert_eq!(f.actor.projection.threads[&f.thread].hold, None);
+    assert!(matches!(
+        f.actor.live[&f.thread].live,
+        Live::Structured {
+            draining: Some(_),
+            ..
+        }
+    ));
+    let _entered = f.runtime.enter();
+    f.actor.handle(EngineMsg::Shutdown);
+    assert!(matches!(
+        f.actor.live[&f.thread].live,
+        Live::Stopping {
+            then: AfterStop::Park
+        }
+    ));
+    f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
+    assert!(
+        matches!(f.actor.live[&f.thread].live, Live::Parked),
+        "quit spawned a queued thread: {:?}",
+        f.actor.live[&f.thread].live
+    );
+    assert_eq!(
+        f.loaded().threads[&f.thread].hold,
+        Some(HoldReason::Restarted)
+    );
+    assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
+    let db = std::mem::replace(&mut f.actor.db, Connection::open_in_memory().unwrap());
+    let (out, _) = mpsc::channel(256);
+    let actor = Actor::new(db, out, Spawner::Scripted(Scripted::default())).unwrap();
+    assert!(matches!(actor.live[&f.thread].live, Live::Parked));
+    assert_eq!(actor.projection.turns[&queued].state, TurnState::Queued);
+    assert_eq!(
+        actor.projection.threads[&f.thread].hold,
+        Some(HoldReason::Restarted)
+    );
+    assert_eq!(
+        actor.state.window_threads.lock().unwrap()[&f.thread].wait_reason,
+        Some(WaitReason::Held(HoldReason::Restarted))
+    );
+}
+
+#[test]
+fn quit_while_stopping_cancels_session_and_terminal_restarts() {
+    for then in [
+        AfterStop::Park,
+        AfterStop::StartStructured { import: false },
+        AfterStop::StartTerminal,
+    ] {
+        let mut f = Fixture::new(LiveState::Stopping);
+        f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping { then };
+        let queued = f.user("waiting for retiring session");
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::Shutdown);
+        f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
+        assert!(
+            matches!(f.actor.live[&f.thread].live, Live::Parked),
+            "quit restarted a stopping thread: {:?}",
+            f.actor.live[&f.thread].live
+        );
+        assert_eq!(f.running(), None);
+        assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
+        assert_eq!(
+            f.loaded().threads[&f.thread].hold,
+            Some(HoldReason::Restarted)
+        );
+    }
+}

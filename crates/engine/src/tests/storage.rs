@@ -1,5 +1,45 @@
 use super::*;
 use crate::events::ChangeEvent as Ev;
+
+#[test]
+fn write_tool_row_stores_its_content_once() {
+    let mut f = Fixture::new(LiveState::Running);
+    let mut codec = crate::provider::claude::Codec::new(
+        NativeSessionId("stored-input".into()),
+        1,
+        std::path::Path::new("/tmp"),
+    );
+    codec.start(f.running().unwrap(), "write".into());
+    let content = "unique stored file contents";
+    let decoded = codec
+        .value(
+            serde_json::json!({"type":"assistant","message":{"id":"write",
+        "content":[{"type":"tool_use","id":"write-tool","name":"Write",
+        "input":{"file_path":"/tmp/file.txt","content":content}}]}}),
+        )
+        .unwrap();
+    for event in decoded.events {
+        f.event(event);
+    }
+    let stored: String = f
+        .actor
+        .db
+        .query_row("SELECT body_json FROM items WHERE kind='tool'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        stored.matches(content).count(),
+        1,
+        "tool input stored twice: {stored}"
+    );
+    let loaded = f.loaded();
+    let ItemBody::Tool(tool) = &loaded.items.values().next().unwrap().body else {
+        panic!("missing stored tool")
+    };
+    assert_eq!(tool.call.arguments["content"], content);
+    assert_eq!(tool.call.input_summary, None);
+}
 #[test]
 fn provisional_ready_preserves_unknown_and_stored_versions() {
     for stored in [None, Some("stored-version".to_owned())] {

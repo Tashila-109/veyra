@@ -1081,6 +1081,26 @@ impl Actor {
         id
     }
     fn prepare_commit(&self, c: &mut ChangeSet) {
+        if self.shutting_down {
+            // Exit decisions can still propose starts while sessions retire during Quit.
+            c.effects.retain(|effect| {
+                match effect {
+                    Effect::Spawn { thread, .. } | Effect::OpenTerminal { thread } => {
+                        let live = c.live.get_mut(thread).unwrap();
+                        live.epoch = self.live[thread].epoch;
+                        live.live = Live::Parked;
+                        live.background_work = false;
+                    }
+                    Effect::StartTurn { turn, .. } => {
+                        c.turns.get_mut(turn).unwrap().state = TurnState::Queued;
+                    }
+                    Effect::Control { .. } | Effect::StopTerminal { .. } => return true,
+                }
+                false
+            });
+            c.events
+                .retain(|event| !matches!(event, Ev::TurnStarted(_)));
+        }
         let ended: std::collections::BTreeSet<_> = c
             .turns
             .values()
@@ -1302,7 +1322,16 @@ impl Actor {
         {
             commands::expire_requests(&self.projection, &mut c, request.turn, "Veyra is closing");
         }
-        let active: Vec<_> = crate::live::busy_threads(&self.projection, &self.live).collect();
+        let active: std::collections::BTreeSet<_> =
+            crate::live::busy_threads(&self.projection, &self.live)
+                .chain(
+                    self.projection
+                        .turns
+                        .values()
+                        .filter(|turn| turn.state == TurnState::Queued)
+                        .map(|turn| turn.thread),
+                )
+                .collect();
         let now = now();
         for thread in active {
             commands::set_hold(

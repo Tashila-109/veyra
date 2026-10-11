@@ -130,6 +130,7 @@ The debug strings are the positive control.
 Before launch, the shared in-memory KERN_PROCARGS2 reader refuses any same-user marked process whose VEYRA_PARENT_PID names a dead pid.
 It prints and records only the count.
 Release ignores VEYRA_REAP_PIDS, so its unrestricted startup sweep requires this preflight.
+After cleanup, reject a release log containing an orphan-group signal, including one from an orphan created after preflight.
 The cleanup trap owns only this release group and scratch folder.
 This section stops the debug app before opening the release window, then relaunches debug after release cleanup.
 
@@ -208,6 +209,11 @@ test ! -e "$REL_DATA/control.sock"
 printf 'PASS release usage exit=2; driver and override strings absent; no socket\n'
 stop_release
 trap - EXIT
+test -s "$REL_PROOF/veyra.log"
+if grep -q 'reaper signalled orphan group' "$REL_PROOF/veyra.log"; then
+    printf 'release check failed: startup signalled an orphan group\n' >&2
+    exit 1
+fi
 PYTHONPATH="$PROOF" python3 - <<'PY'
 from driver import *
 start('after-release')
@@ -224,6 +230,7 @@ PY
 - Log: `veyra.log` retains the asserted ready line and rejected Send notice.
 - Recovery: `persisted-project.txt` matches the SQLite row after both relaunches; migration, WAL, tables, mode and inode are asserted every time.
 - Release: `release/strings.txt` has zero release counts and positive debug controls for every driver and override name, `ctl.txt` exits 2 and `data-listing.txt` has no socket.
+- Release: `release/veyra.log` contains no `reaper signalled orphan group` line.
 - Cleanup: `marker-check.txt` passes and DATA is absent while proof remains.
 
 ## Gotchas

@@ -490,6 +490,28 @@ mod tests {
     use gpui_kit::AppContext;
     use veyra_engine::domain::*;
     #[test]
+    fn tool_input_formats_arguments_without_a_stored_summary() {
+        for (name, arguments, expected) in [
+            (
+                "remote tool",
+                serde_json::json!({"command":"remote operation"}),
+                "command: remote operation",
+            ),
+            (
+                "file tool",
+                serde_json::json!({"content":"contents", "file_path":"/tmp/x"}),
+                "content: contents\nfile_path: /tmp/x",
+            ),
+        ] {
+            let call = ToolCall {
+                name: name.into(),
+                arguments,
+                input_summary: None,
+            };
+            assert_eq!(tool_input(&call), expected);
+        }
+    }
+    #[test]
     fn turn_outcome_line() {
         let mut turn = Turn {
             id: TurnId::new(),

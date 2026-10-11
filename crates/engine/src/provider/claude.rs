@@ -176,9 +176,10 @@ struct ControlRequest {
     request: ToolRequest,
 }
 #[derive(Deserialize, Default)]
-#[serde(default)]
 struct ToolRequest {
+    #[serde(default)]
     subtype: String,
+    #[serde(default)]
     tool_name: String,
     input: serde_json::Map<String, Value>,
 }
@@ -202,7 +203,7 @@ pub(crate) fn probe_value(wire: Value) -> Result<Option<InitializeReply>, super:
 
 fn target_location(project: &std::path::Path, target: &std::path::Path) -> TargetLocation {
     use std::{io::ErrorKind, path::Component};
-    if !target.is_absolute() || target.to_string_lossy().starts_with('~') {
+    if !target.is_absolute() {
         return TargetLocation::NotVerified;
     }
     let Ok(project) = project.canonicalize() else {
@@ -890,31 +891,11 @@ impl Codec {
                 .map(str::to_owned)
         } else {
             None
-        }
-        .unwrap_or_else(|| {
-            arguments
-                .as_object()
-                .map(|fields| {
-                    fields
-                        .iter()
-                        .map(|(name, value)| {
-                            format!(
-                                "{name}: {}",
-                                value
-                                    .as_str()
-                                    .map(str::to_owned)
-                                    .unwrap_or_else(|| value.to_string())
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_else(|| arguments.to_string())
-        });
+        };
         ToolCall {
             name,
             arguments,
-            input_summary: Some(input_summary),
+            input_summary,
         }
     }
     fn preview(arguments: serde_json::Map<String, Value>) -> ApprovalPreview {
@@ -1311,6 +1292,29 @@ mod tests {
             std::path::Path::new("/tmp"),
         )
     }
+    fn approval(
+        codec: &mut Codec,
+        id: &str,
+        tool: &str,
+        input: Value,
+    ) -> (ProposedAction, Option<GrantKey>) {
+        let decoded = codec
+            .value(json!({"type":"control_request","request_id":id,
+            "request":{"subtype":"can_use_tool","tool_name":tool,"input":input}}))
+            .unwrap();
+        let ProviderEvent::Turn {
+            event:
+                TurnEvent::RequestOpened {
+                    kind: RequestKind::Approval { action, grant_key },
+                    ..
+                },
+            ..
+        } = &decoded.events[0]
+        else {
+            panic!("missing approval")
+        };
+        (action.clone(), grant_key.clone())
+    }
     #[test]
     fn tool_rows_receive_provider_neutral_input_summaries() {
         for (name, input, expected) in [
@@ -1342,7 +1346,10 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(call.input_summary.as_deref(), Some(expected));
+            assert_eq!(
+                call.input_summary.as_deref(),
+                (name == "Bash").then_some(expected)
+            );
             assert_eq!(call.arguments, input);
         }
         let old: ToolCall =
@@ -1372,23 +1379,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let decoded = codec
-                .value(
-                    json!({"type":"control_request","request_id":format!("decoy-{index}"),
-                "request":{"subtype":"can_use_tool","tool_name":tool,"input":input}}),
-                )
-                .unwrap();
-            let ProviderEvent::Turn {
-                event:
-                    TurnEvent::RequestOpened {
-                        kind: RequestKind::Approval { action, grant_key },
-                        ..
-                    },
-                ..
-            } = &decoded.events[0]
-            else {
-                panic!("missing approval")
-            };
+            let (action, grant_key) =
+                approval(&mut codec, &format!("decoy-{index}"), tool, input.clone());
             let ApprovalTarget::Tool { preview } = &action.target else {
                 panic!("conflicting or missing target must not claim a file location")
             };
@@ -1400,24 +1392,12 @@ mod tests {
     fn approval_relative_and_tilde_targets_are_not_verified() {
         let mut codec = codec();
         for (index, target) in ["~/outside.txt", "relative.txt"].into_iter().enumerate() {
-            let decoded = codec
-                .value(
-                    json!({"type":"control_request","request_id":format!("relative-{index}"),
-                "request":{"subtype":"can_use_tool","tool_name":"Write",
-                    "input":{"file_path":target,"content":"contents"}}}),
-                )
-                .unwrap();
-            let ProviderEvent::Turn {
-                event:
-                    TurnEvent::RequestOpened {
-                        kind: RequestKind::Approval { action, .. },
-                        ..
-                    },
-                ..
-            } = &decoded.events[0]
-            else {
-                panic!("missing approval")
-            };
+            let (action, _) = approval(
+                &mut codec,
+                &format!("relative-{index}"),
+                "Write",
+                json!({"file_path":target,"content":"contents"}),
+            );
             assert!(
                 matches!(
                     &action.target,
@@ -1450,23 +1430,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let decoded = codec
-                .value(
-                    json!({"type":"control_request","request_id":format!("grant-{index}"),
-                "request":{"subtype":"can_use_tool","tool_name":tool,"input":input}}),
-                )
-                .unwrap();
-            let ProviderEvent::Turn {
-                event:
-                    TurnEvent::RequestOpened {
-                        kind: RequestKind::Approval { action, grant_key },
-                        ..
-                    },
-                ..
-            } = &decoded.events[0]
-            else {
-                panic!("missing approval")
-            };
+            let (action, grant_key) = approval(&mut codec, &format!("grant-{index}"), tool, input);
             assert_eq!(
                 grant_key.is_some(),
                 grant,
@@ -1692,6 +1656,29 @@ mod tests {
         );
     }
     #[test]
+    fn tool_request_requires_an_input_object() {
+        let mut codec = codec();
+        for (index, request) in [
+            json!({"subtype":"can_use_tool","tool_name":"Bash"}),
+            json!({"subtype":"can_use_tool","tool_name":"Bash","input":null}),
+            json!({"subtype":"can_use_tool","tool_name":"Bash","input":[]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("missing-input-{index}");
+            let decoded = codec
+                .value(json!({"type":"control_request","request_id":id,
+                "request":request}))
+                .unwrap();
+            assert!(
+                decoded.events.is_empty(),
+                "malformed input opened an approval"
+            );
+            assert_eq!(decoded.replies, [Codec::unsupported_request(id)]);
+        }
+    }
+    #[test]
     fn undecodable_initialize_reply_fails_session() {
         let mut codec = codec();
         assert!(
@@ -1716,12 +1703,8 @@ mod tests {
             ("mcp__local__change", json!({"nested":{"first":1,"second":"every argument"},"flag":true})),
             ("Bash", json!({"command":"echo ok","run_in_background":true,"dangerouslyDisableSandbox":true})),
         ].into_iter().enumerate() {
-            let decoded = codec.value(json!({"type":"control_request","request_id":format!("display-{index}"),
-                "request":{"subtype":"can_use_tool","tool_name":name,"input":input}})).unwrap();
-            let ProviderEvent::Turn { event: TurnEvent::RequestOpened {
-                kind: RequestKind::Approval { action, grant_key }, .. }, .. } = &decoded.events[0]
-            else { panic!("missing approval") };
-            let display = serde_json::to_value(action).unwrap();
+            let (action, grant_key) = approval(&mut codec, &format!("display-{index}"), name, input.clone());
+            let display = serde_json::to_value(&action).unwrap();
             assert!(display.get("target").is_some(), "approval must expose a typed target");
             assert!(display.get("input").is_none(), "raw input must not be stored");
             let preview = &display["target"]["preview"]["text"];
@@ -1743,22 +1726,12 @@ mod tests {
     #[test]
     fn unknown_tools_keep_command_and_path_arguments_literal() {
         let mut codec = codec();
-        let decoded = codec
-            .value(json!({"type":"control_request","request_id":"remote-tool",
-            "request":{"subtype":"can_use_tool","tool_name":"mcp__local__remote",
-                "input":{"command":"remote operation","path":"remote/not-a-local-file"}}}))
-            .unwrap();
-        let ProviderEvent::Turn {
-            event:
-                TurnEvent::RequestOpened {
-                    kind: RequestKind::Approval { action, grant_key },
-                    ..
-                },
-            ..
-        } = &decoded.events[0]
-        else {
-            panic!("missing approval")
-        };
+        let (action, grant_key) = approval(
+            &mut codec,
+            "remote-tool",
+            "mcp__local__remote",
+            json!({"command":"remote operation","path":"remote/not-a-local-file"}),
+        );
         let ApprovalTarget::Tool { preview } = &action.target else {
             panic!("unknown tool arguments")
         };
@@ -1789,24 +1762,12 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let decoded = codec
-                .value(
-                    json!({"type":"control_request","request_id":format!("path-{index}"),
-                "request":{"subtype":"can_use_tool","tool_name":"Write",
-                    "input":{"file_path":project.join(path),"content":"contents"}}}),
-                )
-                .unwrap();
-            let ProviderEvent::Turn {
-                event:
-                    TurnEvent::RequestOpened {
-                        kind: RequestKind::Approval { action, .. },
-                        ..
-                    },
-                ..
-            } = &decoded.events[0]
-            else {
-                panic!("missing approval")
-            };
+            let (action, _) = approval(
+                &mut codec,
+                &format!("path-{index}"),
+                "Write",
+                json!({"file_path":project.join(path),"content":"contents"}),
+            );
             assert!(
                 matches!(&action.target, ApprovalTarget::File { path: absolute, location, .. }
                 if absolute == &project.join(path) && absolute.is_absolute() && *location == expected)
@@ -1820,23 +1781,13 @@ mod tests {
     #[test]
     fn approval_content_preview_is_cut_with_notice() {
         let mut codec = codec();
-        let decoded = codec
-            .value(json!({"type":"control_request","request_id":"long-content",
-            "request":{"subtype":"can_use_tool","tool_name":"Write",
-                "input":{"file_path":"/tmp/x","content":"界".repeat(10001)}}}))
-            .unwrap();
-        let ProviderEvent::Turn {
-            event:
-                TurnEvent::RequestOpened {
-                    kind: RequestKind::Approval { action, .. },
-                    ..
-                },
-            ..
-        } = &decoded.events[0]
-        else {
-            panic!("missing approval")
-        };
-        let display = serde_json::to_value(action).unwrap();
+        let (action, _) = approval(
+            &mut codec,
+            "long-content",
+            "Write",
+            json!({"file_path":"/tmp/x","content":"界".repeat(10001)}),
+        );
+        let display = serde_json::to_value(&action).unwrap();
         assert_eq!(display["target"]["preview"]["truncated"], true);
         assert_eq!(
             display["target"]["preview"]["text"]
@@ -1871,23 +1822,12 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let decoded = codec
-                .value(
-                    json!({"type":"control_request","request_id":format!("approval-{index}"),
-                "request":{"subtype":"can_use_tool","tool_name":tool,"input":input}}),
-                )
-                .unwrap();
-            let ProviderEvent::Turn {
-                event:
-                    TurnEvent::RequestOpened {
-                        kind: RequestKind::Approval { action, grant_key },
-                        ..
-                    },
-                ..
-            } = &decoded.events[0]
-            else {
-                panic!("missing approval")
-            };
+            let (action, grant_key) = approval(
+                &mut codec,
+                &format!("approval-{index}"),
+                tool,
+                input.clone(),
+            );
             assert_eq!(action.tool, tool);
             if let Some(command) = input["command"].as_str() {
                 assert!(

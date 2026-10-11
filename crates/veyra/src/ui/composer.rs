@@ -49,14 +49,8 @@ pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String,
     };
     let mut preview_text = preview.text.clone();
     if preview.truncated {
-        let mut limit = veyra_engine::domain::TOOL_OUTPUT_CHARS.to_string();
-        let digits = limit.len();
-        for index in (1..digits)
-            .rev()
-            .filter(|index| (digits - index).is_multiple_of(3))
-        {
-            limit.insert(index, ',');
-        }
+        let cap = veyra_engine::domain::TOOL_OUTPUT_CHARS;
+        let limit = format!("{},{:03}", cap / 1000, cap % 1000);
         preview_text.push_str(&format!("\nPreview cut after {limit} characters."));
     }
     (label, consequence, preview_text)
@@ -64,6 +58,13 @@ pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String,
 
 fn dock_chip(button: Button, focused: bool, chip: impl IntoElement) -> Button {
     button.when(focused, |button| button.child(chip))
+}
+
+fn button_caption(label: SharedString) -> SharedString {
+    let Some((line, _)) = label.split_once('\n') else {
+        return label;
+    };
+    format!("{line}…").into()
 }
 
 pub fn labelled_button(
@@ -85,7 +86,7 @@ pub fn labelled_button(
                 .font_weight(t.text.label.weight)
                 .min_w_0()
                 .truncate()
-                .child(label.split_whitespace().collect::<Vec<_>>().join(" ")),
+                .child(button_caption(label)),
         )
 }
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
@@ -475,6 +476,56 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
 mod tests {
     use super::approval_text;
     use veyra_engine::domain::{ApprovalPreview, ApprovalTarget, ProposedAction};
+    #[gpui::test]
+    fn grant_caption_keeps_command_whitespace(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::{prelude::*, *};
+        for (label, expected) in [
+            (
+                "Allow `echo a  b` in this thread",
+                "Allow `echo a  b` in this thread",
+            ),
+            (
+                "Allow `echo a  b\nnext line` in this thread",
+                "Allow `echo a  b…",
+            ),
+        ] {
+            assert_eq!(super::button_caption(label.into()).as_ref(), expected);
+        }
+        struct Caption(String);
+        impl Render for Caption {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().flex().child(
+                    super::labelled_button("grant", self.0.clone(), cx)
+                        .debug_selector(|| "grant-caption".into()),
+                )
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+            Caption("Allow `echo a b` in this thread".into())
+        });
+        let mut widths = Vec::new();
+        for caption in [
+            "Allow `echo a b` in this thread",
+            "Allow `echo a  b` in this thread",
+        ] {
+            view.update(cx, |view, cx| {
+                view.0 = caption.into();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            widths.push(cx.debug_bounds("grant-caption").unwrap().size.width);
+        }
+        assert!(
+            widths[1] > widths[0],
+            "grant captions collapsed distinct command whitespace"
+        );
+    }
     #[test]
     fn tool_approval_preview_shows_arguments_and_cut_notice() {
         let action = ProposedAction {

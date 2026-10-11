@@ -107,7 +107,9 @@ CancelQuit dismisses it and restores composer focus.
 ConfirmQuit cancels the branch task, awaits Engine::shutdown_wait in a gpui task, then calls cx.quit.
 The debug ctl quit verb dispatches ConfirmQuit directly.
 `Engine::shutdown_wait` refuses new commands, ends running turns, expires pending requests and asks every session to shut down.
-Shutdown persists Restarted holds for running, Starting and background-busy threads in its own transaction.
+Shutdown persists Restarted holds for running, queued, Starting and background-busy threads in its own transaction.
+Actor::prepare_commit suppresses every proposed Spawn, OpenTerminal and StartTurn while shutting down, before storage or effect dispatch.
+Suppressed turns remain Queued and retiring sessions become Parked without a replacement.
 It expires pending requests with "Veyra is closing" before ending turns.
 A Restarted hold remains Held even without a queued turn; Send with an empty queue or Continue clears it.
 Sessions queue deny/cancel replies before the protocol interrupt and give the writer up to one second to drain before group cleanup.
@@ -196,7 +198,7 @@ All three preserve an existing hold.
 Tasks cannot arise through the application because the tool server is not implemented.
 `can_use_tool` opens a typed approval or AskUserQuestion request.
 Unknown subtypes and malformed requests receive an error response without opening a request.
-Malformed includes empty tool names or ids, ids reused within that CLI process lifetime, non-object input, missing question text or option labels, and duplicate question texts.
+Malformed includes empty tool names or ids, ids reused within that CLI process lifetime, missing or non-object input, missing question text or option labels, and duplicate question texts.
 A pending request makes the thread NeedsYou and docks its exact command, tool target or question above the composer.
 The Claude codec turns each approval into ProposedAction, a tool label and provider-neutral ApprovalTarget: Command, File or Tool.
 Command preserves exact command text; File carries its operation, literal target path, location and preview; Tool carries its argument preview.
@@ -209,21 +211,11 @@ Relative targets and targets starting with ~ are NotVerified.
 The codec classifies absolute location once, synchronously in the session task, when the request opens against the canonical project folder.
 It canonicalizes the deepest existing ancestor and appends the missing remainder; a remainder containing a parent component or an unresolvable path is NotVerified.
 InsideProject requires the resolved target to be under the canonical project folder; proved other targets are OutsideProject.
-The app renders only the typed action and does no disk work to render it.
-The full command or file path, consequence and bounded argument preview share a scrollable area bounded by the composer height token, with Allow and Deny below it.
 Request rows store only this typed display form, with no duplicated raw input.
 Legacy stored command rows load as Command; rows with optional legacy input load as Tool previews without claiming a verified file location.
 AllowOnce, AllowInThread and Deny answer approvals; AnswerQuestion collects one answer per question.
 Only a Bash Command action whose input keys are command, description or timeout may offer an exact-command thread grant using that displayed command.
 Inputs with any other field always dock without a grant offer.
-The dock shows 1 of N for multiple pending requests.
-Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
-Because a docked request implies a running turn, composer Command+Return with an empty draft dispatches Stop, which interrupts the turn and expires the request.
-Approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
-Requests never take focus automatically, and answering an approval or question keeps dock focus while another request remains.
-After the last response, focus returns to the composer once no other pending request remains.
-Approvals and questions share the same unfocused dock prompt and FocusDock chord.
-The focused dock has an accent border.
 StopThread and Interrupt expire pending requests, and the provider queues cancel replies before interrupt.
 There is no automatic request timeout.
 Respond persists an answer before dispatching the native reply; question answers also add a user transcript item.
@@ -323,7 +315,9 @@ It publishes a synthesized turn end before awaiting group cleanup, so post-KILL 
 Exited still follows cleanup, and the actor starts no queued work before Exited.
 Other abnormal exits produce Failed with Veyra's bounded, redacted crash text.
 Streamed and final blocks share native keys so final frames do not duplicate delivered text.
-The codec supplies provider-neutral tool input summaries; older stored calls without a summary render their arguments generically.
+The codec supplies a provider-neutral input summary only for the Bash command.
+Other tool rows store their input only in arguments, and the transcript formats those arguments generically.
+Older stored summaries remain readable.
 Each background_tasks_changed replaces the pending set; ambient tasks never keep the thread Working.
 Child frames feed the pending root Task or Agent tool's bounded output tail instead of creating root text or turns.
 Unknown or finished child parents are ignored, and snapshots retain a running tool's tail.
@@ -447,7 +441,19 @@ SetDefaultMode publishes SettingsChanged; Escape or thread/project selection lea
 
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
 Ctrl+C is literal control in the composer and preserves its draft while interrupting the turn.
-Approval chords are Command+Return, Command+Option+Return and Command+period while the dock has focus.
+The app renders only the typed action and does no disk work to render it.
+The full command or file path, consequence and bounded argument preview share a scrollable area bounded by the composer height token, with Allow and Deny below it.
+The dock shows 1 of N for multiple pending requests.
+Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
+Because a docked request implies a running turn, composer Command+Return with an empty draft dispatches Stop, which interrupts the turn and expires the request.
+Approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
+Requests never take focus automatically, and answering an approval or question keeps dock focus while another request remains.
+After the last response, focus returns to the composer once no other pending request remains.
+Approvals and questions share the same unfocused dock prompt and FocusDock chord.
+The focused dock has an accent border.
+The focused approval chords are Command+Return, Command+Option+Return and Command+period.
+Grant button captions keep whitespace in their visible first line, add an ellipsis at a newline, and truncate to their width.
+Their accessibility labels retain the whole original caption.
 NextNeedsYou scans sidebar order for NeedsYou before Failed, wrapping once and including child rows.
 The composer shows Stop while a turn runs and its draft is empty, plus held reasons and Continue.
 Discard queued appears only when a held thread has queued turns.
@@ -492,12 +498,13 @@ No wait server command exists.
 
 [verify-veyra](.agents/skills/verify-veyra/SKILL.md) owns the fresh-shell launch, driver, capture, evidence and cleanup procedure.
 Its fake lane isolates data and uses only the fake CLI; an explicitly authorized live lane records actual provider wires.
-Proof stays outside disposable scratch, and every action targets a process this run started.
+Proof stays outside disposable scratch, and driver and cleanup actions target only processes this run started.
 Captures require the owned window to remain on-screen and frontmost; the guard prevents covered or stale frames from counting as proof.
 Cleanup checks owned app pids, provider groups and same-user parent markers without printing arguments before removing scratch.
 Release proof uses a disposable HOME and restricted PATH, scans driver/override strings including VEYRA_REAP_PIDS, and checks a socket-free window.
 Release ignores the debug reap filter, so its launch first refuses any same-user marked process whose VEYRA_PARENT_PID names a dead pid.
-The preflight shares Cleanup's in-memory KERN_PROCARGS2 reader and reports counts only.
+That check holds only at preflight; an orphan created before the release sweep can still be signalled, so release checks must not overlap another run's deliberate orphan.
+After release cleanup, the recipe fails if the preserved log records an orphan-group signal.
 Only one owned Veyra window exists during that release check; it takes no PNG.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
@@ -526,6 +533,8 @@ replay_claude uses the real session task with the fake CLI for text and tools, p
 It covers approvals, questions, unknown requests, Stop with a pending approval and late interrupts.
 It also checks assistant-error parking, interrupt outcomes and ladder cancellation, subagent isolation against the live Agent recording, notices and malformed-byte recovery.
 Actor tests cover retirement before queued work, the Stop drain, Provider-tail rejection and skipped text-only transactions.
+Shutdown tests check that Quit during a drain or Stopping starts no replacement session and keeps queued work held after reload.
+A storage test checks that a Write tool row stores its content once.
 Platform tests check the two-second login-shell bound, inherited-pipe deadline and group nice value.
 Session tests check process exit classification and cleanup ordering.
 Request, grant and awake tests check request expiry, exact matching, thread isolation, needs_awake and retained-guard flags.
