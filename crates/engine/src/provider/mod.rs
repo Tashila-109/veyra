@@ -74,7 +74,7 @@ pub enum SessionEvent {
         turn: TurnId,
     },
     ProviderTurnStarted {
-        generation: TurnId,
+        provider_turn: TurnId,
     },
     Ready {
         native: NativeSessionId,

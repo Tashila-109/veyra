@@ -115,7 +115,7 @@ impl Fixture {
                 live,
                 background_work: false,
                 capabilities: vec![],
-                pending_start: None,
+                admission: None,
             },
         );
         let tx = actor.db.transaction().unwrap();

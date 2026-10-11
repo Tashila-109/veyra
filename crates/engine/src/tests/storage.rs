@@ -642,7 +642,7 @@ fn storage_failure_stops_session_before_provider_turn_is_registered() {
     assert!(f.running().is_none());
     f.actor.fail_write = true;
     f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
-        generation: decoded.provider_generation.unwrap(),
+        provider_turn: decoded.provider_turn.unwrap(),
     }));
     assert!(
         f.drain()

@@ -117,6 +117,7 @@ impl Drop for LaunchGate {
 pub struct WindowThread {
     pub wait_reason: Option<domain::WaitReason>,
     pub busy: bool,
+    pub turn_busy: bool,
 }
 #[cfg(debug_assertions)]
 #[derive(Default)]

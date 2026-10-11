@@ -456,6 +456,11 @@ pub struct ThreadView<'a> {
     pub pending_request: bool,
     pub last: Option<&'a Turn>,
 }
+impl ThreadView<'_> {
+    pub fn turn_busy(&self) -> bool {
+        self.running.is_some() || self.live.admission.is_some()
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     NeedsYou,
@@ -498,7 +503,10 @@ pub fn thread_status(v: &ThreadView<'_>) -> Status {
     if matches!(v.live.live, crate::live::Live::Terminal { .. }) {
         return Status::InTerminal;
     }
-    if v.live.background_work || matches!(v.live.live, crate::live::Live::Starting { .. }) {
+    if v.live.admission.is_some()
+        || v.live.background_work
+        || matches!(v.live.live, crate::live::Live::Starting { .. })
+    {
         return Status::Working { since: 0 };
     }
     match v.last.map(|t| &t.state) {
@@ -562,7 +570,7 @@ pub fn wait_reason(v: &ThreadView<'_>) -> Option<WaitReason> {
     if let Some(reason) = v.thread.hold {
         return Some(WaitReason::Held(reason));
     }
-    if v.running.is_some() || v.live.pending_start.is_some() {
+    if v.turn_busy() {
         return Some(WaitReason::TurnRunning);
     }
     if matches!(v.live.live, Live::Starting { .. }) {

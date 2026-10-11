@@ -510,7 +510,7 @@ pub(crate) struct Codec {
 pub(crate) struct Decoded {
     pub events: Vec<ProviderEvent>,
     pub replies: Vec<Value>,
-    pub provider_generation: Option<TurnId>,
+    pub provider_turn: Option<TurnId>,
 }
 impl Codec {
     pub fn new(native: NativeSessionId, pid: u32, cwd: &std::path::Path) -> Self {
@@ -581,7 +581,7 @@ impl Codec {
                 return Ok(Decoded {
                     events: Vec::new(),
                     replies: vec![Self::unsupported_request(id)],
-                    provider_generation: None,
+                    provider_turn: None,
                 });
             }
             Err(_) if control_response => {
@@ -726,9 +726,9 @@ impl Codec {
             }
         }
         if self.active.is_none() && events.iter().any(TurnEvent::opens_provider_turn) {
-            let generation = TurnId::new();
-            self.active = Some(ActiveTurn::Provider(generation));
-            decoded.provider_generation = Some(generation);
+            let provider_turn = TurnId::new();
+            self.active = Some(ActiveTurn::Provider(provider_turn));
+            decoded.provider_turn = Some(provider_turn);
         }
         let ended = events
             .iter()

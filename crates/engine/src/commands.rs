@@ -1,7 +1,7 @@
 use crate::{
     domain::*,
     events::{ChangeEvent as Ev, ChangeSet, Effect},
-    live::{AfterStop, Live, LiveThread, can_start, park_due},
+    live::{AfterStop, Live, LiveThread, TurnAdmission, can_start, park_due},
     provider::{ProviderKind, SessionControl, StopReason},
     store::StoreError,
 };
@@ -288,9 +288,9 @@ fn interrupt(
             control(c, thread, SessionControl::Shutdown);
             stopping(l, c, thread, AfterStop::Park);
         }
-        Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
-            interrupt_running(p, l, c, thread);
-            end_running(p, c, thread, StopReason::User, now);
+        Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
+            interrupt_active(p, l, c, thread);
+            end_active(p, l, c, thread, StopReason::User, now);
         }
         Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
         Live::Parked | Live::Structured { .. } | Live::Stopping { .. } => {}
@@ -387,7 +387,7 @@ fn configure(
     match &l[&thread].live {
         Live::Parked => {}
         Live::Starting { .. } => return Err(CommandError::Busy(WaitReason::Starting)),
-        Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
+        Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
             return Err(CommandError::Busy(WaitReason::TurnRunning));
         }
         Live::Structured { .. } => {
@@ -443,7 +443,7 @@ fn switch_view(
             c.effects.push(Effect::OpenTerminal { thread });
         }
         Live::Starting { .. } => return Err(CommandError::Busy(WaitReason::Starting)),
-        Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
+        Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
             return Err(CommandError::Busy(WaitReason::TurnRunning));
         }
         Live::Structured { .. } if to == View::Terminal => {
@@ -544,35 +544,33 @@ fn hold_parent(p: &Projection, c: &mut ChangeSet, thread: ThreadId) {
         set_hold(p, c, parent, Some(HoldReason::ChildReport));
     }
 }
-fn interrupt_running(
+fn interrupt_active(
     p: &Projection,
     l: &BTreeMap<ThreadId, LiveThread>,
     c: &mut ChangeSet,
     thread: ThreadId,
 ) {
-    let turn = c.view(p, l, thread).unwrap().running.unwrap().id;
-    drain_running(p, l, c, thread);
-    control(
-        c,
-        thread,
-        SessionControl::Interrupt {
-            turn,
-            reason: StopReason::User,
-        },
-    );
-}
-fn drain_running(
-    p: &Projection,
-    l: &BTreeMap<ThreadId, LiveThread>,
-    c: &mut ChangeSet,
-    thread: ThreadId,
-) {
-    let turn = c.view(p, l, thread).unwrap().running.map(|turn| turn.id);
+    let view = c.view(p, l, thread).unwrap();
+    let running = view.running.map(|turn| turn.id);
+    let pending = view.live.pending_turn();
     let mut live = c.live(l, thread).clone();
     if let Live::Structured { draining, .. } = &mut live.live {
-        *draining = turn;
+        *draining = running.or(pending);
     }
     c.live.insert(thread, live);
+    for turn in running
+        .into_iter()
+        .chain(pending.filter(|turn| Some(*turn) != running))
+    {
+        control(
+            c,
+            thread,
+            SessionControl::Interrupt {
+                turn,
+                reason: StopReason::User,
+            },
+        );
+    }
 }
 fn stop_one(
     p: &Projection,
@@ -586,8 +584,8 @@ fn stop_one(
             control(c, thread, SessionControl::Shutdown);
             stopping(l, c, thread, AfterStop::Park);
         }
-        Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
-            interrupt_running(p, l, c, thread);
+        Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
+            interrupt_active(p, l, c, thread);
         }
         Live::Terminal { .. } => {
             c.effects.push(Effect::StopTerminal { thread });
@@ -600,7 +598,7 @@ fn stop_one(
         }
         Live::Parked | Live::Structured { .. } => {}
     }
-    end_running(p, c, thread, StopReason::User, now);
+    end_active(p, l, c, thread, StopReason::User, now);
     drop_turns(p, c, thread, false, now);
     set_hold(p, c, thread, Some(HoldReason::Stopped));
 }
@@ -682,8 +680,9 @@ pub fn end_turn(
     c.turns.insert(ended, turn);
     requeue_wake(p, c, ended);
 }
-pub(crate) fn end_running(
+pub(crate) fn end_active(
     p: &Projection,
+    l: &BTreeMap<ThreadId, LiveThread>,
     c: &mut ChangeSet,
     thread: ThreadId,
     reason: crate::provider::StopReason,
@@ -691,7 +690,10 @@ pub(crate) fn end_running(
 ) {
     let turns: Vec<_> = c
         .turns(p, thread)
-        .filter(|t| matches!(t.state, TurnState::Running { .. }))
+        .filter(|t| {
+            matches!(t.state, TurnState::Running { .. })
+                || c.live(l, thread).pending_turn() == Some(t.id) && t.state == TurnState::Queued
+        })
         .cloned()
         .collect();
     for t in turns {
@@ -759,7 +761,7 @@ pub fn start_changed(
                 c.events.push(Ev::TurnStarted(t.clone()));
                 c.turns.insert(t.id, t.clone());
                 let mut live = c.live(l, id).clone();
-                live.pending_start = Some(t.id);
+                live.admission = Some(TurnAdmission::Pending(t.id));
                 c.live.insert(id, live);
                 c.effects.push(Effect::StartTurn {
                     thread: id,
@@ -774,7 +776,7 @@ pub fn spawn(l: &BTreeMap<ThreadId, LiveThread>, c: &mut ChangeSet, id: ThreadId
     let mut live = c.live(l, id).clone();
     live.epoch += 1;
     live.live = Live::Starting { session: None };
-    live.pending_start = None;
+    live.admission = None;
     live.background_work = false;
     c.live.insert(id, live);
     c.effects.push(Effect::Spawn { thread: id, import });

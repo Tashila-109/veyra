@@ -19,6 +19,7 @@ The dock shows its answer chords only while focused; otherwise it shows ⌘⇧Y 
 Requests do not take focus automatically.
 Composer ⌘↵ sends a nonempty draft and leaves the request pending; an empty draft during a turn dispatches Stop.
 Every button's shortcut_chip reads the same bindings table as the keymap.
+Buttons answer their displayed request; an expired request or a question index that already advanced sends no answer.
 A question shows its options; click Focus to use shortcuts or press ⌘⇧Y to FocusDock.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
 More than one pending request shows 1 of N.
@@ -76,16 +77,16 @@ poll('approval-allow-done',lambda d: d['selected_thread']['status']=='Done'
     and sql("select count(*) from turns where thread_id='"+thread+"' and state='ended'") == '2')
 assert check.is_file()
 thread = create('approval-grant','Run touch veyra-grant.txt',scenario='approval-grant')
-poll('approval-grant-dock',lambda d: d['composer']['dock'] is not None)
+grant = poll('approval-grant-dock',lambda d: d['composer']['dock'] is not None)
 capture('approval-grant')
-action('approval-grant-answer','AllowInThread')
+action('approval-grant-answer','AllowInThread',{'request':grant['composer']['dock']['request']['id']})
 compound = poll('approval-compound',lambda d: d['composer']['dock'] is not None
     and '&&' in d['composer']['dock']['request']['kind']['Approval']['action']['target']['command'])
 assert sql("select count(*) from requests where thread_id='"+thread+"'") == '3'
 assert sql("select count(*) from grants where thread_id='"+thread+"'") == '1'
 assert (DATA/'project'/'veyra-grant.txt').is_file()
 capture('approval-compound')
-action('approval-compound-deny','Deny')
+action('approval-compound-deny','Deny',{'request':compound['composer']['dock']['request']['id']})
 ctl('approval-grant-done','wait',thread,'Done')
 for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve())),
     ('outside', '/tmp/veyra-outside-'+RUN+'.txt')]:
@@ -129,7 +130,7 @@ for label, tool, arguments in [
     assert preview == arguments
     assert dock['request']['kind']['Approval']['grant_key'] is None
     capture('approval-'+label)
-    action('approval-'+label+'-allow','AllowOnce')
+    action('approval-'+label+'-allow','AllowOnce',{'request':dock['request']['id']})
     ctl('approval-'+label+'-done','wait',thread,'Done')
 command = "cat <<'VEYRA_END'\n" + 'long approval heredoc line\n'*200 + 'VEYRA_END'
 records = [json.loads(line) for line in (SOURCE/'approval-allow.jsonl').read_text().splitlines()]

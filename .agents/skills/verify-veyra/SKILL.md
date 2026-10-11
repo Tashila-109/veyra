@@ -424,6 +424,9 @@ The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
 Use the same exported `RUN` in every fresh shell.
 `action NAME [JSON]` builds a registered gpui action.
+AllowOnce, AllowInThread and Deny accept a request id; AnswerQuestion accepts request, question index and option index.
+Without a request payload, consent actions use the rendered dock target, as focused keyboard chords do.
+For an explicit AnswerQuestion request, supply its question index as well.
 Action and key replies acknowledge dispatch; poll `dump` for the resulting view or use `ctl wait` for a thread state.
 `keys KEYSTROKES` dispatches each key through the window.
 `text STRING` uses the focused textarea's public input handler; Settings has no text handler.

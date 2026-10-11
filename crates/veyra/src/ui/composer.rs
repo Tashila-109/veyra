@@ -239,6 +239,12 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     )
                 })
                 .when_some(request, |composer, request| {
+                    let request_id = request.id;
+                    let question_index = shell
+                        .question_draft
+                        .as_ref()
+                        .filter(|(id, _)| *id == request_id)
+                        .map_or(0, |(_, answers)| answers.len());
                     let mut dock = div()
                         .v_flex()
                         .w_full()
@@ -254,6 +260,12 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         })
                         .track_focus(&shell.dock_focus)
                         .key_context("VeyraDock")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _, _, _| {
+                                shell.dock_press = Some((request_id, question_index));
+                            }),
+                        )
                         .when(pending.len() > 1, |dock| {
                             dock.child(
                                 div()
@@ -311,23 +323,37 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .gap(t.space.0[3])
                                         .child(
                                             dock_chip(
-                                                labelled_button("deny", "Deny", cx).debug_selector(
-                                                    || "approval-deny-button".into(),
-                                                ),
+                                                labelled_button(
+                                                    SharedString::from(format!(
+                                                        "deny-{request_id}"
+                                                    )),
+                                                    "Deny",
+                                                    cx,
+                                                )
+                                                .debug_selector(|| "approval-deny-button".into()),
                                                 shell.dock_focused,
                                                 shortcut_chip::<Deny>(cx),
                                             )
                                             .on_click(
-                                                |_, window, cx| {
-                                                    window.dispatch_action(Box::new(Deny), cx)
-                                                },
+                                                cx.listener(move |shell, event, window, cx| {
+                                                    let (request, _) =
+                                                        shell.dock_click(event, request_id, 0);
+                                                    window.dispatch_action(
+                                                        Box::new(Deny {
+                                                            request: Some(request),
+                                                        }),
+                                                        cx,
+                                                    )
+                                                }),
                                             ),
                                         )
                                         .when_some(grant_key.as_ref(), |row, key| {
                                             row.child(
                                                 dock_chip(
                                                     labelled_button(
-                                                        "allow-thread",
+                                                        SharedString::from(format!(
+                                                            "allow-thread-{request_id}"
+                                                        )),
                                                         format!(
                                                             "Allow `{}` in this thread",
                                                             key.command
@@ -338,57 +364,76 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     shell.dock_focused,
                                                     shortcut_chip::<AllowInThread>(cx),
                                                 )
-                                                .on_click(|_, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(AllowInThread),
-                                                        cx,
-                                                    )
-                                                }),
+                                                .on_click(cx.listener(
+                                                    move |shell, event, window, cx| {
+                                                        let (request, _) =
+                                                            shell.dock_click(event, request_id, 0);
+                                                        window.dispatch_action(
+                                                            Box::new(AllowInThread {
+                                                                request: Some(request),
+                                                            }),
+                                                            cx,
+                                                        )
+                                                    },
+                                                )),
                                             )
                                         })
                                         .child(
                                             dock_chip(
-                                                labelled_button("allow-once", "Allow once", cx)
-                                                    .primary()
-                                                    .debug_selector(|| {
-                                                        "approval-allow-button".into()
-                                                    }),
+                                                labelled_button(
+                                                    SharedString::from(format!(
+                                                        "allow-once-{request_id}"
+                                                    )),
+                                                    "Allow once",
+                                                    cx,
+                                                )
+                                                .primary()
+                                                .debug_selector(|| "approval-allow-button".into()),
                                                 shell.dock_focused,
                                                 shortcut_chip::<AllowOnce>(cx),
                                             )
                                             .on_click(
-                                                |_, window, cx| {
-                                                    window.dispatch_action(Box::new(AllowOnce), cx)
-                                                },
+                                                cx.listener(move |shell, event, window, cx| {
+                                                    let (request, _) =
+                                                        shell.dock_click(event, request_id, 0);
+                                                    window.dispatch_action(
+                                                        Box::new(AllowOnce {
+                                                            request: Some(request),
+                                                        }),
+                                                        cx,
+                                                    )
+                                                }),
                                             ),
                                         ),
                                 );
                         }
                         RequestKind::Question { questions } => {
-                            let index = shell
-                                .question_draft
-                                .as_ref()
-                                .filter(|(id, _)| *id == request.id)
-                                .map_or(0, |(_, answers)| answers.len());
+                            let index = question_index;
                             if let Some(question) = questions.get(index) {
                                 dock = dock.child(question.text.clone()).children(
                                     question.options.iter().enumerate().map(|(option, label)| {
                                         labelled_button(
-                                            SharedString::from(format!("answer-{option}")),
+                                            SharedString::from(format!(
+                                                "answer-{request_id}-{index}-{option}"
+                                            )),
                                             format!("{}  {label}", option + 1),
                                             cx,
                                         )
                                         .justify_start()
                                         .child(div().flex_1())
                                         .on_click(
-                                            move |_, window, cx| {
+                                            cx.listener(move |shell, event, window, cx| {
+                                                let (request, question) =
+                                                    shell.dock_click(event, request_id, index);
                                                 window.dispatch_action(
                                                     Box::new(AnswerQuestion {
+                                                        request: Some(request),
+                                                        question: Some(question),
                                                         option: Some(option),
                                                     }),
                                                     cx,
                                                 )
-                                            },
+                                            }),
                                         )
                                     }),
                                 );

@@ -1422,10 +1422,10 @@ for line in sys.stdin:
                         })
                         .unwrap();
                 }
-                if let ProviderEvent::Session(SessionEvent::ProviderTurnStarted { generation }) =
+                if let ProviderEvent::Session(SessionEvent::ProviderTurnStarted { provider_turn }) =
                     &event
                 {
-                    provider = Some(*generation);
+                    provider = Some(*provider_turn);
                 }
                 if let ProviderEvent::Turn {
                     turn,
@@ -1687,4 +1687,132 @@ fn queued_prompt_behind_provider_followup_keeps_three_turns() {
 #[test]
 fn queued_prompt_without_provider_followup_completes() {
     queued_prompt_with_followup(false);
+}
+
+fn blocked_interrupt_probe(stop: bool) {
+    let scratch =
+        Scratch(std::env::temp_dir().join(format!("veyra-blocked-writer-{}", ThreadId::new())));
+    fs::create_dir(&scratch.0).unwrap();
+    let binary = stand_in(
+        &scratch,
+        "owned-blocked-writer",
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, select, sys, time
+buffer = b''
+def read_line(timeout=5):
+    global buffer
+    deadline = time.monotonic() + timeout
+    while b'\n' not in buffer:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([0], [], [], remaining)[0]: return None
+        data = os.read(0, 65536)
+        if not data: return None
+        buffer += data
+    line, buffer = buffer.split(b'\n', 1)
+    return json.loads(line)
+def emit(value): print(json.dumps(value), flush=True)
+def wait_file(name):
+    deadline = time.monotonic() + 10
+    while not pathlib.Path(name).exists():
+        if time.monotonic() >= deadline: raise RuntimeError(name)
+        time.sleep(.01)
+wire = read_line()
+emit({'type':'control_response','response':{'subtype':'success','request_id':wire['request_id'],'response':{}}})
+user = read_line()
+emit({'type':'assistant','message':{'id':'first','content':[{'type':'text','text':'first turn'}]}})
+emit({'type':'control_request','request_id':'x' * (1024*1024),'request':{'subtype':'unsupported'}})
+time.sleep(.2)
+pathlib.Path('writer-blocked').touch()
+wait_file('finish-a')
+emit({'type':'result','subtype':'success','is_error':False,'user_message_uuid':user['uuid']})
+emit({'type':'assistant','message':{'id':'later','content':[{'type':'text','text':'provider B'}]}})
+wait_file('read-stdin')
+reply = read_line()
+assert reply['type'] == 'control_response'
+interrupt = read_line(1)
+if interrupt and interrupt.get('request',{}).get('subtype') == 'interrupt':
+    pathlib.Path('interrupt-delivered-to-b').touch()
+    emit({'type':'result','subtype':'error_during_execution','is_error':False,'terminal_reason':'aborted_streaming'})
+else:
+    emit({'type':'result','subtype':'success','is_error':False})
+while read_line(5) is not None: pass
+"#,
+    );
+    let mut env = ChildEnv::load();
+    env.claude_bin = Some(binary);
+    env.fixtures = None;
+    env.record = None;
+    let first = TurnId::new();
+    let ends = Runtime::new().unwrap().block_on(async {
+        let (out, mut rx) = mpsc::channel(256);
+        let handle = session::spawn(SessionSpec {
+            thread: ThreadId::new(), cwd: scratch.0.clone(),
+            config: ThreadConfig { model: None, effort: None, mode: PermissionMode::AskFirst },
+            native: None, import: false,
+        }, env, out, 1).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut sent = false;
+            let mut released = false;
+            let mut ends = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if sent && !released && scratch.0.join("writer-blocked").exists() {
+                            if stop {
+                                handle.control.send(SessionControl::Interrupt {
+                                    turn: first, reason: StopReason::User,
+                                }).unwrap();
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            fs::write(scratch.0.join("finish-a"), "").unwrap();
+                            released = true;
+                        }
+                    }
+                    msg = rx.recv() => {
+                        let Some(EngineMsg::Provider { event, .. }) = msg else { break; };
+                        match event {
+                            ProviderEvent::Session(SessionEvent::Ready { .. }) if !sent => {
+                                sent = true;
+                                handle.control.send(SessionControl::StartTurn {
+                                    turn: first, text: "first".into(),
+                                }).unwrap();
+                            }
+                            ProviderEvent::Turn { turn: None, event: TurnEvent::TextDelta { .. } } => {
+                                assert_eq!(ends.len(), 1);
+                                if stop { assert!(matches!(ends[0], TurnOutcome::Interrupted { .. })); }
+                                fs::write(scratch.0.join("read-stdin"), "").unwrap();
+                            }
+                            ProviderEvent::Turn { event: TurnEvent::TurnEnded { outcome, .. }, .. } => {
+                                ends.push(outcome);
+                                if ends.len() == 2 { handle.control.send(SessionControl::Shutdown).unwrap(); }
+                            }
+                            ProviderEvent::Session(SessionEvent::Exited { .. }) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            ends
+        }).await;
+        handle.control.send(SessionControl::Shutdown).ok();
+        result.unwrap()
+    });
+    eprintln!(
+        "stop={stop} ends={ends:?} interrupt_delivered_to_b={}",
+        scratch.0.join("interrupt-delivered-to-b").exists()
+    );
+    assert_eq!(ends.len(), 2);
+    assert_eq!(
+        ends[1],
+        TurnOutcome::Completed,
+        "the old turn's queued wire interrupt stopped Provider B"
+    );
+}
+#[test]
+fn blocked_writer_stop_cannot_reach_later_provider_turn() {
+    blocked_interrupt_probe(true);
+}
+#[test]
+fn blocked_writer_without_stop_leaves_provider_turn_completed() {
+    blocked_interrupt_probe(false);
 }

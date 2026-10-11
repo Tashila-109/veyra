@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     process::Child,
     sync::{mpsc, oneshot},
 };
@@ -147,6 +147,34 @@ impl Drop for ProcessGroup {
         self.end();
     }
 }
+struct WriterLine {
+    line: serde_json::Value,
+    interrupt: Option<TurnId>,
+}
+async fn write_interrupt(
+    stdin: &mut (impl AsyncWrite + Unpin),
+    bytes: &[u8],
+    turn: TurnId,
+    active: &Mutex<Option<TurnId>>,
+) -> std::io::Result<()> {
+    let written = std::future::poll_fn(|cx| {
+        let active = active.lock().unwrap();
+        if *active != Some(turn) {
+            return std::task::Poll::Ready(Ok(None));
+        }
+        std::pin::Pin::new(&mut *stdin)
+            .poll_write(cx, bytes)
+            .map(|result| result.map(Some))
+    })
+    .await?;
+    if let Some(written) = written {
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        stdin.write_all(&bytes[written..]).await?;
+    }
+    Ok(())
+}
 struct Process {
     child: ProcessGroup,
     native: NativeSessionId,
@@ -156,15 +184,21 @@ struct Process {
 impl Process {
     fn send(
         &mut self,
-        writer: &mpsc::UnboundedSender<serde_json::Value>,
+        writer: &mpsc::UnboundedSender<WriterLine>,
         line: serde_json::Value,
+        turn: Option<TurnId>,
     ) -> Result<(), ProviderError> {
         #[cfg(debug_assertions)]
         if let Some(recorder) = &mut self.recorder {
             recorder.line(true, line.clone())?;
         }
+        let interrupt = if line["request"]["subtype"] == "interrupt" {
+            turn
+        } else {
+            None
+        };
         writer
-            .send(line)
+            .send(WriterLine { line, interrupt })
             .map_err(|_| ProviderError::Protocol("Claude stdin writer closed".into()))
     }
     fn record_inbound(&mut self, line: &serde_json::Value) -> Result<(), ProviderError> {
@@ -517,12 +551,14 @@ async fn run_one(
         }
     });
     let mut stdin = process.child.stdin().expect("piped stdin");
-    let (writer, mut input) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (writer, mut input) = mpsc::unbounded_channel::<WriterLine>();
+    let active_turn = Arc::new(Mutex::new(None));
+    let writer_turn = active_turn.clone();
     let writer_closing = control.closing.clone();
     #[cfg(test)]
     let close_before_user_write = control.close_before_user_write.clone();
     let mut write_task = tokio::spawn(async move {
-        while let Some(line) = input.recv().await {
+        while let Some(WriterLine { line, interrupt }) = input.recv().await {
             let mut bytes = serde_json::to_vec(&line)?;
             bytes.push(b'\n');
             #[cfg(test)]
@@ -532,7 +568,11 @@ async fn run_one(
             if line["type"] == "user" && writer_closing.is_closing() {
                 continue;
             }
-            stdin.write_all(&bytes).await?;
+            if let Some(turn) = interrupt {
+                write_interrupt(&mut stdin, &bytes, turn, &writer_turn).await?;
+            } else {
+                stdin.write_all(&bytes).await?;
+            }
             stdin.flush().await?;
         }
         Ok::<_, std::io::Error>(())
@@ -545,7 +585,7 @@ async fn run_one(
         recorder.bind(process.native.0.clone(), "<id:session>".into());
     }
     let mut failure = process
-        .send(&writer, claude::initialize())
+        .send(&writer, claude::initialize(), None)
         .err()
         .map(|error| error.to_string());
     let mut consumer_gone = false;
@@ -567,15 +607,17 @@ async fn run_one(
                     if let Some(recorder) = &mut process.recorder {
                         recorder.bind(turn.to_string(), format!("<id:turn:{turn}>"));
                     }
-                    if let Err(error) = process.send(&writer, line) {
+                    *active_turn.lock().unwrap() = codec.active.map(claude::ActiveTurn::target);
+                    if let Err(error) = process.send(&writer, line, None) {
                         failure = Some(error.to_string());
                         break;
                     }
                 }
                 Some(SessionControl::Shutdown) | None => {
+                    let turn = codec.active.map(claude::ActiveTurn::target);
                     let lines = codec.interrupt_active(StopReason::AppClosing);
                     for line in lines {
-                        if let Err(error) = process.send(&writer, line) {
+                        if let Err(error) = process.send(&writer, line, turn) {
                             failure = Some(error.to_string());
                             break;
                         }
@@ -588,15 +630,16 @@ async fn run_one(
                 }
                 Some(SessionControl::Interrupt { turn, reason }) => {
                     for line in codec.interrupt_lines(turn, reason) {
-                        if let Err(error) = process.send(&writer, line) {
+                        if let Err(error) = process.send(&writer, line, Some(turn)) {
                             failure = Some(error.to_string());
                             break;
                         }
                     }
                 }
                 Some(SessionControl::InterruptActive(reason)) => {
+                    let turn = codec.active.map(claude::ActiveTurn::target);
                     for line in codec.interrupt_active(reason) {
-                        if let Err(error) = process.send(&writer, line) {
+                        if let Err(error) = process.send(&writer, line, turn) {
                             failure = Some(error.to_string());
                             break;
                         }
@@ -604,7 +647,7 @@ async fn run_one(
                 }
                 Some(SessionControl::Answer { native, reply }) => {
                     if let Some(line) = codec.answer(native, reply)
-                        && let Err(error) = process.send(&writer, line)
+                        && let Err(error) = process.send(&writer, line, None)
                     {
                         failure = Some(error.to_string());
                         break;
@@ -655,16 +698,17 @@ async fn run_one(
                     }
                     match codec.value(wire) {
                         Ok(decoded) => {
+                            *active_turn.lock().unwrap() = codec.active.map(claude::ActiveTurn::target);
                             for reply in decoded.replies {
-                                if let Err(error) = process.send(&writer, reply) {
+                                if let Err(error) = process.send(&writer, reply, None) {
                                     failure = Some(error.to_string());
                                     break;
                                 }
                             }
                             if failure.is_some() { break; }
-                            if let Some(generation) = decoded.provider_generation
+                            if let Some(provider_turn) = decoded.provider_turn
                                 && !emit(out, thread, epoch, ProviderEvent::Session(
-                                    SessionEvent::ProviderTurnStarted { generation }
+                                    SessionEvent::ProviderTurnStarted { provider_turn }
                                 )).await
                             { consumer_gone = true; break; }
                             for event in decoded.events {
@@ -963,6 +1007,33 @@ pub async fn probe(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn blocked_interrupt_is_checked_at_its_first_byte() {
+        use tokio::io::AsyncReadExt;
+        for stale in [false, true] {
+            let first = TurnId::new();
+            let active = Mutex::new(Some(first));
+            let (mut stdin, mut reader) = tokio::io::duplex(1);
+            stdin.write_all(b"x").await.unwrap();
+            let mut write = Box::pin(write_interrupt(&mut stdin, b"y", first, &active));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(write.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if stale {
+                *active.lock().unwrap() = Some(TurnId::new());
+            }
+            let mut byte = [0];
+            reader.read_exact(&mut byte).await.unwrap();
+            assert_eq!(&byte, b"x");
+            write.await.unwrap();
+            drop(stdin);
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, if stale { vec![] } else { b"y".to_vec() });
+        }
+    }
     use super::*;
     #[tokio::test(start_paused = true)]
     async fn stderr_wait_error_keeps_drain_deadline() {

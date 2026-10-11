@@ -115,6 +115,13 @@ pub fn now() -> Millis {
         .unwrap_or_default()
         .as_millis() as Millis
 }
+fn clear_drain(live: &mut LiveThread, turn: TurnId) {
+    if let Live::Structured { draining, .. } = &mut live.live
+        && *draining == Some(turn)
+    {
+        *draining = None;
+    }
+}
 impl Actor {
     #[cfg(test)]
     pub(crate) fn streaming_entries(&self) -> (usize, usize) {
@@ -706,32 +713,24 @@ impl Actor {
         let mut c = ChangeSet::default();
         match event {
             ProviderEvent::Session(SessionEvent::StartTurnRefused { turn }) => {
-                if self.live[&thread].pending_start != Some(turn) {
+                if self.live[&thread].pending_turn() != Some(turn) {
                     return None;
                 }
                 self.requeue_start(&mut c, turn);
                 let mut live = self.live[&thread].clone();
-                live.pending_start = None;
-                if let Live::Structured { draining, .. } = &mut live.live
-                    && *draining == Some(turn)
-                {
-                    *draining = None;
-                }
+                live.admission = Some(crate::live::TurnAdmission::Refused);
+                clear_drain(&mut live, turn);
                 c.live.insert(thread, live);
             }
-            ProviderEvent::Session(SessionEvent::ProviderTurnStarted { generation }) => {
+            ProviderEvent::Session(SessionEvent::ProviderTurnStarted { provider_turn }) => {
                 if !matches!(self.live[&thread].live, Live::Structured { .. }) {
                     return None;
                 }
-                if let Some(turn) = self.live[&thread].pending_start {
+                if let Some(turn) = self.live[&thread].pending_turn() {
                     self.requeue_start(&mut c, turn);
                     let mut live = self.live[&thread].clone();
-                    if let Live::Structured { draining, .. } = &mut live.live
-                        && *draining == Some(turn)
-                    {
-                        *draining = None;
-                        c.live.insert(thread, live);
-                    }
+                    clear_drain(&mut live, turn);
+                    c.live.insert(thread, live);
                 }
                 let view = c.view(&self.projection, &self.live, thread).unwrap();
                 if view.running.is_some()
@@ -746,7 +745,7 @@ impl Actor {
                     return Some(c);
                 }
                 let turn = Turn {
-                    id: generation,
+                    id: provider_turn,
                     thread,
                     ordinal: c
                         .turns(&self.projection, thread)
@@ -845,11 +844,18 @@ impl Actor {
                     return None;
                 }
                 if let Some(id) = turn
-                    && self.live[&thread].pending_start == Some(id)
+                    && self.live[&thread].pending_turn() == Some(id)
                 {
                     let mut live = self.live[&thread].clone();
-                    live.pending_start = None;
+                    live.admission = None;
                     c.live.insert(thread, live);
+                    if matches!(self.projection.turns[&id].state, TurnState::Ended { .. }) {
+                        let mut live = c.live(&self.live, thread).clone();
+                        if let Live::Structured { draining, .. } = &mut live.live {
+                            *draining = Some(id);
+                        }
+                        c.live.insert(thread, live);
+                    }
                     if self.projection.turns[&id].state == TurnState::Queued {
                         let mut started = self.projection.turns[&id].clone();
                         started.state = TurnState::Running { since: now() };
@@ -857,7 +863,15 @@ impl Actor {
                         c.turns.insert(id, started);
                     }
                 }
-                let drained = match self.live[&thread].live {
+                if matches!(event, TurnEvent::TurnEnded { .. })
+                    && c.live(&self.live, thread).admission
+                        == Some(crate::live::TurnAdmission::Refused)
+                {
+                    let mut live = c.live(&self.live, thread).clone();
+                    live.admission = None;
+                    c.live.insert(thread, live);
+                }
+                let drained = match c.live(&self.live, thread).live {
                     Live::Structured { draining, .. } => draining,
                     _ => None,
                 };
@@ -871,9 +885,7 @@ impl Actor {
                     && (turn == drained || turn.is_none() && provider_drain)
                 {
                     let mut live = c.live(&self.live, thread).clone();
-                    if let Live::Structured { draining, .. } = &mut live.live {
-                        *draining = None;
-                    }
+                    clear_drain(&mut live, drained.unwrap());
                     c.live.insert(thread, live);
                 } else if turn.is_none() && provider_drain && event.opens_provider_turn() {
                     tracing::info!(%thread, "dropped stopped Provider turn tail");
@@ -887,15 +899,6 @@ impl Actor {
                 let current = match (turn, running) {
                     (Some(id), Some(t)) if id == t.id => t,
                     (None, Some(t)) if t.origin == TurnOrigin::Provider => t,
-                    (None, None) if event.opens_provider_turn() => {
-                        let id =
-                            commands::queue(&self.projection, &mut c, thread, TurnOrigin::Provider);
-                        let mut t = c.turns[&id].clone();
-                        t.state = TurnState::Running { since: now() };
-                        c.turns.insert(id, t.clone());
-                        c.events.push(Ev::TurnStarted(t.clone()));
-                        t
-                    }
                     _ => {
                         tracing::debug!(%thread,"dropped event for non-running turn");
                         commands::start_changed(&self.projection, &self.live, &mut c, now());
@@ -1077,20 +1080,16 @@ impl Actor {
     fn exited(&self, thread: ThreadId, crash: Option<String>) -> ChangeSet {
         let mut c = ChangeSet::default();
         let old = &self.live[&thread];
-        let running = self
+        let active: Vec<_> = self
             .projection
             .turns_for(thread)
-            .find(|t| matches!(t.state, TurnState::Running { .. }))
-            .cloned();
-        if let Some(t) = running {
-            let outcome = match crash.as_ref() {
-                Some(m) => TurnOutcome::Failed { message: m.clone() },
-                None => TurnOutcome::Interrupted {
-                    reason: "The session exited".into(),
-                },
-            };
-            commands::end_turn(&self.projection, &mut c, t.clone(), outcome, now());
-        } else if matches!(old.live, Live::Starting { .. }) {
+            .filter(|t| {
+                matches!(t.state, TurnState::Running { .. })
+                    || old.pending_turn() == Some(t.id) && t.state == TurnState::Queued
+            })
+            .cloned()
+            .collect();
+        if active.is_empty() && matches!(old.live, Live::Starting { .. }) {
             if let Some(t) = self
                 .projection
                 .turns_for(thread)
@@ -1103,12 +1102,22 @@ impl Actor {
                     t.clone(),
                     TurnOutcome::Failed {
                         message: crash
+                            .clone()
                             .unwrap_or_else(|| "The session exited before it was ready".into()),
                     },
                     now(),
                 );
             }
             commands::set_hold(&self.projection, &mut c, thread, Some(HoldReason::Stopped));
+        }
+        for t in active {
+            let outcome = match crash.as_ref() {
+                Some(m) => TurnOutcome::Failed { message: m.clone() },
+                None => TurnOutcome::Interrupted {
+                    reason: "The session exited".into(),
+                },
+            };
+            commands::end_turn(&self.projection, &mut c, t.clone(), outcome, now());
         }
         for req in self
             .projection
@@ -1120,7 +1129,7 @@ impl Actor {
         }
         let mut live = old.clone();
         live.live = Live::Parked;
-        live.pending_start = None;
+        live.admission = None;
         live.background_work = false;
         c.live.insert(thread, live);
 
@@ -1387,6 +1396,7 @@ impl Actor {
                     crate::WindowThread {
                         wait_reason: wait_reason(&view),
                         busy: crate::live::busy(&view),
+                        turn_busy: view.turn_busy(),
                     },
                 );
             }
@@ -1439,8 +1449,9 @@ impl Actor {
                 thread,
                 Some(HoldReason::Restarted),
             );
-            commands::end_running(
+            commands::end_active(
                 &self.projection,
+                &self.live,
                 &mut c,
                 thread,
                 StopReason::AppClosing,

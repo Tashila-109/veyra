@@ -9,7 +9,20 @@ pub struct LiveThread {
     pub live: Live,
     pub background_work: bool,
     pub capabilities: Vec<String>,
-    pub pending_start: Option<TurnId>,
+    pub admission: Option<TurnAdmission>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnAdmission {
+    Pending(TurnId),
+    Refused,
+}
+impl LiveThread {
+    pub fn pending_turn(&self) -> Option<TurnId> {
+        match self.admission {
+            Some(TurnAdmission::Pending(turn)) => Some(turn),
+            Some(TurnAdmission::Refused) | None => None,
+        }
+    }
 }
 #[derive(Clone, Debug, Default)]
 pub enum Live {
@@ -52,16 +65,14 @@ pub fn can_start(view: &ThreadView<'_>) -> bool {
 }
 pub fn park_due(view: &ThreadView<'_>, idle_since: Millis, now: Millis) -> bool {
     matches!(view.live.live, Live::Structured { .. })
-        && view.running.is_none()
+        && !view.turn_busy()
         && !view.pending_request
         && !view.live.background_work
         && now - idle_since >= 10 * 60 * 1000
 }
 
 pub fn busy(view: &ThreadView<'_>) -> bool {
-    view.running.is_some()
-        || view.live.background_work
-        || matches!(view.live.live, Live::Starting { .. })
+    view.turn_busy() || view.live.background_work || matches!(view.live.live, Live::Starting { .. })
 }
 pub fn needs_awake(
     projection: &crate::domain::Projection,

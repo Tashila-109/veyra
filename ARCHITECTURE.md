@@ -105,11 +105,11 @@ The debug listener binds before the window opens.
 
 ## Quit and shutdown
 
-Quit opens a sheet listing running, Starting and background-busy threads, or runs ConfirmQuit immediately when none are busy.
+Quit opens a sheet listing running, pending-admission, Starting and background-busy threads, or runs ConfirmQuit immediately when none are busy.
 CancelQuit dismisses it and restores composer focus until ConfirmQuit begins; afterward Escape and CancelQuit keep the sheet open.
 ConfirmQuit synchronously closes the engine and cancels readiness probes and the branch task, then awaits Engine::shutdown_wait in a gpui task and calls cx.quit.
 The debug ctl quit verb dispatches ConfirmQuit directly.
-`Engine::shutdown_wait` refuses new commands, ends running turns, expires pending requests and asks every session to shut down.
+`Engine::shutdown_wait` refuses new commands, ends running and pending-admission turns, expires pending requests and asks every session to shut down.
 Shutdown persists Restarted holds for running, queued, Starting and background-busy threads in its own transaction, without replacing an earlier hold.
 The engine owns one LaunchGate shared with the actor, every CLI session, ChildEnv and Probes.
 It combines an atomic closing state with a small synchronous lock; no guard crosses an await.
@@ -153,9 +153,9 @@ It receives typed messages through a 256-slot tokio channel.
 A timer sends Tick every five seconds; text uses separate flush and write messages.
 The actor never waits for provider I/O.
 The actor trims stored tool output to its last 10,000 characters.
-The actor publishes window thread wait reasons and busy flags after reconciliation, then updates only threads whose thread, turn, request or live rows changed.
+The actor publishes window thread wait reasons, busy flags and turn-busy flags after reconciliation, then updates only threads whose thread, turn, request or live rows changed.
 Engine::window_threads reads that snapshot.
-The live::busy predicate defines a busy thread, and live::busy_threads supplies the shared walk for shutdown holds and needs_awake.
+ThreadView::turn_busy includes a running row or an unresolved admission; live::busy adds Starting and background work, and live::busy_threads supplies the shared walk for shutdown holds and needs_awake.
 Every actor message is timed, and a message over 50 ms logs its kind and duration.
 `actor_no_blocking_io` scans actor.rs, store.rs and commands.rs for direct filesystem, process-spawn and thread-sleep calls; indirect platform calls such as keep-awake are outside that textual guard.
 
@@ -176,12 +176,14 @@ While the thread is still Starting, an exit before Ready fails the oldest queued
 3. A matched initialize reply or system/init publishes Ready and changes Starting to Structured.
 4. start_changed makes the queued turn Running, records pending admission and dispatches StartTurn with committed prompt text.
 The first prompt waits for Ready.
-The codec admits StartTurn only with no active turn and reports StartTurnRefused when CLI work is already running.
+The codec admits StartTurn only with no active turn, and the session reports StartTurnRefused when CLI work is already running.
 ProviderTurnStarted opens the CLI's own turn under its reported id and restores a pending Veyra turn to Queued with its original ordinal.
-The queue waits with TurnRunning while that Provider turn runs or an admission remains unresolved.
-A refusal clears pending admission; the first correlated turn event confirms an admitted prompt and restores its Running row if CLI work displaced it.
+The queue waits with TurnRunning while that Provider turn runs, an admission remains pending, or a refused start waits for the CLI turn to end.
+Pending admission counts as busy for Stop, Interrupt, Configure, SwitchView, idle parking, keep-awake and Quit.
+Stop and Interrupt target both a running row and a pending start; the session ignores either target unless it accepted that turn.
+A refusal replaces Pending admission with Refused until the next CLI turn end; the first correlated turn event confirms an admitted prompt and restores its Running row if CLI work displaced it.
 The Provider end applies start_changed, which retries eligible queued work once pending admission has resolved.
-The codec also emits Ready on system/init, so an early system/init can open this gate before the initialize reply.
+The codec also emits Ready on system/init, so an early system/init can open the Ready gate before the initialize reply.
 5. The codec normalizes deltas; the actor buffers text and counts actual stream deltas before flushing.
 6. Item and turn completion persist final rows, free streaming buffers and publish the engine-owned status.
 
@@ -196,17 +198,17 @@ Tick retries before draining deferred process events.
 Full and closed command queues are distinct errors; Busy carries a typed WaitReason and a closed request is distinct from either.
 The UI shows command and acknowledgement failures as notices.
 
-`LiveThread` owns an epoch outside its runtime variants, capabilities, the background-work flag and an optional pending StartTurn id.
+`LiveThread` owns an epoch outside its runtime variants, capabilities, the background-work flag and optional TurnAdmission, either Pending with a turn id or Refused.
 Starting stores its session handle before the actor handles any event from that session.
 The engine derives thread status with `domain::thread_status` and publishes `ThreadStatusChanged` after changed thread, turn, request or live rows.
 The window, sidebar, header, dump and ctl wait consume that status, including background work, NeedsYou and InTerminal.
 Spawn increments the epoch; stale session events are ignored.
-Turn events must also match the running turn, unless uncorrelated content starts or joins a Provider-origin turn.
+Turn events must also match the running turn, unless uncorrelated content joins the Provider-origin row opened by ProviderTurnStarted.
 An admitted `TurnEnded { park: true }` first sends Shutdown and enters `Stopping { Park }`, even if its turn already ended.
 Stopping drops that session's later turn events; its Exited still matches the epoch.
 The actor waits for Exited before parking and spawning eligible queued work.
 A late end cannot settle another turn.
-Idle structured sessions park after ten minutes without a running turn, pending request or background work.
+Idle structured sessions park after ten minutes without a busy turn, pending request or background work.
 The engine supports holds, queue reasons, cascaded StopThread/ArchiveThread, Interrupt, Respond, wake delivery and task settlement.
 The composer's Stop button, Ctrl+C and Send with an empty draft during a running turn dispatch the Stop action, which sends the engine's Interrupt command.
 The sidebar's StopThread action sends the engine's StopThread command.
@@ -322,10 +324,14 @@ The codec owns an active turn's interrupt ladder and both deadlines: group SIGTE
 SessionControl::Interrupt carries the turn id targeted by a human Stop and a typed StopReason.
 Storage failure uses InterruptActive with StopReason::StorageBlocked to stop whichever codec turn is active, independently of actor admission.
 Veyra-started turns use their stored turn id; CLI-started Provider turns open under the fresh id reported by ProviderTurnStarted before their first content event.
-The actor captures the running row's id before ending it, without a separate Provider token field.
+The actor drops unannounced Provider content instead of inventing an id the codec cannot match.
+The actor captures the running and pending-admission turn ids before ending their rows.
 Shutdown and startup recovery use StopReason::AppClosing for their shared turn-end reason.
 The codec ignores an interrupt whose target is no longer active, including when a later Provider turn has opened.
 Only a matching targeted interrupt cancels that turn's open requests and arms its ladder; active-turn interruptions resolve the target directly from the codec.
+The stdin queue retains an interrupt's target, and the writer checks the codec's shared active id at each poll until its first byte is written.
+An unsent interrupt for an ended target is discarded; its preceding cancel replies remain ordered before any matching interrupt.
+Once writing begins, the writer finishes that frame before another frame.
 A turn end clears its ladder; an admitted new prompt starts with no active turn or old ladder.
 Human interrupts use "Stopped by you"; storage and shutdown carry their own reasons.
 A session without a turn never arms that ladder.
@@ -335,7 +341,7 @@ Dropping a live group guard immediately kills its owned group and schedules clea
 A group still present after the final cleanup deadline produces a bounded warning with its id.
 The normal session path discards other cleanup errors.
 A supervisor waits for registered cleanup even if the session task panics.
-The actor stores pid and group on Ready and parks on Exited.
+The actor stores pid and group on Ready; Exited ends both running and pending-admission rows before parking.
 After StopThread, Archive or Interrupt it only parks.
 
 `claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, request references, approval and question classification (see Actor decisions) and background-work replacement.
@@ -372,7 +378,7 @@ Before admitting StartTurn, SessionControls reads the gate's closing state and d
 
 The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals, process inspection, idle-sleep assertions and Terminal opening.
 Each agent and probe spawn attempts to set group nice 10 and logs failure while continuing.
-The actor attempts to hold one caffeinate guard while any thread is Starting, has a running turn or has non-ambient background work.
+The actor attempts to hold one caffeinate guard while any thread is Starting, has a busy turn or has non-ambient background work.
 An assertion-helper spawn failure is logged without stopping work.
 The pure needs_awake predicate controls that guard, whose drop stops its owned caffeinate child.
 Platform module selection rejects unsupported targets with compile_error.
@@ -490,6 +496,9 @@ The approval dock (`ui/composer.rs`) renders only the codec's typed ProposedActi
 The full command or file path, consequence and bounded argument preview share a scrollable area bounded by the composer height token, with Allow and Deny below it.
 The dock shows 1 of N for multiple pending requests.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
+Consent buttons carry their displayed request id, and question choices also carry the displayed question index.
+A mouse press retains that dock target across a repaint before release; keyboard handlers bind the focused dock's rendered target.
+Respond rejects an expired or missing request, and a question choice rejects an index that has already advanced, without selecting another request.
 Because a docked request implies a running turn, composer Command+Return with an empty draft dispatches Stop, which interrupts the turn and expires the request.
 Approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
 Requests never take focus automatically, and answering an approval or question keeps dock focus while another request remains.
@@ -500,7 +509,7 @@ The focused approval chords are Command+Return, Command+Option+Return and Comman
 Grant button captions keep whitespace in their visible first line, add an ellipsis at a newline, and truncate to their width.
 Their accessibility labels retain the whole original caption.
 NextNeedsYou scans sidebar order for NeedsYou before Failed, wrapping once and including child rows.
-The composer shows Stop while a turn runs and its draft is empty, plus held reasons and Continue.
+The composer shows Stop while a turn runs or awaits admission and its draft is empty, plus held reasons and Continue.
 Discard queued appears only when a held thread has queued turns.
 The quit sheet overlays the existing window content.
 The Theme global owns all colours, geometry, type, radii and motion tokens.
@@ -578,7 +587,7 @@ replay_claude uses the real session task with the fake CLI for text and tools, p
 It covers approvals, questions, unknown requests, Stop with a pending approval and late interrupts.
 It also checks assistant-error parking, interrupt outcomes and ladder cancellation, subagent isolation against the live Agent recording, notices and malformed-byte recovery.
 The late-Stop actor/codec and real-session tests complete a user turn, open a later Provider turn, then check that the old Stop leaves the later turn Completed, alongside a control without Stop.
-provider_interrupt_targets_generation_and_preserves_cancel_order checks stale Provider tokens and cancel replies before a matching interrupt.
+provider_interrupt_targets_provider_turn_and_preserves_cancel_order checks a stale Provider turn id and cancel replies before a matching interrupt.
 The queued-prompt actor/codec and real-session tests preserve A Completed, Provider B Completed, then C Completed with C's own reply.
 A second actor/codec ordering ends B before the pending admission and checks that C's prompt is not dispatched twice.
 A Stop before refusal preserves the stopped prompt's end and allows the later Provider turn and queue to settle.
@@ -612,6 +621,9 @@ The versioned-binary test proves that a marked orphan started by its parent harn
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
 Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
 Application tests enable gpui test-support to exercise Shell selection, its event pump, typed dock text and focus, chords and empty-Send Stop through the keymap in a synthetic window.
+Dock regressions reject an old Allow once render, stale approval ids and an already-answered question index, with current-request controls.
+A blocked real-session writer completes Provider B after dropping A's queued interrupt; a duplex-writer test checks the target again after a pending first-byte write.
+Admission tests cover Stop, Interrupt, Configure, SwitchView, Quit, keep-awake, idle parking and refusal waiting for a CLI end.
 A composer unit test checks the preview cut notice; a synthetic window checks that long approval text scrolls within a bounded area while decision buttons stay on-screen.
 The approvals-questions screenshots show the real-window scroll area.
 Codec and storage tests cover all tool arguments, symlinks with missing parents, unverified targets, truncated Unicode previews, legacy approval rows and undecodable control failures.

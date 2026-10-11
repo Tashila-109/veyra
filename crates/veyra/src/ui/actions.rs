@@ -1,6 +1,6 @@
 use gpui_kit::*;
 use veyra_engine::{
-    domain::{ItemId, PermissionMode, ProjectId, ThreadId},
+    domain::{ItemId, PermissionMode, ProjectId, RequestId, ThreadId},
     provider::ProviderKind,
 };
 
@@ -17,9 +17,6 @@ actions!(
         Continue,
         DiscardQueued,
         NextNeedsYou,
-        AllowOnce,
-        AllowInThread,
-        Deny,
         FocusDock,
         FocusComposer,
         ScrollTranscriptUp,
@@ -66,7 +63,22 @@ choice_action!(PickPermission, mode, PermissionMode);
 choice_action!(SetDefaultMode, mode, PermissionMode);
 choice_action!(SelectThread, thread, ThreadId);
 choice_action!(StopThread, thread, ThreadId);
-choice_action!(AnswerQuestion, option, usize);
+choice_action!(AllowOnce, request, RequestId);
+choice_action!(AllowInThread, request, RequestId);
+choice_action!(Deny, request, RequestId);
+
+#[derive(
+    Clone, Default, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action,
+)]
+#[serde(default)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct AnswerQuestion {
+    #[schemars(with = "Option<String>")]
+    pub request: Option<RequestId>,
+    pub question: Option<usize>,
+    pub option: Option<usize>,
+}
 choice_action!(SelectProject, project, ProjectId);
 choice_action!(ToggleItem, item, ItemId);
 #[cfg(debug_assertions)]
@@ -109,6 +121,7 @@ macro_rules! binding {
             build: || {
                 Box::new($action {
                     $field: Some($value),
+                    ..Default::default()
                 })
             },
         }

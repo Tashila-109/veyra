@@ -272,6 +272,9 @@ fn stale_epoch_dropped() {
 #[test]
 fn provider_turn_join() {
     let mut f = Fixture::new(LiveState::Idle);
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        provider_turn: TurnId::new(),
+    }));
     f.event(turn_event(None, TurnEvent::Started));
     let turn = f.running().unwrap();
     f.event(turn_event(
@@ -514,6 +517,9 @@ fn completed_turn_status_reports_five_milliseconds() {
 #[test]
 fn provider_stop_tail_opens_no_turn() {
     let mut f = Fixture::new(LiveState::Idle);
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        provider_turn: TurnId::new(),
+    }));
     f.event(turn_event(None, TurnEvent::Started));
     let first = f.running().unwrap();
     f.event(turn_event(
@@ -1258,8 +1264,8 @@ fn late_stop_of_completed_user_prompt_leaves_provider_turn_unstopped() {
     for event in old_end
         .events
         .into_iter()
-        .chain(later.provider_generation.map(|generation| {
-            ProviderEvent::Session(SessionEvent::ProviderTurnStarted { generation })
+        .chain(later.provider_turn.map(|provider_turn| {
+            ProviderEvent::Session(SessionEvent::ProviderTurnStarted { provider_turn })
         }))
         .chain(later.events)
     {
@@ -1289,7 +1295,7 @@ fn late_stop_of_completed_user_prompt_leaves_provider_turn_unstopped() {
 }
 
 #[test]
-fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
+fn provider_interrupt_targets_provider_turn_and_preserves_cancel_order() {
     use crate::provider::claude::Codec;
     use serde_json::json;
     let mut f = Fixture::new(LiveState::Idle);
@@ -1303,13 +1309,13 @@ fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
         "content":[{"type":"text", "text":"first"}]}}))
         .unwrap();
     f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
-        generation: first.provider_generation.unwrap(),
+        provider_turn: first.provider_turn.unwrap(),
     }));
     for event in first.events {
         f.event(event);
     }
     let first = f.running().unwrap();
-    let first_generation = first;
+    let first_provider_turn = first;
     let old_end = codec
         .value(json!({"type":"result", "subtype":"success", "is_error":false}))
         .unwrap();
@@ -1318,7 +1324,7 @@ fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
         "content":[{"type":"text", "text":"next"}]}}))
         .unwrap();
     let mut events = vec![ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
-        generation: later.provider_generation.unwrap(),
+        provider_turn: later.provider_turn.unwrap(),
     })];
     events.extend(later.events);
     for id in ["approval-b", "approval-a"] {
@@ -1330,7 +1336,7 @@ fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
     let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
         panic!()
     };
-    assert_eq!(turn, first_generation);
+    assert_eq!(turn, first_provider_turn);
     assert!(codec.interrupt_lines(turn, reason).is_empty());
     assert!(codec.interrupt_deadline().is_none());
     for event in old_end.events.into_iter().chain(events) {
@@ -1338,7 +1344,7 @@ fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
     }
     let next = f.running().unwrap();
     assert_ne!(first, next);
-    assert_ne!(first_generation, next);
+    assert_ne!(first_provider_turn, next);
     assert_eq!(
         f.loaded()
             .requests
@@ -1406,7 +1412,7 @@ fn queued_prompt_waits_for_provider_followup(defer_admission: bool) {
         {"type":"text", "text":"provider followup before queued prompt"}]}}),
         )
         .unwrap();
-    let provider = followup.provider_generation.unwrap();
+    let provider = followup.provider_turn.unwrap();
     for event in old_end.events {
         f.event(event);
     }
@@ -1416,7 +1422,7 @@ fn queued_prompt_waits_for_provider_followup(defer_admission: bool) {
     };
     assert_eq!(turn, next);
     f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
-        generation: provider,
+        provider_turn: provider,
     }));
     for event in followup.events {
         f.event(event);
@@ -1534,7 +1540,7 @@ fn refused_stopped_prompt_does_not_strand_provider_turn() {
         {"type":"text", "text":"CLI work"}]}}),
         )
         .unwrap();
-    let generation = provider.provider_generation.unwrap();
+    let provider_turn = provider.provider_turn.unwrap();
     f.command(Command::Interrupt { thread: f.thread }).unwrap();
     let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
         panic!()
@@ -1542,12 +1548,12 @@ fn refused_stopped_prompt_does_not_strand_provider_turn() {
     assert_eq!(turn, stopped);
     assert!(codec.interrupt_lines(turn, reason).is_empty());
     f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
-        generation,
+        provider_turn,
     }));
     for event in provider.events {
         f.event(event);
     }
-    assert_eq!(f.running(), Some(generation));
+    assert_eq!(f.running(), Some(provider_turn));
     assert!(codec.start(stopped, "pending".into()).is_none());
     f.event(ProviderEvent::Session(SessionEvent::StartTurnRefused {
         turn: stopped,
@@ -1581,4 +1587,316 @@ fn refused_stopped_prompt_does_not_strand_provider_turn() {
             ..
         }
     ));
+}
+
+fn admitted_while_queued() -> (Fixture, crate::provider::claude::Codec, TurnId) {
+    let mut f = Fixture::new(LiveState::Idle);
+    let Ok(Ack::Turn(first)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "first".into(),
+    }) else {
+        panic!()
+    };
+    f.controls.try_recv().unwrap();
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut codec = Codec::new(
+        NativeSessionId("owned-probe".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    assert!(codec.start(first, "first".into()).is_some());
+    let Ok(Ack::Turn(next)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "queued".into(),
+    }) else {
+        panic!()
+    };
+    let old_end = codec.value(json!({
+        "type":"result", "subtype":"success", "is_error":false, "user_message_uuid":first.to_string()
+    })).unwrap();
+    let followup = codec.value(json!({
+        "type":"assistant", "message":{"id":"pf", "content":[{"type":"text", "text":"provider"}]}
+    })).unwrap();
+    let provider = followup.provider_turn.unwrap();
+    for e in old_end.events {
+        f.event(e);
+    }
+    let SessionControl::StartTurn { turn, text } = f.controls.try_recv().unwrap() else {
+        panic!()
+    };
+    assert_eq!(turn, next);
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        provider_turn: provider,
+    }));
+    for e in followup.events {
+        f.event(e);
+    }
+    let followup_end = codec
+        .value(json!({"type":"result","subtype":"success","is_error":false}))
+        .unwrap();
+    assert!(codec.start(next, text).is_some());
+    for e in followup_end.events {
+        f.event(e);
+    }
+    assert!(f.running().is_none());
+    assert_eq!(f.loaded().turns[&next].state, TurnState::Queued);
+    (f, codec, next)
+}
+
+fn apply_admission_controls(
+    f: &mut Fixture,
+    codec: &mut crate::provider::claude::Codec,
+) -> Vec<serde_json::Value> {
+    let mut lines = vec![];
+    while let Ok(control) = f.controls.try_recv() {
+        eprintln!("control={control:?}");
+        match control {
+            SessionControl::Interrupt { turn, reason } => {
+                lines.extend(codec.interrupt_lines(turn, reason))
+            }
+            SessionControl::InterruptActive(reason) => lines.extend(codec.interrupt_active(reason)),
+            _ => {}
+        }
+    }
+    lines
+}
+
+#[test]
+fn stop_reaches_admitted_requeued_prompt() {
+    let (mut f, mut codec, next) = admitted_while_queued();
+    f.command(Command::StopThread { thread: f.thread }).unwrap();
+    let lines = apply_admission_controls(&mut f, &mut codec);
+    eprintln!("next_state={:?}", f.loaded().turns[&next].state);
+    eprintln!("codec_lines={lines:?}");
+    assert_eq!(
+        lines,
+        vec![serde_json::json!({
+            "type":"control_request", "request_id":"veyra-interrupt", "request":{"subtype":"interrupt"}
+        })]
+    );
+    assert!(matches!(&f.loaded().turns[&next].state, TurnState::Ended {
+        outcome: TurnOutcome::Interrupted { reason }, ..
+    } if reason == "Stopped by you"));
+}
+
+#[test]
+fn interrupt_keeps_admitted_requeued_prompt_held() {
+    let (mut f, mut codec, next) = admitted_while_queued();
+    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    let lines = apply_admission_controls(&mut f, &mut codec);
+    eprintln!("codec_lines={lines:?}");
+    for e in codec.value(serde_json::json!({
+        "type":"assistant", "message":{"id":"qr", "content":[{"type":"text", "text":"queued reply"}]}
+    })).unwrap().events {
+        f.event(e);
+    }
+    eprintln!(
+        "hold={:?} next_state={:?}",
+        f.loaded().threads[&f.thread].hold,
+        f.loaded().turns[&next].state
+    );
+    assert!(
+        !lines.is_empty()
+            && matches!(
+                f.loaded().turns[&next].state,
+                TurnState::Ended {
+                    outcome: TurnOutcome::Interrupted { .. },
+                    ..
+                }
+            ),
+        "Interrupt sent nothing, then C started running under an Interrupted hold"
+    );
+}
+
+#[test]
+fn refusal_waits_for_active_turn_end() {
+    let (mut f, mut codec, _next) = admitted_while_queued();
+    f.command(Command::StopThread { thread: f.thread }).unwrap();
+    apply_admission_controls(&mut f, &mut codec);
+    let Ok(Ack::Turn(d)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "after stop".into(),
+    }) else {
+        panic!()
+    };
+    assert!(f.controls.try_recv().is_err());
+    for e in codec.value(serde_json::json!({
+        "type":"assistant", "message":{"id":"qr", "content":[{"type":"text", "text":"discarded prompt runs"}]}
+    })).unwrap().events {
+        f.event(e);
+    }
+    assert!(!f.loaded().items_for(f.thread).any(|item| {
+        matches!(&item.body, ItemBody::AssistantText { text, .. } if text == "discarded prompt runs")
+    }));
+    let mut starts = 0;
+    for _ in 0..5 {
+        let Ok(SessionControl::StartTurn { turn, text }) = f.controls.try_recv() else {
+            break;
+        };
+        assert_eq!(turn, d);
+        starts += 1;
+        assert!(codec.start(turn, text).is_none());
+        f.event(ProviderEvent::Session(SessionEvent::StartTurnRefused {
+            turn,
+        }));
+    }
+    eprintln!("start_turn_dispatches={starts}");
+    assert!(
+        starts <= 1,
+        "refusal immediately re-dispatched StartTurn {starts} times"
+    );
+}
+
+#[test]
+fn pending_admission_blocks_configuration_and_view_switch() {
+    let (mut f, _, _) = admitted_while_queued();
+    for command in [
+        Command::Configure {
+            thread: f.thread,
+            config: config(),
+        },
+        Command::SwitchView {
+            thread: f.thread,
+            to: View::Terminal,
+        },
+    ] {
+        assert!(matches!(
+            f.command(command),
+            Err(CommandError::Busy(WaitReason::TurnRunning))
+        ));
+        assert!(f.controls.try_recv().is_err());
+    }
+}
+
+#[test]
+fn pending_admission_is_busy_for_quit_awake_and_idle_parking() {
+    let (mut f, _, next) = admitted_while_queued();
+    let changes = ChangeSet::default();
+    let view = changes
+        .view(&f.actor.projection, &f.actor.live, f.thread)
+        .unwrap();
+    assert!(crate::live::busy(&view));
+    assert!(!crate::live::park_due(&view, 0, 10 * 60 * 1000));
+    assert!(crate::live::needs_awake(&f.actor.projection, &f.actor.live));
+    assert!(f.actor.state.window_threads.lock().unwrap()[&f.thread].busy);
+    assert!(f.actor.state.window_threads.lock().unwrap()[&f.thread].turn_busy);
+    let _entered = f.runtime.enter();
+    f.actor.handle(EngineMsg::Shutdown);
+    let rows = f.loaded();
+    assert_eq!(rows.threads[&f.thread].hold, Some(HoldReason::Restarted));
+    assert!(matches!(
+        rows.turns[&next].state,
+        TurnState::Ended {
+            outcome: TurnOutcome::Interrupted { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn refused_prompt_waits_for_cli_end() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let Ok(Ack::Turn(first)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "first".into(),
+    }) else {
+        panic!()
+    };
+    assert!(
+        matches!(f.controls.try_recv().unwrap(), SessionControl::StartTurn { turn, .. } if turn == first)
+    );
+    f.event(ProviderEvent::Session(SessionEvent::StartTurnRefused {
+        turn: first,
+    }));
+    assert_eq!(f.loaded().turns[&first].state, TurnState::Queued);
+    assert!(
+        f.controls.try_recv().is_err(),
+        "refusal immediately resent the prompt"
+    );
+    f.command(Command::Send {
+        thread: f.thread,
+        text: "second".into(),
+    })
+    .unwrap();
+    let _entered = f.runtime.enter();
+    f.actor.handle(EngineMsg::Tick);
+    assert!(
+        f.controls.try_recv().is_err(),
+        "send or tick retried before the CLI ended"
+    );
+    f.event(turn_event(
+        None,
+        TurnEvent::TurnEnded {
+            park: false,
+            outcome: TurnOutcome::Completed,
+        },
+    ));
+    assert!(matches!(f.controls.try_recv().unwrap(),
+            SessionControl::StartTurn { turn, text } if turn == first && text == "first"));
+}
+
+#[test]
+fn unannounced_provider_content_opens_no_turn() {
+    let mut f = Fixture::new(LiveState::Idle);
+    f.event(turn_event(
+        None,
+        TurnEvent::TextDelta {
+            key: NativeItemKey("unannounced".into()),
+            text: "dropped".into(),
+            streamed: true,
+        },
+    ));
+    assert!(f.loaded().turns.is_empty());
+    let provider_turn = TurnId::new();
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        provider_turn,
+    }));
+    f.event(turn_event(
+        None,
+        TurnEvent::TextDelta {
+            key: NativeItemKey("announced".into()),
+            text: "kept".into(),
+            streamed: true,
+        },
+    ));
+    f.event(turn_event(
+        None,
+        TurnEvent::TurnEnded {
+            park: false,
+            outcome: TurnOutcome::Completed,
+        },
+    ));
+    let rows = f.loaded();
+    assert_eq!(rows.turns.len(), 1);
+    assert!(
+        rows.items_for(f.thread)
+            .any(|item| item.turn == provider_turn
+                && matches!(&item.body, ItemBody::AssistantText { text, .. } if text == "kept"))
+    );
+}
+
+#[test]
+fn session_exit_ends_running_and_pending_admission_rows() {
+    let (mut f, _, pending) = admitted_while_queued();
+    let mut changes = ChangeSet::default();
+    let mut provider = f
+        .loaded()
+        .turns_for(f.thread)
+        .find(|turn| turn.origin == TurnOrigin::Provider)
+        .unwrap()
+        .clone();
+    provider.state = TurnState::Running { since: now() };
+    let provider_id = provider.id;
+    changes.turns.insert(provider.id, provider);
+    f.save(changes);
+    f.event(ProviderEvent::Session(SessionEvent::Exited {
+        crash: Some("owned session failed".into()),
+    }));
+    let rows = f.loaded();
+    for id in [provider_id, pending] {
+        assert!(matches!(&rows.turns[&id].state,
+            TurnState::Ended { outcome: TurnOutcome::Failed { message }, .. } if message == "owned session failed"));
+    }
+    assert!(f.controls.try_recv().is_err());
 }

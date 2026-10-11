@@ -411,11 +411,14 @@ where
     values.get(index.map(|index| (index + 1) % values.len()).unwrap_or(0))
 }
 pub struct Shell {
+    #[cfg(test)]
+    sent_responses: std::rc::Rc<std::cell::RefCell<Vec<(RequestId, Decision)>>>,
     #[cfg(debug_assertions)]
     repaints: u64,
     focus: FocusHandle,
     dock_focus: FocusHandle,
     dock_focused: bool,
+    dock_press: Option<(RequestId, usize)>,
     quit_focus: FocusHandle,
     quit_sheet: bool,
     window_active: bool,
@@ -581,11 +584,14 @@ impl Shell {
             focus,
             dock_focus: cx.focus_handle(),
             dock_focused: false,
+            dock_press: None,
             quit_focus: cx.focus_handle(),
             quit_sheet: false,
             window_active: window.is_window_active(),
             notifications_posted: 0,
             question_draft: None,
+            #[cfg(test)]
+            sent_responses: Default::default(),
             sidebar_width: cx.global::<Theme>().layout.sidebar_default,
             resizing: false,
             notice: None,
@@ -664,6 +670,12 @@ impl Shell {
         cx.notify();
     }
     fn send_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if let Command::Respond { request, decision } = &command {
+            self.sent_responses
+                .borrow_mut()
+                .push((*request, decision.clone()));
+        }
         let reply = self.engine.send(command);
         cx.spawn_in(window, async move |this, cx| {
             let result = reply.await;
@@ -914,10 +926,13 @@ impl Shell {
         self.send_command(command, window, cx);
     }
     fn running(&self, thread: ThreadId) -> bool {
-        self.state
-            .turns
-            .values()
-            .any(|turn| turn.thread == thread && matches!(turn.state, TurnState::Running { .. }))
+        self.engine
+            .window_threads()
+            .get(&thread)
+            .is_some_and(|state| state.turn_busy)
+            || self.state.turns.values().any(|turn| {
+                turn.thread == thread && matches!(turn.state, TurnState::Running { .. })
+            })
     }
     fn busy_threads(&self) -> Vec<String> {
         self.engine
@@ -949,41 +964,60 @@ impl Shell {
             );
         }
     }
-    fn respond(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
-        let request = self.view.chat().and_then(|thread| {
-            self.state
-                .pending_requests(thread)
-                .first()
-                .map(|row| row.id)
-        });
-        if let Some(request) = request {
-            self.send_command(Command::Respond { request, decision }, window, cx);
-            if self.view.chat().is_some_and(|thread| {
-                self.state
-                    .pending_requests(thread)
-                    .iter()
-                    .all(|row| row.id == request)
-            }) {
-                self.input.update(cx, |input, cx| input.focus(window, cx));
-            }
+    fn dock_click(
+        &mut self,
+        event: &ClickEvent,
+        request: RequestId,
+        question: usize,
+    ) -> (RequestId, usize) {
+        if matches!(event, ClickEvent::Mouse(_)) {
+            self.dock_press.take().unwrap_or((request, question))
+        } else {
+            (request, question)
         }
     }
-    fn answer_question(&mut self, option: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.view.chat() else {
+    fn pending_request(&self, request: Option<RequestId>) -> Option<&Request> {
+        let thread = self.view.chat()?;
+        self.state.requests.iter().find(|row| {
+            Some(row.id) == request && row.thread == thread && row.state == RequestState::Pending
+        })
+    }
+    fn respond(
+        &mut self,
+        request: Option<RequestId>,
+        decision: Decision,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = self.pending_request(request).map(|row| row.id) else {
+            self.notice("This request is no longer pending", cx);
             return;
         };
-        let request = self
-            .state
-            .pending_requests(thread)
-            .first()
-            .copied()
-            .cloned();
+        self.send_command(Command::Respond { request, decision }, window, cx);
+        if self.view.chat().is_some_and(|thread| {
+            self.state
+                .pending_requests(thread)
+                .iter()
+                .all(|row| row.id == request)
+        }) {
+            self.input.update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+    fn answer_question(
+        &mut self,
+        request: Option<RequestId>,
+        question: Option<usize>,
+        option: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(Request {
             id,
             kind: RequestKind::Question { questions },
             ..
-        }) = request
+        }) = self.pending_request(request).cloned()
         else {
+            self.notice("This request is no longer pending", cx);
             return;
         };
         let index = self
@@ -991,6 +1025,10 @@ impl Shell {
             .as_ref()
             .filter(|(request, _)| *request == id)
             .map_or(0, |(_, answers)| answers.len());
+        if question != Some(index) {
+            self.notice("This question is no longer current", cx);
+            return;
+        }
         let Some(text) = questions
             .get(index)
             .and_then(|question| question.options.get(option))
@@ -998,11 +1036,10 @@ impl Shell {
         else {
             return;
         };
-        self.question_draft.get_or_insert_with(|| (id, vec![]));
         if self
             .question_draft
             .as_ref()
-            .is_some_and(|(request, _)| *request != id)
+            .is_none_or(|(request, _)| *request != id)
         {
             self.question_draft = Some((id, vec![]));
         }
@@ -1010,7 +1047,7 @@ impl Shell {
         answers.push(Answer { text });
         if answers.len() == questions.len() {
             let (_, answers) = self.question_draft.take().unwrap();
-            self.respond(Decision::Answers(answers), window, cx);
+            self.respond(Some(id), Decision::Answers(answers), window, cx);
         }
         cx.notify();
     }
@@ -1392,6 +1429,18 @@ impl Render for Shell {
             self.repaints += 1;
         }
         let theme = cx.global::<Theme>().clone();
+        let dock_request = self.view.chat().and_then(|thread| {
+            self.state
+                .pending_requests(thread)
+                .first()
+                .map(|request| request.id)
+        });
+        let dock_question = dock_request.map(|request| {
+            self.question_draft
+                .as_ref()
+                .filter(|(id, _)| *id == request)
+                .map_or(0, |(_, answers)| answers.len())
+        });
         let root = div()
             .h_flex()
             .size_full()
@@ -1429,20 +1478,43 @@ impl Render for Shell {
                     shell.select_thread(thread, window, cx);
                 }
             }))
-            .on_action(cx.listener(|shell, _: &AllowOnce, window, cx| {
-                shell.respond(Decision::AllowOnce, window, cx)
-            }))
-            .on_action(cx.listener(|shell, _: &AllowInThread, window, cx| {
-                shell.respond(Decision::AllowInThread, window, cx)
+            .on_action(cx.listener(move |shell, action: &AllowOnce, window, cx| {
+                shell.respond(
+                    action.request.or(dock_request),
+                    Decision::AllowOnce,
+                    window,
+                    cx,
+                )
             }))
             .on_action(
-                cx.listener(|shell, _: &Deny, window, cx| {
-                    shell.respond(Decision::Deny, window, cx)
+                cx.listener(move |shell, action: &AllowInThread, window, cx| {
+                    shell.respond(
+                        action.request.or(dock_request),
+                        Decision::AllowInThread,
+                        window,
+                        cx,
+                    )
                 }),
             )
-            .on_action(cx.listener(|shell, action: &AnswerQuestion, window, cx| {
-                shell.answer_question(action.option.unwrap_or(0), window, cx);
+            .on_action(cx.listener(move |shell, action: &Deny, window, cx| {
+                shell.respond(action.request.or(dock_request), Decision::Deny, window, cx)
             }))
+            .on_action(
+                cx.listener(move |shell, action: &AnswerQuestion, window, cx| {
+                    let (request, question) = if action.request.is_some() {
+                        (action.request, action.question)
+                    } else {
+                        (dock_request, dock_question)
+                    };
+                    shell.answer_question(
+                        request,
+                        question,
+                        action.option.unwrap_or(0),
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .on_action(cx.listener(|shell, _: &FocusDock, window, cx| {
                 if shell
                     .view
@@ -3003,5 +3075,193 @@ mod tests {
             launched.is_empty(),
             "a provider launched after quit began: {launched}"
         );
+    }
+    #[gpui::test]
+    fn old_rendered_allow_button_does_not_approve_new_request(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let responses = shell.read_with(cx, |shell, _| shell.sent_responses.clone());
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        tool: "Bash".into(),
+                        target: ApprovalTarget::Command {
+                            command: "touch request-a".into(),
+                            preview: ApprovalPreview::new(String::new()),
+                        },
+                    },
+                    grant_key: None,
+                };
+                cx.notify();
+            });
+            draw(cx);
+            let visible = shell.read_with(cx, |shell, _| shell.state.requests[0].id);
+            let button = cx.debug_bounds("approval-allow-button").unwrap().center();
+            cx.simulate_click(button, gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(
+                responses.borrow().as_slice(),
+                &[(visible, Decision::AllowOnce)]
+            );
+            eprintln!("unchanged-render control selected the displayed request");
+            draw(cx);
+            let button = cx.debug_bounds("approval-allow-button").unwrap().center();
+            let next = RequestId::new();
+            shell.update(cx, |shell, _| {
+                let old_turn = shell.state.requests[0].turn;
+                shell.state.requests[0].state = RequestState::Expired {
+                    reason: "The turn ended".into(),
+                };
+                shell.state.turns.get_mut(&old_turn).unwrap().state = TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(0),
+                    at: 1,
+                };
+                let mut turn = shell.state.turns[&old_turn].clone();
+                turn.id = TurnId::new();
+                turn.ordinal += 1;
+                turn.state = TurnState::Running { since: 1 };
+                let mut request = shell.state.requests[0].clone();
+                request.id = next;
+                request.turn = turn.id;
+                request.native = NativeRequestRef("request-b".into());
+                request.state = RequestState::Pending;
+                request.kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        tool: "Bash".into(),
+                        target: ApprovalTarget::Command {
+                            command: "touch request-b".into(),
+                            preview: ApprovalPreview::new(String::new()),
+                        },
+                    },
+                    grant_key: None,
+                };
+                shell.state.turns.insert(turn.id, turn);
+                shell.state.requests.push(request);
+            });
+            responses.borrow_mut().clear();
+            cx.simulate_click(button, gpui::Modifiers::none());
+            cx.run_until_parked();
+            let responses = responses.borrow().clone();
+            eprintln!("visible={visible} next={next} selected={responses:?}");
+            assert!(
+                !responses.iter().any(|(request, _)| *request == next),
+                "clicking A's rendered Allow once button approved B from a later turn"
+            );
+        });
+    }
+    #[gpui::test]
+    fn approval_decisions_reject_stale_request_ids(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let responses = shell.read_with(cx, |shell, _| shell.sent_responses.clone());
+            let (expired, pending) = shell.update(cx, |shell, cx| {
+                for request in &mut shell.state.requests {
+                    request.kind = RequestKind::Approval {
+                        action: ProposedAction {
+                            tool: "Bash".into(),
+                            target: ApprovalTarget::Command {
+                                command: "echo exact".into(),
+                                preview: ApprovalPreview::new(String::new()),
+                            },
+                        },
+                        grant_key: Some(GrantKey {
+                            tool: "Bash".into(),
+                            command: "echo exact".into(),
+                        }),
+                    };
+                }
+                shell.state.requests[0].state = RequestState::Expired {
+                    reason: "The turn ended".into(),
+                };
+                cx.notify();
+                (shell.state.requests[0].id, shell.state.requests[1].id)
+            });
+            draw(cx);
+            for request in [expired, pending] {
+                cx.dispatch_action(super::AllowOnce {
+                    request: Some(request),
+                });
+                cx.run_until_parked();
+                cx.dispatch_action(super::Deny {
+                    request: Some(request),
+                });
+                cx.run_until_parked();
+                cx.dispatch_action(super::AllowInThread {
+                    request: Some(request),
+                });
+                cx.run_until_parked();
+            }
+            assert_eq!(
+                responses.borrow().as_slice(),
+                &[
+                    (pending, Decision::AllowOnce),
+                    (pending, Decision::Deny),
+                    (pending, Decision::AllowInThread),
+                ]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn question_choice_keeps_request_and_question_identity(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let responses = shell.read_with(cx, |shell, _| shell.sent_responses.clone());
+            let request = shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Question {
+                    questions: vec![
+                        Question {
+                            text: "Route".into(),
+                            options: vec!["Short".into()],
+                        },
+                        Question {
+                            text: "Next".into(),
+                            options: vec!["Continue".into()],
+                        },
+                    ],
+                };
+                cx.notify();
+                shell.state.requests[0].id
+            });
+            draw(cx);
+            for (id, question) in [(request, 0), (request, 0), (RequestId::new(), 1)] {
+                cx.dispatch_action(super::AnswerQuestion {
+                    request: Some(id),
+                    question: Some(question),
+                    option: Some(0),
+                });
+                cx.run_until_parked();
+            }
+            assert!(responses.borrow().is_empty());
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.question_draft.clone()),
+                Some((
+                    request,
+                    vec![Answer {
+                        text: "Short".into()
+                    }]
+                ))
+            );
+            cx.dispatch_action(super::AnswerQuestion {
+                request: Some(request),
+                question: Some(1),
+                option: Some(0),
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                responses.borrow().as_slice(),
+                &[(
+                    request,
+                    Decision::Answers(vec![
+                        Answer {
+                            text: "Short".into()
+                        },
+                        Answer {
+                            text: "Continue".into()
+                        },
+                    ])
+                )]
+            );
+        });
     }
 }
