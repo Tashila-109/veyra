@@ -116,11 +116,8 @@ It combines an atomic closing state with a small synchronous lock; no guard cros
 Engine::shutdown sets closing while holding the gate before enqueueing Shutdown, asynchronously sending that message if the mailbox is full.
 Dropping the last Engine handle and Actor::shutdown also set closing under the gate.
 The Shell reads Engine::is_closing rather than keeping its own flag, and begin_quitting closes the engine and cancels probes and branch work for both quit paths.
-Actor::handle_inner reads the atomic closing state at admission without locking the gate, entering shutdown instead when closing wins.
-A command past that read commits as pre-quit work even if quit closes the engine before decide, write or install finishes.
 The actor never holds the launch gate across decisions, SQLite writes, installation or effect dispatch, so a synchronous Spawner::spawn or Spawner::terminal can enter the launch boundary without re-entering a held lock.
-Quit waits at most for one launch critical section, never for the actor or SQLite.
-Actor::exited reads it directly before session and terminal restarts or queued-turn starts; effect dispatch also refuses starts while closing.
+Quit can wait for multiple contending launch critical sections at the gate, never for the actor or SQLite.
 Queued turns remain Queued and held, retiring sessions become Parked without a replacement, and Starting threads without a session handle park during shutdown rather than waiting for an impossible exit.
 If the shutdown write fails, a Starting thread that still owns a session can instead fail its oldest queued turn when that session exits.
 A posted spawn error for a sessionless Starting thread meets its Parked runtime state and keeps the queued turn held.
@@ -141,13 +138,13 @@ macOS termination does not promise Rust destructors, so verification explicitly 
 - Actor admission: the atomic closing read at the start of a message is its commitment point.
 A command or provider event past a read of open commits as pre-quit work; a read of closing refuses new work and keeps earlier queues.
 Shutdown ends and holds an admitted turn for recovery, while the prompt writer refuses a prompt whose own closing check has not passed.
-- Storage retry: Tick reads closing without taking the gate before writing and installing retained changes.
-A retry past that read commits as pre-quit work, and each deferred message then re-enters admission.
-Effects from either path run with no launch gate held and refuse starts while closing.
+Storage retry uses Tick's admission read before writing and installing retained changes, and each deferred message re-enters admission.
+Actor::exited reads the closing state directly before session and terminal restarts or queued-turn starts.
+Effects run with no launch gate held and refuse starts while closing.
 - Launch with registration: ChildEnv::spawn holds the gate through its closing check, OS spawn and group registration, so quit either refuses the launch or sees its group in the signal pass.
-- Prompt write: the stdin writer checks closing under the gate immediately before each user frame and drops that frame if closing won, while preserving cancel replies before interrupt.
+- Prompt write: the stdin writer uses an Acquire read of the atomic closing state immediately before each user frame and drops that frame if closing won, while preserving cancel replies before interrupt.
 The prompt check is its commitment point; a write already past it belongs to a turn admitted before quit and shutdown interrupts that turn by protocol.
-The writer releases the gate before asynchronous I/O, so an already committed write can finish after closing.
+The writer takes no gate and an already committed write can finish after closing.
 
 ## Actor decisions, storage and recovery
 
@@ -194,7 +191,7 @@ Tick retries before draining deferred process events.
 Full and closed command queues are distinct errors; Busy carries a typed WaitReason and a closed request is distinct from either.
 The UI shows command and acknowledgement failures as notices.
 
-`LiveThread` owns an epoch outside its runtime variants, capabilities and the background-work flag.
+`LiveThread` owns an epoch outside its runtime variants, capabilities, the background-work flag and the codec token for its latest Provider turn.
 Starting stores its session handle before the actor handles any event from that session.
 The engine derives thread status with `domain::thread_status` and publishes `ThreadStatusChanged` after changed thread, turn, request or live rows.
 The window, sidebar, header, dump and ctl wait consume that status, including background work, NeedsYou and InTerminal.
@@ -317,9 +314,12 @@ Each accepted stdout line is parsed once and its value passes through recording,
 The bounded stderr tail is redacted before display and supplies failures when the CLI exits unexpectedly.
 Interrupt and Shutdown queue deny replies for every open approval and question with `interrupt: true` before the protocol interrupt.
 The codec owns an active turn's interrupt ladder and both deadlines: group SIGTERM after three seconds, then SIGKILL one second later.
-SessionControl::Interrupt carries a typed StopReason for user or storage-blocked interruptions.
+SessionControl::Interrupt carries its target turn identity and a typed StopReason for user or storage-blocked interruptions.
+Veyra-started turns use their stored turn id; CLI-started Provider turns use a fresh codec token reported by ProviderTurnStarted before their first content event.
+The actor keeps that token in LiveThread and captures the target before ending the running turn.
 Shutdown and startup recovery use StopReason::AppClosing for their shared turn-end reason.
-An ended turn ignores a late interrupt, and both a turn end and a new prompt clear the old ladder.
+The codec ignores an interrupt whose target is no longer active, including when a later Provider turn has opened.
+Only a matching interrupt cancels that turn's open requests and arms its ladder; both a turn end and a new prompt clear the old ladder.
 Human interrupts use "Stopped by you"; storage and shutdown carry their own reasons.
 A session without a turn never arms that ladder.
 Shutdown gives queued replies up to one second to drain, then aborts an unfinished writer before group cleanup.
@@ -569,6 +569,8 @@ DebugStallUi blocks the window thread for its supplied milliseconds so the pump 
 Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
 replay_claude uses the real session task with the fake CLI for text and tools, prompt correlation, provider-turn completion, resume, crash and error outcomes, background replacement and readiness.
 It covers approvals, questions, unknown requests, Stop with a pending approval and late interrupts.
+The late-Stop actor/codec and real-session tests complete a user turn, open a later Provider turn, then check that the old Stop leaves the later turn Completed, alongside a control without Stop.
+provider_interrupt_targets_generation_and_preserves_cancel_order checks stale Provider tokens and cancel replies before a matching interrupt.
 It also checks assistant-error parking, interrupt outcomes and ladder cancellation, subagent isolation against the live Agent recording, notices and malformed-byte recovery.
 Actor tests cover retirement before queued work, the Stop drain, Provider-tail rejection and skipped text-only transactions.
 Shutdown tests check that Quit during a drain, Stopping or missing-session recovery starts no replacement session and keeps queued work held after reload.
@@ -583,9 +585,9 @@ cancelling_probe_during_version_cleanup_starts_no_initialize cancels a probe dur
 Tests also check the shared engine/environment gate and registry, the ChildEnv spawn boundary, recheck_after_confirm_quit_launches_no_provider and escape_after_confirm_quit_keeps_sheet.
 shutdown_between_actor_check_and_decide_commits_then_holds_turn pauses after the admission read and checks both orders of closing, persisted pre-quit commitment, no prompt and the recovery hold.
 The two database-lock quit tests hold BEGIN IMMEDIATE while an admitted settings write waits, then check shutdown within 10 ms, native quit within 150 ms, persistence and post-quit refusal.
-shutdown_between_final_launch_check_and_spawn_starts_no_process pauses inside the launch gate after its final closing check and races native quit, then checks registration in the signal pass, SIGTERM exit and subsequent launch refusal.
+launch_past_final_check_at_quit_is_registered_and_signalled pauses inside the launch gate after its final closing check and races native quit, then checks registration in the signal pass, SIGTERM exit and subsequent launch refusal.
 A launch already past that check completes before closing; launches that reach the check after closing are refused.
-launch_in_flight_at_quit_is_signalled_or_refused checks registration before the quit signal pass across concurrent launches.
+launch_in_flight_at_quit_is_signalled_or_refused races one launch loop against closing over 20 runs and checks registration before the quit signal pass.
 dropping_spawn_result_reaps_and_unregisters_its_group checks that dropping the returned guard reaps its owned process and removes its registry entry.
 native_quit_signals_registered_provider_groups checks actual SIGTERM delivery through Engine::on_app_quit and subsequent launch refusal.
 shutdown_after_admission_before_stdin_write_sends_no_prompt checks prompt refusal at the writer with an uncancelled delivery control.

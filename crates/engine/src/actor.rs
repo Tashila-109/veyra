@@ -432,13 +432,26 @@ impl Actor {
     fn commit_event(&mut self, mut c: ChangeSet) {
         self.prepare_commit(&mut c);
         if let Err(error) = self.write(&c) {
-            for live in self.live.values() {
+            for (thread, live) in &self.live {
                 if let Some(session) = live.live.session() {
                     let control =
                         if self.shutting_down || matches!(live.live, Live::Starting { .. }) {
                             SessionControl::Shutdown
                         } else {
-                            SessionControl::Interrupt(StopReason::StorageBlocked)
+                            let turn = c
+                                .view(&self.projection, &self.live, *thread)
+                                .unwrap()
+                                .running
+                                .or_else(|| {
+                                    self.projection.turns_for(*thread).find(|turn| {
+                                        matches!(turn.state, TurnState::Running { .. })
+                                    })
+                                });
+                            let Some(turn) = turn else { continue };
+                            SessionControl::Interrupt {
+                                turn: live.interrupt_target(turn),
+                                reason: StopReason::StorageBlocked,
+                            }
                         };
                     let _ = session.control.send(control);
                 }
@@ -460,10 +473,6 @@ impl Actor {
         }
     }
     fn retry(&mut self) {
-        if self.state.closing.is_closing() {
-            self.shutdown();
-            return;
-        }
         let mut blocked = self.blocked.take().unwrap();
         if let Err(e) = self.write(&blocked.changes) {
             blocked.error = e.to_string();
@@ -709,6 +718,15 @@ impl Actor {
         }
         let mut c = ChangeSet::default();
         match event {
+            ProviderEvent::Session(SessionEvent::ProviderTurnStarted { generation }) => {
+                if !matches!(self.live[&thread].live, Live::Structured { .. }) {
+                    return None;
+                }
+                let mut live = self.live[&thread].clone();
+                live.provider_generation = generation;
+                c.live.insert(thread, live);
+                return Some(c);
+            }
             ProviderEvent::Session(SessionEvent::Ready {
                 native,
                 cli_version,

@@ -198,7 +198,10 @@ fn command_requeues_wake(command: impl Fn(ThreadId) -> Command, archived: bool) 
     );
     assert_eq!(
         f.controls.try_recv().unwrap(),
-        SessionControl::Interrupt(StopReason::User)
+        SessionControl::Interrupt {
+            turn: wake,
+            reason: StopReason::User
+        }
     );
     f.event(turn_event(
         Some(wake),
@@ -640,7 +643,10 @@ fn interrupt_expires_pending_requests() {
     ));
     assert_eq!(
         f.controls.try_recv().unwrap(),
-        SessionControl::Interrupt(StopReason::User)
+        SessionControl::Interrupt {
+            turn: f.actor.live[&f.thread].provider_generation,
+            reason: StopReason::User
+        }
     );
 }
 #[test]
@@ -654,7 +660,10 @@ fn stop_expires_pending_requests() {
     ));
     assert_eq!(
         f.controls.try_recv().unwrap(),
-        SessionControl::Interrupt(StopReason::User)
+        SessionControl::Interrupt {
+            turn: f.actor.live[&f.thread].provider_generation,
+            reason: StopReason::User
+        }
     );
 }
 #[test]

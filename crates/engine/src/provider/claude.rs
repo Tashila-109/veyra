@@ -398,13 +398,18 @@ impl ResultFrame {
 #[derive(Clone, Copy)]
 pub(crate) enum ActiveTurn {
     Veyra(TurnId),
-    Provider,
+    Provider(TurnId),
 }
 impl ActiveTurn {
+    pub fn target(self) -> TurnId {
+        match self {
+            Self::Veyra(turn) | Self::Provider(turn) => turn,
+        }
+    }
     pub fn id(self) -> Option<TurnId> {
         match self {
             Self::Veyra(turn) => Some(turn),
-            Self::Provider => None,
+            Self::Provider(_) => None,
         }
     }
 }
@@ -505,6 +510,7 @@ pub(crate) struct Codec {
 pub(crate) struct Decoded {
     pub events: Vec<ProviderEvent>,
     pub replies: Vec<Value>,
+    pub provider_generation: Option<TurnId>,
 }
 impl Codec {
     pub fn new(native: NativeSessionId, pid: u32, cwd: &std::path::Path) -> Self {
@@ -572,6 +578,7 @@ impl Codec {
                 return Ok(Decoded {
                     events: Vec::new(),
                     replies: vec![Self::unsupported_request(id)],
+                    provider_generation: None,
                 });
             }
             Err(_) if control_response => {
@@ -716,7 +723,9 @@ impl Codec {
             }
         }
         if self.active.is_none() && events.iter().any(TurnEvent::opens_provider_turn) {
-            self.active = Some(ActiveTurn::Provider);
+            let generation = TurnId::new();
+            self.active = Some(ActiveTurn::Provider(generation));
+            decoded.provider_generation = Some(generation);
         }
         let ended = events
             .iter()
@@ -739,10 +748,11 @@ impl Codec {
     }
     #[cfg(test)]
     pub fn interrupt(&mut self) -> bool {
-        self.interrupt_for(StopReason::User)
+        self.active
+            .is_some_and(|turn| self.interrupt_for(turn.target(), StopReason::User))
     }
-    pub fn interrupt_for(&mut self, reason: StopReason) -> bool {
-        if self.active.is_none() {
+    pub fn interrupt_for(&mut self, turn: TurnId, reason: StopReason) -> bool {
+        if self.active.map(ActiveTurn::target) != Some(turn) {
             return false;
         }
         self.interrupted.get_or_insert_with(|| Interruption {
@@ -930,8 +940,8 @@ impl Codec {
         self.requests.remove(&native.0);
         Some(Self::response(native.0, response))
     }
-    pub fn interrupt_lines(&mut self, reason: StopReason) -> Vec<Value> {
-        if !self.interrupt_for(reason) {
+    pub fn interrupt_lines(&mut self, turn: TurnId, reason: StopReason) -> Vec<Value> {
+        if !self.interrupt_for(turn, reason) {
             return Vec::new();
         }
         let mut lines = self.cancel_requests(reason.text());
@@ -1857,8 +1867,9 @@ mod tests {
     #[test]
     fn storage_interruption_names_database() {
         let mut codec = codec();
-        codec.start(TurnId::new(), "reply".into());
-        assert!(codec.interrupt_for(StopReason::StorageBlocked));
+        let turn = TurnId::new();
+        codec.start(turn, "reply".into());
+        assert!(codec.interrupt_for(turn, StopReason::StorageBlocked));
         let decoded = codec
             .value(json!({"type":"result", "subtype":"success"}))
             .unwrap();
@@ -1871,7 +1882,7 @@ mod tests {
         } if reason == "Stopped because the database is blocked"))
         );
         assert!(codec.interrupted.is_none());
-        assert!(!codec.interrupt_for(StopReason::User));
+        assert!(!codec.interrupt_for(turn, StopReason::User));
     }
     #[test]
     fn empty_final_reasoning_adds_no_item() {

@@ -180,7 +180,7 @@ impl ChildEnv {
         #[cfg(test)]
         self.launches
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        if let Err(error) = platform::lower_priority(child.pid) {
+        if let Err(error) = platform::lower_priority(child.pid()) {
             tracing::warn!(%error, "could not lower agent group priority");
         }
         Ok(child)
@@ -298,7 +298,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.pid;
+        let pid = child.pid();
         assert!(env.groups.lock().unwrap().contains(&pid));
         drop(child);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(env.launches.load(super::Ordering::Acquire), 1);
     }
     #[test]
-    fn shutdown_between_final_launch_check_and_spawn_starts_no_process() {
+    fn launch_past_final_check_at_quit_is_registered_and_signalled() {
         use std::{path::Path, time::Duration};
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let env = ChildEnv::load();
@@ -394,7 +394,7 @@ mod tests {
         let signalled = done.recv_timeout(Duration::from_millis(500)).ok();
         resume.send(()).unwrap();
         let mut child = launcher.join().unwrap();
-        let pid = child.pid;
+        let pid = child.pid();
         let signalled =
             signalled.unwrap_or_else(|| done.recv_timeout(Duration::from_secs(2)).unwrap());
         quit.join().unwrap();
@@ -453,7 +453,7 @@ mod tests {
             launched += children.len();
             escaped += children
                 .iter()
-                .filter(|child| !signalled.contains(&child.pid))
+                .filter(|child| !signalled.contains(&child.pid()))
                 .count();
             runtime.block_on(async {
                 for child in children {
@@ -488,7 +488,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.pid;
+        let pid = child.pid();
         assert!(env.groups.lock().unwrap().contains(&pid));
         engine.on_app_quit().await;
         let exited = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;

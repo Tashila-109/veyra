@@ -25,7 +25,7 @@ use tokio::{
 
 pub(crate) struct ProcessGroup {
     child: Option<Child>,
-    pub(crate) pid: u32,
+    pid: u32,
     reaped: Option<oneshot::Sender<()>>,
     groups: Option<super::env::Groups>,
     #[cfg(test)]
@@ -79,6 +79,9 @@ async fn end_process(
     failure.map_or(status, Err)
 }
 impl ProcessGroup {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
     pub(crate) fn tracked(child: Child, env: &ChildEnv) -> Self {
         let pid = child.id().expect("new child");
         env.groups.lock().unwrap().insert(pid);
@@ -495,7 +498,7 @@ async fn run_one(
     resume: bool,
     cwd: &std::path::Path,
 ) -> Completion {
-    let pid = process.child.pid;
+    let pid = process.child.pid();
     let mut lines = ByteLines::new(process.child.stdout().expect("piped stdout"));
     let mut errors = ByteLines::new(process.child.stderr().expect("piped stderr"));
     let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
@@ -526,11 +529,8 @@ async fn run_one(
             if line["type"] == "user" && close_before_user_write.swap(false, Ordering::AcqRel) {
                 writer_closing.close();
             }
-            if line["type"] == "user" {
-                let _admission = writer_closing.enter();
-                if writer_closing.is_closing() {
-                    continue;
-                }
+            if line["type"] == "user" && writer_closing.is_closing() {
+                continue;
             }
             stdin.write_all(&bytes).await?;
             stdin.flush().await?;
@@ -568,7 +568,9 @@ async fn run_one(
                     }
                 }
                 Some(SessionControl::Shutdown) | None => {
-                    for line in codec.interrupt_lines(StopReason::AppClosing) {
+                    let lines = codec.active.map(|turn| codec.interrupt_lines(turn.target(), StopReason::AppClosing))
+                        .unwrap_or_default();
+                    for line in lines {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
@@ -580,8 +582,8 @@ async fn run_one(
                     }
                     break;
                 }
-                Some(SessionControl::Interrupt(reason)) => {
-                    for line in codec.interrupt_lines(reason) {
+                Some(SessionControl::Interrupt { turn, reason }) => {
+                    for line in codec.interrupt_lines(turn, reason) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
@@ -648,6 +650,11 @@ async fn run_one(
                                 }
                             }
                             if failure.is_some() { break; }
+                            if let Some(generation) = decoded.provider_generation
+                                && !emit(out, thread, epoch, ProviderEvent::Session(
+                                    SessionEvent::ProviderTurnStarted { generation }
+                                )).await
+                            { consumer_gone = true; break; }
                             for event in decoded.events {
                                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                                     ready = true;
@@ -977,7 +984,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.pid;
+        let pid = child.pid();
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
@@ -1066,7 +1073,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let pid = child.pid;
+            let pid = child.pid();
             let process = Process {
                 child,
                 native: NativeSessionId("fixture-session".into()),
@@ -1134,7 +1141,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.pid;
+        let pid = child.pid();
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
@@ -1195,7 +1202,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.pid;
+        let pid = child.pid();
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
@@ -1270,7 +1277,7 @@ mod tests {
             )
             .unwrap();
         let mut group = child;
-        let pid = group.pid;
+        let pid = group.pid();
         group.check = |_, _| Ok(true);
         let process = Process {
             child: group,
@@ -1365,7 +1372,7 @@ mod tests {
             )
             .unwrap();
         let mut group = child;
-        let pid = group.pid;
+        let pid = group.pid();
         let mut output = BufReader::new(group.stdout().unwrap()).lines();
         assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
         let (cleanup, reaped) = mpsc::unbounded_channel();
@@ -1410,7 +1417,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.pid;
+        let pid = child.pid();
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
@@ -1473,7 +1480,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.pid;
+        let pid = child.pid();
         let mut output = BufReader::new(child.stdout().unwrap()).lines();
         assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
         child.check = |_, _| Err(std::io::Error::other("check failed"));
@@ -1541,7 +1548,7 @@ mod tests {
             )
             .unwrap();
         let mut group = child;
-        let pid = group.pid;
+        let pid = group.pid();
         group.check = |_, _| Ok(true);
         let process = Process {
             child: group,
@@ -1597,7 +1604,10 @@ mod tests {
         let at = tokio::time::Instant::now();
         handle
             .control
-            .send(SessionControl::Interrupt(StopReason::User))
+            .send(SessionControl::Interrupt {
+                turn,
+                reason: StopReason::User,
+            })
             .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(9), async {
             loop {
@@ -1717,7 +1727,7 @@ mod tests {
                         None,
                     )
                     .unwrap();
-                let pid = child.pid;
+                let pid = child.pid();
                 let process = Process {
                     child,
                     native: NativeSessionId("missing-native".into()),

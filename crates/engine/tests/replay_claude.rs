@@ -615,6 +615,7 @@ fn controlled_replay_with(
         )
         .unwrap();
         let mut next = 0;
+        let mut turn = TurnId::new();
         let mut interrupted = false;
         let events = tokio::time::timeout(Duration::from_secs(10), async {
             let mut events = Vec::new();
@@ -629,10 +630,11 @@ fn controlled_replay_with(
                         }
                     );
                 if start && let Some(text) = prompts.get(next) {
+                    turn = TurnId::new();
                     handle
                         .control
                         .send(SessionControl::StartTurn {
-                            turn: TurnId::new(),
+                            turn,
                             text: (*text).into(),
                         })
                         .unwrap();
@@ -645,7 +647,10 @@ fn controlled_replay_with(
                 {
                     handle
                         .control
-                        .send(SessionControl::Interrupt(StopReason::User))
+                        .send(SessionControl::Interrupt {
+                            turn,
+                            reason: StopReason::User,
+                        })
                         .unwrap();
                     interrupted = true;
                 }
@@ -1053,13 +1058,14 @@ fn request_replay(
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             let mut events = Vec::new();
             let mut requests = 0;
+            let turn = TurnId::new();
             let mut started = false;
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
                 if !started && matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                     handle
                         .control
                         .send(SessionControl::StartTurn {
-                            turn: TurnId::new(),
+                            turn,
                             text: "test".into(),
                         })
                         .unwrap();
@@ -1083,7 +1089,10 @@ fn request_replay(
                     if stop_after == Some(requests) {
                         handle
                             .control
-                            .send(SessionControl::Interrupt(StopReason::User))
+                            .send(SessionControl::Interrupt {
+                                turn,
+                                reason: StopReason::User,
+                            })
                             .unwrap();
                     }
                 }
@@ -1219,12 +1228,13 @@ for line in sys.stdin:
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             let mut events = Vec::new();
             let mut ends = 0;
+            let turn = TurnId::new();
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                     handle
                         .control
                         .send(SessionControl::StartTurn {
-                            turn: TurnId::new(),
+                            turn,
                             text: "first".into(),
                         })
                         .unwrap();
@@ -1240,7 +1250,10 @@ for line in sys.stdin:
                     if ends == 1 {
                         handle
                             .control
-                            .send(SessionControl::Interrupt(StopReason::User))
+                            .send(SessionControl::Interrupt {
+                                turn,
+                                reason: StopReason::User,
+                            })
                             .unwrap();
                         handle
                             .control
@@ -1338,4 +1351,123 @@ fn fake_touch_rejects_absolute_and_parent_paths() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("touch path must stay within"));
     }
     assert!(!scratch.0.join("veyra-invalid-touch").exists());
+}
+
+fn provider_followup(late_stop: bool) {
+    let scratch = Scratch(std::env::temp_dir().join(format!("veyra-followup-{}", ThreadId::new())));
+    fs::create_dir(&scratch.0).unwrap();
+    let binary = stand_in(
+        &scratch,
+        "owned-provider-stand-in",
+        r#"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    wire = json.loads(line)
+    if wire.get('request', {}).get('subtype') == 'initialize':
+        print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success',
+            'request_id': wire['request_id'], 'response': {}}}), flush=True)
+    if wire.get('type') == 'user':
+        print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,
+            'user_message_uuid': wire['uuid']}), flush=True)
+        print(json.dumps({'type': 'assistant', 'message': {'id': 'later-provider',
+            'content': [{'type': 'text', 'text': 'background follow-up'}]}}), flush=True)
+        time.sleep(5)
+        print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False}), flush=True)
+"#,
+    );
+    let mut env = ChildEnv::load();
+    env.claude_bin = Some(binary);
+    env.fixtures = None;
+    env.record = None;
+    let first = TurnId::new();
+    let outcomes = Runtime::new().unwrap().block_on(async {
+        let (out, mut rx) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: None,
+                import: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut outcomes = Vec::new();
+            let mut old_end = false;
+            let mut interrupted = false;
+            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: first,
+                            text: "first".into(),
+                        })
+                        .unwrap();
+                }
+                if let ProviderEvent::Turn {
+                    turn,
+                    event: TurnEvent::TurnEnded { outcome, .. },
+                } = &event
+                {
+                    if *turn == Some(first) {
+                        old_end = true;
+                    }
+                    eprintln!("turn={turn:?} outcome={outcome:?}");
+                    outcomes.push(outcome.clone());
+                    if outcomes.len() == 2 {
+                        handle.control.send(SessionControl::Shutdown).ok();
+                    }
+                }
+                if late_stop
+                    && old_end
+                    && !interrupted
+                    && matches!(
+                        event,
+                        ProviderEvent::Turn {
+                            turn: None,
+                            event: TurnEvent::TextDelta { .. }
+                        }
+                    )
+                {
+                    interrupted = true;
+                    handle
+                        .control
+                        .send(SessionControl::Interrupt {
+                            turn: first,
+                            reason: StopReason::User,
+                        })
+                        .unwrap();
+                }
+                if matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. })) {
+                    break;
+                }
+            }
+            outcomes
+        })
+        .await;
+        handle.control.send(SessionControl::Shutdown).ok();
+        result.unwrap()
+    });
+    assert_eq!(
+        outcomes,
+        vec![TurnOutcome::Completed, TurnOutcome::Completed]
+    );
+}
+
+#[test]
+fn provider_followup_without_late_stop_completes() {
+    provider_followup(false);
+}
+#[test]
+fn late_stop_after_user_end_does_not_stop_provider_followup() {
+    provider_followup(true);
 }

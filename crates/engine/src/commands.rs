@@ -289,9 +289,17 @@ fn interrupt(
             stopping(l, c, thread, AfterStop::Park);
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
+            let turn = l[&thread].interrupt_target(c.view(p, l, thread).unwrap().running.unwrap());
             drain_running(p, l, c, thread);
             end_running(p, c, thread, StopReason::User, now);
-            control(c, thread, SessionControl::Interrupt(StopReason::User));
+            control(
+                c,
+                thread,
+                SessionControl::Interrupt {
+                    turn,
+                    reason: StopReason::User,
+                },
+            );
         }
         Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
         Live::Parked | Live::Structured { .. } | Live::Stopping { .. } => {}
@@ -571,8 +579,16 @@ fn stop_one(
             stopping(l, c, thread, AfterStop::Park);
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
+            let turn = l[&thread].interrupt_target(c.view(p, l, thread).unwrap().running.unwrap());
             drain_running(p, l, c, thread);
-            control(c, thread, SessionControl::Interrupt(StopReason::User));
+            control(
+                c,
+                thread,
+                SessionControl::Interrupt {
+                    turn,
+                    reason: StopReason::User,
+                },
+            );
         }
         Live::Terminal { .. } => {
             c.effects.push(Effect::StopTerminal { thread });

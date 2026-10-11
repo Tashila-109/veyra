@@ -568,7 +568,10 @@ fn provider_stop_tail_opens_no_turn() {
     assert_eq!(f.running(), Some(second));
     assert_eq!(
         f.controls.try_recv().unwrap(),
-        SessionControl::Interrupt(StopReason::User)
+        SessionControl::Interrupt {
+            turn: f.actor.live[&f.thread].provider_generation,
+            reason: StopReason::User
+        }
     );
     assert_eq!(
         f.controls.try_recv().unwrap(),
@@ -1205,4 +1208,165 @@ fn subagent_output_updates_running_tail_and_caps_characters() {
     let legacy: ToolItem = serde_json::from_value(legacy).unwrap();
     assert!(legacy.output_tail.is_empty());
     assert_eq!(legacy.result, tool.result);
+}
+
+#[test]
+fn late_stop_of_completed_user_prompt_leaves_provider_turn_unstopped() {
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut f = Fixture::new(LiveState::Idle);
+    let Ok(Ack::Turn(first)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "first".into(),
+    }) else {
+        panic!("Send failed")
+    };
+    assert!(
+        matches!(f.controls.try_recv().unwrap(), SessionControl::StartTurn { turn, .. } if turn == first)
+    );
+    let mut codec = Codec::new(
+        NativeSessionId("owned-test".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    codec.start(first, "first".into());
+    let old_end = codec
+        .value(
+            json!({"type":"result", "subtype":"success", "is_error":false,
+        "user_message_uuid":first.to_string()}),
+        )
+        .unwrap();
+    let later = codec
+        .value(
+            json!({"type":"assistant", "message":{"id":"later-provider", "content":[
+        {"type":"text", "text":"background follow-up"}]}}),
+        )
+        .unwrap();
+    assert!(later.events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::Turn {
+            turn: None,
+            event: TurnEvent::TextDelta { .. }
+        }
+    )));
+    assert_eq!(f.running(), Some(first));
+    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
+        panic!("missing Interrupt")
+    };
+    let replies = codec.interrupt_lines(turn, reason);
+    for event in old_end
+        .events
+        .into_iter()
+        .chain(later.provider_generation.map(|generation| {
+            ProviderEvent::Session(SessionEvent::ProviderTurnStarted { generation })
+        }))
+        .chain(later.events)
+    {
+        f.event(event);
+    }
+    let next = f.running().unwrap();
+    assert_ne!(first, next);
+    assert_eq!(f.actor.projection.turns[&next].origin, TurnOrigin::Provider);
+    let next_end = codec
+        .value(json!({"type":"result", "subtype":"success", "is_error":false}))
+        .unwrap();
+    eprintln!("late_stop_protocol={replies:?}");
+    for event in next_end.events {
+        f.event(event);
+    }
+    assert!(
+        matches!(
+            f.loaded().turns[&next].state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "Stop for the completed user prompt interrupted the later Provider turn: {:?}",
+        f.loaded().turns[&next].state
+    );
+}
+
+#[test]
+fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut codec = Codec::new(
+        NativeSessionId("owned-test".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    let first = codec
+        .value(json!({"type":"assistant", "message":{"id":"first-provider",
+        "content":[{"type":"text", "text":"first"}]}}))
+        .unwrap();
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        generation: first.provider_generation.unwrap(),
+    }));
+    for event in first.events {
+        f.event(event);
+    }
+    let first = f.running().unwrap();
+    let first_generation = f.actor.live[&f.thread].provider_generation;
+    let old_end = codec
+        .value(json!({"type":"result", "subtype":"success", "is_error":false}))
+        .unwrap();
+    let later = codec
+        .value(json!({"type":"assistant", "message":{"id":"next-provider",
+        "content":[{"type":"text", "text":"next"}]}}))
+        .unwrap();
+    let mut events = vec![ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        generation: later.provider_generation.unwrap(),
+    })];
+    events.extend(later.events);
+    for id in ["approval-b", "approval-a"] {
+        events.extend(codec.value(json!({"type":"control_request", "request_id":id,
+            "request":{"subtype":"can_use_tool", "tool_name":"Bash", "input":{"command":"echo ok"}}
+        })).unwrap().events);
+    }
+    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
+        panic!()
+    };
+    assert_eq!(turn, first_generation);
+    assert!(codec.interrupt_lines(turn, reason).is_empty());
+    assert!(codec.interrupt_deadline().is_none());
+    for event in old_end.events.into_iter().chain(events) {
+        f.event(event);
+    }
+    let next = f.running().unwrap();
+    assert_ne!(first, next);
+    assert_ne!(
+        first_generation,
+        f.actor.live[&f.thread].provider_generation
+    );
+    assert_eq!(
+        f.loaded()
+            .requests
+            .values()
+            .filter(|r| r.state == RequestState::Pending)
+            .count(),
+        2
+    );
+    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
+        panic!()
+    };
+    assert_eq!(turn, f.actor.live[&f.thread].provider_generation);
+    assert_eq!(
+        codec.interrupt_lines(turn, reason),
+        vec![
+            json!({"type":"control_response", "response":{"subtype":"success", "request_id":"approval-a",
+            "response":{"behavior":"deny", "message":"Stopped by you", "interrupt":true}}}),
+            json!({"type":"control_response", "response":{"subtype":"success", "request_id":"approval-b",
+            "response":{"behavior":"deny", "message":"Stopped by you", "interrupt":true}}}),
+            json!({"type":"control_request", "request_id":"veyra-interrupt", "request":{"subtype":"interrupt"}}),
+        ]
+    );
+    assert!(codec.interrupt_deadline().is_some());
+    assert!(matches!(&f.loaded().turns[&next].state, TurnState::Ended {
+        outcome: TurnOutcome::Interrupted { reason }, ..
+    } if reason == "Stopped by you"));
 }

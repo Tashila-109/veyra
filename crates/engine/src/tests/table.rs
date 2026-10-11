@@ -183,7 +183,10 @@ fn cell(row: Row, state: LiveState) {
                     assert_eq!(f.running(), None);
                     assert_eq!(
                         f.controls.try_recv().unwrap(),
-                        SessionControl::Interrupt(StopReason::User)
+                        SessionControl::Interrupt {
+                            turn: f.actor.live[&f.thread].provider_generation,
+                            reason: StopReason::User
+                        }
                     );
                 }
             }
