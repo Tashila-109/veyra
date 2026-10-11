@@ -289,17 +289,8 @@ fn interrupt(
             stopping(l, c, thread, AfterStop::Park);
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
-            let turn = l[&thread].interrupt_target(c.view(p, l, thread).unwrap().running.unwrap());
-            drain_running(p, l, c, thread);
+            interrupt_running(p, l, c, thread);
             end_running(p, c, thread, StopReason::User, now);
-            control(
-                c,
-                thread,
-                SessionControl::Interrupt {
-                    turn,
-                    reason: StopReason::User,
-                },
-            );
         }
         Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
         Live::Parked | Live::Structured { .. } | Live::Stopping { .. } => {}
@@ -553,6 +544,23 @@ fn hold_parent(p: &Projection, c: &mut ChangeSet, thread: ThreadId) {
         set_hold(p, c, parent, Some(HoldReason::ChildReport));
     }
 }
+fn interrupt_running(
+    p: &Projection,
+    l: &BTreeMap<ThreadId, LiveThread>,
+    c: &mut ChangeSet,
+    thread: ThreadId,
+) {
+    let turn = c.view(p, l, thread).unwrap().running.unwrap().id;
+    drain_running(p, l, c, thread);
+    control(
+        c,
+        thread,
+        SessionControl::Interrupt {
+            turn,
+            reason: StopReason::User,
+        },
+    );
+}
 fn drain_running(
     p: &Projection,
     l: &BTreeMap<ThreadId, LiveThread>,
@@ -579,16 +587,7 @@ fn stop_one(
             stopping(l, c, thread, AfterStop::Park);
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
-            let turn = l[&thread].interrupt_target(c.view(p, l, thread).unwrap().running.unwrap());
-            drain_running(p, l, c, thread);
-            control(
-                c,
-                thread,
-                SessionControl::Interrupt {
-                    turn,
-                    reason: StopReason::User,
-                },
-            );
+            interrupt_running(p, l, c, thread);
         }
         Live::Terminal { .. } => {
             c.effects.push(Effect::StopTerminal { thread });
@@ -759,6 +758,9 @@ pub fn start_changed(
                 t.state = TurnState::Running { since: now };
                 c.events.push(Ev::TurnStarted(t.clone()));
                 c.turns.insert(t.id, t.clone());
+                let mut live = c.live(l, id).clone();
+                live.pending_start = Some(t.id);
+                c.live.insert(id, live);
                 c.effects.push(Effect::StartTurn {
                     thread: id,
                     turn: t.id,
@@ -772,6 +774,7 @@ pub fn spawn(l: &BTreeMap<ThreadId, LiveThread>, c: &mut ChangeSet, id: ThreadId
     let mut live = c.live(l, id).clone();
     live.epoch += 1;
     live.live = Live::Starting { session: None };
+    live.pending_start = None;
     live.background_work = false;
     c.live.insert(id, live);
     c.effects.push(Effect::Spawn { thread: id, import });

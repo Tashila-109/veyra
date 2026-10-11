@@ -115,7 +115,7 @@ impl Fixture {
                 live,
                 background_work: false,
                 capabilities: vec![],
-                provider_generation: TurnId::new(),
+                pending_start: None,
             },
         );
         let tx = actor.db.transaction().unwrap();

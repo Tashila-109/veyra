@@ -562,7 +562,7 @@ pub fn wait_reason(v: &ThreadView<'_>) -> Option<WaitReason> {
     if let Some(reason) = v.thread.hold {
         return Some(WaitReason::Held(reason));
     }
-    if v.running.is_some() {
+    if v.running.is_some() || v.live.pending_start.is_some() {
         return Some(WaitReason::TurnRunning);
     }
     if matches!(v.live.live, Live::Starting { .. }) {

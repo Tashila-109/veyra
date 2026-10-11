@@ -528,15 +528,18 @@ impl Codec {
             seen_requests: BTreeSet::new(),
         }
     }
-    pub fn start(&mut self, turn: TurnId, text: String) -> Value {
+    pub fn start(&mut self, turn: TurnId, text: String) -> Option<Value> {
+        if self.active.is_some() {
+            return None;
+        }
         self.active = Some(ActiveTurn::Veyra(turn));
         self.stream = MessageStream::default();
         self.error = None;
         self.interrupted = None;
-        json!({
+        Some(json!({
             "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
             "parent_tool_use_id":null, "message":{"role":"user","content":text}
-        })
+        }))
     }
     fn prompt(&self) -> Option<TurnId> {
         self.active.and_then(ActiveTurn::id)
@@ -748,8 +751,7 @@ impl Codec {
     }
     #[cfg(test)]
     pub fn interrupt(&mut self) -> bool {
-        self.active
-            .is_some_and(|turn| self.interrupt_for(turn.target(), StopReason::User))
+        !self.interrupt_active(StopReason::User).is_empty()
     }
     pub fn interrupt_for(&mut self, turn: TurnId, reason: StopReason) -> bool {
         if self.active.map(ActiveTurn::target) != Some(turn) {
@@ -939,6 +941,11 @@ impl Codec {
         };
         self.requests.remove(&native.0);
         Some(Self::response(native.0, response))
+    }
+    pub fn interrupt_active(&mut self, reason: StopReason) -> Vec<Value> {
+        self.active
+            .map(|turn| self.interrupt_lines(turn.target(), reason))
+            .unwrap_or_default()
     }
     pub fn interrupt_lines(&mut self, turn: TurnId, reason: StopReason) -> Vec<Value> {
         if !self.interrupt_for(turn, reason) {

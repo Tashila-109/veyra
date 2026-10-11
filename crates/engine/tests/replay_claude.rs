@@ -1353,7 +1353,15 @@ fn fake_touch_rejects_absolute_and_parent_paths() {
     assert!(!scratch.0.join("veyra-invalid-touch").exists());
 }
 
-fn provider_followup(late_stop: bool) {
+#[derive(Clone, Copy)]
+enum FollowupStop {
+    None,
+    Previous,
+    Provider,
+    Storage,
+}
+
+fn provider_followup(stop: FollowupStop) {
     let scratch = Scratch(std::env::temp_dir().join(format!("veyra-followup-{}", ThreadId::new())));
     fs::create_dir(&scratch.0).unwrap();
     let binary = stand_in(
@@ -1402,6 +1410,7 @@ for line in sys.stdin:
         let result = tokio::time::timeout(Duration::from_secs(30), async {
             let mut outcomes = Vec::new();
             let mut old_end = false;
+            let mut provider = None;
             let mut interrupted = false;
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
@@ -1413,6 +1422,11 @@ for line in sys.stdin:
                         })
                         .unwrap();
                 }
+                if let ProviderEvent::Session(SessionEvent::ProviderTurnStarted { generation }) =
+                    &event
+                {
+                    provider = Some(*generation);
+                }
                 if let ProviderEvent::Turn {
                     turn,
                     event: TurnEvent::TurnEnded { outcome, .. },
@@ -1421,13 +1435,12 @@ for line in sys.stdin:
                     if *turn == Some(first) {
                         old_end = true;
                     }
-                    eprintln!("turn={turn:?} outcome={outcome:?}");
                     outcomes.push(outcome.clone());
                     if outcomes.len() == 2 {
                         handle.control.send(SessionControl::Shutdown).ok();
                     }
                 }
-                if late_stop
+                if !matches!(stop, FollowupStop::None)
                     && old_end
                     && !interrupted
                     && matches!(
@@ -1439,13 +1452,21 @@ for line in sys.stdin:
                     )
                 {
                     interrupted = true;
-                    handle
-                        .control
-                        .send(SessionControl::Interrupt {
+                    let control = match stop {
+                        FollowupStop::Storage => {
+                            SessionControl::InterruptActive(StopReason::StorageBlocked)
+                        }
+                        FollowupStop::Provider => SessionControl::Interrupt {
+                            turn: provider.unwrap_or(first),
+                            reason: StopReason::User,
+                        },
+                        FollowupStop::Previous => SessionControl::Interrupt {
                             turn: first,
                             reason: StopReason::User,
-                        })
-                        .unwrap();
+                        },
+                        FollowupStop::None => unreachable!(),
+                    };
+                    handle.control.send(control).unwrap();
                 }
                 if matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. })) {
                     break;
@@ -1459,15 +1480,211 @@ for line in sys.stdin:
     });
     assert_eq!(
         outcomes,
-        vec![TurnOutcome::Completed, TurnOutcome::Completed]
+        vec![
+            TurnOutcome::Completed,
+            if matches!(stop, FollowupStop::Provider | FollowupStop::Storage) {
+                TurnOutcome::Interrupted {
+                    reason: if matches!(stop, FollowupStop::Storage) {
+                        StopReason::StorageBlocked.text().into()
+                    } else {
+                        StopReason::User.text().into()
+                    },
+                }
+            } else {
+                TurnOutcome::Completed
+            }
+        ]
     );
 }
 
 #[test]
 fn provider_followup_without_late_stop_completes() {
-    provider_followup(false);
+    provider_followup(FollowupStop::None);
 }
 #[test]
 fn late_stop_after_user_end_does_not_stop_provider_followup() {
-    provider_followup(true);
+    provider_followup(FollowupStop::Previous);
+}
+
+#[test]
+fn stop_targets_reported_provider_turn() {
+    provider_followup(FollowupStop::Provider);
+}
+
+#[test]
+fn storage_stop_interrupts_unregistered_provider_turn() {
+    provider_followup(FollowupStop::Storage);
+}
+
+fn queued_prompt_with_followup(followup: bool) {
+    let scratch =
+        Scratch(std::env::temp_dir().join(format!("veyra-start-followup-{}", ThreadId::new())));
+    fs::create_dir(&scratch.0).unwrap();
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys, time
+followup = {}
+users = 0
+for line in sys.stdin:
+    wire = json.loads(line)
+    if wire.get('request', {{}}).get('subtype') == 'initialize':
+        print(json.dumps({{'type':'control_response','response':{{'subtype':'success',
+            'request_id':wire['request_id'],'response':{{}}}}}}), flush=True)
+    if wire.get('type') == 'user':
+        users += 1
+        if users == 1:
+            print(json.dumps({{'type':'result','subtype':'success','is_error':False,
+                'user_message_uuid':wire['uuid']}}), flush=True)
+            if followup:
+                print(json.dumps({{'type':'assistant','message':{{'id':'followup','content':[
+                    {{'type':'text','text':'provider followup'}}]}}}}), flush=True)
+                time.sleep(.5)
+                print(json.dumps({{'type':'result','subtype':'success','is_error':False}}), flush=True)
+        else:
+            print(json.dumps({{'type':'assistant','message':{{'id':'next-user','content':[
+                {{'type':'text','text':'actual queued reply'}}]}}}}), flush=True)
+            print(json.dumps({{'type':'result','subtype':'success','is_error':False,
+                'user_message_uuid':wire['uuid']}}), flush=True)
+            break
+"#,
+        if followup { "True" } else { "False" }
+    );
+    let binary = stand_in(&scratch, "owned-followup-stand-in", &script);
+    let mut env = ChildEnv::load();
+    env.claude_bin = Some(binary);
+    env.fixtures = None;
+    env.record = None;
+    let first = TurnId::new();
+    let next = TurnId::new();
+    let events = Runtime::new().unwrap().block_on(async {
+        let (out, mut rx) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: None,
+                import: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut events = Vec::new();
+            let mut sent_next = false;
+            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if matches!(&event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: first,
+                            text: "first".into(),
+                        })
+                        .unwrap();
+                }
+                let send_next = if followup {
+                    matches!(
+                        &event,
+                        ProviderEvent::Turn {
+                            turn: None,
+                            event: TurnEvent::TextDelta { .. }
+                        }
+                    )
+                } else {
+                    matches!(&event, ProviderEvent::Turn {
+                        turn:Some(id), event:TurnEvent::TurnEnded { .. }
+                    } if *id == first)
+                };
+                if send_next && !sent_next {
+                    sent_next = true;
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: next,
+                            text: "queued user prompt".into(),
+                        })
+                        .unwrap();
+                }
+                if matches!(
+                    &event,
+                    ProviderEvent::Turn {
+                        turn: None,
+                        event: TurnEvent::TurnEnded { .. }
+                    }
+                ) {
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: next,
+                            text: "queued user prompt".into(),
+                        })
+                        .unwrap();
+                }
+                let exited = matches!(&event, ProviderEvent::Session(SessionEvent::Exited { .. }));
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+            events
+        })
+        .await;
+        handle.control.send(SessionControl::Shutdown).ok();
+        result.unwrap()
+    });
+    let ends = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Turn {
+                turn,
+                event: TurnEvent::TurnEnded { outcome, .. },
+            } => Some((*turn, outcome.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Turn {
+        turn: Some(id), event: TurnEvent::TextDelta { text, .. }
+    } if *id == next && text == "actual queued reply"))
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+        ProviderEvent::Session(SessionEvent::StartTurnRefused { turn }) if *turn == next))
+            .count(),
+        usize::from(followup)
+    );
+    let expected = if followup {
+        vec![
+            (Some(first), TurnOutcome::Completed),
+            (None, TurnOutcome::Completed),
+            (Some(next), TurnOutcome::Completed),
+        ]
+    } else {
+        vec![
+            (Some(first), TurnOutcome::Completed),
+            (Some(next), TurnOutcome::Completed),
+        ]
+    };
+    assert_eq!(
+        ends, expected,
+        "StartTurn must preserve the already active Provider turn and its result"
+    );
+}
+#[test]
+fn queued_prompt_behind_provider_followup_keeps_three_turns() {
+    queued_prompt_with_followup(true);
+}
+#[test]
+fn queued_prompt_without_provider_followup_completes() {
+    queued_prompt_with_followup(false);
 }

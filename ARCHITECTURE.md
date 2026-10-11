@@ -174,8 +174,13 @@ The send-to-reply path is ordered as follows.
 2. The Spawn effect starts the session on its own process group.
 While the thread is still Starting, an exit before Ready fails the oldest queued turn and holds the thread as Stopped.
 3. A matched initialize reply or system/init publishes Ready and changes Starting to Structured.
-4. start_changed makes the queued turn Running and dispatches StartTurn with committed prompt text.
+4. start_changed makes the queued turn Running, records pending admission and dispatches StartTurn with committed prompt text.
 The first prompt waits for Ready.
+The codec admits StartTurn only with no active turn and reports StartTurnRefused when CLI work is already running.
+ProviderTurnStarted opens the CLI's own turn under its reported id and restores a pending Veyra turn to Queued with its original ordinal.
+The queue waits with TurnRunning while that Provider turn runs or an admission remains unresolved.
+A refusal clears pending admission; the first correlated turn event confirms an admitted prompt and restores its Running row if CLI work displaced it.
+The Provider end applies start_changed, which retries eligible queued work once pending admission has resolved.
 The codec also emits Ready on system/init, so an early system/init can open this gate before the initialize reply.
 5. The codec normalizes deltas; the actor buffers text and counts actual stream deltas before flushing.
 6. Item and turn completion persist final rows, free streaming buffers and publish the engine-owned status.
@@ -186,12 +191,12 @@ Unpersisted text writes every two seconds and at item/turn completion.
 Completed items and ended turns free their item keys and text buffers.
 A command write failure returns an error without publishing the decision.
 A provider, Tick or text write failure retains changes, interrupts active turns with the database-blocked reason, refuses commands and publishes StorageBlocked.
-Starting sessions receive Shutdown, and idle structured sessions receive no turn interrupt or ladder.
+Starting sessions receive Shutdown; every structured session receives InterruptActive, which interrupts the codec's active turn even before its actor row exists and leaves an idle codec without a ladder.
 Tick retries before draining deferred process events.
 Full and closed command queues are distinct errors; Busy carries a typed WaitReason and a closed request is distinct from either.
 The UI shows command and acknowledgement failures as notices.
 
-`LiveThread` owns an epoch outside its runtime variants, capabilities, the background-work flag and the codec token for its latest Provider turn.
+`LiveThread` owns an epoch outside its runtime variants, capabilities, the background-work flag and an optional pending StartTurn id.
 Starting stores its session handle before the actor handles any event from that session.
 The engine derives thread status with `domain::thread_status` and publishes `ThreadStatusChanged` after changed thread, turn, request or live rows.
 The window, sidebar, header, dump and ctl wait consume that status, including background work, NeedsYou and InTerminal.
@@ -211,7 +216,7 @@ On a Starting thread, StopThread, Archive and Interrupt send Shutdown and wait i
 The session receives that control before stdout.
 A Shutdown already pending at the launch decision prevents launch and emits Exited; if it arrives during launch, the session stops the owned group once launch returns and emits no Ready.
 A Ready that arrives after StopThread, Archive or Interrupt has moved the thread to Stopping is dropped because Stopping holds no session.
-On a running Structured thread, those controls end the engine turn with Interrupted and "Stopped by you", keep its session and send the protocol interrupt.
+On a running Structured thread, those controls end the engine turn with Interrupted and "Stopped by you", keep its session and send an Interrupt control for that turn; the codec writes the protocol interrupt only while that turn remains active.
 `Live::Structured.draining` keeps that ended turn's id until its own CLI end arrives.
 Queued work with no hold waits with `WaitReason::Stopping` during the drain.
 Send keeps an existing hold only while a turn is queued.
@@ -314,12 +319,14 @@ Each accepted stdout line is parsed once and its value passes through recording,
 The bounded stderr tail is redacted before display and supplies failures when the CLI exits unexpectedly.
 Interrupt and Shutdown queue deny replies for every open approval and question with `interrupt: true` before the protocol interrupt.
 The codec owns an active turn's interrupt ladder and both deadlines: group SIGTERM after three seconds, then SIGKILL one second later.
-SessionControl::Interrupt carries its target turn identity and a typed StopReason for user or storage-blocked interruptions.
-Veyra-started turns use their stored turn id; CLI-started Provider turns use a fresh codec token reported by ProviderTurnStarted before their first content event.
-The actor keeps that token in LiveThread and captures the target before ending the running turn.
+SessionControl::Interrupt carries the turn id targeted by a human Stop and a typed StopReason.
+Storage failure uses InterruptActive with StopReason::StorageBlocked to stop whichever codec turn is active, independently of actor admission.
+Veyra-started turns use their stored turn id; CLI-started Provider turns open under the fresh id reported by ProviderTurnStarted before their first content event.
+The actor captures the running row's id before ending it, without a separate Provider token field.
 Shutdown and startup recovery use StopReason::AppClosing for their shared turn-end reason.
 The codec ignores an interrupt whose target is no longer active, including when a later Provider turn has opened.
-Only a matching interrupt cancels that turn's open requests and arms its ladder; both a turn end and a new prompt clear the old ladder.
+Only a matching targeted interrupt cancels that turn's open requests and arms its ladder; active-turn interruptions resolve the target directly from the codec.
+A turn end clears its ladder; an admitted new prompt starts with no active turn or old ladder.
 Human interrupts use "Stopped by you"; storage and shutdown carry their own reasons.
 A session without a turn never arms that ladder.
 Shutdown gives queued replies up to one second to drain, then aborts an unfinished writer before group cleanup.
@@ -569,9 +576,14 @@ DebugStallUi blocks the window thread for its supplied milliseconds so the pump 
 Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
 replay_claude uses the real session task with the fake CLI for text and tools, prompt correlation, provider-turn completion, resume, crash and error outcomes, background replacement and readiness.
 It covers approvals, questions, unknown requests, Stop with a pending approval and late interrupts.
+It also checks assistant-error parking, interrupt outcomes and ladder cancellation, subagent isolation against the live Agent recording, notices and malformed-byte recovery.
 The late-Stop actor/codec and real-session tests complete a user turn, open a later Provider turn, then check that the old Stop leaves the later turn Completed, alongside a control without Stop.
 provider_interrupt_targets_generation_and_preserves_cancel_order checks stale Provider tokens and cancel replies before a matching interrupt.
-It also checks assistant-error parking, interrupt outcomes and ladder cancellation, subagent isolation against the live Agent recording, notices and malformed-byte recovery.
+The queued-prompt actor/codec and real-session tests preserve A Completed, Provider B Completed, then C Completed with C's own reply.
+A second actor/codec ordering ends B before the pending admission and checks that C's prompt is not dispatched twice.
+A Stop before refusal preserves the stopped prompt's end and allows the later Provider turn and queue to settle.
+stop_targets_reported_provider_turn stops B with the real session's ProviderTurnStarted id and requires Interrupted.
+Storage-failure tests require an active-turn control before the Provider row is registered and prove that an unregistered CLI turn ends with the storage-blocked reason.
 Actor tests cover retirement before queued work, the Stop drain, Provider-tail rejection and skipped text-only transactions.
 Shutdown tests check that Quit during a drain, Stopping or missing-session recovery starts no replacement session and keeps queued work held after reload.
 An actor decision test checks that shutdown exits propose no restart or queued-turn start, preserving epochs and earlier holds.

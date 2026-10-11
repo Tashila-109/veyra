@@ -37,6 +37,7 @@ pub enum SessionControl {
         turn: TurnId,
         reason: StopReason,
     },
+    InterruptActive(StopReason),
     Answer {
         native: NativeRequestRef,
         reply: Reply,
@@ -69,6 +70,9 @@ pub enum ProviderEvent {
 }
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
+    StartTurnRefused {
+        turn: TurnId,
+    },
     ProviderTurnStarted {
         generation: TurnId,
     },

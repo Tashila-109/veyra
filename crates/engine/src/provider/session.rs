@@ -557,7 +557,12 @@ async fn run_one(
             _ = out.closed() => { consumer_gone = true; break; }
             message = control.recv() => match message {
                 Some(SessionControl::StartTurn { turn, text }) => {
-                    let line = codec.start(turn, text);
+                    let Some(line) = codec.start(turn, text) else {
+                        if !emit(out, thread, epoch, ProviderEvent::Session(
+                            SessionEvent::StartTurnRefused { turn }
+                        )).await { consumer_gone = true; break; }
+                        continue;
+                    };
                     #[cfg(debug_assertions)]
                     if let Some(recorder) = &mut process.recorder {
                         recorder.bind(turn.to_string(), format!("<id:turn:{turn}>"));
@@ -568,8 +573,7 @@ async fn run_one(
                     }
                 }
                 Some(SessionControl::Shutdown) | None => {
-                    let lines = codec.active.map(|turn| codec.interrupt_lines(turn.target(), StopReason::AppClosing))
-                        .unwrap_or_default();
+                    let lines = codec.interrupt_active(StopReason::AppClosing);
                     for line in lines {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
@@ -584,6 +588,14 @@ async fn run_one(
                 }
                 Some(SessionControl::Interrupt { turn, reason }) => {
                     for line in codec.interrupt_lines(turn, reason) {
+                        if let Err(error) = process.send(&writer, line) {
+                            failure = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+                Some(SessionControl::InterruptActive(reason)) => {
+                    for line in codec.interrupt_active(reason) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;

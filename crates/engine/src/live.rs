@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Millis, ThreadView, Turn, TurnId, TurnOrigin, wait_reason},
+    domain::{Millis, ThreadView, TurnId, wait_reason},
     provider::{SessionHandle, TerminalHandle},
 };
 
@@ -9,15 +9,7 @@ pub struct LiveThread {
     pub live: Live,
     pub background_work: bool,
     pub capabilities: Vec<String>,
-    pub provider_generation: TurnId,
-}
-impl LiveThread {
-    pub(crate) fn interrupt_target(&self, turn: &Turn) -> TurnId {
-        match turn.origin {
-            TurnOrigin::Provider => self.provider_generation,
-            TurnOrigin::User { .. } | TurnOrigin::Task { .. } | TurnOrigin::Wake { .. } => turn.id,
-        }
-    }
+    pub pending_start: Option<TurnId>,
 }
 #[derive(Clone, Debug, Default)]
 pub enum Live {

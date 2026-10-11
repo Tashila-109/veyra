@@ -569,7 +569,7 @@ fn provider_stop_tail_opens_no_turn() {
     assert_eq!(
         f.controls.try_recv().unwrap(),
         SessionControl::Interrupt {
-            turn: f.actor.live[&f.thread].provider_generation,
+            turn: first,
             reason: StopReason::User
         }
     );
@@ -1271,7 +1271,7 @@ fn late_stop_of_completed_user_prompt_leaves_provider_turn_unstopped() {
     let next_end = codec
         .value(json!({"type":"result", "subtype":"success", "is_error":false}))
         .unwrap();
-    eprintln!("late_stop_protocol={replies:?}");
+    assert!(replies.is_empty());
     for event in next_end.events {
         f.event(event);
     }
@@ -1309,7 +1309,7 @@ fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
         f.event(event);
     }
     let first = f.running().unwrap();
-    let first_generation = f.actor.live[&f.thread].provider_generation;
+    let first_generation = first;
     let old_end = codec
         .value(json!({"type":"result", "subtype":"success", "is_error":false}))
         .unwrap();
@@ -1338,10 +1338,7 @@ fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
     }
     let next = f.running().unwrap();
     assert_ne!(first, next);
-    assert_ne!(
-        first_generation,
-        f.actor.live[&f.thread].provider_generation
-    );
+    assert_ne!(first_generation, next);
     assert_eq!(
         f.loaded()
             .requests
@@ -1354,7 +1351,7 @@ fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
     let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
         panic!()
     };
-    assert_eq!(turn, f.actor.live[&f.thread].provider_generation);
+    assert_eq!(turn, next);
     assert_eq!(
         codec.interrupt_lines(turn, reason),
         vec![
@@ -1369,4 +1366,219 @@ fn provider_interrupt_targets_generation_and_preserves_cancel_order() {
     assert!(matches!(&f.loaded().turns[&next].state, TurnState::Ended {
         outcome: TurnOutcome::Interrupted { reason }, ..
     } if reason == "Stopped by you"));
+}
+
+fn queued_prompt_waits_for_provider_followup(defer_admission: bool) {
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut f = Fixture::new(LiveState::Idle);
+    let Ok(Ack::Turn(first)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "first".into(),
+    }) else {
+        panic!()
+    };
+    assert!(
+        matches!(f.controls.try_recv().unwrap(), SessionControl::StartTurn { turn, .. } if turn == first)
+    );
+    let mut codec = Codec::new(
+        NativeSessionId("owned-test".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    assert!(codec.start(first, "first".into()).is_some());
+    let Ok(Ack::Turn(next)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "queued user prompt".into(),
+    }) else {
+        panic!()
+    };
+    let ordinal = f.loaded().turns[&next].ordinal;
+    let old_end = codec
+        .value(
+            json!({"type":"result", "subtype":"success", "is_error":false,
+        "user_message_uuid":first.to_string()}),
+        )
+        .unwrap();
+    let followup = codec
+        .value(
+            json!({"type":"assistant", "message":{"id":"provider-followup", "content":[
+        {"type":"text", "text":"provider followup before queued prompt"}]}}),
+        )
+        .unwrap();
+    let provider = followup.provider_generation.unwrap();
+    for event in old_end.events {
+        f.event(event);
+    }
+    assert_eq!(f.running(), Some(next));
+    let SessionControl::StartTurn { turn, text } = f.controls.try_recv().unwrap() else {
+        panic!()
+    };
+    assert_eq!(turn, next);
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        generation: provider,
+    }));
+    for event in followup.events {
+        f.event(event);
+    }
+    assert_eq!(f.running(), Some(provider));
+    assert_eq!(f.loaded().turns[&next].state, TurnState::Queued);
+    assert_eq!(f.loaded().turns[&next].ordinal, ordinal);
+    assert_eq!(
+        wait_reason(
+            &ChangeSet::default()
+                .view(&f.actor.projection, &f.actor.live, f.thread)
+                .unwrap()
+        ),
+        Some(WaitReason::TurnRunning)
+    );
+    if !defer_admission {
+        assert!(codec.start(turn, text.clone()).is_none());
+        f.event(ProviderEvent::Session(SessionEvent::StartTurnRefused {
+            turn,
+        }));
+    }
+    let followup_end = codec
+        .value(json!({"type":"result", "subtype":"success", "is_error":false}))
+        .unwrap();
+    for event in followup_end.events {
+        f.event(event);
+    }
+    if defer_admission {
+        assert!(f.running().is_none());
+        assert!(
+            f.controls.try_recv().is_err(),
+            "wait for the outstanding admission before retrying"
+        );
+    } else {
+        assert_eq!(f.running(), Some(next));
+        assert_eq!(
+            f.controls.try_recv().unwrap(),
+            SessionControl::StartTurn {
+                turn: next,
+                text: text.clone()
+            }
+        );
+    }
+    assert!(codec.start(next, text).is_some());
+    for event in codec
+        .value(
+            json!({"type":"assistant", "message":{"id":"queued-reply", "content":[
+        {"type":"text", "text":"actual queued reply"}]}}),
+        )
+        .unwrap()
+        .events
+    {
+        f.event(event);
+    }
+    assert_eq!(f.running(), Some(next));
+    for event in codec
+        .value(
+            json!({"type":"result", "subtype":"success", "is_error":false,
+        "user_message_uuid":next.to_string()}),
+        )
+        .unwrap()
+        .events
+    {
+        f.event(event);
+    }
+    let rows = f.loaded();
+    for id in [first, provider, next] {
+        assert!(matches!(
+            rows.turns[&id].state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ));
+    }
+    assert!(rows.items_for(f.thread).any(|item| item.turn == provider
+        && matches!(&item.body,
+        ItemBody::AssistantText { text, .. } if text == "provider followup before queued prompt")));
+    assert!(rows.items_for(f.thread).any(|item| item.turn == next
+        && matches!(&item.body,
+        ItemBody::AssistantText { text, .. } if text == "actual queued reply")));
+    assert!(f.controls.try_recv().is_err());
+}
+
+#[test]
+fn queued_prompt_does_not_take_provider_followup_result() {
+    queued_prompt_waits_for_provider_followup(false);
+}
+
+#[test]
+fn provider_end_before_pending_admission_does_not_send_duplicate_prompt() {
+    queued_prompt_waits_for_provider_followup(true);
+}
+
+#[test]
+fn refused_stopped_prompt_does_not_strand_provider_turn() {
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut f = Fixture::new(LiveState::Idle);
+    let Ok(Ack::Turn(stopped)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "pending".into(),
+    }) else {
+        panic!()
+    };
+    f.controls.try_recv().unwrap();
+    let mut codec = Codec::new(
+        NativeSessionId("owned-test".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    let provider = codec
+        .value(
+            json!({"type":"assistant", "message":{"id":"provider", "content":[
+        {"type":"text", "text":"CLI work"}]}}),
+        )
+        .unwrap();
+    let generation = provider.provider_generation.unwrap();
+    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
+        panic!()
+    };
+    assert_eq!(turn, stopped);
+    assert!(codec.interrupt_lines(turn, reason).is_empty());
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        generation,
+    }));
+    for event in provider.events {
+        f.event(event);
+    }
+    assert_eq!(f.running(), Some(generation));
+    assert!(codec.start(stopped, "pending".into()).is_none());
+    f.event(ProviderEvent::Session(SessionEvent::StartTurnRefused {
+        turn: stopped,
+    }));
+    let Ok(Ack::Turn(next)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "next".into(),
+    }) else {
+        panic!()
+    };
+    assert_eq!(f.loaded().turns[&next].state, TurnState::Queued);
+    for event in codec
+        .value(json!({"type":"result", "subtype":"success", "is_error":false}))
+        .unwrap()
+        .events
+    {
+        f.event(event);
+    }
+    assert_eq!(f.running(), Some(next));
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::StartTurn {
+            turn: next,
+            text: "next".into()
+        }
+    );
+    assert!(matches!(
+        f.loaded().turns[&stopped].state,
+        TurnState::Ended {
+            outcome: TurnOutcome::Interrupted { .. },
+            ..
+        }
+    ));
 }

@@ -422,10 +422,7 @@ fn failing_store_on_turn_ended_blocks_and_retries() {
     assert_eq!(f.loaded().requests[&req].state, RequestState::Pending);
     assert_eq!(
         f.controls.try_recv().unwrap(),
-        SessionControl::Interrupt {
-            turn: f.actor.live[&f.thread].provider_generation,
-            reason: StopReason::StorageBlocked
-        }
+        SessionControl::InterruptActive(StopReason::StorageBlocked)
     );
     assert!(matches!(
         f.drain()[0],
@@ -618,13 +615,56 @@ fn storage_failure_uses_storage_control() {
     ));
     assert_eq!(
         f.controls.try_recv().unwrap(),
-        SessionControl::Interrupt {
-            turn: f.actor.live[&f.thread].provider_generation,
-            reason: StopReason::StorageBlocked
-        }
+        SessionControl::InterruptActive(StopReason::StorageBlocked)
     );
     assert!(matches!(
         f.loaded().turns[&f.running().unwrap()].state,
         TurnState::Running { .. }
     ));
+}
+
+#[test]
+fn storage_failure_stops_session_before_provider_turn_is_registered() {
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut codec = Codec::new(
+        NativeSessionId("owned-storage-test".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    let decoded = codec
+        .value(
+            json!({"type":"assistant","message":{"id":"provider", "content":[
+        {"type":"text","text":"unregistered"}]}}),
+        )
+        .unwrap();
+    assert!(f.running().is_none());
+    f.actor.fail_write = true;
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        generation: decoded.provider_generation.unwrap(),
+    }));
+    assert!(
+        f.drain()
+            .iter()
+            .any(|e| matches!(e, UiEvent::StorageBlocked { error: Some(_) }))
+    );
+    assert!(f.running().is_none());
+    let SessionControl::InterruptActive(reason) = f.controls.try_recv().unwrap() else {
+        panic!("storage failure must stop the session's unregistered turn")
+    };
+    assert_eq!(reason, StopReason::StorageBlocked);
+    assert_eq!(
+        codec.interrupt_active(reason),
+        vec![json!({
+            "type":"control_request", "request_id":"veyra-interrupt", "request":{"subtype":"interrupt"}
+        })]
+    );
+    assert!(
+        matches!(&codec.value(json!({"type":"result", "subtype":"success", "is_error":false})).unwrap().events[..],
+            [ProviderEvent::Turn { turn: None, event: TurnEvent::TurnEnded {
+                outcome: TurnOutcome::Interrupted { reason }, ..
+            } }] if reason == StopReason::StorageBlocked.text()
+        )
+    );
 }
