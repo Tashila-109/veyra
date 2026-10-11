@@ -487,8 +487,8 @@ async fn run_one(
                     }
                     break;
                 }
-                Some(message @ (SessionControl::Interrupt | SessionControl::StorageBlocked)) => {
-                    for line in message.stop_reason().into_iter().flat_map(|reason| codec.interrupt_lines(reason)) {
+                Some(SessionControl::Interrupt(reason)) => {
+                    for line in codec.interrupt_lines(reason) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
@@ -576,23 +576,25 @@ async fn run_one(
         let _ = write_task.await;
     }
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-    let mut observed = None;
+    let mut observed = process
+        .child
+        .child
+        .as_mut()
+        .and_then(|child| child.try_wait().ok().flatten());
     let mut stderr_done = false;
-    loop {
-        if observed.is_none() {
-            observed = process
-                .child
-                .child
-                .as_mut()
-                .and_then(|child| child.try_wait().ok().flatten());
-        }
-        if stderr_done && (!stdout_closed || observed.is_some()) {
-            break;
-        }
-        tokio::select! {
-            _ = &mut stderr, if !stderr_done => { stderr_done = true; }
-            _ = tokio::time::sleep_until(deadline) => break,
-            _ = tokio::time::sleep(Duration::from_millis(50)), if stdout_closed && observed.is_none() => {}
+    if let Some(child) = process.child.child.as_mut() {
+        loop {
+            if stderr_done && (!stdout_closed || observed.is_some()) {
+                break;
+            }
+            tokio::select! {
+                _ = &mut stderr, if !stderr_done => { stderr_done = true; }
+                _ = tokio::time::sleep_until(deadline) => break,
+                status = child.wait(), if stdout_closed && observed.is_none() => {
+                    observed = status.ok();
+                    if observed.is_none() { break; }
+                }
+            }
         }
     }
     if !stderr_done {
@@ -825,6 +827,68 @@ pub async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn natural_exit_after_stdout_eof_wakes_without_a_timer() {
+        let child = ChildEnv::load()
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "read initialize; read prompt; exec 1>&- 2>&-; sleep 0.2; exit 130".into(),
+                ],
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .unwrap();
+        let pid = child.id().unwrap();
+        let process = Process {
+            child: ProcessGroup::new(child),
+            native: NativeSessionId("fixture-session".into()),
+            #[cfg(debug_assertions)]
+            recorder: None,
+        };
+        let (sender, mut control) = mpsc::unbounded_channel();
+        sender
+            .send(SessionControl::StartTurn {
+                turn: TurnId::new(),
+                text: "reply".into(),
+            })
+            .unwrap();
+        let (out, mut events) = mpsc::channel(256);
+        let task = tokio::spawn(async move {
+            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await
+        });
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        let ended = loop {
+            if let Ok(event) = events.try_recv() {
+                break Some(event);
+            }
+            if std::time::Instant::now() >= end {
+                break None;
+            }
+            tokio::task::yield_now().await;
+        };
+        tokio::time::resume();
+        task.await.unwrap();
+        assert!(!platform::group_exists(pid).unwrap());
+        let EngineMsg::Provider {
+            event:
+                ProviderEvent::Turn {
+                    event: TurnEvent::TurnEnded { outcome, .. },
+                    ..
+                },
+            ..
+        } = ended.expect("natural exit must wake the session without advancing its clock")
+        else {
+            panic!("missing end")
+        };
+        assert_eq!(
+            outcome,
+            TurnOutcome::Interrupted {
+                reason: "Stopped by exit code 130".into()
+            }
+        );
+    }
     #[tokio::test]
     async fn exit_by_signal_or_code_classifies() {
         for (script, interrupted, expected) in [
@@ -1347,7 +1411,10 @@ mod tests {
         .await
         .expect("owned child acknowledged prompt");
         let at = tokio::time::Instant::now();
-        handle.control.send(SessionControl::Interrupt).unwrap();
+        handle
+            .control
+            .send(SessionControl::Interrupt(StopReason::User))
+            .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(9), async {
             loop {
                 if matches!(

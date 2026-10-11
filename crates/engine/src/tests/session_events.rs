@@ -566,7 +566,10 @@ fn provider_stop_tail_opens_no_turn() {
         },
     ));
     assert_eq!(f.running(), Some(second));
-    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Interrupt);
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::Interrupt(StopReason::User)
+    );
     assert_eq!(
         f.controls.try_recv().unwrap(),
         SessionControl::StartTurn {

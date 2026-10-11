@@ -634,7 +634,10 @@ fn controlled_replay_with(
                     event: TurnEvent::TextDelta { text, .. }, ..
                 } if text == "partial")
                 {
-                    handle.control.send(SessionControl::Interrupt).unwrap();
+                    handle
+                        .control
+                        .send(SessionControl::Interrupt(StopReason::User))
+                        .unwrap();
                     interrupted = true;
                 }
                 let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
@@ -1048,7 +1051,10 @@ fn request_replay(
                     }
                     requests += 1;
                     if stop_after == Some(requests) {
-                        handle.control.send(SessionControl::Interrupt).unwrap();
+                        handle
+                            .control
+                            .send(SessionControl::Interrupt(StopReason::User))
+                            .unwrap();
                     }
                 }
                 let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
@@ -1202,7 +1208,10 @@ for line in sys.stdin:
                 ) {
                     ends += 1;
                     if ends == 1 {
-                        handle.control.send(SessionControl::Interrupt).unwrap();
+                        handle
+                            .control
+                            .send(SessionControl::Interrupt(StopReason::User))
+                            .unwrap();
                         handle
                             .control
                             .send(SessionControl::StartTurn {

@@ -233,7 +233,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .gap(t.space.0[3])
                                         .child(
                                             labelled_button("deny", "Deny", cx)
-                                                .child(shortcut_chip::<Deny>(cx))
+                                                .when(shell.dock_focused, |button| {
+                                                    button.child(shortcut_chip::<Deny>(cx))
+                                                })
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(Box::new(Deny), cx)
                                                 }),
@@ -248,7 +250,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     ),
                                                     cx,
                                                 )
-                                                .child(shortcut_chip::<AllowInThread>(cx))
+                                                .when(shell.dock_focused, |button| {
+                                                    button.child(shortcut_chip::<AllowInThread>(cx))
+                                                })
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(
                                                         Box::new(AllowInThread),
@@ -260,12 +264,29 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .child(
                                             labelled_button("allow-once", "Allow once", cx)
                                                 .primary()
-                                                .child(shortcut_chip::<AllowOnce>(cx))
+                                                .when(shell.dock_focused, |button| {
+                                                    button.child(shortcut_chip::<AllowOnce>(cx))
+                                                })
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(Box::new(AllowOnce), cx)
                                                 }),
                                         ),
-                                );
+                                )
+                                .when(!shell.dock_focused, |dock| {
+                                    dock.child(
+                                        labelled_button(
+                                            "focus-approval",
+                                            "Focus to use shortcuts",
+                                            cx,
+                                        )
+                                        .child(shortcut_chip::<FocusDock>(cx))
+                                        .on_click(
+                                            |_, window, cx| {
+                                                window.dispatch_action(Box::new(FocusDock), cx)
+                                            },
+                                        ),
+                                    )
+                                });
                         }
                         RequestKind::Question { questions } => {
                             let index = shell

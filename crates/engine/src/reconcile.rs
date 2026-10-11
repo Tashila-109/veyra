@@ -21,7 +21,7 @@ pub fn decide(p: &Projection, now: Millis) -> ChangeSet {
                 &mut c,
                 t.clone(),
                 TurnOutcome::Interrupted {
-                    reason: "Veyra closed while this turn ran".into(),
+                    reason: crate::provider::StopReason::AppClosing.text().into(),
                 },
                 now,
             );

@@ -117,6 +117,11 @@ macOS termination does not promise Rust destructors, so verification explicitly 
 It receives typed messages through a 256-slot tokio channel.
 A timer sends Tick every five seconds; text uses separate flush and write messages.
 The actor never waits for provider I/O.
+The actor trims stored tool output to its last 10,000 characters.
+The actor publishes window thread wait reasons and busy flags after reconciliation, then updates only threads whose thread, turn, request or live rows changed.
+Engine::window_threads reads that snapshot.
+The live::busy predicate defines a busy thread, and live::busy_threads supplies the shared walk for shutdown holds and needs_awake.
+Every actor message is timed, and a message over 50 ms logs its kind and duration.
 `actor_no_blocking_io` scans actor.rs, store.rs and commands.rs for direct filesystem, process-spawn and thread-sleep calls; indirect platform calls such as keep-awake are outside that textual guard.
 
 `commands::decide` reads rows and runtime state, then produces a `ChangeSet` of row changes, events and effects.
@@ -167,9 +172,9 @@ The composer's Stop button, Ctrl+C and Send with an empty draft during a running
 The sidebar's StopThread action sends the engine's StopThread command.
 Respond, Continue and DiscardQueued also have window controls.
 Archive has no window control, and task cards remain unimplemented.
-On a Starting thread, Stop, Archive and Interrupt send Shutdown and wait in Stopping for Exited.
+On a Starting thread, StopThread, Archive and Interrupt send Shutdown and wait in Stopping for Exited.
 The session receives that control before stdout; if the child has not launched yet it stops the group once launch returns and emits no Ready.
-A Ready from an already-running initialization is ignored after the actor leaves Starting.
+A Ready that arrives after StopThread, Archive or Interrupt has moved the thread to Stopping is dropped because Stopping holds no session.
 On a running Structured thread, those controls end the engine turn with Interrupted and "Stopped by you", keep its session and send the protocol interrupt.
 `Live::Structured.draining` keeps that ended turn's id until its own CLI end arrives.
 Queued work with no hold waits with `WaitReason::Stopping` during the drain.
@@ -178,25 +183,28 @@ With no queued turn it clears the hold, so a Send after Stop waits with WaitReas
 Continue clears a hold without adding a turn.
 An uncorrelated tail from a drained Provider-origin turn is logged and dropped before it can open another turn.
 The old CLI end clears the drain; the same change applies the start rule, which still refuses Stopping sessions.
-Stop and Archive also discard queued user and task turns and set a Stopped hold, while Interrupt keeps them and sets an Interrupted hold.
+StopThread and Archive also discard queued user and task turns and set a Stopped hold, while Interrupt keeps them and sets an Interrupted hold.
 All three preserve an existing hold.
 Tasks cannot arise through the application because the tool server is not implemented.
 `can_use_tool` opens a typed approval or AskUserQuestion request.
 Unknown subtypes and malformed requests receive an error response without opening a request.
-Malformed includes empty tool names or ids, ids reused within the process lifetime, non-object input, missing question text or option labels, and duplicate question texts.
+Malformed includes empty tool names or ids, ids reused within that CLI process lifetime, non-object input, missing question text or option labels, and duplicate question texts.
 A pending request makes the thread NeedsYou and docks its exact command or question above the composer.
 AllowOnce, AllowInThread and Deny answer approvals; AnswerQuestion collects one answer per question.
 Only an input whose keys are command, description or timeout may offer an exact-command thread grant.
 Inputs with any other field always dock without a grant offer.
 The dock shows 1 of N for multiple pending requests.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
+Approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
+Requests never take focus automatically, and answering a question keeps dock focus while another request remains.
 The focused dock has an accent border.
-Stop expires pending requests, and the provider queues cancel replies before interrupt.
+StopThread and Interrupt expire pending requests, and the provider queues cancel replies before interrupt.
 There is no automatic request timeout.
 Respond persists an answer before dispatching the native reply; question answers also add a user transcript item.
 The command and codec boundaries share RequestKind::accepts, whose accepted decision carries the matching grant or question/answer rows.
 A mismatched codec answer sends nothing and leaves its request pending.
-The codec keeps used native request ids for the process lifetime so delayed replies cannot authorize a later request.
+The codec keeps used native request ids for the life of that CLI process so delayed replies cannot authorize a later request.
+A respawn starts a new codec; exit expires the engine's pending rows, and the old session's answer channel cannot reach the new process.
 AllowInThread stores the exact thread, tool and command in grants, and a later identical request is allowed without RequestOpened.
 Other commands, tools and threads still dock, including compound commands and requests in Full access.
 Turn completion and process exit expire pending requests and publish RequestClosed in the same transaction.
@@ -254,7 +262,8 @@ Each accepted stdout line is parsed once and its value passes through recording,
 The bounded stderr tail is redacted before display and supplies failures when the CLI exits unexpectedly.
 Interrupt and Shutdown queue deny replies for every open approval and question with `interrupt: true` before the protocol interrupt.
 The codec owns an active turn's interrupt ladder and both deadlines: group SIGTERM after three seconds, then SIGKILL one second later.
-Typed StopReason values distinguish user, storage-blocked and app-closing interruptions.
+SessionControl::Interrupt carries a typed StopReason for user or storage-blocked interruptions.
+Shutdown and startup recovery use StopReason::AppClosing for their shared turn-end reason.
 An ended turn ignores a late interrupt, and both a turn end and a new prompt clear the old ladder.
 Human interrupts use "Stopped by you"; storage and shutdown carry their own reasons.
 A session without a turn never arms that ladder.
@@ -265,7 +274,7 @@ A group still present after the final cleanup deadline produces a bounded warnin
 The normal session path discards other cleanup errors.
 A supervisor waits for registered cleanup even if the session task panics.
 The actor stores pid and group on Ready and parks on Exited.
-After Stop, Archive or Interrupt it only parks.
+After StopThread, Archive or Interrupt it only parks.
 
 `claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, request references and background-work replacement.
 Unknown protocol metadata logs its category without frame content, and unsupported or malformed control requests get an error reply.
@@ -278,7 +287,7 @@ Assistant error words latch per prompt, and account-related classes park the pro
 An active Veyra interrupt overrides that error outcome and suppresses newly arriving diagnostic text, including streamed blocks.
 Without an active Veyra interruption or latched assistant error, externally observed SIGHUP, SIGINT, SIGTERM or conventional signal exit codes produce Interrupted.
 Cleanup-generated signals do not change the outcome.
-After stdout EOF, the session polls try_wait during the existing 500 ms stderr drain to observe the natural leader status before signalling cleanup.
+After stdout EOF, the session awaits child.wait alongside stderr completion under the existing 500 ms deadline to observe the natural leader status before signalling cleanup.
 It publishes a synthesized turn end before awaiting group cleanup, so post-KILL waits cannot extend the interrupt boundary beyond five seconds.
 Exited still follows cleanup, and the actor starts no queued work before Exited.
 Other abnormal exits produce Failed with Veyra's bounded, redacted crash text.
@@ -289,6 +298,16 @@ Unknown or finished child parents are ignored, and snapshots retain a running to
 Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
+
+## Platform and keep-awake
+
+The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals, process inspection, idle-sleep assertions and Terminal opening.
+Each agent and probe spawn attempts to set group nice 10 and logs failure while continuing.
+The actor attempts to hold one caffeinate guard while any thread is Starting, has a running turn or has non-ambient background work.
+An assertion-helper spawn failure is logged without stopping work.
+The pure needs_awake predicate controls that guard, whose drop stops its owned caffeinate child.
+Platform module selection rejects unsupported targets with compile_error.
+The textual platform_boundary test is a guard, not proof against every indirect OS call; review still checks indirect commands and strings.
 
 ## Readiness, fixtures and recording
 
@@ -376,10 +395,6 @@ A user scroll detaches following; new text, requests and tool rows preserve that
 Scrolling within text.read.line_height of the bottom or choosing Latest reattaches.
 Latest appears only while following is detached and content remains below.
 Expanding a row remeasures it without moving its top anchor.
-The actor trims stored tool output to its last 10,000 characters.
-The actor publishes window thread wait reasons and busy flags after reconciliation, then updates only threads whose thread, turn, request or live rows changed.
-Engine::window_threads reads that snapshot.
-The live::busy predicate is shared by quit-sheet publication, shutdown holds and keep-awake.
 Streamed text and tool input remain unbounded outside the 4 MiB wire-line cap.
 The failed view uses the latest nonqueued turn and shows the cause, next step, Retry and Open Terminal on the project folder.
 Retry probes again; once the thread's provider is Ready it clears any hold and resends the failed turn's own user item as a new turn.
@@ -450,20 +465,12 @@ Captures require the owned window to remain on-screen and frontmost; the guard p
 Cleanup checks owned app pids, provider groups and same-user parent markers without printing arguments before removing scratch.
 Release proof uses a disposable HOME and restricted PATH, scans driver/override strings and checks a socket-free window.
 Only one owned Veyra window exists during that release check; it takes no PNG.
-The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals, process inspection, idle-sleep assertions and Terminal opening.
-Each agent and probe spawn attempts to set group nice 10 and logs failure while continuing.
-The actor attempts to hold one caffeinate guard while any thread is Starting, has a running turn or has non-ambient background work.
-An assertion-helper spawn failure is logged without stopping work.
-The pure needs_awake predicate controls that guard, whose drop stops its owned caffeinate child.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, repaints and max_batch_events.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
-Every actor message is timed, and a message over 50 ms logs its kind and duration.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
-Platform module selection rejects unsupported targets with compile_error.
-The textual platform_boundary test is a guard, not proof against every indirect OS call; review still checks indirect commands and strings.
 
 ## Source map
 
@@ -494,14 +501,14 @@ Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ord
 Application tests enable gpui test-support to exercise Shell selection and its event pump in a synthetic window.
 Shell tests load the login-shell PATH as the app does and run the startup orphan sweep.
 Their current-thread runtimes do not drive readiness tasks before replacing the probes, so those tests start no provider check.
-The native-quit test is also verified with an executable stand-in whose access time remains unchanged.
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence, header-branch clearing and cleanup.
 Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.
 Permission-matrix records separately authorized live permission checks.
 Their Status lines record the lead's acceptance, independently of the recipes.
 The release page scans driver/override strings with a debug positive control and runs a socket-free release window.
-The ignored live test requires fresh human consent; it is not a workspace-test live invocation.
+The ignored live tests require fresh human consent; workspace tests compile them without running a provider.
+live_claude_approval_round_trip uses the public engine in Ask first to check an exact Bash request, Deny without a file, and AllowOnce on a repeat with the file created.
 Actor tests check account-error retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.
 Live CLI behavior and performance need their authorized lanes; fake replay and structural checks cannot establish them.
 Real provider permission behavior, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.

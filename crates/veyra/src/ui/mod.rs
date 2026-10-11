@@ -892,7 +892,7 @@ impl Shell {
         }
         let text = self.input.read(cx).value().to_string();
         if text.trim().is_empty() && self.view.chat().is_some_and(|thread| self.running(thread)) {
-            self.stop(window, cx);
+            window.dispatch_action(Box::new(Stop), cx);
             return;
         }
         if text.trim().is_empty() {
@@ -959,10 +959,14 @@ impl Shell {
         }
     }
     fn answer_question(&mut self, option: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.view.chat() else {
+            return;
+        };
         let request = self
-            .view
-            .chat()
-            .and_then(|thread| self.state.pending_requests(thread).first().copied())
+            .state
+            .pending_requests(thread)
+            .first()
+            .copied()
             .cloned();
         let Some(Request {
             id,
@@ -1004,7 +1008,9 @@ impl Shell {
                 window,
                 cx,
             );
-            self.input.update(cx, |input, cx| input.focus(window, cx));
+            if self.state.pending_requests(thread).len() == 1 {
+                self.input.update(cx, |input, cx| input.focus(window, cx));
+            }
         }
         cx.notify();
     }
@@ -1812,12 +1818,256 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::{AppState, provider_rows};
+    use gpui::{
+        AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+        Styled, Window, div,
+    };
     use std::collections::BTreeMap;
     use veyra_engine::{
         domain::*,
         events::{ChangeEvent, ThreadSnapshot, UiEvent},
         provider::{Probe, ProviderKind, Readiness},
     };
+
+    fn draw(cx: &mut gpui::VisualTestContext) {
+        for _ in 0..2 {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        }
+        cx.run_until_parked();
+    }
+
+    fn with_docked_shell(
+        cx: &mut gpui::TestAppContext,
+        check: impl FnOnce(
+            Entity<super::Shell>,
+            &mut gpui::VisualTestContext,
+            std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        ),
+    ) {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        struct ActionCapture {
+            shell: Entity<super::Shell>,
+            stopped: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+        impl Render for ActionCapture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let stopped = self.stopped.clone();
+                let allowed = self.stopped.clone();
+                let denied = self.stopped.clone();
+                div()
+                    .size_full()
+                    .capture_action(move |_: &super::Stop, _, _| {
+                        stopped.borrow_mut().push("Stop");
+                    })
+                    .capture_action(move |_: &super::AllowOnce, _, _| {
+                        allowed.borrow_mut().push("AllowOnce");
+                    })
+                    .capture_action(move |_: &super::Deny, _, _| {
+                        denied.borrow_mut().push("Deny");
+                    })
+                    .child(self.shell.clone())
+            }
+        }
+        let scratch = Scratch(
+            std::path::PathBuf::from("/tmp").join(format!("veyra-dock-{}", ThreadId::new())),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = veyra_engine::Engine::start(
+            runtime.handle(),
+            veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+        )
+        .unwrap();
+        runtime.block_on(engine.shutdown_wait());
+        let (_, events) = tokio::sync::mpsc::unbounded_channel();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::actions::init(cx);
+        });
+        let stopped = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(super::Appearance::Dark, window, cx);
+            let shell = cx.new(|cx| {
+                let mut shell = super::Shell::new(
+                    engine,
+                    runtime.handle().clone(),
+                    events,
+                    scratch.0.clone(),
+                    window,
+                    cx,
+                );
+                shell.probes = Default::default();
+                shell.providers = vec![Probe {
+                    provider: ProviderKind::Claude,
+                    path: None,
+                    version: None,
+                    readiness: Readiness::Ready,
+                    models: vec![],
+                    account: None,
+                }];
+                let thread = ThreadId::new();
+                let turn = TurnId::new();
+                shell.view = super::MainView::Chat(thread);
+                shell.state.turns.insert(
+                    turn,
+                    Turn {
+                        id: turn,
+                        thread,
+                        ordinal: 1,
+                        origin: TurnOrigin::Provider,
+                        state: TurnState::Running { since: 0 },
+                    },
+                );
+                shell.state.requests = (0..2)
+                    .map(|index| Request {
+                        id: RequestId::new(),
+                        thread,
+                        turn,
+                        native: NativeRequestRef(format!("question-{index}")),
+                        state: RequestState::Pending,
+                        kind: RequestKind::Question {
+                            questions: vec![Question {
+                                text: "Choose a route".into(),
+                                options: vec!["Short".into(), "Long".into()],
+                            }],
+                        },
+                    })
+                    .collect();
+                shell.input.update(cx, |input, cx| input.focus(window, cx));
+                shell
+            });
+            ActionCapture {
+                shell,
+                stopped: stopped.clone(),
+            }
+        });
+        let shell = view.read_with(cx, |view, _| view.shell.clone());
+        cx.run_until_parked();
+        draw(cx);
+        shell.update_in(cx, |shell, window, cx| {
+            shell.input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        draw(cx);
+        cx.update(|window, _| window.activate_window());
+        draw(cx);
+        check(shell, cx, stopped);
+    }
+
+    #[gpui::test]
+    fn empty_send_dispatches_stop_action(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, stopped| {
+            shell.update_in(cx, |shell, window, cx| shell.send(window, cx));
+            cx.run_until_parked();
+            draw(cx);
+            assert_eq!(
+                stopped.borrow().as_slice(),
+                ["Stop"],
+                "empty Send must reach the window's Stop action"
+            );
+            cx.dispatch_action(super::Stop);
+            cx.run_until_parked();
+            draw(cx);
+            assert_eq!(stopped.borrow().as_slice(), ["Stop", "Stop"]);
+        });
+    }
+
+    #[gpui::test]
+    fn approval_chips_follow_keyboard_focus(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, stopped| {
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        tool: "Bash".into(),
+                        command: "touch veyra-check.txt".into(),
+                    },
+                    grant_key: None,
+                };
+                cx.notify();
+            });
+            cx.run_until_parked();
+            draw(cx);
+            assert!(
+                cx.debug_bounds("veyra::AllowOnce").is_none(),
+                "composer Return does not allow"
+            );
+            assert!(
+                cx.debug_bounds("veyra::Deny").is_none(),
+                "composer period does not deny"
+            );
+            assert!(cx.debug_bounds("veyra::FocusDock").is_some());
+            cx.simulate_keystrokes("secondary-enter");
+            cx.run_until_parked();
+            draw(cx);
+            assert_eq!(stopped.borrow().as_slice(), ["Stop"]);
+            cx.simulate_keystrokes("secondary-.");
+            draw(cx);
+            assert_eq!(stopped.borrow().as_slice(), ["Stop"]);
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
+            assert!(cx.debug_bounds("veyra::AllowOnce").is_some());
+            assert!(cx.debug_bounds("veyra::Deny").is_some());
+            assert!(cx.debug_bounds("veyra::FocusDock").is_none());
+            cx.simulate_keystrokes("secondary-enter");
+            cx.run_until_parked();
+            draw(cx);
+            assert_eq!(stopped.borrow().as_slice(), ["Stop", "AllowOnce"]);
+            cx.simulate_keystrokes("secondary-.");
+            draw(cx);
+            assert_eq!(stopped.borrow().as_slice(), ["Stop", "AllowOnce", "Deny"]);
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            draw(cx);
+            assert!(!shell.read_with(cx, |shell, _| shell.dock_focused));
+            assert!(cx.debug_bounds("veyra::AllowOnce").is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn answering_one_of_several_requests_keeps_dock_focus(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _| {
+            cx.simulate_keystrokes("secondary-shift-y");
+            cx.run_until_parked();
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
+            cx.simulate_keystrokes("1");
+            cx.run_until_parked();
+            draw(cx);
+            assert!(
+                shell.read_with(cx, |shell, _| shell.dock_focused),
+                "another request still needs the dock"
+            );
+            shell.update(cx, |shell, cx| {
+                shell.state.requests[0].state =
+                    RequestState::Answered(Decision::Answers(vec![Answer {
+                        text: "Short".into(),
+                    }]));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            draw(cx);
+            cx.simulate_keystrokes("1");
+            cx.run_until_parked();
+            draw(cx);
+            assert!(
+                !shell.read_with(cx, |shell, _| shell.dock_focused),
+                "last answer returns to composer"
+            );
+            assert!(shell.read_with(cx, |shell, _| shell.question_draft.is_none()));
+        });
+    }
 
     #[gpui::test]
     fn native_app_quit_closes_engine_without_quit_action(cx: &mut gpui::TestAppContext) {

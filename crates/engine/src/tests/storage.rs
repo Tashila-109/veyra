@@ -382,7 +382,7 @@ fn failing_store_on_turn_ended_blocks_and_retries() {
     assert_eq!(f.loaded().requests[&req].state, RequestState::Pending);
     assert_eq!(
         f.controls.try_recv().unwrap(),
-        SessionControl::StorageBlocked
+        SessionControl::Interrupt(StopReason::StorageBlocked)
     );
     assert!(matches!(
         f.drain()[0],
@@ -575,7 +575,7 @@ fn storage_failure_uses_storage_control() {
     ));
     assert_eq!(
         f.controls.try_recv().unwrap(),
-        SessionControl::StorageBlocked
+        SessionControl::Interrupt(StopReason::StorageBlocked)
     );
     assert!(matches!(
         f.loaded().turns[&f.running().unwrap()].state,

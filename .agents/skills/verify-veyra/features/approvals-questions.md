@@ -14,11 +14,14 @@ Status: not run, 2026-10-11, pending, all
 In Ask first, ask for `touch veyra-check.txt`.
 The request docks above the input, with the command and its consequence.
 Deny is ⌘., Allow once is ⌘↵ and Allow in this thread is ⌘⌥↵ while the dock has focus.
-Press ⌘⇧Y to FocusDock; composer ⌘↵ sends its draft and leaves the request pending.
+The dock shows its answer chords only while focused; otherwise it shows ⌘⇧Y to FocusDock.
+Requests do not take focus automatically.
+Composer ⌘↵ sends a nonempty draft and leaves the request pending; an empty draft during a turn dispatches Stop.
 Every button's shortcut_chip reads the same bindings table as the keymap.
 A question shows its options; click Use number keys or press ⌘⇧Y to FocusDock.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
 More than one pending request shows 1 of N.
+Answering one keeps dock focus while another request remains.
 NextNeedsYou uses ⌘⇧J pending the operator's chord decision.
 
 ## Driving it with veyra ctl
@@ -44,6 +47,8 @@ assert dock['composer']['dock']['request']['kind']['Approval']['action']['comman
 assert dock['selected_thread']['status'] == 'NeedsYou'
 capture('approval-deny')
 action('approval-deny-focus','FocusDock')
+poll('approval-deny-focused',lambda d: d['composer']['dock']['focused'])
+capture('approval-deny-focused')
 ctl('approval-deny-key','keys','secondary-.')
 ctl('approval-deny-done','wait',thread,'Done')
 assert not check.exists()
@@ -63,6 +68,8 @@ assert pending['composer']['dock'] is not None and not pending['composer']['dock
 assert sql("select state from requests where thread_id='"+thread+"'") == 'pending'
 assert sql("select count(*) from turns where thread_id='"+thread+"' and state='queued'") == '1'
 action('approval-allow-focus','FocusDock')
+poll('approval-allow-focused',lambda d: d['composer']['dock']['focused'])
+capture('approval-allow-focused')
 ctl('approval-allow-key','keys','secondary-enter')
 poll('approval-allow-done',lambda d: d['selected_thread']['status']=='Done'
     and sql("select count(*) from turns where thread_id='"+thread+"' and state='ended'") == '2')
@@ -112,8 +119,9 @@ assert both['composer']['dock']['position']==1
 capture('question-two')
 action('question-two-focus','FocusDock')
 ctl('question-two-first','keys','1')
-poll('question-two-next',lambda d: d['composer']['dock'] is not None and d['composer']['dock']['count']==1)
-action('question-two-refocus','FocusDock')
+next_request = poll('question-two-next',lambda d: d['composer']['dock'] is not None and d['composer']['dock']['count']==1)
+assert next_request['composer']['dock']['focused'], 'answer lost focus with another request pending'
+capture('question-two-next')
 ctl('question-two-second','keys','1')
 result = ctl('question-two-done','wait',two,'Done')
 save('questions-done',result)
@@ -128,12 +136,14 @@ PY
 
 ## Observable success
 
-The approval PNGs show the exact command, consequence and chord chips.
+The unfocused approval PNGs show the exact command, consequence and FocusDock chord.
+The focused approval PNGs show Allow once, Deny and their answer chords, matching the keys driven in those states.
 The project file stays absent after Deny and exists after Allow once.
 SQLite records one grant and three requests, showing the identical granted request never docked.
 `approval-composer-pending.json` and SQLite prove composer Send leaves approval Pending and queues the draft.
 `question-focused.json`, the digit commands and the changed focused PNG prove focus isolation and its accent border.
-`question-two.png` shows 1 of 2; `questions-done.json` and SQLite show both answered.
+`question-two.png` shows 1 of 2; `question-two-next.json` and its PNG show the remaining request still focused.
+The next digit answers it without refocusing; `questions-done.json` and SQLite show both answered.
 `composer.dock`, `requests`, `selected_thread.status` and `transcript.items` are the observable window state.
 
 ## Gotchas

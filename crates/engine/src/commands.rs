@@ -2,7 +2,7 @@ use crate::{
     domain::*,
     events::{ChangeEvent as Ev, ChangeSet, Effect},
     live::{AfterStop, Live, LiveThread, can_start, park_due},
-    provider::{ProviderKind, SessionControl},
+    provider::{ProviderKind, SessionControl, StopReason},
     store::StoreError,
 };
 use std::{collections::BTreeMap, path::PathBuf};
@@ -290,8 +290,8 @@ fn interrupt(
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
             drain_running(p, l, c, thread);
-            end_running(p, c, thread, crate::provider::StopReason::User, now);
-            control(c, thread, SessionControl::Interrupt);
+            end_running(p, c, thread, StopReason::User, now);
+            control(c, thread, SessionControl::Interrupt(StopReason::User));
         }
         Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
         Live::Parked | Live::Structured { .. } | Live::Stopping { .. } => {}
@@ -572,7 +572,7 @@ fn stop_one(
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
             drain_running(p, l, c, thread);
-            control(c, thread, SessionControl::Interrupt);
+            control(c, thread, SessionControl::Interrupt(StopReason::User));
         }
         Live::Terminal { .. } => {
             c.effects.push(Effect::StopTerminal { thread });
@@ -585,7 +585,7 @@ fn stop_one(
         }
         Live::Parked | Live::Structured { .. } => {}
     }
-    end_running(p, c, thread, crate::provider::StopReason::User, now);
+    end_running(p, c, thread, StopReason::User, now);
     drop_turns(p, c, thread, false, now);
     set_hold(p, c, thread, Some(HoldReason::Stopped));
 }

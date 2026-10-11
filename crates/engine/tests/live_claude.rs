@@ -9,27 +9,7 @@ use veyra_engine::{
 #[test]
 #[ignore = "requires the human's consent for a live Claude turn"]
 fn live_claude_ok_reply() {
-    let markers: Vec<_> = std::env::vars_os()
-        .filter_map(|(key, _)| {
-            let name = key.to_string_lossy();
-            ((name.starts_with("CLAUDE_CODE_") && !name.starts_with("CLAUDE_CODE_USE_"))
-                || [
-                    "CLAUDE_PID",
-                    "CLAUDE_EFFORT",
-                    "CLAUDECODE",
-                    "CLAUDE_AGENT_SDK_VERSION",
-                ]
-                .contains(&name.as_ref()))
-            .then_some(key)
-        })
-        .collect();
-    if !markers.is_empty() {
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--ignored", "--exact", "live_claude_ok_reply"]);
-        for marker in markers {
-            command.env_remove(marker);
-        }
-        assert!(command.status().unwrap().success());
+    if rerun_without_session_markers("live_claude_ok_reply") {
         return;
     }
     let cwd = std::env::temp_dir().join(format!("veyra-live-{}", ThreadId::new()));
@@ -100,4 +80,129 @@ fn live_claude_ok_reply() {
     });
     drop(runtime);
     fs::remove_dir_all(cwd).unwrap();
+}
+
+fn rerun_without_session_markers(test: &str) -> bool {
+    let markers: Vec<_> = std::env::vars_os()
+        .filter_map(|(key, _)| {
+            let name = key.to_string_lossy();
+            ((name.starts_with("CLAUDE_CODE_") && !name.starts_with("CLAUDE_CODE_USE_"))
+                || [
+                    "CLAUDE_PID",
+                    "CLAUDE_EFFORT",
+                    "CLAUDECODE",
+                    "CLAUDE_AGENT_SDK_VERSION",
+                ]
+                .contains(&name.as_ref()))
+            .then_some(key)
+        })
+        .collect();
+    if !markers.is_empty() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--ignored", "--exact", test]);
+        for marker in markers {
+            command.env_remove(marker);
+        }
+        assert!(command.status().unwrap().success());
+        return true;
+    }
+    false
+}
+
+#[test]
+#[ignore = "requires the human's consent for live Claude approval turns"]
+fn live_claude_approval_round_trip() {
+    use veyra_engine::{
+        Engine,
+        commands::{Ack, Command},
+        data_dir::DataDir,
+        events::{ChangeEvent, UiEvent},
+    };
+    if rerun_without_session_markers("live_claude_approval_round_trip") {
+        return;
+    }
+    for name in [
+        "VEYRA_CLAUDE_BIN",
+        "VEYRA_FAKE_FIXTURES",
+        "VEYRA_FAKE_FIXTURE",
+    ] {
+        assert!(
+            std::env::var_os(name).is_none(),
+            "live approval test requires the real Claude binary"
+        );
+    }
+    let root = std::env::temp_dir().join(format!("veyra-live-approval-{}", ThreadId::new()));
+    let cwd = root.join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let engine = Engine::start(runtime.handle(), DataDir::at(root.join("data")).unwrap()).unwrap();
+    let run = async {
+        let mut events = engine.subscribe();
+        tokio::time::timeout(Duration::from_secs(180), async {
+            let Ack::Project(project) = engine.send(Command::AddProject { path: cwd.clone() }).await.unwrap().unwrap()
+                else { panic!("missing project") };
+            let prompt = "Use Bash to run exactly `touch veyra-check.txt` in the current project folder. \
+                Do not use another tool or command. If denied, do not retry; end this turn.";
+            let Ack::Thread(thread) = engine.send(Command::CreateThread { project, provider: ProviderKind::Claude,
+                config: ThreadConfig { model: None, effort: None, mode: PermissionMode::AskFirst },
+                text: prompt.into() }).await.unwrap().unwrap() else { panic!("missing thread") };
+            for decision in [Decision::Deny, Decision::AllowOnce] {
+                if decision == Decision::AllowOnce {
+                    assert!(matches!(engine.send(Command::Send { thread, text: prompt.into() })
+                        .await.unwrap().unwrap(), Ack::Turn(_)));
+                }
+                let mut request = None;
+                let mut needs_you = false;
+                while request.is_none() || !needs_you {
+                    match events.recv().await.expect("engine event stream ended") {
+                        UiEvent::Change { event: ChangeEvent::RequestOpened(row), .. } if row.thread == thread => {
+                            assert!(matches!(&row.kind, RequestKind::Approval { action, .. }
+                                if action.tool == "Bash" && action.command == "touch veyra-check.txt"));
+                            assert_eq!(row.state, RequestState::Pending);
+                            request = Some(row);
+                        }
+                        UiEvent::Change { event: ChangeEvent::ThreadStatusChanged { thread: id, status }, .. }
+                            if id == thread => { needs_you = status == Status::NeedsYou; }
+                        UiEvent::Change { event: ChangeEvent::TurnEnded(row), .. } if row.thread == thread => {
+                            panic!("Claude ended before docking the exact command: {:?}", row.state);
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(!cwd.join("veyra-check.txt").exists(), "command ran before approval");
+                let request = request.unwrap();
+                assert_eq!(engine.send(Command::Respond { request: request.id, decision: decision.clone() })
+                    .await.unwrap().unwrap(), Ack::Applied);
+                let mut answered = false;
+                loop {
+                    match events.recv().await.expect("engine event stream ended") {
+                        UiEvent::Change { event: ChangeEvent::RequestClosed(row), .. } if row.id == request.id => {
+                            assert_eq!(row.state, RequestState::Answered(decision.clone()));
+                            answered = true;
+                        }
+                        UiEvent::Change { event: ChangeEvent::TurnEnded(row), .. } if row.id == request.turn => {
+                            assert!(matches!(row.state, TurnState::Ended { outcome: TurnOutcome::Completed, .. }));
+                            assert!(answered);
+                            break;
+                        }
+                        UiEvent::Change { event: ChangeEvent::RequestOpened(_), .. } => {
+                            panic!("Claude requested another tool after the approval decision");
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(cwd.join("veyra-check.txt").is_file(), decision == Decision::AllowOnce);
+            }
+        })
+        .await
+        .unwrap();
+    };
+    let check = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(run)));
+    runtime.block_on(engine.shutdown_wait());
+    drop(engine);
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+    if let Err(error) = check {
+        std::panic::resume_unwind(error);
+    }
 }

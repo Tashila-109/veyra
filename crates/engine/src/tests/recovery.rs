@@ -196,7 +196,10 @@ fn command_requeues_wake(command: impl Fn(ThreadId) -> Command, archived: bool) 
             delivery: Delivery::Pending { wake: replacement }
         }
     );
-    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Interrupt);
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::Interrupt(StopReason::User)
+    );
     f.event(turn_event(
         Some(wake),
         TurnEvent::TurnEnded {
@@ -634,7 +637,10 @@ fn interrupt_expires_pending_requests() {
         f.loaded().requests[&req].state,
         RequestState::Expired { .. }
     ));
-    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Interrupt);
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::Interrupt(StopReason::User)
+    );
 }
 #[test]
 fn stop_expires_pending_requests() {
@@ -645,7 +651,10 @@ fn stop_expires_pending_requests() {
         f.loaded().requests[&req].state,
         RequestState::Expired { .. }
     ));
-    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Interrupt);
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::Interrupt(StopReason::User)
+    );
 }
 #[test]
 fn hold_reason_names_its_command() {

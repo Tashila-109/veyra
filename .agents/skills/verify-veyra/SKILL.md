@@ -387,6 +387,8 @@ Items include `outcome`, queued `wait_reason` and a tool's `failed_last_line`.
 `selected_thread.hold` and `wait_reason` describe held work.
 `composer.discard_queued_visible` reports the held queue control.
 `composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
+Approval answer chords appear only with dock focus; otherwise its hint shows the FocusDock chord.
+Answering one request keeps dock focus while requests remain.
 `notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
 `composer.provider_picker_open` reports the picker opened by `OpenProviderPicker` or ⌘⌥⇧P.
@@ -436,7 +438,8 @@ required = {
     'chat-send-stream':['chat-working.json','chat-working.png','chat-done.json','chat-done.png',
         'chat-failed.json','chat-failed.png','chat-provider-done.json','chat-background-working.json'],
     'approvals-questions':['approval-deny.png','approval-allow.png','question.png','question-two.png',
-        'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png'],
+        'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png',
+        'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json'],

@@ -33,16 +33,15 @@ pub enum SessionControl {
         turn: TurnId,
         text: String,
     },
-    Interrupt,
-    StorageBlocked,
+    Interrupt(StopReason),
     Answer {
         native: NativeRequestRef,
         reply: Reply,
     },
     Shutdown,
 }
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum StopReason {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
     User,
     StorageBlocked,
     AppClosing,
@@ -53,16 +52,6 @@ impl StopReason {
             Self::User => "Stopped by you",
             Self::StorageBlocked => "Stopped because the database is blocked",
             Self::AppClosing => "Veyra closed while this turn ran",
-        }
-    }
-}
-impl SessionControl {
-    pub(crate) fn stop_reason(&self) -> Option<StopReason> {
-        match self {
-            Self::Interrupt => Some(StopReason::User),
-            Self::StorageBlocked => Some(StopReason::StorageBlocked),
-            Self::Shutdown => Some(StopReason::AppClosing),
-            Self::StartTurn { .. } | Self::Answer { .. } => None,
         }
     }
 }

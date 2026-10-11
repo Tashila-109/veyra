@@ -66,8 +66,14 @@ pub fn needs_awake(
     projection: &crate::domain::Projection,
     live: &std::collections::BTreeMap<crate::domain::ThreadId, LiveThread>,
 ) -> bool {
+    busy_threads(projection, live).next().is_some()
+}
+pub(crate) fn busy_threads<'a>(
+    projection: &'a crate::domain::Projection,
+    live: &'a std::collections::BTreeMap<crate::domain::ThreadId, LiveThread>,
+) -> impl Iterator<Item = crate::domain::ThreadId> + 'a {
     let changes = crate::events::ChangeSet::default();
-    projection.threads.keys().any(|&id| {
+    projection.threads.keys().copied().filter(move |&id| {
         changes
             .view(projection, live, id)
             .is_some_and(|view| busy(&view))

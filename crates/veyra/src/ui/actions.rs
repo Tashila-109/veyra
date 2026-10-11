@@ -190,6 +190,7 @@ pub fn shortcut<A: Action + Default>() -> Option<String> {
 pub fn shortcut_chip<A: Action + Default>(cx: &App) -> impl IntoElement {
     let t = cx.global::<super::theme::Theme>();
     div()
+        .debug_selector(|| A::default().name().into())
         .text_size(t.text.meta.size)
         .line_height(t.text.meta.line_height)
         .text_color(t.colors.text_muted)

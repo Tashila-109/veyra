@@ -181,7 +181,10 @@ fn cell(row: Row, state: LiveState) {
                 }
                 if state == LiveState::Running {
                     assert_eq!(f.running(), None);
-                    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Interrupt);
+                    assert_eq!(
+                        f.controls.try_recv().unwrap(),
+                        SessionControl::Interrupt(StopReason::User)
+                    );
                 }
             }
             Row::Respond => {

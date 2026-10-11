@@ -418,7 +418,7 @@ impl Actor {
                         if self.shutting_down || matches!(live.live, Live::Starting { .. }) {
                             SessionControl::Shutdown
                         } else {
-                            SessionControl::StorageBlocked
+                            SessionControl::Interrupt(StopReason::StorageBlocked)
                         };
                     let _ = session.control.send(control);
                 }
@@ -1302,18 +1302,7 @@ impl Actor {
         {
             commands::expire_requests(&self.projection, &mut c, request.turn, "Veyra is closing");
         }
-        let changes = ChangeSet::default();
-        let active: Vec<_> = self
-            .projection
-            .threads
-            .keys()
-            .copied()
-            .filter(|&id| {
-                changes
-                    .view(&self.projection, &self.live, id)
-                    .is_some_and(|view| crate::live::busy(&view))
-            })
-            .collect();
+        let active: Vec<_> = crate::live::busy_threads(&self.projection, &self.live).collect();
         let now = now();
         for thread in active {
             commands::set_hold(
@@ -1326,7 +1315,7 @@ impl Actor {
                 &self.projection,
                 &mut c,
                 thread,
-                crate::provider::StopReason::AppClosing,
+                StopReason::AppClosing,
                 now,
             );
         }
