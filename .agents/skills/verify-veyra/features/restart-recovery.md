@@ -46,11 +46,31 @@ thread = create('restart-running','Long reply',scenario='long-reply')
 ctl('restart-working','wait',thread,'Working')
 ctl('restart-queue-text','text','after restart')
 action('restart-queue-send','Send')
+capture('restart-before-sheet')
 ctl('restart-quit-key','keys','secondary-q')
 sheet = poll('restart-sheet',lambda d: d['quit_sheet']['open'])
 assert sheet['quit_sheet']['threads'] and sheet['selected_thread']['status']=='Working'
 assert sheet['selected_thread']['title'] in sheet['quit_sheet']['threads']
 capture('restart-quit-sheet')
+# Compare a sidebar pixel outside the sheet, using the platform's PNG reader.
+checker = PROOF/'quit-overlay.swift'
+checker.write_text("""import AppKit
+import Foundation
+let paths = Array(CommandLine.arguments.dropFirst())
+let before = NSBitmapImageRep(data: try Data(contentsOf: URL(fileURLWithPath: paths[0])))!
+let after = NSBitmapImageRep(data: try Data(contentsOf: URL(fileURLWithPath: paths[1])))!
+let x = before.pixelsWide / 64
+let y = before.pixelsHigh / 2
+if !before.colorAt(x: x, y: y)!.isEqual(after.colorAt(x: x, y: y)!) {
+    print("FAIL quit sheet hid the sidebar")
+    exit(1)
+}
+print("PASS quit sheet preserves the sidebar")
+""")
+checked = subprocess.run(['swift',str(checker),str(PROOF/'restart-before-sheet.png'),
+    str(PROOF/'restart-quit-sheet.png')])
+assert checked.returncode == 0, 'quit sheet hid the sidebar'
+
 ctl('restart-cancel-key','keys','escape')
 kept = poll('restart-cancelled',lambda d: not d['quit_sheet']['open'])
 assert kept['selected_thread']['status']=='Working'
@@ -107,6 +127,7 @@ recovered = poll('restart-crash-held',lambda d: d['selected_thread']['id']==cras
 assert recovered['selected_thread']['wait_reason']=='Held because Veyra closed while this ran'
 assert sql("select count(*) from turns where thread_id='"+crashed+"' and state='queued'")=='1'
 capture('restart-crash-held')
+assert sql("select count(*) from threads where live_pid is not null or live_pgid is not null") == '0'
 action('restart-discard','DiscardQueued')
 pid = identity()
 action('restart-idle-quit','Quit')
@@ -130,6 +151,6 @@ The process checks show every owned provider group gone before orderly relaunch.
 
 The app's startup sweep reaps same-user marked orphans across data folders on every launch, including test launches.
 The harness only signals the pids and groups it started.
-Crash recovery proves one thread; child-task recovery belongs to M4.
+Crash recovery proves one thread; child-task recovery needs its own feature recipe.
 `scripts/bundle-app.sh`, process inspection and `pmset` run only on macOS.
-The lead fills Status after its candidate gate.
+Update Status from candidate acceptance.

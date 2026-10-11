@@ -290,7 +290,7 @@ fn interrupt(
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().running.is_some() => {
             drain_running(p, l, c, thread);
-            end_running(p, c, thread, "Stopped by you", now);
+            end_running(p, c, thread, crate::provider::StopReason::User, now);
             control(c, thread, SessionControl::Interrupt);
         }
         Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
@@ -318,47 +318,43 @@ fn respond(
             if c.view(p, l, thread).unwrap().running.map(|t| t.id) == Some(r.turn)
                 && r.state == RequestState::Pending =>
         {
-            if !r.kind.accepts(&decision) {
-                return Err(CommandError::Invalid(
-                    "answer the request with its matching decision".into(),
-                ));
-            }
-            if let (RequestKind::Question { questions }, Decision::Answers(answers)) =
-                (&r.kind, &decision)
-            {
-                add_item(
-                    p,
-                    c,
-                    Item {
-                        id: ItemId::new(),
-                        thread,
-                        turn: r.turn,
-                        seq: 0,
-                        body: ItemBody::UserText(
-                            questions
-                                .iter()
-                                .zip(answers)
-                                .map(|(question, answer)| {
-                                    format!("{}: {}", question.text, answer.text)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        ),
-                    },
-                );
+            match r.kind.accepts(&decision) {
+                Some(AcceptedDecision::Allow { grant }) => {
+                    if let Some(key) = grant {
+                        c.grants.push((thread, key.clone()));
+                    }
+                }
+                Some(AcceptedDecision::Deny) => {}
+                Some(AcceptedDecision::Answers { questions, answers }) => {
+                    add_item(
+                        p,
+                        c,
+                        Item {
+                            id: ItemId::new(),
+                            thread,
+                            turn: r.turn,
+                            seq: 0,
+                            body: ItemBody::UserText(
+                                questions
+                                    .iter()
+                                    .zip(answers)
+                                    .map(|(question, answer)| {
+                                        format!("{}: {}", question.text, answer.text)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            ),
+                        },
+                    );
+                }
+                None => {
+                    return Err(CommandError::Invalid(
+                        "answer the request with its matching decision".into(),
+                    ));
+                }
             }
             let mut r = r.clone();
             r.state = RequestState::Answered(decision.clone());
-            if let (
-                RequestKind::Approval {
-                    grant_key: Some(key),
-                    ..
-                },
-                Decision::AllowInThread,
-            ) = (&r.kind, &decision)
-            {
-                c.grants.push((thread, key.clone()));
-            }
             c.events.push(Ev::RequestClosed(r.clone()));
             c.requests.insert(request, r.clone());
             control(
@@ -589,7 +585,7 @@ fn stop_one(
         }
         Live::Parked | Live::Structured { .. } => {}
     }
-    end_running(p, c, thread, "Stopped by you", now);
+    end_running(p, c, thread, crate::provider::StopReason::User, now);
     drop_turns(p, c, thread, false, now);
     set_hold(p, c, thread, Some(HoldReason::Stopped));
 }
@@ -675,7 +671,7 @@ pub(crate) fn end_running(
     p: &Projection,
     c: &mut ChangeSet,
     thread: ThreadId,
-    reason: &str,
+    reason: crate::provider::StopReason,
     now: Millis,
 ) {
     let turns: Vec<_> = c
@@ -689,7 +685,7 @@ pub(crate) fn end_running(
             c,
             t,
             TurnOutcome::Interrupted {
-                reason: reason.into(),
+                reason: reason.text().into(),
             },
             now,
         );

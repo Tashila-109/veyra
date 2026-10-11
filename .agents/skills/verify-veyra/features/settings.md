@@ -170,4 +170,4 @@ The driver dispatches through the same OpenSettings action as the menu, but does
 The helper waits for provider groups to finish before relaunch; it does not add provider reaping.
 The default is stored, not a process-local preference.
 The run-owned git shim answers only the branch read and disappears with DATA during Cleanup.
-The lead fills the Status values after its gate.
+Update Status from candidate acceptance.

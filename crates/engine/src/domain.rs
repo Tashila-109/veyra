@@ -201,20 +201,36 @@ pub enum RequestKind {
         questions: Vec<Question>,
     },
 }
+pub enum AcceptedDecision<'a> {
+    Allow {
+        grant: Option<&'a GrantKey>,
+    },
+    Deny,
+    Answers {
+        questions: &'a [Question],
+        answers: &'a [Answer],
+    },
+}
 impl RequestKind {
-    pub fn accepts(&self, decision: &Decision) -> bool {
+    pub fn accepts<'a>(&'a self, decision: &'a Decision) -> Option<AcceptedDecision<'a>> {
         match (self, decision) {
-            (Self::Approval { .. }, Decision::AllowOnce | Decision::Deny) => true,
+            (Self::Approval { .. }, Decision::AllowOnce) => {
+                Some(AcceptedDecision::Allow { grant: None })
+            }
+            (Self::Approval { .. }, Decision::Deny) => Some(AcceptedDecision::Deny),
             (
                 Self::Approval {
-                    grant_key: Some(_), ..
+                    grant_key: Some(key),
+                    ..
                 },
                 Decision::AllowInThread,
-            ) => true,
-            (Self::Question { questions }, Decision::Answers(answers)) => {
-                questions.len() == answers.len()
+            ) => Some(AcceptedDecision::Allow { grant: Some(key) }),
+            (Self::Question { questions }, Decision::Answers(answers))
+                if questions.len() == answers.len() =>
+            {
+                Some(AcceptedDecision::Answers { questions, answers })
             }
-            _ => false,
+            _ => None,
         }
     }
 }

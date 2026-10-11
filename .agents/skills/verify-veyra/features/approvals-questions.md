@@ -13,7 +13,8 @@ Status: not run, 2026-10-11, pending, all
 
 In Ask first, ask for `touch veyra-check.txt`.
 The request docks above the input, with the command and its consequence.
-Deny is ⌘., Allow once is ⌘↵ and Allow in this thread is ⌘⌥↵.
+Deny is ⌘., Allow once is ⌘↵ and Allow in this thread is ⌘⌥↵ while the dock has focus.
+Press ⌘⇧Y to FocusDock; composer ⌘↵ sends its draft and leaves the request pending.
 Every button's shortcut_chip reads the same bindings table as the keymap.
 A question shows its options; click Use number keys or press ⌘⇧Y to FocusDock.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
@@ -42,14 +43,29 @@ dock = poll('approval-deny-dock',lambda d: d['composer']['dock'] is not None)
 assert dock['composer']['dock']['request']['kind']['Approval']['action']['command'] == 'touch veyra-check.txt'
 assert dock['selected_thread']['status'] == 'NeedsYou'
 capture('approval-deny')
+action('approval-deny-focus','FocusDock')
 ctl('approval-deny-key','keys','secondary-.')
 ctl('approval-deny-done','wait',thread,'Done')
 assert not check.exists()
-thread = create('approval-allow','Run touch veyra-check.txt',scenario='approval-allow')
+records = [json.loads(line) for line in (SOURCE/'approval-allow.jsonl').read_text().splitlines()]
+reply = [json.loads(line) for line in (SOURCE/'ok-reply.jsonl').read_text().splitlines()][3:]
+reply = json.loads(json.dumps(reply).replace('<id:prompt>','<id:queued-prompt>'))
+stage_records(records[:-1]+reply)
+thread = create('approval-allow','Run touch veyra-check.txt',scenario=None)
 poll('approval-allow-dock',lambda d: d['composer']['dock'] is not None)
 capture('approval-allow')
+ctl('approval-composer-draft','text','reply with the word ok')
+ctl('approval-composer-deny','keys','secondary-.')
+assert sql("select state from requests where thread_id='"+thread+"'") == 'pending'
+ctl('approval-composer-send','keys','secondary-enter')
+pending = poll('approval-composer-pending',lambda d: d['composer_text']=='')
+assert pending['composer']['dock'] is not None and not pending['composer']['dock']['focused']
+assert sql("select state from requests where thread_id='"+thread+"'") == 'pending'
+assert sql("select count(*) from turns where thread_id='"+thread+"' and state='queued'") == '1'
+action('approval-allow-focus','FocusDock')
 ctl('approval-allow-key','keys','secondary-enter')
-ctl('approval-allow-done','wait',thread,'Done')
+poll('approval-allow-done',lambda d: d['selected_thread']['status']=='Done'
+    and sql("select count(*) from turns where thread_id='"+thread+"' and state='ended'") == '2')
 assert check.is_file()
 thread = create('approval-grant','Run touch veyra-grant.txt',scenario='approval-grant')
 poll('approval-grant-dock',lambda d: d['composer']['dock'] is not None)
@@ -75,6 +91,8 @@ selected = poll('question-selected',lambda d: d['selected_thread']['id']==questi
 assert selected['composer']['dock'] is not None
 ctl('question-focus-key','keys','secondary-shift-y')
 poll('question-focused',lambda d: d['composer']['dock']['focused'])
+capture('question-focused')
+assert (PROOF/'question.png').read_bytes() != (PROOF/'question-focused.png').read_bytes()
 ctl('question-choice-key','keys','1')
 answered = ctl('question-done','wait',question,'Done')
 assert answered['composer']['dock'] is None
@@ -113,13 +131,14 @@ PY
 The approval PNGs show the exact command, consequence and chord chips.
 The project file stays absent after Deny and exists after Allow once.
 SQLite records one grant and three requests, showing the identical granted request never docked.
-`question-focused.json` and the digit commands prove focus isolation.
+`approval-composer-pending.json` and SQLite prove composer Send leaves approval Pending and queues the draft.
+`question-focused.json`, the digit commands and the changed focused PNG prove focus isolation and its accent border.
 `question-two.png` shows 1 of 2; `questions-done.json` and SQLite show both answered.
 `composer.dock`, `requests`, `selected_thread.status` and `transcript.items` are the observable window state.
 
 ## Gotchas
 
 The fake CLI proves Veyra's control path, not a real provider's permission behavior.
-The thread-grant fixture repeats the command in the same process; the lead owns the live park/resume grant check.
+The thread-grant fixture repeats the command in the same process; live park/resume grants need their own authorized check.
 Native typing and pointer entry remain manual checks.
-The lead fills Status after its candidate gate.
+Update Status from candidate acceptance.

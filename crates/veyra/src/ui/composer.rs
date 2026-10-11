@@ -162,18 +162,23 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                     .gap(t.space.0[3])
                                     .child(
                                         labelled_button("continue", "Continue", cx)
-                                            .child(shortcut_chip("Continue", cx))
+                                            .child(shortcut_chip::<Continue>(cx))
                                             .on_click(|_, window, cx| {
                                                 window.dispatch_action(Box::new(Continue), cx)
                                             }),
                                     )
-                                    .child(
-                                        labelled_button("discard-queued", "Discard queued", cx)
-                                            .child(shortcut_chip("DiscardQueued", cx))
-                                            .on_click(|_, window, cx| {
-                                                window.dispatch_action(Box::new(DiscardQueued), cx)
-                                            }),
-                                    ),
+                                    .when(shell.discard_queued_visible(), |row| {
+                                        row.child(
+                                            labelled_button("discard-queued", "Discard queued", cx)
+                                                .child(shortcut_chip::<DiscardQueued>(cx))
+                                                .on_click(|_, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(DiscardQueued),
+                                                        cx,
+                                                    )
+                                                }),
+                                        )
+                                    }),
                             ),
                     )
                 })
@@ -182,7 +187,15 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         .v_flex()
                         .w_full()
                         .gap(t.space.0[3])
-                        .pb(t.space.0[5])
+                        .p(t.space.0[4])
+                        .mb(t.space.0[5])
+                        .rounded(t.radius.control)
+                        .border(t.layout.border)
+                        .border_color(if shell.dock_focused {
+                            t.colors.accent
+                        } else {
+                            t.colors.border
+                        })
                         .track_focus(&shell.dock_focus)
                         .key_context("VeyraDock")
                         .when(pending.len() > 1, |dock| {
@@ -220,7 +233,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .gap(t.space.0[3])
                                         .child(
                                             labelled_button("deny", "Deny", cx)
-                                                .child(shortcut_chip("Deny", cx))
+                                                .child(shortcut_chip::<Deny>(cx))
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(Box::new(Deny), cx)
                                                 }),
@@ -235,7 +248,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     ),
                                                     cx,
                                                 )
-                                                .child(shortcut_chip("AllowInThread", cx))
+                                                .child(shortcut_chip::<AllowInThread>(cx))
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(
                                                         Box::new(AllowInThread),
@@ -247,7 +260,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .child(
                                             labelled_button("allow-once", "Allow once", cx)
                                                 .primary()
-                                                .child(shortcut_chip("AllowOnce", cx))
+                                                .child(shortcut_chip::<AllowOnce>(cx))
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(Box::new(AllowOnce), cx)
                                                 }),
@@ -294,26 +307,17 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     composer.child(dock)
                 })
                 .child(
-                    div()
-                        .w_full()
-                        .key_context("VeyraComposer")
-                        .when(
-                            request.is_some_and(|request| {
-                                matches!(request.kind, RequestKind::Approval { .. })
-                            }),
-                            |input| input.key_context("VeyraComposer VeyraApproval"),
-                        )
-                        .child(
-                            Textarea::new(&shell.input)
-                                .appearance(false)
-                                .bordered(false)
-                                .w_full()
-                                .min_h(t.layout.composer_min_height)
-                                .max_h(t.layout.composer_max_height)
-                                .text_size(t.text.read.size)
-                                .line_height(t.text.read.line_height)
-                                .aria_label("Message"),
-                        ),
+                    div().w_full().key_context("VeyraComposer").child(
+                        Textarea::new(&shell.input)
+                            .appearance(false)
+                            .bordered(false)
+                            .w_full()
+                            .min_h(t.layout.composer_min_height)
+                            .max_h(t.layout.composer_max_height)
+                            .text_size(t.text.read.size)
+                            .line_height(t.text.read.line_height)
+                            .aria_label("Message"),
+                    ),
                 )
                 .child(
                     div()
@@ -330,7 +334,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             labelled_button("send", if stop { "Stop" } else { "Send" }, cx)
                                 .primary()
                                 .disabled(!stop && reason.is_some())
-                                .when(stop, |button| button.child(shortcut_chip("Stop", cx)))
+                                .when(stop, |button| button.child(shortcut_chip::<Stop>(cx)))
                                 .on_click(move |_, window, cx| {
                                     if stop {
                                         window.dispatch_action(Box::new(Stop), cx);

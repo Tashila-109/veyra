@@ -356,7 +356,7 @@ PY
 ## Drive
 
 Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.md), [chat-send-stream](features/chat-send-stream.md) and [settings](features/settings.md).
-M3 adds [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
+Also run [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
 The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
 Use the same exported `RUN` in every fresh shell.
@@ -385,6 +385,7 @@ The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `ap
 `transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
 Items include `outcome`, queued `wait_reason` and a tool's `failed_last_line`.
 `selected_thread.hold` and `wait_reason` describe held work.
+`composer.discard_queued_visible` reports the held queue control.
 `composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
 `notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
@@ -393,6 +394,7 @@ Each transcript item carries `delta_count`, the actual text-stream deltas observ
 `processes` lists each reported live CLI with its thread, pid and resident bytes, retaining retiring groups until Exited.
 `perf.commits`, `perf.actor_max_ms` and `perf.actor_busy_ms` expose committed transactions and actor timing.
 `perf.repaints` counts window renders and `perf.max_batch_events` counts the largest applied pump batch.
+The debug-only `veyra::DebugNotificationResponse` action takes a banner `tag` and invokes the native response handler.
 The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and blocks the main thread for that interval.
 `settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
 Before every capture, the debug-only `ActivateWindow` action activates Veyra from inside the app.
@@ -420,7 +422,7 @@ identity()
 ctl('dump-after','dump')
 pages = set((PROOF/'pages-run').read_text().split())
 assert pages, 'no completed page'
-database('final','ask_first' if 'settings' in pages else 'full_access')
+database('final','ask_first' if pages & {'settings','approvals-questions'} else 'full_access')
 capture('window')
 shutil.copy2(DATA/'logs/veyra.log',PROOF/'veyra.log')
 (PROOF/'git-identity.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True)
@@ -434,9 +436,9 @@ required = {
     'chat-send-stream':['chat-working.json','chat-working.png','chat-done.json','chat-done.png',
         'chat-failed.json','chat-failed.png','chat-provider-done.json','chat-background-working.json'],
     'approvals-questions':['approval-deny.png','approval-allow.png','question.png','question-two.png',
-        'approvals-done.json','questions-done.json'],
+        'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
-        'notifications-background.json'],
+        'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
         'settings-existing.json','settings-new.json'],
@@ -595,4 +597,4 @@ A socket path permits 103 usable bytes; keep RUN short.
 
 Update the matching feature page when actions, commands or dump fields change.
 `verify_map_names` checks exact action names, ctl verbs and top-level dump keys.
-The lead owns the `Status: STATE, DATE, COMMIT, MISSING` values and their docs-only update after the candidate commit.
+Update the `Status: STATE, DATE, COMMIT, MISSING` values from candidate acceptance in a docs-only change after the candidate commit.

@@ -69,6 +69,8 @@ choice_action!(StopThread, thread, ThreadId);
 choice_action!(AnswerQuestion, option, usize);
 choice_action!(SelectProject, project, ProjectId);
 choice_action!(ToggleItem, item, ItemId);
+#[cfg(debug_assertions)]
+choice_action!(DebugNotificationResponse, tag, String);
 
 #[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
 #[schemars(crate = "::gpui::private::schemars")]
@@ -169,10 +171,10 @@ pub fn bindings() -> Vec<Binding> {
         binding!(AnswerQuestion, "9", Some("VeyraDock"), option: 8),
     ]
 }
-pub fn shortcut(action: &str) -> Option<String> {
+pub fn shortcut<A: Action + Default>() -> Option<String> {
     bindings()
         .iter()
-        .find(|binding| binding.action == action)
+        .find(|binding| (binding.build)().name() == A::default().name())
         .map(|binding| {
             binding
                 .chord
@@ -185,7 +187,7 @@ pub fn shortcut(action: &str) -> Option<String> {
                 .replace("escape", "Esc")
         })
 }
-pub fn shortcut_chip(action: &str, cx: &App) -> impl IntoElement {
+pub fn shortcut_chip<A: Action + Default>(cx: &App) -> impl IntoElement {
     let t = cx.global::<super::theme::Theme>();
     div()
         .text_size(t.text.meta.size)
@@ -196,7 +198,7 @@ pub fn shortcut_chip(action: &str, cx: &App) -> impl IntoElement {
         .rounded(t.radius.inline)
         .border(t.layout.border)
         .border_color(t.colors.border)
-        .child(shortcut(action).expect("a shortcut chip needs a binding"))
+        .children(shortcut::<A>())
 }
 pub fn init(cx: &mut App) {
     cx.bind_keys(bindings().into_iter().map(|binding| {
@@ -225,29 +227,27 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bindings, shortcut};
+    use super::{ActivateWindow, AllowOnce, Deny, Stop, bindings, shortcut};
     use gpui_kit::Keystroke;
     #[test]
     fn shortcut_chips_match_bindings() {
-        for action in [
-            "AllowOnce",
-            "AllowInThread",
-            "Deny",
-            "Continue",
-            "DiscardQueued",
-            "Stop",
-        ] {
-            let binding = bindings()
-                .into_iter()
-                .find(|binding| binding.action == action)
-                .unwrap();
-            assert_eq!((binding.build)().name(), format!("veyra::{action}"));
-            assert!(Keystroke::parse(binding.chord).is_ok());
-            assert!(shortcut(action).is_some());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        for entry in std::fs::read_dir(root).unwrap() {
+            let source = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            let source = source.split("#[cfg(test)]").next().unwrap();
+            for call in source.split("shortcut_chip::<").skip(1) {
+                let action = call.split('>').next().unwrap();
+                let binding = bindings()
+                    .into_iter()
+                    .find(|binding| binding.action == action)
+                    .unwrap_or_else(|| panic!("unbound rendered chip: {action}"));
+                assert_eq!((binding.build)().name(), format!("veyra::{action}"));
+                assert!(Keystroke::parse(binding.chord).is_ok());
+            }
         }
-        assert_eq!(shortcut("AllowOnce"), Some("⌘↵".into()));
-        assert_eq!(shortcut("Deny"), Some("⌘.".into()));
-        assert_eq!(shortcut("Stop"), Some("⌃c".into()));
-        assert_eq!(shortcut("Unbound"), None);
+        assert_eq!(shortcut::<AllowOnce>(), Some("⌘↵".into()));
+        assert_eq!(shortcut::<Deny>(), Some("⌘.".into()));
+        assert_eq!(shortcut::<Stop>(), Some("⌃c".into()));
+        assert_eq!(shortcut::<ActivateWindow>(), None);
     }
 }

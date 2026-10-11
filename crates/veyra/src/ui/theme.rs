@@ -183,7 +183,6 @@ pub struct Motion {
     pub menu: [Transition; 2],
     pub resize: Transition,
     pub stream_reveal: Transition,
-    pub stream_caret: Size<Pixels>,
     pub spinner: Transition,
 }
 #[derive(Clone)]
@@ -338,7 +337,6 @@ impl Theme {
                 ],
                 resize: transition(200, [0., 0., 0.58, 1.]),
                 stream_reveal: transition(300, [0., 0., 0.58, 1.]),
-                stream_caret: size(px(2.), px(15.)),
                 spinner: transition(1000, [0., 0., 1., 1.]),
             },
             layout: Layout {
@@ -523,10 +521,10 @@ mod tests {
                 }
             }
         }
-        const M3_INITIAL_TOKEN_CALLS: usize = 7;
+        const INITIAL_TOKEN_CALLS: usize = 7;
         assert!(
-            count <= M3_INITIAL_TOKEN_CALLS,
-            "theme token calls increased from the M3 starting count of 7 to {count}"
+            count <= INITIAL_TOKEN_CALLS,
+            "theme token calls increased from the starting count of 7 to {count}"
         );
         assert_eq!(
             token_call_count("px(1) // rgb(2)\n/* hsla(3) /* px(4) */ */ rgb(5)"),

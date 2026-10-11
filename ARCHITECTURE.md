@@ -11,7 +11,7 @@ The engine never depends on gpui.
 Claude sessions, readiness probes, replay fixtures and debug recording are implemented.
 Codex and Grok have placeholder readiness but no codec.
 Claude approvals and questions reach a window dock whose actions send typed decisions through the engine.
-Exact thread grants and deny/cancel replies are persisted before their provider controls run.
+Exact thread grants and deny/cancel replies are persisted before their provider controls run, except on storage-blocked and blocked-shutdown paths where cancellation precedes stored expiry.
 Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
 The window owns render and event-batch counters.
 Inactive-window family changes post system banners, and busy Quit opens a sheet.
@@ -117,6 +117,7 @@ macOS termination does not promise Rust destructors, so verification explicitly 
 It receives typed messages through a 256-slot tokio channel.
 A timer sends Tick every five seconds; text uses separate flush and write messages.
 The actor never waits for provider I/O.
+`actor_no_blocking_io` scans actor.rs, store.rs and commands.rs for direct filesystem, process-spawn and thread-sleep calls; indirect platform calls such as keep-awake are outside that textual guard.
 
 `commands::decide` reads rows and runtime state, then produces a `ChangeSet` of row changes, events and effects.
 Projection indexes identify each thread's turn and item ids; command overlays read those keyed rows rather than scanning every stored turn or item.
@@ -162,7 +163,10 @@ The actor waits for Exited before parking and spawning eligible queued work.
 A late end cannot settle another turn.
 Idle structured sessions park after ten minutes without a running turn, pending request or background work.
 The engine supports holds, queue reasons, cascaded Stop/Archive, Interrupt, Respond, wake delivery and task settlement.
-The window exposes Stop, StopThread, Respond, Continue and DiscardQueued; task cards remain unimplemented.
+The composer's Stop button, Ctrl+C and Send with an empty draft during a running turn dispatch the Stop action, which sends the engine's Interrupt command.
+The sidebar's StopThread action sends the engine's StopThread command.
+Respond, Continue and DiscardQueued also have window controls.
+Archive has no window control, and task cards remain unimplemented.
 On a Starting thread, Stop, Archive and Interrupt send Shutdown and wait in Stopping for Exited.
 The session receives that control before stdout; if the child has not launched yet it stops the group once launch returns and emits no Ready.
 A Ready from an already-running initialization is ignored after the actor leaves Starting.
@@ -184,11 +188,14 @@ A pending request makes the thread NeedsYou and docks its exact command or quest
 AllowOnce, AllowInThread and Deny answer approvals; AnswerQuestion collects one answer per question.
 Only an input whose keys are command, description or timeout may offer an exact-command thread grant.
 Inputs with any other field always dock without a grant offer.
-The dock shows 1 of N for multiple pending requests, and number keys answer only while it has focus.
+The dock shows 1 of N for multiple pending requests.
+Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
+The focused dock has an accent border.
 Stop expires pending requests, and the provider queues cancel replies before interrupt.
 There is no automatic request timeout.
 Respond persists an answer before dispatching the native reply; question answers also add a user transcript item.
-The command and codec boundaries share RequestKind::accepts; a mismatched codec answer sends nothing and leaves its request pending.
+The command and codec boundaries share RequestKind::accepts, whose accepted decision carries the matching grant or question/answer rows.
+A mismatched codec answer sends nothing and leaves its request pending.
 The codec keeps used native request ids for the process lifetime so delayed replies cannot authorize a later request.
 AllowInThread stores the exact thread, tool and command in grants, and a later identical request is allowed without RequestOpened.
 Other commands, tools and threads still dock, including compound commands and requests in Full access.
@@ -216,6 +223,8 @@ The actor routes that change through `prepare_commit`, completing interrupted te
 It interrupts stored running turns, expires requests and holds affected queues as Restarted without replacing an earlier hold.
 It replaces an already-started unaccepted wake, preserves an unstarted wake, and leaves running child tasks open.
 Terminal view returns to Chat with import_pending.
+InTerminal and Terminal view are reachable only through engine tests until a PTY exists.
+After startup reaping handles stored process pairs, reconciliation writes every thread Parked and clears both live_pid and live_pgid.
 No provider work restarts automatically and Veyra writes no user CLI configuration.
 
 ## Claude process boundary
@@ -256,12 +265,11 @@ A group still present after the final cleanup deadline produces a bounded warnin
 The normal session path discards other cleanup errors.
 A supervisor waits for registered cleanup even if the session task panics.
 The actor stores pid and group on Ready and parks on Exited.
-While the thread is still Starting, an exit before Ready fails the oldest queued turn and holds the thread as Stopped.
 After Stop, Archive or Interrupt it only parks.
 
 `claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, request references and background-work replacement.
 Unknown protocol metadata logs its category without frame content, and unsupported or malformed control requests get an error reply.
-The first spawn uses a Veyra UUID with --session-id; later spawns use --resume.
+Spawns before Ready binds a native id use --session-id with the Veyra UUID; spawns with that bound native id use --resume.
 Mode maps to default, acceptEdits or bypassPermissions plus --allow-dangerously-skip-permissions.
 An initialize reply can open the Ready gate before the prompt causes system/init to supply native id, version and capabilities.
 Prompt UUID echoes and lifecycle acknowledgements separate Veyra prompts from foreign results and Provider-origin work.
@@ -270,13 +278,15 @@ Assistant error words latch per prompt, and account-related classes park the pro
 An active Veyra interrupt overrides that error outcome and suppresses newly arriving diagnostic text, including streamed blocks.
 Without an active Veyra interruption or latched assistant error, externally observed SIGHUP, SIGINT, SIGTERM or conventional signal exit codes produce Interrupted.
 Cleanup-generated signals do not change the outcome.
-After stdout EOF, the session waits up to one second for the natural leader status before beginning cleanup, avoiding an exit-status race.
+After stdout EOF, the session polls try_wait during the existing 500 ms stderr drain to observe the natural leader status before signalling cleanup.
+It publishes a synthesized turn end before awaiting group cleanup, so post-KILL waits cannot extend the interrupt boundary beyond five seconds.
+Exited still follows cleanup, and the actor starts no queued work before Exited.
 Other abnormal exits produce Failed with Veyra's bounded, redacted crash text.
 Streamed and final blocks share native keys so final frames do not duplicate delivered text.
 Each background_tasks_changed replaces the pending set; ambient tasks never keep the thread Working.
 Child frames feed the pending root Task or Agent tool's bounded output tail instead of creating root text or turns.
 Unknown or finished child parents are ignored, and snapshots retain a running tool's tail.
-The current renderer reads only a finished tool's result tail.
+Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
 
@@ -295,6 +305,7 @@ An account with apiProvider and tokenSource but no signed-in identity fields rea
 Missing or empty account remains unknown and Ready.
 Both version and initialize reads reuse capped byte lines, and stderr is drained so a chatty probe cannot block its stdout reply.
 Codex and Grok are always Ready placeholders and run no probe command.
+Their Send is enabled, but spawn fails with "this provider is not built yet", fails the oldest queued turn and holds the Starting thread as Stopped.
 The Shell holds raw probe account metadata in memory.
 Dump exposes only account presence as known or unknown, never its value.
 
@@ -358,13 +369,17 @@ Entering Settings clears the displayed branch and lets an in-flight lookup finis
 Other view changes and Quit call `forget_branch` to cancel the task and clear the displayed branch.
 Dropping the Shell also cancels the task, and its reply checks the selection identity.
 The centred transcript uses a window-owned MessageScrollerState over gpui ListState and selectable Markdown TextView.
-The still stream caret follows assistant text; reasoning and tool toggles align left and tool input uses readable command or field lines.
-Failed tools show their last nonempty output line while collapsed, and each ended turn's final item carries its outcome and elapsed seconds.
+The transcript and its expansion behavior live in ui/transcript.rs.
+Failed tools show their last nonempty output line, truncated to one row at its width.
+The window and dump share row_outcome, which annotates only each ended turn's final item.
 A user scroll detaches following; new text, requests and tool rows preserve that state.
-Scrolling within the theme's 24 px read line of the bottom or choosing Latest reattaches.
+Scrolling within text.read.line_height of the bottom or choosing Latest reattaches.
+Latest appears only while following is detached and content remains below.
 Expanding a row remeasures it without moving its top anchor.
 The actor trims stored tool output to its last 10,000 characters.
-The actor publishes each window thread's wait reason and busy flag after reconciliation and every installed change; Engine::window_threads reads that snapshot.
+The actor publishes window thread wait reasons and busy flags after reconciliation, then updates only threads whose thread, turn, request or live rows changed.
+Engine::window_threads reads that snapshot.
+The live::busy predicate is shared by quit-sheet publication, shutdown holds and keep-awake.
 Streamed text and tool input remain unbounded outside the 4 MiB wire-line cap.
 The failed view uses the latest nonqueued turn and shows the cause, next step, Retry and Open Terminal on the project folder.
 Retry probes again; once the thread's provider is Ready it clears any hold and resends the failed turn's own user item as a new turn.
@@ -385,21 +400,25 @@ SetDefaultMode publishes SettingsChanged; Escape or thread/project selection lea
 
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
 Ctrl+C is literal control in the composer and preserves its draft while interrupting the turn.
-Approval chords are Command+Return, Command+Option+Return and Command+period.
+Approval chords are Command+Return, Command+Option+Return and Command+period while the dock has focus.
 NextNeedsYou scans sidebar order for NeedsYou before Failed, wrapping once and including child rows.
-The composer shows Stop while a turn runs and its draft is empty, plus held reasons, Continue and Discard queued.
+The composer shows Stop while a turn runs and its draft is empty, plus held reasons and Continue.
+Discard queued appears only when a held thread has queued turns.
+The quit sheet overlays the existing window content.
 The Theme global owns all colours, geometry, type, radii and motion tokens.
 Theme::apply projects them through the kit and follows macOS appearance.
-Violet marks focus, caret, selection, streaming and Working status; selected controls and hover remain neutral.
+Theme values and roles live in ui/theme.rs.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
-The requested window is 1280 by 800 with a 760 by 560 minimum; a window manager can override it.
+Window geometry comes from the theme and can be overridden by the window manager.
 
 `ui/notify.rs` derives banners only when an inactive window's family enters NeedsYou, Done or Failed.
 Family status includes unarchived children, so pending background work prevents a Done banner.
-The banner contains only the family root title and status, never transcript text.
+The banner contains the family root title, derived by collapsing whitespace in its first user message and taking the first 80 characters, and a status word.
+It excludes assistant, tool and later user text.
 Its root-id tag lets a click activate the window and select the root or the first child needing attention.
 `scripts/bundle-app.sh` builds an unsigned macOS app bundle with dev.veyra.app identity for system notification delivery.
 System permission and native banner clicks require operator verification.
+The debug-only DebugNotificationResponse action passes a banner tag to the same notification_response handler as the native callback, allowing stale-tag routing checks without OS delivery.
 
 ## Debug protocol and verification trust
 
@@ -440,7 +459,7 @@ Dump's awake reports whether the actor retains the guard, without checking the c
 Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, repaints and max_batch_events.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
-Dump includes pending requests, quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
+Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
 Every actor message is timed, and a message over 50 ms logs its kind and duration.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
 Platform module selection rejects unsupported targets with compile_error.
@@ -473,13 +492,17 @@ Reaper tests check live parents, non-agent argv and the environment-read boundar
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
 Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
 Application tests enable gpui test-support to exercise Shell selection and its event pump in a synthetic window.
-Shell tests load the login-shell PATH as the app does, run no provider CLI and run the startup orphan sweep.
+Shell tests load the login-shell PATH as the app does and run the startup orphan sweep.
+Their current-thread runtimes do not drive readiness tasks before replacing the probes, so those tests start no provider check.
+The native-quit test is also verified with an executable stand-in whose access time remains unchanged.
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence, header-branch clearing and cleanup.
+Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.
+Permission-matrix records separately authorized live permission checks.
 Their Status lines record the lead's acceptance, independently of the recipes.
 The release page scans driver/override strings with a debug positive control and runs a socket-free release window.
 The ignored live test requires fresh human consent; it is not a workspace-test live invocation.
 Actor tests check account-error retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.
 Live CLI behavior and performance need their authorized lanes; fake replay and structural checks cannot establish them.
 Real provider permission behavior, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.
-Stop and Interrupt have window actions; their real-provider continuation still requires the lead's live lane.
+Composer Stop sends Interrupt and sidebar StopThread sends StopThread; real-provider continuation requires its authorized live lane.

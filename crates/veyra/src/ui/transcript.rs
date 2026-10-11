@@ -22,11 +22,17 @@ impl MessageScrollerState {
         );
         list.set_follow_mode(FollowMode::Tail);
         let this = cx.weak_entity();
-        list.set_scroll_handler(move |_, _, cx| {
+        list.set_scroll_handler(move |_, window, cx| {
+            let line_height = cx
+                .global::<Theme>()
+                .text
+                .read
+                .line_height
+                .to_pixels(window.rem_size());
             let this = this.clone();
             cx.defer(move |cx| {
                 let _ = this.update(cx, |state, cx| {
-                    state.follow = state.distance_to_bottom() <= cx.global::<Theme>().layout.fade;
+                    state.follow = state.distance_to_bottom() <= line_height;
                     if state.follow {
                         state.list.set_follow_mode(FollowMode::Tail);
                     } else {
@@ -40,6 +46,9 @@ impl MessageScrollerState {
     }
     fn distance_to_bottom(&self) -> Pixels {
         self.list.max_offset_for_scrollbar().y + self.list.scroll_px_offset_for_scrollbar().y
+    }
+    fn latest_visible(&self) -> bool {
+        !self.follow && self.distance_to_bottom() > Pixels::ZERO
     }
     pub fn item_count(&self) -> usize {
         self.list.item_count()
@@ -73,17 +82,23 @@ impl MessageScrollerState {
         });
         cx.notify();
     }
-    pub fn scroll_by(&mut self, distance: Pixels, cx: &mut Context<Self>) {
+    pub fn scroll_by(&mut self, distance: Pixels, window: &Window, cx: &mut Context<Self>) {
         self.list.set_follow_mode(FollowMode::Normal);
         self.list.scroll_by(distance);
-        self.follow = self.distance_to_bottom() <= cx.global::<Theme>().layout.fade;
+        self.follow = self.distance_to_bottom()
+            <= cx
+                .global::<Theme>()
+                .text
+                .read
+                .line_height
+                .to_pixels(window.rem_size());
         if self.follow {
             self.scroll_to_end(cx);
         }
         cx.notify();
     }
-    pub fn scroll_down(&mut self, cx: &mut Context<Self>) {
-        self.scroll_by(cx.global::<Theme>().layout.window_min.height, cx);
+    pub fn scroll_down(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.scroll_by(cx.global::<Theme>().layout.window_min.height, window, cx);
     }
     #[cfg(debug_assertions)]
     pub fn dump(&self) -> serde_json::Value {
@@ -179,8 +194,12 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                 .when_some(failed_tool_last_line(tool), |row, line| {
                     row.child(
                         div()
+                            .debug_selector(|| "failed-tool-preview".into())
                             .w_full()
+                            .min_w_0()
+                            .truncate()
                             .text_size(t.text.label.size)
+                            .line_height(t.text.label.line_height)
                             .text_color(t.colors.danger)
                             .child(line.to_owned()),
                     )
@@ -194,9 +213,7 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                             .child(tool_input(&tool.call.arguments)),
                     )
                     .when_some(
-                        tool.result
-                            .as_ref()
-                            .and_then(|result| result.output_tail.clone()),
+                        tool_output(tool).map(str::to_owned),
                         |row, text| {
                             row.child(TextView::markdown(
                                 SharedString::from(format!("tool-output-{}", item.id)),
@@ -247,6 +264,26 @@ pub fn turn_outcome_line(turn: &Turn) -> Option<String> {
             format!("Failed · {}", message.lines().next().unwrap_or_default())
         }
     })
+}
+fn tool_output(tool: &ToolItem) -> Option<&str> {
+    tool.result
+        .as_ref()
+        .and_then(|result| result.output_tail.as_deref())
+        .or_else(|| (!tool.output_tail.is_empty()).then_some(tool.output_tail.as_str()))
+}
+pub fn row_outcome(
+    items: &[Item],
+    index: usize,
+    turns: &std::collections::BTreeMap<TurnId, Turn>,
+) -> Option<String> {
+    let item = items.get(index)?;
+    if items
+        .get(index + 1)
+        .is_some_and(|next| next.turn == item.turn)
+    {
+        return None;
+    }
+    turns.get(&item.turn).and_then(turn_outcome_line)
 }
 pub fn failed_tool_last_line(tool: &ToolItem) -> Option<&str> {
     let result = tool.result.as_ref().filter(|result| !result.ok)?;
@@ -380,13 +417,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             .map(|item| {
                                 let t = cx.global::<Theme>();
                                 let turn = turns.get(&item.turn);
-                                let outcome = turn
-                                    .filter(|_| {
-                                        items
-                                            .get(index + 1)
-                                            .is_none_or(|next| next.turn != item.turn)
-                                    })
-                                    .and_then(turn_outcome_line);
+                                let outcome = row_outcome(&items, index, &turns);
                                 div()
                                     .v_flex()
                                     .w_full()
@@ -420,7 +451,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     .into_any_element(),
                 ),
         )
-        .when(!shell.scroller.read(cx).follow, |content| {
+        .when(shell.scroller.read(cx).latest_visible(), |content| {
             content.child(
                 labelled_button("latest", "Latest", cx).on_click(|_, window, cx| {
                     window.dispatch_action(Box::new(ScrollTranscriptEnd), cx)
@@ -443,10 +474,7 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
         ItemBody::Reasoning { text, done } => ("reasoning", text.clone(), *done),
         ItemBody::Tool(tool) => (
             "tool",
-            tool.result
-                .as_ref()
-                .and_then(|result| result.output_tail.clone())
-                .unwrap_or_default(),
+            tool_output(tool).unwrap_or_default().to_owned(),
             tool.result.is_some(),
         ),
         ItemBody::Notice(notice) => ("notice", notice.text.clone(), true),
@@ -458,6 +486,7 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::tool_input;
+    use gpui_kit::AppContext;
     use veyra_engine::domain::*;
     #[test]
     fn turn_outcome_line() {
@@ -496,6 +525,122 @@ mod tests {
         assert_eq!(
             super::turn_outcome_line(&turn),
             Some("Failed · No account".into())
+        );
+    }
+    #[gpui::test]
+    fn failed_tool_preview_stays_one_line_at_narrow_width(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::{prelude::*, *};
+        struct Preview(Item);
+        impl Render for Preview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(cx.global::<super::Theme>().layout.transcript_min)
+                    .child(super::row(&self.0, false, cx))
+            }
+        }
+        cx.update(gpui_kit::init);
+        let item = Item {
+            id: ItemId::new(),
+            thread: ThreadId::new(),
+            turn: TurnId::new(),
+            seq: 0,
+            body: ItemBody::Tool(ToolItem {
+                call: ToolCall {
+                    name: "Bash".into(),
+                    arguments: serde_json::json!({"command":"false"}),
+                },
+                output_tail: String::new(),
+                result: Some(ToolResult {
+                    ok: false,
+                    output_tail: Some("a very long failure diagnostic ".repeat(40)),
+                }),
+            }),
+        };
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+            Preview(item)
+        });
+        let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+        cx.draw(
+            Point::default(),
+            size(
+                AvailableSpace::Definite(theme.layout.transcript_min),
+                AvailableSpace::Definite(theme.layout.window_default.height),
+            ),
+            |_, _| div().child(view),
+        );
+        let bounds = cx.debug_bounds("failed-tool-preview").unwrap();
+        assert!(
+            bounds.size.height
+                <= theme
+                    .text
+                    .read
+                    .line_height
+                    .to_pixels(cx.update(|window, _| window.rem_size())),
+            "preview wrapped: {:?}",
+            bounds.size
+        );
+        assert!(
+            bounds.size.width <= theme.layout.transcript_min,
+            "preview exceeded its row width"
+        );
+    }
+    #[gpui::test]
+    fn latest_is_hidden_when_detached_at_bottom(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(super::Theme::new(crate::ui::theme::Appearance::Dark)));
+        let state = cx.new(|cx| super::MessageScrollerState::new(1, cx));
+        state.update(cx, |state, cx| state.scroll_to_item(0, cx));
+        assert!(!state.read_with(cx, |state, _| state.latest_visible()));
+    }
+    #[test]
+    fn running_subagent_tail_is_visible_before_result() {
+        for name in ["Task", "Agent"] {
+            let mut tool = ToolItem {
+                call: ToolCall {
+                    name: name.into(),
+                    arguments: serde_json::json!({}),
+                },
+                output_tail: "still working".into(),
+                result: None,
+            };
+            assert_eq!(super::tool_output(&tool), Some("still working"));
+            tool.result = Some(ToolResult {
+                ok: true,
+                output_tail: Some("finished".into()),
+            });
+            assert_eq!(super::tool_output(&tool), Some("finished"));
+        }
+    }
+    #[test]
+    fn outcome_annotates_only_the_turns_last_item() {
+        let thread = ThreadId::new();
+        let turn = Turn {
+            id: TurnId::new(),
+            thread,
+            ordinal: 1,
+            origin: TurnOrigin::Provider,
+            state: TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                started: Some(1000),
+                at: 3000,
+            },
+        };
+        let items = ["prompt", "reply"]
+            .into_iter()
+            .enumerate()
+            .map(|(seq, text)| Item {
+                id: ItemId::new(),
+                thread,
+                turn: turn.id,
+                seq: seq as u32,
+                body: ItemBody::UserText(text.into()),
+            })
+            .collect::<Vec<_>>();
+        let turns = [(turn.id, turn)].into_iter().collect();
+        assert_eq!(super::row_outcome(&items, 0, &turns), None);
+        assert_eq!(
+            super::row_outcome(&items, 1, &turns),
+            Some("Done in 2s".into())
         );
     }
     #[test]

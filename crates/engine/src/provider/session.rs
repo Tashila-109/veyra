@@ -475,7 +475,7 @@ async fn run_one(
                     }
                 }
                 Some(SessionControl::Shutdown) | None => {
-                    for line in interrupt_lines(&mut codec, StopReason::AppClosing) {
+                    for line in codec.interrupt_lines(StopReason::AppClosing) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
@@ -488,8 +488,7 @@ async fn run_one(
                     break;
                 }
                 Some(message @ (SessionControl::Interrupt | SessionControl::StorageBlocked)) => {
-                    let reason = message.stop_reason().expect("stop control");
-                    for line in interrupt_lines(&mut codec, reason) {
+                    for line in message.stop_reason().into_iter().flat_map(|reason| codec.interrupt_lines(reason)) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
@@ -576,10 +575,27 @@ async fn run_one(
         write_task.abort();
         let _ = write_task.await;
     }
-    if tokio::time::timeout(Duration::from_millis(500), &mut stderr)
-        .await
-        .is_err()
-    {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut observed = None;
+    let mut stderr_done = false;
+    loop {
+        if observed.is_none() {
+            observed = process
+                .child
+                .child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten());
+        }
+        if stderr_done && (!stdout_closed || observed.is_some()) {
+            break;
+        }
+        tokio::select! {
+            _ = &mut stderr, if !stderr_done => { stderr_done = true; }
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep(Duration::from_millis(50)), if stdout_closed && observed.is_none() => {}
+        }
+    }
+    if !stderr_done {
         stderr.abort();
         let _ = stderr.await;
     }
@@ -587,35 +603,13 @@ async fn run_one(
     let failure = failure
         .or(rejected)
         .map(|text| with_stderr(&text, &lines, None));
-    let observed = match process.child.child.as_mut() {
-        Some(child) if stdout_closed => tokio::time::timeout(Duration::from_secs(1), child.wait())
-            .await
-            .ok()
-            .and_then(Result::ok),
-        Some(child) => child.try_wait().ok().flatten(),
-        None => None,
-    };
-    let status = process.child.stop().await.ok();
-    #[cfg(debug_assertions)]
-    if let Some(recorder) = &mut process.recorder {
-        let _ = recorder.exit(
-            status
-                .as_ref()
-                .and_then(|status| status.code())
-                .unwrap_or(-1),
-        );
-    }
-    if consumer_gone {
-        return Completion::ConsumerGone;
-    }
-    if resume
+    let missing = resume
         && lines
             .iter()
-            .any(|line| line.contains("No conversation found with session ID"))
-    {
-        return Completion::MissingSession;
-    }
-    let crash = if let Some(active) = codec.active {
+            .any(|line| line.contains("No conversation found with session ID"));
+    let crash = if consumer_gone || missing {
+        None
+    } else if let Some(active) = codec.active {
         let outside = observed
             .as_ref()
             .and_then(|status| match platform::exit_signal(status) {
@@ -627,15 +621,7 @@ async fn run_one(
                     .filter(|code| [129, 130, 143].contains(code))
                     .map(|code| format!("Stopped by exit code {code}")),
             });
-        let outcome = if let Some(interrupt) = &codec.interrupted {
-            TurnOutcome::Interrupted {
-                reason: interrupt.reason.clone(),
-            }
-        } else if let Some(text) = codec.failure() {
-            TurnOutcome::Failed {
-                message: text.into(),
-            }
-        } else if let Some(reason) = outside {
+        let fallback = if let Some(reason) = outside {
             TurnOutcome::Interrupted { reason }
         } else {
             TurnOutcome::Failed {
@@ -644,6 +630,7 @@ async fn run_one(
                 }),
             }
         };
+        let outcome = codec.end_outcome(fallback);
         let crash = match &outcome {
             TurnOutcome::Failed { message } => Some(message.clone()),
             _ => None,
@@ -662,16 +649,36 @@ async fn run_one(
         )
         .await;
         crash
-    } else if let Some(failure) = failure {
-        Some(failure)
-    } else if !ready || status.is_some_and(|status| !status.success()) {
+    } else {
+        failure
+    };
+    let status = process.child.stop().await.ok();
+    #[cfg(debug_assertions)]
+    if let Some(recorder) = &mut process.recorder {
+        let _ = recorder.exit(
+            status
+                .as_ref()
+                .and_then(|status| status.code())
+                .unwrap_or(-1),
+        );
+    }
+    if consumer_gone {
+        return Completion::ConsumerGone;
+    }
+    if missing {
+        return Completion::MissingSession;
+    }
+    let crash = if crash.is_none()
+        && codec.active.is_none()
+        && (!ready || status.is_some_and(|status| !status.success()))
+    {
         Some(crash_text(
             status.and_then(|status| status.code()),
             &lines,
             None,
         ))
     } else {
-        None
+        crash
     };
     Completion::Exited(crash)
 }
@@ -815,18 +822,6 @@ pub async fn probe(
     result
 }
 
-fn interrupt_lines(codec: &mut Codec, reason: StopReason) -> Vec<serde_json::Value> {
-    if !codec.interrupt_for(reason) {
-        return Vec::new();
-    }
-    let mut lines = codec.cancel_requests(reason.text());
-    lines.push(serde_json::json!({
-        "type":"control_request", "request_id":"veyra-interrupt",
-        "request":{"subtype":"interrupt"}
-    }));
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,6 +945,70 @@ mod tests {
             outcome,
             TurnOutcome::Interrupted {
                 reason: "Stopped by exit code 130".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stdout_eof_synthesizes_end_without_extra_grace() {
+        let script = "trap '' TERM; exec 1>&- 2>&-; sleep 30";
+        let env = ChildEnv::load();
+        let child = env
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    format!("read initialize; read prompt; {script}"),
+                ],
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .unwrap();
+        let pid = child.id().unwrap();
+        let process = Process {
+            child: ProcessGroup::new(child),
+            native: NativeSessionId("fixture-session".into()),
+            #[cfg(debug_assertions)]
+            recorder: None,
+        };
+        let (sender, mut control) = mpsc::unbounded_channel();
+        sender
+            .send(SessionControl::StartTurn {
+                turn: TurnId::new(),
+                text: "reply".into(),
+            })
+            .unwrap();
+        let (out, mut events) = mpsc::channel(256);
+        let start = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await
+        });
+        let ended = tokio::time::timeout(Duration::from_secs(9), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let elapsed = start.elapsed();
+        task.await.unwrap();
+        assert!(!platform::group_exists(pid).unwrap());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "EOF observation added a grace period: {elapsed:?}"
+        );
+        let EngineMsg::Provider {
+            event:
+                ProviderEvent::Turn {
+                    event: TurnEvent::TurnEnded { outcome, .. },
+                    ..
+                },
+            ..
+        } = ended
+        else {
+            panic!("missing end")
+        };
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                message: "claude exited unexpectedly (exit code unknown)".into(),
             }
         );
     }
@@ -1211,5 +1270,126 @@ mod tests {
         assert_eq!(text.lines().nth(6).unwrap().chars().count(), 500);
         assert!(!text.contains("abc123") && !text.contains(token) && !text.contains("discarded"));
         assert!(!record::secret_shapes(&text.replace("[redacted]", "<any>")));
+    }
+    #[tokio::test]
+    async fn stopped_group_cleanup_keeps_five_second_turn_boundary() {
+        let env = ChildEnv::load();
+        let cwd = std::path::PathBuf::from("/tmp");
+        let child = env
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    concat!(
+                        "trap '' TERM; read initialize; read prompt; printf '%s\\n' ",
+                        "'{\"type\":\"assistant\",\"message\":{\"id\":\"probe-message\",",
+                        "\"content\":[{\"type\":\"text\",\"text\":\"ready\"}]}}'; ",
+                        "read interrupt; /bin/sleep 30"
+                    )
+                    .into(),
+                ],
+                &cwd,
+                None,
+            )
+            .unwrap();
+        let mut group = ProcessGroup::new(child);
+        let pid = group.pid;
+        group.check = |_, _| Ok(true);
+        let process = Process {
+            child: group,
+            native: NativeSessionId("fixture-session".into()),
+            #[cfg(debug_assertions)]
+            recorder: None,
+        };
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let (out, mut events) = mpsc::channel(256);
+        let handle = start_session(
+            process,
+            SessionSpec {
+                thread,
+                cwd,
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: None,
+                import: false,
+            },
+            env,
+            out,
+            1,
+        );
+        handle
+            .control
+            .send(SessionControl::StartTurn {
+                turn,
+                text: "reply".into(),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    EngineMsg::Provider {
+                        event: ProviderEvent::Turn {
+                            event: TurnEvent::TextDelta { .. },
+                            ..
+                        },
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("owned child acknowledged prompt");
+        let at = tokio::time::Instant::now();
+        handle.control.send(SessionControl::Interrupt).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(9), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    EngineMsg::Provider {
+                        event: ProviderEvent::Turn {
+                            event: TurnEvent::TurnEnded {
+                                outcome: TurnOutcome::Interrupted { .. },
+                                park: true,
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+            let elapsed = at.elapsed();
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    EngineMsg::Provider {
+                        event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+            elapsed
+        })
+        .await;
+        assert!(
+            !platform::group_exists(pid).unwrap(),
+            "owned child group survived"
+        );
+        let elapsed = result.expect("owned group cleanup finished");
+        println!("synthesized interrupted end after {elapsed:?}");
+        assert!(
+            elapsed <= Duration::from_secs(5),
+            "Stop drain exceeded five seconds: {elapsed:?}"
+        );
     }
 }

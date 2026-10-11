@@ -42,8 +42,8 @@ DATE is the last run's date.
 COMMIT is the short SHA of the candidate commit the lanes ran.
 MISSING lists every sub-feature that run did not prove, or `none` when all passed.
 A partial run never counts as passed.
-The lead fills the values from lane results.
-The lead fills COMMIT in a docs-only commit after the candidate commit, since a commit cannot contain its own SHA.
+Fill the values from preserved verification results.
+Fill COMMIT in a docs-only commit after the candidate commit, since a commit cannot contain its own SHA.
 
 Each feature has five H2 sections.
 They are `Sub-features`, `How to get to it (user POV)`, `Driving it with veyra ctl`, `Observable success`, and `Gotchas`.

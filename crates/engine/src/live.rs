@@ -57,15 +57,19 @@ pub fn park_due(view: &ThreadView<'_>, idle_since: Millis, now: Millis) -> bool 
         && now - idle_since >= 10 * 60 * 1000
 }
 
+pub fn busy(view: &ThreadView<'_>) -> bool {
+    view.running.is_some()
+        || view.live.background_work
+        || matches!(view.live.live, Live::Starting { .. })
+}
 pub fn needs_awake(
     projection: &crate::domain::Projection,
     live: &std::collections::BTreeMap<crate::domain::ThreadId, LiveThread>,
 ) -> bool {
-    live.iter().any(|(&thread, live)| {
-        matches!(live.live, Live::Starting { .. })
-            || live.background_work
-            || projection
-                .turns_for(thread)
-                .any(|turn| matches!(turn.state, crate::domain::TurnState::Running { .. }))
+    let changes = crate::events::ChangeSet::default();
+    projection.threads.keys().any(|&id| {
+        changes
+            .view(projection, live, id)
+            .is_some_and(|view| busy(&view))
     })
 }

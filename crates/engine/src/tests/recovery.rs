@@ -834,3 +834,24 @@ fn wait_reason_follows_start_rule() {
         Some(WaitReason::Archived)
     );
 }
+
+#[test]
+fn startup_recovery_clears_stored_process_ids() {
+    let mut f = Fixture::new(LiveState::Running);
+    let query = "SELECT live_pid, live_pgid FROM threads WHERE id=?1";
+    let pair = |db: &Connection| -> (Option<u32>, Option<u32>) {
+        db.query_row(query, [f.thread.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+    };
+    assert_eq!(pair(&f.actor.db), (Some(9), Some(9)));
+    let database = std::mem::replace(&mut f.actor.db, Connection::open_in_memory().unwrap());
+    let (sender, _) = mpsc::channel(256);
+    let actor = Actor::new(database, sender, Spawner::Scripted(Scripted::default())).unwrap();
+    assert_eq!(pair(&actor.db), (None, None));
+    assert_eq!(
+        actor.projection.threads[&f.thread].hold,
+        Some(HoldReason::Restarted)
+    );
+}

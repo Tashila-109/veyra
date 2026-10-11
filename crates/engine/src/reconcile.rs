@@ -6,6 +6,11 @@ use crate::{
 
 pub fn decide(p: &Projection, now: Millis) -> ChangeSet {
     let mut c = ChangeSet::default();
+    c.live.extend(
+        p.threads
+            .keys()
+            .map(|&id| (id, crate::live::LiveThread::default())),
+    );
     for t in p.turns.values() {
         if matches!(t.state, TurnState::Queued | TurnState::Running { .. }) {
             set_hold(p, &mut c, t.thread, Some(HoldReason::Restarted));

@@ -3,7 +3,6 @@ mod grants;
 mod perf;
 mod recovery;
 mod requests;
-mod review_regressions;
 mod session_events;
 mod shutdown;
 mod stop;

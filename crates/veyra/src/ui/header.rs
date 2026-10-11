@@ -14,6 +14,7 @@ pub(super) fn status_text(status: &Status) -> String {
                 0
             }
         ),
+        Status::NeedsYou => "Needs you".into(),
         Status::Done { took } => format!("Done · {}s", took / 1000),
         _ => status_name(status).into(),
     }
@@ -76,4 +77,15 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
             labelled_button("new-thread", "New thread  ⌘N", cx)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn needs_you_header_uses_readable_words() {
+        assert_eq!(
+            super::status_text(&veyra_engine::domain::Status::NeedsYou),
+            "Needs you"
+        );
+    }
 }

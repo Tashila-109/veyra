@@ -145,7 +145,7 @@ printf 'exit=%s\n' "$rc" >>"$REL_PROOF/ctl.txt"
 test "$rc" = 2
 grep -qx 'usage: veyra \[mcp\]' "$REL_PROOF/ctl.txt"
 : >"$REL_PROOF/strings.txt"
-for name in control.sock VEYRA_CLAUDE_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD; do
+for name in control.sock VEYRA_CLAUDE_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD DebugNotificationResponse; do
     release=$(/usr/bin/strings -a target/release/veyra | grep -c "$name" || true)
     debug=$(/usr/bin/strings -a target/debug/veyra | grep -c "$name" || true)
     printf 'release %s count=%s\ndebug %s count=%s\n' "$name" "$release" "$name" "$debug" \
@@ -213,7 +213,7 @@ PY
 - Controls: `drive.log` records exit codes and all asserted width, text and notice transitions.
 - Log: `veyra.log` retains the asserted ready line and rejected Send notice.
 - Recovery: `persisted-project.txt` matches the SQLite row after both relaunches; migration, WAL, tables, mode and inode are asserted every time.
-- Release: `release/strings.txt` has four zero release counts and four positive debug controls, `ctl.txt` exits 2 and `data-listing.txt` has no socket.
+- Release: `release/strings.txt` has zero release counts and positive debug controls for every driver and override name, `ctl.txt` exits 2 and `data-listing.txt` has no socket.
 - Cleanup: `marker-check.txt` passes and DATA is absent while proof remains.
 
 ## Gotchas

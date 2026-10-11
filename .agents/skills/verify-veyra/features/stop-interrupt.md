@@ -45,6 +45,7 @@ action('stop-first','Stop')
 stopped = ctl('stop-interrupted','wait',thread,'Interrupted','5')
 assert time.monotonic()-start_time < 5
 assert any('Stopped by you' in (item.get('outcome') or '') for item in stopped['transcript']['items'])
+assert not stopped['composer']['discard_queued_visible']
 poll('stop-idle-awake',lambda d: not d['awake'])
 (PROOF/'awake-ended-pmset.txt').write_text(subprocess.check_output(['pmset','-g','assertions'],text=True))
 thread = create('stop-queue','A later long reply',scenario='long-reply')
@@ -59,6 +60,7 @@ assert [item['wait_reason'] for item in queued['transcript']['items'] if item['k
 action('stop-queue-stop','Stop')
 held = ctl('stop-queue-held','wait',thread,'Held')
 assert held['selected_thread']['wait_reason']=='Held because you pressed Stop'
+assert held['composer']['discard_queued_visible']
 capture('stop-held')
 assert sql("select count(*) from turns where thread_id='"+thread+"' and state='queued'")=='2'
 stage('ok-reply',slow=True,turns=2)
@@ -117,12 +119,18 @@ stage('ok-reply')
 action('notifications-answer-away','Deny')
 done = ctl('notifications-done-away','wait',thread,'Done')
 assert done['notifications']['posted']==posted+2
+old_banner_tag = thread
 action('notifications-front','ActivateWindow')
 poll('notifications-front-active',lambda d: d['window_active'])
 posted = ctl('notifications-front-before','dump')['notifications']['posted']
 thread = create('notifications-front-reply','reply with the word ok',slow=True)
 ctl('notifications-front-done','wait',thread,'Done')
 assert ctl('notifications-front-after','dump')['notifications']['posted']==posted
+# The older tag still routes through the native response handler.
+action('notifications-older-response','DebugNotificationResponse',{'tag':old_banner_tag})
+selected = poll('notifications-older-selected',lambda d: d['selected_thread'] is not None
+    and d['selected_thread']['id']==old_banner_tag and d['window_active'])
+capture('notifications-older-response')
 records = [json.loads(line) for line in (SOURCE/'background-after-result.jsonl').read_text().splitlines()]
 agent = records.pop(5)
 agent['after_ms'] = 0
@@ -158,13 +166,15 @@ PY
 The two pmset files retain OS assertion evidence around awake.
 `notifications-needs-you.json`, `notifications-done-away.json` and the frontmost check prove the banner decision.
 `notifications-background.json` proves no Done banner at foreground end while work remains.
-`processes`, `perf.commits`, `perf.actor_max_ms`, `perf.actor_busy_ms`, `perf.repaints` and `perf.max_batch_events` remain available to the lead's performance lane.
+`processes`, `perf.commits`, `perf.actor_max_ms`, `perf.actor_busy_ms`, `perf.repaints` and `perf.max_batch_events` remain available to an authorized performance run.
 The debug-only DebugStallUi action remains available for that lane.
 
 ## Gotchas
 
 `pmset` and `scripts/bundle-app.sh` run only on macOS.
 Posting counts gpui requests even outside an app bundle; OS delivery is a separate manual banner check.
-The lead owns the older-banner click and macOS permission setting check from target/Veyra.app.
+The debug-only veyra::DebugNotificationResponse action takes {"tag":"ROOT_ID"} and calls the native banner response handler.
+`notifications-older-selected.json` and its PNG prove an older family tag activates and selects that family.
+OS banner delivery and the macOS permission setting require a manual check from target/Veyra.app.
 Use only this run's recorded pids and groups during cleanup.
-The lead fills Status after its candidate gate.
+Update Status from candidate acceptance.

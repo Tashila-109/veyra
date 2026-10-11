@@ -1,4 +1,6 @@
+use super::requests::{codec, request};
 use super::*;
+use serde_json::json;
 
 pub(super) fn approval(f: &mut Fixture, tool: &str, command: &str) -> RequestId {
     let before: std::collections::BTreeSet<_> =
@@ -219,4 +221,70 @@ fn grant_replay_automatically_answers_only_the_exact_command() {
         assert!(!root.join("compound.txt").exists());
     });
     drop(scratch);
+}
+
+#[test]
+fn grant_does_not_answer_commands_with_extra_fields() {
+    let mut f = Fixture::new(LiveState::Running);
+    let mut c = ChangeSet::default();
+    c.grants.push((
+        f.thread,
+        GrantKey {
+            tool: "Bash".into(),
+            command: "echo safe".into(),
+        },
+    ));
+    f.save(c);
+    let mut codec = codec(&f);
+    let plain = codec
+        .value(request(
+            "plain",
+            "Bash",
+            json!({
+        "command":"echo safe", "description":"safe", "timeout":1000}),
+        ))
+        .unwrap();
+    for event in plain.events {
+        f.event(event);
+    }
+    assert!(matches!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::Answer {
+            reply: Decision::AllowOnce,
+            ..
+        }
+    ));
+    for field in ["dangerouslyDisableSandbox", "run_in_background"] {
+        let mut input = json!({"command":"echo safe"});
+        input[field] = json!(true);
+        let opened = codec.value(request(field, "Bash", input)).unwrap();
+        assert!(matches!(
+            &opened.events[0],
+            ProviderEvent::Turn {
+                event: TurnEvent::RequestOpened {
+                    kind: RequestKind::Approval {
+                        grant_key: None,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
+        for event in opened.events {
+            f.event(event);
+        }
+        assert!(
+            f.controls.try_recv().is_err(),
+            "extra input must dock without the grant"
+        );
+    }
+    assert_eq!(
+        f.loaded()
+            .requests
+            .values()
+            .filter(|r| r.state == RequestState::Pending)
+            .count(),
+        2
+    );
 }

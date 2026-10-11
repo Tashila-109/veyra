@@ -1018,7 +1018,6 @@ impl Shell {
             .flex()
             .items_center()
             .justify_center()
-            .bg(t.colors.bg)
             .track_focus(&self.quit_focus)
             .key_context("VeyraQuit")
             .child(
@@ -1060,6 +1059,19 @@ impl Shell {
                     ),
             )
     }
+    fn discard_queued_visible(&self) -> bool {
+        self.view.chat().is_some_and(|thread| {
+            self.state
+                .threads
+                .get(&thread)
+                .is_some_and(|row| row.hold.is_some())
+                && self
+                    .state
+                    .turns
+                    .values()
+                    .any(|turn| turn.thread == thread && turn.state == TurnState::Queued)
+        })
+    }
     fn confirm_quit(&mut self, cx: &mut Context<Self>) {
         if self.quitting {
             return;
@@ -1090,6 +1102,15 @@ impl Shell {
                 self.notifications_posted += 1;
                 cx.show_system_notification(banner);
             }
+        }
+    }
+    fn notification_response(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(root) = serde_json::from_value::<ThreadId>(serde_json::Value::String(tag.into()))
+            && let Some(thread) = self.banner_target(root)
+        {
+            cx.activate(true);
+            window.activate_window();
+            self.select_thread(thread, window, cx);
         }
     }
     fn banner_target(&self, root: ThreadId) -> Option<ThreadId> {
@@ -1249,20 +1270,18 @@ impl Shell {
     }
     #[cfg(debug_assertions)]
     fn dump_transcript(&self) -> Vec<serde_json::Value> {
-        self.view
+        let items = self
+            .view
             .selected()
             .map(|thread| self.state.transcript(thread))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        items
             .iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(index, item)| {
                 let mut row = transcript::dump_item(item);
                 row["expanded"] = serde_json::json!(self.expanded.contains(&item.id));
-                row["outcome"] = self
-                    .state
-                    .turns
-                    .get(&item.turn)
-                    .and_then(transcript::turn_outcome_line)
-                    .into();
+                row["outcome"] = transcript::row_outcome(&items, index, &self.state.turns).into();
                 row["wait_reason"] = self
                     .state
                     .turns
@@ -1301,6 +1320,7 @@ impl Shell {
             "provider_picker_labels":self.provider_picker.as_ref().map(|_| &self.provider_picker_labels),
             "stop_visible":self.view.chat().is_some_and(|thread| self.running(thread))
                 && self.input.read(cx).value().trim().is_empty(),
+            "discard_queued_visible":self.discard_queued_visible(),
             "dock":self.view.chat().and_then(|thread| self.state.pending_requests(thread).first().map(|request| {
                 serde_json::json!({"request":request, "position":1,
                     "count":self.state.pending_requests(thread).len(), "focused":self.dock_focused,
@@ -1423,8 +1443,10 @@ impl Render for Shell {
                     state.scroll_to_item(0, cx);
                 });
             }))
-            .on_action(cx.listener(|shell, _: &ScrollTranscriptDown, _, cx| {
-                shell.scroller.update(cx, |state, cx| state.scroll_down(cx));
+            .on_action(cx.listener(|shell, _: &ScrollTranscriptDown, window, cx| {
+                shell
+                    .scroller
+                    .update(cx, |state, cx| state.scroll_down(window, cx));
             }))
             .on_action(cx.listener(|shell, _: &ScrollTranscriptEnd, _, cx| {
                 shell
@@ -1696,19 +1718,29 @@ impl Render for Shell {
             });
         }));
         #[cfg(debug_assertions)]
-        let root = root.on_action(cx.listener(|shell, action: &DebugScrollTranscript, _, cx| {
-            if action.pixels.is_finite() {
-                shell
-                    .scroller
-                    .update(cx, |state, cx| state.scroll_by(action.pixels.into(), cx));
-            }
-        }));
+        let root = root.on_action(cx.listener(
+            |shell, action: &DebugScrollTranscript, window, cx| {
+                if action.pixels.is_finite() {
+                    shell.scroller.update(cx, |state, cx| {
+                        state.scroll_by(action.pixels.into(), window, cx)
+                    });
+                }
+            },
+        ));
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|_, _: &ActivateWindow, window, cx| {
             cx.activate(true);
             window.activate_window();
             window.refresh();
         }));
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(
+            |shell, action: &DebugNotificationResponse, window, cx| {
+                if let Some(tag) = &action.tag {
+                    shell.notification_response(tag, window, cx);
+                }
+            },
+        ));
         root
     }
 }
@@ -1753,19 +1785,11 @@ pub fn run(
                 let notifications = shell.downgrade();
                 let handle = window.window_handle();
                 cx.on_system_notification_response(move |response, cx| {
-                    if let Ok(root) = serde_json::from_value::<ThreadId>(serde_json::Value::String(
-                        response.tag.to_string(),
-                    )) {
-                        let _ = handle.update(cx, |_, window, cx| {
-                            let _ = notifications.update(cx, |shell, cx| {
-                                if let Some(thread) = shell.banner_target(root) {
-                                    cx.activate(true);
-                                    window.activate_window();
-                                    shell.select_thread(thread, window, cx);
-                                }
-                            });
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = notifications.update(cx, |shell, cx| {
+                            shell.notification_response(response.tag.as_ref(), window, cx);
                         });
-                    }
+                    });
                 });
                 #[cfg(debug_assertions)]
                 crate::control::attach(&shell, requests, data_dir.clone(), window, cx);
@@ -1806,7 +1830,10 @@ mod tests {
         let scratch = Scratch(
             std::path::PathBuf::from("/tmp").join(format!("veyra-quit-{}", ThreadId::new())),
         );
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let engine = veyra_engine::Engine::start(
             runtime.handle(),
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),

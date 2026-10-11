@@ -38,7 +38,7 @@ Select each mode with PickPermission, send through Send, and preserve every dock
 Use AllowOnce or Deny as the operator directs; do not silently grant the whole thread.
 Read the project and outside files to prove the effects, then remove only this run's outside file.
 Record cell status, provider version, requested approvals, decisions, files and the run proof path.
-Codex and Grok remain not run until their adapters exist in M5 and M6.
+Codex and Grok remain not run until their adapters exist.
 
 ## Observable success
 
@@ -50,6 +50,6 @@ Replay evidence never marks a live cell passed.
 ## Gotchas
 
 The worker is forbidden to run claude, codex or grok; all nine cells remain not run here.
-CLI upgrades can change permission behavior, so M8 reruns the grid live with human consent.
+CLI upgrades require another live permission-grid run with human consent.
 Full access can change files outside the project.
-The lead fills Claude's row from its authorized M3 lane.
+Fill Claude's row only from an authorized live permission run.

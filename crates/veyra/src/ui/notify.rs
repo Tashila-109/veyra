@@ -65,18 +65,61 @@ mod tests {
     }
     #[test]
     fn banner_for_waits_for_background_work() {
+        use veyra_engine::{domain::*, live::LiveThread};
         let root = ThreadId::new();
+        let thread = Thread {
+            id: root,
+            project: ProjectId::new(),
+            title: "Root".into(),
+            lineage: Lineage::Root,
+            provider: veyra_engine::provider::ProviderKind::Claude,
+            config: ThreadConfig {
+                model: None,
+                effort: None,
+                mode: PermissionMode::AskFirst,
+            },
+            cwd: "/tmp".into(),
+            native: None,
+            native_cursor: None,
+            cli_version: None,
+            hold: None,
+            view: View::Chat,
+            import_pending: false,
+            archived: false,
+        };
+        let turn = Turn {
+            id: TurnId::new(),
+            thread: root,
+            ordinal: 1,
+            origin: TurnOrigin::Provider,
+            state: TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                started: Some(0),
+                at: 42_000,
+            },
+        };
+        let live = LiveThread {
+            background_work: true,
+            ..Default::default()
+        };
+        let view = |live| ThreadView {
+            thread: &thread,
+            live,
+            running: None,
+            queued: false,
+            pending_request: false,
+            last: Some(&turn),
+        };
         let working = Status::Working { since: 1 };
-        let background = Status::Working { since: 0 };
+        let background = family_status(&view(&live), &[]);
+        assert_eq!(background, Status::Working { since: 0 });
         assert!(banner_for(false, &working, &background, root, "Root").is_none());
-        let banner = banner_for(
-            false,
-            &background,
-            &Status::Done { took: 42_000 },
-            root,
-            "Root",
-        )
-        .unwrap();
+        let completed_live = LiveThread {
+            background_work: false,
+            ..live.clone()
+        };
+        let done = family_status(&view(&completed_live), &[]);
+        let banner = banner_for(false, &background, &done, root, "Root").unwrap();
         assert_eq!(banner.body.as_ref(), "Done");
     }
 }

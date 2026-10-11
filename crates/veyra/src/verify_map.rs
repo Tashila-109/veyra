@@ -48,7 +48,7 @@ fn dump_keys(source: &str) -> BTreeSet<String> {
     keys
 }
 #[test]
-fn verify_m3_nested_dump_names() {
+fn verify_nested_dump_names() {
     let skill =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.agents/skills/verify-veyra/SKILL.md");
     let map = fs::read_to_string(skill).unwrap();
@@ -63,6 +63,7 @@ fn verify_m3_nested_dump_names() {
         "wait_reason",
         "failed_last_line",
         "stop_visible",
+        "discard_queued_visible",
         "dock",
         "request",
         "position",

@@ -281,12 +281,12 @@ The debug transcript also reports gap, top_item, top_offset and item_tops for sc
 
 `chat-follow-25.json` remains detached at 25 px and `chat-follow-24.json` reattaches within one read line.
 The failed-tool PNG shows the last diagnostic while collapsed; its expansion assertion compares the same row top.
-The signed-out, retirement and notice dumps cover M3's account and notice window behavior.
+The signed-out, retirement and notice dumps cover account and notice window behavior.
 
 ## Gotchas
 
 Replay is not a live permission or tool proof.
-Approvals, questions and Stop are covered by their M3 pages.
+Approvals, questions and Stop are covered by their feature pages.
 A streamed row may complete before the turn ends; the header remains Working until the result.
 Open Terminal and native mouse/keyboard entry points remain manual checks.
-The lead fills the Status values after its gate.
+Update Status from candidate acceptance.

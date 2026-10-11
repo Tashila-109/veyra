@@ -127,3 +127,51 @@ fn shutdown_wait_is_bounded_when_actor_is_stalled() {
         assert!(matches!(receiver.recv().await, Some(EngineMsg::Shutdown)));
     });
 }
+
+#[test]
+fn orderly_shutdown_persists_restarted_hold_before_reconcile() {
+    for queued in [false, true] {
+        let mut f = Fixture::new(LiveState::Running);
+        if queued {
+            f.user("later");
+        }
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::Shutdown);
+        let mut persisted = f.loaded();
+        assert_eq!(
+            persisted.threads[&f.thread].hold,
+            Some(HoldReason::Restarted)
+        );
+        let mut live = persisted
+            .threads
+            .keys()
+            .map(|&id| (id, LiveThread::default()))
+            .collect();
+        crate::reconcile::decide(&persisted, now()).install(&mut persisted, &mut live);
+        assert_eq!(
+            persisted.threads[&f.thread].hold,
+            Some(HoldReason::Restarted)
+        );
+        let view = ChangeSet::default();
+        let view = view.view(&persisted, &live, f.thread).unwrap();
+        assert_eq!(
+            wait_reason(&view),
+            Some(WaitReason::Held(HoldReason::Restarted))
+        );
+        assert_eq!(thread_status(&view), Status::Held);
+    }
+}
+
+#[test]
+fn shutdown_expires_requests_with_closing_reason() {
+    let mut f = Fixture::new(LiveState::Running);
+    let request = f.req();
+    let _entered = f.runtime.enter();
+    f.actor.handle(EngineMsg::Shutdown);
+    assert_eq!(
+        f.loaded().requests[&request].state,
+        RequestState::Expired {
+            reason: "Veyra is closing".into()
+        }
+    );
+}

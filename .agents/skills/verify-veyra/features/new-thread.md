@@ -148,4 +148,4 @@ Do not invent a signed-out fixture before a live signal is recorded.
 Check again may briefly show Checking; the helper polls that state at the same 50 ms cadence as ctl wait.
 The checks do not run a Claude turn or mutate any committed fixture.
 The native folder picker and external keyboard delivery are manual entry points.
-The lead fills the Status values after its gate.
+Update Status from candidate acceptance.

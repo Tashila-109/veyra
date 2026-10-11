@@ -457,7 +457,7 @@ pub(crate) struct Codec {
     stream: MessageStream,
     tools: BTreeMap<String, Tool>,
     error: Option<AssistantError>,
-    pub interrupted: Option<Interruption>,
+    interrupted: Option<Interruption>,
     requests: BTreeMap<String, PendingRequest>,
     seen_requests: BTreeSet<String>,
 }
@@ -609,11 +609,7 @@ impl Codec {
             Frame::Result(result) => {
                 if self.owns_result(&result) {
                     events.push(TurnEvent::TurnEnded {
-                        outcome: if let Some(interrupt) = &self.interrupted {
-                            TurnOutcome::Interrupted { reason: interrupt.reason.clone() }
-                        } else if let Some(error) = &self.error {
-                            TurnOutcome::Failed { message: error.message.clone() }
-                        } else { result.outcome() },
+                        outcome: self.end_outcome(result.outcome()),
                         park: self.error.as_ref().is_some_and(|error| error.park),
                     });
                 }
@@ -764,29 +760,37 @@ impl Codec {
         }
     }
     pub fn answer(&mut self, native: NativeRequestRef, decision: Decision) -> Option<Value> {
-        if !self.requests.get(&native.0)?.kind.accepts(&decision) {
-            return None;
-        }
-        let request = self.requests.remove(&native.0)?;
-        let response = match decision {
-            Decision::AllowOnce | Decision::AllowInThread => json!({"behavior":"allow"}),
-            Decision::Deny => json!({"behavior":"deny", "message":"Denied by you"}),
-            Decision::Answers(answers) => {
-                let RequestKind::Question { questions } = request.kind else {
-                    return None;
-                };
-                let mut input = request.input;
+        let request = self.requests.get(&native.0)?;
+        let response = match request.kind.accepts(&decision)? {
+            AcceptedDecision::Allow { .. } => json!({"behavior":"allow"}),
+            AcceptedDecision::Deny => json!({"behavior":"deny", "message":"Denied by you"}),
+            AcceptedDecision::Answers { questions, answers } => {
+                let mut input = request.input.clone();
                 input["answers"] = Value::Object(
                     questions
-                        .into_iter()
+                        .iter()
                         .zip(answers)
-                        .map(|(question, answer)| (question.text, Value::String(answer.text)))
+                        .map(|(question, answer)| {
+                            (question.text.clone(), Value::String(answer.text.clone()))
+                        })
                         .collect(),
                 );
                 json!({"behavior":"allow", "updatedInput":input})
             }
         };
+        self.requests.remove(&native.0);
         Some(Self::response(native.0, response))
+    }
+    pub fn interrupt_lines(&mut self, reason: StopReason) -> Vec<Value> {
+        if !self.interrupt_for(reason) {
+            return Vec::new();
+        }
+        let mut lines = self.cancel_requests(reason.text());
+        lines.push(json!({
+            "type":"control_request", "request_id":"veyra-interrupt",
+            "request":{"subtype":"interrupt"}
+        }));
+        lines
     }
     pub fn cancel_requests(&mut self, reason: &str) -> Vec<Value> {
         std::mem::take(&mut self.requests)
@@ -806,8 +810,18 @@ impl Codec {
             "subtype":"success", "request_id":id, "response":response
         }})
     }
-    pub fn failure(&self) -> Option<&str> {
-        self.error.as_ref().map(|error| error.message.as_str())
+    pub fn end_outcome(&self, fallback: TurnOutcome) -> TurnOutcome {
+        if let Some(interrupt) = &self.interrupted {
+            TurnOutcome::Interrupted {
+                reason: interrupt.reason.clone(),
+            }
+        } else if let Some(error) = &self.error {
+            TurnOutcome::Failed {
+                message: error.message.clone(),
+            }
+        } else {
+            fallback
+        }
     }
     fn notice(text: String) -> ProviderEvent {
         ProviderEvent::Session(SessionEvent::Notice { text })
