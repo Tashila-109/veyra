@@ -153,7 +153,7 @@ pub enum TerminalEvent {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("probe cancelled")]
+    #[error("provider work cancelled")]
     Cancelled,
     #[error("this provider is not built yet")]
     NotBuilt,
@@ -333,6 +333,10 @@ impl Probes {
         env: env::ChildEnv,
         cwd: PathBuf,
     ) -> tokio::sync::oneshot::Receiver<Probe> {
+        if env.closing.load(std::sync::atomic::Ordering::Acquire) {
+            let (_, result) = tokio::sync::oneshot::channel();
+            return result;
+        }
         let previous = self.tasks.remove(&provider);
         let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
         let (reply, result) = tokio::sync::oneshot::channel();
@@ -341,7 +345,13 @@ impl Probes {
                 let _ = previous.cancel.send(());
                 let _ = previous.task.await;
             }
-            if reply.is_closed() || cancelled.try_recv().is_ok() {
+            if env.closing.load(std::sync::atomic::Ordering::Acquire)
+                || reply.is_closed()
+                || !matches!(
+                    cancelled.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                )
+            {
                 return;
             }
             let probe = provider.probe_cancellable(&env, &cwd, cancelled).await;
@@ -356,5 +366,76 @@ impl Drop for Probes {
         for (_, task) in std::mem::take(&mut self.tasks) {
             let _ = task.cancel.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_probe_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancelling_probe_during_version_cleanup_starts_no_initialize() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/probe-cancel-{}",
+            crate::domain::ThreadId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let binary = root.join("owned-probe-stand-in");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  trap 'printf stopping > version-stopping' TERM
+  printf '1.0.0\n'
+  while :; do /bin/sleep 0.05; done
+fi
+printf launched > initialize-spawned
+read initialize
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("700")
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut env = env::ChildEnv::load();
+        env.groups = Default::default();
+        env.claude_bin = Some(binary);
+        env.fixtures = None;
+        env.record = None;
+        let mut probes = Probes::default();
+        let reply = probes.check(
+            &tokio::runtime::Handle::current(),
+            ProviderKind::Claude,
+            env.clone(),
+            root.clone(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !root.join("version-stopping").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(probes);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), reply).await;
+        assert!(result.is_ok(), "probe did not finish cleanup");
+        assert!(
+            env.groups.lock().unwrap().is_empty(),
+            "owned groups survived cleanup"
+        );
+        assert_eq!(
+            env.launches.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "cancelled probe spawned initialize"
+        );
+        assert!(
+            !root.join("initialize-spawned").exists(),
+            "cancelled probe launched initialize after version cleanup"
+        );
     }
 }

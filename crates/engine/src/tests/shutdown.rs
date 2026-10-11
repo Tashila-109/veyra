@@ -366,3 +366,153 @@ read initialize
         "Actor Shutdown launched a fresh provider replacement"
     );
 }
+
+#[test]
+fn shutdown_request_prevents_ready_start_before_mailbox_shutdown() {
+    let mut f = Fixture::new(LiveState::Starting);
+    let _entered = f.runtime.enter();
+    let queued = f.user("waiting before quit");
+    let (sender, mut receiver) = mpsc::channel(256);
+    let engine = crate::Engine {
+        inner: std::sync::Arc::new(crate::EngineInner {
+            sender,
+            schema_version: 2,
+            state: f.actor.state.clone(),
+            runtime: f.runtime.handle().clone(),
+            groups: Default::default(),
+        }),
+    };
+    engine
+        .inner
+        .sender
+        .try_send(EngineMsg::Provider {
+            thread: f.thread,
+            epoch: 1,
+            event: ProviderEvent::Session(SessionEvent::Ready {
+                native: NativeSessionId("owned-native".into()),
+                cli_version: None,
+                pid: 1,
+                pgid: 1,
+                capabilities: vec![],
+            }),
+        })
+        .unwrap();
+    engine.shutdown();
+    f.actor.handle(receiver.try_recv().unwrap());
+    let mut started = false;
+    while let Ok(control) = f.controls.try_recv() {
+        started |= matches!(control, SessionControl::StartTurn { .. });
+    }
+    assert!(!started, "Ready started queued work after Engine::shutdown");
+    assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
+}
+
+#[test]
+fn shutdown_request_rejects_backlogged_start_commands() {
+    let mut accepted = Vec::new();
+    for state in [
+        LiveState::Parked,
+        LiveState::Idle,
+        LiveState::Starting,
+        LiveState::Stopping,
+    ] {
+        let mut f = Fixture::new(state);
+        let _entered = f.runtime.enter();
+        let (sender, mut receiver) = mpsc::channel(256);
+        let engine = crate::Engine {
+            inner: std::sync::Arc::new(crate::EngineInner {
+                sender,
+                schema_version: 2,
+                state: f.actor.state.clone(),
+                runtime: f.runtime.handle().clone(),
+                groups: Default::default(),
+            }),
+        };
+        let mut reply = engine.send(Command::Send {
+            thread: f.thread,
+            text: "queued before quit".into(),
+        });
+        engine.shutdown();
+        f.actor.handle(receiver.try_recv().unwrap());
+        if !matches!(reply.try_recv().unwrap(), Err(CommandError::Closed)) {
+            accepted.push(state);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "backlogged Send accepted after Engine::shutdown: {accepted:?}"
+    );
+}
+#[test]
+fn shutdown_request_prevents_retiring_session_restart_before_mailbox_shutdown() {
+    let mut restarted = Vec::new();
+    for then in [
+        AfterStop::Park,
+        AfterStop::StartStructured { import: false },
+        AfterStop::StartTerminal,
+    ] {
+        for hold in [None, Some(HoldReason::Interrupted)] {
+            let mut f = Fixture::new(LiveState::Stopping);
+            f.hold(hold);
+            let _entered = f.runtime.enter();
+            f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping { then: then.clone() };
+            let queued = f.user("queued before quit");
+            let (sender, mut receiver) = mpsc::channel(256);
+            let engine = crate::Engine {
+                inner: std::sync::Arc::new(crate::EngineInner {
+                    sender,
+                    schema_version: 2,
+                    state: f.actor.state.clone(),
+                    runtime: f.runtime.handle().clone(),
+                    groups: Default::default(),
+                }),
+            };
+            engine
+                .inner
+                .sender
+                .try_send(EngineMsg::Provider {
+                    thread: f.thread,
+                    epoch: 1,
+                    event: ProviderEvent::Session(SessionEvent::Exited { crash: None }),
+                })
+                .unwrap();
+            engine.shutdown();
+            f.actor.handle(receiver.try_recv().unwrap());
+            if !matches!(f.actor.live[&f.thread].live, Live::Parked) {
+                restarted.push(then.clone());
+            }
+            assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
+            assert_eq!(
+                f.loaded().threads[&f.thread].hold,
+                Some(hold.unwrap_or(HoldReason::Restarted))
+            );
+        }
+    }
+    assert!(
+        restarted.is_empty(),
+        "session restarted after Engine::shutdown: {restarted:?}"
+    );
+}
+
+#[test]
+fn engine_and_provider_environment_share_closing_state() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut db = rusqlite::Connection::open_in_memory().unwrap();
+    store::initialize(&mut db).unwrap();
+    let env = env::ChildEnv::load();
+    let engine =
+        crate::Engine::launch(runtime.handle(), db, Spawner::Cli(env.clone()), None).unwrap();
+    let probe_env = engine.child_env();
+    assert!(std::sync::Arc::ptr_eq(
+        &env.closing,
+        &engine.inner.state.closing
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &probe_env.closing,
+        &engine.inner.state.closing
+    ));
+    engine.shutdown();
+    assert!(env.closing.load(std::sync::atomic::Ordering::Acquire));
+    assert!(probe_env.closing.load(std::sync::atomic::Ordering::Acquire));
+    runtime.block_on(engine.shutdown_wait());
+}

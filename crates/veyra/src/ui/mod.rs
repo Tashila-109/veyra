@@ -477,6 +477,10 @@ impl Shell {
         })
         .detach();
         cx.on_app_quit(|shell, _| {
+            shell.engine.shutdown();
+            shell.quitting = true;
+            shell.probes = Default::default();
+            shell.forget_branch();
             let engine = shell.engine.clone();
             async move { engine.on_app_quit().await }
         })
@@ -786,6 +790,9 @@ impl Shell {
         cx.notify();
     }
     fn recheck(&mut self, retry: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
         self.providers.clear();
         if self.provider_picker.is_some() {
             self.set_provider_picker(true, window, cx);
@@ -793,7 +800,7 @@ impl Shell {
         self.probe_generation += 1;
         let generation = self.probe_generation;
         let retry_thread = retry.then(|| self.view.chat()).flatten();
-        let env = veyra_engine::provider::env::ChildEnv::load();
+        let env = self.engine.child_env();
         for provider in ProviderKind::ALL {
             let reply =
                 self.probes
@@ -801,7 +808,7 @@ impl Shell {
             cx.spawn_in(window, async move |this, cx| {
                 if let Ok(probe) = reply.await {
                     let _ = this.update_in(cx, |shell, window, cx| {
-                        if shell.probe_generation != generation {
+                        if shell.quitting || shell.probe_generation != generation {
                             return;
                         }
                         shell.providers.push(probe);
@@ -1080,7 +1087,9 @@ impl Shell {
         if self.quitting {
             return;
         }
+        self.engine.shutdown();
         self.quitting = true;
+        self.probes = Default::default();
         self.forget_branch();
         let engine = self.engine.clone();
         cx.spawn(async move |_, cx| {
@@ -1634,6 +1643,9 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &ConfirmQuit, _, cx| shell.confirm_quit(cx)))
             .on_action(cx.listener(|shell, _: &CancelQuit, window, cx| {
+                if shell.quitting {
+                    return;
+                }
                 shell.quit_sheet = false;
                 shell.input.update(cx, |input, cx| input.focus(window, cx));
                 cx.notify();
@@ -2825,5 +2837,158 @@ mod tests {
         );
         probe.readiness = Readiness::Ready;
         assert_eq!(provider_rows(&[probe])[0].1, "Claude Code · Ready");
+    }
+
+    #[gpui::test]
+    fn escape_after_confirm_quit_keeps_sheet(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                shell.quit_sheet = true;
+                window.focus(&shell.quit_focus, cx);
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            assert!(!shell.read_with(cx, |shell, _| shell.quit_sheet));
+            shell.update_in(cx, |shell, window, cx| {
+                shell.quit_sheet = true;
+                window.focus(&shell.quit_focus, cx);
+                cx.notify();
+            });
+            draw(cx);
+            cx.dispatch_action(super::ConfirmQuit);
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.quitting));
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.quit_sheet));
+        });
+    }
+
+    #[gpui::test]
+    fn recheck_after_confirm_quit_launches_no_provider(cx: &mut gpui::TestAppContext) {
+        use std::time::Duration;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        if std::env::var_os("TEST_QUIT_PROBE_MARKER").is_none() {
+            let scratch = Scratch(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("../../target/quit-probe-{}", ThreadId::new())),
+            );
+            std::fs::create_dir_all(&scratch.0).unwrap();
+            let binary = scratch.0.join("owned-probe-stand-in");
+            std::fs::write(
+                &binary,
+                concat!(
+                    "#!/bin/sh\nprintf launched >> \"$TEST_QUIT_PROBE_MARKER\"\n",
+                    "if [ \"$1\" = --version ]; then printf '1.0.0\\n'; exit; fi\n",
+                    "read initialize\nprintf '%s\\n' '",
+                    "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",",
+                    "\"request_id\":\"veyra-initialize\",\"response\":{}}}'\n",
+                ),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&binary)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::tests::recheck_after_confirm_quit_launches_no_provider",
+                ])
+                .env("VEYRA_CLAUDE_BIN", &binary)
+                .env("TEST_QUIT_PROBE_MARKER", scratch.0.join("marker"))
+                .env_remove("VEYRA_FAKE_FIXTURES")
+                .env_remove("VEYRA_RECORD")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            return;
+        }
+        let marker = std::path::PathBuf::from(std::env::var_os("TEST_QUIT_PROBE_MARKER").unwrap());
+        let scratch = Scratch(
+            std::path::PathBuf::from("/tmp").join(format!("veyra-quit-probe-{}", ThreadId::new())),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = veyra_engine::Engine::start_with_processes(
+            runtime.handle(),
+            veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+            vec![],
+        )
+        .unwrap();
+        let (_sender, events) = tokio::sync::mpsc::unbounded_channel();
+        cx.update(gpui_kit::init);
+        cx.skip_drawing();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(super::Appearance::Dark, window, cx);
+            let mut shell = super::Shell::new(
+                engine.clone(),
+                runtime.handle().clone(),
+                events,
+                scratch.0.clone(),
+                window,
+                cx,
+            );
+            shell.probes = Default::default();
+            shell
+        });
+        let mut probes = veyra_engine::provider::Probes::default();
+        let control = probes.check(
+            runtime.handle(),
+            ProviderKind::Claude,
+            veyra_engine::provider::env::ChildEnv::load(),
+            scratch.0.clone(),
+        );
+        let positive = runtime.block_on(control).unwrap();
+        assert_eq!(positive.readiness, Readiness::Ready);
+        assert!(
+            marker.exists(),
+            "positive probe path={:?}; override={:?}; marker={:?}",
+            positive.path,
+            std::env::var_os("VEYRA_CLAUDE_BIN"),
+            marker
+        );
+        assert!(!std::fs::read_to_string(&marker).unwrap().is_empty());
+        std::fs::remove_file(&marker).unwrap();
+        shell.update_in(cx, |shell, _, cx| shell.confirm_quit(cx));
+        cx.run_until_parked();
+        let refused = runtime.block_on(engine.send(
+            veyra_engine::commands::Command::SetDefaultMode {
+                mode: PermissionMode::AskFirst,
+            },
+        ));
+        assert!(matches!(
+            refused.unwrap(),
+            Err(veyra_engine::commands::CommandError::Closed)
+        ));
+        shell.update_in(cx, |shell, window, cx| {
+            assert!(shell.quitting);
+            shell.recheck(false, window, cx);
+        });
+        runtime.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
+        let launched = std::fs::read_to_string(&marker).unwrap_or_default();
+        shell.update(cx, |shell, _| shell.probes = Default::default());
+        runtime.block_on(engine.shutdown_wait());
+        assert!(
+            launched.is_empty(),
+            "a provider launched after quit began: {launched}"
+        );
     }
 }

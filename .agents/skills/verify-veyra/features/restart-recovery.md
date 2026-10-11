@@ -18,6 +18,8 @@ On relaunch, read Held because Veyra closed while this ran, then Continue or Dis
 ConfirmQuit waits for engine shutdown, and the app quit hook calls Engine::on_app_quit.
 No busy thread means Quit runs ConfirmQuit immediately.
 
+After ConfirmQuit begins, Escape keeps the quit sheet visible until the app exits.
+
 ## Driving it with veyra ctl
 
 Run Launch, Doctor and new-thread first, with fake CLI only.

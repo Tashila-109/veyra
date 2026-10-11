@@ -131,8 +131,16 @@ impl Actor {
             .map(|id| (*id, LiveThread::default()))
             .collect();
         let idle_since = projection.threads.keys().map(|id| (*id, now())).collect();
+        let closing = match &spawner {
+            Spawner::Cli(env) => env.closing.clone(),
+            #[cfg(test)]
+            Spawner::Scripted(_) => Default::default(),
+        };
         let mut actor = Self {
-            state: Default::default(),
+            state: Arc::new(RuntimeState {
+                closing,
+                ..Default::default()
+            }),
             awake: None,
             shutting_down: false,
             db,
@@ -201,6 +209,9 @@ impl Actor {
         }
     }
     fn handle_inner(&mut self, msg: EngineMsg) {
+        if self.state.closing.load(Ordering::Acquire) {
+            self.shutdown();
+        }
         if self.shutting_down {
             match msg {
                 EngineMsg::Command { reply, .. } => {
@@ -589,6 +600,14 @@ impl Actor {
             }
         }
         for effect in effects {
+            if self.state.closing.load(Ordering::Acquire)
+                && matches!(
+                    effect,
+                    Effect::Spawn { .. } | Effect::StartTurn { .. } | Effect::OpenTerminal { .. }
+                )
+            {
+                continue;
+            }
             match effect {
                 Effect::Spawn { thread, import } => {
                     let row = &self.projection.threads[&thread];
@@ -613,7 +632,11 @@ impl Actor {
                             thread,
                             epoch,
                             event: ProviderEvent::Session(SessionEvent::Exited {
-                                crash: Some(error.to_string()),
+                                crash: if matches!(error, ProviderError::Cancelled) {
+                                    None
+                                } else {
+                                    Some(error.to_string())
+                                },
                             }),
                         }),
                     }
@@ -671,6 +694,9 @@ impl Actor {
         epoch: u32,
         event: ProviderEvent,
     ) -> Option<ChangeSet> {
+        if self.state.closing.load(Ordering::Acquire) {
+            return None;
+        }
         if !self.current(thread, epoch) {
             tracing::debug!(%thread,epoch,"dropped stale session event");
             return None;
@@ -790,7 +816,10 @@ impl Actor {
                 let current = match (turn, running) {
                     (Some(id), Some(t)) if id == t.id => t,
                     (None, Some(t)) if t.origin == TurnOrigin::Provider => t,
-                    (None, None) if event.opens_provider_turn() => {
+                    (None, None)
+                        if event.opens_provider_turn()
+                            && !self.state.closing.load(Ordering::Acquire) =>
+                    {
                         let id =
                             commands::queue(&self.projection, &mut c, thread, TurnOrigin::Provider);
                         let mut t = c.turns[&id].clone();
@@ -801,14 +830,18 @@ impl Actor {
                     }
                     _ => {
                         tracing::debug!(%thread,"dropped event for non-running turn");
-                        commands::start_changed(&self.projection, &self.live, &mut c, now());
+                        if !self.state.closing.load(Ordering::Acquire) {
+                            commands::start_changed(&self.projection, &self.live, &mut c, now());
+                        }
                         return Some(c);
                     }
                 };
                 self.turn_event(&mut c, thread, epoch, current, event);
             }
         }
-        commands::start_changed(&self.projection, &self.live, &mut c, now());
+        if !self.state.closing.load(Ordering::Acquire) {
+            commands::start_changed(&self.projection, &self.live, &mut c, now());
+        }
         Some(c)
     }
     fn turn_event(
@@ -1016,7 +1049,7 @@ impl Actor {
         live.background_work = false;
         c.live.insert(thread, live);
 
-        if !self.shutting_down {
+        if !self.state.closing.load(Ordering::Acquire) {
             match &old.live {
                 Live::Stopping {
                     then: AfterStop::StartStructured { import },
@@ -1037,7 +1070,7 @@ impl Actor {
             }
         }
         commands::settle_idle_child(&self.projection, &self.live, &mut c, thread, false, now());
-        if !self.shutting_down {
+        if !self.state.closing.load(Ordering::Acquire) {
             commands::start_changed(&self.projection, &self.live, &mut c, now());
         }
         c

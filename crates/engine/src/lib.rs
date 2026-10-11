@@ -55,7 +55,7 @@ struct EngineInner {
 #[derive(Default)]
 pub(crate) struct RuntimeState {
     pub awake: AtomicBool,
-    pub closing: AtomicBool,
+    pub closing: Arc<AtomicBool>,
     pub window_threads: Mutex<std::collections::BTreeMap<ThreadId, WindowThread>>,
     #[cfg(debug_assertions)]
     pub counters: Mutex<ProbeCounters>,
@@ -90,6 +90,7 @@ pub struct Process {
 }
 impl Drop for EngineInner {
     fn drop(&mut self) {
+        self.state.closing.store(true, Ordering::Release);
         let _ = self.sender.try_send(EngineMsg::Shutdown);
     }
 }
@@ -200,10 +201,10 @@ impl Engine {
             .await;
     }
     pub async fn on_app_quit(&self) {
+        self.shutdown();
         for &group in self.inner.groups.lock().unwrap().iter() {
             let _ = platform::signal_group(group, platform::Signal::Terminate);
         }
-        self.shutdown();
         let _ = self
             .inner
             .runtime
@@ -211,6 +212,11 @@ impl Engine {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             })
             .await;
+    }
+    pub fn child_env(&self) -> provider::env::ChildEnv {
+        let mut env = provider::env::ChildEnv::load();
+        env.closing = self.inner.state.closing.clone();
+        env
     }
     pub fn window_threads(&self) -> std::collections::BTreeMap<ThreadId, WindowThread> {
         self.inner.state.window_threads.lock().unwrap().clone()

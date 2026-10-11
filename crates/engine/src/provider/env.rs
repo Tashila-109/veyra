@@ -8,7 +8,10 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::process::{Child, Command};
 
@@ -33,6 +36,9 @@ static LOGIN_PATH: LazyLock<LoginPath> = LazyLock::new(|| match platform::login_
 #[derive(Clone, Debug)]
 pub struct ChildEnv {
     pub(crate) groups: Groups,
+    pub(crate) closing: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) launches: Arc<std::sync::atomic::AtomicUsize>,
     pub path: OsString,
     pub home: Option<PathBuf>,
     #[cfg(debug_assertions)]
@@ -52,6 +58,9 @@ impl ChildEnv {
         }
         Self {
             groups: GROUPS.clone(),
+            closing: Default::default(),
+            #[cfg(test)]
+            launches: Default::default(),
             path: LOGIN_PATH.path.clone(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             #[cfg(debug_assertions)]
@@ -128,6 +137,9 @@ impl ChildEnv {
         cwd: &Path,
         fixture: Option<&Path>,
     ) -> Result<Child, ProviderError> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ProviderError::Cancelled);
+        }
         let mut cmd = self.command(binary, args, cwd);
         #[cfg(debug_assertions)]
         if let Some(fixture) = fixture {
@@ -138,7 +150,13 @@ impl ChildEnv {
         }
         #[cfg(not(debug_assertions))]
         let _ = fixture;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ProviderError::Cancelled);
+        }
         let child = cmd.spawn()?;
+        #[cfg(test)]
+        self.launches
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         if let Err(error) = platform::lower_priority(child.id().expect("new child")) {
             tracing::warn!(%error, "could not lower agent group priority");
         }
@@ -181,6 +199,8 @@ mod tests {
         if let Some(root) = std::env::var_os("VEYRA_TEST_RESOLUTION") {
             let env = super::ChildEnv {
                 groups: Default::default(),
+                closing: Default::default(),
+                launches: Default::default(),
                 path: "bin::.".into(),
                 home: None,
                 lanes: Default::default(),
@@ -237,5 +257,30 @@ mod tests {
         assert_eq!(first_first.1, 1);
         assert_eq!(second_first.1, 1);
         assert_eq!(env.next_lane(second), (second_first.0, 2));
+    }
+
+    #[tokio::test]
+    async fn closing_state_refuses_every_provider_spawn() {
+        let env = ChildEnv::load();
+        let cwd = std::path::Path::new("/tmp");
+        let binary = std::path::Path::new("/usr/bin/true");
+        let mut positive = env.spawn(binary, &[], cwd, None).unwrap();
+        positive.wait().await.unwrap();
+        assert_eq!(env.launches.load(super::Ordering::Acquire), 1);
+        env.closing.store(true, super::Ordering::Release);
+        assert!(matches!(
+            env.clone().spawn(binary, &[], cwd, None),
+            Err(super::ProviderError::Cancelled)
+        ));
+        assert!(matches!(
+            env.spawn(
+                binary,
+                &[],
+                cwd,
+                Some(std::path::Path::new("/nonexistent/fixture"))
+            ),
+            Err(super::ProviderError::Cancelled)
+        ));
+        assert_eq!(env.launches.load(super::Ordering::Acquire), 1);
     }
 }

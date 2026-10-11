@@ -12,7 +12,10 @@ use crate::{
 };
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -227,6 +230,9 @@ pub fn spawn(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
+    if env.closing.load(Ordering::Acquire) {
+        return Err(ProviderError::Cancelled);
+    }
     env.resolve(ProviderKind::Claude)?;
     Ok(start_task(None, spec, env, out, epoch))
 }
@@ -253,20 +259,14 @@ fn start_task(
     let supervisor_out = out.clone();
     let task = tokio::spawn(async move {
         let mut spec = spec;
-        let mut receiver = SessionControls::new(receiver);
+        let mut receiver = SessionControls::new(receiver, env.closing.clone());
         let mut process = match process {
             Some(process) => process,
             None => {
-                if !receiver.can_launch() || out.is_closed() {
-                    return emit(
-                        &out,
-                        thread,
-                        epoch,
-                        ProviderEvent::Session(SessionEvent::Exited { crash: None }),
-                    )
-                    .await;
-                }
-                match launch(&spec, &env, None) {
+                match receiver
+                    .drain_and_check_launch(&out)
+                    .and_then(|()| launch(&spec, &env, None))
+                {
                     Ok(process) => process,
                     Err(error) => {
                         return emit(&out, thread, epoch, launch_failed(error)).await;
@@ -288,18 +288,12 @@ fn start_task(
             .await
             {
                 Completion::MissingSession => {
-                    if !receiver.can_launch() || out.is_closed() {
-                        return emit(
-                            &out,
-                            thread,
-                            epoch,
-                            ProviderEvent::Session(SessionEvent::Exited { crash: None }),
-                        )
-                        .await;
-                    }
                     spec.native = None;
                     let native = NativeSessionId(ThreadId::new().to_string());
-                    match launch(&spec, &env, Some(native)) {
+                    match receiver
+                        .drain_and_check_launch(&out)
+                        .and_then(|()| launch(&spec, &env, Some(native)))
+                    {
                         Ok(mut next) => {
                             next.child.watch(&cleanup);
                             let notice = ProviderEvent::Session(SessionEvent::Notice {
@@ -333,7 +327,11 @@ fn start_task(
 }
 fn launch_failed(error: ProviderError) -> ProviderEvent {
     ProviderEvent::Session(SessionEvent::Exited {
-        crash: Some(record::redact(&error.to_string(), None)),
+        crash: if matches!(error, ProviderError::Cancelled) {
+            None
+        } else {
+            Some(record::redact(&error.to_string(), None))
+        },
     })
 }
 
@@ -425,28 +423,49 @@ impl<R: AsyncRead + Unpin> ByteLines<R> {
 struct SessionControls {
     receiver: mpsc::UnboundedReceiver<SessionControl>,
     pending: VecDeque<SessionControl>,
+    closing: Arc<AtomicBool>,
 }
 impl SessionControls {
-    fn new(receiver: mpsc::UnboundedReceiver<SessionControl>) -> Self {
+    fn new(receiver: mpsc::UnboundedReceiver<SessionControl>, closing: Arc<AtomicBool>) -> Self {
         Self {
             receiver,
             pending: VecDeque::new(),
+            closing,
         }
     }
-    fn can_launch(&mut self) -> bool {
+    fn drain_and_close(&mut self) {
+        if self.closing.load(Ordering::Acquire) {
+            self.receiver.close();
+        }
         while let Ok(message) = self.receiver.try_recv() {
             if matches!(message, SessionControl::Shutdown) {
                 self.receiver.close();
             }
             self.pending.push_back(message);
         }
-        !self.receiver.is_closed()
+    }
+    fn drain_and_check_launch(
+        &mut self,
+        out: &mpsc::Sender<EngineMsg>,
+    ) -> Result<(), ProviderError> {
+        self.drain_and_close();
+        if self.receiver.is_closed() || out.is_closed() {
+            Err(ProviderError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
     async fn recv(&mut self) -> Option<SessionControl> {
         let message = match self.pending.pop_front() {
             Some(message) => Some(message),
             None => self.receiver.recv().await,
         };
+        if matches!(message, Some(SessionControl::StartTurn { .. })) {
+            self.drain_and_close();
+            if self.receiver.is_closed() {
+                return Some(SessionControl::Shutdown);
+            }
+        }
         if matches!(message, Some(SessionControl::Shutdown) | None) {
             self.receiver.close();
         }
@@ -806,6 +825,14 @@ pub async fn probe(
             })
             .unwrap_or_default()
     } else {
+        if env.closing.load(Ordering::Acquire)
+            || !matches!(
+                cancelled.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            )
+        {
+            return Err(ProviderError::Cancelled);
+        }
         let mut child =
             ProcessGroup::tracked(env.spawn(&binary, &["--version".into()], cwd, None)?, env);
         let mut stdout = ByteLines::new(child.stdout().expect("piped version stdout"));
@@ -843,6 +870,14 @@ pub async fn probe(
             record::Recorder::create(&path, "claude", &version, cwd, env.home.as_deref(), None)
         })
         .transpose()?;
+    if env.closing.load(Ordering::Acquire)
+        || !matches!(
+            cancelled.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        )
+    {
+        return Err(ProviderError::Cancelled);
+    }
     let mut child = ProcessGroup::tracked(
         env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?,
         env,
@@ -941,7 +976,7 @@ mod tests {
             recorder: None,
         };
         let (sender, control) = mpsc::unbounded_channel();
-        let mut control = SessionControls::new(control);
+        let mut control = SessionControls::new(control, Default::default());
         sender
             .send(SessionControl::StartTurn {
                 turn: TurnId::new(),
@@ -1030,7 +1065,7 @@ mod tests {
                 recorder: None,
             };
             let (sender, control) = mpsc::unbounded_channel();
-            let mut control = SessionControls::new(control);
+            let mut control = SessionControls::new(control, Default::default());
             sender
                 .send(SessionControl::StartTurn {
                     turn: TurnId::new(),
@@ -1098,7 +1133,7 @@ mod tests {
             recorder: None,
         };
         let (sender, control) = mpsc::unbounded_channel();
-        let mut control = SessionControls::new(control);
+        let mut control = SessionControls::new(control, Default::default());
         sender
             .send(SessionControl::StartTurn {
                 turn: TurnId::new(),
@@ -1159,7 +1194,7 @@ mod tests {
             recorder: None,
         };
         let (sender, control) = mpsc::unbounded_channel();
-        let mut control = SessionControls::new(control);
+        let mut control = SessionControls::new(control, Default::default());
         sender
             .send(SessionControl::StartTurn {
                 turn: TurnId::new(),
@@ -1375,7 +1410,7 @@ mod tests {
             recorder: None,
         };
         let (sender, control) = mpsc::unbounded_channel();
-        let mut control = SessionControls::new(control);
+        let mut control = SessionControls::new(control, Default::default());
         let turn = TurnId::new();
         sender
             .send(SessionControl::StartTurn {
@@ -1602,6 +1637,28 @@ mod tests {
             "Stop drain exceeded five seconds: {elapsed:?}"
         );
     }
+    async fn assert_stand_in_starts(
+        env: &ChildEnv,
+        cwd: &std::path::Path,
+        marker: &std::path::Path,
+    ) {
+        let child = env
+            .spawn(env.claude_bin.as_ref().unwrap(), &[], cwd, None)
+            .unwrap();
+        let process = ProcessGroup::tracked(child, env);
+        let started = tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        process.stop().await.unwrap();
+        started.unwrap();
+        assert!(marker.exists(), "uncancelled stand-in did not start");
+        assert!(env.groups.lock().unwrap().is_empty());
+        std::fs::remove_file(marker).unwrap();
+    }
+
     #[tokio::test]
     async fn shutdown_during_missing_resume_never_launches_replacement() {
         for during_cleanup in [false, true] {
@@ -1633,6 +1690,7 @@ mod tests {
                 env.claude_bin = Some(binary);
                 env.fixtures = None;
                 env.record = None;
+                assert_stand_in_starts(&env, &cwd, &marker).await;
                 let script = if during_cleanup {
                     concat!(
                         "trap 'printf cleanup > cleanup-started' TERM; ",
@@ -1759,6 +1817,7 @@ mod tests {
             env.claude_bin = Some(binary);
             env.fixtures = None;
             env.record = None;
+            assert_stand_in_starts(&env, &cwd, &marker).await;
             let (out, mut events) = mpsc::channel(256);
             let handle = spawn(
                 SessionSpec {
@@ -1819,6 +1878,135 @@ mod tests {
                     ..
                 }
             ));
+        }
+    }
+    #[tokio::test]
+    async fn pending_shutdown_preempts_queued_turn_on_ready_session() {
+        for cancellation in ["shutdown", "closed", "engine", "none"] {
+            let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../target/session-close-{}", ThreadId::new()));
+            std::fs::create_dir_all(&cwd).unwrap();
+            let _scratch = crate::tests::Scratch(cwd.clone());
+            let binary = cwd.join("owned-session-stand-in");
+            std::fs::write(
+                &binary,
+                r#"#!/bin/sh
+read initialize
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success",'\
+'"request_id":"veyra-initialize","response":{}}}'
+while read line; do
+  case "$line" in *'"type":"user"'*) printf started > turn-started;; esac
+done
+"#,
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&binary)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut env = ChildEnv::load();
+            env.groups = Default::default();
+            env.claude_bin = Some(binary);
+            env.fixtures = None;
+            env.record = Some(cwd.join("rec"));
+            let (out, mut events) = mpsc::channel(256);
+            let handle = spawn(
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: cwd.clone(),
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode: PermissionMode::AskFirst,
+                    },
+                    native: None,
+                    import: false,
+                },
+                env.clone(),
+                out,
+                1,
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(message) = events.recv().await {
+                    if matches!(
+                        message,
+                        EngineMsg::Provider {
+                            event: ProviderEvent::Session(SessionEvent::Ready { .. }),
+                            ..
+                        }
+                    ) {
+                        return;
+                    }
+                }
+                panic!("session ended before ready");
+            })
+            .await
+            .unwrap();
+            handle
+                .control
+                .send(SessionControl::StartTurn {
+                    turn: TurnId::new(),
+                    text: "already cancelled".into(),
+                })
+                .unwrap();
+            match cancellation {
+                "shutdown" => handle.control.send(SessionControl::Shutdown).unwrap(),
+                "closed" => drop(handle),
+                "engine" => env.closing.store(true, Ordering::Release),
+                "none" => {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while !cwd.join("turn-started").exists() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    handle.control.send(SessionControl::Shutdown).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(message) = events.recv().await {
+                    if matches!(
+                        message,
+                        EngineMsg::Provider {
+                            event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                            ..
+                        }
+                    ) {
+                        return;
+                    }
+                }
+                panic!("session ended without exit");
+            })
+            .await
+            .unwrap();
+            assert!(
+                env.groups.lock().unwrap().is_empty(),
+                "owned session group survived cleanup"
+            );
+            let capture = std::fs::read_to_string(cwd.join("rec/t1-s1.jsonl")).unwrap();
+            let users = capture
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|record| {
+                    record["type"] == "expect_outbound" && record["line"]["type"] == "user"
+                })
+                .count();
+            assert_eq!(
+                users,
+                usize::from(cancellation == "none"),
+                "cancelled session wrote a new user prompt: {cancellation}"
+            );
+            assert!(
+                cwd.join("turn-started").exists() == (cancellation == "none"),
+                "owned stand-in received a user turn after cancellation: {cancellation}"
+            );
         }
     }
 }

@@ -102,14 +102,19 @@ It does not read `RUST_LOG`, so that variable cannot suppress readiness.
 The debug listener binds before the window opens.
 `Window::on_next_frame` prints `veyra ready pid=PID data_dir=DIR` to stderr and the log after the first frame.
 `build.rs` embeds Git HEAD, or `unknown` outside Git, and watches HEAD, its reflog, packed refs and the current loose ref.
+## Quit and shutdown
+
 Quit opens a sheet listing running, Starting and background-busy threads, or runs ConfirmQuit immediately when none are busy.
-CancelQuit dismisses it and restores composer focus.
-ConfirmQuit cancels the branch task, awaits Engine::shutdown_wait in a gpui task, then calls cx.quit.
+CancelQuit dismisses it and restores composer focus until ConfirmQuit begins; afterward Escape and CancelQuit keep the sheet open.
+ConfirmQuit synchronously closes the engine and cancels readiness probes and the branch task, then awaits Engine::shutdown_wait in a gpui task and calls cx.quit.
 The debug ctl quit verb dispatches ConfirmQuit directly.
 `Engine::shutdown_wait` refuses new commands, ends running turns, expires pending requests and asks every session to shut down.
 Shutdown persists Restarted holds for running, queued, Starting and background-busy threads in its own transaction, without replacing an earlier hold.
-While shutting down, Actor::handle_inner refuses start-producing messages, and Actor::exited skips session and terminal restarts and queued-turn starts.
+Engine shutdown, the actor, every CLI session, ChildEnv and Probes share one closing flag.
+Actor::handle_inner reads that flag before each message and enters shutdown before admitting any backlogged command or provider event.
+Actor::exited reads it directly before session and terminal restarts or queued-turn starts; effect dispatch also refuses starts while closing.
 Queued turns remain Queued and held, and retiring sessions become Parked without a replacement.
+If the shutdown write fails or a spawn error is already posted, a Starting thread's oldest queued turn can instead fail as it would outside Quit.
 Actor::prepare_commit debug-asserts that no start or spawn effect leaves a shutdown decision.
 It expires pending requests with "Veyra is closing" before ending turns.
 A Restarted hold remains Held even without a queued turn; Send with an empty queue or Continue clears it.
@@ -118,8 +123,8 @@ Cleanup terminates their owned groups and kills survivors one second later.
 After the shutdown commit attempt, a three-second deadline ends the actor's session wait when its message is handled.
 If that write fails, pending row changes remain blocked while sessions still receive Shutdown.
 Database work and queued messages can delay handling that deadline; shutdown_wait bounds its own wait with a three-second runtime timeout.
-`Engine::on_app_quit` sends SIGTERM to every registered provider/probe group, enqueues shutdown and waits 100 ms on the runtime.
-The application registers on_app_quit with gpui, covering native termination as well as ConfirmQuit.
+`Engine::on_app_quit` closes the engine before sending SIGTERM to every registered provider/probe group, then waits 100 ms on the runtime.
+The application registers on_app_quit with gpui, synchronously closing the engine and cancelling probes and branch work before awaiting native termination cleanup.
 macOS termination does not promise Rust destructors, so verification explicitly cleans run-owned provider groups.
 
 ## Actor decisions, storage and recovery
@@ -184,7 +189,8 @@ The sidebar's StopThread action sends the engine's StopThread command.
 Respond, Continue and DiscardQueued also have window controls.
 Archive has no window control, and task cards remain unimplemented.
 On a Starting thread, StopThread, Archive and Interrupt send Shutdown and wait in Stopping for Exited.
-The session receives that control before stdout; if the child has not launched yet it stops the group once launch returns and emits no Ready.
+The session receives that control before stdout.
+A Shutdown already pending at the launch decision prevents launch and emits Exited; if it arrives during launch, the session stops the owned group once launch returns and emits no Ready.
 A Ready that arrives after StopThread, Archive or Interrupt has moved the thread to Stopping is dropped because Stopping holds no session.
 On a running Structured thread, those controls end the engine turn with Interrupted and "Stopped by you", keep its session and send the protocol interrupt.
 `Live::Structured.draining` keeps that ended turn's id until its own CLI end arrives.
@@ -275,6 +281,9 @@ Veyra inherits the user's hooks/MCP configuration and never edits it.
 The new-thread hint names that behavior.
 
 ChildEnv loads share one application-owned group registry, so the quit hook can also signal readiness probes created outside the engine.
+Engine::child_env gives UI probes the engine's closing flag, while sessions inherit it from the actor's ChildEnv.
+ChildEnv::spawn checks that flag immediately before every provider or probe spawn and reports Cancelled without launching when it is set.
+A cancelled session launch emits Exited without a crash.
 One session task owns the child, its stdin writer and a process-group guard.
 `ByteLines` caps each stdout and stderr line at 4 MiB and survives cancelled reads.
 Oversized lines and invalid JSON are skipped; diagnostics reveal lengths rather than raw content.
@@ -325,8 +334,9 @@ Unknown or finished child parents are ignored, and snapshots retain a running to
 Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
-SessionControls buffers pending controls at each launch decision and closes its receiver on Shutdown, retaining cancellation through process cleanup.
-Both initial launch and resume fallback refuse a pending or consumed Shutdown, a closed control channel or a gone event consumer.
+SessionControls drains pending controls and closes its receiver on Shutdown or the shared closing flag, retaining cancellation through process cleanup.
+One drain_and_check_launch gates both initial launch and resume fallback, refusing closing, pending or consumed Shutdown, a closed control channel or a gone event consumer.
+Before admitting StartTurn, SessionControls checks the shared flag and drains queued controls, so a pending Shutdown or channel closure prevents the prompt without changing cancel-reply or cleanup order.
 
 ## Platform and keep-awake
 
@@ -340,8 +350,10 @@ The textual platform_boundary test is a guard, not proof against every indirect 
 
 ## Readiness, fixtures and recording
 
-Startup, Check again and Retry probe each provider independently on the runtime.
-`Probes` owns each provider's cancellable task.
+Startup, Check again and Retry probe each provider independently on the runtime while the engine remains open.
+RecheckProviders and Retry refuse rechecks once the Shell is quitting, and stale probe replies cannot retry a turn during Quit.
+`Probes` owns each provider's cancellable task and reads its ChildEnv's closing flag before scheduling and running work.
+The Claude probe checks its own cancellation and that shared flag before both version and initialize spawns, including after version cleanup.
 A replacement cancels and waits for the earlier task, including its process-group ladder, before starting.
 Shell generation numbers reject stale probe replies.
 There is no probe timeout; a hung Claude stays Checking while the other providers become Ready.
@@ -541,6 +553,11 @@ An actor decision test checks that shutdown exits propose no restart or queued-t
 A storage test checks that a Write tool row stores its content once.
 Platform tests check the two-second login-shell bound, inherited-pipe deadline and group nice value.
 Session tests check process exit classification and cleanup ordering.
+shutdown_during_missing_resume_never_launches_replacement and shutdown_before_session_launch_starts_no_provider check launch refusal, each with an uncancelled stand-in positive control.
+pending_shutdown_preempts_queued_turn_on_ready_session checks queued Shutdown, control closure and shared closing before prompt admission, with an uncancelled prompt control.
+shutdown_request_* tests check backlogged commands, Ready and every retiring-session restart before the mailbox Shutdown.
+cancelling_probe_during_version_cleanup_starts_no_initialize counts actual successful spawns before asserting cleanup.
+Tests also check the shared engine/environment flag, the ChildEnv spawn boundary, recheck_after_confirm_quit_launches_no_provider and escape_after_confirm_quit_keeps_sheet.
 Request, grant and awake tests check request expiry, exact matching, thread isolation, needs_awake and retained-guard flags.
 They do not inspect caffeinate liveness or the OS assertion lifetime.
 Reaper tests check live parents, non-agent argv, the lazy executable/environment-read boundary and stored/swept versioned binaries reached through a provider symlink.
