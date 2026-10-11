@@ -511,8 +511,80 @@ fn engine_and_provider_environment_share_closing_state() {
         &probe_env.closing,
         &engine.inner.state.closing
     ));
+    assert!(std::sync::Arc::ptr_eq(&probe_env.groups, &env.groups));
     engine.shutdown();
-    assert!(env.closing.load(std::sync::atomic::Ordering::Acquire));
-    assert!(probe_env.closing.load(std::sync::atomic::Ordering::Acquire));
+    assert!(env.closing.is_closing());
+    assert!(probe_env.closing.is_closing());
     runtime.block_on(engine.shutdown_wait());
+}
+
+#[test]
+fn shutdown_between_actor_check_and_decide_admits_no_new_turn() {
+    {
+        let mut positive = Fixture::new(LiveState::Idle);
+        assert!(
+            positive
+                .command(Command::Send {
+                    thread: positive.thread,
+                    text: "positive control".into()
+                })
+                .is_ok()
+        );
+        assert!(positive.running().is_some());
+        let _entered = positive.runtime.enter();
+        positive.actor.handle(EngineMsg::Shutdown);
+    }
+    let mut f = Fixture::new(LiveState::Idle);
+    f.actor.close_before_decide = true;
+    let result = f.command(Command::Send {
+        thread: f.thread,
+        text: "closed during admission".into(),
+    });
+    assert!(f.actor.state.closing.is_closing());
+    let running = f
+        .loaded()
+        .turns
+        .values()
+        .any(|turn| matches!(turn.state, TurnState::Running { .. }));
+    let admitted = result.is_ok();
+    let _entered = f.runtime.enter();
+    f.actor.handle(EngineMsg::Shutdown);
+    assert!(
+        !admitted && !running,
+        "actor accepted Send and committed Running after closing was set: admitted={admitted}, running={running}"
+    );
+}
+
+#[test]
+fn actor_admission_commits_before_contending_quit() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let closing = f.actor.state.closing.clone();
+    let (started, admission) = std::sync::mpsc::sync_channel(0);
+    let (attempted, attempt) = std::sync::mpsc::sync_channel(0);
+    f.actor.before_commit = Some(Box::new(move || {
+        started.send(()).unwrap();
+        attempt.recv().unwrap();
+    }));
+    let quit = std::thread::spawn(move || {
+        admission.recv().unwrap();
+        assert!(closing.lock.try_lock().is_err());
+        attempted.send(()).unwrap();
+        closing.close();
+    });
+    let result = f.command(Command::Send {
+        thread: f.thread,
+        text: "committed before quit".into(),
+    });
+    quit.join().unwrap();
+    assert!(matches!(result, Ok(Ack::Turn(_))));
+    assert!(f.running().is_some());
+    assert!(
+        f.loaded()
+            .turns
+            .values()
+            .any(|turn| matches!(turn.state, TurnState::Running { .. }))
+    );
+    let _entered = f.runtime.enter();
+    f.actor.handle(EngineMsg::Shutdown);
+    assert!(f.running().is_none());
 }

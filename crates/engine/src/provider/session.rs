@@ -10,12 +10,11 @@ use crate::{
     platform::{self, Signal},
     record,
 };
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::VecDeque,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -92,7 +91,6 @@ impl ProcessGroup {
     }
     fn tracked(child: Child, env: &ChildEnv) -> Self {
         let mut group = Self::new(child);
-        env.groups.lock().unwrap().insert(group.pid);
         group.groups = Some(env.groups.clone());
         group
     }
@@ -230,9 +228,6 @@ pub fn spawn(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    if env.closing.load(Ordering::Acquire) {
-        return Err(ProviderError::Cancelled);
-    }
     env.resolve(ProviderKind::Claude)?;
     Ok(start_task(None, spec, env, out, epoch))
 }
@@ -260,6 +255,10 @@ fn start_task(
     let task = tokio::spawn(async move {
         let mut spec = spec;
         let mut receiver = SessionControls::new(receiver, env.closing.clone());
+        #[cfg(test)]
+        {
+            receiver.close_before_user_write = env.close_before_user_write.clone();
+        }
         let mut process = match process {
             Some(process) => process,
             None => {
@@ -423,18 +422,25 @@ impl<R: AsyncRead + Unpin> ByteLines<R> {
 struct SessionControls {
     receiver: mpsc::UnboundedReceiver<SessionControl>,
     pending: VecDeque<SessionControl>,
-    closing: Arc<AtomicBool>,
+    closing: Arc<crate::LaunchGate>,
+    #[cfg(test)]
+    close_before_user_write: Arc<AtomicBool>,
 }
 impl SessionControls {
-    fn new(receiver: mpsc::UnboundedReceiver<SessionControl>, closing: Arc<AtomicBool>) -> Self {
+    fn new(
+        receiver: mpsc::UnboundedReceiver<SessionControl>,
+        closing: Arc<crate::LaunchGate>,
+    ) -> Self {
         Self {
             receiver,
             pending: VecDeque::new(),
             closing,
+            #[cfg(test)]
+            close_before_user_write: Default::default(),
         }
     }
     fn drain_and_close(&mut self) {
-        if self.closing.load(Ordering::Acquire) {
+        if self.closing.is_closing() {
             self.receiver.close();
         }
         while let Ok(message) = self.receiver.try_recv() {
@@ -508,10 +514,23 @@ async fn run_one(
     });
     let mut stdin = process.child.stdin().expect("piped stdin");
     let (writer, mut input) = mpsc::unbounded_channel::<serde_json::Value>();
+    let writer_closing = control.closing.clone();
+    #[cfg(test)]
+    let close_before_user_write = control.close_before_user_write.clone();
     let mut write_task = tokio::spawn(async move {
         while let Some(line) = input.recv().await {
             let mut bytes = serde_json::to_vec(&line)?;
             bytes.push(b'\n');
+            #[cfg(test)]
+            if line["type"] == "user" && close_before_user_write.swap(false, Ordering::AcqRel) {
+                writer_closing.close();
+            }
+            if line["type"] == "user" {
+                let _admission = writer_closing.enter();
+                if writer_closing.is_closing() {
+                    continue;
+                }
+            }
             stdin.write_all(&bytes).await?;
             stdin.flush().await?;
         }
@@ -806,6 +825,12 @@ fn discard_stderr(child: &mut ProcessGroup) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next().await {} })
 }
 
+pub(super) fn check_cancelled(cancelled: &mut oneshot::Receiver<()>) -> Result<(), ProviderError> {
+    match cancelled.try_recv() {
+        Err(oneshot::error::TryRecvError::Empty) => Ok(()),
+        Ok(()) | Err(oneshot::error::TryRecvError::Closed) => Err(ProviderError::Cancelled),
+    }
+}
 pub async fn probe(
     env: &ChildEnv,
     cwd: &std::path::Path,
@@ -825,14 +850,7 @@ pub async fn probe(
             })
             .unwrap_or_default()
     } else {
-        if env.closing.load(Ordering::Acquire)
-            || !matches!(
-                cancelled.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            )
-        {
-            return Err(ProviderError::Cancelled);
-        }
+        check_cancelled(&mut cancelled)?;
         let mut child =
             ProcessGroup::tracked(env.spawn(&binary, &["--version".into()], cwd, None)?, env);
         let mut stdout = ByteLines::new(child.stdout().expect("piped version stdout"));
@@ -870,14 +888,7 @@ pub async fn probe(
             record::Recorder::create(&path, "claude", &version, cwd, env.home.as_deref(), None)
         })
         .transpose()?;
-    if env.closing.load(Ordering::Acquire)
-        || !matches!(
-            cancelled.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        )
-    {
-        return Err(ProviderError::Cancelled);
-    }
+    check_cancelled(&mut cancelled)?;
     let mut child = ProcessGroup::tracked(
         env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?,
         env,
@@ -957,7 +968,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn natural_exit_after_stdout_eof_wakes_without_a_timer() {
-        let child = ChildEnv::load()
+        let env = ChildEnv::load();
+        let child = env
             .spawn(
                 std::path::Path::new("/bin/sh"),
                 &[
@@ -970,7 +982,7 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         let process = Process {
-            child: ProcessGroup::new(child),
+            child: ProcessGroup::tracked(child, &env),
             native: NativeSessionId("fixture-session".into()),
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1059,7 +1071,7 @@ mod tests {
                 .unwrap();
             let pid = child.id().unwrap();
             let process = Process {
-                child: ProcessGroup::new(child),
+                child: ProcessGroup::tracked(child, &env),
                 native: NativeSessionId("fixture-session".into()),
                 #[cfg(debug_assertions)]
                 recorder: None,
@@ -1127,7 +1139,7 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         let process = Process {
-            child: ProcessGroup::new(child),
+            child: ProcessGroup::tracked(child, &env),
             native: NativeSessionId("fixture-session".into()),
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1188,7 +1200,7 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         let process = Process {
-            child: ProcessGroup::new(child),
+            child: ProcessGroup::tracked(child, &env),
             native: NativeSessionId("fixture-session".into()),
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1260,7 +1272,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut group = ProcessGroup::new(child);
+        let mut group = ProcessGroup::tracked(child, &env);
         let pid = group.pid;
         group.check = |_, _| Ok(true);
         let process = Process {
@@ -1356,7 +1368,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut group = ProcessGroup::new(child);
+        let mut group = ProcessGroup::tracked(child, &env);
         let pid = group.pid;
         let mut output = BufReader::new(group.stdout().unwrap()).lines();
         assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
@@ -1404,7 +1416,7 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         let process = Process {
-            child: ProcessGroup::new(child),
+            child: ProcessGroup::tracked(child, &env),
             native: NativeSessionId("fixture-session".into()),
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1534,7 +1546,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut group = ProcessGroup::new(child);
+        let mut group = ProcessGroup::tracked(child, &env);
         let pid = group.pid;
         group.check = |_, _| Ok(true);
         let process = Process {
@@ -1713,7 +1725,7 @@ mod tests {
                     .unwrap();
                 let pid = child.id().unwrap();
                 let process = Process {
-                    child: ProcessGroup::new(child),
+                    child: ProcessGroup::tracked(child, &env),
                     native: NativeSessionId("missing-native".into()),
                     recorder: None,
                 };
@@ -1957,7 +1969,7 @@ done
             match cancellation {
                 "shutdown" => handle.control.send(SessionControl::Shutdown).unwrap(),
                 "closed" => drop(handle),
-                "engine" => env.closing.store(true, Ordering::Release),
+                "engine" => env.closing.close(),
                 "none" => {
                     tokio::time::timeout(Duration::from_secs(3), async {
                         while !cwd.join("turn-started").exists() {
@@ -2007,6 +2019,138 @@ done
                 cwd.join("turn-started").exists() == (cancellation == "none"),
                 "owned stand-in received a user turn after cancellation: {cancellation}"
             );
+        }
+    }
+    #[tokio::test]
+    async fn shutdown_after_admission_before_stdin_write_sends_no_prompt() {
+        for cancellation in ["none", "writer"] {
+            let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../target/session-close-{}", ThreadId::new()));
+            std::fs::create_dir_all(&cwd).unwrap();
+            let _scratch = crate::tests::Scratch(cwd.clone());
+            let binary = cwd.join("owned-session-stand-in");
+            std::fs::write(
+                &binary,
+                r#"#!/bin/sh
+read initialize
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success",'\
+'"request_id":"veyra-initialize","response":{}}}'
+while read line; do
+  case "$line" in *'"type":"user"'*) printf started > turn-started;; esac
+done
+"#,
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&binary)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut env = ChildEnv::load();
+            env.groups = Default::default();
+            env.claude_bin = Some(binary);
+            env.fixtures = None;
+            env.record = Some(cwd.join("rec"));
+            let (out, mut events) = mpsc::channel(256);
+            let handle = spawn(
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: cwd.clone(),
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode: PermissionMode::AskFirst,
+                    },
+                    native: None,
+                    import: false,
+                },
+                env.clone(),
+                out,
+                1,
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(message) = events.recv().await {
+                    if matches!(
+                        message,
+                        EngineMsg::Provider {
+                            event: ProviderEvent::Session(SessionEvent::Ready { .. }),
+                            ..
+                        }
+                    ) {
+                        return;
+                    }
+                }
+                panic!("session ended before ready");
+            })
+            .await
+            .unwrap();
+            if cancellation == "writer" {
+                env.close_before_user_write.store(true, Ordering::Release);
+            }
+            handle
+                .control
+                .send(SessionControl::StartTurn {
+                    turn: TurnId::new(),
+                    text: "already cancelled".into(),
+                })
+                .unwrap();
+            match cancellation {
+                "shutdown" => handle.control.send(SessionControl::Shutdown).unwrap(),
+                "closed" => drop(handle),
+                "engine" => env.closing.close(),
+                "none" | "writer" => {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while if cancellation == "writer" {
+                            !env.closing.is_closing()
+                        } else {
+                            !cwd.join("turn-started").exists()
+                        } {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    handle.control.send(SessionControl::Shutdown).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(message) = events.recv().await {
+                    if matches!(
+                        message,
+                        EngineMsg::Provider {
+                            event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                            ..
+                        }
+                    ) {
+                        return;
+                    }
+                }
+                panic!("session ended without exit");
+            })
+            .await
+            .unwrap();
+            assert!(
+                env.groups.lock().unwrap().is_empty(),
+                "owned session group survived cleanup"
+            );
+
+            if cancellation == "writer" {
+                assert!(env.closing.is_closing());
+                assert!(
+                    !cwd.join("turn-started").exists(),
+                    "dedicated stdin writer delivered a user prompt after closing was set; all owned groups cleaned up"
+                );
+            } else {
+                assert!(
+                    cwd.join("turn-started").exists(),
+                    "positive control did not start"
+                );
+            }
         }
     }
 }

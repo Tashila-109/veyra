@@ -105,6 +105,10 @@ pub struct Actor {
     #[cfg(test)]
     pub(crate) fail_write: bool,
     #[cfg(test)]
+    pub(crate) close_before_decide: bool,
+    #[cfg(test)]
+    pub(crate) before_commit: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
     pub(crate) test_commits: usize,
 }
 pub fn now() -> Millis {
@@ -163,6 +167,10 @@ impl Actor {
             #[cfg(test)]
             fail_write: false,
             #[cfg(test)]
+            close_before_decide: false,
+            #[cfg(test)]
+            before_commit: None,
+            #[cfg(test)]
             test_commits: 0,
         };
         let mut c = c;
@@ -209,7 +217,18 @@ impl Actor {
         }
     }
     fn handle_inner(&mut self, msg: EngineMsg) {
-        if self.state.closing.load(Ordering::Acquire) {
+        if matches!(msg, EngineMsg::Shutdown) {
+            self.shutdown();
+            return;
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.close_before_decide) {
+            self.state.closing.close();
+        }
+        let closing = self.state.closing.clone();
+        let mut admission = Some(closing.enter());
+        if closing.is_closing() {
+            admission.take();
             self.shutdown();
         }
         if self.shutting_down {
@@ -250,6 +269,7 @@ impl Actor {
                     return;
                 }
                 EngineMsg::Tick => {
+                    admission.take();
                     self.retry();
                     return;
                 }
@@ -273,6 +293,10 @@ impl Actor {
                 let result = commands::decide(&self.projection, &self.live, command, now())
                     .and_then(|(mut c, ack)| {
                         self.prepare_commit(&mut c);
+                        #[cfg(test)]
+                        if let Some(before_commit) = self.before_commit.take() {
+                            before_commit();
+                        }
                         self.write(&c)?;
                         #[cfg(test)]
                         if measure && let Spawner::Scripted(script) = &self.spawner {
@@ -451,6 +475,13 @@ impl Actor {
         }
     }
     fn retry(&mut self) {
+        let closing = self.state.closing.clone();
+        let admission = closing.enter();
+        if closing.is_closing() {
+            drop(admission);
+            self.shutdown();
+            return;
+        }
         let mut blocked = self.blocked.take().unwrap();
         if let Err(e) = self.write(&blocked.changes) {
             blocked.error = e.to_string();
@@ -459,6 +490,7 @@ impl Actor {
         }
         self.install(blocked.changes);
         self.publish(UiEvent::StorageBlocked { error: None });
+        drop(admission);
         while let Some(msg) = blocked.deferred.pop_front() {
             self.handle(msg);
             if let Some(next) = &mut self.blocked {
@@ -600,7 +632,7 @@ impl Actor {
             }
         }
         for effect in effects {
-            if self.state.closing.load(Ordering::Acquire)
+            if self.state.closing.is_closing()
                 && matches!(
                     effect,
                     Effect::Spawn { .. } | Effect::StartTurn { .. } | Effect::OpenTerminal { .. }
@@ -632,11 +664,7 @@ impl Actor {
                             thread,
                             epoch,
                             event: ProviderEvent::Session(SessionEvent::Exited {
-                                crash: if matches!(error, ProviderError::Cancelled) {
-                                    None
-                                } else {
-                                    Some(error.to_string())
-                                },
+                                crash: Some(error.to_string()),
                             }),
                         }),
                     }
@@ -694,7 +722,7 @@ impl Actor {
         epoch: u32,
         event: ProviderEvent,
     ) -> Option<ChangeSet> {
-        if self.state.closing.load(Ordering::Acquire) {
+        if self.state.closing.is_closing() {
             return None;
         }
         if !self.current(thread, epoch) {
@@ -817,8 +845,7 @@ impl Actor {
                     (Some(id), Some(t)) if id == t.id => t,
                     (None, Some(t)) if t.origin == TurnOrigin::Provider => t,
                     (None, None)
-                        if event.opens_provider_turn()
-                            && !self.state.closing.load(Ordering::Acquire) =>
+                        if event.opens_provider_turn() && !self.state.closing.is_closing() =>
                     {
                         let id =
                             commands::queue(&self.projection, &mut c, thread, TurnOrigin::Provider);
@@ -830,7 +857,7 @@ impl Actor {
                     }
                     _ => {
                         tracing::debug!(%thread,"dropped event for non-running turn");
-                        if !self.state.closing.load(Ordering::Acquire) {
+                        if !self.state.closing.is_closing() {
                             commands::start_changed(&self.projection, &self.live, &mut c, now());
                         }
                         return Some(c);
@@ -839,7 +866,7 @@ impl Actor {
                 self.turn_event(&mut c, thread, epoch, current, event);
             }
         }
-        if !self.state.closing.load(Ordering::Acquire) {
+        if !self.state.closing.is_closing() {
             commands::start_changed(&self.projection, &self.live, &mut c, now());
         }
         Some(c)
@@ -1049,7 +1076,7 @@ impl Actor {
         live.background_work = false;
         c.live.insert(thread, live);
 
-        if !self.state.closing.load(Ordering::Acquire) {
+        if !self.state.closing.is_closing() {
             match &old.live {
                 Live::Stopping {
                     then: AfterStop::StartStructured { import },
@@ -1070,7 +1097,7 @@ impl Actor {
             }
         }
         commands::settle_idle_child(&self.projection, &self.live, &mut c, thread, false, now());
-        if !self.state.closing.load(Ordering::Acquire) {
+        if !self.state.closing.is_closing() {
             commands::start_changed(&self.projection, &self.live, &mut c, now());
         }
         c
@@ -1336,7 +1363,7 @@ impl Actor {
             return;
         }
         self.shutting_down = true;
-        self.state.closing.store(true, Ordering::Release);
+        self.state.closing.close();
         let mut c = ChangeSet::default();
         for request in self
             .projection
@@ -1384,11 +1411,24 @@ impl Actor {
                 };
                 c.live.insert(thread, live);
             }
+            if matches!(live.live, Live::Starting { session: None }) {
+                let mut live = live.clone();
+                live.live = Live::Parked;
+                live.background_work = false;
+                c.live.insert(thread, live);
+            }
             if let Live::Terminal { .. } = &live.live {
                 c.effects.push(Effect::StopTerminal { thread });
             }
         }
         self.commit_event(c);
+        for live in self.live.values_mut() {
+            if matches!(live.live, Live::Starting { session: None }) {
+                live.live = Live::Parked;
+                live.background_work = false;
+            }
+        }
+        self.update_awake();
         let out = self.out.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1410,6 +1450,74 @@ fn tool_tail(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quit_between_decision_and_dispatch_still_ends_promptly() {
+        for (closing_before_dispatch, fail_write) in [(false, false), (true, false), (true, true)] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let entered = runtime.enter();
+            let mut db = Connection::open_in_memory().unwrap();
+            store::initialize(&mut db).unwrap();
+            let (out, messages) = mpsc::channel(256);
+            let mut actor =
+                Actor::new(db, out.clone(), Spawner::Scripted(Default::default())).unwrap();
+            let (reply, mut ack) = oneshot::channel();
+            actor.handle(EngineMsg::Command {
+                command: Command::AddProject {
+                    path: "/tmp".into(),
+                },
+                reply,
+            });
+            let Ack::Project(project) = ack.try_recv().unwrap().unwrap() else {
+                panic!("missing project")
+            };
+            let (mut c, ack) = commands::decide(
+                &actor.projection,
+                &actor.live,
+                Command::CreateThread {
+                    project,
+                    provider: ProviderKind::Claude,
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode: PermissionMode::AskFirst,
+                    },
+                    text: "sent as quit begins".into(),
+                },
+                now(),
+            )
+            .unwrap();
+            let Ack::Thread(thread) = ack else {
+                panic!("missing thread")
+            };
+            assert!(c.effects.iter().any(|e| matches!(e, Effect::Spawn { .. })));
+            actor.prepare_commit(&mut c);
+            actor.write(&c).unwrap();
+            if closing_before_dispatch {
+                actor.state.closing.close();
+            }
+            actor.install(c);
+            let live = format!("{:?}", std::mem::discriminant(&actor.live[&thread].live));
+            let sessionless = matches!(actor.live[&thread].live, Live::Starting { session: None });
+            actor.fail_write = fail_write;
+            out.try_send(EngineMsg::Shutdown).unwrap();
+            drop(entered);
+            let handle = runtime.handle().clone();
+            let start = Instant::now();
+            std::thread::spawn(move || actor.run(messages, handle))
+                .join()
+                .unwrap();
+            let elapsed = start.elapsed();
+            eprintln!(
+                "closing_before_dispatch={closing_before_dispatch} sessionless_start={sessionless} \
+                 fail_write={fail_write} live={live} quit_took={elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "quit waited {elapsed:?} for the deadline; thread {thread} stayed Starting with no session"
+            );
+        }
+    }
 
     #[test]
     fn shutdown_exit_decides_no_restart_or_queued_start() {

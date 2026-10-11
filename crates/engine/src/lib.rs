@@ -55,12 +55,63 @@ struct EngineInner {
 #[derive(Default)]
 pub(crate) struct RuntimeState {
     pub awake: AtomicBool,
-    pub closing: Arc<AtomicBool>,
+    pub closing: Arc<LaunchGate>,
     pub window_threads: Mutex<std::collections::BTreeMap<ThreadId, WindowThread>>,
     #[cfg(debug_assertions)]
     pub counters: Mutex<ProbeCounters>,
     #[cfg(debug_assertions)]
     pub processes: Mutex<std::collections::BTreeMap<ThreadId, u32>>,
+}
+#[derive(Debug, Default)]
+pub(crate) struct LaunchGate {
+    closing: AtomicBool,
+    lock: Mutex<()>,
+    #[cfg(test)]
+    worst_hold_ns: std::sync::atomic::AtomicU64,
+}
+impl LaunchGate {
+    fn enter(&self) -> LaunchGuard<'_> {
+        let guard = self.lock.lock().unwrap();
+        LaunchGuard {
+            _guard: guard,
+            #[cfg(test)]
+            gate: self,
+            #[cfg(test)]
+            started: Instant::now(),
+        }
+    }
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+    fn close(&self) {
+        let _guard = self.enter();
+        self.closing.store(true, Ordering::Release);
+    }
+}
+struct LaunchGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+    #[cfg(test)]
+    gate: &'a LaunchGate,
+    #[cfg(test)]
+    started: Instant,
+}
+#[cfg(test)]
+impl Drop for LaunchGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.worst_hold_ns.fetch_max(
+            self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+#[cfg(test)]
+impl Drop for LaunchGate {
+    fn drop(&mut self) {
+        eprintln!(
+            "launch_gate_worst_hold_ns={}",
+            self.worst_hold_ns.load(Ordering::Relaxed)
+        );
+    }
 }
 #[derive(Clone, Copy)]
 pub struct WindowThread {
@@ -90,7 +141,7 @@ pub struct Process {
 }
 impl Drop for EngineInner {
     fn drop(&mut self) {
-        self.state.closing.store(true, Ordering::Release);
+        self.state.closing.close();
         let _ = self.sender.try_send(EngineMsg::Shutdown);
     }
 }
@@ -178,7 +229,7 @@ impl Engine {
         })
     }
     pub fn shutdown(&self) {
-        self.inner.state.closing.store(true, Ordering::Release);
+        self.inner.state.closing.close();
         if let Err(mpsc::error::TrySendError::Full(message)) =
             self.inner.sender.try_send(EngineMsg::Shutdown)
         {
@@ -216,10 +267,14 @@ impl Engine {
     pub fn child_env(&self) -> provider::env::ChildEnv {
         let mut env = provider::env::ChildEnv::load();
         env.closing = self.inner.state.closing.clone();
+        env.groups = self.inner.groups.clone();
         env
     }
     pub fn window_threads(&self) -> std::collections::BTreeMap<ThreadId, WindowThread> {
         self.inner.state.window_threads.lock().unwrap().clone()
+    }
+    pub fn is_closing(&self) -> bool {
+        self.inner.state.closing.is_closing()
     }
     pub fn awake(&self) -> bool {
         self.inner.state.awake.load(Ordering::Acquire)
@@ -255,7 +310,7 @@ impl Engine {
     }
     pub fn send(&self, command: Command) -> oneshot::Receiver<Result<Ack, CommandError>> {
         let (reply, rx) = oneshot::channel();
-        if self.inner.state.closing.load(Ordering::Acquire) {
+        if self.inner.state.closing.is_closing() {
             let _ = reply.send(Err(CommandError::Closed));
             return rx;
         }

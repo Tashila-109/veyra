@@ -418,7 +418,6 @@ pub struct Shell {
     dock_focused: bool,
     quit_focus: FocusHandle,
     quit_sheet: bool,
-    quitting: bool,
     window_active: bool,
     notifications_posted: u64,
     question_draft: Option<(RequestId, Vec<Answer>)>,
@@ -477,10 +476,7 @@ impl Shell {
         })
         .detach();
         cx.on_app_quit(|shell, _| {
-            shell.engine.shutdown();
-            shell.quitting = true;
-            shell.probes = Default::default();
-            shell.forget_branch();
+            shell.begin_quitting();
             let engine = shell.engine.clone();
             async move { engine.on_app_quit().await }
         })
@@ -587,7 +583,6 @@ impl Shell {
             dock_focused: false,
             quit_focus: cx.focus_handle(),
             quit_sheet: false,
-            quitting: false,
             window_active: window.is_window_active(),
             notifications_posted: 0,
             question_draft: None,
@@ -790,7 +785,7 @@ impl Shell {
         cx.notify();
     }
     fn recheck(&mut self, retry: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.quitting {
+        if self.engine.is_closing() {
             return;
         }
         self.providers.clear();
@@ -808,7 +803,7 @@ impl Shell {
             cx.spawn_in(window, async move |this, cx| {
                 if let Ok(probe) = reply.await {
                     let _ = this.update_in(cx, |shell, window, cx| {
-                        if shell.quitting || shell.probe_generation != generation {
+                        if shell.engine.is_closing() || shell.probe_generation != generation {
                             return;
                         }
                         shell.providers.push(probe);
@@ -1083,14 +1078,16 @@ impl Shell {
                     .any(|turn| turn.thread == thread && turn.state == TurnState::Queued)
         })
     }
-    fn confirm_quit(&mut self, cx: &mut Context<Self>) {
-        if self.quitting {
-            return;
-        }
+    fn begin_quitting(&mut self) {
         self.engine.shutdown();
-        self.quitting = true;
         self.probes = Default::default();
         self.forget_branch();
+    }
+    fn confirm_quit(&mut self, cx: &mut Context<Self>) {
+        if self.engine.is_closing() {
+            return;
+        }
+        self.begin_quitting();
         let engine = self.engine.clone();
         cx.spawn(async move |_, cx| {
             engine.shutdown_wait().await;
@@ -1643,7 +1640,7 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &ConfirmQuit, _, cx| shell.confirm_quit(cx)))
             .on_action(cx.listener(|shell, _: &CancelQuit, window, cx| {
-                if shell.quitting {
+                if shell.engine.is_closing() {
                     return;
                 }
                 shell.quit_sheet = false;
@@ -2842,6 +2839,21 @@ mod tests {
     #[gpui::test]
     fn escape_after_confirm_quit_keeps_sheet(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
+            let engine = veyra_engine::Engine::start_with_processes(
+                runtime.handle(),
+                veyra_engine::data_dir::DataDir::at(data).unwrap(),
+                vec![],
+            )
+            .unwrap();
+            shell.update_in(cx, |shell, _, _| {
+                shell.engine = engine.clone();
+                shell.runtime = runtime.handle().clone();
+            });
             shell.update_in(cx, |shell, window, cx| {
                 shell.quit_sheet = true;
                 window.focus(&shell.quit_focus, cx);
@@ -2859,10 +2871,11 @@ mod tests {
             draw(cx);
             cx.dispatch_action(super::ConfirmQuit);
             draw(cx);
-            assert!(shell.read_with(cx, |shell, _| shell.quitting));
+            assert!(shell.read_with(cx, |shell, _| shell.engine.is_closing()));
             cx.simulate_keystrokes("escape");
             draw(cx);
             assert!(shell.read_with(cx, |shell, _| shell.quit_sheet));
+            runtime.block_on(engine.shutdown_wait());
         });
     }
 
@@ -2979,7 +2992,7 @@ mod tests {
             Err(veyra_engine::commands::CommandError::Closed)
         ));
         shell.update_in(cx, |shell, window, cx| {
-            assert!(shell.quitting);
+            assert!(shell.engine.is_closing());
             shell.recheck(false, window, cx);
         });
         runtime.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });

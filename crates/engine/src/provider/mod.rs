@@ -333,7 +333,7 @@ impl Probes {
         env: env::ChildEnv,
         cwd: PathBuf,
     ) -> tokio::sync::oneshot::Receiver<Probe> {
-        if env.closing.load(std::sync::atomic::Ordering::Acquire) {
+        if env.closing.is_closing() {
             let (_, result) = tokio::sync::oneshot::channel();
             return result;
         }
@@ -345,13 +345,7 @@ impl Probes {
                 let _ = previous.cancel.send(());
                 let _ = previous.task.await;
             }
-            if env.closing.load(std::sync::atomic::Ordering::Acquire)
-                || reply.is_closed()
-                || !matches!(
-                    cancelled.try_recv(),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-                )
-            {
+            if reply.is_closed() || session::check_cancelled(&mut cancelled).is_err() {
                 return;
             }
             let probe = provider.probe_cancellable(&env, &cwd, cancelled).await;
