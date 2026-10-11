@@ -105,9 +105,7 @@ pub struct Actor {
     #[cfg(test)]
     pub(crate) fail_write: bool,
     #[cfg(test)]
-    pub(crate) close_before_decide: bool,
-    #[cfg(test)]
-    pub(crate) before_commit: Option<Box<dyn FnOnce() + Send>>,
+    pub(crate) after_admission: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     pub(crate) test_commits: usize,
 }
@@ -167,9 +165,7 @@ impl Actor {
             #[cfg(test)]
             fail_write: false,
             #[cfg(test)]
-            close_before_decide: false,
-            #[cfg(test)]
-            before_commit: None,
+            after_admission: None,
             #[cfg(test)]
             test_commits: 0,
         };
@@ -217,18 +213,12 @@ impl Actor {
         }
     }
     fn handle_inner(&mut self, msg: EngineMsg) {
-        if matches!(msg, EngineMsg::Shutdown) {
-            self.shutdown();
-            return;
-        }
+        let closing = self.state.closing.is_closing();
         #[cfg(test)]
-        if std::mem::take(&mut self.close_before_decide) {
-            self.state.closing.close();
+        if let Some(pause) = self.after_admission.take() {
+            pause();
         }
-        let closing = self.state.closing.clone();
-        let mut admission = Some(closing.enter());
-        if closing.is_closing() {
-            admission.take();
+        if closing {
             self.shutdown();
         }
         if self.shutting_down {
@@ -269,7 +259,6 @@ impl Actor {
                     return;
                 }
                 EngineMsg::Tick => {
-                    admission.take();
                     self.retry();
                     return;
                 }
@@ -293,10 +282,6 @@ impl Actor {
                 let result = commands::decide(&self.projection, &self.live, command, now())
                     .and_then(|(mut c, ack)| {
                         self.prepare_commit(&mut c);
-                        #[cfg(test)]
-                        if let Some(before_commit) = self.before_commit.take() {
-                            before_commit();
-                        }
                         self.write(&c)?;
                         #[cfg(test)]
                         if measure && let Spawner::Scripted(script) = &self.spawner {
@@ -475,10 +460,7 @@ impl Actor {
         }
     }
     fn retry(&mut self) {
-        let closing = self.state.closing.clone();
-        let admission = closing.enter();
-        if closing.is_closing() {
-            drop(admission);
+        if self.state.closing.is_closing() {
             self.shutdown();
             return;
         }
@@ -490,7 +472,6 @@ impl Actor {
         }
         self.install(blocked.changes);
         self.publish(UiEvent::StorageBlocked { error: None });
-        drop(admission);
         while let Some(msg) = blocked.deferred.pop_front() {
             self.handle(msg);
             if let Some(next) = &mut self.blocked {
@@ -722,9 +703,6 @@ impl Actor {
         epoch: u32,
         event: ProviderEvent,
     ) -> Option<ChangeSet> {
-        if self.state.closing.is_closing() {
-            return None;
-        }
         if !self.current(thread, epoch) {
             tracing::debug!(%thread,epoch,"dropped stale session event");
             return None;
@@ -844,9 +822,7 @@ impl Actor {
                 let current = match (turn, running) {
                     (Some(id), Some(t)) if id == t.id => t,
                     (None, Some(t)) if t.origin == TurnOrigin::Provider => t,
-                    (None, None)
-                        if event.opens_provider_turn() && !self.state.closing.is_closing() =>
-                    {
+                    (None, None) if event.opens_provider_turn() => {
                         let id =
                             commands::queue(&self.projection, &mut c, thread, TurnOrigin::Provider);
                         let mut t = c.turns[&id].clone();
@@ -857,18 +833,14 @@ impl Actor {
                     }
                     _ => {
                         tracing::debug!(%thread,"dropped event for non-running turn");
-                        if !self.state.closing.is_closing() {
-                            commands::start_changed(&self.projection, &self.live, &mut c, now());
-                        }
+                        commands::start_changed(&self.projection, &self.live, &mut c, now());
                         return Some(c);
                     }
                 };
                 self.turn_event(&mut c, thread, epoch, current, event);
             }
         }
-        if !self.state.closing.is_closing() {
-            commands::start_changed(&self.projection, &self.live, &mut c, now());
-        }
+        commands::start_changed(&self.projection, &self.live, &mut c, now());
         Some(c)
     }
     fn turn_event(

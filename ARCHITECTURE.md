@@ -116,10 +116,14 @@ It combines an atomic closing state with a small synchronous lock; no guard cros
 Engine::shutdown sets closing while holding the gate before enqueueing Shutdown, asynchronously sending that message if the mailbox is full.
 Dropping the last Engine handle and Actor::shutdown also set closing under the gate.
 The Shell reads Engine::is_closing rather than keeping its own flag, and begin_quitting closes the engine and cancels probes and branch work for both quit paths.
-Actor::handle_inner holds the gate from its closing check through each decision, database write and installation, entering shutdown instead when closing wins.
+Actor::handle_inner reads the atomic closing state at admission without locking the gate, entering shutdown instead when closing wins.
+A command past that read commits as pre-quit work even if quit closes the engine before decide, write or install finishes.
+The actor never holds the launch gate across decisions, SQLite writes, installation or effect dispatch, so a synchronous Spawner::spawn or Spawner::terminal can enter the launch boundary without re-entering a held lock.
+Quit waits at most for one launch critical section, never for the actor or SQLite.
 Actor::exited reads it directly before session and terminal restarts or queued-turn starts; effect dispatch also refuses starts while closing.
 Queued turns remain Queued and held, retiring sessions become Parked without a replacement, and Starting threads without a session handle park during shutdown rather than waiting for an impossible exit.
-If the shutdown write fails or a spawn error is already posted, a Starting thread's oldest queued turn can instead fail as it would outside Quit.
+If the shutdown write fails, a Starting thread that still owns a session can instead fail its oldest queued turn when that session exits.
+A posted spawn error for a sessionless Starting thread meets its Parked runtime state and keeps the queued turn held.
 Actor::prepare_commit debug-asserts that no start or spawn effect leaves a shutdown decision.
 It expires pending requests with "Veyra is closing" before ending turns.
 A Restarted hold remains Held even without a queued turn; Send with an empty queue or Continue clears it.
@@ -134,7 +138,12 @@ macOS termination does not promise Rust destructors, so verification explicitly 
 
 ### Quit commitment points
 
-- Actor admission: a command or provider event holds the gate through decide, write and install, so its complete commitment precedes closing or it is refused with earlier queued work kept.
+- Actor admission: the atomic closing read at the start of a message is its commitment point.
+A command or provider event past a read of open commits as pre-quit work; a read of closing refuses new work and keeps earlier queues.
+Shutdown ends and holds an admitted turn for recovery, while the prompt writer refuses a prompt whose own closing check has not passed.
+- Storage retry: Tick reads closing without taking the gate before writing and installing retained changes.
+A retry past that read commits as pre-quit work, and each deferred message then re-enters admission.
+Effects from either path run with no launch gate held and refuse starts while closing.
 - Launch with registration: ChildEnv::spawn holds the gate through its closing check, OS spawn and group registration, so quit either refuses the launch or sees its group in the signal pass.
 - Prompt write: the stdin writer checks closing under the gate immediately before each user frame and drops that frame if closing won, while preserving cancel replies before interrupt.
 The prompt check is its commitment point; a write already past it belongs to a turn admitted before quit and shutdown interrupts that turn by protocol.
@@ -295,7 +304,8 @@ The new-thread hint names that behavior.
 
 ChildEnv loads create independent group registries; Engine::child_env shares the engine registry with UI readiness probes, and sessions inherit it from the actor environment.
 Engine::child_env gives UI probes the engine's LaunchGate, while sessions inherit it from the actor's ChildEnv.
-ChildEnv::spawn checks closing, spawns and registers the process group in one gate-held operation, reporting Cancelled without launching when closing is set.
+ChildEnv::spawn checks closing, spawns and constructs the tracked ProcessGroup in one gate-held operation, reporting Cancelled without launching when closing is set.
+ProcessGroup owns both registry insertion and removal; ChildEnv::spawn returns that guard, so callers cannot receive an untracked child or forget to remove its group.
 A cancelled session launch emits Exited without a crash.
 One session task owns the child, its stdin writer and a process-group guard.
 `ByteLines` caps each stdout and stderr line at 4 MiB and survives cancelled reads.
@@ -347,9 +357,9 @@ Unknown or finished child parents are ignored, and snapshots retain a running to
 Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
-SessionControls drains pending controls and closes its receiver on Shutdown or the shared closing flag, retaining cancellation through process cleanup.
+SessionControls drains pending controls and closes its receiver on Shutdown or the shared LaunchGate closing state, retaining cancellation through process cleanup.
 One drain_and_check_launch gates both initial launch and resume fallback, refusing closing, pending or consumed Shutdown, a closed control channel or a gone event consumer.
-Before admitting StartTurn, SessionControls checks the shared flag and drains queued controls, so a pending Shutdown or channel closure prevents the prompt without changing cancel-reply or cleanup order.
+Before admitting StartTurn, SessionControls reads the gate's closing state and drains queued controls, so a pending Shutdown or channel closure prevents the prompt without changing cancel-reply or cleanup order.
 
 ## Platform and keep-awake
 
@@ -364,7 +374,7 @@ The textual platform_boundary test is a guard, not proof against every indirect 
 ## Readiness, fixtures and recording
 
 Startup, Check again and Retry probe each provider independently on the runtime while the engine remains open.
-RecheckProviders and Retry refuse rechecks once the Shell is quitting, and stale probe replies cannot retry a turn during Quit.
+RecheckProviders and Retry refuse rechecks once Engine::is_closing reports closing, and stale probe replies cannot retry a turn during Quit.
 `Probes` owns each provider's cancellable task, refuses scheduling while closing and checks cancellation after awaiting a predecessor.
 The Claude probe uses one check_cancelled helper before both version and initialize spawns, including after version cleanup; ChildEnv::spawn owns the closing check for each launch.
 A replacement cancels and waits for the earlier task, including its process-group ladder, before starting.
@@ -571,8 +581,12 @@ pending_shutdown_preempts_queued_turn_on_ready_session checks queued Shutdown, c
 shutdown_request_* tests check backlogged commands, Ready and every retiring-session restart before the mailbox Shutdown.
 cancelling_probe_during_version_cleanup_starts_no_initialize cancels a probe during version cleanup, then checks that no owned group survives and only the version spawn succeeded.
 Tests also check the shared engine/environment gate and registry, the ChildEnv spawn boundary, recheck_after_confirm_quit_launches_no_provider and escape_after_confirm_quit_keeps_sheet.
-shutdown_between_actor_check_and_decide_admits_no_new_turn and actor_admission_commits_before_contending_quit check both orders of actor admission and closing.
-shutdown_between_final_launch_check_and_spawn_starts_no_process and launch_in_flight_at_quit_is_signalled_or_refused check launch refusal and registration before the quit signal pass.
+shutdown_between_actor_check_and_decide_commits_then_holds_turn pauses after the admission read and checks both orders of closing, persisted pre-quit commitment, no prompt and the recovery hold.
+The two database-lock quit tests hold BEGIN IMMEDIATE while an admitted settings write waits, then check shutdown within 10 ms, native quit within 150 ms, persistence and post-quit refusal.
+shutdown_between_final_launch_check_and_spawn_starts_no_process pauses inside the launch gate after its final closing check and races native quit, then checks registration in the signal pass, SIGTERM exit and subsequent launch refusal.
+A launch already past that check completes before closing; launches that reach the check after closing are refused.
+launch_in_flight_at_quit_is_signalled_or_refused checks registration before the quit signal pass across concurrent launches.
+dropping_spawn_result_reaps_and_unregisters_its_group checks that dropping the returned guard reaps its owned process and removes its registry entry.
 native_quit_signals_registered_provider_groups checks actual SIGTERM delivery through Engine::on_app_quit and subsequent launch refusal.
 shutdown_after_admission_before_stdin_write_sends_no_prompt checks prompt refusal at the writer with an uncancelled delivery control.
 quit_between_decision_and_dispatch_still_ends_promptly checks that a Starting thread with no session parks without waiting for the shutdown deadline, including when the shutdown write fails.

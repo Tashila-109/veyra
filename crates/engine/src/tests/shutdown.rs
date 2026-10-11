@@ -1,6 +1,91 @@
 use super::grants::approval;
 use super::*;
 
+#[cfg(debug_assertions)]
+fn quit_during_database_write(native: bool, locked: bool) -> std::time::Duration {
+    use std::time::{Duration, Instant};
+    let runtime = Runtime::new().unwrap();
+    let scratch = Scratch(std::env::temp_dir().join(format!("veyra-quit-{}", ThreadId::new())));
+    let engine = crate::Engine::start_with_processes(
+        runtime.handle(),
+        crate::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+        vec![],
+    )
+    .unwrap();
+    let blocker = Connection::open(scratch.0.join("veyra.db")).unwrap();
+    let mut pending = None;
+    if locked {
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        pending = Some(engine.send(Command::SetDefaultMode {
+            mode: PermissionMode::AskFirst,
+        }));
+        let wait = Instant::now();
+        while engine.perf().actor_busy_ms < 100.0 {
+            assert!(wait.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let release = std::thread::spawn(move || {
+        if locked {
+            std::thread::sleep(Duration::from_millis(800));
+            blocker.execute_batch("ROLLBACK").unwrap();
+        }
+    });
+    let started = Instant::now();
+    if native {
+        runtime.block_on(engine.on_app_quit());
+    } else {
+        engine.shutdown();
+    }
+    let elapsed = started.elapsed();
+    release.join().unwrap();
+    runtime.block_on(engine.shutdown_wait());
+    if let Some(reply) = pending {
+        assert!(runtime.block_on(reply).unwrap().is_ok());
+        let stored = store::open(&scratch.0.join("veyra.db")).unwrap();
+        assert_eq!(
+            store::load(&stored).unwrap().settings.default_mode,
+            PermissionMode::AskFirst
+        );
+    }
+    assert!(matches!(
+        runtime
+            .block_on(engine.send(Command::SetDefaultMode {
+                mode: PermissionMode::FullAccess,
+            }))
+            .unwrap(),
+        Err(CommandError::Closed)
+    ));
+    drop(engine);
+    drop(runtime);
+    eprintln!("native={native} locked={locked} quit_took={elapsed:?}");
+    elapsed
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn confirm_quit_gate_does_not_stall_window_on_database_lock() {
+    use std::time::Duration;
+    assert!(quit_during_database_write(false, false) < Duration::from_millis(10));
+    let elapsed = quit_during_database_write(false, true);
+    assert!(
+        elapsed < Duration::from_millis(10),
+        "Engine::shutdown took {elapsed:?}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_quit_gate_stays_inside_gpui_shutdown_budget_on_database_lock() {
+    use std::time::Duration;
+    assert!(quit_during_database_write(true, false) < Duration::from_millis(150));
+    let elapsed = quit_during_database_write(true, true);
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "native quit took {elapsed:?}"
+    );
+}
+
 #[test]
 fn window_thread_reason_is_available_after_reload() {
     let mut f = Fixture::new(LiveState::Running);
@@ -68,7 +153,8 @@ fn on_app_quit_terminates_owned_groups_and_waits_100ms() {
     store::initialize(&mut db).unwrap();
     let engine = crate::Engine::scripted(runtime.handle(), db, Scripted::default()).unwrap();
     runtime.block_on(async {
-        let mut child = env::ChildEnv::load()
+        let mut child = engine
+            .child_env()
             .spawn(
                 std::path::Path::new("/bin/sleep"),
                 &["10".into()],
@@ -76,17 +162,12 @@ fn on_app_quit_terminates_owned_groups_and_waits_100ms() {
                 None,
             )
             .unwrap();
-        let pid = child.id().unwrap();
-        engine.inner.groups.lock().unwrap().insert(pid);
         let start = std::time::Instant::now();
         engine.on_app_quit().await;
         let elapsed = start.elapsed();
         let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
-        if status.is_err() {
-            crate::platform::signal_group(pid, crate::platform::Signal::Kill).ok();
-            child.wait().await.ok();
-        }
-        engine.inner.groups.lock().unwrap().remove(&pid);
+        child.stop().await.unwrap();
+        assert!(engine.inner.groups.lock().unwrap().is_empty());
         engine.shutdown_wait().await;
         assert!(status.unwrap().unwrap().code().is_none());
         assert!(elapsed >= std::time::Duration::from_millis(100));
@@ -519,72 +600,62 @@ fn engine_and_provider_environment_share_closing_state() {
 }
 
 #[test]
-fn shutdown_between_actor_check_and_decide_admits_no_new_turn() {
-    {
-        let mut positive = Fixture::new(LiveState::Idle);
+fn shutdown_between_actor_check_and_decide_commits_then_holds_turn() {
+    for closed_before_read in [true, false] {
+        let mut f = Fixture::new(LiveState::Idle);
+        let (sender, _receiver) = mpsc::channel(256);
+        let engine = crate::Engine {
+            inner: std::sync::Arc::new(crate::EngineInner {
+                sender,
+                schema_version: 2,
+                state: f.actor.state.clone(),
+                runtime: f.runtime.handle().clone(),
+                groups: Default::default(),
+            }),
+        };
+        if closed_before_read {
+            engine.shutdown();
+        }
+        f.actor.after_admission = Some(Box::new(move || engine.shutdown()));
+        let result = f.command(Command::Send {
+            thread: f.thread,
+            text: "committed before quit".into(),
+        });
+        assert!(f.actor.state.closing.is_closing());
+        if closed_before_read {
+            assert!(matches!(result, Err(CommandError::Closed)));
+            assert!(f.loaded().turns.is_empty());
+            assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Shutdown);
+            assert!(f.controls.try_recv().is_err());
+            continue;
+        }
+        let Ok(Ack::Turn(turn)) = result else {
+            panic!("a command past its closing read must commit: {result:?}");
+        };
+        assert_eq!(f.running(), Some(turn));
+        assert!(matches!(
+            f.loaded().turns[&turn].state,
+            TurnState::Running { .. }
+        ));
         assert!(
-            positive
-                .command(Command::Send {
-                    thread: positive.thread,
-                    text: "positive control".into()
-                })
-                .is_ok()
+            f.controls.try_recv().is_err(),
+            "a prompt was dispatched after closing"
         );
-        assert!(positive.running().is_some());
-        let _entered = positive.runtime.enter();
-        positive.actor.handle(EngineMsg::Shutdown);
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::Shutdown);
+        assert!(f.running().is_none());
+        assert_eq!(
+            f.loaded().threads[&f.thread].hold,
+            Some(HoldReason::Restarted)
+        );
+        assert!(matches!(
+            f.loaded().turns[&turn].state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Interrupted { .. },
+                ..
+            }
+        ));
+        assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Shutdown);
+        assert!(f.controls.try_recv().is_err());
     }
-    let mut f = Fixture::new(LiveState::Idle);
-    f.actor.close_before_decide = true;
-    let result = f.command(Command::Send {
-        thread: f.thread,
-        text: "closed during admission".into(),
-    });
-    assert!(f.actor.state.closing.is_closing());
-    let running = f
-        .loaded()
-        .turns
-        .values()
-        .any(|turn| matches!(turn.state, TurnState::Running { .. }));
-    let admitted = result.is_ok();
-    let _entered = f.runtime.enter();
-    f.actor.handle(EngineMsg::Shutdown);
-    assert!(
-        !admitted && !running,
-        "actor accepted Send and committed Running after closing was set: admitted={admitted}, running={running}"
-    );
-}
-
-#[test]
-fn actor_admission_commits_before_contending_quit() {
-    let mut f = Fixture::new(LiveState::Idle);
-    let closing = f.actor.state.closing.clone();
-    let (started, admission) = std::sync::mpsc::sync_channel(0);
-    let (attempted, attempt) = std::sync::mpsc::sync_channel(0);
-    f.actor.before_commit = Some(Box::new(move || {
-        started.send(()).unwrap();
-        attempt.recv().unwrap();
-    }));
-    let quit = std::thread::spawn(move || {
-        admission.recv().unwrap();
-        assert!(closing.lock.try_lock().is_err());
-        attempted.send(()).unwrap();
-        closing.close();
-    });
-    let result = f.command(Command::Send {
-        thread: f.thread,
-        text: "committed before quit".into(),
-    });
-    quit.join().unwrap();
-    assert!(matches!(result, Ok(Ack::Turn(_))));
-    assert!(f.running().is_some());
-    assert!(
-        f.loaded()
-            .turns
-            .values()
-            .any(|turn| matches!(turn.state, TurnState::Running { .. }))
-    );
-    let _entered = f.runtime.enter();
-    f.actor.handle(EngineMsg::Shutdown);
-    assert!(f.running().is_none());
 }

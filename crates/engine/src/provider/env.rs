@@ -12,7 +12,7 @@ use std::{
     process::Stdio,
     sync::{Arc, LazyLock, Mutex},
 };
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 pub(crate) type Groups = Arc<Mutex<std::collections::BTreeSet<u32>>>;
 
@@ -31,6 +31,13 @@ static LOGIN_PATH: LazyLock<LoginPath> = LazyLock::new(|| match platform::login_
     },
 });
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SpawnPause {
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChildEnv {
     pub(crate) groups: Groups,
@@ -38,7 +45,7 @@ pub struct ChildEnv {
     #[cfg(test)]
     pub(crate) launches: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
-    pub(crate) close_before_spawn: Arc<AtomicBool>,
+    pub(crate) before_spawn: Arc<Mutex<Option<SpawnPause>>>,
     #[cfg(test)]
     pub(crate) close_before_user_write: Arc<AtomicBool>,
     pub path: OsString,
@@ -64,7 +71,7 @@ impl ChildEnv {
             #[cfg(test)]
             launches: Default::default(),
             #[cfg(test)]
-            close_before_spawn: Default::default(),
+            before_spawn: Default::default(),
             #[cfg(test)]
             close_before_user_write: Default::default(),
             path: LOGIN_PATH.path.clone(),
@@ -136,13 +143,13 @@ impl ChildEnv {
         platform::own_group(&mut cmd);
         cmd
     }
-    pub fn spawn(
+    pub(crate) fn spawn(
         &self,
         binary: &Path,
         args: &[String],
         cwd: &Path,
         fixture: Option<&Path>,
-    ) -> Result<Child, ProviderError> {
+    ) -> Result<super::session::ProcessGroup, ProviderError> {
         if self.closing.is_closing() {
             return Err(ProviderError::Cancelled);
         }
@@ -156,24 +163,24 @@ impl ChildEnv {
         }
         #[cfg(not(debug_assertions))]
         let _ = fixture;
-        #[cfg(test)]
-        if self.close_before_spawn.swap(false, Ordering::AcqRel) {
-            self.closing.close();
-        }
         let admission = self.closing.enter();
         if self.closing.is_closing() {
             return Err(ProviderError::Cancelled);
         }
-        let child = cmd.spawn()?;
-        self.groups
-            .lock()
-            .unwrap()
-            .insert(child.id().expect("new child"));
+        #[cfg(test)]
+        if let Some(pause) = self.before_spawn.lock().unwrap().take() {
+            pause.reached.send(()).unwrap();
+            pause
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        let child = super::session::ProcessGroup::tracked(cmd.spawn()?, self);
         drop(admission);
         #[cfg(test)]
         self.launches
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        if let Err(error) = platform::lower_priority(child.id().expect("new child")) {
+        if let Err(error) = platform::lower_priority(child.pid) {
             tracing::warn!(%error, "could not lower agent group priority");
         }
         Ok(child)
@@ -218,7 +225,7 @@ mod tests {
                 closing: Default::default(),
                 launches: Default::default(),
                 #[cfg(test)]
-                close_before_spawn: Default::default(),
+                before_spawn: Default::default(),
                 #[cfg(test)]
                 close_before_user_write: Default::default(),
                 path: "bin::.".into(),
@@ -280,12 +287,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_spawn_result_reaps_and_unregisters_its_group() {
+        use std::{path::Path, time::Duration};
+        let env = ChildEnv::load();
+        let child = env
+            .spawn(
+                Path::new("/bin/sleep"),
+                &["5".into()],
+                Path::new("/tmp"),
+                None,
+            )
+            .unwrap();
+        let pid = child.pid;
+        assert!(env.groups.lock().unwrap().contains(&pid));
+        drop(child);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while env.groups.lock().unwrap().contains(&pid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let stale = env.groups.lock().unwrap().contains(&pid);
+        if crate::platform::group_exists(pid).unwrap() {
+            let _ = crate::platform::signal_group(pid, crate::platform::Signal::Kill);
+        }
+        env.groups.lock().unwrap().remove(&pid);
+        assert!(
+            !stale,
+            "dropping the spawn result left an entry for a dead owned group"
+        );
+        assert!(!crate::platform::group_exists(pid).unwrap());
+    }
+
+    #[tokio::test]
     async fn closing_state_refuses_every_provider_spawn() {
         let env = ChildEnv::load();
         let cwd = std::path::Path::new("/tmp");
         let binary = std::path::Path::new("/usr/bin/true");
         let mut positive = env.spawn(binary, &[], cwd, None).unwrap();
         positive.wait().await.unwrap();
+        positive.stop().await.unwrap();
         assert_eq!(env.launches.load(super::Ordering::Acquire), 1);
         env.closing.close();
         assert!(matches!(
@@ -303,26 +342,81 @@ mod tests {
         ));
         assert_eq!(env.launches.load(super::Ordering::Acquire), 1);
     }
-    #[tokio::test]
-    async fn shutdown_between_final_launch_check_and_spawn_starts_no_process() {
+    #[test]
+    fn shutdown_between_final_launch_check_and_spawn_starts_no_process() {
+        use std::{path::Path, time::Duration};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let env = ChildEnv::load();
-        let cwd = std::path::Path::new("/tmp");
-        let binary = std::path::Path::new("/usr/bin/true");
-        let mut positive = env.spawn(binary, &[], cwd, None).unwrap();
-        positive.wait().await.unwrap();
-        assert_eq!(env.launches.load(super::Ordering::Acquire), 1);
-        env.close_before_spawn.store(true, super::Ordering::Release);
-        let result = env.spawn(binary, &[], cwd, None);
-        let cancelled = matches!(result, Err(super::ProviderError::Cancelled));
-        if let Ok(mut child) = result {
-            child.wait().await.unwrap();
-        }
-        assert!(env.closing.is_closing());
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::initialize(&mut db).unwrap();
+        let engine = crate::Engine::launch(
+            runtime.handle(),
+            db,
+            super::super::Spawner::Cli(env.clone()),
+            None,
+        )
+        .unwrap();
+        let (reached, paused) = std::sync::mpsc::sync_channel(0);
+        let (resume, resumed) = std::sync::mpsc::sync_channel(0);
+        *env.before_spawn.lock().unwrap() = Some(super::SpawnPause {
+            reached,
+            resume: resumed,
+        });
+        let launcher = {
+            let env = env.clone();
+            let handle = runtime.handle().clone();
+            std::thread::spawn(move || {
+                let _entered = handle.enter();
+                env.spawn(
+                    Path::new("/bin/sleep"),
+                    &["5".into()],
+                    Path::new("/tmp"),
+                    None,
+                )
+                .unwrap()
+            })
+        };
+        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (started, starting) = std::sync::mpsc::sync_channel(0);
+        let (finished, done) = std::sync::mpsc::sync_channel(1);
+        let quit = {
+            let handle = runtime.handle().clone();
+            let engine = engine.clone();
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                handle.block_on(engine.on_app_quit());
+                finished
+                    .send(engine.inner.groups.lock().unwrap().clone())
+                    .unwrap();
+            })
+        };
+        starting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let signalled = done.recv_timeout(Duration::from_millis(500)).ok();
+        resume.send(()).unwrap();
+        let mut child = launcher.join().unwrap();
+        let pid = child.pid;
+        let signalled =
+            signalled.unwrap_or_else(|| done.recv_timeout(Duration::from_secs(2)).unwrap());
+        quit.join().unwrap();
+        let status = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(1), child.wait()).await });
+        runtime.block_on(child.stop()).unwrap();
+        runtime.block_on(engine.shutdown_wait());
+        assert!(env.groups.lock().unwrap().is_empty());
         assert!(
-            cancelled,
-            "provider process launched after closing was set between final check and spawn; launch count={}",
-            env.launches.load(super::Ordering::Acquire)
+            signalled.contains(&pid),
+            "a launch committed after quit's group signal pass"
         );
+        assert_eq!(
+            crate::platform::exit_signal(&status.unwrap().unwrap()),
+            Some("SIGTERM")
+        );
+        assert!(!crate::platform::group_exists(pid).unwrap());
+        let _entered = runtime.enter();
+        assert!(matches!(
+            env.spawn(Path::new("/usr/bin/true"), &[], Path::new("/tmp"), None),
+            Err(super::ProviderError::Cancelled)
+        ));
     }
 
     #[test]
@@ -347,7 +441,6 @@ mod tests {
                         Path::new("/tmp"),
                         None,
                     ) {
-                        env.groups.lock().unwrap().insert(child.id().unwrap());
                         children.push(child);
                     }
                     children
@@ -356,16 +449,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
             env.closing.close();
             let signalled = env.groups.lock().unwrap().clone();
-            let mut children = launcher.join().unwrap();
+            let children = launcher.join().unwrap();
             launched += children.len();
             escaped += children
                 .iter()
-                .filter(|child| !signalled.contains(&child.id().unwrap()))
+                .filter(|child| !signalled.contains(&child.pid))
                 .count();
             runtime.block_on(async {
-                for child in &mut children {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                for child in children {
+                    let _ = child.stop().await;
                 }
             });
         }
@@ -396,19 +488,16 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.id().unwrap();
+        let pid = child.pid;
         assert!(env.groups.lock().unwrap().contains(&pid));
         engine.on_app_quit().await;
         let exited = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
-        if exited.is_err() {
-            let _ = child.start_kill();
-            child.wait().await.unwrap();
-        }
+        child.stop().await.unwrap();
         assert_eq!(
             crate::platform::exit_signal(&exited.unwrap().unwrap()),
             Some("SIGTERM")
         );
-        env.groups.lock().unwrap().remove(&pid);
+        assert!(env.groups.lock().unwrap().is_empty());
         assert!(matches!(
             env.spawn(
                 std::path::Path::new("/usr/bin/true"),

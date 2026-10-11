@@ -23,9 +23,9 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-struct ProcessGroup {
+pub(crate) struct ProcessGroup {
     child: Option<Child>,
-    pid: u32,
+    pub(crate) pid: u32,
     reaped: Option<oneshot::Sender<()>>,
     groups: Option<super::env::Groups>,
     #[cfg(test)]
@@ -79,20 +79,17 @@ async fn end_process(
     failure.map_or(status, Err)
 }
 impl ProcessGroup {
-    fn new(child: Child) -> Self {
+    pub(crate) fn tracked(child: Child, env: &ChildEnv) -> Self {
+        let pid = child.id().expect("new child");
+        env.groups.lock().unwrap().insert(pid);
         Self {
-            pid: child.id().expect("new child"),
+            pid,
             child: Some(child),
             reaped: None,
-            groups: None,
+            groups: Some(env.groups.clone()),
             #[cfg(test)]
             check: process_alive,
         }
-    }
-    fn tracked(child: Child, env: &ChildEnv) -> Self {
-        let mut group = Self::new(child);
-        group.groups = Some(env.groups.clone());
-        group
     }
     fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
         self.child.as_mut()?.stdout.take()
@@ -102,6 +99,10 @@ impl ProcessGroup {
     }
     fn stdin(&mut self) -> Option<tokio::process::ChildStdin> {
         self.child.as_mut()?.stdin.take()
+    }
+    #[cfg(test)]
+    pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.as_mut().unwrap().wait().await
     }
     fn watch(&mut self, cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>) {
         let (sender, receiver) = oneshot::channel();
@@ -128,7 +129,7 @@ impl ProcessGroup {
             result
         }))
     }
-    async fn stop(mut self) -> std::io::Result<std::process::ExitStatus> {
+    pub(crate) async fn stop(mut self) -> std::io::Result<std::process::ExitStatus> {
         match self.end() {
             Some(task) => task.await.map_err(std::io::Error::other)?,
             None => Err(std::io::Error::other("process already stopped")),
@@ -216,7 +217,7 @@ fn launch(
         .transpose()?;
     let child = env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?;
     Ok(Process {
-        child: ProcessGroup::tracked(child, env),
+        child,
         native,
         #[cfg(debug_assertions)]
         recorder,
@@ -851,8 +852,7 @@ pub async fn probe(
             .unwrap_or_default()
     } else {
         check_cancelled(&mut cancelled)?;
-        let mut child =
-            ProcessGroup::tracked(env.spawn(&binary, &["--version".into()], cwd, None)?, env);
+        let mut child = env.spawn(&binary, &["--version".into()], cwd, None)?;
         let mut stdout = ByteLines::new(child.stdout().expect("piped version stdout"));
         let stderr = discard_stderr(&mut child);
         let result = tokio::select! {
@@ -889,10 +889,7 @@ pub async fn probe(
         })
         .transpose()?;
     check_cancelled(&mut cancelled)?;
-    let mut child = ProcessGroup::tracked(
-        env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?,
-        env,
-    );
+    let mut child = env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?;
     let mut lines = ByteLines::new(child.stdout().expect("piped stdout"));
     let stderr = discard_stderr(&mut child);
     let mut stdin = child.stdin().expect("piped stdin");
@@ -980,9 +977,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.id().unwrap();
+        let pid = child.pid;
         let process = Process {
-            child: ProcessGroup::tracked(child, &env),
+            child,
             native: NativeSessionId("fixture-session".into()),
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1069,9 +1066,9 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let pid = child.id().unwrap();
+            let pid = child.pid;
             let process = Process {
-                child: ProcessGroup::tracked(child, &env),
+                child,
                 native: NativeSessionId("fixture-session".into()),
                 #[cfg(debug_assertions)]
                 recorder: None,
@@ -1137,9 +1134,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.id().unwrap();
+        let pid = child.pid;
         let process = Process {
-            child: ProcessGroup::tracked(child, &env),
+            child,
             native: NativeSessionId("fixture-session".into()),
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1198,9 +1195,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.id().unwrap();
+        let pid = child.pid;
         let process = Process {
-            child: ProcessGroup::tracked(child, &env),
+            child,
             native: NativeSessionId("fixture-session".into()),
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1272,7 +1269,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut group = ProcessGroup::tracked(child, &env);
+        let mut group = child;
         let pid = group.pid;
         group.check = |_, _| Ok(true);
         let process = Process {
@@ -1340,18 +1337,17 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.id().unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut output = BufReader::new(child.stdout().unwrap()).lines();
         assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
-        let result = end_process(child, pid, |child, _| {
+        child.check = |child, _| {
             let text = if child.try_wait()?.is_none() {
                 "first check failed"
             } else {
                 "post-reap check failed"
             };
             Err(std::io::Error::other(text))
-        })
-        .await;
+        };
+        let result = child.stop().await;
         assert_eq!(result.unwrap_err().to_string(), "first check failed");
     }
     #[tokio::test]
@@ -1368,7 +1364,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut group = ProcessGroup::tracked(child, &env);
+        let mut group = child;
         let pid = group.pid;
         let mut output = BufReader::new(group.stdout().unwrap()).lines();
         assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
@@ -1414,9 +1410,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.id().unwrap();
+        let pid = child.pid;
         let process = Process {
-            child: ProcessGroup::tracked(child, &env),
+            child,
             native: NativeSessionId("fixture-session".into()),
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1477,13 +1473,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pid = child.id().unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        let pid = child.pid;
+        let mut output = BufReader::new(child.stdout().unwrap()).lines();
         assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
-        let result = end_process(child, pid, |_, _| {
-            Err(std::io::Error::other("check failed"))
-        })
-        .await;
+        child.check = |_, _| Err(std::io::Error::other("check failed"));
+        let result = child.stop().await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         while platform::group_exists(pid).unwrap() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1546,7 +1540,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut group = ProcessGroup::tracked(child, &env);
+        let mut group = child;
         let pid = group.pid;
         group.check = |_, _| Ok(true);
         let process = Process {
@@ -1657,7 +1651,7 @@ mod tests {
         let child = env
             .spawn(env.claude_bin.as_ref().unwrap(), &[], cwd, None)
             .unwrap();
-        let process = ProcessGroup::tracked(child, env);
+        let process = child;
         let started = tokio::time::timeout(Duration::from_secs(3), async {
             while !marker.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1723,9 +1717,9 @@ mod tests {
                         None,
                     )
                     .unwrap();
-                let pid = child.id().unwrap();
+                let pid = child.pid;
                 let process = Process {
-                    child: ProcessGroup::tracked(child, &env),
+                    child,
                     native: NativeSessionId("missing-native".into()),
                     recorder: None,
                 };
