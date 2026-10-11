@@ -24,6 +24,8 @@ Launch then removes replay overrides, records to `$PROOF/rec`, and the new-threa
 A live lane needs separate human authorization because it runs the installed CLI and spends its quota.
 The debug-only VEYRA_REAP_PIDS filter restricts startup reaping to the run's saved provider pids, including after a crash.
 An empty list permits no startup signals.
+The release check refuses to launch while any same-user marked process names a dead parent.
+Its preflight and Cleanup share an in-memory marker reader and report counts only.
 Both lanes remove the caller's Claude session variables while keeping `CLAUDE_CODE_USE_*` user configuration.
 Every app launch runs from `$DATA/appcwd`; probes run in Veyra's private data folder.
 
@@ -83,7 +85,7 @@ swiftc -O "$PROOF/capture-window.swift" -o "$PROOF/capture-window"
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
 printf 'RUN=%s\n' "$RUN"
 cat >"$PROOF/driver.py" <<'PY'
-import hashlib, json, os, pathlib, re, shutil, signal, sqlite3, subprocess, sys, time
+import ctypes, errno, hashlib, json, os, pathlib, re, shutil, signal, sqlite3, struct, subprocess, sys, time
 PROOF = pathlib.Path(__file__).resolve().parent
 RUN = os.environ['RUN']
 DATA = pathlib.Path('/tmp/veyra-verify-' + RUN)
@@ -104,6 +106,63 @@ if LANE == 'fake':
     ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()))
 else:
     ENV['VEYRA_RECORD'] = str(PROOF.resolve()/'rec')
+lib = ctypes.CDLL(None,use_errno=True)
+lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t]
+def no_environment(pid):
+    status = subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
+    return not status or status.startswith('Z')
+def marked_processes(parents=None):
+    remaining = []
+    rows = subprocess.check_output(['ps','-axo','pid=,uid=,stat='],text=True).splitlines()
+    for row in rows:
+        text,uid,status = row.split()
+        if int(uid) != os.geteuid() or status.startswith('Z'): continue
+        pid = int(text)
+        mib = (ctypes.c_int*3)(1,49,pid)
+        size = ctypes.c_size_t()
+        if lib.sysctl(mib,3,None,ctypes.byref(size),None,0) != 0:
+            error = ctypes.get_errno()
+            if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
+            if error == errno.EINVAL:
+                remaining.append(pid)
+                continue
+            raise OSError(error,f'marker size read failed for pid {pid}')
+        if size.value == 0: continue
+        buffer = ctypes.create_string_buffer(size.value)
+        if lib.sysctl(mib,3,buffer,ctypes.byref(size),None,0) != 0:
+            error = ctypes.get_errno()
+            if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
+            if error == errno.EINVAL:
+                remaining.append(pid)
+                continue
+            raise OSError(error,f'marker read failed for pid {pid}')
+        raw = buffer.raw[:size.value]
+        if not raw: continue
+        try:
+            argc = struct.unpack_from('i',raw)[0]
+            if argc < 0: raise ValueError('invalid argument count')
+            offset = raw.index(b'\0',4)+1
+            while offset < len(raw) and raw[offset] == 0: offset += 1
+            for _ in range(argc): offset = raw.index(b'\0',offset)+1
+        except (ValueError,struct.error):
+            if not no_environment(pid): remaining.append(pid)
+            continue
+        markers = [value.split(b'=',1)[1] for value in raw[offset:].split(b'\0')
+            if value.startswith(b'VEYRA_PARENT_PID=')]
+        for value in markers:
+            if not value.isdigit() or int(value) <= 0: continue
+            parent = int(value)
+            if parents is not None:
+                orphan = parent in parents
+            else:
+                try: os.kill(parent,0)
+                except ProcessLookupError: orphan = True
+                else: orphan = False
+            if orphan:
+                remaining.append(pid)
+                break
+    return remaining
 def page_done(name):
     with (PROOF/'pages-run').open('a') as out: out.write(name+'\n')
 def save(name, value):
@@ -394,7 +453,8 @@ Items include `outcome`, queued `wait_reason` and a tool's `failed_last_line`.
 Approval answer chords appear only with dock focus; otherwise its hint shows the FocusDock chord.
 Approval dock action_text, consequence and preview report the same typed target, one-line effect and bounded arguments rendered in the window.
 A cut preview ends with a notice.
-The preview scrolls independently within the existing composer height limit.
+The full command or file path, consequence and bounded argument preview share a scrollable area within the composer height limit.
+Allow and Deny stay below that area.
 Questions share the same unfocused FocusDock prompt.
 Answering one request keeps dock focus while requests remain.
 `notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
@@ -449,7 +509,7 @@ required = {
         'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png',
         'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png',
         'approval-write-inside.png','approval-write-outside.png','approval-web-fetch.png',
-        'approval-notebook-edit.png','approval-mcp.png'],
+        'approval-notebook-edit.png','approval-mcp.png','approval-long-command.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json'],
@@ -532,7 +592,7 @@ for attempt in $(seq 1 50); do
     sleep .1
 done
 ! kill -0 "$PID" 2>/dev/null
-python3 - "$PROOF" <<'PY'
+PYTHONPATH="$PROOF" python3 - "$PROOF" <<'PY'
 import ctypes, errno, json, os, pathlib, struct, subprocess, sys, time
 proof = pathlib.Path(sys.argv[1])
 parents = {int(pid) for pid in (proof/'owned-app-pids').read_text().split()}
@@ -544,57 +604,11 @@ def groups_gone():
         except ProcessLookupError: continue
         remaining.append(group)
     return remaining
-lib = ctypes.CDLL(None,use_errno=True)
-lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,
-    ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t]
-def no_environment(pid):
-    status = subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
-    return not status or status.startswith('Z')
-def marked_processes():
-    remaining = []
-    rows = subprocess.check_output(['ps','-axo','pid=,uid=,stat='],text=True).splitlines()
-    for row in rows:
-        text,uid,status = row.split()
-        if int(uid) != os.geteuid() or status.startswith('Z'): continue
-        pid = int(text)
-        mib = (ctypes.c_int*3)(1,49,pid)
-        size = ctypes.c_size_t()
-        if lib.sysctl(mib,3,None,ctypes.byref(size),None,0) != 0:
-            error = ctypes.get_errno()
-            if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
-            if error == errno.EINVAL:
-                remaining.append(pid)
-                continue
-            raise OSError(error,f'marker size read failed for pid {pid}')
-        if size.value == 0: continue
-        buffer = ctypes.create_string_buffer(size.value)
-        if lib.sysctl(mib,3,buffer,ctypes.byref(size),None,0) != 0:
-            error = ctypes.get_errno()
-            if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
-            if error == errno.EINVAL:
-                remaining.append(pid)
-                continue
-            raise OSError(error,f'marker read failed for pid {pid}')
-        raw = buffer.raw[:size.value]
-        if not raw: continue
-        try:
-            argc = struct.unpack_from('i',raw)[0]
-            if argc < 0: raise ValueError('invalid argument count')
-            offset = raw.index(b'\0',4)+1
-            while offset < len(raw) and raw[offset] == 0: offset += 1
-            for _ in range(argc): offset = raw.index(b'\0',offset)+1
-        except (ValueError,struct.error):
-            if not no_environment(pid): remaining.append(pid)
-            continue
-        markers = [value.split(b'=',1)[1] for value in raw[offset:].split(b'\0')
-            if value.startswith(b'VEYRA_PARENT_PID=')]
-        owned = any(value.decode().isdigit() and int(value) in parents for value in markers)
-        if owned: remaining.append(pid)
-    return remaining
+from driver import marked_processes
 end = time.monotonic()+5
 while True:
     remaining_groups = groups_gone()
-    remaining_markers = marked_processes()
+    remaining_markers = marked_processes(parents)
     with (proof/'leftover-checks.jsonl').open('a') as out:
         out.write(json.dumps({'groups':len(remaining_groups),'markers':len(remaining_markers),
             'time':time.monotonic()})+'\n')

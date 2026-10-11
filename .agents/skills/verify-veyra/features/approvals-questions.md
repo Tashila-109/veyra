@@ -131,6 +131,19 @@ for label, tool, arguments in [
     capture('approval-'+label)
     action('approval-'+label+'-allow','AllowOnce')
     ctl('approval-'+label+'-done','wait',thread,'Done')
+command = "cat <<'VEYRA_END'\n" + 'long approval heredoc line\n'*200 + 'VEYRA_END'
+records = [json.loads(line) for line in (SOURCE/'approval-allow.jsonl').read_text().splitlines()]
+records[4]['line']['request'].update(tool_name='Bash',input={'command':command})
+stage_records(records)
+thread = create('approval-long-command','Approve a long heredoc',scenario=None)
+dump = poll('approval-long-command-dock',lambda d: d['composer']['dock'] is not None)
+assert dump['composer']['dock']['action_text'] == command
+assert dump['composer']['dock']['request']['kind']['Approval']['grant_key']['command'] == command
+action('approval-long-command-focus','FocusDock')
+poll('approval-long-command-focused',lambda d: d['composer']['dock']['focused'])
+capture('approval-long-command')
+ctl('approval-long-command-allow','keys','secondary-enter')
+ctl('approval-long-command-done','wait',thread,'Done')
 question = create('question','Choose a route',scenario='question')
 poll('question-dock',lambda d: d['composer']['dock'] is not None)
 capture('question')
@@ -185,7 +198,9 @@ The unfocused approval PNGs show the exact command, consequence and FocusDock ch
 The focused approval PNGs show Allow once, Deny and their answer chords, matching the keys driven in those states.
 The project file stays absent after Deny and exists after Allow once.
 The Write PNGs and action_text/consequence fields show absolute targets inside and outside the project, plus their content preview.
-The WebFetch, NotebookEdit and MCP PNGs show their full arguments in a bounded, scrollable preview.
+The WebFetch, NotebookEdit and MCP PNGs show their full arguments in a bounded, scrollable area.
+The long-command PNG shows a heredoc in that area with Allow and Deny visible below it.
+Its action_text and grant key preserve the whole command.
 Only the provider codec interprets tool fields and resolves file locations; rendering consumes typed data.
 Those fake requests check dock presentation, not outside file effects.
 Text input after each final approval proves composer focus returned.

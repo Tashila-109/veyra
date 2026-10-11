@@ -187,15 +187,7 @@ mod tests {
                     .unwrap()
                     .success()
             );
-            assert!(
-                std::process::Command::new("/bin/ln")
-                    .arg("-s")
-                    .arg(root.join("versions/2.1.296"))
-                    .arg(root.join("claude"))
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            platform::test_symlink(&root.join("versions/2.1.296"), &root.join("claude")).unwrap();
             let output = tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let env = ChildEnv::load();
                 let mut parent = env

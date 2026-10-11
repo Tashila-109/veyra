@@ -210,7 +210,7 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                             .font_family(t.text.mono_font.clone())
                             .text_size(t.text.code.size)
                             .line_height(t.text.code.line_height)
-                            .child(tool_input(&tool.call.arguments)),
+                            .child(tool_input(&tool.call)),
                     )
                     .when_some(
                         tool_output(tool).map(str::to_owned),
@@ -295,10 +295,11 @@ pub fn failed_tool_last_line(tool: &ToolItem) -> Option<&str> {
         .find(|line| !line.trim().is_empty())
         .map(str::trim_end)
 }
-fn tool_input(arguments: &serde_json::Value) -> String {
-    if let Some(command) = arguments.get("command").and_then(serde_json::Value::as_str) {
-        return command.to_owned();
+fn tool_input(call: &ToolCall) -> String {
+    if let Some(summary) = &call.input_summary {
+        return summary.clone();
     }
+    let arguments = &call.arguments;
     arguments
         .as_object()
         .map(|fields| {
@@ -548,6 +549,7 @@ mod tests {
                 call: ToolCall {
                     name: "Bash".into(),
                     arguments: serde_json::json!({"command":"false"}),
+                    input_summary: None,
                 },
                 output_tail: String::new(),
                 result: Some(ToolResult {
@@ -599,6 +601,7 @@ mod tests {
                 call: ToolCall {
                     name: name.into(),
                     arguments: serde_json::json!({}),
+                    input_summary: None,
                 },
                 output_tail: "still working".into(),
                 result: None,
@@ -649,6 +652,7 @@ mod tests {
             call: ToolCall {
                 name: "Bash".into(),
                 arguments: serde_json::json!({"command":"false"}),
+                input_summary: Some("false".into()),
             },
             output_tail: String::new(),
             result: Some(ToolResult {
@@ -659,6 +663,6 @@ mod tests {
         assert_eq!(super::failed_tool_last_line(&tool), Some("last line"));
         tool.result.as_mut().unwrap().ok = true;
         assert_eq!(super::failed_tool_last_line(&tool), None);
-        assert_eq!(tool_input(&tool.call.arguments), "false");
+        assert_eq!(tool_input(&tool.call), "false");
     }
 }

@@ -349,6 +349,11 @@ pub fn connect_socket(path: &Path) -> io::Result<UnixStream> {
 }
 
 #[cfg(test)]
+pub fn test_symlink(original: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

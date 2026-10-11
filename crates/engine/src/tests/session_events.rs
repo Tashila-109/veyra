@@ -1136,6 +1136,7 @@ fn subagent_output_updates_running_tail_and_caps_characters() {
             call: ToolCall {
                 name: "Agent".into(),
                 arguments: serde_json::json!({}),
+                input_summary: None,
             },
         },
     ));

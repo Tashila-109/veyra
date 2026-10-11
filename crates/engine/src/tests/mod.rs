@@ -253,7 +253,7 @@ fn turn_event(turn: Option<TurnId>, event: TurnEvent) -> ProviderEvent {
     ProviderEvent::Turn { turn, event }
 }
 
-struct Scratch(std::path::PathBuf);
+pub(crate) struct Scratch(pub(crate) std::path::PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).unwrap();

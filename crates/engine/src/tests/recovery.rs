@@ -329,6 +329,7 @@ fn startup_completes_interrupted_transcript_items() {
             call: ToolCall {
                 name: "Bash".into(),
                 arguments: serde_json::json!({}),
+                input_summary: None,
             },
             result: None,
             output_tail: String::new(),

@@ -1995,6 +1995,70 @@ mod tests {
     }
 
     #[gpui::test]
+    fn long_approval_keeps_decision_buttons_visible(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let command = format!(
+                "cat <<'END'\n{}END",
+                "long approval command line\n".repeat(200)
+            );
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        tool: "command tool".into(),
+                        target: ApprovalTarget::Command {
+                            command: command.clone(),
+                            preview: ApprovalPreview::new("argument preview\n".repeat(200)),
+                        },
+                    },
+                    grant_key: Some(GrantKey {
+                        tool: "command tool".into(),
+                        command: command.clone(),
+                    }),
+                };
+                cx.notify();
+            });
+            draw(cx);
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            let text = cx.debug_bounds("approval-details").unwrap();
+            let deny = cx.debug_bounds("approval-deny-button").unwrap();
+            let allow = cx.debug_bounds("approval-allow-button").unwrap();
+            let viewport = cx.update(|window, _| window.viewport_size());
+            assert!(
+                text.size.height <= theme.layout.composer_max_height,
+                "command exceeds bounded approval area: {:?}",
+                text.size
+            );
+            for button in [deny, allow] {
+                assert!(
+                    button.origin.y >= gpui::Pixels::ZERO && button.bottom() <= viewport.height,
+                    "decision button is off-screen: {button:?}"
+                );
+            }
+            let dock = shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"].clone());
+            assert_eq!(dock["action_text"], command, "command must remain whole");
+            let before = cx.debug_bounds("approval-action-text").unwrap();
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: text.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(
+                    gpui::Pixels::ZERO,
+                    -theme.layout.composer_max_height,
+                )),
+                touch_phase: gpui::TouchPhase::Moved,
+                ..Default::default()
+            });
+            draw(cx);
+            let after = cx.debug_bounds("approval-action-text").unwrap();
+            assert!(
+                after.origin.y < before.origin.y,
+                "approval command did not scroll"
+            );
+            assert_eq!(cx.debug_bounds("approval-deny-button").unwrap(), deny);
+            assert_eq!(cx.debug_bounds("approval-allow-button").unwrap(), allow);
+        });
+    }
+
+    #[gpui::test]
     fn file_approval_dock_names_target_and_consequence(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             for (operation, location, consequence) in [

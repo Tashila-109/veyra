@@ -180,10 +180,10 @@ struct ControlRequest {
 struct ToolRequest {
     subtype: String,
     tool_name: String,
-    input: Value,
+    input: serde_json::Map<String, Value>,
 }
 struct PendingRequest {
-    input: Value,
+    input: serde_json::Map<String, Value>,
     kind: RequestKind,
 }
 
@@ -202,6 +202,9 @@ pub(crate) fn probe_value(wire: Value) -> Result<Option<InitializeReply>, super:
 
 fn target_location(project: &std::path::Path, target: &std::path::Path) -> TargetLocation {
     use std::{io::ErrorKind, path::Component};
+    if !target.is_absolute() || target.to_string_lossy().starts_with('~') {
+        return TargetLocation::NotVerified;
+    }
     let Ok(project) = project.canonicalize() else {
         return TargetLocation::NotVerified;
     };
@@ -772,12 +775,13 @@ impl Codec {
             || tool.tool_name.is_empty()
             || request.request_id.is_empty()
             || self.requests.contains_key(&request.request_id)
-            || !tool.input.is_object()
         {
             return None;
         }
         if tool.tool_name == "AskUserQuestion" {
-            let questions = tool.input["questions"]
+            let questions = tool
+                .input
+                .get("questions")?
                 .as_array()?
                 .iter()
                 .map(|question| {
@@ -799,20 +803,21 @@ impl Codec {
             }
             Some(RequestKind::Question { questions })
         } else {
-            let command = tool.input["command"].as_str();
-            Some(RequestKind::Approval {
-                action: self.approval_action(tool),
-                grant_key: command
-                    .filter(|_| {
-                        tool.input.as_object().unwrap().keys().all(|key| {
-                            ["command", "description", "timeout"].contains(&key.as_str())
-                        })
+            let action = self.approval_action(tool);
+            let grant_key = match &action.target {
+                ApprovalTarget::Command { command, .. }
+                    if tool.input.keys().all(|key| {
+                        ["command", "description", "timeout"].contains(&key.as_str())
+                    }) =>
+                {
+                    Some(GrantKey {
+                        tool: action.tool.clone(),
+                        command: command.clone(),
                     })
-                    .map(|command| GrantKey {
-                        tool: tool.tool_name.clone(),
-                        command: command.into(),
-                    }),
-            })
+                }
+                _ => None,
+            };
+            Some(RequestKind::Approval { action, grant_key })
         }
     }
     fn unsupported_request(id: String) -> Value {
@@ -821,13 +826,35 @@ impl Codec {
         }})
     }
     fn approval_action(&self, tool: &ToolRequest) -> ProposedAction {
-        let mut arguments = tool
+        let mut arguments = tool.input.clone();
+        let file_target = match tool.tool_name.as_str() {
+            "Write" => Some(("file_path", FileOperation::Write)),
+            "Edit" | "MultiEdit" => Some(("file_path", FileOperation::Edit)),
+            "Read" => Some(("file_path", FileOperation::Read)),
+            "NotebookEdit" => Some(("notebook_path", FileOperation::Edit)),
+            _ => None,
+        }
+        .and_then(|(field, operation)| {
+            tool.input
+                .get(field)
+                .and_then(Value::as_str)
+                .map(|path| (field, operation, path))
+        })
+        .filter(|(field, _, path)| {
+            ["file_path", "path", "notebook_path"]
+                .into_iter()
+                .all(|other| {
+                    other == *field
+                        || tool
+                            .input
+                            .get(other)
+                            .is_none_or(|value| value.as_str() == Some(*path))
+                })
+        });
+        let target = if let Some(command) = tool
             .input
-            .as_object()
-            .expect("validated tool input")
-            .clone();
-        let target = if let Some(command) = tool.input["command"]
-            .as_str()
+            .get("command")
+            .and_then(Value::as_str)
             .filter(|_| tool.tool_name == "Bash")
         {
             arguments.remove("command");
@@ -835,25 +862,10 @@ impl Codec {
                 command: command.into(),
                 preview: Self::preview(arguments),
             }
-        } else if let Some((field, path)) = ["file_path", "path", "notebook_path"]
-            .into_iter()
-            .find_map(|field| tool.input[field].as_str().map(|path| (field, path)))
-            .filter(|_| {
-                matches!(
-                    tool.tool_name.as_str(),
-                    "Write" | "Edit" | "MultiEdit" | "Read" | "NotebookEdit"
-                )
-            })
-        {
+        } else if let Some((field, operation, path)) = file_target {
             arguments.remove(field);
-            let path = self.cwd.join(path);
+            let path = std::path::PathBuf::from(path);
             let location = target_location(&self.cwd, &path);
-            let operation = match tool.tool_name.as_str() {
-                "Write" => FileOperation::Write,
-                "Edit" | "MultiEdit" | "NotebookEdit" => FileOperation::Edit,
-                "Read" => FileOperation::Read,
-                _ => FileOperation::Other,
-            };
             ApprovalTarget::File {
                 operation,
                 path,
@@ -870,6 +882,41 @@ impl Codec {
             target,
         }
     }
+    fn tool_call(name: String, arguments: Value) -> ToolCall {
+        let input_summary = if name == "Bash" {
+            arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            arguments
+                .as_object()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|(name, value)| {
+                            format!(
+                                "{name}: {}",
+                                value
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| value.to_string())
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| arguments.to_string())
+        });
+        ToolCall {
+            name,
+            arguments,
+            input_summary: Some(input_summary),
+        }
+    }
     fn preview(arguments: serde_json::Map<String, Value>) -> ApprovalPreview {
         ApprovalPreview::new(if arguments.is_empty() {
             String::new()
@@ -884,14 +931,17 @@ impl Codec {
             AcceptedDecision::Deny => json!({"behavior":"deny", "message":"Denied by you"}),
             AcceptedDecision::Answers { questions, answers } => {
                 let mut input = request.input.clone();
-                input["answers"] = Value::Object(
-                    questions
-                        .iter()
-                        .zip(answers)
-                        .map(|(question, answer)| {
-                            (question.text.clone(), Value::String(answer.text.clone()))
-                        })
-                        .collect(),
+                input.insert(
+                    "answers".into(),
+                    Value::Object(
+                        questions
+                            .iter()
+                            .zip(answers)
+                            .map(|(question, answer)| {
+                                (question.text.clone(), Value::String(answer.text.clone()))
+                            })
+                            .collect(),
+                    ),
                 );
                 json!({"behavior":"allow", "updatedInput":input})
             }
@@ -1133,11 +1183,11 @@ impl Codec {
                     if let ContentBlock::ToolUse { name, input, .. } = &block.content {
                         events.push(TurnEvent::ToolStarted {
                             key: block.key.clone(),
-                            call: ToolCall {
-                                name: name.clone(),
-                                arguments: serde_json::from_str(&block.input)
+                            call: Self::tool_call(
+                                name.clone(),
+                                serde_json::from_str(&block.input)
                                     .unwrap_or_else(|_| input.clone()),
-                            },
+                            ),
                         });
                     } else if block.streamed {
                         events.push(TurnEvent::ItemEnded {
@@ -1219,10 +1269,7 @@ impl Codec {
                         self.tool(id, &name, key.clone());
                         events.push(TurnEvent::ToolStarted {
                             key,
-                            call: ToolCall {
-                                name,
-                                arguments: input,
-                            },
+                            call: Self::tool_call(name, input),
                         });
                         continue;
                     }
@@ -1256,13 +1303,186 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn interrupted_stream_diagnostic_emits_no_text() {
-        let mut codec = Codec::new(
+    use crate::tests::Scratch;
+    fn codec() -> Codec {
+        Codec::new(
             NativeSessionId("fixture-session".into()),
             1,
             std::path::Path::new("/tmp"),
-        );
+        )
+    }
+    #[test]
+    fn tool_rows_receive_provider_neutral_input_summaries() {
+        for (name, input, expected) in [
+            ("Bash", json!({"command":"echo ok"}), "echo ok"),
+            (
+                "mcp__local__run",
+                json!({"command":"remote operation"}),
+                "command: remote operation",
+            ),
+            (
+                "Write",
+                json!({"content":"contents", "file_path":"/tmp/x"}),
+                "content: contents\nfile_path: /tmp/x",
+            ),
+        ] {
+            let mut codec = codec();
+            let decoded = codec
+                .value(json!({"type":"assistant","message":{"id":"summary",
+                "content":[{"type":"tool_use","id":"tool", "name":name,"input":input}]}}))
+                .unwrap();
+            let call = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event: TurnEvent::ToolStarted { call, .. },
+                        ..
+                    } => Some(call),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(call.input_summary.as_deref(), Some(expected));
+            assert_eq!(call.arguments, input);
+        }
+        let old: ToolCall =
+            serde_json::from_value(json!({"name":"old tool", "arguments":{"value":"old input"}}))
+                .unwrap();
+        assert_eq!(old.input_summary, None);
+        assert_eq!(old.arguments, json!({"value":"old input"}));
+    }
+    #[test]
+    fn approval_target_uses_the_tools_field_without_decoys() {
+        let mut codec = codec();
+        for (index, (tool, input)) in [
+            (
+                "NotebookEdit",
+                json!({"file_path":"/tmp/inside.txt",
+                "notebook_path":"/outside/book.ipynb", "new_source":"cell"}),
+            ),
+            (
+                "Write",
+                json!({"path":"/tmp/decoy.txt", "content":"contents"}),
+            ),
+            (
+                "Read",
+                json!({"file_path":"/tmp/inside.txt", "path":"/outside/file.txt"}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let decoded = codec
+                .value(
+                    json!({"type":"control_request","request_id":format!("decoy-{index}"),
+                "request":{"subtype":"can_use_tool","tool_name":tool,"input":input}}),
+                )
+                .unwrap();
+            let ProviderEvent::Turn {
+                event:
+                    TurnEvent::RequestOpened {
+                        kind: RequestKind::Approval { action, grant_key },
+                        ..
+                    },
+                ..
+            } = &decoded.events[0]
+            else {
+                panic!("missing approval")
+            };
+            let ApprovalTarget::Tool { preview } = &action.target else {
+                panic!("conflicting or missing target must not claim a file location")
+            };
+            assert_eq!(serde_json::from_str::<Value>(&preview.text).unwrap(), input);
+            assert!(grant_key.is_none());
+        }
+    }
+    #[test]
+    fn approval_relative_and_tilde_targets_are_not_verified() {
+        let mut codec = codec();
+        for (index, target) in ["~/outside.txt", "relative.txt"].into_iter().enumerate() {
+            let decoded = codec
+                .value(
+                    json!({"type":"control_request","request_id":format!("relative-{index}"),
+                "request":{"subtype":"can_use_tool","tool_name":"Write",
+                    "input":{"file_path":target,"content":"contents"}}}),
+                )
+                .unwrap();
+            let ProviderEvent::Turn {
+                event:
+                    TurnEvent::RequestOpened {
+                        kind: RequestKind::Approval { action, .. },
+                        ..
+                    },
+                ..
+            } = &decoded.events[0]
+            else {
+                panic!("missing approval")
+            };
+            assert!(
+                matches!(
+                    &action.target,
+                    ApprovalTarget::File {
+                        location: TargetLocation::NotVerified,
+                        ..
+                    }
+                ),
+                "relative and tilde targets must never read inside: {action:?}"
+            );
+        }
+    }
+    #[test]
+    fn approval_grants_only_the_displayed_bash_command() {
+        let mut codec = codec();
+        for (index, (tool, input, grant)) in [
+            ("mcp__local__run", json!({"command":"echo ok"}), false),
+            ("Write", json!({"command":"echo ok"}), false),
+            (
+                "Bash",
+                json!({"command":"echo ok", "description":"simple", "timeout":1000}),
+                true,
+            ),
+            (
+                "Bash",
+                json!({"command":"echo ok", "run_in_background":true}),
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let decoded = codec
+                .value(
+                    json!({"type":"control_request","request_id":format!("grant-{index}"),
+                "request":{"subtype":"can_use_tool","tool_name":tool,"input":input}}),
+                )
+                .unwrap();
+            let ProviderEvent::Turn {
+                event:
+                    TurnEvent::RequestOpened {
+                        kind: RequestKind::Approval { action, grant_key },
+                        ..
+                    },
+                ..
+            } = &decoded.events[0]
+            else {
+                panic!("missing approval")
+            };
+            assert_eq!(
+                grant_key.is_some(),
+                grant,
+                "{tool} must share the dock command rule"
+            );
+            if let Some(key) = grant_key {
+                assert_eq!(key.command, "echo ok");
+                assert!(
+                    matches!(&action.target, ApprovalTarget::Command { command, .. } if command == &key.command)
+                );
+            }
+        }
+    }
+    #[test]
+    fn interrupted_stream_diagnostic_emits_no_text() {
+        let mut codec = codec();
         codec.start(TurnId::new(), "test".into());
         codec.interrupt();
         let frames = [
@@ -1321,11 +1541,7 @@ mod tests {
     }
     #[test]
     fn aborted_reason_ends_interrupted() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         let turn = TurnId::new();
         codec.start(turn, "reply".into());
         let decoded = codec
@@ -1381,11 +1597,7 @@ mod tests {
         let parallel_registration = tracing::Dispatch::new(capture.clone());
         tracing::subscriber::with_default(capture.clone(), || {
             tracing::callsite::rebuild_interest_cache();
-            let mut codec = Codec::new(
-                NativeSessionId("fixture-session".into()),
-                1,
-                std::path::Path::new("/tmp"),
-            );
+            let mut codec = codec();
             for wire in [
                 json!({"type":"stream_event","event":{"type":"future_event","content":"private-content"}}),
                 json!({"type":"stream_event","event":{"type":"content_block_delta",
@@ -1428,11 +1640,7 @@ mod tests {
         capture.0.lock().unwrap().clear();
         tracing::subscriber::with_default(capture.clone(), || {
             tracing::callsite::rebuild_interest_cache();
-            let mut codec = Codec::new(
-                NativeSessionId("fixture-session".into()),
-                1,
-                std::path::Path::new("/tmp"),
-            );
+            let mut codec = codec();
             for wire in [
                 json!({"future":"private-content"}),
                 json!({"type":"system","subtype":"init","capabilities":null,"future":"private-content"}),
@@ -1453,11 +1661,7 @@ mod tests {
     }
     #[test]
     fn undecodable_control_request_gets_error_response() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         for (index, request) in [
             json!({"subtype":"can_use_tool","tool_name":null,"input":{}}),
             Value::Null,
@@ -1489,11 +1693,7 @@ mod tests {
     }
     #[test]
     fn undecodable_initialize_reply_fails_session() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         assert!(
             codec
                 .value(json!({"type":"control_response","response":{
@@ -1507,11 +1707,7 @@ mod tests {
     }
     #[test]
     fn approval_displays_every_argument_as_bounded_typed_data() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         for (index, (name, input)) in [
             ("Write", json!({"file_path":"/tmp/x","content":"file contents"})),
             ("Edit", json!({"file_path":"/tmp/x","old_string":"old text","new_string":"new text"})),
@@ -1546,11 +1742,7 @@ mod tests {
     }
     #[test]
     fn unknown_tools_keep_command_and_path_arguments_literal() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         let decoded = codec
             .value(json!({"type":"control_request","request_id":"remote-tool",
             "request":{"subtype":"can_use_tool","tool_name":"mcp__local__remote",
@@ -1579,35 +1771,13 @@ mod tests {
     #[test]
     fn approval_location_resolves_deepest_existing_ancestor() {
         use std::path::Path;
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
         let root = Scratch(Path::new("/tmp").join(format!("veyra-approval-{}", ThreadId::new())));
         let project = root.0.join("project");
         let outside = root.0.join("outside");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir(&outside).unwrap();
-        assert!(
-            std::process::Command::new("/bin/ln")
-                .args(["-s"])
-                .arg(&outside)
-                .arg(project.join("linked"))
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("/bin/ln")
-                .args(["-s"])
-                .arg(root.0.join("absent"))
-                .arg(project.join("dangling"))
-                .status()
-                .unwrap()
-                .success()
-        );
+        crate::platform::test_symlink(&outside, &project.join("linked")).unwrap();
+        crate::platform::test_symlink(&root.0.join("absent"), &project.join("dangling")).unwrap();
         let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1, &project);
         for (index, (path, expected)) in [
             ("linked/new/file.txt", TargetLocation::OutsideProject),
@@ -1623,7 +1793,7 @@ mod tests {
                 .value(
                     json!({"type":"control_request","request_id":format!("path-{index}"),
                 "request":{"subtype":"can_use_tool","tool_name":"Write",
-                    "input":{"file_path":path,"content":"contents"}}}),
+                    "input":{"file_path":project.join(path),"content":"contents"}}}),
                 )
                 .unwrap();
             let ProviderEvent::Turn {
@@ -1649,11 +1819,7 @@ mod tests {
     }
     #[test]
     fn approval_content_preview_is_cut_with_notice() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         let decoded = codec
             .value(json!({"type":"control_request","request_id":"long-content",
             "request":{"subtype":"can_use_tool","tool_name":"Write",
@@ -1683,11 +1849,7 @@ mod tests {
     }
     #[test]
     fn approval_preserves_typed_display_and_grants() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         codec.start(TurnId::new(), "reply".into());
         for (index, (tool, input, grant)) in [
             (
@@ -1754,11 +1916,7 @@ mod tests {
     }
     #[test]
     fn storage_interruption_names_database() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         codec.start(TurnId::new(), "reply".into());
         assert!(codec.interrupt_for(StopReason::StorageBlocked));
         let decoded = codec
@@ -1777,11 +1935,7 @@ mod tests {
     }
     #[test]
     fn empty_final_reasoning_adds_no_item() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         let turn = TurnId::new();
         codec.start(turn, "reply".into());
         let decoded = codec
@@ -1808,11 +1962,7 @@ mod tests {
     }
     #[test]
     fn final_blocks_match_message_and_occurrence_within_kind() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         codec.start(TurnId::new(), "reply".into());
         codec
             .line(
@@ -1872,11 +2022,7 @@ mod tests {
     }
     #[test]
     fn split_final_frames_match_each_same_kind_block_and_reset_on_message_start() {
-        let mut codec = Codec::new(
-            NativeSessionId("fixture-session".into()),
-            1,
-            std::path::Path::new("/tmp"),
-        );
+        let mut codec = codec();
         codec.start(TurnId::new(), "reply".into());
         for message in ["first", "second", "first"] {
             codec

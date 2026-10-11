@@ -29,7 +29,6 @@ pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String,
                 FileOperation::Write => "writes a file",
                 FileOperation::Edit => "edits a file",
                 FileOperation::Read => "reads a file",
-                FileOperation::Other => "uses this file",
             };
             let location = match location {
                 TargetLocation::InsideProject => "inside the project folder",
@@ -50,7 +49,15 @@ pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String,
     };
     let mut preview_text = preview.text.clone();
     if preview.truncated {
-        preview_text.push_str("\nPreview cut after 10,000 characters.");
+        let mut limit = veyra_engine::domain::TOOL_OUTPUT_CHARS.to_string();
+        let digits = limit.len();
+        for index in (1..digits)
+            .rev()
+            .filter(|index| (digits - index).is_multiple_of(3))
+        {
+            limit.insert(index, ',');
+        }
+        preview_text.push_str(&format!("\nPreview cut after {limit} characters."));
     }
     (label, consequence, preview_text)
 }
@@ -77,9 +84,8 @@ pub fn labelled_button(
                 .line_height(t.text.label.line_height)
                 .font_weight(t.text.label.weight)
                 .min_w_0()
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(label),
+                .truncate()
+                .child(label.split_whitespace().collect::<Vec<_>>().join(" ")),
         )
 }
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
@@ -259,83 +265,103 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         RequestKind::Approval { action, grant_key } => {
                             let (label, consequence, preview) =
                                 approval_text(action, shell.chosen_provider().label());
-                            dock =
-                                dock.key_context("VeyraDock VeyraApproval")
-                                    .child(
-                                        div()
-                                            .font_family(t.text.mono_font.clone())
-                                            .text_size(t.text.code.size)
-                                            .line_height(t.text.code.line_height)
-                                            .child(label),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(t.text.label.size)
-                                            .text_color(t.colors.text_muted)
-                                            .child(consequence),
-                                    )
-                                    .when(!preview.is_empty(), |dock| {
-                                        dock.child(
+                            dock = dock
+                                .key_context("VeyraDock VeyraApproval")
+                                .child(
+                                    div()
+                                        .id("approval-details")
+                                        .w_full()
+                                        .min_w_0()
+                                        .debug_selector(|| "approval-details".into())
+                                        .v_flex()
+                                        .min_h_0()
+                                        .max_h(t.layout.composer_max_height)
+                                        .overflow_scroll()
+                                        .gap(t.space.0[3])
+                                        .child(
                                             div()
-                                                .id("approval-preview")
-                                                .debug_selector(|| "approval-preview".into())
-                                                .max_h(t.layout.composer_max_height)
-                                                .overflow_y_scroll()
                                                 .font_family(t.text.mono_font.clone())
                                                 .text_size(t.text.code.size)
                                                 .line_height(t.text.code.line_height)
-                                                .child(preview),
+                                                .debug_selector(|| "approval-action-text".into())
+                                                .child(label),
                                         )
-                                    })
-                                    .child(
-                                        div()
-                                            .h_flex()
-                                            .flex_wrap()
-                                            .gap(t.space.0[3])
-                                            .child(
+                                        .child(
+                                            div()
+                                                .text_size(t.text.label.size)
+                                                .text_color(t.colors.text_muted)
+                                                .child(consequence),
+                                        )
+                                        .when(!preview.is_empty(), |details| {
+                                            details.child(
+                                                div()
+                                                    .debug_selector(|| "approval-preview".into())
+                                                    .font_family(t.text.mono_font.clone())
+                                                    .text_size(t.text.code.size)
+                                                    .line_height(t.text.code.line_height)
+                                                    .child(preview),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .h_flex()
+                                        .flex_wrap()
+                                        .gap(t.space.0[3])
+                                        .child(
+                                            dock_chip(
+                                                labelled_button("deny", "Deny", cx).debug_selector(
+                                                    || "approval-deny-button".into(),
+                                                ),
+                                                shell.dock_focused,
+                                                shortcut_chip::<Deny>(cx),
+                                            )
+                                            .on_click(
+                                                |_, window, cx| {
+                                                    window.dispatch_action(Box::new(Deny), cx)
+                                                },
+                                            ),
+                                        )
+                                        .when_some(grant_key.as_ref(), |row, key| {
+                                            row.child(
                                                 dock_chip(
-                                                    labelled_button("deny", "Deny", cx),
+                                                    labelled_button(
+                                                        "allow-thread",
+                                                        format!(
+                                                            "Allow `{}` in this thread",
+                                                            key.command
+                                                        ),
+                                                        cx,
+                                                    )
+                                                    .max_w_full(),
                                                     shell.dock_focused,
-                                                    shortcut_chip::<Deny>(cx),
+                                                    shortcut_chip::<AllowInThread>(cx),
                                                 )
                                                 .on_click(|_, window, cx| {
-                                                    window.dispatch_action(Box::new(Deny), cx)
+                                                    window.dispatch_action(
+                                                        Box::new(AllowInThread),
+                                                        cx,
+                                                    )
                                                 }),
                                             )
-                                            .when_some(grant_key.as_ref(), |row, key| {
-                                                row.child(
-                                                    dock_chip(
-                                                        labelled_button(
-                                                            "allow-thread",
-                                                            format!(
-                                                                "Allow `{}` in this thread",
-                                                                key.command
-                                                            ),
-                                                            cx,
-                                                        ),
-                                                        shell.dock_focused,
-                                                        shortcut_chip::<AllowInThread>(cx),
-                                                    )
-                                                    .on_click(|_, window, cx| {
-                                                        window.dispatch_action(
-                                                            Box::new(AllowInThread),
-                                                            cx,
-                                                        )
+                                        })
+                                        .child(
+                                            dock_chip(
+                                                labelled_button("allow-once", "Allow once", cx)
+                                                    .primary()
+                                                    .debug_selector(|| {
+                                                        "approval-allow-button".into()
                                                     }),
-                                                )
-                                            })
-                                            .child(
-                                                dock_chip(
-                                                    labelled_button("allow-once", "Allow once", cx)
-                                                        .primary(),
-                                                    shell.dock_focused,
-                                                    shortcut_chip::<AllowOnce>(cx),
-                                                )
-                                                .on_click(|_, window, cx| {
+                                                shell.dock_focused,
+                                                shortcut_chip::<AllowOnce>(cx),
+                                            )
+                                            .on_click(
+                                                |_, window, cx| {
                                                     window.dispatch_action(Box::new(AllowOnce), cx)
-                                                }),
+                                                },
                                             ),
-                                    );
+                                        ),
+                                );
                         }
                         RequestKind::Question { questions } => {
                             let index = shell
@@ -480,6 +506,7 @@ mod tests {
             "\"notebook_path\"",
             "\"Write\"",
             "\"Edit\"",
+            "\"MultiEdit\"",
             "\"Read\"",
             "\"Bash\"",
             "\"WebFetch\"",
@@ -491,6 +518,54 @@ mod tests {
                 !code.contains(wire_name),
                 "dock must not interpret provider data or touch disk: {wire_name}"
             );
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut folders = vec![root];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    folders.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let code = source.split("#[cfg(test)]").next().unwrap();
+                for tool in [
+                    "Bash",
+                    "Write",
+                    "Edit",
+                    "MultiEdit",
+                    "Read",
+                    "NotebookEdit",
+                    "WebFetch",
+                ] {
+                    assert!(
+                        !code.contains(&format!("\"{tool}\"")),
+                        "{} interprets provider tool {tool}",
+                        path.display()
+                    );
+                }
+                for field in [
+                    "command",
+                    "file_path",
+                    "path",
+                    "notebook_path",
+                    "old_string",
+                    "new_string",
+                    "new_source",
+                ] {
+                    for access in [format!(".get(\"{field}\")"), format!("[\"{field}\"]")] {
+                        assert!(
+                            !code.contains(&access),
+                            "{} interprets provider field {field}",
+                            path.display()
+                        );
+                    }
+                }
+            }
         }
         assert!(code.contains(".child(preview)"));
     }

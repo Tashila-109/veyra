@@ -127,6 +127,9 @@ Use a disposable HOME and a PATH with no Claude to prevent an unauthorized live 
 Require the known system-wide install paths to contain no Claude before launch.
 Release still reads VEYRA_DATA_DIR, but excludes the driver, recording and provider overrides at compile time.
 The debug strings are the positive control.
+Before launch, the shared in-memory KERN_PROCARGS2 reader refuses any same-user marked process whose VEYRA_PARENT_PID names a dead pid.
+It prints and records only the count.
+Release ignores VEYRA_REAP_PIDS, so its unrestricted startup sweep requires this preflight.
 The cleanup trap owns only this release group and scratch folder.
 This section stops the debug app before opening the release window, then relaunches debug after release cleanup.
 
@@ -145,7 +148,7 @@ printf 'exit=%s\n' "$rc" >>"$REL_PROOF/ctl.txt"
 test "$rc" = 2
 grep -qx 'usage: veyra \[mcp\]' "$REL_PROOF/ctl.txt"
 : >"$REL_PROOF/strings.txt"
-for name in control.sock VEYRA_CLAUDE_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD DebugNotificationResponse; do
+for name in control.sock VEYRA_CLAUDE_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD VEYRA_REAP_PIDS DebugNotificationResponse; do
     release=$(/usr/bin/strings -a target/release/veyra | grep -c "$name" || true)
     debug=$(/usr/bin/strings -a target/debug/veyra | grep -c "$name" || true)
     printf 'release %s count=%s\ndebug %s count=%s\n' "$name" "$release" "$name" "$debug" \
@@ -163,6 +166,13 @@ if kill -0 "$DEBUG_PID" 2>/dev/null; then
     printf 'debug app is still running before release launch\n' >&2
     exit 1
 fi
+PYTHONPATH="$PROOF" python3 - <<'PY'
+from driver import *
+orphans = marked_processes()
+(PROOF/'release'/'orphan-preflight.txt').write_text(f'marked orphan count={len(orphans)}\n')
+print(f'marked orphan count={len(orphans)}')
+assert not orphans, 'release launch refused: marked orphan processes exist'
+PY
 mkdir -p "$REL_DATA/home"
 set -m
 HOME="$REL_DATA/home" SHELL=/usr/bin/false PATH=/usr/bin:/bin:/usr/sbin:/sbin VEYRA_DATA_DIR="$REL_DATA" \

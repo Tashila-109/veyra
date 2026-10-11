@@ -156,6 +156,8 @@ pub enum ItemBody {
 pub struct ToolCall {
     pub name: String,
     pub arguments: serde_json::Value,
+    #[serde(default)]
+    pub input_summary: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolItem {
@@ -262,7 +264,6 @@ pub enum FileOperation {
     Write,
     Edit,
     Read,
-    Other,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -199,18 +199,22 @@ Unknown subtypes and malformed requests receive an error response without openin
 Malformed includes empty tool names or ids, ids reused within that CLI process lifetime, non-object input, missing question text or option labels, and duplicate question texts.
 A pending request makes the thread NeedsYou and docks its exact command, tool target or question above the composer.
 The Claude codec turns each approval into ProposedAction, a tool label and provider-neutral ApprovalTarget: Command, File or Tool.
-Command preserves exact command text; File carries its operation, absolute target path, location and preview; Tool carries its argument preview.
+Command preserves exact command text; File carries its operation, literal target path, location and preview; Tool carries its argument preview.
 File previews include content and edit strings, and other tool previews include every argument as pretty-printed text.
 Command previews include all arguments other than the separately displayed command.
 Each preview retains at most TOOL_OUTPUT_CHARS, the same 10,000-character cap as tool output, and carries a truncation flag rendered as a cut notice.
-The codec classifies location once when the request opens against the canonical project folder.
+Write, Edit, MultiEdit and Read use file_path; NotebookEdit uses notebook_path.
+A missing target or a conflicting file_path, path or notebook_path becomes a Tool action showing every argument without a file-location claim.
+Relative targets and targets starting with ~ are NotVerified.
+The codec classifies absolute location once, synchronously in the session task, when the request opens against the canonical project folder.
 It canonicalizes the deepest existing ancestor and appends the missing remainder; a remainder containing a parent component or an unresolvable path is NotVerified.
 InsideProject requires the resolved target to be under the canonical project folder; proved other targets are OutsideProject.
-The app renders only the typed action, does no disk work to render it, and gives argument previews a scrollable area bounded by the composer height token.
+The app renders only the typed action and does no disk work to render it.
+The full command or file path, consequence and bounded argument preview share a scrollable area bounded by the composer height token, with Allow and Deny below it.
 Request rows store only this typed display form, with no duplicated raw input.
 Legacy stored command rows load as Command; rows with optional legacy input load as Tool previews without claiming a verified file location.
 AllowOnce, AllowInThread and Deny answer approvals; AnswerQuestion collects one answer per question.
-Only an input whose keys are command, description or timeout may offer an exact-command thread grant.
+Only a Bash Command action whose input keys are command, description or timeout may offer an exact-command thread grant using that displayed command.
 Inputs with any other field always dock without a grant offer.
 The dock shows 1 of N for multiple pending requests.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
@@ -282,7 +286,7 @@ One session task owns the child, its stdin writer and a process-group guard.
 `ByteLines` caps each stdout and stderr line at 4 MiB and survives cancelled reads.
 Oversized lines and invalid JSON are skipped; diagnostics reveal lengths rather than raw content.
 Valid JSON that cannot decode as an ordinary Claude frame is skipped, logging only its type without frame content.
-An undecodable control request with a valid id gets an error control_response and reserves that id for the session lifetime; an unaddressable request fails the session.
+An undecodable control request with a valid id gets an error control_response and reserves that id for that CLI process's lifetime; an unaddressable request fails the session.
 Undecodable control replies, including initialize, fail the session instead of leaving the Ready gate waiting.
 Each accepted stdout line is parsed once and its value passes through recording, root decoding and subagent decoding.
 The bounded stderr tail is redacted before display and supplies failures when the CLI exits unexpectedly.
@@ -319,6 +323,7 @@ It publishes a synthesized turn end before awaiting group cleanup, so post-KILL 
 Exited still follows cleanup, and the actor starts no queued work before Exited.
 Other abnormal exits produce Failed with Veyra's bounded, redacted crash text.
 Streamed and final blocks share native keys so final frames do not duplicate delivered text.
+The codec supplies provider-neutral tool input summaries; older stored calls without a summary render their arguments generically.
 Each background_tasks_changed replaces the pending set; ambient tasks never keep the thread Working.
 Child frames feed the pending root Task or Agent tool's bounded output tail instead of creating root text or turns.
 Unknown or finished child parents are ignored, and snapshots retain a running tool's tail.
@@ -490,8 +495,9 @@ Its fake lane isolates data and uses only the fake CLI; an explicitly authorized
 Proof stays outside disposable scratch, and every action targets a process this run started.
 Captures require the owned window to remain on-screen and frontmost; the guard prevents covered or stale frames from counting as proof.
 Cleanup checks owned app pids, provider groups and same-user parent markers without printing arguments before removing scratch.
-A marker read treats ESRCH and an empty argument block as a gone process; EINVAL or incomplete reads from a still-listed process remain in the count and retry under the existing five-second deadline.
-Release proof uses a disposable HOME and restricted PATH, scans driver/override strings and checks a socket-free window.
+Release proof uses a disposable HOME and restricted PATH, scans driver/override strings including VEYRA_REAP_PIDS, and checks a socket-free window.
+Release ignores the debug reap filter, so its launch first refuses any same-user marked process whose VEYRA_PARENT_PID names a dead pid.
+The preflight shares Cleanup's in-memory KERN_PROCARGS2 reader and reports counts only.
 Only one owned Veyra window exists during that release check; it takes no PNG.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
@@ -528,7 +534,9 @@ Reaper tests check live parents, non-agent argv, the lazy executable/environment
 The versioned-binary test proves that a marked orphan started by its parent harness survives the child test's sweep.
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
 Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
-Application tests enable gpui test-support to exercise Shell selection, its event pump, typed dock text, bounded previews and focus, chords and empty-Send Stop through the keymap in a synthetic window.
+Application tests enable gpui test-support to exercise Shell selection, its event pump, typed dock text and focus, chords and empty-Send Stop through the keymap in a synthetic window.
+A composer unit test checks the preview cut notice; a synthetic window checks that long approval text scrolls within a bounded area while decision buttons stay on-screen.
+The approvals-questions screenshots show the real-window scroll area.
 Codec and storage tests cover all tool arguments, symlinks with missing parents, unverified targets, truncated Unicode previews, legacy approval rows and undecodable control failures.
 Shell tests load the login-shell PATH as the app does but admit no process to their startup sweep.
 Their current-thread runtimes do not drive readiness tasks before replacing the probes, so those tests start no provider check.
