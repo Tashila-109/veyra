@@ -234,12 +234,105 @@ impl RequestKind {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProposedAction {
     pub tool: String,
-    pub command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<Box<serde_json::Value>>,
+    pub target: ApprovalTarget,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalTarget {
+    Command {
+        command: String,
+        preview: ApprovalPreview,
+    },
+    File {
+        operation: FileOperation,
+        path: PathBuf,
+        location: TargetLocation,
+        preview: ApprovalPreview,
+    },
+    Tool {
+        preview: ApprovalPreview,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOperation {
+    Write,
+    Edit,
+    Read,
+    Other,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetLocation {
+    InsideProject,
+    OutsideProject,
+    NotVerified,
+}
+pub const TOOL_OUTPUT_CHARS: usize = 10_000;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalPreview {
+    pub text: String,
+    pub truncated: bool,
+}
+impl ApprovalPreview {
+    pub fn new(mut text: String) -> Self {
+        let cut = text
+            .char_indices()
+            .nth(TOOL_OUTPUT_CHARS)
+            .map(|(index, _)| index);
+        if let Some(index) = cut {
+            text.truncate(index);
+        }
+        Self {
+            text,
+            truncated: cut.is_some(),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ProposedAction {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StoredAction {
+            Typed {
+                tool: String,
+                target: ApprovalTarget,
+            },
+            Legacy {
+                tool: String,
+                command: String,
+                #[serde(default)]
+                input: Option<serde_json::Value>,
+            },
+        }
+        let (tool, target) = match StoredAction::deserialize(deserializer)? {
+            StoredAction::Typed { tool, target } => (tool, target),
+            StoredAction::Legacy {
+                tool,
+                command,
+                input,
+            } => {
+                let target = if let Some(input) = input {
+                    ApprovalTarget::Tool {
+                        preview: ApprovalPreview::new(
+                            serde_json::to_string_pretty(&input)
+                                .map_err(serde::de::Error::custom)?,
+                        ),
+                    }
+                } else {
+                    ApprovalTarget::Command {
+                        command,
+                        preview: ApprovalPreview::new(String::new()),
+                    }
+                };
+                (tool, target)
+            }
+        };
+        Ok(Self { tool, target })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {

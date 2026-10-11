@@ -110,7 +110,11 @@ fn question(text: &str) -> Value {
     json!({"question":text, "options":[{"label":"No"}, {"label":"Yes"}]})
 }
 pub(super) fn codec(f: &Fixture) -> Codec {
-    let mut codec = Codec::new(NativeSessionId("regression".into()), 9);
+    let mut codec = Codec::new(
+        NativeSessionId("regression".into()),
+        9,
+        std::path::Path::new("/project"),
+    );
     codec.start(f.running().unwrap(), "first".into());
     codec
 }
@@ -253,4 +257,56 @@ fn duplicate_question_text_is_rejected_before_opening() {
             )
             .is_none()
     );
+}
+
+#[test]
+fn legacy_approval_rows_load_as_typed_display() {
+    let mut f = Fixture::new(LiveState::Running);
+    let id = approval(&mut f, "Bash", "echo old");
+    for (action, expected) in [
+        (
+            json!({"tool":"Bash","command":"echo old"}),
+            ApprovalTarget::Command {
+                command: "echo old".into(),
+                preview: ApprovalPreview::new(String::new()),
+            },
+        ),
+        (
+            json!({"tool":"Write","command":"duplicate raw input",
+            "input":{"file_path":"/tmp/x","content":"old contents"}}),
+            ApprovalTarget::Tool {
+                preview: ApprovalPreview::new(
+                    "{\n  \"content\": \"old contents\",\n  \"file_path\": \"/tmp/x\"\n}".into(),
+                ),
+            },
+        ),
+    ] {
+        let body = json!(["old-native", {"Approval":{"action":action,"grant_key":null}}]);
+        f.actor
+            .db
+            .execute(
+                "UPDATE requests SET body_json=?1 WHERE id=?2",
+                rusqlite::params![body.to_string(), id.to_string()],
+            )
+            .unwrap();
+        let loaded = f.loaded();
+        let RequestKind::Approval { action, .. } = &loaded.requests[&id].kind else {
+            panic!("approval")
+        };
+        if let ApprovalTarget::Tool { preview } = &expected {
+            let ApprovalTarget::Tool { preview: actual } = &action.target else {
+                panic!("tool preview")
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&actual.text).unwrap(),
+                serde_json::from_str::<Value>(&preview.text).unwrap()
+            );
+            assert!(!actual.truncated);
+        } else {
+            assert_eq!(action.target, expected);
+        }
+        let stored = serde_json::to_value(action).unwrap();
+        assert!(stored.get("input").is_none());
+        assert!(stored.get("command").is_none());
+    }
 }

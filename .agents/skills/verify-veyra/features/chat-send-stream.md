@@ -135,15 +135,17 @@ assert ambient['selected_thread']['status']=='Done'
 assert sql("select live_pgid is not null from threads where id='"+background+"'")=='1'
 assert sql("select count(*) from turns where thread_id='"+background+"'")=='1'
 provider = create('chat-provider','reply with the word ok',scenario='provider-turn-after-background')
+reply = 'The background `sleep 20` finished with exit code 0.'
 provider_done = poll('chat-provider-done',lambda d: d['selected_thread']['id']==provider
     and d['selected_thread']['status']=='Done'
-    and sql("select count(*) from turns where thread_id='"+provider+"' and state='ended'")=='2')
+    and sql("select count(*) from turns where thread_id='"+provider+"' and state='ended'")=='2'
+    and [(item['kind'],item['text'],item['done']) for item in d['transcript']['items']
+        if item['kind'] in ['assistant','reasoning']] == [('assistant','started',True),('assistant',reply,True)])
 assert sql("select group_concat(json_extract(outcome_json,'$')) from turns where thread_id='"
     +provider+"'") == 'Completed,Completed'
 provider_turn = sql("select id from turns where thread_id='"+provider+"' and origin_json='\"Provider\"'")
 assert provider_turn
 assert sql("select count(*) from items where turn_id='"+provider_turn+"'") == '1'
-reply = 'The background `sleep 20` finished with exit code 0.'
 assert sql("select kind||'|'||json_extract(body_json,'$.AssistantText.text')||'|'||done "
     +"from items where turn_id='"+provider_turn+"'") == 'assistant_text|'+reply+'|1'
 assert [(item['kind'],item['text'],item['done']) for item in provider_done['transcript']['items']

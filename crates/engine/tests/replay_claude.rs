@@ -580,13 +580,17 @@ fn replacing_hung_probe_ends_its_group_before_ready_reply() {
     });
 }
 
-fn controlled_replay(name: &str, prompts: &[&str], interrupt: bool) -> Vec<ProviderEvent> {
-    controlled_replay_with(name, prompts, interrupt, |_| {})
+fn controlled_replay(
+    name: &str,
+    prompts: &[&str],
+    interrupt_text: Option<&str>,
+) -> Vec<ProviderEvent> {
+    controlled_replay_with(name, prompts, interrupt_text, |_| {})
 }
 fn controlled_replay_with(
     name: &str,
     prompts: &[&str],
-    interrupt: bool,
+    interrupt_text: Option<&str>,
     edit: impl FnOnce(&Scratch),
 ) -> Vec<ProviderEvent> {
     let (scratch, env) = environment(name, false);
@@ -634,11 +638,10 @@ fn controlled_replay_with(
                         .unwrap();
                     next += 1;
                 }
-                if interrupt
-                    && !interrupted
+                if !interrupted
                     && matches!(&event, ProviderEvent::Turn {
                     event: TurnEvent::TextDelta { text, .. }, ..
-                } if text == "partial" || (name == "interrupt-honoured" && text.ends_with("9: It equ")))
+                } if interrupt_text.is_some_and(|trigger| text.ends_with(trigger)))
                 {
                     handle
                         .control
@@ -684,7 +687,11 @@ fn claude_assistant_error_fails_and_parks() {
 }
 #[test]
 fn claude_interrupt_result_is_interrupted() {
-    let events = controlled_replay("interrupt-error-during-execution", &["first"], true);
+    let events = controlled_replay(
+        "interrupt-error-during-execution",
+        &["first"],
+        Some("partial"),
+    );
     assert_eq!(
         outcomes(&events),
         vec![TurnOutcome::Interrupted {
@@ -697,7 +704,7 @@ fn subagent_events(late: bool) -> Vec<ProviderEvent> {
     controlled_replay_with(
         "subagent-task",
         &["reply with the word ok"],
-        false,
+        None,
         |scratch| {
             if !late {
                 return;
@@ -801,7 +808,7 @@ fn claude_subagent_late_frames_dropped() {
 }
 #[test]
 fn claude_compact_and_clear_add_notices() {
-    let events = controlled_replay("compact-and-clear", &["/compact", "/clear"], false);
+    let events = controlled_replay("compact-and-clear", &["/compact", "/clear"], None);
     let notices: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -856,7 +863,7 @@ fn claude_retry_limit_fallback_notices() {
 }
 #[test]
 fn claude_interrupt_honoured() {
-    let recorded = controlled_replay("interrupt-honoured", &["first"], true);
+    let recorded = controlled_replay("interrupt-honoured", &["first"], Some("9: It equ"));
     assert_eq!(
         outcomes(&recorded),
         vec![TurnOutcome::Interrupted {
@@ -873,7 +880,7 @@ fn claude_interrupt_honoured() {
         }
     )));
 
-    let events = controlled_replay("interrupt-continued", &["first", "second"], true);
+    let events = controlled_replay("interrupt-continued", &["first", "second"], Some("partial"));
     assert_eq!(text(&events), "partialok");
     assert_eq!(
         outcomes(&events),
@@ -894,7 +901,7 @@ fn claude_interrupt_honoured() {
 }
 #[test]
 fn claude_interrupt_ignored() {
-    let events = controlled_replay("interrupt-ignored", &["first"], true);
+    let events = controlled_replay("interrupt-ignored", &["first"], Some("partial"));
     assert_eq!(text(&events), "partial");
     assert_eq!(
         outcomes(&events),
@@ -906,7 +913,7 @@ fn claude_interrupt_ignored() {
 
 #[test]
 fn ladder_synthesizes_interrupted_end() {
-    let events = controlled_replay("interrupt-ignored", &["first"], true);
+    let events = controlled_replay("interrupt-ignored", &["first"], Some("partial"));
     assert_eq!(
         outcomes(&events),
         vec![TurnOutcome::Interrupted {
@@ -932,7 +939,7 @@ fn ladder_synthesizes_interrupted_end() {
 #[test]
 fn ladder_stops_at_cli_turn_end() {
     let started = std::time::Instant::now();
-    let events = controlled_replay("interrupt-continued", &["first", "second"], true);
+    let events = controlled_replay("interrupt-continued", &["first", "second"], Some("partial"));
     assert!(started.elapsed() >= Duration::from_millis(4500));
     assert_eq!(text(&events), "partialok");
     assert_eq!(
@@ -1111,7 +1118,7 @@ fn claude_approval_deny() {
             .iter()
             .any(|event| matches!(event, ProviderEvent::Turn {
         event: TurnEvent::RequestOpened { kind: RequestKind::Approval { action, .. }, .. }, ..
-    } if action.command == "touch veyra-check.txt"))
+    } if matches!(&action.target, ApprovalTarget::Command { command, .. } if command == "touch veyra-check.txt")))
     );
 }
 #[test]

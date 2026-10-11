@@ -272,6 +272,7 @@ fn start_task(
                 thread,
                 epoch,
                 spec.native.is_some(),
+                &spec.cwd,
             )
             .await
             {
@@ -414,6 +415,7 @@ async fn run_one(
     thread: ThreadId,
     epoch: u32,
     resume: bool,
+    cwd: &std::path::Path,
 ) -> Completion {
     let pid = process.child.pid;
     let mut lines = ByteLines::new(process.child.stdout().expect("piped stdout"));
@@ -444,7 +446,7 @@ async fn run_one(
         }
         Ok::<_, std::io::Error>(())
     });
-    let mut codec = Codec::new(process.native.clone(), pid);
+    let mut codec = Codec::new(process.native.clone(), pid, cwd);
     let mut ready = false;
     let mut rejected = None;
     #[cfg(debug_assertions)]
@@ -895,7 +897,16 @@ mod tests {
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
         let task = tokio::spawn(async move {
-            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await
+            run_one(
+                process,
+                &mut control,
+                &out,
+                ThreadId::new(),
+                1,
+                false,
+                std::path::Path::new("/tmp"),
+            )
+            .await
         });
         let end = std::time::Instant::now() + Duration::from_secs(5);
         let ended = loop {
@@ -973,7 +984,16 @@ mod tests {
                 })
                 .unwrap();
             let (out, mut events) = mpsc::channel(256);
-            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
+            run_one(
+                process,
+                &mut control,
+                &out,
+                ThreadId::new(),
+                1,
+                false,
+                std::path::Path::new("/tmp"),
+            )
+            .await;
             assert!(!platform::group_exists(pid).unwrap());
             let EngineMsg::Provider {
                 event:
@@ -1031,7 +1051,16 @@ mod tests {
             })
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
-        run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
+        run_one(
+            process,
+            &mut control,
+            &out,
+            ThreadId::new(),
+            1,
+            false,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
         assert!(!platform::group_exists(pid).unwrap());
         let EngineMsg::Provider {
             event:
@@ -1084,7 +1113,16 @@ mod tests {
         let (out, mut events) = mpsc::channel(256);
         let start = tokio::time::Instant::now();
         let task = tokio::spawn(async move {
-            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await
+            run_one(
+                process,
+                &mut control,
+                &out,
+                ThreadId::new(),
+                1,
+                false,
+                std::path::Path::new("/tmp"),
+            )
+            .await
         });
         let ended = tokio::time::timeout(Duration::from_secs(9), events.recv())
             .await
@@ -1289,7 +1327,16 @@ mod tests {
             })
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
-        let completion = run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
+        let completion = run_one(
+            process,
+            &mut control,
+            &out,
+            ThreadId::new(),
+            1,
+            false,
+            std::path::Path::new("/tmp"),
+        )
+        .await;
         let expected = concat!(
             "Claude protocol: expected ident at line 1 column 2\n",
             "line 1\nline 2\nline 3\nline 4\nline 5\n",

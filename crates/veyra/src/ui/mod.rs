@@ -947,12 +947,6 @@ impl Shell {
             );
         }
     }
-    fn approval_cwd(&self) -> &std::path::Path {
-        self.view
-            .chat()
-            .and_then(|thread| self.state.threads.get(&thread))
-            .map_or(&self.probe_cwd, |thread| &thread.cwd)
-    }
     fn respond(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
         let request = self.view.chat().and_then(|thread| {
             self.state
@@ -1334,12 +1328,13 @@ impl Shell {
             "dock":self.view.chat().and_then(|thread| self.state.pending_requests(thread).first().map(|request| {
                 let text = match &request.kind {
                     RequestKind::Approval { action, .. } => Some(composer::approval_text(
-                        action, self.approval_cwd(), self.chosen_provider().label())),
+                        action, self.chosen_provider().label())),
                     _ => None,
                 };
                 serde_json::json!({"request":request, "position":1,
-                    "action_text":text.as_ref().map(|(label, _)| label),
-                    "consequence":text.as_ref().map(|(_, consequence)| consequence),
+                    "action_text":text.as_ref().map(|(label, _, _)| label),
+                    "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
+                    "preview":text.as_ref().map(|(_, _, preview)| preview),
                     "count":self.state.pending_requests(thread).len(), "focused":self.dock_focused,
                     "question_index":self.question_draft.as_ref().filter(|(id, _)| *id == request.id)
                         .map_or(0, |(_, answers)| answers.len())})
@@ -1900,9 +1895,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let engine = veyra_engine::Engine::start(
+        let engine = veyra_engine::Engine::start_with_processes(
             runtime.handle(),
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+            vec![],
         )
         .unwrap();
         runtime.block_on(engine.shutdown_wait());
@@ -2001,49 +1997,52 @@ mod tests {
     #[gpui::test]
     fn file_approval_dock_names_target_and_consequence(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
-            for (tool, path, consequence) in [
+            for (operation, location, consequence) in [
                 (
-                    "Write",
-                    "/tmp/x",
+                    FileOperation::Write,
+                    TargetLocation::OutsideProject,
                     "Claude Code writes a file outside the project folder.",
                 ),
                 (
-                    "Edit",
-                    "file.txt",
+                    FileOperation::Edit,
+                    TargetLocation::InsideProject,
                     "Claude Code edits a file inside the project folder.",
                 ),
                 (
-                    "Write",
-                    "../x",
-                    "Claude Code writes a file outside the project folder.",
+                    FileOperation::Write,
+                    TargetLocation::NotVerified,
+                    "Claude Code writes a file at a location that is not verified.",
                 ),
             ] {
                 shell.update(cx, |shell, _| {
                     shell.state.requests.truncate(1);
                     shell.state.requests[0].kind = RequestKind::Approval {
                         action: ProposedAction {
-                            input: Some(Box::new(
-                                serde_json::json!({"file_path":path,"content":"private contents"}),
-                            )),
-                            tool: tool.into(),
-                            command:
-                                serde_json::json!({"file_path":path,"content":"private contents"})
-                                    .to_string(),
+                            tool: "file tool".into(),
+                            target: ApprovalTarget::File {
+                                operation,
+                                location,
+                                path: "/tmp/x".into(),
+                                preview: ApprovalPreview::new("contents to approve".into()),
+                            },
                         },
                         grant_key: None,
                     };
                 });
                 let dock = shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"].clone());
-                assert_eq!(dock["action_text"], format!("{tool} {path}"));
+                assert_eq!(dock["action_text"], "file tool /tmp/x");
                 assert_eq!(dock["consequence"], consequence);
+                assert_eq!(dock["preview"], "contents to approve");
             }
             let command = "{\"file_path\":\"/tmp/x\"}";
             shell.update(cx, |shell, _| {
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
                         tool: "Bash".into(),
-                        command: command.into(),
-                        input: None,
+                        target: ApprovalTarget::Command {
+                            command: command.into(),
+                            preview: ApprovalPreview::new(String::new()),
+                        },
                     },
                     grant_key: None,
                 };
@@ -2064,9 +2063,11 @@ mod tests {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
-                        input: None,
                         tool: "Bash".into(),
-                        command: "echo ok".into(),
+                        target: ApprovalTarget::Command {
+                            command: "echo ok".into(),
+                            preview: ApprovalPreview::new(String::new()),
+                        },
                     },
                     grant_key: None,
                 };
@@ -2100,9 +2101,11 @@ mod tests {
                 for request in &mut shell.state.requests {
                     request.kind = RequestKind::Approval {
                         action: ProposedAction {
-                            input: None,
                             tool: "Bash".into(),
-                            command: "echo ok".into(),
+                            target: ApprovalTarget::Command {
+                                command: "echo ok".into(),
+                                preview: ApprovalPreview::new(String::new()),
+                            },
                         },
                         grant_key: Some(GrantKey {
                             tool: "Bash".into(),
@@ -2158,9 +2161,11 @@ mod tests {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
-                        input: None,
                         tool: "Bash".into(),
-                        command: "touch veyra-check.txt".into(),
+                        target: ApprovalTarget::Command {
+                            command: "touch veyra-check.txt".into(),
+                            preview: ApprovalPreview::new(String::new()),
+                        },
                     },
                     grant_key: None,
                 };
@@ -2262,9 +2267,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let engine = veyra_engine::Engine::start(
+        let engine = veyra_engine::Engine::start_with_processes(
             runtime.handle(),
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+            vec![],
         )
         .unwrap();
         let (_, events) = tokio::sync::mpsc::unbounded_channel();
@@ -2324,9 +2330,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let engine = veyra_engine::Engine::start(
+        let engine = veyra_engine::Engine::start_with_processes(
             runtime.handle(),
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+            vec![],
         )
         .unwrap();
         runtime.block_on(engine.shutdown_wait());

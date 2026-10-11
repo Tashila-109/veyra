@@ -32,14 +32,6 @@ fn run() -> anyhow::Result<()> {
     let data = DataDir::resolve().context("resolve Veyra data folder")?;
     let runtime = tokio::runtime::Runtime::new().context("start session runtime")?;
     let data_path = data.path().to_owned();
-    let _engine = match Engine::start(runtime.handle(), data) {
-        Ok(engine) => engine,
-        Err(StartError::Lock(LockError::AlreadyRunning)) => {
-            eprintln!("Veyra is already running");
-            process::exit(1);
-        }
-        Err(error) => return Err(error.into()),
-    };
     let log = platform::private_file(
         &data_path.join("logs/veyra.log"),
         OpenOptions::new().create(true).append(true),
@@ -50,6 +42,14 @@ fn run() -> anyhow::Result<()> {
         .with_ansi(false)
         .with_writer(log)
         .init();
+    let _engine = match Engine::start(runtime.handle(), data) {
+        Ok(engine) => engine,
+        Err(StartError::Lock(LockError::AlreadyRunning)) => {
+            eprintln!("Veyra is already running");
+            process::exit(1);
+        }
+        Err(error) => return Err(error.into()),
+    };
     tracing::info!(build_rev = env!("VEYRA_BUILD_REV"), "Veyra starting");
     #[cfg(debug_assertions)]
     let requests = control::listen(&data_path, _engine.schema_version())?;

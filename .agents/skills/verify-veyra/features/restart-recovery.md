@@ -149,7 +149,8 @@ The process checks show every owned provider group gone before orderly relaunch.
 
 ## Gotchas
 
-The app's startup sweep reaps same-user marked orphans across data folders on every launch, including test launches.
+Normal startup sweeps same-user marked orphans across data folders.
+Verification's debug-only VEYRA_REAP_PIDS filter admits only provider pids saved by this run.
 The harness only signals the pids and groups it started.
 Crash recovery proves one thread; child-task recovery needs its own feature recipe.
 `scripts/bundle-app.sh`, process inspection and `pmset` run only on macOS.

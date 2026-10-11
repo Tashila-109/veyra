@@ -200,6 +200,41 @@ pub(crate) fn probe_value(wire: Value) -> Result<Option<InitializeReply>, super:
     Ok(None)
 }
 
+fn target_location(project: &std::path::Path, target: &std::path::Path) -> TargetLocation {
+    use std::{io::ErrorKind, path::Component};
+    let Ok(project) = project.canonicalize() else {
+        return TargetLocation::NotVerified;
+    };
+    let mut ancestor = target.to_owned();
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for part in missing.into_iter().rev() {
+                    resolved.push(part);
+                }
+                return if resolved.starts_with(&project) {
+                    TargetLocation::InsideProject
+                } else {
+                    TargetLocation::OutsideProject
+                };
+            }
+            Err(error) => {
+                if error.kind() != ErrorKind::NotFound || ancestor.symlink_metadata().is_ok() {
+                    return TargetLocation::NotVerified;
+                }
+                let Some(Component::Normal(part)) = ancestor.components().next_back() else {
+                    return TargetLocation::NotVerified;
+                };
+                missing.push(part.to_owned());
+                if !ancestor.pop() {
+                    return TargetLocation::NotVerified;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 enum EchoMode {
     #[default]
@@ -454,6 +489,7 @@ pub(crate) struct Codec {
     echo: EchoMode,
     native: NativeSessionId,
     pid: u32,
+    cwd: std::path::PathBuf,
     stream: MessageStream,
     tools: BTreeMap<String, Tool>,
     error: Option<AssistantError>,
@@ -467,12 +503,13 @@ pub(crate) struct Decoded {
     pub replies: Vec<Value>,
 }
 impl Codec {
-    pub fn new(native: NativeSessionId, pid: u32) -> Self {
+    pub fn new(native: NativeSessionId, pid: u32, cwd: &std::path::Path) -> Self {
         Self {
             active: None,
             echo: EchoMode::Unknown,
             native,
             pid,
+            cwd: cwd.to_owned(),
             stream: MessageStream::default(),
             error: None,
             interrupted: None,
@@ -517,8 +554,27 @@ impl Codec {
                 "delta":{"type":wire["event"]["delta"]["type"].as_str().unwrap_or("unknown")}
             }
         });
+        let frame_type = wire["type"].as_str().unwrap_or("unknown");
+        let request_id = wire["request_id"].as_str().map(str::to_owned);
+        let control_request = frame_type == "control_request";
+        let control_response = frame_type == "control_response";
         let frame = match serde_json::from_value(wire) {
             Ok(frame) => frame,
+            Err(_) if control_request => {
+                let id = request_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                    super::ProviderError::Protocol("Claude control request has no valid id".into())
+                })?;
+                self.seen_requests.insert(id.clone());
+                return Ok(Decoded {
+                    events: Vec::new(),
+                    replies: vec![Self::unsupported_request(id)],
+                });
+            }
+            Err(_) if control_response => {
+                return Err(super::ProviderError::Protocol(
+                    "Claude control response could not be decoded".into(),
+                ));
+            }
             Err(_) => {
                 tracing::info!(
                     frame_type = metadata["type"].as_str().unwrap_or("unknown"),
@@ -644,13 +700,7 @@ impl Codec {
                         native: NativeRequestRef(request.request_id), kind,
                     });
                 } else {
-                    decoded.replies.push(json!({
-                        "type": "control_response",
-                        "response": {
-                            "subtype": "error", "request_id": request.request_id,
-                            "error": "This request is not supported by Veyra"
-                        }
-                    }));
+                    decoded.replies.push(Self::unsupported_request(request.request_id));
                 }
             }
             Frame::ControlResponse(_) | Frame::Unknown => {
@@ -751,11 +801,7 @@ impl Codec {
         } else {
             let command = tool.input["command"].as_str();
             Some(RequestKind::Approval {
-                action: ProposedAction {
-                    tool: tool.tool_name.clone(),
-                    command: command.map_or_else(|| tool.input.to_string(), str::to_owned),
-                    input: command.is_none().then(|| Box::new(tool.input.clone())),
-                },
+                action: self.approval_action(tool),
                 grant_key: command
                     .filter(|_| {
                         tool.input.as_object().unwrap().keys().all(|key| {
@@ -768,6 +814,68 @@ impl Codec {
                     }),
             })
         }
+    }
+    fn unsupported_request(id: String) -> Value {
+        json!({"type":"control_response","response":{
+            "subtype":"error","request_id":id,"error":"This request is not supported by Veyra"
+        }})
+    }
+    fn approval_action(&self, tool: &ToolRequest) -> ProposedAction {
+        let mut arguments = tool
+            .input
+            .as_object()
+            .expect("validated tool input")
+            .clone();
+        let target = if let Some(command) = tool.input["command"]
+            .as_str()
+            .filter(|_| tool.tool_name == "Bash")
+        {
+            arguments.remove("command");
+            ApprovalTarget::Command {
+                command: command.into(),
+                preview: Self::preview(arguments),
+            }
+        } else if let Some((field, path)) = ["file_path", "path", "notebook_path"]
+            .into_iter()
+            .find_map(|field| tool.input[field].as_str().map(|path| (field, path)))
+            .filter(|_| {
+                matches!(
+                    tool.tool_name.as_str(),
+                    "Write" | "Edit" | "MultiEdit" | "Read" | "NotebookEdit"
+                )
+            })
+        {
+            arguments.remove(field);
+            let path = self.cwd.join(path);
+            let location = target_location(&self.cwd, &path);
+            let operation = match tool.tool_name.as_str() {
+                "Write" => FileOperation::Write,
+                "Edit" | "MultiEdit" | "NotebookEdit" => FileOperation::Edit,
+                "Read" => FileOperation::Read,
+                _ => FileOperation::Other,
+            };
+            ApprovalTarget::File {
+                operation,
+                path,
+                location,
+                preview: Self::preview(arguments),
+            }
+        } else {
+            ApprovalTarget::Tool {
+                preview: Self::preview(arguments),
+            }
+        };
+        ProposedAction {
+            tool: tool.tool_name.clone(),
+            target,
+        }
+    }
+    fn preview(arguments: serde_json::Map<String, Value>) -> ApprovalPreview {
+        ApprovalPreview::new(if arguments.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string_pretty(&arguments).expect("JSON tool arguments")
+        })
     }
     pub fn answer(&mut self, native: NativeRequestRef, decision: Decision) -> Option<Value> {
         let request = self.requests.get(&native.0)?;
@@ -838,7 +946,7 @@ impl Codec {
     }
     fn tool(&mut self, id: String, name: &str, key: NativeItemKey) {
         let subagent = matches!(name, "Task" | "Agent")
-            .then(|| Box::new(Self::new(self.native.clone(), self.pid)));
+            .then(|| Box::new(Self::new(self.native.clone(), self.pid, &self.cwd)));
         self.tools.insert(id, Tool { key, subagent });
     }
     fn system(&mut self, system: System, decoded: &mut Decoded) {
@@ -1150,7 +1258,11 @@ mod tests {
     use super::*;
     #[test]
     fn interrupted_stream_diagnostic_emits_no_text() {
-        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
         codec.start(TurnId::new(), "test".into());
         codec.interrupt();
         let frames = [
@@ -1209,7 +1321,11 @@ mod tests {
     }
     #[test]
     fn aborted_reason_ends_interrupted() {
-        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
         let turn = TurnId::new();
         codec.start(turn, "reply".into());
         let decoded = codec
@@ -1265,7 +1381,11 @@ mod tests {
         let parallel_registration = tracing::Dispatch::new(capture.clone());
         tracing::subscriber::with_default(capture.clone(), || {
             tracing::callsite::rebuild_interest_cache();
-            let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+            let mut codec = Codec::new(
+                NativeSessionId("fixture-session".into()),
+                1,
+                std::path::Path::new("/tmp"),
+            );
             for wire in [
                 json!({"type":"stream_event","event":{"type":"future_event","content":"private-content"}}),
                 json!({"type":"stream_event","event":{"type":"content_block_delta",
@@ -1308,7 +1428,11 @@ mod tests {
         capture.0.lock().unwrap().clear();
         tracing::subscriber::with_default(capture.clone(), || {
             tracing::callsite::rebuild_interest_cache();
-            let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+            let mut codec = Codec::new(
+                NativeSessionId("fixture-session".into()),
+                1,
+                std::path::Path::new("/tmp"),
+            );
             for wire in [
                 json!({"future":"private-content"}),
                 json!({"type":"system","subtype":"init","capabilities":null,"future":"private-content"}),
@@ -1328,8 +1452,242 @@ mod tests {
         assert!(!format!("{logs:?}").contains("private-content"));
     }
     #[test]
-    fn approval_retains_input_only_without_command() {
-        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+    fn undecodable_control_request_gets_error_response() {
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
+        for (index, request) in [
+            json!({"subtype":"can_use_tool","tool_name":null,"input":{}}),
+            Value::Null,
+            json!({"subtype":"can_use_tool","tool_name":"Write","input":null}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("bad-{index}");
+            let decoded = codec
+                .value(json!({"type":"control_request","request_id":id,
+                "request":request}))
+                .unwrap();
+            assert_eq!(
+                decoded.replies,
+                [json!({"type":"control_response","response":{
+                    "subtype":"error","request_id":id,"error":"This request is not supported by Veyra"
+                }})]
+            );
+            assert!(decoded.events.is_empty());
+        }
+        assert!(
+            codec
+                .value(json!({"type":"control_request","request_id":42,
+            "request":null}))
+                .is_err(),
+            "an unaddressable request must fail the session"
+        );
+    }
+    #[test]
+    fn undecodable_initialize_reply_fails_session() {
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
+        assert!(
+            codec
+                .value(json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":INITIALIZE_ID,"response":{
+                        "models":[{"value":"fixture-model","supportedEffortLevels":null}]
+                    }
+                }}))
+                .is_err(),
+            "an undecodable initialize reply cannot leave the Ready gate waiting"
+        );
+    }
+    #[test]
+    fn approval_displays_every_argument_as_bounded_typed_data() {
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
+        for (index, (name, input)) in [
+            ("Write", json!({"file_path":"/tmp/x","content":"file contents"})),
+            ("Edit", json!({"file_path":"/tmp/x","old_string":"old text","new_string":"new text"})),
+            ("WebFetch", json!({"url":"https://example.test/a","prompt":"read page"})),
+            ("NotebookEdit", json!({"notebook_path":"/tmp/book.ipynb","new_source":"cell contents"})),
+            ("mcp__local__change", json!({"nested":{"first":1,"second":"every argument"},"flag":true})),
+            ("Bash", json!({"command":"echo ok","run_in_background":true,"dangerouslyDisableSandbox":true})),
+        ].into_iter().enumerate() {
+            let decoded = codec.value(json!({"type":"control_request","request_id":format!("display-{index}"),
+                "request":{"subtype":"can_use_tool","tool_name":name,"input":input}})).unwrap();
+            let ProviderEvent::Turn { event: TurnEvent::RequestOpened {
+                kind: RequestKind::Approval { action, grant_key }, .. }, .. } = &decoded.events[0]
+            else { panic!("missing approval") };
+            let display = serde_json::to_value(action).unwrap();
+            assert!(display.get("target").is_some(), "approval must expose a typed target");
+            assert!(display.get("input").is_none(), "raw input must not be stored");
+            let preview = &display["target"]["preview"]["text"];
+            let mut arguments: Value = serde_json::from_str(preview.as_str().unwrap()).unwrap();
+            match &action.target {
+                ApprovalTarget::Command { command, .. } => {
+                    arguments["command"] = json!(command);
+                }
+                ApprovalTarget::File { path, .. } => {
+                    let field = if name == "NotebookEdit" { "notebook_path" } else { "file_path" };
+                    arguments[field] = json!(path);
+                }
+                ApprovalTarget::Tool { .. } => {}
+            }
+            assert_eq!(arguments, input, "every argument must be visible exactly once");
+            assert!(grant_key.is_none());
+        }
+    }
+    #[test]
+    fn unknown_tools_keep_command_and_path_arguments_literal() {
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
+        let decoded = codec
+            .value(json!({"type":"control_request","request_id":"remote-tool",
+            "request":{"subtype":"can_use_tool","tool_name":"mcp__local__remote",
+                "input":{"command":"remote operation","path":"remote/not-a-local-file"}}}))
+            .unwrap();
+        let ProviderEvent::Turn {
+            event:
+                TurnEvent::RequestOpened {
+                    kind: RequestKind::Approval { action, grant_key },
+                    ..
+                },
+            ..
+        } = &decoded.events[0]
+        else {
+            panic!("missing approval")
+        };
+        let ApprovalTarget::Tool { preview } = &action.target else {
+            panic!("unknown tool arguments")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&preview.text).unwrap(),
+            json!({"command":"remote operation","path":"remote/not-a-local-file"})
+        );
+        assert!(grant_key.is_none());
+    }
+    #[test]
+    fn approval_location_resolves_deepest_existing_ancestor() {
+        use std::path::Path;
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let root = Scratch(Path::new("/tmp").join(format!("veyra-approval-{}", ThreadId::new())));
+        let project = root.0.join("project");
+        let outside = root.0.join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        assert!(
+            std::process::Command::new("/bin/ln")
+                .args(["-s"])
+                .arg(&outside)
+                .arg(project.join("linked"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("/bin/ln")
+                .args(["-s"])
+                .arg(root.0.join("absent"))
+                .arg(project.join("dangling"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1, &project);
+        for (index, (path, expected)) in [
+            ("linked/new/file.txt", TargetLocation::OutsideProject),
+            ("new/parents/file.txt", TargetLocation::InsideProject),
+            ("linked/new/../file.txt", TargetLocation::NotVerified),
+            ("dangling/new/file.txt", TargetLocation::NotVerified),
+            ("../outside/file.txt", TargetLocation::OutsideProject),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let decoded = codec
+                .value(
+                    json!({"type":"control_request","request_id":format!("path-{index}"),
+                "request":{"subtype":"can_use_tool","tool_name":"Write",
+                    "input":{"file_path":path,"content":"contents"}}}),
+                )
+                .unwrap();
+            let ProviderEvent::Turn {
+                event:
+                    TurnEvent::RequestOpened {
+                        kind: RequestKind::Approval { action, .. },
+                        ..
+                    },
+                ..
+            } = &decoded.events[0]
+            else {
+                panic!("missing approval")
+            };
+            assert!(
+                matches!(&action.target, ApprovalTarget::File { path: absolute, location, .. }
+                if absolute == &project.join(path) && absolute.is_absolute() && *location == expected)
+            );
+        }
+        assert_eq!(
+            target_location(&root.0.join("missing-project"), &project.join("file")),
+            TargetLocation::NotVerified
+        );
+    }
+    #[test]
+    fn approval_content_preview_is_cut_with_notice() {
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
+        let decoded = codec
+            .value(json!({"type":"control_request","request_id":"long-content",
+            "request":{"subtype":"can_use_tool","tool_name":"Write",
+                "input":{"file_path":"/tmp/x","content":"界".repeat(10001)}}}))
+            .unwrap();
+        let ProviderEvent::Turn {
+            event:
+                TurnEvent::RequestOpened {
+                    kind: RequestKind::Approval { action, .. },
+                    ..
+                },
+            ..
+        } = &decoded.events[0]
+        else {
+            panic!("missing approval")
+        };
+        let display = serde_json::to_value(action).unwrap();
+        assert_eq!(display["target"]["preview"]["truncated"], true);
+        assert_eq!(
+            display["target"]["preview"]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            10000
+        );
+    }
+    #[test]
+    fn approval_preserves_typed_display_and_grants() {
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
         codec.start(TurnId::new(), "reply".into());
         for (index, (tool, input, grant)) in [
             (
@@ -1369,26 +1727,38 @@ mod tests {
                 panic!("missing approval")
             };
             assert_eq!(action.tool, tool);
-            assert_eq!(
-                action.input,
-                (tool == "Write").then(|| Box::new(input.clone()))
-            );
-            assert_eq!(
-                action.command,
-                input["command"]
-                    .as_str()
-                    .map_or_else(|| input.to_string(), str::to_owned)
-            );
+            if let Some(command) = input["command"].as_str() {
+                assert!(
+                    matches!(&action.target, ApprovalTarget::Command { command: text, .. } if text == command)
+                );
+            } else {
+                assert!(
+                    matches!(&action.target, ApprovalTarget::File { operation: FileOperation::Write,
+                    path, preview, .. } if path == std::path::Path::new("/tmp/x")
+                        && preview.text == "{\n  \"content\": \"private contents\"\n}")
+                );
+            }
             assert_eq!(grant_key.is_some(), grant);
         }
         let old = json!({"tool":"Bash", "command":"echo old"});
         let action: ProposedAction = serde_json::from_value(old.clone()).unwrap();
-        assert_eq!(action.input, None);
-        assert_eq!(serde_json::to_value(action).unwrap(), old);
+        assert!(
+            matches!(&action.target, ApprovalTarget::Command { command, preview }
+            if command == "echo old" && preview.text.is_empty() && !preview.truncated)
+        );
+        let stored = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ProposedAction>(stored).unwrap(),
+            action
+        );
     }
     #[test]
     fn storage_interruption_names_database() {
-        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
         codec.start(TurnId::new(), "reply".into());
         assert!(codec.interrupt_for(StopReason::StorageBlocked));
         let decoded = codec
@@ -1407,7 +1777,11 @@ mod tests {
     }
     #[test]
     fn empty_final_reasoning_adds_no_item() {
-        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
         let turn = TurnId::new();
         codec.start(turn, "reply".into());
         let decoded = codec
@@ -1434,7 +1808,11 @@ mod tests {
     }
     #[test]
     fn final_blocks_match_message_and_occurrence_within_kind() {
-        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
         codec.start(TurnId::new(), "reply".into());
         codec
             .line(
@@ -1494,7 +1872,11 @@ mod tests {
     }
     #[test]
     fn split_final_frames_match_each_same_kind_block_and_reset_on_message_start() {
-        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        let mut codec = Codec::new(
+            NativeSessionId("fixture-session".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
         codec.start(TurnId::new(), "reply".into());
         for message in ["first", "second", "first"] {
             codec
@@ -1571,7 +1953,11 @@ mod tests {
                 },
             ),
         ] {
-            let mut codec = Codec::new(NativeSessionId("native".into()), 1);
+            let mut codec = Codec::new(
+                NativeSessionId("native".into()),
+                1,
+                std::path::Path::new("/tmp"),
+            );
             let turn = TurnId::new();
             codec.start(turn, "prompt".into());
             let decoded = codec
@@ -1589,7 +1975,11 @@ mod tests {
     }
     #[test]
     fn changed_native_session_emits_notice_before_binding() {
-        let mut codec = Codec::new(NativeSessionId("stored".into()), 1);
+        let mut codec = Codec::new(
+            NativeSessionId("stored".into()),
+            1,
+            std::path::Path::new("/tmp"),
+        );
         let turn = TurnId::new();
         codec.start(turn, "prompt".into());
         let wire = json!({"type":"system", "subtype":"init", "session_id":"replacement"});

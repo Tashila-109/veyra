@@ -11,9 +11,11 @@ pub(super) fn approval(f: &mut Fixture, tool: &str, command: &str) -> RequestId 
             native: NativeRequestRef(format!("request-{}", before.len())),
             kind: RequestKind::Approval {
                 action: ProposedAction {
-                    input: None,
                     tool: tool.into(),
-                    command: command.into(),
+                    target: ApprovalTarget::Command {
+                        command: command.into(),
+                        preview: ApprovalPreview::new(String::new()),
+                    },
                 },
                 grant_key: Some(GrantKey {
                     tool: tool.into(),
@@ -171,7 +173,10 @@ fn grant_replay_automatically_answers_only_the_exact_command() {
                             let RequestKind::Approval { action, .. } = request.kind else {
                                 panic!("approval");
                             };
-                            docked.push(action.command);
+                            let ApprovalTarget::Command { command, .. } = action.target else {
+                                panic!("command approval")
+                            };
+                            docked.push(command);
                             let decision = if docked.len() == 1 {
                                 Decision::AllowInThread
                             } else {

@@ -1347,7 +1347,7 @@ impl Actor {
 fn tool_tail(text: String) -> String {
     text.chars()
         .rev()
-        .take(10000)
+        .take(TOOL_OUTPUT_CHARS)
         .collect::<String>()
         .chars()
         .rev()

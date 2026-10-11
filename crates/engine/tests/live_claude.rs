@@ -131,7 +131,12 @@ fn live_claude_approval_round_trip() {
     let cwd = root.join("project");
     fs::create_dir_all(&cwd).unwrap();
     let runtime = Runtime::new().unwrap();
-    let engine = Engine::start(runtime.handle(), DataDir::at(root.join("data")).unwrap()).unwrap();
+    let engine = Engine::start_with_processes(
+        runtime.handle(),
+        DataDir::at(root.join("data")).unwrap(),
+        vec![],
+    )
+    .unwrap();
     let run = async {
         tokio::time::timeout(Duration::from_secs(180), approval_round_trip(&engine, &cwd))
             .await
@@ -208,7 +213,10 @@ async fn approval_round_trip(engine: &veyra_engine::Engine, cwd: &std::path::Pat
                         panic!("Claude must dock an approval")
                     };
                     assert_eq!(action.tool, "Bash");
-                    assert_eq!(action.command, "touch veyra-check.txt");
+                    let ApprovalTarget::Command { command, .. } = &action.target else {
+                        panic!("command approval")
+                    };
+                    assert_eq!(command, "touch veyra-check.txt");
                     assert_eq!(row.state, RequestState::Pending);
                     request = Some(row);
                 }

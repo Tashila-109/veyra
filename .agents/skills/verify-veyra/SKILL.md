@@ -22,6 +22,8 @@ The helper does not set application state; its writes are fixture copies, screen
 For an authorized live lane, export `VEYRA_VERIFY_LANE=live` before Launch.
 Launch then removes replay overrides, records to `$PROOF/rec`, and the new-thread and chat pages use their live branches.
 A live lane needs separate human authorization because it runs the installed CLI and spends its quota.
+The debug-only VEYRA_REAP_PIDS filter restricts startup reaping to the run's saved provider pids, including after a crash.
+An empty list permits no startup signals.
 Both lanes remove the caller's Claude session variables while keeping `CLAUDE_CODE_USE_*` user configuration.
 Every app launch runs from `$DATA/appcwd`; probes run in Veyra's private data folder.
 
@@ -95,6 +97,7 @@ ENV = {key:value for key,value in os.environ.items() if not (
     (key.startswith('CLAUDE_CODE_') and not key.startswith('CLAUDE_CODE_USE_'))
     or key in ['CLAUDE_PID','CLAUDE_EFFORT','CLAUDECODE','CLAUDE_AGENT_SDK_VERSION'])}
 ENV['VEYRA_DATA_DIR'] = str(DATA)
+ENV['VEYRA_REAP_PIDS'] = ''
 for name in ['VEYRA_CLAUDE_BIN','VEYRA_FAKE_FIXTURES','VEYRA_FAKE_FIXTURE','VEYRA_RECORD']:
     ENV.pop(name,None)
 if LANE == 'fake':
@@ -219,6 +222,7 @@ def start(label):
         if subprocess.run(['pgrep','-x','veyra'],capture_output=True).returncode == 0:
             quiet = time.monotonic()
         time.sleep(.1)
+    ENV['VEYRA_REAP_PIDS'] = ','.join(sql('select live_pid from threads where live_pid is not null').split())
     app = subprocess.Popen([str(pathlib.Path('target/debug/veyra').resolve())],cwd=DATA/'appcwd',env=ENV,
         stdout=(PROOF/(label+'.stdout')).open('w'),stderr=(PROOF/(label+'.stderr')).open('w'),
         start_new_session=True)
@@ -388,7 +392,9 @@ Items include `outcome`, queued `wait_reason` and a tool's `failed_last_line`.
 `composer.discard_queued_visible` reports the held queue control.
 `composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
 Approval answer chords appear only with dock focus; otherwise its hint shows the FocusDock chord.
-Approval dock action_text and consequence report the same command or tool-target text and one-line effect rendered in the window.
+Approval dock action_text, consequence and preview report the same typed target, one-line effect and bounded arguments rendered in the window.
+A cut preview ends with a notice.
+The preview scrolls independently within the existing composer height limit.
 Questions share the same unfocused FocusDock prompt.
 Answering one request keeps dock focus while requests remain.
 `notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
@@ -442,7 +448,8 @@ required = {
     'approvals-questions':['approval-deny.png','approval-allow.png','question.png','question-two.png',
         'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png',
         'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png',
-        'approval-write-inside.png','approval-write-outside.png'],
+        'approval-write-inside.png','approval-write-outside.png','approval-web-fetch.png',
+        'approval-notebook-edit.png','approval-mcp.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json'],
@@ -489,6 +496,8 @@ The marker check uses Darwin's `KERN_PROCARGS2` through `sysctl` in memory, neve
 It checks live processes with this run's effective user for `VEYRA_PARENT_PID` naming any app pid this run started.
 macOS refuses argument reads for privileged processes whose real uid is the user but effective uid is root; a fake CLI lane cannot create such a process.
 Zombies have no argument/environment block on Darwin and are excluded before the read; owned app pids must still be absent.
+ESRCH or an empty argument block after either sysctl read means the process is gone.
+EINVAL or an incomplete block from a still-listed process keeps it in the leftover count and retries within the same five-second window.
 A failed database read, group check or marker check leaves DATA for diagnosis.
 
 ```sh
@@ -553,17 +562,30 @@ def marked_processes():
         if lib.sysctl(mib,3,None,ctypes.byref(size),None,0) != 0:
             error = ctypes.get_errno()
             if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
+            if error == errno.EINVAL:
+                remaining.append(pid)
+                continue
             raise OSError(error,f'marker size read failed for pid {pid}')
+        if size.value == 0: continue
         buffer = ctypes.create_string_buffer(size.value)
         if lib.sysctl(mib,3,buffer,ctypes.byref(size),None,0) != 0:
             error = ctypes.get_errno()
             if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
+            if error == errno.EINVAL:
+                remaining.append(pid)
+                continue
             raise OSError(error,f'marker read failed for pid {pid}')
         raw = buffer.raw[:size.value]
-        argc = struct.unpack_from('i',raw)[0]
-        offset = raw.index(b'\0',4)+1
-        while offset < len(raw) and raw[offset] == 0: offset += 1
-        for _ in range(argc): offset = raw.index(b'\0',offset)+1
+        if not raw: continue
+        try:
+            argc = struct.unpack_from('i',raw)[0]
+            if argc < 0: raise ValueError('invalid argument count')
+            offset = raw.index(b'\0',4)+1
+            while offset < len(raw) and raw[offset] == 0: offset += 1
+            for _ in range(argc): offset = raw.index(b'\0',offset)+1
+        except (ValueError,struct.error):
+            if not no_environment(pid): remaining.append(pid)
+            continue
         markers = [value.split(b'=',1)[1] for value in raw[offset:].split(b'\0')
             if value.startswith(b'VEYRA_PARENT_PID=')]
         owned = any(value.decode().isdigit() and int(value) in parents for value in markers)

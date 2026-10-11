@@ -4,6 +4,7 @@ Status: not run, 2026-10-11, pending, all
 
 ## Sub-features
 
+- Typed commands, file operations and other tools, with absolute file targets and bounded argument previews.
 - Exact command, Deny, AllowOnce and AllowInThread, including a compound command.
 - AnswerQuestion choices, FocusDock and FocusComposer, digit focus isolation and two pending requests.
 - NextNeedsYou selects the request's thread across the sidebar.
@@ -43,7 +44,7 @@ check.unlink(missing_ok=True)
 action('approval-mode','SetDefaultMode',{'mode':'ask_first'})
 thread = create('approval-deny','Run touch veyra-check.txt',scenario='approval-deny')
 dock = poll('approval-deny-dock',lambda d: d['composer']['dock'] is not None)
-assert dock['composer']['dock']['request']['kind']['Approval']['action']['command'] == 'touch veyra-check.txt'
+assert dock['composer']['dock']['request']['kind']['Approval']['action']['target']['command'] == 'touch veyra-check.txt'
 assert dock['selected_thread']['status'] == 'NeedsYou'
 capture('approval-deny')
 action('approval-deny-focus','FocusDock')
@@ -79,7 +80,7 @@ poll('approval-grant-dock',lambda d: d['composer']['dock'] is not None)
 capture('approval-grant')
 action('approval-grant-answer','AllowInThread')
 compound = poll('approval-compound',lambda d: d['composer']['dock'] is not None
-    and '&&' in d['composer']['dock']['request']['kind']['Approval']['action']['command'])
+    and '&&' in d['composer']['dock']['request']['kind']['Approval']['action']['target']['command'])
 assert sql("select count(*) from requests where thread_id='"+thread+"'") == '3'
 assert sql("select count(*) from grants where thread_id='"+thread+"'") == '1'
 assert (DATA/'project'/'veyra-grant.txt').is_file()
@@ -97,6 +98,7 @@ for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve(
     assert dock['action_text'] == 'Write '+target
     assert dock['consequence'] == 'Claude Code writes a file '+place+' the project folder.'
     assert dock['request']['kind']['Approval']['grant_key'] is None
+    assert json.loads(dock['preview']) == {'content':'veyra check'}
     capture('approval-write-'+place)
     action('approval-write-'+place+'-focus','FocusDock')
     ctl('approval-write-'+place+'-allow','keys','secondary-enter')
@@ -104,6 +106,31 @@ for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve(
     assert done['composer']['dock'] is None
     ctl('approval-write-'+place+'-composer','text','composer has focus')
     assert ctl('approval-write-'+place+'-draft','dump')['composer_text'] == 'composer has focus'
+for label, tool, arguments in [
+    ('web-fetch', 'WebFetch', {'url':'https://example.test/page','prompt':'Read the page'}),
+    ('notebook-edit', 'NotebookEdit', {'notebook_path':str(DATA/'project'/'check.ipynb'),
+        'new_source':'print("veyra check")','cell_id':'cell-a','edit_mode':'replace'}),
+    ('mcp', 'mcp__local__change', {'target':'record-a','changes':{'first':1,'second':'every argument'},'flag':True}),
+]:
+    records = [json.loads(line) for line in (SOURCE/'approval-allow.jsonl').read_text().splitlines()]
+    records[4]['line']['request'].update(tool_name=tool,input=arguments)
+    stage_records(records)
+    thread = create('approval-'+label,'Approve the tool arguments',scenario=None)
+    dump = poll('approval-'+label,lambda d: d['composer']['dock'] is not None)
+    dock = dump['composer']['dock']
+    preview = json.loads(dock['preview'])
+    if label == 'notebook-edit':
+        assert dock['action_text'] == tool+' '+arguments['notebook_path']
+        assert dock['consequence'] == 'Claude Code edits a file inside the project folder.'
+        preview['notebook_path'] = arguments['notebook_path']
+    else:
+        assert dock['action_text'] == tool
+        assert dock['consequence'] == 'Claude Code uses this tool with the arguments below.'
+    assert preview == arguments
+    assert dock['request']['kind']['Approval']['grant_key'] is None
+    capture('approval-'+label)
+    action('approval-'+label+'-allow','AllowOnce')
+    ctl('approval-'+label+'-done','wait',thread,'Done')
 question = create('question','Choose a route',scenario='question')
 poll('question-dock',lambda d: d['composer']['dock'] is not None)
 capture('question')
@@ -157,7 +184,9 @@ PY
 The unfocused approval PNGs show the exact command, consequence and FocusDock chord.
 The focused approval PNGs show Allow once, Deny and their answer chords, matching the keys driven in those states.
 The project file stays absent after Deny and exists after Allow once.
-The Write PNGs and action_text/consequence fields show tool targets inside and outside the project without raw content JSON.
+The Write PNGs and action_text/consequence fields show absolute targets inside and outside the project, plus their content preview.
+The WebFetch, NotebookEdit and MCP PNGs show their full arguments in a bounded, scrollable preview.
+Only the provider codec interprets tool fields and resolves file locations; rendering consumes typed data.
 Those fake requests check dock presentation, not outside file effects.
 Text input after each final approval proves composer focus returned.
 SQLite records one grant and three requests, showing the identical granted request never docked.

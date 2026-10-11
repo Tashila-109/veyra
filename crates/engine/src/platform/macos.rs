@@ -135,7 +135,6 @@ pub struct ProcessInfo {
     pub pid: u32,
     pub pgid: u32,
     pub argv: Vec<String>,
-    pub executable: Option<PathBuf>,
 }
 pub fn is_alive(pid: u32) -> io::Result<bool> {
     if pid <= 1 {
@@ -167,15 +166,12 @@ pub fn list_processes() -> io::Result<Vec<ProcessInfo>> {
                 pid,
                 pgid,
                 argv: words.map(str::to_owned).collect(),
-                executable: (pid == pgid)
-                    .then(|| process_executable(pid).ok())
-                    .flatten(),
             });
         }
     }
     Ok(processes)
 }
-fn process_executable(pid: u32) -> io::Result<PathBuf> {
+pub fn process_executable(pid: u32) -> io::Result<PathBuf> {
     let mut bytes = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     if unsafe { libc::proc_pidpath(pid as i32, bytes.as_mut_ptr().cast(), bytes.len() as u32) } <= 0
     {

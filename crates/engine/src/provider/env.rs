@@ -43,6 +43,7 @@ pub struct ChildEnv {
     pub fixtures: Option<PathBuf>,
     #[cfg(debug_assertions)]
     pub record: Option<PathBuf>,
+    pub reaper_pids: Option<std::collections::BTreeSet<u32>>,
 }
 impl ChildEnv {
     pub fn load() -> Self {
@@ -61,6 +62,12 @@ impl ChildEnv {
             fixtures: std::env::var_os("VEYRA_FAKE_FIXTURES").map(PathBuf::from),
             #[cfg(debug_assertions)]
             record: std::env::var_os("VEYRA_RECORD").map(PathBuf::from),
+            #[cfg(debug_assertions)]
+            reaper_pids: std::env::var("VEYRA_REAP_PIDS")
+                .ok()
+                .map(|text| text.split(',').filter_map(|pid| pid.parse().ok()).collect()),
+            #[cfg(not(debug_assertions))]
+            reaper_pids: None,
         }
     }
     pub fn resolve(&self, provider: ProviderKind) -> Result<PathBuf, ProviderError> {
@@ -180,6 +187,8 @@ mod tests {
                 claude_bin: None,
                 fixtures: None,
                 record: None,
+                #[cfg(debug_assertions)]
+                reaper_pids: None,
             };
             let selected = env.resolve(super::ProviderKind::Claude).ok();
             let planted =

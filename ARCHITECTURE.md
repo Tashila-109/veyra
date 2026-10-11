@@ -77,14 +77,19 @@ Only the lock holder stamps its pid or removes a stale debug socket.
 A second launch refuses the folder and exits 1.
 The OS releases the lock on exit or crash.
 `process::start` resolves canonical provider binaries through the engine's ChildEnv before validating stored pid/group pairs.
-A provider leader is recognized by its argv basename or by a canonical executable path matching one of those binaries.
+A provider leader is recognized by a provider argv basename, by node, bun or a shell running a provider script, or by a canonical executable path matching one of those binaries.
 Its dead-parent `VEYRA_PARENT_PID` marker must also validate before signalling.
-A background sweep lists argv and leader executable paths first and reads environments only for recognized provider or Veyra leaders.
-The macOS executable lookup uses `proc_pidpath`, so versioned native-installer binaries reached through provider symlinks qualify without widening environment reads.
+A background sweep lists argv, checks the group-leader rule once, and lazily reads executable paths before reading environments only for recognized provider or Veyra leaders.
+The macOS executable lookup uses `proc_pidpath`, so versioned native-installer binaries reached through provider symlinks qualify.
+Executable matching can include every leader of a shared shim that a provider name resolves to; the dead-parent marker check still gates every signal.
+Provider leaders started by session hooks or tools also qualify when they inherit that marker and its parent is dead.
 The sweep covers every same-user marked agent or Veyra group whose marker parent is dead, from any data folder.
-Every launch runs it, including disposable verification instances and tests that call Engine::start.
+Normal launches run the unrestricted sweep.
+Reaper tests pass a process-list closure filtered to their own child pids; synthetic Shell and live approval tests use Engine::start_with_processes with an empty owned set.
+The debug-only VEYRA_REAP_PIDS override restricts verification startup to saved run-owned provider pids; an empty list permits no signals.
 It sends SIGTERM to validated orphans and revalidates them before SIGKILL one second later.
 Live parents, missing or invalid markers, reused non-agent pids and unrelated processes are left alone.
+Each successful orphan-group signal writes an INFO line with pid, group and reason, without arguments or environment values.
 Process arguments and environment values are never logged; the macOS environment read uses `KERN_PROCARGS2`.
 
 `main` keeps a multi-thread tokio runtime alive across the gpui loop.
@@ -92,7 +97,7 @@ The actor enters that runtime on its own thread; the UI never enters it.
 The UI awaits runtime-agnostic tokio channels in gpui tasks and uses gpui timers.
 Readiness work is explicitly spawned on the runtime through its handle.
 
-After engine startup, `main` opens `logs/veyra.log` privately and installs INFO tracing.
+Before engine startup, `main` opens `logs/veyra.log` privately and installs INFO tracing so startup reap signals are recorded.
 It does not read `RUST_LOG`, so that variable cannot suppress readiness.
 The debug listener binds before the window opens.
 `Window::on_next_frame` prints `veyra ready pid=PID data_dir=DIR` to stderr and the log after the first frame.
@@ -193,10 +198,17 @@ Tasks cannot arise through the application because the tool server is not implem
 Unknown subtypes and malformed requests receive an error response without opening a request.
 Malformed includes empty tool names or ids, ids reused within that CLI process lifetime, non-object input, missing question text or option labels, and duplicate question texts.
 A pending request makes the thread NeedsYou and docks its exact command, tool target or question above the composer.
-Non-command approvals show the tool and target path, with a consequence naming its operation and whether that target is inside or outside the project folder.
-ProposedAction retains optional input only for non-command tools, so a JSON-looking command still renders exactly as supplied.
-The optional input defaults absent when reading older rows and requires no schema migration.
-This presentation leaves exact-command grant eligibility unchanged.
+The Claude codec turns each approval into ProposedAction, a tool label and provider-neutral ApprovalTarget: Command, File or Tool.
+Command preserves exact command text; File carries its operation, absolute target path, location and preview; Tool carries its argument preview.
+File previews include content and edit strings, and other tool previews include every argument as pretty-printed text.
+Command previews include all arguments other than the separately displayed command.
+Each preview retains at most TOOL_OUTPUT_CHARS, the same 10,000-character cap as tool output, and carries a truncation flag rendered as a cut notice.
+The codec classifies location once when the request opens against the canonical project folder.
+It canonicalizes the deepest existing ancestor and appends the missing remainder; a remainder containing a parent component or an unresolvable path is NotVerified.
+InsideProject requires the resolved target to be under the canonical project folder; proved other targets are OutsideProject.
+The app renders only the typed action, does no disk work to render it, and gives argument previews a scrollable area bounded by the composer height token.
+Request rows store only this typed display form, with no duplicated raw input.
+Legacy stored command rows load as Command; rows with optional legacy input load as Tool previews without claiming a verified file location.
 AllowOnce, AllowInThread and Deny answer approvals; AnswerQuestion collects one answer per question.
 Only an input whose keys are command, description or timeout may offer an exact-command thread grant.
 Inputs with any other field always dock without a grant offer.
@@ -205,7 +217,7 @@ Approval chords and number keys answer only while the dock has focus; the compos
 Because a docked request implies a running turn, composer Command+Return with an empty draft dispatches Stop, which interrupts the turn and expires the request.
 Approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
 Requests never take focus automatically, and answering an approval or question keeps dock focus while another request remains.
-After the last response, focus returns to the composer; the check excludes the answered request by id rather than relying on projection lag.
+After the last response, focus returns to the composer once no other pending request remains.
 Approvals and questions share the same unfocused dock prompt and FocusDock chord.
 The focused dock has an accent border.
 StopThread and Interrupt expire pending requests, and the provider queues cancel replies before interrupt.
@@ -269,7 +281,9 @@ ChildEnv loads share one application-owned group registry, so the quit hook can 
 One session task owns the child, its stdin writer and a process-group guard.
 `ByteLines` caps each stdout and stderr line at 4 MiB and survives cancelled reads.
 Oversized lines and invalid JSON are skipped; diagnostics reveal lengths rather than raw content.
-Valid JSON that cannot decode as a Claude frame is also skipped, logging only its type without frame content.
+Valid JSON that cannot decode as an ordinary Claude frame is skipped, logging only its type without frame content.
+An undecodable control request with a valid id gets an error control_response and reserves that id for the session lifetime; an unaddressable request fails the session.
+Undecodable control replies, including initialize, fail the session instead of leaving the Ready gate waiting.
 Each accepted stdout line is parsed once and its value passes through recording, root decoding and subagent decoding.
 The bounded stderr tail is redacted before display and supplies failures when the CLI exits unexpectedly.
 Interrupt and Shutdown queue deny replies for every open approval and question with `interrupt: true` before the protocol interrupt.
@@ -352,7 +366,7 @@ The fake CLI ignores SIGTERM when its header sets ignore_sigterm.
 `veyra-fake-cli` consumes one fixture and exits 3 with expected/actual diagnostics on mismatch.
 Capture-derived fixtures come from Veyra's own CLI recordings; other cases are Veyra's scripted wires.
 
-The debug fields of `ChildEnv::load` are the only application read site for VEYRA_CLAUDE_BIN, VEYRA_FAKE_FIXTURES and VEYRA_RECORD.
+The debug-only branches of `ChildEnv::load` are the only application read site for VEYRA_CLAUDE_BIN, VEYRA_FAKE_FIXTURES, VEYRA_RECORD and VEYRA_REAP_PIDS.
 The override replaces Claude's binary.
 Each Engine owns its lane registry through its shared ChildEnv.
 New threads register in creation order; each thread's spawn E uses tN-sE.jsonl, with probe.jsonl for probes.
@@ -476,6 +490,7 @@ Its fake lane isolates data and uses only the fake CLI; an explicitly authorized
 Proof stays outside disposable scratch, and every action targets a process this run started.
 Captures require the owned window to remain on-screen and frontmost; the guard prevents covered or stale frames from counting as proof.
 Cleanup checks owned app pids, provider groups and same-user parent markers without printing arguments before removing scratch.
+A marker read treats ESRCH and an empty argument block as a gone process; EINVAL or incomplete reads from a still-listed process remain in the count and retry under the existing five-second deadline.
 Release proof uses a disposable HOME and restricted PATH, scans driver/override strings and checks a socket-free window.
 Only one owned Veyra window exists during that release check; it takes no PNG.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
@@ -483,7 +498,7 @@ Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, repaints and max_batch_events.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
-The composer dock adds action_text and consequence from the same formatter the window renders.
+The composer dock adds action_text, consequence and preview from the same formatter the window renders.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
 
 ## Source map
@@ -509,11 +524,13 @@ Platform tests check the two-second login-shell bound, inherited-pipe deadline a
 Session tests check process exit classification and cleanup ordering.
 Request, grant and awake tests check request expiry, exact matching, thread isolation, needs_awake and retained-guard flags.
 They do not inspect caffeinate liveness or the OS assertion lifetime.
-Reaper tests check live parents, non-agent argv, the environment-read boundary and stored/swept versioned binaries reached through a provider symlink.
+Reaper tests check live parents, non-agent argv, the lazy executable/environment-read boundary and stored/swept versioned binaries reached through a provider symlink.
+The versioned-binary test proves that a marked orphan started by its parent harness survives the child test's sweep.
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
 Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
-Application tests enable gpui test-support to exercise Shell selection, its event pump, dock text and focus, chords and empty-Send Stop through the keymap in a synthetic window.
-Shell tests load the login-shell PATH as the app does and run the startup orphan sweep.
+Application tests enable gpui test-support to exercise Shell selection, its event pump, typed dock text, bounded previews and focus, chords and empty-Send Stop through the keymap in a synthetic window.
+Codec and storage tests cover all tool arguments, symlinks with missing parents, unverified targets, truncated Unicode previews, legacy approval rows and undecodable control failures.
+Shell tests load the login-shell PATH as the app does but admit no process to their startup sweep.
 Their current-thread runtimes do not drive readiness tasks before replacing the probes, so those tests start no provider check.
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence, header-branch clearing and cleanup.

@@ -99,6 +99,23 @@ pub struct Engine {
 }
 impl Engine {
     pub fn start(runtime: &Handle, data: DataDir) -> Result<Self, StartError> {
+        Self::start_with(runtime, data, |env| env)
+    }
+    pub fn start_with_processes(
+        runtime: &Handle,
+        data: DataDir,
+        pids: Vec<u32>,
+    ) -> Result<Self, StartError> {
+        Self::start_with(runtime, data, |mut env| {
+            env.reaper_pids = Some(pids.into_iter().collect());
+            env
+        })
+    }
+    fn start_with(
+        runtime: &Handle,
+        data: DataDir,
+        prepare: impl FnOnce(provider::env::ChildEnv) -> provider::env::ChildEnv,
+    ) -> Result<Self, StartError> {
         let lock = data.lock()?;
         platform::private_file(
             &data.path().join("veyra.db"),
@@ -109,7 +126,7 @@ impl Engine {
                 .truncate(false),
         )?;
         let db = store::open(&data.path().join("veyra.db"))?;
-        let env = provider::env::ChildEnv::load();
+        let env = prepare(provider::env::ChildEnv::load());
         process::start(store::live_processes(&db)?, &env);
         Self::launch(runtime, db, Spawner::Cli(env), Some(lock))
     }

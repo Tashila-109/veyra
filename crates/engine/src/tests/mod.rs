@@ -206,9 +206,11 @@ impl Fixture {
             native: NativeRequestRef("approval-one".into()),
             kind: RequestKind::Approval {
                 action: ProposedAction {
-                    input: None,
                     tool: "shell".into(),
-                    command: "echo own-test".into(),
+                    target: ApprovalTarget::Command {
+                        command: "echo own-test".into(),
+                        preview: ApprovalPreview::new(String::new()),
+                    },
                 },
                 grant_key: None,
             },

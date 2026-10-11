@@ -8,62 +8,51 @@ use gpui_kit::component::{
     popover::Popover,
 };
 use gpui_kit::{prelude::*, *};
-use veyra_engine::domain::{ProposedAction, RequestKind, WaitReason};
+use veyra_engine::domain::{
+    ApprovalTarget, FileOperation, ProposedAction, RequestKind, TargetLocation, WaitReason,
+};
 
-pub(super) fn approval_text(
-    action: &ProposedAction,
-    cwd: &std::path::Path,
-    provider: &str,
-) -> (String, String) {
-    if let Some(input) = &action.input {
-        let target = input["file_path"]
-            .as_str()
-            .or_else(|| input["path"].as_str());
-        let label = target.map_or_else(
-            || action.tool.clone(),
-            |path| format!("{} {path}", action.tool),
-        );
-        let operation = match action.tool.as_str() {
-            "Write" => "writes a file",
-            "Edit" | "MultiEdit" => "edits a file",
-            "Read" => "reads a file",
-            _ => "uses this tool",
-        };
-        let location = target.map_or(String::new(), |path| {
-            let path = cwd.join(path);
-            let resolved = path
-                .canonicalize()
-                .or_else(|_| {
-                    path.parent()
-                        .unwrap_or(cwd)
-                        .canonicalize()
-                        .map(|parent| parent.join(path.file_name().unwrap_or_default()))
-                })
-                .unwrap_or(path);
-            let normalized =
-                resolved
-                    .components()
-                    .fold(std::path::PathBuf::new(), |mut path, part| {
-                        if part == std::path::Component::ParentDir {
-                            path.pop();
-                        } else if part != std::path::Component::CurDir {
-                            path.push(part);
-                        }
-                        path
-                    });
-            if normalized.starts_with(cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned())) {
-                " inside the project folder".into()
-            } else {
-                " outside the project folder".into()
-            }
-        });
-        (label, format!("{provider} {operation}{location}."))
-    } else {
-        (
-            action.command.clone(),
+pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String, String, String) {
+    let (label, consequence, preview) = match &action.target {
+        ApprovalTarget::Command { command, preview } => (
+            command.clone(),
             format!("{provider} will run this command in the project folder."),
-        )
+            preview,
+        ),
+        ApprovalTarget::File {
+            operation,
+            path,
+            location,
+            preview,
+        } => {
+            let operation = match operation {
+                FileOperation::Write => "writes a file",
+                FileOperation::Edit => "edits a file",
+                FileOperation::Read => "reads a file",
+                FileOperation::Other => "uses this file",
+            };
+            let location = match location {
+                TargetLocation::InsideProject => "inside the project folder",
+                TargetLocation::OutsideProject => "outside the project folder",
+                TargetLocation::NotVerified => "at a location that is not verified",
+            };
+            (
+                format!("{} {}", action.tool, path.display()),
+                format!("{provider} {operation} {location}."),
+                preview,
+            )
+        }
+        ApprovalTarget::Tool { preview } => (
+            action.tool.clone(),
+            format!("{provider} uses this tool with the arguments below."),
+            preview,
+        ),
+    };
+    let mut preview_text = preview.text.clone();
+    if preview.truncated {
+        preview_text.push_str("\nPreview cut after 10,000 characters.");
     }
+    (label, consequence, preview_text)
 }
 
 fn dock_chip(button: Button, focused: bool, chip: impl IntoElement) -> Button {
@@ -268,11 +257,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         });
                     match &request.kind {
                         RequestKind::Approval { action, grant_key } => {
-                            let (label, consequence) = approval_text(
-                                action,
-                                shell.approval_cwd(),
-                                shell.chosen_provider().label(),
-                            );
+                            let (label, consequence, preview) =
+                                approval_text(action, shell.chosen_provider().label());
                             dock =
                                 dock.key_context("VeyraDock VeyraApproval")
                                     .child(
@@ -288,6 +274,19 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                             .text_color(t.colors.text_muted)
                                             .child(consequence),
                                     )
+                                    .when(!preview.is_empty(), |dock| {
+                                        dock.child(
+                                            div()
+                                                .id("approval-preview")
+                                                .debug_selector(|| "approval-preview".into())
+                                                .max_h(t.layout.composer_max_height)
+                                                .overflow_y_scroll()
+                                                .font_family(t.text.mono_font.clone())
+                                                .text_size(t.text.code.size)
+                                                .line_height(t.text.code.line_height)
+                                                .child(preview),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .h_flex()
@@ -303,14 +302,14 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     window.dispatch_action(Box::new(Deny), cx)
                                                 }),
                                             )
-                                            .when(grant_key.is_some(), |row| {
+                                            .when_some(grant_key.as_ref(), |row, key| {
                                                 row.child(
                                                     dock_chip(
                                                         labelled_button(
                                                             "allow-thread",
                                                             format!(
                                                                 "Allow `{}` in this thread",
-                                                                action.command
+                                                                key.command
                                                             ),
                                                             cx,
                                                         ),
@@ -444,4 +443,55 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     .child(notice),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approval_text;
+    use veyra_engine::domain::{ApprovalPreview, ApprovalTarget, ProposedAction};
+    #[test]
+    fn tool_approval_preview_shows_arguments_and_cut_notice() {
+        let action = ProposedAction {
+            tool: "remote tool".into(),
+            target: ApprovalTarget::Tool {
+                preview: ApprovalPreview::new("x".repeat(10001)),
+            },
+        };
+        let (label, consequence, preview) = approval_text(&action, "Provider");
+        assert_eq!(label, "remote tool");
+        assert_eq!(
+            consequence,
+            "Provider uses this tool with the arguments below."
+        );
+        assert_eq!(
+            preview,
+            "x".repeat(10000) + "\nPreview cut after 10,000 characters."
+        );
+    }
+    #[test]
+    fn dock_renders_only_typed_provider_neutral_actions() {
+        let code = include_str!("composer.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for wire_name in [
+            "\"file_path\"",
+            "\"path\"",
+            "\"notebook_path\"",
+            "\"Write\"",
+            "\"Edit\"",
+            "\"Read\"",
+            "\"Bash\"",
+            "\"WebFetch\"",
+            "\"NotebookEdit\"",
+            "canonicalize",
+            "std::fs",
+        ] {
+            assert!(
+                !code.contains(wire_name),
+                "dock must not interpret provider data or touch disk: {wire_name}"
+            );
+        }
+        assert!(code.contains(".child(preview)"));
+    }
 }
