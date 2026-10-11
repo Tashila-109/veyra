@@ -18,10 +18,10 @@ The dock shows its answer chords only while focused; otherwise it shows ⌘⇧Y 
 Requests do not take focus automatically.
 Composer ⌘↵ sends a nonempty draft and leaves the request pending; an empty draft during a turn dispatches Stop.
 Every button's shortcut_chip reads the same bindings table as the keymap.
-A question shows its options; click Use number keys or press ⌘⇧Y to FocusDock.
+A question shows its options; click Focus to use shortcuts or press ⌘⇧Y to FocusDock.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
 More than one pending request shows 1 of N.
-Answering one keeps dock focus while another request remains.
+Answering one keeps dock focus while another request remains; the last answer returns focus to the composer.
 NextNeedsYou uses ⌘⇧J pending the operator's chord decision.
 
 ## Driving it with veyra ctl
@@ -86,6 +86,24 @@ assert (DATA/'project'/'veyra-grant.txt').is_file()
 capture('approval-compound')
 action('approval-compound-deny','Deny')
 ctl('approval-grant-done','wait',thread,'Done')
+for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve())),
+    ('outside', '/tmp/veyra-outside-'+RUN+'.txt')]:
+    records = [json.loads(line) for line in (SOURCE/'approval-allow.jsonl').read_text().splitlines()]
+    records[4]['line']['request'].update(tool_name='Write', input={'file_path':target,'content':'veyra check'})
+    stage_records(records)
+    thread = create('approval-write-'+place,'Write the target file',scenario=None)
+    dump = poll('approval-write-'+place,lambda d: d['composer']['dock'] is not None)
+    dock = dump['composer']['dock']
+    assert dock['action_text'] == 'Write '+target
+    assert dock['consequence'] == 'Claude Code writes a file '+place+' the project folder.'
+    assert dock['request']['kind']['Approval']['grant_key'] is None
+    capture('approval-write-'+place)
+    action('approval-write-'+place+'-focus','FocusDock')
+    ctl('approval-write-'+place+'-allow','keys','secondary-enter')
+    done = ctl('approval-write-'+place+'-done','wait',thread,'Done')
+    assert done['composer']['dock'] is None
+    ctl('approval-write-'+place+'-composer','text','composer has focus')
+    assert ctl('approval-write-'+place+'-draft','dump')['composer_text'] == 'composer has focus'
 question = create('question','Choose a route',scenario='question')
 poll('question-dock',lambda d: d['composer']['dock'] is not None)
 capture('question')
@@ -139,6 +157,9 @@ PY
 The unfocused approval PNGs show the exact command, consequence and FocusDock chord.
 The focused approval PNGs show Allow once, Deny and their answer chords, matching the keys driven in those states.
 The project file stays absent after Deny and exists after Allow once.
+The Write PNGs and action_text/consequence fields show tool targets inside and outside the project without raw content JSON.
+Those fake requests check dock presentation, not outside file effects.
+Text input after each final approval proves composer focus returned.
 SQLite records one grant and three requests, showing the identical granted request never docked.
 `approval-composer-pending.json` and SQLite prove composer Send leaves approval Pending and queues the draft.
 `question-focused.json`, the digit commands and the changed focused PNG prove focus isolation and its accent border.

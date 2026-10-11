@@ -152,6 +152,12 @@ fn claude_ok_reply() {
     )));
 }
 #[test]
+fn claude_unknown_json_shape_keeps_session() {
+    let events = replay("unknown-json-shape", false);
+    assert_eq!(text(&events), "ok");
+    assert_eq!(outcomes(&events), vec![TurnOutcome::Completed]);
+}
+#[test]
 fn claude_bash_echo() {
     let events = replay("bash-echo", false);
     assert_eq!(
@@ -632,7 +638,7 @@ fn controlled_replay_with(
                     && !interrupted
                     && matches!(&event, ProviderEvent::Turn {
                     event: TurnEvent::TextDelta { text, .. }, ..
-                } if text == "partial")
+                } if text == "partial" || (name == "interrupt-honoured" && text.ends_with("9: It equ")))
                 {
                     handle
                         .control
@@ -850,7 +856,24 @@ fn claude_retry_limit_fallback_notices() {
 }
 #[test]
 fn claude_interrupt_honoured() {
-    let events = controlled_replay("interrupt-honoured", &["first", "second"], true);
+    let recorded = controlled_replay("interrupt-honoured", &["first"], true);
+    assert_eq!(
+        outcomes(&recorded),
+        vec![TurnOutcome::Interrupted {
+            reason: "Stopped by you".into()
+        }]
+    );
+    assert!(text(&recorded).starts_with("1: It is the multiplicative identity."));
+    assert!(text(&recorded).ends_with("9: It equ"));
+    assert!(recorded.iter().all(|event| !matches!(
+        event,
+        ProviderEvent::Turn {
+            event: TurnEvent::TurnEnded { park: true, .. },
+            ..
+        }
+    )));
+
+    let events = controlled_replay("interrupt-continued", &["first", "second"], true);
     assert_eq!(text(&events), "partialok");
     assert_eq!(
         outcomes(&events),
@@ -909,7 +932,7 @@ fn ladder_synthesizes_interrupted_end() {
 #[test]
 fn ladder_stops_at_cli_turn_end() {
     let started = std::time::Instant::now();
-    let events = controlled_replay("interrupt-honoured", &["first", "second"], true);
+    let events = controlled_replay("interrupt-continued", &["first", "second"], true);
     assert!(started.elapsed() >= Duration::from_millis(4500));
     assert_eq!(text(&events), "partialok");
     assert_eq!(

@@ -947,6 +947,12 @@ impl Shell {
             );
         }
     }
+    fn approval_cwd(&self) -> &std::path::Path {
+        self.view
+            .chat()
+            .and_then(|thread| self.state.threads.get(&thread))
+            .map_or(&self.probe_cwd, |thread| &thread.cwd)
+    }
     fn respond(&mut self, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
         let request = self.view.chat().and_then(|thread| {
             self.state
@@ -956,6 +962,14 @@ impl Shell {
         });
         if let Some(request) = request {
             self.send_command(Command::Respond { request, decision }, window, cx);
+            if self.view.chat().is_some_and(|thread| {
+                self.state
+                    .pending_requests(thread)
+                    .iter()
+                    .all(|row| row.id == request)
+            }) {
+                self.input.update(cx, |input, cx| input.focus(window, cx));
+            }
         }
     }
     fn answer_question(&mut self, option: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1000,17 +1014,7 @@ impl Shell {
         answers.push(Answer { text });
         if answers.len() == questions.len() {
             let (_, answers) = self.question_draft.take().unwrap();
-            self.send_command(
-                Command::Respond {
-                    request: id,
-                    decision: Decision::Answers(answers),
-                },
-                window,
-                cx,
-            );
-            if self.state.pending_requests(thread).len() == 1 {
-                self.input.update(cx, |input, cx| input.focus(window, cx));
-            }
+            self.respond(Decision::Answers(answers), window, cx);
         }
         cx.notify();
     }
@@ -1328,7 +1332,14 @@ impl Shell {
                 && self.input.read(cx).value().trim().is_empty(),
             "discard_queued_visible":self.discard_queued_visible(),
             "dock":self.view.chat().and_then(|thread| self.state.pending_requests(thread).first().map(|request| {
+                let text = match &request.kind {
+                    RequestKind::Approval { action, .. } => Some(composer::approval_text(
+                        action, self.approval_cwd(), self.chosen_provider().label())),
+                    _ => None,
+                };
                 serde_json::json!({"request":request, "position":1,
+                    "action_text":text.as_ref().map(|(label, _)| label),
+                    "consequence":text.as_ref().map(|(_, consequence)| consequence),
                     "count":self.state.pending_requests(thread).len(), "focused":self.dock_focused,
                     "question_index":self.question_draft.as_ref().filter(|(id, _)| *id == request.id)
                         .map_or(0, |(_, answers)| answers.len())})
@@ -1846,6 +1857,7 @@ mod tests {
             Entity<super::Shell>,
             &mut gpui::VisualTestContext,
             std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+            tokio::sync::mpsc::UnboundedSender<UiEvent>,
         ),
     ) {
         struct Scratch(std::path::PathBuf);
@@ -1856,23 +1868,27 @@ mod tests {
         }
         struct ActionCapture {
             shell: Entity<super::Shell>,
-            stopped: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+            dispatched: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
         }
         impl Render for ActionCapture {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                let stopped = self.stopped.clone();
-                let allowed = self.stopped.clone();
-                let denied = self.stopped.clone();
+                let dispatched = self.dispatched.clone();
+                let allowed = self.dispatched.clone();
+                let denied = self.dispatched.clone();
+                let granted = self.dispatched.clone();
                 div()
                     .size_full()
                     .capture_action(move |_: &super::Stop, _, _| {
-                        stopped.borrow_mut().push("Stop");
+                        dispatched.borrow_mut().push("Stop");
                     })
                     .capture_action(move |_: &super::AllowOnce, _, _| {
                         allowed.borrow_mut().push("AllowOnce");
                     })
                     .capture_action(move |_: &super::Deny, _, _| {
                         denied.borrow_mut().push("Deny");
+                    })
+                    .capture_action(move |_: &super::AllowInThread, _, _| {
+                        granted.borrow_mut().push("AllowInThread");
                     })
                     .child(self.shell.clone())
             }
@@ -1890,12 +1906,12 @@ mod tests {
         )
         .unwrap();
         runtime.block_on(engine.shutdown_wait());
-        let (_, events) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, events) = tokio::sync::mpsc::unbounded_channel();
         cx.update(|cx| {
             gpui_kit::init(cx);
             super::actions::init(cx);
         });
-        let stopped = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+        let dispatched = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
         let (view, cx) = cx.add_window_view(|window, cx| {
             super::Theme::apply(super::Appearance::Dark, window, cx);
             let shell = cx.new(|cx| {
@@ -1949,7 +1965,7 @@ mod tests {
             });
             ActionCapture {
                 shell,
-                stopped: stopped.clone(),
+                dispatched: dispatched.clone(),
             }
         });
         let shell = view.read_with(cx, |view, _| view.shell.clone());
@@ -1961,34 +1977,188 @@ mod tests {
         draw(cx);
         cx.update(|window, _| window.activate_window());
         draw(cx);
-        check(shell, cx, stopped);
+        check(shell, cx, dispatched, sender);
     }
 
     #[gpui::test]
     fn empty_send_dispatches_stop_action(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, stopped| {
+        with_docked_shell(cx, |shell, cx, dispatched, _| {
             shell.update_in(cx, |shell, window, cx| shell.send(window, cx));
             cx.run_until_parked();
             draw(cx);
             assert_eq!(
-                stopped.borrow().as_slice(),
+                dispatched.borrow().as_slice(),
                 ["Stop"],
                 "empty Send must reach the window's Stop action"
             );
             cx.dispatch_action(super::Stop);
             cx.run_until_parked();
             draw(cx);
-            assert_eq!(stopped.borrow().as_slice(), ["Stop", "Stop"]);
+            assert_eq!(dispatched.borrow().as_slice(), ["Stop", "Stop"]);
+        });
+    }
+
+    #[gpui::test]
+    fn file_approval_dock_names_target_and_consequence(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            for (tool, path, consequence) in [
+                (
+                    "Write",
+                    "/tmp/x",
+                    "Claude Code writes a file outside the project folder.",
+                ),
+                (
+                    "Edit",
+                    "file.txt",
+                    "Claude Code edits a file inside the project folder.",
+                ),
+                (
+                    "Write",
+                    "../x",
+                    "Claude Code writes a file outside the project folder.",
+                ),
+            ] {
+                shell.update(cx, |shell, _| {
+                    shell.state.requests.truncate(1);
+                    shell.state.requests[0].kind = RequestKind::Approval {
+                        action: ProposedAction {
+                            input: Some(Box::new(
+                                serde_json::json!({"file_path":path,"content":"private contents"}),
+                            )),
+                            tool: tool.into(),
+                            command:
+                                serde_json::json!({"file_path":path,"content":"private contents"})
+                                    .to_string(),
+                        },
+                        grant_key: None,
+                    };
+                });
+                let dock = shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"].clone());
+                assert_eq!(dock["action_text"], format!("{tool} {path}"));
+                assert_eq!(dock["consequence"], consequence);
+            }
+            let command = "{\"file_path\":\"/tmp/x\"}";
+            shell.update(cx, |shell, _| {
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        tool: "Bash".into(),
+                        command: command.into(),
+                        input: None,
+                    },
+                    grant_key: None,
+                };
+            });
+            let dock = shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"].clone());
+            assert_eq!(dock["action_text"], command);
+            assert_eq!(
+                dock["consequence"],
+                "Claude Code will run this command in the project folder."
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn last_approval_returns_focus_to_composer(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        input: None,
+                        tool: "Bash".into(),
+                        command: "echo ok".into(),
+                    },
+                    grant_key: None,
+                };
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
+            cx.simulate_keystrokes("secondary-enter");
+            draw(cx);
+            assert!(!shell.read_with(cx, |shell, _| shell.dock_focused));
+        });
+    }
+
+    #[gpui::test]
+    fn question_focus_prompt_matches_approval(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            assert!(cx.debug_bounds("veyra::FocusDock").is_some());
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
+            assert!(cx.debug_bounds("veyra::FocusDock").is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn allow_in_thread_chip_follows_keyboard_focus(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, dispatched, sender| {
+            shell.update(cx, |shell, cx| {
+                for request in &mut shell.state.requests {
+                    request.kind = RequestKind::Approval {
+                        action: ProposedAction {
+                            input: None,
+                            tool: "Bash".into(),
+                            command: "echo ok".into(),
+                        },
+                        grant_key: Some(GrantKey {
+                            tool: "Bash".into(),
+                            command: "echo ok".into(),
+                        }),
+                    };
+                }
+                cx.notify();
+            });
+            draw(cx);
+            assert!(cx.debug_bounds("veyra::AllowInThread").is_none());
+            cx.simulate_keystrokes("secondary-alt-enter");
+            draw(cx);
+            assert!(dispatched.borrow().is_empty());
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
+            assert!(cx.debug_bounds("veyra::AllowInThread").is_some());
+            cx.simulate_keystrokes("secondary-alt-enter");
+            draw(cx);
+            assert_eq!(dispatched.borrow().as_slice(), ["AllowInThread"]);
+            assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
+            let mut answered = shell.read_with(cx, |shell, _| shell.state.requests[0].clone());
+            answered.state = RequestState::Answered(Decision::AllowInThread);
+            sender
+                .send(UiEvent::Change {
+                    counter: Some(1),
+                    event: ChangeEvent::RequestClosed(answered),
+                })
+                .unwrap();
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell
+                    .state
+                    .pending_requests(shell.view.chat().unwrap())
+                    .len()),
+                1
+            );
+            cx.simulate_keystrokes("secondary-alt-enter");
+            draw(cx);
+            assert_eq!(
+                dispatched.borrow().as_slice(),
+                ["AllowInThread", "AllowInThread"]
+            );
+            assert!(!shell.read_with(cx, |shell, _| shell.dock_focused));
+            assert!(cx.debug_bounds("veyra::AllowInThread").is_none());
         });
     }
 
     #[gpui::test]
     fn approval_chips_follow_keyboard_focus(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, stopped| {
+        with_docked_shell(cx, |shell, cx, dispatched, _| {
             shell.update(cx, |shell, cx| {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
+                        input: None,
                         tool: "Bash".into(),
                         command: "touch veyra-check.txt".into(),
                     },
@@ -2010,10 +2180,10 @@ mod tests {
             cx.simulate_keystrokes("secondary-enter");
             cx.run_until_parked();
             draw(cx);
-            assert_eq!(stopped.borrow().as_slice(), ["Stop"]);
+            assert_eq!(dispatched.borrow().as_slice(), ["Stop"]);
             cx.simulate_keystrokes("secondary-.");
             draw(cx);
-            assert_eq!(stopped.borrow().as_slice(), ["Stop"]);
+            assert_eq!(dispatched.borrow().as_slice(), ["Stop"]);
             cx.simulate_keystrokes("secondary-shift-y");
             draw(cx);
             assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
@@ -2023,10 +2193,15 @@ mod tests {
             cx.simulate_keystrokes("secondary-enter");
             cx.run_until_parked();
             draw(cx);
-            assert_eq!(stopped.borrow().as_slice(), ["Stop", "AllowOnce"]);
+            assert_eq!(dispatched.borrow().as_slice(), ["Stop", "AllowOnce"]);
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
             cx.simulate_keystrokes("secondary-.");
             draw(cx);
-            assert_eq!(stopped.borrow().as_slice(), ["Stop", "AllowOnce", "Deny"]);
+            assert_eq!(
+                dispatched.borrow().as_slice(),
+                ["Stop", "AllowOnce", "Deny"]
+            );
             cx.simulate_keystrokes("escape");
             cx.run_until_parked();
             draw(cx);
@@ -2037,7 +2212,7 @@ mod tests {
 
     #[gpui::test]
     fn answering_one_of_several_requests_keeps_dock_focus(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, _| {
+        with_docked_shell(cx, |shell, cx, _, sender| {
             cx.simulate_keystrokes("secondary-shift-y");
             cx.run_until_parked();
             draw(cx);
@@ -2049,13 +2224,16 @@ mod tests {
                 shell.read_with(cx, |shell, _| shell.dock_focused),
                 "another request still needs the dock"
             );
-            shell.update(cx, |shell, cx| {
-                shell.state.requests[0].state =
-                    RequestState::Answered(Decision::Answers(vec![Answer {
-                        text: "Short".into(),
-                    }]));
-                cx.notify();
-            });
+            let mut answered = shell.read_with(cx, |shell, _| shell.state.requests[0].clone());
+            answered.state = RequestState::Answered(Decision::Answers(vec![Answer {
+                text: "Short".into(),
+            }]));
+            sender
+                .send(UiEvent::Change {
+                    counter: Some(1),
+                    event: ChangeEvent::RequestClosed(answered),
+                })
+                .unwrap();
             cx.run_until_parked();
             draw(cx);
             cx.simulate_keystrokes("1");

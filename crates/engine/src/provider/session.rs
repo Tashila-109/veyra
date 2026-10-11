@@ -575,32 +575,18 @@ async fn run_one(
         write_task.abort();
         let _ = write_task.await;
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-    let mut observed = process
+    let observed = process
         .child
         .child
         .as_mut()
         .and_then(|child| child.try_wait().ok().flatten());
-    let mut stderr_done = false;
-    if let Some(child) = process.child.child.as_mut() {
-        loop {
-            if stderr_done && (!stdout_closed || observed.is_some()) {
-                break;
-            }
-            tokio::select! {
-                _ = &mut stderr, if !stderr_done => { stderr_done = true; }
-                _ = tokio::time::sleep_until(deadline) => break,
-                status = child.wait(), if stdout_closed && observed.is_none() => {
-                    observed = status.ok();
-                    if observed.is_none() { break; }
-                }
-            }
+    let wait = async {
+        match process.child.child.as_mut() {
+            Some(child) => child.wait().await,
+            None => std::future::pending().await,
         }
-    }
-    if !stderr_done {
-        stderr.abort();
-        let _ = stderr.await;
-    }
+    };
+    let observed = drain_stderr(&mut stderr, wait, observed, stdout_closed).await;
     let lines = tail.lock().unwrap().iter().cloned().collect::<Vec<_>>();
     let failure = failure
         .or(rejected)
@@ -705,6 +691,41 @@ fn with_stderr(text: &str, lines: &[String], token: Option<&str>) -> String {
         );
     }
     text
+}
+
+async fn drain_stderr(
+    stderr: &mut tokio::task::JoinHandle<()>,
+    wait: impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+    mut observed: Option<std::process::ExitStatus>,
+    stdout_closed: bool,
+) -> Option<std::process::ExitStatus> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut stderr_done = false;
+    let mut wait_failed = false;
+    tokio::pin!(wait);
+    loop {
+        if stderr_done && (!stdout_closed || observed.is_some()) {
+            break;
+        }
+        tokio::select! {
+            _ = &mut *stderr, if !stderr_done => { stderr_done = true; }
+            _ = tokio::time::sleep_until(deadline) => break,
+            status = &mut wait, if stdout_closed && observed.is_none() && !wait_failed => {
+                match status {
+                    Ok(status) => observed = Some(status),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not wait for Claude exit");
+                        wait_failed = true;
+                    }
+                }
+            }
+        }
+    }
+    if !stderr_done {
+        stderr.abort();
+        let _ = stderr.await;
+    }
+    observed
 }
 
 fn discard_stderr(child: &mut ProcessGroup) -> tokio::task::JoinHandle<()> {
@@ -827,6 +848,24 @@ pub async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn stderr_wait_error_keeps_drain_deadline() {
+        let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = tail.clone();
+        let mut stderr = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            output.lock().unwrap().push("late diagnostic");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let start = tokio::time::Instant::now();
+        let wait = async { Err(std::io::Error::other("wait failed")) };
+        let observed = drain_stderr(&mut stderr, wait, None, true).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(500));
+        assert_eq!(*tail.lock().unwrap(), ["late diagnostic"]);
+        assert!(observed.is_none());
+        assert!(stderr.is_finished());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn natural_exit_after_stdout_eof_wakes_without_a_timer() {
         let child = ChildEnv::load()

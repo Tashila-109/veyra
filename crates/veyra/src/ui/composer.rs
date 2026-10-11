@@ -8,7 +8,67 @@ use gpui_kit::component::{
     popover::Popover,
 };
 use gpui_kit::{prelude::*, *};
-use veyra_engine::domain::{RequestKind, WaitReason};
+use veyra_engine::domain::{ProposedAction, RequestKind, WaitReason};
+
+pub(super) fn approval_text(
+    action: &ProposedAction,
+    cwd: &std::path::Path,
+    provider: &str,
+) -> (String, String) {
+    if let Some(input) = &action.input {
+        let target = input["file_path"]
+            .as_str()
+            .or_else(|| input["path"].as_str());
+        let label = target.map_or_else(
+            || action.tool.clone(),
+            |path| format!("{} {path}", action.tool),
+        );
+        let operation = match action.tool.as_str() {
+            "Write" => "writes a file",
+            "Edit" | "MultiEdit" => "edits a file",
+            "Read" => "reads a file",
+            _ => "uses this tool",
+        };
+        let location = target.map_or(String::new(), |path| {
+            let path = cwd.join(path);
+            let resolved = path
+                .canonicalize()
+                .or_else(|_| {
+                    path.parent()
+                        .unwrap_or(cwd)
+                        .canonicalize()
+                        .map(|parent| parent.join(path.file_name().unwrap_or_default()))
+                })
+                .unwrap_or(path);
+            let normalized =
+                resolved
+                    .components()
+                    .fold(std::path::PathBuf::new(), |mut path, part| {
+                        if part == std::path::Component::ParentDir {
+                            path.pop();
+                        } else if part != std::path::Component::CurDir {
+                            path.push(part);
+                        }
+                        path
+                    });
+            if normalized.starts_with(cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned())) {
+                " inside the project folder".into()
+            } else {
+                " outside the project folder".into()
+            }
+        });
+        (label, format!("{provider} {operation}{location}."))
+    } else {
+        (
+            action.command.clone(),
+            format!("{provider} will run this command in the project folder."),
+        )
+    }
+}
+
+fn dock_chip(button: Button, focused: bool, chip: impl IntoElement) -> Button {
+    button.when(focused, |button| button.child(chip))
+}
 
 pub fn labelled_button(
     id: impl Into<ElementId>,
@@ -208,85 +268,75 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         });
                     match &request.kind {
                         RequestKind::Approval { action, grant_key } => {
-                            dock = dock
-                                .key_context("VeyraDock VeyraApproval")
-                                .child(
-                                    div()
-                                        .font_family(t.text.mono_font.clone())
-                                        .text_size(t.text.code.size)
-                                        .line_height(t.text.code.line_height)
-                                        .child(action.command.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(t.text.label.size)
-                                        .text_color(t.colors.text_muted)
-                                        .child(format!(
-                                            "{} will run this command in the project folder.",
-                                            shell.chosen_provider().label()
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .h_flex()
-                                        .flex_wrap()
-                                        .gap(t.space.0[3])
-                                        .child(
-                                            labelled_button("deny", "Deny", cx)
-                                                .when(shell.dock_focused, |button| {
-                                                    button.child(shortcut_chip::<Deny>(cx))
-                                                })
+                            let (label, consequence) = approval_text(
+                                action,
+                                shell.approval_cwd(),
+                                shell.chosen_provider().label(),
+                            );
+                            dock =
+                                dock.key_context("VeyraDock VeyraApproval")
+                                    .child(
+                                        div()
+                                            .font_family(t.text.mono_font.clone())
+                                            .text_size(t.text.code.size)
+                                            .line_height(t.text.code.line_height)
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(t.text.label.size)
+                                            .text_color(t.colors.text_muted)
+                                            .child(consequence),
+                                    )
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .flex_wrap()
+                                            .gap(t.space.0[3])
+                                            .child(
+                                                dock_chip(
+                                                    labelled_button("deny", "Deny", cx),
+                                                    shell.dock_focused,
+                                                    shortcut_chip::<Deny>(cx),
+                                                )
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(Box::new(Deny), cx)
                                                 }),
-                                        )
-                                        .when(grant_key.is_some(), |row| {
-                                            row.child(
-                                                labelled_button(
-                                                    "allow-thread",
-                                                    format!(
-                                                        "Allow `{}` in this thread",
-                                                        action.command
-                                                    ),
-                                                    cx,
-                                                )
-                                                .when(shell.dock_focused, |button| {
-                                                    button.child(shortcut_chip::<AllowInThread>(cx))
-                                                })
-                                                .on_click(|_, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(AllowInThread),
-                                                        cx,
-                                                    )
-                                                }),
                                             )
-                                        })
-                                        .child(
-                                            labelled_button("allow-once", "Allow once", cx)
-                                                .primary()
-                                                .when(shell.dock_focused, |button| {
-                                                    button.child(shortcut_chip::<AllowOnce>(cx))
-                                                })
+                                            .when(grant_key.is_some(), |row| {
+                                                row.child(
+                                                    dock_chip(
+                                                        labelled_button(
+                                                            "allow-thread",
+                                                            format!(
+                                                                "Allow `{}` in this thread",
+                                                                action.command
+                                                            ),
+                                                            cx,
+                                                        ),
+                                                        shell.dock_focused,
+                                                        shortcut_chip::<AllowInThread>(cx),
+                                                    )
+                                                    .on_click(|_, window, cx| {
+                                                        window.dispatch_action(
+                                                            Box::new(AllowInThread),
+                                                            cx,
+                                                        )
+                                                    }),
+                                                )
+                                            })
+                                            .child(
+                                                dock_chip(
+                                                    labelled_button("allow-once", "Allow once", cx)
+                                                        .primary(),
+                                                    shell.dock_focused,
+                                                    shortcut_chip::<AllowOnce>(cx),
+                                                )
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(Box::new(AllowOnce), cx)
                                                 }),
-                                        ),
-                                )
-                                .when(!shell.dock_focused, |dock| {
-                                    dock.child(
-                                        labelled_button(
-                                            "focus-approval",
-                                            "Focus to use shortcuts",
-                                            cx,
-                                        )
-                                        .child(shortcut_chip::<FocusDock>(cx))
-                                        .on_click(
-                                            |_, window, cx| {
-                                                window.dispatch_action(Box::new(FocusDock), cx)
-                                            },
-                                        ),
-                                    )
-                                });
+                                            ),
+                                    );
                         }
                         RequestKind::Question { questions } => {
                             let index = shell
@@ -295,37 +345,39 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                 .filter(|(id, _)| *id == request.id)
                                 .map_or(0, |(_, answers)| answers.len());
                             if let Some(question) = questions.get(index) {
-                                dock =
-                                    dock.child(question.text.clone())
-                                        .children(question.options.iter().enumerate().map(
-                                            |(option, label)| {
-                                                labelled_button(
-                                                    SharedString::from(format!("answer-{option}")),
-                                                    format!("{}  {label}", option + 1),
+                                dock = dock.child(question.text.clone()).children(
+                                    question.options.iter().enumerate().map(|(option, label)| {
+                                        labelled_button(
+                                            SharedString::from(format!("answer-{option}")),
+                                            format!("{}  {label}", option + 1),
+                                            cx,
+                                        )
+                                        .justify_start()
+                                        .child(div().flex_1())
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                window.dispatch_action(
+                                                    Box::new(AnswerQuestion {
+                                                        option: Some(option),
+                                                    }),
                                                     cx,
                                                 )
-                                                .justify_start()
-                                                .child(div().flex_1())
-                                                .on_click(move |_, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(AnswerQuestion {
-                                                            option: Some(option),
-                                                        }),
-                                                        cx,
-                                                    )
-                                                })
                                             },
-                                        ))
-                                        .child(
-                                            labelled_button("focus-dock", "Use number keys", cx)
-                                                .on_click(|_, window, cx| {
-                                                    window.dispatch_action(Box::new(FocusDock), cx)
-                                                }),
-                                        );
+                                        )
+                                    }),
+                                );
                             }
                         }
                     }
-                    composer.child(dock)
+                    composer.child(dock.when(!shell.dock_focused, |dock| {
+                        dock.child(
+                            labelled_button("focus-dock", "Focus to use shortcuts", cx)
+                                .child(shortcut_chip::<FocusDock>(cx))
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(FocusDock), cx)
+                                }),
+                        )
+                    }))
                 })
                 .child(
                     div().w_full().key_context("VeyraComposer").child(

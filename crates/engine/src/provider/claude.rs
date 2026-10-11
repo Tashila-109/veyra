@@ -517,7 +517,16 @@ impl Codec {
                 "delta":{"type":wire["event"]["delta"]["type"].as_str().unwrap_or("unknown")}
             }
         });
-        let frame = serde_json::from_value(wire)?;
+        let frame = match serde_json::from_value(wire) {
+            Ok(frame) => frame,
+            Err(_) => {
+                tracing::info!(
+                    frame_type = metadata["type"].as_str().unwrap_or("unknown"),
+                    "skipped undecodable Claude frame"
+                );
+                return Ok(Decoded::default());
+            }
+        };
         self.frame(metadata, frame)
     }
     fn frame(&mut self, wire: Value, mut frame: Frame) -> Result<Decoded, super::ProviderError> {
@@ -745,6 +754,7 @@ impl Codec {
                 action: ProposedAction {
                     tool: tool.tool_name.clone(),
                     command: command.map_or_else(|| tool.input.to_string(), str::to_owned),
+                    input: command.is_none().then(|| Box::new(tool.input.clone())),
                 },
                 grant_key: command
                     .filter(|_| {
@@ -1294,6 +1304,87 @@ mod tests {
             ]
         );
         assert!(!format!("{logs:?}").contains("private-content"));
+        drop(logs);
+        capture.0.lock().unwrap().clear();
+        tracing::subscriber::with_default(capture.clone(), || {
+            tracing::callsite::rebuild_interest_cache();
+            let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+            for wire in [
+                json!({"future":"private-content"}),
+                json!({"type":"system","subtype":"init","capabilities":null,"future":"private-content"}),
+            ] {
+                let decoded = codec.value(wire).unwrap();
+                assert!(decoded.events.is_empty());
+                assert!(decoded.replies.is_empty());
+            }
+        });
+        let logs = capture.0.lock().unwrap();
+        assert_eq!(
+            logs.iter()
+                .map(|fields| fields["frame_type"].as_str())
+                .collect::<Vec<_>>(),
+            ["unknown", "system"]
+        );
+        assert!(!format!("{logs:?}").contains("private-content"));
+    }
+    #[test]
+    fn approval_retains_input_only_without_command() {
+        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        codec.start(TurnId::new(), "reply".into());
+        for (index, (tool, input, grant)) in [
+            (
+                "Write",
+                json!({"file_path":"/tmp/x","content":"private contents"}),
+                false,
+            ),
+            (
+                "Bash",
+                json!({"command":"{\"file_path\":\"/tmp/x\"}"}),
+                true,
+            ),
+            (
+                "Bash",
+                json!({"command":"echo ok","extra":"blocks grant"}),
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let decoded = codec
+                .value(
+                    json!({"type":"control_request","request_id":format!("approval-{index}"),
+                "request":{"subtype":"can_use_tool","tool_name":tool,"input":input}}),
+                )
+                .unwrap();
+            let ProviderEvent::Turn {
+                event:
+                    TurnEvent::RequestOpened {
+                        kind: RequestKind::Approval { action, grant_key },
+                        ..
+                    },
+                ..
+            } = &decoded.events[0]
+            else {
+                panic!("missing approval")
+            };
+            assert_eq!(action.tool, tool);
+            assert_eq!(
+                action.input,
+                (tool == "Write").then(|| Box::new(input.clone()))
+            );
+            assert_eq!(
+                action.command,
+                input["command"]
+                    .as_str()
+                    .map_or_else(|| input.to_string(), str::to_owned)
+            );
+            assert_eq!(grant_key.is_some(), grant);
+        }
+        let old = json!({"tool":"Bash", "command":"echo old"});
+        let action: ProposedAction = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(action.input, None);
+        assert_eq!(serde_json::to_value(action).unwrap(), old);
     }
     #[test]
     fn storage_interruption_names_database() {

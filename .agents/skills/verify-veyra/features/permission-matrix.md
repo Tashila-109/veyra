@@ -1,15 +1,15 @@
 # Provider permission matrix
 
-Status: not run, 2026-10-11, pending, all live cells
+Status: not run, 2026-10-11, 8ea19cf, Codex and Grok live cells
 
 ## Sub-features
 
 One live prompt checks reading, a command, a project write and an outside write in every permission mode.
-Every cell below starts not run; only preserved live evidence can change it.
+Claude's row comes from preserved authorized live evidence; Codex and Grok remain not run.
 
 | Provider | Ask first | Accept edits | Full access |
 | --- | --- | --- | --- |
-| Claude | not run | not run | not run |
+| Claude | passed: Read and `echo` ran without approval; both writes docked as `Write` (`permission-project.txt`, `veyra-outside-d654ddf0.txt`), Allow once, both files written | passed: Read, `echo` and the project write ran without approval; the outside write docked as `Write` (`veyra-outside-d654ddf0.txt`), Allow once, written | passed: all four steps ran with no approval; both files written |
 | Codex | not run | not run | not run |
 | Grok | not run | not run | not run |
 
@@ -49,7 +49,48 @@ Replay evidence never marks a live cell passed.
 
 ## Gotchas
 
-The worker is forbidden to run claude, codex or grok; all nine cells remain not run here.
+Workers do not run installed providers; the Claude cells above retain the authorized live run's results.
 CLI upgrades require another live permission-grid run with human consent.
 Full access can change files outside the project.
 Fill Claude's row only from an authorized live permission run.
+
+Live run RUN `d654ddf0`, Claude 2.1.296, model `sonnet`, 2026-10-11, checkout `8ea19cf`.
+One prompt per mode was sent through Send after PickPermission; every dock was captured and answered Allow once with dock focus.
+Proof paths below name the preserved lane evidence.
+
+### Preserved live evidence
+
+#### Ask first
+
+- Thread `01a12b32-71bd-7487-a0d3-15968f920528`, `selected_thread.config.mode` / SQLite mode `ask_first`, turn `"Completed"`.
+- Tool calls in order: `Read`, `Bash`, `Write`, `Write`; `echo` printed `veyra-permission-probe`; Read returned `veyra permission probe`.
+- Docks (2): `Write` `{"file_path":"/private/tmp/veyra-verify-d654ddf0/project/permission-project.txt","content":"veyra permission probe\n"}`; `Write` `{"file_path":"/tmp/veyra-outside-d654ddf0.txt","content":"veyra permission probe\n"}`.
+- Requests in SQLite: approval answered "AllowOnce"; approval answered "AllowOnce".
+- Effects: `permission-project.txt` = "veyra permission probe\n"; `/tmp/veyra-outside-d654ddf0.txt` = "veyra permission probe\n" (removed after the check).
+- Files: `lane-3/checks/l3-matrix-ask_first.txt`, `lane-3/run/l3-matrix-ask_first-dock-*.{json,png}`, `lane-3/run/l3-matrix-ask_first-done.{json,png}`, `lane-3/samples/l3-matrix-ask_first-*.jsonl`, recording `lane-3/rec/`.
+
+#### Accept edits
+
+- Thread `01a12b32-a337-7784-b7cc-cf3b74283187`, `selected_thread.config.mode` / SQLite mode `accept_edits`, turn `"Completed"`.
+- Tool calls in order: `Read`, `Bash`, `Write`, `Write`; `echo` printed `veyra-permission-probe`; Read returned `veyra permission probe`.
+- Docks (1): `Write` `{"file_path":"/tmp/veyra-outside-d654ddf0.txt","content":"veyra permission probe\n"}`.
+- Requests in SQLite: approval answered "AllowOnce".
+- Effects: `permission-project.txt` = "veyra permission probe\n"; `/tmp/veyra-outside-d654ddf0.txt` = "veyra permission probe\n" (removed after the check).
+- Files: `lane-3/checks/l3-matrix-accept_edits.txt`, `lane-3/run/l3-matrix-accept_edits-dock-*.{json,png}`, `lane-3/run/l3-matrix-accept_edits-done.{json,png}`, `lane-3/samples/l3-matrix-accept_edits-*.jsonl`, recording `lane-3/rec/`.
+
+#### Full access
+
+- Thread `01a12b32-ce7f-7070-a171-7da550d1d2e8`, `selected_thread.config.mode` / SQLite mode `full_access`, turn `"Completed"`.
+- Tool calls in order: `Read`, `Bash`, `Write`, `Write`; `echo` printed `veyra-permission-probe`; Read returned `veyra permission probe`.
+- Docks (0): none.
+- Requests in SQLite: none.
+- Effects: `permission-project.txt` = "veyra permission probe\n"; `/tmp/veyra-outside-d654ddf0.txt` = "veyra permission probe\n" (removed after the check).
+- Files: `lane-3/checks/l3-matrix-full_access.txt`, `lane-3/run/l3-matrix-full_access-done.{json,png}`, `lane-3/samples/l3-matrix-full_access-*.jsonl`, recording `lane-3/rec/`.
+
+### Evidence notes
+
+- Every observed behaviour matches the page's expectation for its mode, so no cell is marked failed.
+- Accept edits records Claude's directory boundary: a write outside the project folder still asks.
+- In every mode Claude's own closing text said no step needed approval, including Ask first, where two writes docked. That is the model's narration, not Veyra state.
+- The `Write` docks show the tool input as raw JSON under the copy "Claude Code will run this command in the project folder.", also for the `/tmp` write (the recording predates the tool-target dock repair).
+- Codex and Grok cells stay not run here.

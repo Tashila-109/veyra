@@ -388,6 +388,8 @@ Items include `outcome`, queued `wait_reason` and a tool's `failed_last_line`.
 `composer.discard_queued_visible` reports the held queue control.
 `composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
 Approval answer chords appear only with dock focus; otherwise its hint shows the FocusDock chord.
+Approval dock action_text and consequence report the same command or tool-target text and one-line effect rendered in the window.
+Questions share the same unfocused FocusDock prompt.
 Answering one request keeps dock focus while requests remain.
 `notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
@@ -439,7 +441,8 @@ required = {
         'chat-failed.json','chat-failed.png','chat-provider-done.json','chat-background-working.json'],
     'approvals-questions':['approval-deny.png','approval-allow.png','question.png','question-two.png',
         'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png',
-        'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png'],
+        'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png',
+        'approval-write-inside.png','approval-write-outside.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json'],
@@ -589,6 +592,14 @@ printf 'PASS cleanup PID=%s gone DATA=%s removed PROOF=%s kept\n' "$PID" "$DATA"
 Cleanup leaves `target/verify-veyra/$RUN` intact.
 If Launch failed before the database exists, record that failure and stop only its recorded app group; do not claim the normal marker/database cleanup passed.
 Never kill by name.
+
+### Gotchas
+
+A live lane's own Claude session-end hooks can spawn processes at quit that inherit VEYRA_PARENT_PID and exit after the five-second check window.
+Distinguish them from a surviving provider by checking only saved pids, parent/group ids and executable basenames in memory: hook chains begin after quit, often have parent pid 1 and a group different from the recorded provider group.
+The observed chain was bash to Python to a versioned Claude executable; a provider leader remains in its saved group.
+Record counts and timing without printing arguments or environments, and let hook processes drain before retrying Cleanup.
+Keep the five-second leftover check unchanged, and signal only groups this run started and recorded.
 
 ## Helpers
 

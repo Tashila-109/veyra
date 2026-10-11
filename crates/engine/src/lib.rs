@@ -109,8 +109,8 @@ impl Engine {
                 .truncate(false),
         )?;
         let db = store::open(&data.path().join("veyra.db"))?;
-        process::start(store::live_processes(&db)?);
         let env = provider::env::ChildEnv::load();
+        process::start(store::live_processes(&db)?, &env);
         Self::launch(runtime, db, Spawner::Cli(env), Some(lock))
     }
     fn launch(

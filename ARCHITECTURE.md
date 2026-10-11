@@ -49,7 +49,7 @@ veyra -> gpui-kit + gpui-pre
 ```
 
 Direct versions are exact pins and `Cargo.lock` is kept.
-The engine's tokio features are `sync`, `rt-multi-thread`, `time`, `macros`, `process` and `io-util`.
+The engine's tokio features are `sync`, `rt-multi-thread`, `time`, `macros`, `process` and `io-util`; engine tests add `test-util`.
 Only the application crate declares gpui dependencies.
 `platform_boundary` scans for libc, socket, process-group, target and listed command strings outside `platform/`; the header's `git` child is a reviewed exception.
 Manifest review keeps gpui out of the engine and direct versions exact; no automated manifest check enforces those rules.
@@ -76,8 +76,11 @@ Cleanup kills only the shell's group; an escaped descendant keeping the pipe ope
 Only the lock holder stamps its pid or removes a stale debug socket.
 A second launch refuses the folder and exits 1.
 The OS releases the lock on exit or crash.
-`process::start` validates stored pid/group pairs against a provider leader's argv and its dead-parent `VEYRA_PARENT_PID` marker before signalling.
-A background sweep lists argv first and reads environments only for Claude, Codex, Grok or Veyra leaders.
+`process::start` resolves canonical provider binaries through the engine's ChildEnv before validating stored pid/group pairs.
+A provider leader is recognized by its argv basename or by a canonical executable path matching one of those binaries.
+Its dead-parent `VEYRA_PARENT_PID` marker must also validate before signalling.
+A background sweep lists argv and leader executable paths first and reads environments only for recognized provider or Veyra leaders.
+The macOS executable lookup uses `proc_pidpath`, so versioned native-installer binaries reached through provider symlinks qualify without widening environment reads.
 The sweep covers every same-user marked agent or Veyra group whose marker parent is dead, from any data folder.
 Every launch runs it, including disposable verification instances and tests that call Engine::start.
 It sends SIGTERM to validated orphans and revalidates them before SIGKILL one second later.
@@ -167,7 +170,7 @@ Stopping drops that session's later turn events; its Exited still matches the ep
 The actor waits for Exited before parking and spawning eligible queued work.
 A late end cannot settle another turn.
 Idle structured sessions park after ten minutes without a running turn, pending request or background work.
-The engine supports holds, queue reasons, cascaded Stop/Archive, Interrupt, Respond, wake delivery and task settlement.
+The engine supports holds, queue reasons, cascaded StopThread/ArchiveThread, Interrupt, Respond, wake delivery and task settlement.
 The composer's Stop button, Ctrl+C and Send with an empty draft during a running turn dispatch the Stop action, which sends the engine's Interrupt command.
 The sidebar's StopThread action sends the engine's StopThread command.
 Respond, Continue and DiscardQueued also have window controls.
@@ -189,14 +192,21 @@ Tasks cannot arise through the application because the tool server is not implem
 `can_use_tool` opens a typed approval or AskUserQuestion request.
 Unknown subtypes and malformed requests receive an error response without opening a request.
 Malformed includes empty tool names or ids, ids reused within that CLI process lifetime, non-object input, missing question text or option labels, and duplicate question texts.
-A pending request makes the thread NeedsYou and docks its exact command or question above the composer.
+A pending request makes the thread NeedsYou and docks its exact command, tool target or question above the composer.
+Non-command approvals show the tool and target path, with a consequence naming its operation and whether that target is inside or outside the project folder.
+ProposedAction retains optional input only for non-command tools, so a JSON-looking command still renders exactly as supplied.
+The optional input defaults absent when reading older rows and requires no schema migration.
+This presentation leaves exact-command grant eligibility unchanged.
 AllowOnce, AllowInThread and Deny answer approvals; AnswerQuestion collects one answer per question.
 Only an input whose keys are command, description or timeout may offer an exact-command thread grant.
 Inputs with any other field always dock without a grant offer.
 The dock shows 1 of N for multiple pending requests.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
+Because a docked request implies a running turn, composer Command+Return with an empty draft dispatches Stop, which interrupts the turn and expires the request.
 Approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
-Requests never take focus automatically, and answering a question keeps dock focus while another request remains.
+Requests never take focus automatically, and answering an approval or question keeps dock focus while another request remains.
+After the last response, focus returns to the composer; the check excludes the answered request by id rather than relying on projection lag.
+Approvals and questions share the same unfocused dock prompt and FocusDock chord.
 The focused dock has an accent border.
 StopThread and Interrupt expire pending requests, and the provider queues cancel replies before interrupt.
 There is no automatic request timeout.
@@ -204,7 +214,8 @@ Respond persists an answer before dispatching the native reply; question answers
 The command and codec boundaries share RequestKind::accepts, whose accepted decision carries the matching grant or question/answer rows.
 A mismatched codec answer sends nothing and leaves its request pending.
 The codec keeps used native request ids for the life of that CLI process so delayed replies cannot authorize a later request.
-A respawn starts a new codec; exit expires the engine's pending rows, and the old session's answer channel cannot reach the new process.
+A respawn starts a new codec, and exit expires the engine's pending rows.
+An engine respawn uses a new session channel; the resume-not-found relaunch reuses the channel, but its fresh codec drops answers for ids it never opened.
 AllowInThread stores the exact thread, tool and command in grants, and a later identical request is allowed without RequestOpened.
 Other commands, tools and threads still dock, including compound commands and requests in Full access.
 Turn completion and process exit expire pending requests and publish RequestClosed in the same transaction.
@@ -258,6 +269,7 @@ ChildEnv loads share one application-owned group registry, so the quit hook can 
 One session task owns the child, its stdin writer and a process-group guard.
 `ByteLines` caps each stdout and stderr line at 4 MiB and survives cancelled reads.
 Oversized lines and invalid JSON are skipped; diagnostics reveal lengths rather than raw content.
+Valid JSON that cannot decode as a Claude frame is also skipped, logging only its type without frame content.
 Each accepted stdout line is parsed once and its value passes through recording, root decoding and subagent decoding.
 The bounded stderr tail is redacted before display and supplies failures when the CLI exits unexpectedly.
 Interrupt and Shutdown queue deny replies for every open approval and question with `interrupt: true` before the protocol interrupt.
@@ -288,6 +300,7 @@ An active Veyra interrupt overrides that error outcome and suppresses newly arri
 Without an active Veyra interruption or latched assistant error, externally observed SIGHUP, SIGINT, SIGTERM or conventional signal exit codes produce Interrupted.
 Cleanup-generated signals do not change the outcome.
 After stdout EOF, the session awaits child.wait alongside stderr completion under the existing 500 ms deadline to observe the natural leader status before signalling cleanup.
+A child-wait error is logged and disables that wait arm while stderr retains the same deadline.
 It publishes a synthesized turn end before awaiting group cleanup, so post-KILL waits cannot extend the interrupt boundary beyond five seconds.
 Exited still follows cleanup, and the actor starts no queued work before Exited.
 Other abnormal exits produce Failed with Veyra's bounded, redacted crash text.
@@ -470,6 +483,7 @@ Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, repaints and max_batch_events.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
+The composer dock adds action_text and consequence from the same formatter the window renders.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
 
 ## Source map
@@ -495,10 +509,10 @@ Platform tests check the two-second login-shell bound, inherited-pipe deadline a
 Session tests check process exit classification and cleanup ordering.
 Request, grant and awake tests check request expiry, exact matching, thread isolation, needs_awake and retained-guard flags.
 They do not inspect caffeinate liveness or the OS assertion lifetime.
-Reaper tests check live parents, non-agent argv and the environment-read boundary.
+Reaper tests check live parents, non-agent argv, the environment-read boundary and stored/swept versioned binaries reached through a provider symlink.
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
 Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
-Application tests enable gpui test-support to exercise Shell selection and its event pump in a synthetic window.
+Application tests enable gpui test-support to exercise Shell selection, its event pump, dock text and focus, chords and empty-Send Stop through the keymap in a synthetic window.
 Shell tests load the login-shell PATH as the app does and run the startup orphan sweep.
 Their current-thread runtimes do not drive readiness tasks before replacing the probes, so those tests start no provider check.
 Clippy with -D warnings and cargo fmt --check check source quality.
@@ -506,7 +520,7 @@ The verify-veyra pages cover the real window, launch and relaunch row preservati
 Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.
 Permission-matrix records separately authorized live permission checks.
 Their Status lines record the lead's acceptance, independently of the recipes.
-The release page scans driver/override strings with a debug positive control and runs a socket-free release window.
+The app-launch page's release check scans driver/override strings with a debug positive control and runs a socket-free release window.
 The ignored live tests require fresh human consent; workspace tests compile them without running a provider.
 live_claude_approval_round_trip uses the public engine in Ask first to check an exact Bash request, Deny without a file, and AllowOnce on a repeat with the file created.
 Actor tests check account-error retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.

@@ -1,0 +1,11 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.294","scenario":"interrupt-continued","source":"Veyra hand-written SDK 0.3.293 scenario"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:initialize>","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:initialize>","response":{}}}}
+{"type":"expect_outbound","line":{"type":"user","uuid":"<id:prompt>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"<any>"}}}
+{"type":"emit_inbound","line":{"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"partial"}]},"parent_tool_use_id":null}}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"veyra-interrupt","request":{"subtype":"interrupt"}}}
+{"type":"emit_inbound","line":{"type":"result","subtype":"error_during_execution","is_error":false,"errors":["Request was aborted"]}}
+{"type":"expect_outbound","line":{"type":"user","uuid":"<id:second>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"<any>"}}}
+{"type":"emit_inbound","line":{"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"ok"}]},"parent_tool_use_id":null},"after_ms":4500}
+{"type":"emit_inbound","line":{"type":"result","subtype":"success","is_error":false}}
+{"type":"exit","code":0}

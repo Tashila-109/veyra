@@ -238,6 +238,8 @@ impl RequestKind {
 pub struct ProposedAction {
     pub tool: String,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Box<serde_json::Value>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
