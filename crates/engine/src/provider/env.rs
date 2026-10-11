@@ -3,17 +3,17 @@ use super::{ProviderError, ProviderKind};
 use crate::domain::ThreadId;
 use crate::platform;
 #[cfg(debug_assertions)]
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::collections::BTreeMap;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::LazyLock,
+    sync::{Arc, LazyLock, Mutex},
 };
 use tokio::process::{Child, Command};
+
+pub(crate) type Groups = Arc<Mutex<std::collections::BTreeSet<u32>>>;
+static GROUPS: LazyLock<Groups> = LazyLock::new(Default::default);
 
 struct LoginPath {
     path: OsString,
@@ -32,6 +32,7 @@ static LOGIN_PATH: LazyLock<LoginPath> = LazyLock::new(|| match platform::login_
 
 #[derive(Clone, Debug)]
 pub struct ChildEnv {
+    pub(crate) groups: Groups,
     pub path: OsString,
     pub home: Option<PathBuf>,
     #[cfg(debug_assertions)]
@@ -49,6 +50,7 @@ impl ChildEnv {
             tracing::warn!(%error, "login shell PATH unavailable; using inherited PATH");
         }
         Self {
+            groups: GROUPS.clone(),
             path: LOGIN_PATH.path.clone(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             #[cfg(debug_assertions)]
@@ -129,7 +131,11 @@ impl ChildEnv {
         }
         #[cfg(not(debug_assertions))]
         let _ = fixture;
-        Ok(cmd.spawn()?)
+        let child = cmd.spawn()?;
+        if let Err(error) = platform::lower_priority(child.id().expect("new child")) {
+            tracing::warn!(%error, "could not lower agent group priority");
+        }
+        Ok(child)
     }
 }
 fn executable(path: &Path) -> Option<PathBuf> {
@@ -167,6 +173,7 @@ mod tests {
     fn resolution_skips_relative_and_empty_path_entries() {
         if let Some(root) = std::env::var_os("VEYRA_TEST_RESOLUTION") {
             let env = super::ChildEnv {
+                groups: Default::default(),
                 path: "bin::.".into(),
                 home: None,
                 lanes: Default::default(),

@@ -451,5 +451,27 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
         };
         p.tasks.insert(t.id, t);
     }
+    let mut q = db.prepare("SELECT thread_id,tool,command FROM grants")?;
+    for row in q.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            GrantKey {
+                tool: r.get(1)?,
+                command: r.get(2)?,
+            },
+        ))
+    })? {
+        let (thread, key) = row?;
+        p.grants.insert((id(thread)?, key));
+    }
     Ok(p)
+}
+
+pub(crate) fn live_processes(db: &Connection) -> Result<Vec<(u32, u32)>, StoreError> {
+    let mut query = db.prepare(
+        "SELECT live_pid,live_pgid FROM threads WHERE live_pid IS NOT NULL AND live_pgid IS NOT NULL",
+    )?;
+    Ok(query
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?)
 }

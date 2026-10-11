@@ -142,3 +142,26 @@ fn platform_boundary_self_test() {
         vec![(4, "libc")]
     );
 }
+
+#[test]
+fn actor_no_blocking_io() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut violations = Vec::new();
+    for name in ["actor.rs", "store.rs", "commands.rs"] {
+        for (line, text) in blank_comments(&fs::read_to_string(root.join(name)).unwrap())
+            .lines()
+            .enumerate()
+        {
+            for needle in ["std::fs", "Command::new", "thread::sleep"] {
+                if text.contains(needle) {
+                    violations.push(format!("{name}:{}: {needle}", line + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "blocking actor calls: {}",
+        violations.join("\n")
+    );
+}

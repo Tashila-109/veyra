@@ -1,0 +1,4 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.296","scenario":"probe-signed-out","source":"Veyra signed-out Claude probe recording; hand-written with masked values"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"veyra-initialize","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"veyra-initialize","response":{"account":{"apiProvider":"<any>","tokenSource":"<any>"},"models":[{"value":"default","displayName":"Default"},{"value":"opus","displayName":"Opus"},{"value":"fable","displayName":"Fable"},{"value":"sonnet","displayName":"Sonnet"},{"value":"haiku","displayName":"Haiku"}]}}}}
+{"type":"exit","code":0}

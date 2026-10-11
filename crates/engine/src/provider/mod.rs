@@ -34,6 +34,7 @@ pub enum SessionControl {
         text: String,
     },
     Interrupt,
+    StorageBlocked,
     Answer {
         native: NativeRequestRef,
         reply: Reply,
@@ -178,6 +179,17 @@ pub struct Probe {
     pub readiness: Readiness,
     pub models: Vec<Model>,
     pub account: Option<serde_json::Value>,
+}
+pub(crate) fn signed_out_account(account: Option<&serde_json::Value>) -> bool {
+    account
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|account| {
+            account.contains_key("apiProvider")
+                && account.contains_key("tokenSource")
+                && !["email", "organization", "subscriptionType"]
+                    .iter()
+                    .any(|key| account.contains_key(*key))
+        })
 }
 impl Probe {
     pub fn account_presence(&self) -> &'static str {

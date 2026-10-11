@@ -1,3 +1,5 @@
+#[cfg(debug_assertions)]
+use std::{sync::Mutex, time::Instant};
 pub mod actor;
 pub mod commands;
 pub mod data_dir;
@@ -6,6 +8,7 @@ pub mod events;
 pub mod fixture;
 pub mod live;
 pub mod platform;
+pub mod process;
 pub mod provider;
 pub mod reconcile;
 pub mod record;
@@ -19,7 +22,14 @@ use data_dir::{DataDir, LockError};
 use domain::ThreadId;
 use events::{ThreadSnapshot, UiEvent};
 use provider::Spawner;
-use std::{fs::OpenOptions, sync::Arc, time::Duration};
+use std::{
+    fs::OpenOptions,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     runtime::Handle,
     sync::{mpsc, oneshot},
@@ -37,6 +47,39 @@ pub enum StartError {
 struct EngineInner {
     sender: mpsc::Sender<EngineMsg>,
     schema_version: u32,
+    state: Arc<RuntimeState>,
+    runtime: Handle,
+    groups: provider::env::Groups,
+}
+#[derive(Default)]
+pub(crate) struct RuntimeState {
+    pub awake: AtomicBool,
+    pub closing: AtomicBool,
+    #[cfg(debug_assertions)]
+    pub counters: Mutex<ProbeCounters>,
+    #[cfg(debug_assertions)]
+    pub processes: Mutex<std::collections::BTreeMap<ThreadId, u32>>,
+}
+#[cfg(debug_assertions)]
+#[derive(Default)]
+pub(crate) struct ProbeCounters {
+    pub commits: u64,
+    pub actor_max_ms: f64,
+    pub started: Option<Instant>,
+}
+#[cfg(debug_assertions)]
+#[derive(serde::Serialize)]
+pub struct Perf {
+    pub commits: u64,
+    pub actor_max_ms: f64,
+    pub actor_busy_ms: f64,
+}
+#[cfg(debug_assertions)]
+#[derive(serde::Serialize)]
+pub struct Process {
+    pub thread: ThreadId,
+    pub pid: u32,
+    pub resident_bytes: Option<u64>,
 }
 impl Drop for EngineInner {
     fn drop(&mut self) {
@@ -59,6 +102,7 @@ impl Engine {
                 .truncate(false),
         )?;
         let db = store::open(&data.path().join("veyra.db"))?;
+        process::start(store::live_processes(&db)?);
         let env = provider::env::ChildEnv::load();
         Self::launch(runtime, db, Spawner::Cli(env), Some(lock))
     }
@@ -73,6 +117,12 @@ impl Engine {
             .map_err(store::StoreError::from)?;
         let (sender, receiver) = mpsc::channel(256);
         let actor = Actor::new(db, sender.clone(), spawner)?;
+        let state = actor.state.clone();
+        let groups = match &actor.spawner {
+            Spawner::Cli(env) => env.groups.clone(),
+            #[cfg(test)]
+            Spawner::Scripted(_) => Default::default(),
+        };
         let handle = runtime.clone();
         let tick_sender = sender.clone();
         let tick = runtime.spawn(async move {
@@ -96,17 +146,86 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 sender,
                 schema_version: version,
+                state,
+                runtime: runtime.clone(),
+                groups,
             }),
         })
     }
     pub fn shutdown(&self) {
-        let _ = self.inner.sender.try_send(EngineMsg::Shutdown);
+        self.inner.state.closing.store(true, Ordering::Release);
+        if let Err(mpsc::error::TrySendError::Full(message)) =
+            self.inner.sender.try_send(EngineMsg::Shutdown)
+        {
+            let sender = self.inner.sender.clone();
+            self.inner.runtime.spawn(async move {
+                let _ = sender.send(message).await;
+            });
+        }
+    }
+    pub async fn shutdown_wait(&self) {
+        self.shutdown();
+        let sender = self.inner.sender.clone();
+        let _ = self
+            .inner
+            .runtime
+            .spawn(async move {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), sender.closed()).await;
+            })
+            .await;
+    }
+    pub async fn on_app_quit(&self) {
+        for &group in self.inner.groups.lock().unwrap().iter() {
+            let _ = platform::signal_group(group, platform::Signal::Terminate);
+        }
+        self.shutdown();
+        let _ = self
+            .inner
+            .runtime
+            .spawn(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            })
+            .await;
+    }
+    pub fn awake(&self) -> bool {
+        self.inner.state.awake.load(Ordering::Acquire)
+    }
+    #[cfg(debug_assertions)]
+    pub fn perf(&self) -> Perf {
+        let counters = self.inner.state.counters.lock().unwrap();
+        Perf {
+            commits: counters.commits,
+            actor_max_ms: counters.actor_max_ms,
+            actor_busy_ms: counters
+                .started
+                .map_or(0.0, |at| at.elapsed().as_secs_f64() * 1000.0),
+        }
+    }
+    #[cfg(debug_assertions)]
+    pub fn processes(&self) -> Vec<Process> {
+        self.inner
+            .state
+            .processes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&thread, &pid)| Process {
+                thread,
+                pid,
+                resident_bytes: platform::resident_bytes(pid).ok(),
+            })
+            .collect()
     }
     pub fn schema_version(&self) -> u32 {
         self.inner.schema_version
     }
     pub fn send(&self, command: Command) -> oneshot::Receiver<Result<Ack, CommandError>> {
         let (reply, rx) = oneshot::channel();
+        if self.inner.state.closing.load(Ordering::Acquire) {
+            let _ = reply.send(Err(CommandError::Closed));
+            return rx;
+        }
         match self
             .inner
             .sender

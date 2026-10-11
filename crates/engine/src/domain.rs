@@ -228,7 +228,7 @@ pub enum Decision {
     Deny,
     Answers(Vec<Answer>),
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GrantKey {
     pub tool: String,
     pub command: String,
@@ -276,6 +276,7 @@ pub struct Projection {
     pub turns: BTreeMap<TurnId, Turn>,
     pub items: BTreeMap<ItemId, Item>,
     pub requests: BTreeMap<RequestId, Request>,
+    pub grants: BTreeSet<(ThreadId, GrantKey)>,
     pub tasks: BTreeMap<TaskId, Task>,
     pub settings: Settings,
 }

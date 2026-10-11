@@ -150,12 +150,16 @@ fn spawn_failure_survives_full_actor_mailbox() {
 }
 #[test]
 fn full_actor_queue_refuses_commands_and_read_requests() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
     let (sender, _receiver) = mpsc::channel(1);
     sender.try_send(EngineMsg::Tick).unwrap();
     let engine = crate::Engine {
         inner: std::sync::Arc::new(crate::EngineInner {
             sender,
             schema_version: 1,
+            state: Default::default(),
+            runtime: runtime.handle().clone(),
+            groups: Default::default(),
         }),
     };
     assert!(matches!(
@@ -178,12 +182,16 @@ fn full_actor_queue_refuses_commands_and_read_requests() {
 }
 #[test]
 fn closed_actor_queue_reports_closed_instead_of_full() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
     let (sender, receiver) = mpsc::channel(1);
     drop(receiver);
     let engine = crate::Engine {
         inner: std::sync::Arc::new(crate::EngineInner {
             sender,
             schema_version: 1,
+            state: Default::default(),
+            runtime: runtime.handle().clone(),
+            groups: Default::default(),
         }),
     };
     assert!(matches!(
@@ -372,7 +380,10 @@ fn failing_store_on_turn_ended_blocks_and_retries() {
     ));
     assert_eq!(f.running(), Some(turn));
     assert_eq!(f.loaded().requests[&req].state, RequestState::Pending);
-    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Interrupt);
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::StorageBlocked
+    );
     assert!(matches!(
         f.drain()[0],
         UiEvent::StorageBlocked { error: Some(_) }

@@ -1,3 +1,5 @@
+mod awake;
+mod grants;
 mod perf;
 mod recovery;
 mod session_events;

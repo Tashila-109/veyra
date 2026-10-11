@@ -127,6 +127,31 @@ fn overlay<'a, K: Ord, V>(
 }
 
 impl ChangeSet {
+    pub fn stores_nothing(&self) -> bool {
+        let Self {
+            projects,
+            threads,
+            turns,
+            items,
+            requests,
+            tasks,
+            grants,
+            settings,
+            live,
+            events: _,
+            effects: _,
+        } = self;
+        projects.is_empty()
+            && threads.is_empty()
+            && turns.is_empty()
+            && items.is_empty()
+            && requests.is_empty()
+            && tasks.is_empty()
+            && grants.is_empty()
+            && settings.is_none()
+            && live.is_empty()
+    }
+
     pub fn status_event(
         &self,
         projection: &Projection,
@@ -203,6 +228,7 @@ impl ChangeSet {
             p.insert_item(item);
         }
         p.requests.extend(self.requests);
+        p.grants.extend(self.grants);
         p.tasks.extend(self.tasks);
         if let Some(settings) = self.settings {
             p.settings = settings;

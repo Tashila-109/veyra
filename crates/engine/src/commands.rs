@@ -330,6 +330,46 @@ fn respond(
                     ));
                 }
             }
+            if decision == Decision::AllowInThread
+                && matches!(
+                    r.kind,
+                    RequestKind::Approval {
+                        grant_key: None,
+                        ..
+                    }
+                )
+            {
+                return Err(CommandError::Invalid(
+                    "only commands can be allowed in this thread".into(),
+                ));
+            }
+            if let (RequestKind::Question { questions }, Decision::Answers(answers)) =
+                (&r.kind, &decision)
+            {
+                if questions.len() != answers.len() {
+                    return Err(CommandError::Invalid("answer every question".into()));
+                }
+                add_item(
+                    p,
+                    c,
+                    Item {
+                        id: ItemId::new(),
+                        thread,
+                        turn: r.turn,
+                        seq: 0,
+                        body: ItemBody::UserText(
+                            questions
+                                .iter()
+                                .zip(answers)
+                                .map(|(question, answer)| {
+                                    format!("{}: {}", question.text, answer.text)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                    },
+                );
+            }
             let mut r = r.clone();
             r.state = RequestState::Answered(decision.clone());
             if let (

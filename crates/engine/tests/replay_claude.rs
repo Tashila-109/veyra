@@ -976,3 +976,327 @@ fn shutdown_during_spawn_never_ready() {
             .unwrap();
         });
 }
+
+#[test]
+fn claude_probe_signed_out() {
+    let (scratch, env) = environment("ok-reply", false);
+    fs::copy(fixture("probe-signed-out"), scratch.0.join("probe.jsonl")).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let result = runtime.block_on(probe(&env, &scratch.0));
+    assert_eq!(result.readiness, Readiness::SignedOut);
+    assert_eq!(result.models.len(), 5);
+    fs::copy(fixture("probe-no-account"), scratch.0.join("probe.jsonl")).unwrap();
+    assert_eq!(
+        runtime.block_on(probe(&env, &scratch.0)).readiness,
+        Readiness::Ready
+    );
+}
+
+fn request_replay(
+    name: &str,
+    decisions: &[Decision],
+    stop_after: Option<usize>,
+) -> (Vec<ProviderEvent>, bool) {
+    let (scratch, env) = environment(name, false);
+    let events = Runtime::new().unwrap().block_on(async {
+        let (out, mut rx) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: None,
+                import: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut events = Vec::new();
+            let mut requests = 0;
+            let mut started = false;
+            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if !started && matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: TurnId::new(),
+                            text: "test".into(),
+                        })
+                        .unwrap();
+                    started = true;
+                }
+                if let ProviderEvent::Turn {
+                    event: TurnEvent::RequestOpened { native, .. },
+                    ..
+                } = &event
+                {
+                    if let Some(decision) = decisions.get(requests) {
+                        handle
+                            .control
+                            .send(SessionControl::Answer {
+                                native: native.clone(),
+                                reply: decision.clone(),
+                            })
+                            .unwrap();
+                    }
+                    requests += 1;
+                    if stop_after == Some(requests) {
+                        handle.control.send(SessionControl::Interrupt).unwrap();
+                    }
+                }
+                let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+            events
+        })
+        .await;
+        handle.control.send(SessionControl::Shutdown).ok();
+        result.unwrap()
+    });
+    let created = scratch.0.join("veyra-check.txt").exists();
+    (events, created)
+}
+#[test]
+fn claude_approval_allow() {
+    let (events, created) = request_replay("approval-allow", &[Decision::AllowOnce], None);
+    assert!(created);
+    assert_eq!(outcomes(&events), vec![TurnOutcome::Completed]);
+}
+#[test]
+fn claude_approval_deny() {
+    let (events, created) = request_replay("approval-deny", &[Decision::Deny], None);
+    assert!(!created);
+    assert_eq!(outcomes(&events), vec![TurnOutcome::Completed]);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Turn {
+        event: TurnEvent::RequestOpened { kind: RequestKind::Approval { action, .. }, .. }, ..
+    } if action.command == "touch veyra-check.txt"))
+    );
+}
+#[test]
+fn claude_question_answered() {
+    let (events, _) = request_replay(
+        "question",
+        &[Decision::Answers(vec![Answer {
+            text: "Short".into(),
+        }])],
+        None,
+    );
+    assert_eq!(outcomes(&events), vec![TurnOutcome::Completed]);
+    let expected = vec![Question {
+        text: "Choose a route".into(),
+        options: vec!["Short".into(), "Long".into()],
+    }];
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Turn {
+        event: TurnEvent::RequestOpened { kind: RequestKind::Question { questions }, .. }, ..
+    } if questions == &expected))
+    );
+}
+#[test]
+fn claude_unknown_request_gets_error() {
+    assert_eq!(
+        outcomes(&replay("unknown-request", false)),
+        vec![TurnOutcome::Completed]
+    );
+}
+#[test]
+fn claude_stop_cancels_pending_request() {
+    let (events, created) = request_replay("stop-pending-approval", &[], Some(2));
+    assert!(!created);
+    assert_eq!(
+        outcomes(&events),
+        vec![TurnOutcome::Interrupted {
+            reason: "Stopped by you".into()
+        }]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ProviderEvent::Turn {
+                    event: TurnEvent::RequestOpened { .. },
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+}
+#[test]
+fn late_interrupt_after_end_does_not_kill_next_prompt() {
+    let (scratch, mut env) = environment("ok-reply", false);
+    env.fixtures = None;
+    env.claude_bin = Some(stand_in(
+        &scratch,
+        "late-interrupt-cli",
+        r#"#!/usr/bin/env python3
+import json, sys, time
+count = 0
+for line in sys.stdin:
+    wire = json.loads(line)
+    if wire.get('request', {}).get('subtype') == 'initialize':
+        print(json.dumps({'type':'control_response','response':{'subtype':'success',
+            'request_id':wire['request_id'],'response':{}}}), flush=True)
+    if wire.get('type') == 'user':
+        count += 1
+        if count == 2: time.sleep(5)
+        print(json.dumps({'type':'result','subtype':'success','is_error':False,
+            'user_message_uuid':wire['uuid']}), flush=True)
+        if count == 2: break
+"#,
+    ));
+    let events = Runtime::new().unwrap().block_on(async {
+        let (out, mut rx) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: None,
+                import: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut events = Vec::new();
+            let mut ends = 0;
+            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: TurnId::new(),
+                            text: "first".into(),
+                        })
+                        .unwrap();
+                }
+                if matches!(
+                    event,
+                    ProviderEvent::Turn {
+                        event: TurnEvent::TurnEnded { .. },
+                        ..
+                    }
+                ) {
+                    ends += 1;
+                    if ends == 1 {
+                        handle.control.send(SessionControl::Interrupt).unwrap();
+                        handle
+                            .control
+                            .send(SessionControl::StartTurn {
+                                turn: TurnId::new(),
+                                text: "second".into(),
+                            })
+                            .unwrap();
+                    }
+                }
+                let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+            events
+        })
+        .await;
+        handle.control.send(SessionControl::Shutdown).ok();
+        result.unwrap()
+    });
+    assert_eq!(
+        outcomes(&events),
+        vec![TurnOutcome::Completed, TurnOutcome::Completed]
+    );
+}
+
+#[test]
+fn chatty_probe_stderr_does_not_block_initialize() {
+    let (scratch, mut env) = environment("ok-reply", false);
+    env.fixtures = None;
+    env.claude_bin = Some(stand_in(
+        &scratch,
+        "chatty-probe",
+        r#"#!/usr/bin/env python3
+import json, os, sys
+if '--version' in sys.argv:
+    print('2.1.296')
+else:
+    with open('probe-pid', 'w') as marker: marker.write(str(os.getpid()))
+    wire = json.loads(sys.stdin.readline())
+    sys.stderr.write('x' * (2 * 1024 * 1024))
+    sys.stderr.flush()
+    print(json.dumps({'type':'control_response','response':{'subtype':'success',
+        'request_id':wire['request_id'],'response':{'models':[{'value':'default'}]}}}), flush=True)
+"#,
+    ));
+    Runtime::new().unwrap().block_on(async {
+        let mut probes = Probes::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            probes.check(
+                &tokio::runtime::Handle::current(),
+                ProviderKind::Claude,
+                env.clone(),
+                scratch.0.clone(),
+            ),
+        )
+        .await;
+        drop(probes);
+        if let Ok(pid) = fs::read_to_string(scratch.0.join("probe-pid")) {
+            let pid: u32 = pid.parse().unwrap();
+            let cleaned = tokio::time::timeout(Duration::from_secs(3), async {
+                while veyra_engine::platform::is_alive(pid).unwrap() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            if cleaned.is_err() {
+                let _ =
+                    veyra_engine::platform::signal_group(pid, veyra_engine::platform::Signal::Kill);
+            }
+            cleaned.unwrap();
+        }
+        let probe = result.expect("stderr blocked initialize").unwrap();
+        assert_eq!(probe.readiness, Readiness::Ready);
+        assert_eq!(probe.models[0].value, "default");
+    });
+}
+
+#[test]
+fn fake_touch_rejects_absolute_and_parent_paths() {
+    let (scratch, env) = environment("ok-reply", false);
+    let transcript = scratch.0.join("touch.jsonl");
+    for path in ["/tmp/veyra-invalid-touch", "../veyra-invalid-touch"] {
+        let record = serde_json::json!({"type":"touch", "path":path});
+        fs::write(&transcript, format!("{record}\n")).unwrap();
+        let output = std::process::Command::new(env.claude_bin.as_ref().unwrap())
+            .env("VEYRA_FAKE_FIXTURE", &transcript)
+            .current_dir(&scratch.0)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("touch path must stay within"));
+    }
+    assert!(!scratch.0.join("veyra-invalid-touch").exists());
+}

@@ -25,6 +25,12 @@ pub enum Record {
         #[serde(default = "once")]
         repeat: usize,
     },
+    Touch {
+        path: String,
+    },
+    Spin {
+        ms: u64,
+    },
     Exit {
         code: i32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

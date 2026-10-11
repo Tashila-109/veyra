@@ -74,6 +74,7 @@ impl Scripted {
                         }
                     }
                     SessionControl::StartTurn { .. }
+                    | SessionControl::StorageBlocked
                     | SessionControl::Interrupt
                     | SessionControl::Answer { .. } => {}
                 }

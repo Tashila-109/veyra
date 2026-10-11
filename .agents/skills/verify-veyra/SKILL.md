@@ -338,7 +338,7 @@ Every exit-1 expectation must also assert its named stderr line.
 A timeout does not cancel an enqueued action; run Doctor before retrying.
 After another Send on an existing thread, gate `wait Done` on the new turn row or a changed status so the preceding Done cannot satisfy it.
 
-The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf` and `notice`.
+The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes` and `notice`.
 `header_branch` is the branch text used by the header and is empty after leaving Chat.
 `view` is `new_thread`, `chat`, `failed_thread` or `settings`.
 `sidebar.rows` holds project and thread rows, with each thread's own status.
@@ -347,6 +347,11 @@ The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `ap
 `providers` reports each probe's path, version, models, readiness and `account`, either `known` or `unknown`, with no account value.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
 `composer.provider_picker_open` reports the picker opened by `OpenProviderPicker` or ⌘⌥⇧P.
+`awake` reports the engine's idle-sleep guard.
+`processes` lists each reported live CLI with its thread, pid and resident bytes, retaining retiring groups until Exited.
+`perf.commits`, `perf.actor_max_ms` and `perf.actor_busy_ms` expose committed transactions and actor timing.
+`perf.repaints` counts window renders and `perf.max_batch_events` counts the largest applied pump batch.
+The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and blocks the main thread for that interval.
 `settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
 Before every capture, the debug-only `ActivateWindow` action activates Veyra from inside the app.
 Capture checks the owned window is on-screen and verifies it remains frontmost.

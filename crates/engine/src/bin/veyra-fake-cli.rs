@@ -69,6 +69,29 @@ fn run() -> io::Result<i32> {
                 }
                 output.flush()?;
             }
+            Record::Touch { path } => {
+                let path = std::path::Path::new(&path);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir)
+                {
+                    return Err(io::Error::other(
+                        "touch path must stay within the project folder",
+                    ));
+                }
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(path)?;
+            }
+            Record::Spin { ms } => {
+                let start = std::time::Instant::now();
+                while start.elapsed() < Duration::from_millis(ms) {
+                    std::hint::spin_loop();
+                }
+            }
             Record::Exit { code, stderr } => {
                 for line in stderr {
                     eprintln!("{line}");

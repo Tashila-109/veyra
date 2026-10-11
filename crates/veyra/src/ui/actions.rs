@@ -60,6 +60,13 @@ choice_action!(ToggleItem, item, ItemId);
 pub struct SetSidebarWidth {
     pub width: f32,
 }
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugStallUi {
+    pub milliseconds: u64,
+}
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([

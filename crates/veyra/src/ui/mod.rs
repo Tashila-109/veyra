@@ -52,6 +52,8 @@ struct AppState {
     statuses: BTreeMap<ThreadId, Status>,
     snapshot_sequence: u64,
     applied_batches: u64,
+    #[cfg(debug_assertions)]
+    max_batch_events: usize,
     max_batch_gap_ms: f64,
     last_text_batch: Option<Instant>,
 }
@@ -69,6 +71,10 @@ fn event_thread(event: &UiEvent) -> Option<(ThreadId, u64)> {
 }
 impl AppState {
     fn apply_all(&mut self, events: Vec<UiEvent>) {
+        #[cfg(debug_assertions)]
+        {
+            self.max_batch_events = self.max_batch_events.max(events.len());
+        }
         self.applied_batches += 1;
         if events.iter().any(|event| {
             matches!(
@@ -361,6 +367,8 @@ where
     values.get(index.map(|index| (index + 1) % values.len()).unwrap_or(0))
 }
 pub struct Shell {
+    #[cfg(debug_assertions)]
+    repaints: u64,
     focus: FocusHandle,
     sidebar_width: Pixels,
     resizing: bool,
@@ -496,6 +504,8 @@ impl Shell {
         })
         .detach();
         let mut shell = Self {
+            #[cfg(debug_assertions)]
+            repaints: 0,
             focus,
             sidebar_width: cx.global::<Theme>().layout.sidebar_default,
             resizing: false,
@@ -983,6 +993,7 @@ impl Shell {
     }
     #[cfg(debug_assertions)]
     pub fn dump(&self, data_dir: &std::path::Path, cx: &App) -> serde_json::Value {
+        let perf = self.engine.perf();
         serde_json::json!({
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
@@ -991,7 +1002,10 @@ impl Shell {
             "selected_thread":self.dump_selected(), "transcript":self.dump_transcript(),
             "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(),
             "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
-            "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.max_batch_gap_ms},
+            "awake":self.engine.awake(), "processes":self.engine.processes(),
+            "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.max_batch_gap_ms,
+                "commits":perf.commits, "actor_max_ms":perf.actor_max_ms, "actor_busy_ms":perf.actor_busy_ms,
+                "repaints":self.repaints, "max_batch_events":self.state.max_batch_events},
             "notice":self.notice.as_ref().map(|notice| notice.as_ref())
         })
     }
@@ -1012,6 +1026,10 @@ impl Focusable for Shell {
 }
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(debug_assertions)]
+        {
+            self.repaints += 1;
+        }
         let theme = cx.global::<Theme>().clone();
         let root = div()
             .h_flex()
@@ -1259,6 +1277,13 @@ impl Render for Shell {
                     }),
             );
         #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|_, action: &DebugStallUi, window, cx| {
+            let milliseconds = action.milliseconds;
+            cx.defer_in(window, move |_, _, _| {
+                std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+            });
+        }));
+        #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|_, _: &ActivateWindow, window, cx| {
             cx.activate(true);
             window.activate_window();
@@ -1363,6 +1388,7 @@ mod tests {
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
         )
         .unwrap();
+        runtime.block_on(engine.shutdown_wait());
         let (sender, events) = tokio::sync::mpsc::unbounded_channel();
         cx.update(gpui_kit::init);
         cx.skip_drawing();

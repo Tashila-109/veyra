@@ -1,0 +1,14 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.296","scenario":"approval-grant","source":"Veyra scripted control-protocol wires from SDK types"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}
+{"type":"expect_outbound","line":{"type":"user","uuid":"<id:prompt>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"<any>"}}}
+{"type":"emit_inbound","line":{"type":"control_request","request_id":"grant-one","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch veyra-grant.txt"}}}}
+{"type":"expect_outbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"grant-one","response":{"behavior":"allow"}}}}
+{"type":"touch","path":"veyra-grant.txt"}
+{"type":"emit_inbound","line":{"type":"control_request","request_id":"grant-two","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch veyra-grant.txt"}}}}
+{"type":"expect_outbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"grant-two","response":{"behavior":"allow"}}}}
+{"type":"touch","path":"veyra-grant.txt"}
+{"type":"emit_inbound","line":{"type":"control_request","request_id":"grant-compound","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch veyra-grant.txt && touch compound.txt"}}}}
+{"type":"expect_outbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"grant-compound","response":{"behavior":"deny","message":"Denied by you"}}}}
+{"type":"emit_inbound","line":{"type":"result","subtype":"success","is_error":false}}
+{"type":"exit","code":0}

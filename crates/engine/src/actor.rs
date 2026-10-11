@@ -1,4 +1,5 @@
 use crate::{
+    RuntimeState,
     commands::{self, Ack, Command, CommandError},
     domain::*,
     events::{ChangeEvent as Ev, ChangeSet, Effect, ThreadSnapshot, UiEvent},
@@ -10,6 +11,7 @@ use crate::{
 use rusqlite::Connection;
 use std::{
     collections::{BTreeMap, VecDeque},
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -46,6 +48,24 @@ pub enum EngineMsg {
     TextWrite,
     Subscribe(mpsc::UnboundedSender<UiEvent>),
     Shutdown,
+    ShutdownDeadline,
+}
+impl EngineMsg {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Command { .. } => "command",
+            Self::Snapshot { .. } => "snapshot",
+            Self::Provider { .. } => "provider",
+            Self::Terminal { .. } => "terminal",
+            Self::Tool { .. } => "tool",
+            Self::Tick => "tick",
+            Self::TextFlush => "text_flush",
+            Self::TextWrite => "text_write",
+            Self::Subscribe(_) => "subscribe",
+            Self::Shutdown => "shutdown",
+            Self::ShutdownDeadline => "shutdown_deadline",
+        }
+    }
 }
 #[derive(Default)]
 struct TextBuffer {
@@ -62,6 +82,9 @@ struct Blocked {
     deferred: VecDeque<EngineMsg>,
 }
 pub struct Actor {
+    pub(crate) state: Arc<RuntimeState>,
+    awake: Option<crate::platform::AwakeGuard>,
+    shutting_down: bool,
     pub(crate) db: Connection,
     pub(crate) projection: Projection,
     pub(crate) live: BTreeMap<ThreadId, LiveThread>,
@@ -109,6 +132,9 @@ impl Actor {
             .collect();
         let idle_since = projection.threads.keys().map(|id| (*id, now())).collect();
         let mut actor = Self {
+            state: Default::default(),
+            awake: None,
+            shutting_down: false,
             db,
             projection,
             live,
@@ -140,14 +166,59 @@ impl Actor {
     pub(crate) fn run(mut self, mut rx: mpsc::Receiver<EngineMsg>, runtime: Handle) {
         let _entered = runtime.enter();
         while let Some(msg) = rx.blocking_recv() {
-            if matches!(msg, EngineMsg::Shutdown) {
-                self.shutdown();
+            let deadline = matches!(msg, EngineMsg::ShutdownDeadline);
+            self.handle(msg);
+            if self.shutting_down
+                && (deadline
+                    || self
+                        .live
+                        .values()
+                        .all(|live| matches!(live.live, Live::Parked)))
+            {
                 break;
             }
-            self.handle(msg);
         }
     }
     pub(crate) fn handle(&mut self, msg: EngineMsg) {
+        let start = Instant::now();
+        let kind = msg.kind();
+        #[cfg(debug_assertions)]
+        {
+            self.state.counters.lock().unwrap().started = Some(start);
+        }
+        self.handle_inner(msg);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(debug_assertions)]
+        {
+            let mut counters = self.state.counters.lock().unwrap();
+            counters.actor_max_ms = counters.actor_max_ms.max(ms);
+            counters.started = None;
+        }
+        if ms > 50.0 {
+            tracing::warn!(kind, elapsed_ms = ms, "engine actor message exceeded 50 ms");
+        }
+    }
+    fn handle_inner(&mut self, msg: EngineMsg) {
+        if self.shutting_down {
+            match msg {
+                EngineMsg::Command { reply, .. } => {
+                    let _ = reply.send(Err(CommandError::Closed));
+                    return;
+                }
+                EngineMsg::Provider {
+                    thread,
+                    epoch,
+                    event: ProviderEvent::Session(SessionEvent::Exited { crash }),
+                } if self.current(thread, epoch) => {
+                    let c = self.exited(thread, crash);
+                    self.commit_event(c);
+                    return;
+                }
+                EngineMsg::ShutdownDeadline => return,
+                EngineMsg::Snapshot { .. } | EngineMsg::Subscribe(_) => {}
+                _ => return,
+            }
+        }
         if let Some(blocked) = &mut self.blocked {
             match msg {
                 EngineMsg::Command { reply, .. } => {
@@ -176,6 +247,7 @@ impl Actor {
                 EngineMsg::Snapshot { .. }
                 | EngineMsg::Subscribe(_)
                 | EngineMsg::Shutdown
+                | EngineMsg::ShutdownDeadline
                 | EngineMsg::TextFlush => {}
             }
         }
@@ -311,6 +383,7 @@ impl Actor {
                 self.subscribers.push(tx);
             }
             EngineMsg::Shutdown => self.shutdown(),
+            EngineMsg::ShutdownDeadline => {}
         }
     }
     fn write(&mut self, c: &ChangeSet) -> Result<(), StoreError> {
@@ -318,21 +391,16 @@ impl Actor {
         if self.fail_write {
             return Err(StoreError::Invalid("injected storage failure".into()));
         }
-        if c.projects.is_empty()
-            && c.threads.is_empty()
-            && c.turns.is_empty()
-            && c.items.is_empty()
-            && c.requests.is_empty()
-            && c.tasks.is_empty()
-            && c.grants.is_empty()
-            && c.settings.is_none()
-            && c.live.is_empty()
-        {
+        if c.stores_nothing() {
             return Ok(());
         }
         let tx = self.db.transaction()?;
         store::apply(&tx, c, now())?;
         tx.commit()?;
+        #[cfg(debug_assertions)]
+        {
+            self.state.counters.lock().unwrap().commits += 1;
+        }
         #[cfg(test)]
         {
             self.test_commits += 1;
@@ -344,7 +412,13 @@ impl Actor {
         if let Err(error) = self.write(&c) {
             for live in self.live.values() {
                 if let Some(session) = live.live.session() {
-                    let _ = session.control.send(SessionControl::Interrupt);
+                    let control =
+                        if self.shutting_down || matches!(live.live, Live::Starting { .. }) {
+                            SessionControl::Shutdown
+                        } else {
+                            SessionControl::StorageBlocked
+                        };
+                    let _ = session.control.send(control);
                 }
                 if let Live::Terminal { term, .. } = &live.live {
                     let _ = term.control.send(TerminalControl::Stop);
@@ -442,6 +516,18 @@ impl Actor {
             .chain(c.live.keys().copied())
             .collect();
         let (events, effects) = c.install(&mut self.projection, &mut self.live);
+        self.update_awake();
+        #[cfg(debug_assertions)]
+        {
+            let mut processes = self.state.processes.lock().unwrap();
+            processes.retain(|thread, _| !matches!(self.live[thread].live, Live::Parked));
+            for (&thread, live) in &self.live {
+                if let Live::Structured { pid, .. } = live.live {
+                    processes.insert(thread, pid);
+                }
+            }
+        }
+
         for id in changed {
             if !self
                 .projection
@@ -842,15 +928,32 @@ impl Actor {
                 },
             ),
             TurnEvent::RequestOpened { native, kind } => {
+                let granted = matches!(&kind, RequestKind::Approval { grant_key: Some(key), .. }
+                    if self.projection.grants.contains(&(thread, key.clone())));
                 let r = Request {
                     id: RequestId::new(),
                     thread,
                     turn: turn.id,
                     native,
                     kind,
-                    state: RequestState::Pending,
+                    state: if granted {
+                        RequestState::Answered(Decision::AllowOnce)
+                    } else {
+                        RequestState::Pending
+                    },
                 };
-                c.events.push(Ev::RequestOpened(r.clone()));
+                if granted {
+                    c.events.push(Ev::RequestClosed(r.clone()));
+                    c.effects.push(Effect::Control {
+                        thread,
+                        control: SessionControl::Answer {
+                            native: r.native.clone(),
+                            reply: Decision::AllowOnce,
+                        },
+                    });
+                } else {
+                    c.events.push(Ev::RequestOpened(r.clone()));
+                }
                 c.requests.insert(r.id, r);
             }
             TurnEvent::TurnEnded { outcome, .. } => {
@@ -1150,15 +1253,75 @@ impl Actor {
             counter: *self.counters.get(&thread).unwrap_or(&0),
         }
     }
-    fn shutdown(&mut self) {
-        for live in self.live.values() {
-            if let Some(session) = live.live.session() {
-                let _ = session.control.send(SessionControl::Shutdown);
+    fn update_awake(&mut self) {
+        let needed = crate::live::needs_awake(&self.projection, &self.live);
+        if needed && self.awake.is_none() {
+            match crate::platform::hold_awake(std::process::id()) {
+                Ok(guard) => self.awake = Some(guard),
+                Err(error) => tracing::warn!(%error, "could not hold idle sleep"),
             }
-            if let Live::Terminal { term, .. } = &live.live {
-                let _ = term.control.send(TerminalControl::Stop);
+        } else if !needed {
+            self.awake = None;
+        }
+        self.state
+            .awake
+            .store(self.awake.is_some(), Ordering::Release);
+    }
+    fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        self.state.closing.store(true, Ordering::Release);
+        let mut c = ChangeSet::default();
+        let turns: Vec<_> = self
+            .projection
+            .turns
+            .values()
+            .filter(|turn| matches!(turn.state, TurnState::Running { .. }))
+            .cloned()
+            .collect();
+        for turn in turns {
+            commands::end_turn(
+                &self.projection,
+                &mut c,
+                turn,
+                TurnOutcome::Interrupted {
+                    reason: "Veyra closed while this turn ran".into(),
+                },
+                now(),
+            );
+        }
+        for request in self
+            .projection
+            .requests
+            .values()
+            .filter(|r| r.state == RequestState::Pending)
+        {
+            commands::expire_requests(&self.projection, &mut c, request.turn, "Veyra is closing");
+        }
+        for (&thread, live) in &self.live {
+            if live.live.session().is_some() {
+                c.effects.push(Effect::Control {
+                    thread,
+                    control: SessionControl::Shutdown,
+                });
+                let mut live = live.clone();
+                live.live = Live::Stopping {
+                    then: AfterStop::Park,
+                };
+                c.live.insert(thread, live);
+            }
+            if let Live::Terminal { .. } = &live.live {
+                c.effects.push(Effect::StopTerminal { thread });
             }
         }
+        self.commit_event(c);
+        let out = self.out.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = out.send(EngineMsg::ShutdownDeadline).await;
+        });
     }
 }
 

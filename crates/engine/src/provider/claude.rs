@@ -173,10 +173,22 @@ pub(crate) struct InitializeReply {
 #[serde(default)]
 struct ControlRequest {
     request_id: String,
+    request: ToolRequest,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ToolRequest {
+    subtype: String,
+    tool_name: String,
+    input: Value,
+}
+struct PendingRequest {
+    input: Value,
+    kind: RequestKind,
 }
 
-pub(crate) fn probe_reply(line: &str) -> Result<Option<InitializeReply>, super::ProviderError> {
-    let frame: Frame = serde_json::from_str(line)?;
+pub(crate) fn probe_value(wire: Value) -> Result<Option<InitializeReply>, super::ProviderError> {
+    let frame: Frame = serde_json::from_value(wire)?;
     if let Frame::ControlResponse(reply) = frame
         && reply.response.request_id == INITIALIZE_ID
     {
@@ -254,6 +266,49 @@ struct Block {
     content: ContentBlock,
     input: String,
     streamed: bool,
+    text_filter: TextFilter,
+}
+enum TextFilter {
+    Plain,
+    Prefix(String),
+    Drop,
+}
+impl TextFilter {
+    fn text(&mut self, text: String) -> Option<String> {
+        let Self::Prefix(prefix) = self else {
+            return if matches!(self, Self::Plain) {
+                Some(text)
+            } else {
+                None
+            };
+        };
+        prefix.push_str(&text);
+        if prefix.starts_with("[ede_diagnostic]") {
+            *self = Self::Drop;
+            None
+        } else if "[ede_diagnostic]".starts_with(prefix.as_str()) {
+            None
+        } else {
+            let text = std::mem::take(prefix);
+            *self = Self::Plain;
+            Some(text)
+        }
+    }
+}
+pub(crate) enum InterruptPhase {
+    Protocol(tokio::time::Instant),
+    Terminate(tokio::time::Instant),
+}
+impl InterruptPhase {
+    pub fn deadline(&self) -> tokio::time::Instant {
+        match self {
+            Self::Protocol(at) | Self::Terminate(at) => *at,
+        }
+    }
+}
+pub(crate) struct Interruption {
+    pub phase: InterruptPhase,
+    pub reason: String,
 }
 fn log_ignored(kind: &str, value: &Value) {
     tracing::info!(
@@ -402,7 +457,8 @@ pub(crate) struct Codec {
     stream: MessageStream,
     tools: BTreeMap<String, Tool>,
     error: Option<AssistantError>,
-    interrupted: bool,
+    pub interrupted: Option<Interruption>,
+    requests: BTreeMap<String, PendingRequest>,
 }
 #[derive(Default)]
 pub(crate) struct Decoded {
@@ -418,15 +474,16 @@ impl Codec {
             pid,
             stream: MessageStream::default(),
             error: None,
-            interrupted: false,
+            interrupted: None,
             tools: BTreeMap::new(),
+            requests: BTreeMap::new(),
         }
     }
     pub fn start(&mut self, turn: TurnId, text: String) -> Value {
         self.active = Some(ActiveTurn::Veyra(turn));
         self.stream = MessageStream::default();
         self.error = None;
-        self.interrupted = false;
+        self.interrupted = None;
         json!({
             "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
             "parent_tool_use_id":null, "message":{"role":"user","content":text}
@@ -444,8 +501,12 @@ impl Codec {
             capabilities,
         })
     }
+    #[cfg(test)]
     pub fn line(&mut self, line: &str) -> Result<Decoded, super::ProviderError> {
-        let frame: Frame = serde_json::from_str(line)?;
+        self.value(serde_json::from_str(line)?)
+    }
+    pub fn value(&mut self, mut wire: Value) -> Result<Decoded, super::ProviderError> {
+        let frame: Frame = serde_json::from_value(wire.clone())?;
         let mut decoded = Decoded::default();
         let parent = match &frame {
             Frame::Assistant(frame) => frame.parent_tool_use_id.as_deref(),
@@ -454,7 +515,6 @@ impl Codec {
             _ => None,
         };
         if let Some(parent) = parent {
-            let mut wire: Value = serde_json::from_str(line)?;
             if let Some(tool) = self.tools.get_mut(parent)
                 && let Some(codec) = &mut tool.subagent
             {
@@ -475,7 +535,7 @@ impl Codec {
                     }
                 } else {
                     wire["parent_tool_use_id"] = Value::Null;
-                    for event in codec.line(&wire.to_string())?.events {
+                    for event in codec.value(wire)?.events {
                         if let ProviderEvent::Turn {
                             event: TurnEvent::TextDelta { text, .. },
                             ..
@@ -524,14 +584,14 @@ impl Codec {
             }
             Frame::User(user) => self.user(user, &mut events),
             Frame::StreamEvent(stream) => {
-                self.stream(stream.event, line, &mut events)?;
+                self.stream(stream.event, &wire, &mut events)?;
             }
             Frame::Assistant(assistant) => self.assistant(assistant, &mut events)?,
             Frame::Result(result) => {
                 if self.owns_result(&result) {
                     events.push(TurnEvent::TurnEnded {
-                        outcome: if self.interrupted {
-                            TurnOutcome::Interrupted { reason: "Stopped by you".into() }
+                        outcome: if let Some(interrupt) = &self.interrupted {
+                            TurnOutcome::Interrupted { reason: interrupt.reason.clone() }
                         } else if let Some(error) = &self.error {
                             TurnOutcome::Failed { message: error.message.clone() }
                         } else { result.outcome() },
@@ -548,15 +608,26 @@ impl Codec {
                         "Claude usage limit: {}; resets at {}.", rate_limit_info.status, reset)));
                 }
             }
-            Frame::ControlRequest(request) => decoded.replies.push(json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "error", "request_id": request.request_id,
-                    "error": "This request is not supported by Veyra"
+            Frame::ControlRequest(request) => {
+                if let Some(kind) = self.request(&request) {
+                    self.requests.insert(request.request_id.clone(), PendingRequest {
+                        input: request.request.input,
+                        kind: kind.clone(),
+                    });
+                    events.push(TurnEvent::RequestOpened {
+                        native: NativeRequestRef(request.request_id), kind,
+                    });
+                } else {
+                    decoded.replies.push(json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "error", "request_id": request.request_id,
+                            "error": "This request is not supported by Veyra"
+                        }
+                    }));
                 }
-            })),
+            }
             Frame::ControlResponse(_) | Frame::Unknown => {
-                let wire: Value = serde_json::from_str(line)?;
                 tracing::info!(
                     frame_type = wire["type"].as_str().unwrap_or("unknown"),
                     subtype = wire["subtype"].as_str().unwrap_or(""),
@@ -581,12 +652,111 @@ impl Codec {
             self.stream = MessageStream::default();
             self.tools.clear();
             self.error = None;
-            self.interrupted = false;
+            self.interrupted = None;
+            self.requests.clear();
         }
         Ok(decoded)
     }
-    pub fn interrupt(&mut self) {
-        self.interrupted = true;
+    #[cfg(test)]
+    pub fn interrupt(&mut self) -> bool {
+        self.interrupt_for("Stopped by you")
+    }
+    pub fn interrupt_for(&mut self, reason: &str) -> bool {
+        if self.active.is_none() {
+            return false;
+        }
+        self.interrupted.get_or_insert_with(|| Interruption {
+            phase: InterruptPhase::Protocol(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+            ),
+            reason: reason.into(),
+        });
+        true
+    }
+    fn request(&self, request: &ControlRequest) -> Option<RequestKind> {
+        let tool = &request.request;
+        if tool.subtype != "can_use_tool"
+            || tool.tool_name.is_empty()
+            || request.request_id.is_empty()
+            || self.requests.contains_key(&request.request_id)
+            || !tool.input.is_object()
+        {
+            return None;
+        }
+        if tool.tool_name == "AskUserQuestion" {
+            let questions = tool.input["questions"]
+                .as_array()?
+                .iter()
+                .map(|question| {
+                    let text = question["question"].as_str()?.to_owned();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let options = question["options"]
+                        .as_array()?
+                        .iter()
+                        .map(|option| option["label"].as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()?;
+                    Some(Question { text, options })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if questions.is_empty() {
+                return None;
+            }
+            Some(RequestKind::Question { questions })
+        } else {
+            let command = tool.input["command"].as_str();
+            Some(RequestKind::Approval {
+                action: ProposedAction {
+                    tool: tool.tool_name.clone(),
+                    command: command.map_or_else(|| tool.input.to_string(), str::to_owned),
+                },
+                grant_key: command.map(|command| GrantKey {
+                    tool: tool.tool_name.clone(),
+                    command: command.into(),
+                }),
+            })
+        }
+    }
+    pub fn answer(&mut self, native: NativeRequestRef, decision: Decision) -> Option<Value> {
+        let request = self.requests.remove(&native.0)?;
+        let response = match decision {
+            Decision::AllowOnce | Decision::AllowInThread => json!({"behavior":"allow"}),
+            Decision::Deny => json!({"behavior":"deny", "message":"Denied by you"}),
+            Decision::Answers(answers) => {
+                let RequestKind::Question { questions } = request.kind else {
+                    return None;
+                };
+                let mut input = request.input;
+                input["answers"] = Value::Object(
+                    questions
+                        .into_iter()
+                        .zip(answers)
+                        .map(|(question, answer)| (question.text, Value::String(answer.text)))
+                        .collect(),
+                );
+                json!({"behavior":"allow", "updatedInput":input})
+            }
+        };
+        Some(Self::response(native.0, response))
+    }
+    pub fn cancel_requests(&mut self, reason: &str) -> Vec<Value> {
+        std::mem::take(&mut self.requests)
+            .into_keys()
+            .map(|id| {
+                Self::response(
+                    id,
+                    json!({
+                        "behavior":"deny", "message":reason, "interrupt":true
+                    }),
+                )
+            })
+            .collect()
+    }
+    fn response(id: String, response: Value) -> Value {
+        json!({"type":"control_response", "response":{
+            "subtype":"success", "request_id":id, "response":response
+        }})
     }
     pub fn failure(&self) -> Option<&str> {
         self.error.as_ref().map(|error| error.message.as_str())
@@ -677,7 +847,7 @@ impl Codec {
     fn stream(
         &mut self,
         event: Event,
-        line: &str,
+        wire: &Value,
         events: &mut Vec<TurnEvent>,
     ) -> Result<(), super::ProviderError> {
         let unknown = match &event {
@@ -693,8 +863,7 @@ impl Codec {
             _ => None,
         };
         if let Some((kind, path)) = unknown {
-            let wire: Value = serde_json::from_str(line)?;
-            log_ignored(kind, path.iter().fold(&wire, |value, key| &value[*key]));
+            log_ignored(kind, path.iter().fold(wire, |value, key| &value[*key]));
         }
         match event {
             Event::MessageStart { message } => {
@@ -715,6 +884,22 @@ impl Codec {
                 if let ContentBlock::ToolUse { id, name, .. } = &content_block {
                     self.tool(id.clone(), name, key.clone());
                 }
+                let text_filter = if self.interrupted.is_some()
+                    && matches!(content_block, ContentBlock::Text { .. })
+                {
+                    let prefix = if let ContentBlock::Text { text } = &content_block {
+                        text.clone()
+                    } else {
+                        String::new()
+                    };
+                    if prefix.starts_with("[ede_diagnostic]") {
+                        TextFilter::Drop
+                    } else {
+                        TextFilter::Prefix(prefix)
+                    }
+                } else {
+                    TextFilter::Plain
+                };
                 self.stream.blocks.insert(
                     index,
                     Block {
@@ -722,6 +907,7 @@ impl Codec {
                         content: content_block,
                         input: String::new(),
                         streamed: false,
+                        text_filter,
                     },
                 );
             }
@@ -730,11 +916,13 @@ impl Codec {
                     match delta {
                         Delta::Text { text } => {
                             block.streamed = true;
-                            events.push(TurnEvent::TextDelta {
-                                key: block.key.clone(),
-                                text,
-                                streamed: true,
-                            });
+                            if let Some(text) = block.text_filter.text(text) {
+                                events.push(TurnEvent::TextDelta {
+                                    key: block.key.clone(),
+                                    text,
+                                    streamed: true,
+                                });
+                            }
                         }
                         Delta::Thinking { thinking } => {
                             if thinking.is_empty() {
@@ -752,7 +940,16 @@ impl Codec {
                 }
             }
             Event::ContentBlockStop { index } => {
-                if let Some(block) = self.stream.blocks.get(&index) {
+                if let Some(block) = self.stream.blocks.get_mut(&index) {
+                    if let TextFilter::Prefix(text) = &mut block.text_filter
+                        && !text.is_empty()
+                    {
+                        events.push(TurnEvent::TextDelta {
+                            key: block.key.clone(),
+                            text: std::mem::take(text),
+                            streamed: true,
+                        });
+                    }
                     if let ContentBlock::ToolUse { name, input, .. } = &block.content {
                         events.push(TurnEvent::ToolStarted {
                             key: block.key.clone(),
@@ -816,7 +1013,7 @@ impl Codec {
                 });
                 match block {
                     ContentBlock::Text { text } => {
-                        if self.interrupted && text.starts_with("[ede_diagnostic]") {
+                        if self.interrupted.is_some() && text.starts_with("[ede_diagnostic]") {
                             continue;
                         }
                         events.push(TurnEvent::TextDelta {
@@ -879,6 +1076,65 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interrupted_stream_diagnostic_emits_no_text() {
+        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        codec.start(TurnId::new(), "test".into());
+        codec.interrupt();
+        let frames = [
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"diagnostic"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","index":0,
+                "content_block":{"type":"text","text":""}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,
+                "delta":{"type":"text_delta","text":"[ede_"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,
+                "delta":{"type":"text_delta","text":"diagnostic] abort details"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_stop","index":0}}),
+        ];
+        let events: Vec<_> = frames
+            .iter()
+            .flat_map(|frame| codec.line(&frame.to_string()).unwrap().events)
+            .collect();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { .. },
+                ..
+            }
+        )));
+        codec
+            .value(json!({"type":"stream_event", "event":{
+                "type":"content_block_start", "index":1,
+                "content_block":{"type":"text", "text":"[ede_diagnostic] abort details"}
+            }}))
+            .unwrap();
+        let stopped = codec
+            .value(json!({"type":"stream_event", "event":{
+                "type":"content_block_stop", "index":1
+            }}))
+            .unwrap();
+        assert!(!stopped.events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { .. },
+                ..
+            }
+        )));
+        let ordinary = codec
+            .line(
+                &json!({"type":"assistant","message":{"id":"ordinary",
+            "content":[{"type":"text","text":"A normal reply"}]}})
+                .to_string(),
+            )
+            .unwrap();
+        assert!(
+            ordinary
+                .events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Turn {
+            event: TurnEvent::TextDelta { text, .. }, .. } if text == "A normal reply"))
+        );
+    }
     #[test]
     fn aborted_reason_ends_interrupted() {
         let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
@@ -976,6 +1232,25 @@ mod tests {
             ]
         );
         assert!(!format!("{logs:?}").contains("private-content"));
+    }
+    #[test]
+    fn storage_interruption_names_database() {
+        let mut codec = Codec::new(NativeSessionId("fixture-session".into()), 1);
+        codec.start(TurnId::new(), "reply".into());
+        assert!(codec.interrupt_for("Stopped because the database is blocked"));
+        let decoded = codec
+            .value(json!({"type":"result", "subtype":"success"}))
+            .unwrap();
+        assert!(
+            decoded
+                .events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Turn {
+            event: TurnEvent::TurnEnded { outcome: TurnOutcome::Interrupted { reason }, .. }, ..
+        } if reason == "Stopped because the database is blocked"))
+        );
+        assert!(codec.interrupted.is_none());
+        assert!(!codec.interrupt_for("Stopped by you"));
     }
     #[test]
     fn empty_final_reasoning_adds_no_item() {

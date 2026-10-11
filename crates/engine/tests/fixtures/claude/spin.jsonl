@@ -1,0 +1,8 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.296","scenario":"spin","source":"Veyra scripted control-protocol wires from SDK types"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}
+{"type":"expect_outbound","line":{"type":"user","uuid":"<id:prompt>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"<any>"}}}
+{"type":"spin","ms":10000}
+{"type":"emit_inbound","line":{"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"ok"}]}}}
+{"type":"emit_inbound","line":{"type":"result","subtype":"success","is_error":false}}
+{"type":"exit","code":0}

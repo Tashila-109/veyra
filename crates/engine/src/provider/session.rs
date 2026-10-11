@@ -1,7 +1,7 @@
 use super::{
     ProviderError, ProviderEvent, ProviderKind, SessionControl, SessionEvent, SessionHandle,
     SessionSpec, TurnEvent,
-    claude::{self, Codec},
+    claude::{self, Codec, InterruptPhase},
     env::ChildEnv,
 };
 use crate::{
@@ -25,6 +25,7 @@ struct ProcessGroup {
     child: Option<Child>,
     pid: u32,
     reaped: Option<oneshot::Sender<()>>,
+    groups: Option<super::env::Groups>,
     #[cfg(test)]
     check: fn(&mut Child, u32) -> std::io::Result<bool>,
 }
@@ -81,9 +82,16 @@ impl ProcessGroup {
             pid: child.id().expect("new child"),
             child: Some(child),
             reaped: None,
+            groups: None,
             #[cfg(test)]
             check: process_alive,
         }
+    }
+    fn tracked(child: Child, env: &ChildEnv) -> Self {
+        let mut group = Self::new(child);
+        env.groups.lock().unwrap().insert(group.pid);
+        group.groups = Some(env.groups.clone());
+        group
     }
     fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
         self.child.as_mut()?.stdout.take()
@@ -105,12 +113,16 @@ impl ProcessGroup {
         let child = self.child.take()?;
         let pid = self.pid;
         let reaped = self.reaped.take();
+        let groups = self.groups.take();
         #[cfg(test)]
         let check = self.check;
         #[cfg(not(test))]
         let check = process_alive;
         Some(tokio::spawn(async move {
             let result = end_process(child, pid, check).await;
+            if let Some(groups) = groups {
+                groups.lock().unwrap().remove(&pid);
+            }
             drop(reaped);
             result
         }))
@@ -150,10 +162,10 @@ impl Process {
             .send(line)
             .map_err(|_| ProviderError::Protocol("Claude stdin writer closed".into()))
     }
-    fn record_inbound(&mut self, line: &str) -> Result<(), ProviderError> {
+    fn record_inbound(&mut self, line: serde_json::Value) -> Result<(), ProviderError> {
         #[cfg(debug_assertions)]
         if let Some(recorder) = &mut self.recorder {
-            recorder.line(false, serde_json::from_str(line)?)?;
+            recorder.line(false, line)?;
         }
         #[cfg(not(debug_assertions))]
         let _ = line;
@@ -203,7 +215,7 @@ fn launch(
         .transpose()?;
     let child = env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?;
     Ok(Process {
-        child: ProcessGroup::new(child),
+        child: ProcessGroup::tracked(child, env),
         native,
         #[cfg(debug_assertions)]
         recorder,
@@ -246,15 +258,7 @@ fn start_task(
             None => match launch(&spec, &env, None) {
                 Ok(process) => process,
                 Err(error) => {
-                    return emit(
-                        &out,
-                        thread,
-                        epoch,
-                        ProviderEvent::Session(SessionEvent::Exited {
-                            crash: Some(record::redact(&error.to_string(), None)),
-                        }),
-                    )
-                    .await;
+                    return emit(&out, thread, epoch, launch_failed(error)).await;
                 }
             },
         };
@@ -286,15 +290,7 @@ fn start_task(
                             process = next;
                         }
                         Err(error) => {
-                            return emit(
-                                &out,
-                                thread,
-                                epoch,
-                                ProviderEvent::Session(SessionEvent::Exited {
-                                    crash: Some(record::redact(&error.to_string(), None)),
-                                }),
-                            )
-                            .await;
+                            return emit(&out, thread, epoch, launch_failed(error)).await;
                         }
                     }
                 }
@@ -314,6 +310,12 @@ fn start_task(
     tokio::spawn(supervise(task, reaped, supervisor_out, thread, epoch));
     SessionHandle { control }
 }
+fn launch_failed(error: ProviderError) -> ProviderEvent {
+    ProviderEvent::Session(SessionEvent::Exited {
+        crash: Some(record::redact(&error.to_string(), None)),
+    })
+}
+
 async fn supervise(
     task: tokio::task::JoinHandle<bool>,
     mut reaped: mpsc::UnboundedReceiver<oneshot::Receiver<()>>,
@@ -399,17 +401,6 @@ impl<R: AsyncRead + Unpin> ByteLines<R> {
         }
     }
 }
-enum Ladder {
-    Protocol(tokio::time::Instant),
-    Terminate(tokio::time::Instant),
-}
-impl Ladder {
-    fn deadline(&self) -> tokio::time::Instant {
-        match self {
-            Self::Protocol(at) | Self::Terminate(at) => *at,
-        }
-    }
-}
 enum Completion {
     MissingSession,
     Exited(Option<String>),
@@ -455,8 +446,6 @@ async fn run_one(
     });
     let mut codec = Codec::new(process.native.clone(), pid);
     let mut ready = false;
-    let mut ladder: Option<Ladder> = None;
-    let mut stopped = false;
     let mut rejected = None;
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder {
@@ -484,20 +473,37 @@ async fn run_one(
                         break;
                     }
                 }
-                Some(SessionControl::Shutdown) | None => break,
-                Some(SessionControl::Interrupt) => {
-                    codec.interrupt();
-                    ladder.get_or_insert(Ladder::Protocol(tokio::time::Instant::now() + Duration::from_secs(3)));
-                    let line = serde_json::json!({
-                        "type":"control_request", "request_id":"veyra-interrupt",
-                        "request":{"subtype":"interrupt"}
-                    });
-                    if let Err(error) = process.send(&writer, line) {
+                Some(SessionControl::Shutdown) | None => {
+                    for line in interrupt_lines(&mut codec, "Veyra closed while this turn ran") {
+                        if let Err(error) = process.send(&writer, line) {
+                            failure = Some(error.to_string());
+                            break;
+                        }
+                    }
+                    drop(writer);
+                    if tokio::time::timeout(Duration::from_secs(1), &mut write_task).await.is_ok() {
+                        writer_done = true;
+                    }
+                    break;
+                }
+                Some(message @ (SessionControl::Interrupt | SessionControl::StorageBlocked)) => {
+                    let reason = if message == SessionControl::Interrupt { "Stopped by you" }
+                        else { "Stopped because the database is blocked" };
+                    for line in interrupt_lines(&mut codec, reason) {
+                        if let Err(error) = process.send(&writer, line) {
+                            failure = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+                Some(SessionControl::Answer { native, reply }) => {
+                    if let Some(line) = codec.answer(native, reply)
+                        && let Err(error) = process.send(&writer, line)
+                    {
                         failure = Some(error.to_string());
                         break;
                     }
                 }
-                Some(SessionControl::Answer { .. }) => {}
             },
             result = &mut write_task => {
                 writer_done = true;
@@ -509,16 +515,18 @@ async fn run_one(
                 break;
             }
             _ = async {
-                match &ladder { Some(ladder) => tokio::time::sleep_until(ladder.deadline()).await,
-                    None => std::future::pending().await }
+                match &codec.interrupted {
+                    Some(interrupt) => tokio::time::sleep_until(interrupt.phase.deadline()).await,
+                    None => std::future::pending().await,
+                }
             } => {
-                stopped = true;
-                match ladder {
-                    Some(Ladder::Protocol(_)) => {
+                match codec.interrupted.as_ref().map(|interrupt| &interrupt.phase) {
+                    Some(InterruptPhase::Protocol(_)) => {
                         let _ = platform::signal_group(pid, Signal::Terminate);
-                        ladder = Some(Ladder::Terminate(tokio::time::Instant::now() + Duration::from_secs(1)));
+                        codec.interrupted.as_mut().unwrap().phase =
+                            InterruptPhase::Terminate(tokio::time::Instant::now() + Duration::from_secs(1));
                     }
-                    Some(Ladder::Terminate(_)) => { let _ = platform::signal_group(pid, Signal::Kill); break; }
+                    Some(InterruptPhase::Terminate(_)) => { let _ = platform::signal_group(pid, Signal::Kill); break; }
                     None => {}
                 }
             }
@@ -530,17 +538,20 @@ async fn run_one(
                     })).await { consumer_gone = true; break; }
                 }
                 Ok(Some(Line::Text(line))) => {
-                    if let Err(error) = serde_json::from_str::<serde_json::Value>(&line) {
-                        tracing::info!(length = line.len(), "skipped non-JSON Claude line");
-                        rejected = Some(ProviderError::Json(error).to_string());
-                        continue;
-                    }
+                    let wire = match serde_json::from_str::<serde_json::Value>(&line) {
+                        Ok(wire) => wire,
+                        Err(error) => {
+                            tracing::info!(length = line.len(), "skipped non-JSON Claude line");
+                            rejected = Some(ProviderError::Json(error).to_string());
+                            continue;
+                        }
+                    };
                     rejected = None;
-                    if let Err(error) = process.record_inbound(&line) {
+                    if let Err(error) = process.record_inbound(wire.clone()) {
                         failure = Some(error.to_string());
                         break;
                     }
-                    match codec.line(&line) {
+                    match codec.value(wire) {
                         Ok(decoded) => {
                             for reply in decoded.replies {
                                 if let Err(error) = process.send(&writer, reply) {
@@ -550,10 +561,6 @@ async fn run_one(
                             }
                             if failure.is_some() { break; }
                             for event in decoded.events {
-                                if matches!(event, ProviderEvent::Turn { event: TurnEvent::TurnEnded { .. }, .. }) {
-                                    ladder = None;
-                                    stopped = false;
-                                }
                                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                                     ready = true;
                                 }
@@ -621,9 +628,9 @@ async fn run_one(
                     .filter(|code| [129, 130, 143].contains(code))
                     .map(|code| format!("Stopped by exit code {code}")),
             });
-        let outcome = if stopped || ladder.is_some() {
+        let outcome = if let Some(interrupt) = &codec.interrupted {
             TurnOutcome::Interrupted {
-                reason: "Stopped by you".into(),
+                reason: interrupt.reason.clone(),
             }
         } else if let Some(text) = codec.failure() {
             TurnOutcome::Failed {
@@ -692,6 +699,11 @@ fn with_stderr(text: &str, lines: &[String], token: Option<&str>) -> String {
     text
 }
 
+fn discard_stderr(child: &mut ProcessGroup) -> tokio::task::JoinHandle<()> {
+    let mut lines = ByteLines::new(child.stderr().expect("piped stderr"));
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next().await {} })
+}
+
 pub async fn probe(
     env: &ChildEnv,
     cwd: &std::path::Path,
@@ -712,16 +724,23 @@ pub async fn probe(
             .unwrap_or_default()
     } else {
         let mut child =
-            ProcessGroup::new(env.command(&binary, &["--version".into()], cwd).spawn()?);
-        let mut stdout = BufReader::new(child.stdout().expect("piped version stdout")).lines();
+            ProcessGroup::tracked(env.spawn(&binary, &["--version".into()], cwd, None)?, env);
+        let mut stdout = ByteLines::new(child.stdout().expect("piped version stdout"));
+        let stderr = discard_stderr(&mut child);
         let result = tokio::select! {
             _ = &mut cancelled => Err(ProviderError::Cancelled),
             result = async {
-                let line = stdout.next_line().await?.unwrap_or_default();
-                Ok::<_, ProviderError>(line)
+                match stdout.next().await? {
+                    Some(Line::Text(line)) => Ok(line),
+                    Some(Line::Oversize(_)) => Err(ProviderError::Protocol("Claude version exceeded 4 MiB".into())),
+                    None => Ok(String::new()),
+                }
             } => result,
         };
-        child.stop().await?;
+        let stopped = child.stop().await;
+        stderr.abort();
+        let _ = stderr.await;
+        stopped?;
         result?
     };
     let version = version
@@ -741,9 +760,12 @@ pub async fn probe(
             record::Recorder::create(&path, "claude", &version, cwd, env.home.as_deref(), None)
         })
         .transpose()?;
-    let mut child =
-        ProcessGroup::new(env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?);
-    let mut lines = BufReader::new(child.stdout().expect("piped stdout")).lines();
+    let mut child = ProcessGroup::tracked(
+        env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?,
+        env,
+    );
+    let mut lines = ByteLines::new(child.stdout().expect("piped stdout"));
+    let stderr = discard_stderr(&mut child);
     let mut stdin = child.stdin().expect("piped stdin");
     let result = tokio::select! {
         _ = &mut cancelled => Err(ProviderError::Cancelled),
@@ -755,17 +777,21 @@ pub async fn probe(
             }
             stdin.write_all(format!("{initialize}\n").as_bytes()).await?;
             stdin.flush().await?;
-            while let Some(line) = lines.next_line().await? {
+            while let Some(line) = lines.next().await? {
+                let Line::Text(line) = line else {
+                    return Err(ProviderError::Protocol("Claude initialize exceeded 4 MiB".into()));
+                };
+                let wire: serde_json::Value = serde_json::from_str(&line)?;
                 #[cfg(debug_assertions)]
-                if let Some(recorder) = &mut recorder {
-                    recorder.line(false, serde_json::from_str(&line)?)?;
-                }
-                if let Some(reply) = claude::probe_reply(&line)? {
+                if let Some(recorder) = &mut recorder { recorder.line(false, wire.clone())?; }
+                if let Some(reply) = claude::probe_value(wire)? {
                     return Ok(super::Probe {
                         provider: ProviderKind::Claude,
                         path: Some(binary.clone()),
                         version: (!version.is_empty()).then_some(version),
-                        readiness: super::Readiness::Ready,
+                        readiness: if super::signed_out_account(reply.account.as_ref()) {
+                            super::Readiness::SignedOut
+                        } else { super::Readiness::Ready },
                         models: reply.models,
                         account: reply.account,
                     });
@@ -775,7 +801,10 @@ pub async fn probe(
         } => result,
     };
     drop(stdin);
-    let status = child.stop().await?;
+    let status = child.stop().await;
+    stderr.abort();
+    let _ = stderr.await;
+    let status = status?;
     #[cfg(debug_assertions)]
     let code = status.code().unwrap_or(-1);
     #[cfg(not(debug_assertions))]
@@ -785,6 +814,18 @@ pub async fn probe(
         recorder.exit(code)?;
     }
     result
+}
+
+fn interrupt_lines(codec: &mut Codec, reason: &str) -> Vec<serde_json::Value> {
+    if !codec.interrupt_for(reason) {
+        return Vec::new();
+    }
+    let mut lines = codec.cancel_requests(reason);
+    lines.push(serde_json::json!({
+        "type":"control_request", "request_id":"veyra-interrupt",
+        "request":{"subtype":"interrupt"}
+    }));
+    lines
 }
 
 #[cfg(test)]
