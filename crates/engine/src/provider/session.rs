@@ -253,17 +253,28 @@ fn start_task(
     let supervisor_out = out.clone();
     let task = tokio::spawn(async move {
         let mut spec = spec;
+        let mut receiver = SessionControls::new(receiver);
         let mut process = match process {
             Some(process) => process,
-            None => match launch(&spec, &env, None) {
-                Ok(process) => process,
-                Err(error) => {
-                    return emit(&out, thread, epoch, launch_failed(error)).await;
+            None => {
+                if !receiver.can_launch() || out.is_closed() {
+                    return emit(
+                        &out,
+                        thread,
+                        epoch,
+                        ProviderEvent::Session(SessionEvent::Exited { crash: None }),
+                    )
+                    .await;
                 }
-            },
+                match launch(&spec, &env, None) {
+                    Ok(process) => process,
+                    Err(error) => {
+                        return emit(&out, thread, epoch, launch_failed(error)).await;
+                    }
+                }
+            }
         };
         process.child.watch(&cleanup);
-        let mut receiver = receiver;
         loop {
             match run_one(
                 process,
@@ -277,6 +288,15 @@ fn start_task(
             .await
             {
                 Completion::MissingSession => {
+                    if !receiver.can_launch() || out.is_closed() {
+                        return emit(
+                            &out,
+                            thread,
+                            epoch,
+                            ProviderEvent::Session(SessionEvent::Exited { crash: None }),
+                        )
+                        .await;
+                    }
                     spec.native = None;
                     let native = NativeSessionId(ThreadId::new().to_string());
                     match launch(&spec, &env, Some(native)) {
@@ -402,6 +422,38 @@ impl<R: AsyncRead + Unpin> ByteLines<R> {
         }
     }
 }
+struct SessionControls {
+    receiver: mpsc::UnboundedReceiver<SessionControl>,
+    pending: VecDeque<SessionControl>,
+}
+impl SessionControls {
+    fn new(receiver: mpsc::UnboundedReceiver<SessionControl>) -> Self {
+        Self {
+            receiver,
+            pending: VecDeque::new(),
+        }
+    }
+    fn can_launch(&mut self) -> bool {
+        while let Ok(message) = self.receiver.try_recv() {
+            if matches!(message, SessionControl::Shutdown) {
+                self.receiver.close();
+            }
+            self.pending.push_back(message);
+        }
+        !self.receiver.is_closed()
+    }
+    async fn recv(&mut self) -> Option<SessionControl> {
+        let message = match self.pending.pop_front() {
+            Some(message) => Some(message),
+            None => self.receiver.recv().await,
+        };
+        if matches!(message, Some(SessionControl::Shutdown) | None) {
+            self.receiver.close();
+        }
+        message
+    }
+}
+
 enum Completion {
     MissingSession,
     Exited(Option<String>),
@@ -410,7 +462,7 @@ enum Completion {
 
 async fn run_one(
     mut process: Process,
-    control: &mut mpsc::UnboundedReceiver<SessionControl>,
+    control: &mut SessionControls,
     out: &mpsc::Sender<EngineMsg>,
     thread: ThreadId,
     epoch: u32,
@@ -888,7 +940,8 @@ mod tests {
             #[cfg(debug_assertions)]
             recorder: None,
         };
-        let (sender, mut control) = mpsc::unbounded_channel();
+        let (sender, control) = mpsc::unbounded_channel();
+        let mut control = SessionControls::new(control);
         sender
             .send(SessionControl::StartTurn {
                 turn: TurnId::new(),
@@ -976,7 +1029,8 @@ mod tests {
                 #[cfg(debug_assertions)]
                 recorder: None,
             };
-            let (sender, mut control) = mpsc::unbounded_channel();
+            let (sender, control) = mpsc::unbounded_channel();
+            let mut control = SessionControls::new(control);
             sender
                 .send(SessionControl::StartTurn {
                     turn: TurnId::new(),
@@ -1043,7 +1097,8 @@ mod tests {
             #[cfg(debug_assertions)]
             recorder: None,
         };
-        let (sender, mut control) = mpsc::unbounded_channel();
+        let (sender, control) = mpsc::unbounded_channel();
+        let mut control = SessionControls::new(control);
         sender
             .send(SessionControl::StartTurn {
                 turn: TurnId::new(),
@@ -1103,7 +1158,8 @@ mod tests {
             #[cfg(debug_assertions)]
             recorder: None,
         };
-        let (sender, mut control) = mpsc::unbounded_channel();
+        let (sender, control) = mpsc::unbounded_channel();
+        let mut control = SessionControls::new(control);
         sender
             .send(SessionControl::StartTurn {
                 turn: TurnId::new(),
@@ -1318,7 +1374,8 @@ mod tests {
             #[cfg(debug_assertions)]
             recorder: None,
         };
-        let (sender, mut control) = mpsc::unbounded_channel();
+        let (sender, control) = mpsc::unbounded_channel();
+        let mut control = SessionControls::new(control);
         let turn = TurnId::new();
         sender
             .send(SessionControl::StartTurn {
@@ -1544,5 +1601,224 @@ mod tests {
             elapsed <= Duration::from_secs(5),
             "Stop drain exceeded five seconds: {elapsed:?}"
         );
+    }
+    #[tokio::test]
+    async fn shutdown_during_missing_resume_never_launches_replacement() {
+        for during_cleanup in [false, true] {
+            for shutdown in [true, false] {
+                let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+                    "../../target/quit-missing-resume-{}",
+                    ThreadId::new()
+                ));
+                std::fs::create_dir_all(&cwd).unwrap();
+                let _scratch = crate::tests::Scratch(cwd.clone());
+                let marker = cwd.join("replacement-spawned");
+                let cleanup = cwd.join("cleanup-started");
+                let binary = cwd.join("owned-replacement-stand-in");
+                std::fs::write(
+                    &binary,
+                    "#!/bin/sh\nprintf launched > replacement-spawned\nread initialize\n",
+                )
+                .unwrap();
+                assert!(
+                    std::process::Command::new("/bin/chmod")
+                        .arg("700")
+                        .arg(&binary)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                let mut env = ChildEnv::load();
+                env.groups = Default::default();
+                env.claude_bin = Some(binary);
+                env.fixtures = None;
+                env.record = None;
+                let script = if during_cleanup {
+                    concat!(
+                        "trap 'printf cleanup > cleanup-started' TERM; ",
+                        "printf 'No conversation found with session ID: missing-native\\n' >&2; ",
+                        "read initialize; exec 1>&- 2>&-; while :; do /bin/sleep 1; done"
+                    )
+                } else {
+                    concat!(
+                        "printf 'No conversation found with session ID: missing-native\\n' >&2; ",
+                        "read initialize; read until_stdin_closes; exit 1"
+                    )
+                };
+                let child = env
+                    .spawn(
+                        std::path::Path::new("/bin/sh"),
+                        &["-c".into(), script.into()],
+                        &cwd,
+                        None,
+                    )
+                    .unwrap();
+                let pid = child.id().unwrap();
+                let process = Process {
+                    child: ProcessGroup::new(child),
+                    native: NativeSessionId("missing-native".into()),
+                    recorder: None,
+                };
+                let thread = ThreadId::new();
+                let (out, mut events) = mpsc::channel(256);
+                let handle = start_session(
+                    process,
+                    SessionSpec {
+                        thread,
+                        cwd,
+                        config: ThreadConfig {
+                            model: None,
+                            effort: None,
+                            mode: PermissionMode::AskFirst,
+                        },
+                        native: Some(NativeSessionId("missing-native".into())),
+                        import: false,
+                    },
+                    env.clone(),
+                    out,
+                    1,
+                );
+                if during_cleanup {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while !cleanup.exists() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                if shutdown {
+                    handle.control.send(SessionControl::Shutdown).unwrap();
+                } else {
+                    drop(handle);
+                }
+                let exited = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let event = events.recv().await.unwrap();
+                        if matches!(
+                            event,
+                            EngineMsg::Provider {
+                                event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                                ..
+                            }
+                        ) {
+                            break event;
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    !platform::group_exists(pid).unwrap(),
+                    "owned resumed group was not reaped"
+                );
+                assert!(
+                    env.groups.lock().unwrap().is_empty(),
+                    "owned replacement was not reaped"
+                );
+                assert!(
+                    !marker.exists(),
+                    "cancellation launched a replacement: shutdown={shutdown} during_cleanup={during_cleanup}"
+                );
+                assert!(matches!(
+                    exited.unwrap(),
+                    EngineMsg::Provider {
+                        event: ProviderEvent::Session(SessionEvent::Exited { crash: None }),
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_session_launch_starts_no_provider() {
+        for shutdown in [true, false] {
+            let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "../../target/quit-before-launch-{}",
+                ThreadId::new()
+            ));
+            std::fs::create_dir_all(&cwd).unwrap();
+            let _scratch = crate::tests::Scratch(cwd.clone());
+            let marker = cwd.join("provider-spawned");
+            let binary = cwd.join("owned-session-stand-in");
+            std::fs::write(
+                &binary,
+                "#!/bin/sh\nprintf launched > provider-spawned\nread initialize\n",
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&binary)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut env = ChildEnv::load();
+            env.groups = Default::default();
+            env.claude_bin = Some(binary);
+            env.fixtures = None;
+            env.record = None;
+            let (out, mut events) = mpsc::channel(256);
+            let handle = spawn(
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd,
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode: PermissionMode::AskFirst,
+                    },
+                    native: None,
+                    import: false,
+                },
+                env.clone(),
+                out,
+                1,
+            )
+            .unwrap();
+            handle
+                .control
+                .send(SessionControl::StartTurn {
+                    turn: TurnId::new(),
+                    text: "queued before shutdown".into(),
+                })
+                .unwrap();
+            if shutdown {
+                handle.control.send(SessionControl::Shutdown).unwrap();
+            } else {
+                drop(handle);
+            }
+            let exited = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if matches!(
+                        event,
+                        EngineMsg::Provider {
+                            event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                            ..
+                        }
+                    ) {
+                        break event;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                env.groups.lock().unwrap().is_empty(),
+                "owned initial group was not reaped"
+            );
+            assert!(
+                !marker.exists(),
+                "cancelled initial launch started a provider: shutdown={shutdown}"
+            );
+            assert!(matches!(
+                exited.unwrap(),
+                EngineMsg::Provider {
+                    event: ProviderEvent::Session(SessionEvent::Exited { crash: None }),
+                    ..
+                }
+            ));
+        }
     }
 }

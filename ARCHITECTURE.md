@@ -107,9 +107,10 @@ CancelQuit dismisses it and restores composer focus.
 ConfirmQuit cancels the branch task, awaits Engine::shutdown_wait in a gpui task, then calls cx.quit.
 The debug ctl quit verb dispatches ConfirmQuit directly.
 `Engine::shutdown_wait` refuses new commands, ends running turns, expires pending requests and asks every session to shut down.
-Shutdown persists Restarted holds for running, queued, Starting and background-busy threads in its own transaction.
-Actor::prepare_commit suppresses every proposed Spawn, OpenTerminal and StartTurn while shutting down, before storage or effect dispatch.
-Suppressed turns remain Queued and retiring sessions become Parked without a replacement.
+Shutdown persists Restarted holds for running, queued, Starting and background-busy threads in its own transaction, without replacing an earlier hold.
+While shutting down, Actor::handle_inner refuses start-producing messages, and Actor::exited skips session and terminal restarts and queued-turn starts.
+Queued turns remain Queued and held, and retiring sessions become Parked without a replacement.
+Actor::prepare_commit debug-asserts that no start or spawn effect leaves a shutdown decision.
 It expires pending requests with "Veyra is closing" before ending turns.
 A Restarted hold remains Held even without a queued turn; Send with an empty queue or Continue clears it.
 Sessions queue deny/cancel replies before the protocol interrupt and give the writer up to one second to drain before group cleanup.
@@ -298,7 +299,7 @@ A supervisor waits for registered cleanup even if the session task panics.
 The actor stores pid and group on Ready and parks on Exited.
 After StopThread, Archive or Interrupt it only parks.
 
-`claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, request references and background-work replacement.
+`claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, request references, approval and question classification (see Actor decisions) and background-work replacement.
 Unknown protocol metadata logs its category without frame content, and unsupported or malformed control requests get an error reply.
 Spawns before Ready binds a native id use --session-id with the Veyra UUID; spawns with that bound native id use --resume.
 Mode maps to default, acceptEdits or bypassPermissions plus --allow-dangerously-skip-permissions.
@@ -324,6 +325,8 @@ Unknown or finished child parents are ignored, and snapshots retain a running to
 Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
+SessionControls buffers pending controls at each launch decision and closes its receiver on Shutdown, retaining cancellation through process cleanup.
+Both initial launch and resume fallback refuse a pending or consumed Shutdown, a closed control channel or a gone event consumer.
 
 ## Platform and keep-awake
 
@@ -441,7 +444,7 @@ SetDefaultMode publishes SettingsChanged; Escape or thread/project selection lea
 
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
 Ctrl+C is literal control in the composer and preserves its draft while interrupting the turn.
-The app renders only the typed action and does no disk work to render it.
+The approval dock (`ui/composer.rs`) renders only the codec's typed ProposedAction and does no disk work to render it.
 The full command or file path, consequence and bounded argument preview share a scrollable area bounded by the composer height token, with Allow and Deny below it.
 The dock shows 1 of N for multiple pending requests.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
@@ -533,7 +536,8 @@ replay_claude uses the real session task with the fake CLI for text and tools, p
 It covers approvals, questions, unknown requests, Stop with a pending approval and late interrupts.
 It also checks assistant-error parking, interrupt outcomes and ladder cancellation, subagent isolation against the live Agent recording, notices and malformed-byte recovery.
 Actor tests cover retirement before queued work, the Stop drain, Provider-tail rejection and skipped text-only transactions.
-Shutdown tests check that Quit during a drain or Stopping starts no replacement session and keeps queued work held after reload.
+Shutdown tests check that Quit during a drain, Stopping or missing-session recovery starts no replacement session and keeps queued work held after reload.
+An actor decision test checks that shutdown exits propose no restart or queued-turn start, preserving epochs and earlier holds.
 A storage test checks that a Write tool row stores its content once.
 Platform tests check the two-second login-shell bound, inherited-pipe deadline and group nice value.
 Session tests check process exit classification and cleanup ordering.

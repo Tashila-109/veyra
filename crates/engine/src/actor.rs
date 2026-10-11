@@ -1016,26 +1016,30 @@ impl Actor {
         live.background_work = false;
         c.live.insert(thread, live);
 
-        match &old.live {
-            Live::Stopping {
-                then: AfterStop::StartStructured { import },
-            } => commands::spawn(&self.live, &mut c, thread, *import),
-            Live::Stopping {
-                then: AfterStop::StartTerminal,
-            } => {
-                c.live.get_mut(&thread).unwrap().epoch += 1;
-                c.effects.push(Effect::OpenTerminal { thread });
+        if !self.shutting_down {
+            match &old.live {
+                Live::Stopping {
+                    then: AfterStop::StartStructured { import },
+                } => commands::spawn(&self.live, &mut c, thread, *import),
+                Live::Stopping {
+                    then: AfterStop::StartTerminal,
+                } => {
+                    c.live.get_mut(&thread).unwrap().epoch += 1;
+                    c.effects.push(Effect::OpenTerminal { thread });
+                }
+                Live::Parked
+                | Live::Starting { .. }
+                | Live::Structured { .. }
+                | Live::Terminal { .. }
+                | Live::Stopping {
+                    then: AfterStop::Park,
+                } => {}
             }
-            Live::Parked
-            | Live::Starting { .. }
-            | Live::Structured { .. }
-            | Live::Terminal { .. }
-            | Live::Stopping {
-                then: AfterStop::Park,
-            } => {}
         }
         commands::settle_idle_child(&self.projection, &self.live, &mut c, thread, false, now());
-        commands::start_changed(&self.projection, &self.live, &mut c, now());
+        if !self.shutting_down {
+            commands::start_changed(&self.projection, &self.live, &mut c, now());
+        }
         c
     }
     fn text_delta(
@@ -1081,26 +1085,13 @@ impl Actor {
         id
     }
     fn prepare_commit(&self, c: &mut ChangeSet) {
-        if self.shutting_down {
-            // Exit decisions can still propose starts while sessions retire during Quit.
-            c.effects.retain(|effect| {
-                match effect {
-                    Effect::Spawn { thread, .. } | Effect::OpenTerminal { thread } => {
-                        let live = c.live.get_mut(thread).unwrap();
-                        live.epoch = self.live[thread].epoch;
-                        live.live = Live::Parked;
-                        live.background_work = false;
-                    }
-                    Effect::StartTurn { turn, .. } => {
-                        c.turns.get_mut(turn).unwrap().state = TurnState::Queued;
-                    }
-                    Effect::Control { .. } | Effect::StopTerminal { .. } => return true,
-                }
-                false
-            });
-            c.events
-                .retain(|event| !matches!(event, Ev::TurnStarted(_)));
-        }
+        debug_assert!(
+            !self.shutting_down
+                || c.effects.iter().all(|effect| matches!(
+                    effect,
+                    Effect::Control { .. } | Effect::StopTerminal { .. }
+                ))
+        );
         let ended: std::collections::BTreeSet<_> = c
             .turns
             .values()
@@ -1381,4 +1372,81 @@ fn tool_tail(text: String) -> String {
         .chars()
         .rev()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_exit_decides_no_restart_or_queued_start() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        for then in [
+            AfterStop::Park,
+            AfterStop::StartStructured { import: false },
+            AfterStop::StartTerminal,
+        ] {
+            for hold in [None, Some(HoldReason::Interrupted)] {
+                let mut db = Connection::open_in_memory().unwrap();
+                store::initialize(&mut db).unwrap();
+                let (out, _messages) = mpsc::channel(256);
+                let mut actor = Actor::new(db, out, Spawner::Scripted(Default::default())).unwrap();
+                let (reply, mut ack) = oneshot::channel();
+                actor.handle(EngineMsg::Command {
+                    command: Command::AddProject {
+                        path: "/tmp".into(),
+                    },
+                    reply,
+                });
+                let Ack::Project(project) = ack.try_recv().unwrap().unwrap() else {
+                    panic!("missing project")
+                };
+                let (reply, mut ack) = oneshot::channel();
+                actor.handle(EngineMsg::Command {
+                    command: Command::CreateThread {
+                        project,
+                        provider: ProviderKind::Claude,
+                        config: ThreadConfig {
+                            model: None,
+                            effort: None,
+                            mode: PermissionMode::AskFirst,
+                        },
+                        text: "queued before quit".into(),
+                    },
+                    reply,
+                });
+                let Ack::Thread(thread) = ack.try_recv().unwrap().unwrap() else {
+                    panic!("missing thread")
+                };
+                actor.live.get_mut(&thread).unwrap().live = Live::Stopping { then: then.clone() };
+                actor.projection.threads.get_mut(&thread).unwrap().hold = hold;
+                let epoch = actor.live[&thread].epoch;
+                if hold.is_none() {
+                    assert!(!actor.exited(thread, None).effects.is_empty());
+                }
+                actor.handle(EngineMsg::Shutdown);
+                let c = actor.exited(thread, None);
+                assert!(
+                    c.effects.iter().all(|effect| matches!(
+                        effect,
+                        Effect::Control { .. } | Effect::StopTerminal { .. }
+                    )),
+                    "shutdown proposed a start effect"
+                );
+                assert_eq!(c.live[&thread].epoch, epoch);
+                assert!(matches!(c.live[&thread].live, Live::Parked));
+                assert!(c.turns.values().all(|turn| turn.state == TurnState::Queued));
+                assert!(
+                    c.events
+                        .iter()
+                        .all(|event| !matches!(event, Ev::TurnStarted(_)))
+                );
+                assert_eq!(
+                    actor.projection.threads[&thread].hold,
+                    Some(hold.unwrap_or(HoldReason::Restarted))
+                );
+            }
+        }
+    }
 }

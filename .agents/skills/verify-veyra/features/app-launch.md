@@ -123,6 +123,8 @@ PY
 
 ### Release check
 
+Do not run it while another verification run is in restart-recovery's crash step.
+
 Use a disposable HOME and a PATH with no Claude to prevent an unauthorized live probe.
 Require the known system-wide install paths to contain no Claude before launch.
 Release still reads VEYRA_DATA_DIR, but excludes the driver, recording and provider overrides at compile time.

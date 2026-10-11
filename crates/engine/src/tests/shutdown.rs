@@ -258,3 +258,111 @@ fn quit_while_stopping_cancels_session_and_terminal_restarts() {
         );
     }
 }
+
+#[test]
+fn actor_shutdown_during_missing_resume_spawns_no_replacement() {
+    use std::{fs, path::PathBuf, time::Duration};
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../target/actor-quit-missing-resume-{}",
+        ThreadId::new()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let _scratch = Scratch(root.clone());
+    let marker = root.join("replacement-spawned");
+    let started = root.join("resume-started");
+    let binary = root.join("owned-session-stand-in");
+    fs::write(
+        &binary,
+        r#"#!/bin/sh
+for arg do
+  if [ "$arg" = "--resume" ]; then
+    printf 'No conversation found with session ID: missing-native\n' >&2
+    printf started > resume-started
+    read initialize
+    read until_stdin_closes
+    exit 1
+  fi
+done
+printf launched > replacement-spawned
+read initialize
+"#,
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("/bin/chmod")
+            .arg("700")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut env = env::ChildEnv::load();
+    env.groups = Default::default();
+    env.claude_bin = Some(binary);
+    env.fixtures = None;
+    env.record = None;
+    let mut f = Fixture::new(LiveState::Parked);
+    let mut c = ChangeSet::default();
+    let mut thread = f.loaded().threads[&f.thread].clone();
+    thread.cwd = root;
+    thread.native = Some(NativeSessionId("missing-native".into()));
+    c.threads.insert(thread.id, thread);
+    f.save(c);
+    let (out, mut messages) = mpsc::channel(256);
+    f.actor = Actor::new(f.actor.db, out, Spawner::Cli(env.clone())).unwrap();
+    let Ack::Turn(queued) = f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "waiting for resume".into(),
+        })
+        .unwrap()
+    else {
+        panic!("missing queued turn")
+    };
+    f.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    });
+    {
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::Shutdown);
+    }
+    f.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = messages.recv().await.unwrap();
+                let exited = matches!(
+                    message,
+                    EngineMsg::Provider {
+                        event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                        ..
+                    }
+                );
+                f.actor.handle(message);
+                if exited {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    });
+    assert!(
+        env.groups.lock().unwrap().is_empty(),
+        "owned groups were not reaped"
+    );
+    assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
+    assert_eq!(
+        f.loaded().threads[&f.thread].hold,
+        Some(HoldReason::Restarted)
+    );
+    assert!(
+        !marker.exists(),
+        "Actor Shutdown launched a fresh provider replacement"
+    );
+}
