@@ -1,6 +1,6 @@
 # Stop and interrupt
 
-Status: not run, 2026-10-11, pending, all
+Status: passed, 2026-10-12, 950317c, none
 
 ## Sub-features
 
@@ -176,5 +176,7 @@ Posting counts gpui requests even outside an app bundle; OS delivery is a separa
 The debug-only veyra::DebugNotificationResponse action takes {"tag":"ROOT_ID"} and calls the native banner response handler.
 `notifications-older-selected.json` and its PNG prove an older family tag activates and selects that family.
 OS banner delivery and the macOS permission setting require a manual check from target/Veyra.app.
+scripts/bundle-app.sh signs the bundle ad hoc, because macOS refuses notification authorization to an unsigned bundle (UNErrorDomain error 1) and shows no permission prompt.
+The first banner from a new signature asks the operator to allow Veyra's notifications.
 Use only this run's recorded pids and groups during cleanup.
 Update Status from candidate acceptance.

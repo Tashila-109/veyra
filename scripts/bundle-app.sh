@@ -17,4 +17,5 @@ cat > "$BUNDLE/Info.plist" <<'PLIST'
 <key>CFBundleVersion</key><string>0.0.1</string>
 </dict></plist>
 PLIST
+codesign --force --sign - target/Veyra.app
 printf '%s\n' "target/Veyra.app"

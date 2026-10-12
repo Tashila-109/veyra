@@ -1,6 +1,6 @@
 # Provider permission matrix
 
-Status: not run, 2026-10-11, 8ea19cf, Codex and Grok live cells
+Status: not run, 2026-10-12, 950317c, Codex and Grok live cells
 
 ## Sub-features
 
@@ -9,7 +9,7 @@ Claude's row comes from preserved authorized live evidence; Codex and Grok remai
 
 | Provider | Ask first | Accept edits | Full access |
 | --- | --- | --- | --- |
-| Claude | passed: Read and `echo` ran without approval; both writes docked as `Write` (`permission-project.txt`, `veyra-outside-d654ddf0.txt`), Allow once, both files written | passed: Read, `echo` and the project write ran without approval; the outside write docked as `Write` (`veyra-outside-d654ddf0.txt`), Allow once, written | passed: all four steps ran with no approval; both files written |
+| Claude | passed: Read and `echo` ran without approval; both writes docked as `Write` with their absolute targets, inside and outside the project, Allow once, both files written | passed: Read, `echo` and the project write ran without approval; the outside write docked as `Write`, outside the project, Allow once, written | passed: all four steps ran with no approval; both files written |
 | Codex | not run | not run | not run |
 | Grok | not run | not run | not run |
 

@@ -535,7 +535,7 @@ Their accessibility labels retain the whole original caption.
 NextNeedsYou scans sidebar order for NeedsYou before Failed, wrapping once and including child rows.
 The pure stop_target function selects a Running row for the selected thread, or its published WindowThread pending_turn when no Running row exists.
 The composer shows Stop only when that function names a turn and its draft is empty.
-Shell::shown_stop returns the rendered Stop target when the draft is empty, and the composer, dump and empty Send use it before Send checks provider readiness.
+Shell::shown_stop returns that rendered target while the trimmed draft is empty; the composer and dump read it, and Send dispatches Stop for it before checking provider readiness.
 A Refused admission with no Running row has no Stop target; held reasons and Continue remain separate controls.
 Discard queued appears only when a held thread has queued turns.
 The quit sheet overlays the existing window content.
@@ -550,7 +550,7 @@ Family status includes unarchived children, so pending background work prevents 
 The banner contains the family root title, derived by collapsing whitespace in its first user message and taking the first 80 characters, and a status word.
 It excludes assistant, tool and later user text.
 Its root-id tag lets a click activate the window and select the root or the first child needing attention.
-`scripts/bundle-app.sh` builds an unsigned macOS app bundle with dev.veyra.app identity for system notification delivery.
+`scripts/bundle-app.sh` builds a macOS app bundle with dev.veyra.app identity and signs it ad hoc, because macOS refuses notification authorization to an unsigned bundle.
 System permission and native banner clicks require operator verification.
 The debug-only DebugNotificationResponse action passes a banner tag to the same notification_response handler as the native callback, allowing stale-tag routing checks without OS delivery.
 
