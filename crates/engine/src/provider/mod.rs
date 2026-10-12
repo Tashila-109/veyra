@@ -22,6 +22,7 @@ pub struct SessionSpec {
     pub config: ThreadConfig,
     pub native: Option<NativeSessionId>,
     pub import: bool,
+    pub root: bool,
 }
 #[derive(Clone, Debug)]
 pub struct SessionHandle {
@@ -47,6 +48,7 @@ pub enum SessionControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     User,
+    Parent,
     StorageBlocked,
     AppClosing,
 }
@@ -54,6 +56,7 @@ impl StopReason {
     pub fn text(self) -> &'static str {
         match self {
             Self::User => "Stopped by you",
+            Self::Parent => "Stopped by its parent",
             Self::StorageBlocked => "Stopped because the database is blocked",
             Self::AppClosing => "Veyra closed while this turn ran",
         }
@@ -359,6 +362,7 @@ impl Probes {
                 return;
             }
             let probe = provider.probe_cancellable(&env, &cwd, cancelled).await;
+            env.catalog.lock().unwrap().insert(provider, probe.clone());
             let _ = reply.send(probe);
         });
         self.tasks.insert(provider, ProbeTask { cancel, task });

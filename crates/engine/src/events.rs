@@ -101,7 +101,7 @@ pub enum Effect {
         thread: ThreadId,
     },
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ChangeSet {
     pub projects: BTreeMap<ProjectId, Project>,
     pub threads: BTreeMap<ThreadId, Thread>,

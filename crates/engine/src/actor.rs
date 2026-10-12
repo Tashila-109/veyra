@@ -40,6 +40,7 @@ pub enum EngineMsg {
     },
     Tool {
         caller: ThreadId,
+        session: Option<crate::mcp::Caller>,
         call: ToolCall,
         reply: oneshot::Sender<ToolResult>,
     },
@@ -102,6 +103,7 @@ pub struct Actor {
     flush_scheduled: bool,
     write_scheduled: bool,
     blocked: Option<Blocked>,
+    storage_receipt: Option<std::path::PathBuf>,
     #[cfg(test)]
     pub(crate) fail_write: bool,
     #[cfg(test)]
@@ -133,6 +135,17 @@ impl Actor {
         spawner: Spawner,
     ) -> Result<Self, StoreError> {
         let projection = store::load(&db)?;
+        let storage_receipt = db
+            .path()
+            .filter(|path| !path.is_empty())
+            .and_then(|path| std::path::Path::new(path).parent())
+            .map(|root| root.join("run/storage-blocked.json"));
+        let lost = storage_receipt
+            .as_ref()
+            .map(|path| crate::platform::optional_text(path))
+            .transpose()
+            .map_err(|error| StoreError::Invalid(error.to_string()))?
+            .flatten();
         let c = reconcile::decide(&projection, now());
         let live = projection
             .threads
@@ -148,6 +161,11 @@ impl Actor {
         let mut actor = Self {
             state: Arc::new(RuntimeState {
                 closing,
+                catalog: match &spawner {
+                    Spawner::Cli(env) => env.catalog.clone(),
+                    #[cfg(test)]
+                    Spawner::Scripted(_) => Default::default(),
+                },
                 ..Default::default()
             }),
             awake: None,
@@ -169,6 +187,7 @@ impl Actor {
             flush_scheduled: false,
             write_scheduled: false,
             blocked: None,
+            storage_receipt,
             #[cfg(test)]
             fail_write: false,
             #[cfg(test)]
@@ -177,9 +196,38 @@ impl Actor {
             test_commits: 0,
         };
         let mut c = c;
+        if let Some(lost) = lost {
+            let rows: BTreeMap<ThreadId, String> = serde_json::from_str(&lost)
+                .map_err(|error| StoreError::Invalid(error.to_string()))?;
+            for (thread, what) in rows {
+                if let Some(turn) = actor
+                    .projection
+                    .turns_for(thread)
+                    .max_by_key(|turn| turn.ordinal)
+                {
+                    let turn = turn.id;
+                    commands::add_item(
+                        &actor.projection,
+                        &mut c,
+                        Item {
+                            id: ItemId::new(),
+                            thread,
+                            turn,
+                            seq: 0,
+                            body: ItemBody::Notice(Notice {
+                                text: format!(
+                                    "Veyra closed while storage was blocked. Thread {thread} may have lost {what}. Check the provider conversation before sending more work."
+                                ),
+                            }),
+                        },
+                    );
+                }
+            }
+        }
         actor.prepare_commit(&mut c);
         actor.write(&c)?;
         c.install(&mut actor.projection, &mut actor.live);
+        actor.clear_storage_receipt();
         actor.publish_window_threads(actor.projection.threads.keys().copied().collect::<Vec<_>>());
         actor.update_awake();
         Ok(actor)
@@ -191,10 +239,11 @@ impl Actor {
             self.handle(msg);
             if self.shutting_down
                 && (deadline
-                    || self
-                        .live
-                        .values()
-                        .all(|live| matches!(live.live, Live::Parked)))
+                    || ((self.blocked.is_none() || self.storage_receipt.is_none())
+                        && self
+                            .live
+                            .values()
+                            .all(|live| matches!(live.live, Live::Parked))))
             {
                 break;
             }
@@ -237,13 +286,40 @@ impl Actor {
                 EngineMsg::Provider {
                     thread,
                     epoch,
+                    event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                } if self.blocked.is_some() => {
+                    if let Some(live) = self
+                        .live
+                        .get_mut(&thread)
+                        .filter(|live| live.epoch == epoch)
+                    {
+                        live.live = Live::Parked;
+                        live.background_work = false;
+                    }
+                    return;
+                }
+                EngineMsg::Provider {
+                    thread,
+                    epoch,
                     event: ProviderEvent::Session(SessionEvent::Exited { crash }),
                 } if self.current(thread, epoch) => {
                     let c = self.exited(thread, crash);
                     self.commit_event(c);
                     return;
                 }
-                EngineMsg::ShutdownDeadline => return,
+                EngineMsg::Tick => {
+                    if self.blocked.is_some() {
+                        self.retry();
+                        self.schedule_shutdown_retry();
+                    }
+                    return;
+                }
+                EngineMsg::ShutdownDeadline => {
+                    if let Some(blocked) = &self.blocked {
+                        tracing::error!(changes=%Self::lost_changes(&blocked.changes),"quit deadline reached with storage changes unwritten");
+                    }
+                    return;
+                }
                 EngineMsg::Snapshot { .. } | EngineMsg::Subscribe(_) => {}
                 _ => return,
             }
@@ -339,11 +415,81 @@ impl Actor {
                     self.commit_event(c);
                 }
             }
-            EngineMsg::Tool { reply, .. } => {
-                let _ = reply.send(ToolResult {
-                    ok: false,
-                    output_tail: Some("agent tools are not built yet".into()),
+            EngineMsg::Tool {
+                caller,
+                session,
+                call,
+                reply,
+            } => {
+                let current = match session {
+                    Some(session) => self.current(caller, session.epoch)
+                        && self.live.get(&caller).is_some_and(
+                            |live| matches!(live.live,Live::Structured{pid,..} if pid==session.pid),
+                        )
+                        && match &self.spawner {
+                            Spawner::Cli(env) => env
+                                .mcp
+                                .as_ref()
+                                .is_some_and(|server| server.allows(caller, session)),
+                            #[cfg(test)]
+                            Spawner::Scripted(_) => true,
+                        },
+                    None => match &self.spawner {
+                        Spawner::Cli(_) => false,
+                        #[cfg(test)]
+                        Spawner::Scripted(_) => true,
+                    },
+                };
+                if !current {
+                    let _=reply.send(ToolResult{ok:false,output_tail:Some("the calling session ended or was replaced; call list_providers from the current root session's running turn".into())});
+                    return;
+                }
+                let providers = match &self.spawner {
+                    Spawner::Cli(env) => env
+                        .catalog
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    #[cfg(test)]
+                    Spawner::Scripted(_) => ProviderKind::ALL
+                        .into_iter()
+                        .map(|provider| Probe {
+                            provider,
+                            path: Some("/scripted".into()),
+                            version: None,
+                            readiness: Readiness::Ready,
+                            models: vec![],
+                            account: None,
+                        })
+                        .collect(),
+                };
+                let result = crate::tools::decide(
+                    &self.projection,
+                    &self.live,
+                    caller,
+                    call,
+                    &providers,
+                    now(),
+                )
+                .and_then(|(mut c, value)| {
+                    self.prepare_commit(&mut c);
+                    self.write(&c)?;
+                    self.install(c);
+                    Ok(value)
                 });
+                let result = match result {
+                    Ok(value) => ToolResult {
+                        ok: true,
+                        output_tail: Some(value.to_string()),
+                    },
+                    Err(error) => ToolResult {
+                        ok: false,
+                        output_tail: Some(error.to_string()),
+                    },
+                };
+                let _ = reply.send(result);
             }
             EngineMsg::Tick => {
                 let mut c = ChangeSet::default();
@@ -400,6 +546,19 @@ impl Actor {
                         TurnState::Queued => Ev::TurnQueued(turn),
                         TurnState::Running { .. } => Ev::TurnStarted(turn),
                         TurnState::Ended { .. } => Ev::TurnEnded(turn),
+                    },
+                ));
+                initial.extend(self.projection.tasks.values().cloned().map(
+                    |task| match task.state {
+                        TaskState::Running => Ev::TaskStarted(task),
+                        TaskState::Settled {
+                            delivery: Delivery::Pending { .. },
+                            ..
+                        } => Ev::TaskSettled(task),
+                        TaskState::Settled {
+                            delivery: Delivery::Delivered { .. },
+                            ..
+                        } => Ev::TaskDelivered(task),
                     },
                 ));
                 initial.extend(self.projection.threads.keys().map(|id| {
@@ -462,6 +621,7 @@ impl Actor {
             self.publish(UiEvent::StorageBlocked {
                 error: Some(error.clone()),
             });
+            self.record_storage_receipt(&c);
             self.blocked = Some(Blocked {
                 changes: c,
                 error,
@@ -479,6 +639,7 @@ impl Actor {
             return;
         }
         self.install(blocked.changes);
+        self.clear_storage_receipt();
         self.publish(UiEvent::StorageBlocked { error: None });
         while let Some(msg) = blocked.deferred.pop_front() {
             self.handle(msg);
@@ -638,6 +799,7 @@ impl Actor {
                         config: row.config.clone(),
                         native: row.native.clone(),
                         import,
+                        root: matches!(row.lineage, Lineage::Root),
                     };
                     let epoch = self.live[&thread].epoch;
                     match self
@@ -939,6 +1101,12 @@ impl Actor {
         match event {
             TurnEvent::Started => {}
             TurnEvent::Accepted => {
+                tracing::info!(
+                    "turn accepted thread={} turn={} at_ms={}",
+                    thread,
+                    turn.id,
+                    now()
+                );
                 for task in self.projection.tasks.values() {
                     let mut t = task.clone();
                     if let TaskState::Settled {
@@ -1085,6 +1253,11 @@ impl Actor {
         }
     }
     fn exited(&self, thread: ThreadId, crash: Option<String>) -> ChangeSet {
+        if let Spawner::Cli(env) = &self.spawner
+            && let Some(server) = &env.mcp
+        {
+            server.revoke(thread, self.live[&thread].epoch);
+        }
         let mut c = ChangeSet::default();
         let old = &self.live[&thread];
         let active: Vec<_> = self
@@ -1420,13 +1593,92 @@ impl Actor {
             .awake
             .store(self.awake.is_some(), Ordering::Release);
     }
+    fn lost_changes(c: &ChangeSet) -> String {
+        let mut rows: BTreeMap<ThreadId, Vec<String>> = BTreeMap::new();
+        for item in c.items.values() {
+            let kind = match &item.body {
+                ItemBody::UserText(_) => "user text",
+                ItemBody::AssistantText { .. } => "assistant text",
+                ItemBody::Reasoning { .. } => "reasoning",
+                ItemBody::Tool(_) => "tool result",
+                ItemBody::Notice(_) => "provider notice",
+                ItemBody::Plan(_) => "plan",
+                ItemBody::TaskCard(_) => "task card",
+                ItemBody::TerminalSpan(_) => "terminal span",
+            };
+            rows.entry(item.thread)
+                .or_default()
+                .push(format!("{kind} item {}", item.id));
+        }
+        for turn in c.turns.values() {
+            rows.entry(turn.thread)
+                .or_default()
+                .push(format!("turn {} state", turn.id));
+        }
+        for thread in c.threads.keys() {
+            rows.entry(*thread)
+                .or_default()
+                .push("thread metadata".into());
+        }
+        for request in c.requests.values() {
+            rows.entry(request.thread)
+                .or_default()
+                .push(format!("request {} state", request.id));
+        }
+        for task in c.tasks.values() {
+            rows.entry(task.parent)
+                .or_default()
+                .push(format!("task {} state and delivery", task.id));
+        }
+        serde_json::to_string(
+            &rows
+                .into_iter()
+                .map(|(thread, parts)| (thread, parts.join(", ")))
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .unwrap()
+    }
+    fn record_storage_receipt(&self, c: &ChangeSet) {
+        let text = Self::lost_changes(c);
+        tracing::error!(changes=%text,"storage changes retained but not written");
+        if let Some(path) = &self.storage_receipt
+            && let Err(error) = crate::platform::private_text(path, &text)
+        {
+            tracing::error!(%error,"could not write storage recovery notice");
+        }
+    }
+    fn clear_storage_receipt(&self) {
+        if let Some(path) = &self.storage_receipt
+            && let Err(error) = crate::platform::remove_optional_file(path)
+        {
+            tracing::error!(%error,"could not clear storage recovery notice");
+        }
+    }
+    fn schedule_shutdown_retry(&self) {
+        if self.shutting_down && self.blocked.is_some() {
+            let out = self.out.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = out.send(EngineMsg::Tick).await;
+            });
+        }
+    }
     fn shutdown(&mut self) {
         if self.shutting_down {
             return;
         }
         self.shutting_down = true;
         self.state.closing.close();
-        let mut c = ChangeSet::default();
+        let mut c = if let Some(blocked) = self.blocked.take() {
+            let mut changes = blocked.changes;
+            changes.effects.clear();
+            changes
+                .clone()
+                .install(&mut self.projection, &mut self.live);
+            changes
+        } else {
+            ChangeSet::default()
+        };
         for request in self
             .projection
             .requests
@@ -1485,6 +1737,10 @@ impl Actor {
             }
         }
         self.commit_event(c);
+        if self.blocked.is_none() {
+            self.clear_storage_receipt();
+        }
+        self.schedule_shutdown_retry();
         for live in self.live.values_mut() {
             if matches!(live.live, Live::Starting { session: None }) {
                 live.live = Live::Parked;

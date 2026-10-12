@@ -2131,6 +2131,7 @@ mod tests {
             },
             native: None,
             import: false,
+            root: false,
         };
         for (mode, expected, dangerous) in [
             (PermissionMode::AskFirst, "default", false),

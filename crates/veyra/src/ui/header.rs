@@ -1,6 +1,4 @@
-use super::{
-    MainView, Shell, actions::NewThread, composer::labelled_button, status_name, theme::Theme,
-};
+use super::{MainView, Shell, actions::NewThread, composer::labelled_button, theme::Theme};
 use gpui_kit::component::StyledExt;
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::Status;
@@ -16,7 +14,7 @@ pub(super) fn status_text(status: &Status) -> String {
         ),
         Status::NeedsYou => "Needs you".into(),
         Status::Done { took } => format!("Done · {}s", took / 1000),
-        _ => status_name(status).into(),
+        _ => status.words().into(),
     }
 }
 pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {

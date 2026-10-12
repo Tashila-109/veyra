@@ -1,0 +1,9 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.296","scenario":"reported dynamic MCP connection","source":"Veyra handwritten; MCP init shape from m4 lane 0"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:initialize>","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:initialize>","response":{}}}}
+{"type":"expect_outbound","line":{"type":"user","uuid":"<id:first>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"<any>"}}}
+{"type":"emit_inbound","line":{"type":"system","subtype":"init","session_id":"<id:session>","claude_code_version":"2.1.296","mcp_servers":[{"name":"veyra","status":"connected","source":"dynamic"}]}}
+{"type":"emit_inbound","line":{"type":"user","uuid":"<id:first>","session_id":"<id:session>","parent_tool_use_id":null,"isReplay":true,"message":{"role":"user","content":"MCP connection check"}}}
+{"type":"emit_inbound","line":{"type":"assistant","session_id":"<id:session>","parent_tool_use_id":null,"message":{"id":"<id:reply>","role":"assistant","content":[{"type":"text","text":"Ready"}]}}}
+{"type":"emit_inbound","line":{"type":"result","subtype":"success","is_error":false,"session_id":"<id:session>","user_message_uuid":"<id:first>"}}
+{"type":"exit","code":0}

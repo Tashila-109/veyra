@@ -1,0 +1,8 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.296","scenario":"child completes its task","source":"Veyra handwritten; MCP init shape from m4 lane 0"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:initialize>","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:initialize>","response":{}}}}
+{"type":"expect_outbound","line":{"type":"user","uuid":"<id:task>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"Your last message is your report to the parent; Veyra delivers up to 4,000 characters after its current turn ends. You cannot start child threads.\n\nDescribe the files and finish with a report"}}}
+{"type":"emit_inbound","line":{"type":"user","uuid":"<id:task>","session_id":"<id:session>","parent_tool_use_id":null,"isReplay":true,"message":{"role":"user","content":"Describe the files and finish with a report"}}}
+{"type":"emit_inbound","line":{"type":"assistant","session_id":"<id:session>","parent_tool_use_id":null,"message":{"id":"<id:reply>","role":"assistant","content":[{"type":"text","text":"The requested file check is complete"}]}}}
+{"type":"emit_inbound","line":{"type":"result","subtype":"success","is_error":false,"session_id":"<id:session>","user_message_uuid":"<id:task>"},"after_ms":250}
+{"type":"exit","code":0}

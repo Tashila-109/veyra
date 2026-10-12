@@ -15,7 +15,8 @@ Exact thread grants and deny/cancel replies are persisted before their provider 
 Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
 The window owns render and event-batch counters.
 Inactive-window family changes post system banners, and busy Quit opens a sheet.
-There is no PTY or tool server.
+There is no PTY.
+Engine startup binds the MCP socket server, and root Claude sessions receive its five actor-owned tools through the relay.
 
 ### System architecture
 
@@ -42,14 +43,14 @@ debug ctl -> private Unix socket -> socket thread -> gpui window actions
 
 ```text
 veyra -> veyra-engine -> rusqlite (bundled) + tokio
-                     -> serde + serde_json + uuid + thiserror + tracing + regex + base64
+                     -> serde + serde_json + uuid + thiserror + tracing + regex + base64 + sha2
                      -> platform -> libc + Rust standard library
 veyra -> gpui-kit + gpui-pre
       -> tokio + serde + serde_json + tracing + tracing-subscriber + anyhow
 ```
 
 Direct versions are exact pins and `Cargo.lock` is kept.
-The engine's tokio features are `sync`, `rt-multi-thread`, `time`, `macros`, `process` and `io-util`; engine tests add `test-util`.
+The engine's tokio features are `sync`, `rt-multi-thread`, `time`, `macros`, `process`, `io-util` and `net`; engine tests add `test-util`.
 Only the application crate declares gpui dependencies.
 `platform_boundary` scans for libc, socket, process-group, target and listed command strings outside `platform/`; the header's `git` child is a reviewed exception.
 Manifest review keeps gpui out of the engine and direct versions exact; no automated manifest check enforces those rules.
@@ -58,13 +59,15 @@ Manifest review keeps gpui out of the engine and direct versions exact; no autom
 
 `main::run` handles arguments before creating folders or starting gpui.
 No argument opens the window; debug builds route `ctl` to its client.
-Other arguments, including `mcp`, print `usage: veyra [mcp]` and exit 2.
+The `mcp` argument runs the byte relay before data resolution, locking, logging, the engine or gpui.
+Other arguments print `usage: veyra [mcp]` and exit 2.
 
 `DataDir::resolve` reads `VEYRA_DATA_DIR`, or uses `~/Library/Application Support/Veyra`.
 Relative overrides become absolute paths.
 It validates the longest socket path before creating the data folder, `logs/` and `run/` at mode 0700.
 The platform limit is 103 usable socket-path bytes.
-Debug builds validate `control.sock`; release builds validate `veyra.sock` but create no service listener.
+Debug builds validate the longer `control.sock` path; release builds validate `veyra.sock`.
+File-backed Engine startup binds veyra.sock in both builds.
 
 `Engine::start` locks the folder, opens `veyra.db` through a private 0600 file, migrates, reaps stored orphan groups, reconciles stored work, then starts the actor on a dedicated `std::thread`.
 The actor keeps the lock file alive.
@@ -126,8 +129,17 @@ It expires pending requests with "Veyra is closing" before ending turns.
 A Restarted hold remains Held even without a queued turn; Send with an empty queue or Continue clears it.
 Sessions queue deny/cancel replies before the protocol interrupt and give the writer up to one second to drain before group cleanup.
 Cleanup terminates their owned groups and kills survivors one second later.
+Shutdown first retains any blocked change set and installs its projection without publishing or dispatching its earlier effects, then combines it with shutdown changes for one write.
+Persistent actors retry a blocked shutdown write every 50 ms within the existing three-second deadline.
+The 50 ms retry cadence is an implementation choice; the design specifies the bounded shutdown wait.
+In-memory actors still end promptly when no session remains.
 After the shutdown commit attempt, a three-second deadline ends the actor's session wait when its message is handled.
 If that write fails, pending row changes remain blocked while sessions still receive Shutdown, and sessionless Starting threads still park in runtime state.
+A blocked write logs affected thread ids and changed item, turn, request, task and metadata identifiers without recording their text.
+A private DATA/run/storage-blocked.json receipt carries that same metadata for the next launch and is removed after a successful write.
+Startup consumes any remaining receipt into notice items on the affected threads before clearing it.
+The notice identifies what may have been lost and asks the user to inspect the provider conversation before sending more work.
+Receipt creation failures are logged; unavailable storage can prevent the next-launch notice from being saved.
 Database work and queued messages can delay handling that deadline; shutdown_wait bounds its own wait with a three-second runtime timeout.
 `Engine::on_app_quit` closes the engine before sending SIGTERM to every registered provider/probe group, then waits 100 ms on the runtime.
 The application registers on_app_quit with gpui and runs begin_quitting before awaiting native termination cleanup.
@@ -238,7 +250,7 @@ An uncorrelated tail from a drained Provider-origin turn is logged and dropped.
 The old CLI end clears the drain; the same change applies the start rule, which still refuses Stopping sessions.
 StopThread and Archive also discard queued user and task turns and set a Stopped hold, while Interrupt keeps them and sets an Interrupted hold.
 All three preserve an existing hold.
-Tasks cannot arise through the application because the tool server is not implemented.
+Authenticated root-session EngineMsg::Tool requests create and manage tasks through the actor.
 `can_use_tool` opens a typed approval or AskUserQuestion request.
 Unknown subtypes and malformed requests receive an error response without opening a request.
 Malformed includes empty tool names or ids, ids reused within that CLI process lifetime, missing or non-object input, missing question text or option labels, and duplicate question texts.
@@ -275,7 +287,11 @@ Turn completion and process exit expire pending requests and publish RequestClos
 Migrations use `PRAGMA user_version` in transactions and refuse newer schemas.
 The eight tables are projects, threads, turns, items, requests, grants, tasks and settings.
 User text lives once in an item referenced by its turn.
-An ended turn carries both its optional start time and end time, including after load; there is no separate start-time map.
+An ended turn carries both its optional start time and end time, including after load.
+A requeued turn retains started_at in SQLite, and Projection.attempted_starts keeps that persisted admission attempt visible to reconcile.
+Reconcile interrupts a queued turn with an earlier start attempt because it cannot know whether the CLI received the dispatched prompt.
+The prompt remains in its existing user item, and Continue cannot resend that uncertain attempt.
+Unstarted queued turns remain queued and held; pending wakes keep the existing safer duplicate-report recovery.
 Migration 2 normalizes older empty CLI versions to NULL once.
 Loading rows is read-only and treats any remaining empty CLI version as unknown.
 Empty versions become unknown at the codec, probe and row-load boundaries; the actor and writes trust that input.
@@ -389,6 +405,67 @@ SessionControls drains pending controls and closes its receiver on Shutdown or t
 One drain_and_check_launch gates both initial launch and resume fallback, refusing closing, pending or consumed Shutdown, a closed control channel or a gone event consumer.
 Before admitting StartTurn, SessionControls reads the gate's closing state and drains queued controls, so a pending Shutdown or channel closure prevents the prompt without changing cancel-reply or cleanup order.
 
+## MCP relay, authentication and actor tools
+
+relay::run sends VEYRA_MCP_TOKEN from its environment as the first socket line, then copies stdin to the socket and the socket to stdout.
+It reads VEYRA_SOCKET for the connection path and writes no token-bearing file.
+The relay starts no window, takes no instance lock and emits no protocol diagnostics to stdout.
+McpToken contains 32 platform-random bytes encoded for the environment, and Debug prints McpToken(***).
+Server::for_spawn holds its credential lock through the caller's spawn and registers the token hash, thread, epoch and actual CLI pid before a relay can authenticate.
+Only the hash remains in the credential registry, and a credential permits one connection.
+Session Drop removes its credential by hash, and Actor::exited also revokes the thread and epoch before committing exit.
+Server::bind requires a private 0700 data folder and uses platform::bind_async_socket to unlink a stale veyra.sock and bind it at 0600.
+The server gets the peer pid with LOCAL_PEERPID, its direct parent with proc_pidinfo and its executable path with proc_pidpath.
+Authentication compares the peer executable with the supplied relay command and its direct parent with the registered CLI pid before consuming the token hash.
+Engine::launch supplies std::env::current_exe to Server::bind before starting its file-backed actor.
+In-memory test engines have no data folder and do not bind a socket.
+Tests supply the built Veyra executable and reach it from the fake CLI's direct-child relay.
+Accepted and refused connections log the thread id when the token identifies one, and tools/call logs the thread and supported tool name without arguments.
+Unknown tool names log as unknown.
+Socket lines reuse the provider's bounded 4 MiB ByteLines reader.
+The three-second first authentication line bound is an implementation choice; the design specifies no authentication timeout.
+The server serves initialize, ping, tools/list and tools/call over newline-delimited JSON-RPC.
+Every unsupported request, including Claude's server/discover, receives -32601 immediately, and notifications receive no reply.
+Claude 2.1.296's measured direct-child server chain supports the executable and parent checks.
+Its system/init lists veyra as connected with source dynamic after the first user message.
+Claude shows initialize instructions from the start but may defer a tool description until ToolSearch loads its schema.
+Instructions therefore contain the complete first-call rules, and each tool description also teaches its own common rule.
+Configuration uses platform::private_dir and platform::private_file to write the sole token-bearing file, 0600 DATA/run/THREAD/mcp.json under a 0700 folder.
+Its mcpServers.veyra entry names the relay command, mcp argument and env bindings VEYRA_SOCKET and VEYRA_MCP_TOKEN.
+Its system_init handler removes the file when veyra is listed with any status, logs a non-connected report with its thread id, and Drop removes it if the session ends first.
+provider::session::Process owns Configuration and a token hash throughout the root session.
+launch gives --mcp-config PATH only to roots, including resumes and fresh replacement sessions, without adding the token to the root CLI environment.
+Child sessions receive neither the config argument nor a relay credential.
+A queued tool request carries the authenticated thread, epoch, actual CLI pid and hash; the actor checks the current structured session and live credential before any decision.
+The CLI actor refuses a tool request without its originating session; only scripted unit fixtures use that seam.
+The token never enters argv, logs, evidence, fixture text or crash text.
+
+Actor::handle_inner sends every tool decision through tools::decide, the existing ChangeSet commit and the existing effects path.
+list_providers reads the shared readiness catalog and returns available providers, models, the caller's mode ceiling and remaining fan-out.
+Probes populate that catalog and Engine::child_env shares it with the actor.
+start_thread creates a child lineage, first task turn and UUID-v5 task keyed by caller and start_thread:client_request_id.
+get_task reads only the caller's task and reports the child's Status::words with its settled summary when present.
+message_thread creates a task on an owned child and reports started or queued with the derived wait reason.
+stop_thread uses the existing child stop and settlement helpers with Stopped by its parent and leaves the parent unheld.
+Identity is supplied by the authenticated connection, never by a self argument.
+Ownership and a running-turn gate apply inside the actor before any tool decision commits.
+A child may not start a thread, and the store's lineage constraints independently refuse grandchildren.
+The derived permission order enforces child mode <= parent mode, with the parent's mode as default.
+The fan-out cap counts distinct children with open tasks, with a limit of four.
+The family cap counts all rows sharing the root, including archived rows, with a limit of sixteen.
+A retry compares the stored first user item and child provider, and message_thread also compares the requested child id before returning a stored task.
+Reusing a key with different text, provider or target is refused, while the two tool names create separate key namespaces.
+Prompts and follow-ups are capped at 100,000 Unicode characters.
+Refusals name the rule, applicable count and limit, and a next tool with the identifiers or argument shape needed to recover.
+The first task prompt alone prepends two child-guidance sentences; stored user text and later task or user prompts stay literal.
+The existing settlement path waits for no running or queued child turn and no background work, or handles Stop and recovered-child Continue.
+It coalesces reports into a queued wake and records Pending delivery in the same transaction.
+A settlement while a wake runs creates a successor wake.
+Wake text frames each child's final assistant message as a report and caps its summary at 4,000 characters.
+The ordinary start rule waits for the parent to be idle and unheld, so a wake never interrupts or steers.
+Accepted changes task delivery to Delivered, and the actor logs thread, turn and acceptance time for each admitted acceptance.
+Parent Stop preserves a held wake, a kept child settles into its archived root's pending wake, and a user stop of one child holds the parent as ChildReport without replacing an earlier hold.
+
 ## Platform and keep-awake
 
 The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals, process inspection, idle-sleep assertions and Terminal opening.
@@ -440,7 +517,9 @@ Missing replay files fail spawn with their path; the child gets the absolute sin
 The standalone fake executable reads that singular variable.
 
 The debug Recorder creates private 0600 captures through platform::private_file.
-It binds the supplied cwd, optional home folder and known ids and can bind a session token; sessions currently have no MCP token.
+It binds the supplied cwd, optional home folder and known ids.
+Process sanitizes inbound and outbound recording values with its token hash before calling Recorder::line, replacing any exact token with <id:token>.
+The same hash sanitizes provider inbound values and stderr before UI, storage or crash text receives them.
 ChildEnv reads HOME once and supplies it to the recorder; `<home>` is a capture placeholder, not a matcher binding.
 It replaces credential fields, redacts secret-shaped text, replaces hook output with a placeholder and keeps account keys with masked values.
 The probe is recorded as probe.jsonl; a later probe replaces that capture only after the earlier probe has ended.
@@ -454,7 +533,7 @@ Recorder and override read sites are compile-time debug-only; release string che
 `Shell` owns the engine handle and read-only projection, window navigation and input, readiness tasks and transient presentation state.
 `MainView::Chat` carries its thread id; Settings keeps an optional return thread.
 It subscribes before requesting snapshots.
-The subscription starts with SettingsChanged, projects, threads, turn rows and one status per thread.
+The subscription starts with SettingsChanged, projects, threads, turn rows, task state and delivery rows, and one status per thread.
 It also sends StorageBlocked if storage is blocked.
 Every thread-scoped initial row advances that thread's counter.
 The gpui pump drains every queued event into one entity update, applies it and notifies once.
@@ -569,6 +648,7 @@ A full queue rejects before enqueueing; a reply timeout does not cancel an actio
 
 Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler, and quit dispatches ConfirmQuit.
 Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
+Each sidebar thread and selected thread includes lineage, and tasks includes each received task row with its state and delivery.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
 Debug counts are removed when their items leave the projection or the thread is archived.
 The driver adds the engine's schema_version without opening the database.
@@ -600,6 +680,7 @@ DebugStallUi blocks the window thread for its supplied milliseconds so the pump 
 
 - [Entry and runtime](crates/veyra/src/main.rs), [engine handle](crates/engine/src/lib.rs), [data folder](crates/engine/src/data_dir.rs).
 - [Actor](crates/engine/src/actor.rs), [decisions](crates/engine/src/commands.rs), [domain/indexes](crates/engine/src/domain.rs), [live variants](crates/engine/src/live.rs).
+- [Relay](crates/veyra/src/relay.rs), [MCP socket and config](crates/engine/src/mcp.rs), [tool decisions and guidance](crates/engine/src/tools.rs).
 - [Storage/schema](crates/engine/src/store.rs), [recovery](crates/engine/src/reconcile.rs), [events/snapshots](crates/engine/src/events.rs).
 - [Provider boundary](crates/engine/src/provider/mod.rs), [environment](crates/engine/src/provider/env.rs), [sessions/probes](crates/engine/src/provider/session.rs), [Claude codec](crates/engine/src/provider/claude.rs).
 - [Fixture format](crates/engine/src/fixture.rs), [fake CLI](crates/engine/src/bin/veyra-fake-cli.rs), [recording/redaction](crates/engine/src/record.rs).
@@ -609,6 +690,11 @@ DebugStallUi blocks the window thread for its supplied milliseconds so the pump 
 - [Driver](crates/veyra/src/control.rs), [name coverage](crates/veyra/src/verify_map.rs), [verification skill](.agents/skills/verify-veyra/SKILL.md).
 
 ## Verification
+
+multi_agent tests exercise actor rules, idempotent tasks, guidance, shared status words, settlement, held and successor wakes, grants, C1 recovery and C2 retained writes and recovery notices.
+mcp_socket uses the built relay and a fake CLI that records only its own argv, then checks foreign-peer refusal, copied-token reuse refusal, private files and socket modes, RPC method fallback, instruction coverage and config cleanup.
+mcp_socket also exercises production root session config lifetime, non-connected init cleanup, pre-init exit cleanup, child argv isolation and token redaction.
+
 
 Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
 replay_claude uses the real session task with the fake CLI for text and tools, prompt correlation, provider-turn completion, resume, crash and error outcomes, background replacement and readiness.

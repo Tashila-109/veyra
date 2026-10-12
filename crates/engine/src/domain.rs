@@ -403,6 +403,7 @@ pub struct Projection {
     pub turn_ids: BTreeMap<ThreadId, BTreeSet<TurnId>>,
     pub item_ids: BTreeMap<ThreadId, BTreeSet<ItemId>>,
     pub turns: BTreeMap<TurnId, Turn>,
+    pub attempted_starts: BTreeMap<TurnId, Millis>,
     pub items: BTreeMap<ItemId, Item>,
     pub requests: BTreeMap<RequestId, Request>,
     pub grants: BTreeSet<(ThreadId, GrantKey)>,
@@ -411,6 +412,9 @@ pub struct Projection {
 }
 impl Projection {
     pub fn insert_turn(&mut self, turn: Turn) {
+        if let Some(start) = turn.state.started() {
+            self.attempted_starts.insert(turn.id, start);
+        }
         self.turn_ids
             .entry(turn.thread)
             .or_default()
@@ -473,6 +477,18 @@ pub enum Status {
     Idle,
 }
 impl Status {
+    pub fn words(&self) -> &'static str {
+        match self {
+            Self::NeedsYou => "NeedsYou",
+            Self::Failed => "Failed",
+            Self::Held => "Held",
+            Self::Interrupted => "Interrupted",
+            Self::Working { .. } => "Working",
+            Self::InTerminal => "InTerminal",
+            Self::Done { .. } => "Done",
+            Self::Idle => "Idle",
+        }
+    }
     fn priority(&self) -> u8 {
         match self {
             Self::NeedsYou => 0,

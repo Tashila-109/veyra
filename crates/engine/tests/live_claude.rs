@@ -32,6 +32,7 @@ fn live_claude_ok_reply() {
                     },
                     native: None,
                     import: false,
+                    root: false,
                 },
                 out,
                 1,

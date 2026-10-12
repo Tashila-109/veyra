@@ -50,6 +50,7 @@ struct AppState {
     projects: BTreeMap<ProjectId, Project>,
     threads: BTreeMap<ThreadId, Thread>,
     turns: BTreeMap<TurnId, Turn>,
+    tasks: BTreeMap<TaskId, veyra_engine::domain::Task>,
     items: BTreeMap<ThreadId, BTreeMap<ItemId, Item>>,
     item_order: BTreeMap<ThreadId, TranscriptOrder>,
     markdown_text: BTreeMap<ItemId, SharedString>,
@@ -189,11 +190,12 @@ impl AppState {
                         self.requests.push(request.clone());
                     }
                 }
-                ChangeEvent::ItemAdded(_)
-                | ChangeEvent::ItemCompleted(_)
-                | ChangeEvent::TaskStarted(_)
-                | ChangeEvent::TaskSettled(_)
-                | ChangeEvent::TaskDelivered(_) => {}
+                ChangeEvent::TaskStarted(task)
+                | ChangeEvent::TaskSettled(task)
+                | ChangeEvent::TaskDelivered(task) => {
+                    self.tasks.insert(task.id, task.clone());
+                }
+                ChangeEvent::ItemAdded(_) | ChangeEvent::ItemCompleted(_) => {}
             }
         }
         if !matches!(
@@ -450,18 +452,6 @@ impl AppState {
                 } => Some(message.as_str()),
                 _ => None,
             })
-    }
-}
-fn status_name(status: &Status) -> &'static str {
-    match status {
-        Status::NeedsYou => "NeedsYou",
-        Status::Failed => "Failed",
-        Status::Held => "Held",
-        Status::Interrupted => "Interrupted",
-        Status::Working { .. } => "Working",
-        Status::InTerminal => "InTerminal",
-        Status::Done { .. } => "Done",
-        Status::Idle => "Idle",
     }
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -1385,8 +1375,8 @@ impl Shell {
             {
                 rows.push(serde_json::json!({
                     "kind":"thread", "id":thread.id, "title":thread.title,
-                    "status":status_name(&self.state.status(thread.id)),
-                    "archived":thread.archived, "mode":thread.config.mode
+                    "status":self.state.status(thread.id).words(),
+                    "archived":thread.archived, "mode":thread.config.mode, "lineage":thread.lineage
                 }));
             }
         }
@@ -1400,10 +1390,10 @@ impl Shell {
             .map(|thread| {
                 let status = self.state.status(thread.id);
                 serde_json::json!({
-                    "id":thread.id, "title":thread.title,
+                    "id":thread.id, "title":thread.title, "lineage":thread.lineage,
                     "native_id":thread.native.as_ref().map(|native| &native.0),
                     "cli_version":thread.cli_version, "config":thread.config,
-                    "status":status_name(&status), "header_status":header::status_text(&status),
+                    "status":status.words(), "header_status":header::status_text(&status),
                     "failure":self.state.failure(thread.id), "hold":thread.hold,
                     "wait_reason":self.engine.window_threads().get(&thread.id)
                         .and_then(|state| state.wait_reason).map(|reason| reason.to_string())
@@ -1516,6 +1506,7 @@ impl Shell {
             "window_active":self.window_active, "notifications":{"posted":self.notifications_posted},
             "quit_sheet":{"open":self.quit_sheet, "threads":self.busy_threads()},
             "requests":self.state.requests,
+            "tasks":self.state.tasks.values().collect::<Vec<_>>(),
             "notice":self.notice.as_ref().map(|notice| notice.as_ref())
         })
     }

@@ -41,6 +41,8 @@ pub(crate) struct SpawnPause {
 #[derive(Clone, Debug)]
 pub struct ChildEnv {
     pub(crate) groups: Groups,
+    pub mcp: Option<Arc<crate::mcp::Server>>,
+    pub(crate) catalog: Arc<Mutex<std::collections::BTreeMap<ProviderKind, super::Probe>>>,
     pub(crate) closing: Arc<crate::LaunchGate>,
     #[cfg(test)]
     pub(crate) launches: Arc<std::sync::atomic::AtomicUsize>,
@@ -67,6 +69,8 @@ impl ChildEnv {
         }
         Self {
             groups: Default::default(),
+            mcp: None,
+            catalog: Default::default(),
             closing: Default::default(),
             #[cfg(test)]
             launches: Default::default(),
@@ -221,7 +225,9 @@ mod tests {
     fn resolution_skips_relative_and_empty_path_entries() {
         if let Some(root) = std::env::var_os("VEYRA_TEST_RESOLUTION") {
             let env = super::ChildEnv {
+                mcp: None,
                 groups: Default::default(),
+                catalog: Default::default(),
                 closing: Default::default(),
                 launches: Default::default(),
                 #[cfg(test)]

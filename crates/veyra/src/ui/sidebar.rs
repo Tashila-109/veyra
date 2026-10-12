@@ -121,6 +121,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                         .justify_start()
                         .child(div().flex_1())
                         .selected(shell.view.chat() == Some(thread.id))
+                        .tooltip(status.words())
                         .on_click(move |_, window, cx| {
                             window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
                         }),

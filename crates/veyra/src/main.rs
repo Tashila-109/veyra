@@ -1,5 +1,6 @@
 #[cfg(debug_assertions)]
 mod control;
+mod relay;
 pub mod ui;
 #[cfg(test)]
 mod verify_map;
@@ -22,6 +23,7 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         None => {}
+        Some("mcp") => return relay::run(),
         #[cfg(debug_assertions)]
         Some("ctl") => return control::client(),
         Some(_) => {

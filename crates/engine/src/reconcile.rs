@@ -15,11 +15,19 @@ pub fn decide(p: &Projection, now: Millis) -> ChangeSet {
         if matches!(t.state, TurnState::Queued | TurnState::Running { .. }) {
             set_hold(p, &mut c, t.thread, Some(HoldReason::Restarted));
         }
-        if matches!(t.state, TurnState::Running { .. }) {
+        if matches!(t.state, TurnState::Running { .. })
+            || (t.state == TurnState::Queued && p.attempted_starts.contains_key(&t.id))
+        {
             end_turn(
                 p,
                 &mut c,
-                t.clone(),
+                {
+                    let mut t = t.clone();
+                    if let Some(since) = p.attempted_starts.get(&t.id) {
+                        t.state = TurnState::Running { since: *since };
+                    }
+                    t
+                },
                 TurnOutcome::Interrupted {
                     reason: crate::provider::StopReason::AppClosing.text().into(),
                 },

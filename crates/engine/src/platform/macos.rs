@@ -353,6 +353,88 @@ pub fn test_symlink(original: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(original, link)
 }
 
+pub fn private_text(path: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    let temporary = path.with_extension("pending");
+    let mut file = private_file(
+        &temporary,
+        OpenOptions::new().create(true).write(true).truncate(true),
+    )?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(temporary, path)
+}
+pub fn optional_text(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+pub fn remove_optional_file(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub type Socket = tokio::net::UnixStream;
+pub type SocketListener = tokio::net::UnixListener;
+pub fn bind_async_socket(path: &Path) -> io::Result<SocketListener> {
+    let listener = bind_socket(path)?;
+    listener.set_nonblocking(true)?;
+    SocketListener::from_std(listener)
+}
+pub async fn connect_async_socket(path: &Path) -> io::Result<Socket> {
+    Socket::connect(path).await
+}
+pub fn peer_pid(stream: &Socket) -> io::Result<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut size,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if pid <= 0 || size as usize != std::mem::size_of_val(&pid) {
+        return Err(io::Error::other("socket peer pid unavailable"));
+    }
+    Ok(pid as u32)
+}
+pub fn parent_pid(pid: u32) -> io::Result<u32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    if unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    } != size as i32
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { info.assume_init() }.pbi_ppid)
+}
+pub fn exe_path(pid: u32) -> io::Result<PathBuf> {
+    process_executable(pid)
+}
+pub fn random_token_bytes() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    unsafe { libc::arc4random_buf(bytes.as_mut_ptr().cast(), bytes.len()) };
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

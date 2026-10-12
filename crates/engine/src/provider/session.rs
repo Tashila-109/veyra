@@ -174,6 +174,7 @@ async fn write_interrupt(
 struct Process {
     child: ProcessGroup,
     native: NativeSessionId,
+    mcp: Option<crate::mcp::Session>,
     #[cfg(debug_assertions)]
     recorder: Option<record::Recorder>,
 }
@@ -185,19 +186,31 @@ impl Process {
     ) -> Result<(), ProviderError> {
         #[cfg(debug_assertions)]
         if let Some(recorder) = &mut self.recorder {
-            recorder.line(true, line.value())?;
+            let mut value = line.value();
+            if let Some(mcp) = &self.mcp {
+                mcp.hash.sanitize(&mut value, "<id:token>");
+            }
+            recorder.line(true, value)?;
         }
         writer
             .send(line)
             .map_err(|_| ProviderError::Protocol("Claude stdin writer closed".into()))
     }
-    fn record_inbound(&mut self, line: &serde_json::Value) -> Result<(), ProviderError> {
+    fn record_inbound(&mut self, line: &mut serde_json::Value) -> Result<(), ProviderError> {
+        if let Some(mcp) = &self.mcp {
+            mcp.config.system_init(line)?;
+        }
         #[cfg(debug_assertions)]
         if let Some(recorder) = &mut self.recorder {
-            recorder.line(false, line.clone())?;
+            let mut recorded = line.clone();
+            if let Some(mcp) = &self.mcp {
+                mcp.hash.sanitize(&mut recorded, "<id:token>");
+            }
+            recorder.line(false, recorded)?;
         }
-        #[cfg(not(debug_assertions))]
-        let _ = line;
+        if let Some(mcp) = &self.mcp {
+            mcp.hash.sanitize(line, "[redacted]");
+        }
         Ok(())
     }
 }
@@ -205,6 +218,7 @@ fn launch(
     spec: &SessionSpec,
     env: &ChildEnv,
     fresh: Option<NativeSessionId>,
+    session_epoch: u32,
 ) -> Result<Process, ProviderError> {
     let binary = env.resolve(ProviderKind::Claude)?;
     #[cfg(debug_assertions)]
@@ -242,10 +256,43 @@ fn launch(
             )
         })
         .transpose()?;
-    let child = env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?;
+    let (child, mcp) = if spec.root
+        && let Some(server) = &env.mcp
+    {
+        let (child, config, hash) = server.for_spawn(spec.thread, session_epoch, |token| {
+            let config = crate::mcp::Configuration::create(
+                server.socket.parent().unwrap(),
+                spec.thread,
+                &server.command,
+                &server.socket,
+                token,
+            )?;
+            args.extend([
+                "--mcp-config".into(),
+                config.path.to_string_lossy().into_owned(),
+            ]);
+            let child = env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?;
+            let pid = child.pid();
+            Ok(((child, config, crate::mcp::TokenHash(token.hash())), pid))
+        })?;
+        (
+            child,
+            Some(crate::mcp::Session {
+                config,
+                hash,
+                server: server.clone(),
+            }),
+        )
+    } else {
+        (
+            env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?,
+            None,
+        )
+    };
     Ok(Process {
         child,
         native,
+        mcp,
         #[cfg(debug_assertions)]
         recorder,
     })
@@ -292,7 +339,7 @@ fn start_task(
             None => {
                 match receiver
                     .drain_and_check_launch(&out)
-                    .and_then(|()| launch(&spec, &env, None))
+                    .and_then(|()| launch(&spec, &env, None, epoch))
                 {
                     Ok(process) => process,
                     Err(error) => {
@@ -319,7 +366,7 @@ fn start_task(
                     let native = NativeSessionId(ThreadId::new().to_string());
                     match receiver
                         .drain_and_check_launch(&out)
-                        .and_then(|()| launch(&spec, &env, Some(native)))
+                        .and_then(|()| launch(&spec, &env, Some(native), epoch))
                     {
                         Ok(mut next) => {
                             next.child.watch(&cleanup);
@@ -403,24 +450,24 @@ async fn emit(
     .is_ok()
 }
 const LINE_CAP: usize = 4 * 1024 * 1024;
-enum Line {
+pub(crate) enum Line {
     Text(String),
     Oversize(usize),
 }
-struct ByteLines<R> {
+pub(crate) struct ByteLines<R> {
     reader: BufReader<R>,
     bytes: Vec<u8>,
     length: usize,
 }
 impl<R: AsyncRead + Unpin> ByteLines<R> {
-    fn new(reader: R) -> Self {
+    pub(crate) fn new(reader: R) -> Self {
         Self {
             reader: BufReader::new(reader),
             bytes: Vec::new(),
             length: 0,
         }
     }
-    async fn next(&mut self) -> std::io::Result<Option<Line>> {
+    pub(crate) async fn next(&mut self) -> std::io::Result<Option<Line>> {
         loop {
             let available = self.reader.fill_buf().await?;
             let end = available.iter().position(|byte| *byte == b'\n');
@@ -674,7 +721,7 @@ async fn run_one(
                     })).await { consumer_gone = true; break; }
                 }
                 Ok(Some(Line::Text(line))) => {
-                    let wire = match serde_json::from_str::<serde_json::Value>(&line) {
+                    let mut wire = match serde_json::from_str::<serde_json::Value>(&line) {
                         Ok(wire) => wire,
                         Err(error) => {
                             tracing::info!(length = line.len(), "skipped non-JSON Claude line");
@@ -683,7 +730,7 @@ async fn run_one(
                         }
                     };
                     rejected = None;
-                    if let Err(error) = process.record_inbound(&wire) {
+                    if let Err(error) = process.record_inbound(&mut wire) {
                         failure = Some(error.to_string());
                         break;
                     }
@@ -734,7 +781,23 @@ async fn run_one(
         }
     };
     let observed = drain_stderr(&mut stderr, wait, observed, stdout_closed).await;
-    let lines = tail.lock().unwrap().iter().cloned().collect::<Vec<_>>();
+    let lines = tail
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| {
+            process
+                .mcp
+                .as_ref()
+                .map_or_else(|| line.clone(), |mcp| mcp.hash.redact(line, "[redacted]"))
+        })
+        .collect::<Vec<_>>();
+    let failure = failure.map(|text| {
+        process
+            .mcp
+            .as_ref()
+            .map_or_else(|| text.clone(), |mcp| mcp.hash.redact(&text, "[redacted]"))
+    });
     let failure = failure
         .or(rejected)
         .map(|text| with_stderr(&text, &lines, None));
@@ -1062,6 +1125,7 @@ mod tests {
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
+            mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
         };
@@ -1151,6 +1215,7 @@ mod tests {
             let process = Process {
                 child,
                 native: NativeSessionId("fixture-session".into()),
+                mcp: None,
                 #[cfg(debug_assertions)]
                 recorder: None,
             };
@@ -1219,6 +1284,7 @@ mod tests {
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
+            mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
         };
@@ -1280,6 +1346,7 @@ mod tests {
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
+            mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
         };
@@ -1356,6 +1423,7 @@ mod tests {
         let process = Process {
             child: group,
             native: NativeSessionId("fixture-session".into()),
+            mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
         };
@@ -1374,6 +1442,7 @@ mod tests {
                 },
                 native: None,
                 import: false,
+                root: false,
             },
             env,
             out,
@@ -1495,6 +1564,7 @@ mod tests {
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
+            mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
         };
@@ -1627,6 +1697,7 @@ mod tests {
         let process = Process {
             child: group,
             native: NativeSessionId("fixture-session".into()),
+            mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
         };
@@ -1645,6 +1716,7 @@ mod tests {
                 },
                 native: None,
                 import: false,
+                root: false,
             },
             env,
             out,
@@ -1805,6 +1877,7 @@ mod tests {
                 let process = Process {
                     child,
                     native: NativeSessionId("missing-native".into()),
+                    mcp: None,
                     recorder: None,
                 };
                 let thread = ThreadId::new();
@@ -1821,6 +1894,7 @@ mod tests {
                         },
                         native: Some(NativeSessionId("missing-native".into())),
                         import: false,
+                        root: false,
                     },
                     env.clone(),
                     out,
@@ -1920,6 +1994,7 @@ mod tests {
                     },
                     native: None,
                     import: false,
+                    root: false,
                 },
                 env.clone(),
                 out,
@@ -2015,6 +2090,7 @@ done
                     },
                     native: None,
                     import: false,
+                    root: false,
                 },
                 env.clone(),
                 out,
@@ -2144,6 +2220,7 @@ done
                     },
                     native: None,
                     import: false,
+                    root: false,
                 },
                 env.clone(),
                 out,
@@ -2230,5 +2307,77 @@ done
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod mcp_record_tests {
+    use super::*;
+    #[tokio::test]
+    async fn session_recorder_replaces_token_before_writing() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/mcp-rec-{}",
+            &ThreadId::new().to_string()[28..]
+        ));
+        platform::private_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let (out, _events) = mpsc::channel(16);
+        let server = Arc::new(
+            crate::mcp::Server::bind(&root, std::env::current_exe().unwrap(), out).unwrap(),
+        );
+        let token = crate::mcp::McpToken::new();
+        let config = crate::mcp::Configuration::create(
+            &root,
+            ThreadId::new(),
+            &server.command,
+            &server.socket,
+            &token,
+        )
+        .unwrap();
+        let config_path = config.path.clone();
+        let capture = root.join("capture.jsonl");
+        let child = ChildEnv::load()
+            .spawn(
+                std::path::Path::new("/bin/sh"),
+                &["-c".into(), "read ignored".into()],
+                &root,
+                None,
+            )
+            .unwrap();
+        let mut process = Process {
+            child,
+            native: NativeSessionId("record-only".into()),
+            mcp: Some(crate::mcp::Session {
+                config,
+                hash: crate::mcp::TokenHash(token.hash()),
+                server,
+            }),
+            recorder: Some(
+                record::Recorder::create(&capture, "claude", "fake", &root, None, None).unwrap(),
+            ),
+        };
+        let mut wire = serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":format!("prefix {} suffix",token.expose())}]}});
+        process.record_inbound(&mut wire).unwrap();
+        assert!(
+            !wire.to_string().contains(token.expose()),
+            "credential reached provider decoding"
+        );
+        let recorded = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            !recorded.contains(token.expose()),
+            "credential reached the capture file"
+        );
+        assert!(recorded.contains("<id:token>"));
+        let Process {
+            child,
+            mcp,
+            recorder,
+            ..
+        } = process;
+        child.stop().await.unwrap();
+        drop(recorder);
+        drop(mcp);
+        assert!(!config_path.exists());
     }
 }

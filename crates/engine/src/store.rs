@@ -159,7 +159,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             "INSERT INTO turns(id,thread_id,ordinal,origin_json,state,outcome_json,queued_at,
              started_at,ended_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(id) DO UPDATE SET origin_json=excluded.origin_json,state=excluded.state,
-             outcome_json=excluded.outcome_json,started_at=excluded.started_at,
+             outcome_json=excluded.outcome_json,started_at=CASE WHEN excluded.state='queued' THEN turns.started_at ELSE excluded.started_at END,
              ended_at=excluded.ended_at",
             params![
                 t.id.to_string(),
@@ -379,6 +379,9 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             origin: parse(r.get(3)?)?,
             state,
         };
+        if let Some(start) = r.get::<_, Option<Millis>>(6)? {
+            p.attempted_starts.insert(t.id, start);
+        }
         p.insert_turn(t);
     }
     let mut q = db.prepare("SELECT id,thread_id,turn_id,seq,body_json FROM items")?;

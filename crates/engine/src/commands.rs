@@ -592,7 +592,7 @@ fn interrupt_active(
         );
     }
 }
-fn stop_one(
+pub(crate) fn stop_one(
     p: &Projection,
     l: &BTreeMap<ThreadId, LiveThread>,
     c: &mut ChangeSet,
@@ -805,13 +805,13 @@ pub fn turn_text(p: &Projection, c: &ChangeSet, turn: &Turn) -> String {
             let ItemBody::UserText(text) = &item.body else { unreachable!() };
             text.clone()
         }
-        TurnOrigin::Task { task } => c
+        TurnOrigin::Task { task } => crate::tools::task_text(p, turn, c
             .items(p, turn.thread)
             .find_map(|i| match &i.body {
                 ItemBody::UserText(text) if i.turn == turn.id => Some(text.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| format!("Task {task}")),
+            .unwrap_or_else(|| format!("Task {task}"))),
         TurnOrigin::Wake { tasks } => tasks
             .iter()
             .filter_map(|id| c.tasks.get(id).or_else(|| p.tasks.get(id)))
@@ -910,7 +910,7 @@ pub fn settle_idle_child(
         hold_parent(p, c, child);
     }
 }
-fn settle_tasks(
+pub(crate) fn settle_tasks(
     p: &Projection,
     c: &mut ChangeSet,
     child: ThreadId,
@@ -943,4 +943,41 @@ fn settle_tasks(
         c.events.push(Ev::TaskSettled(t.clone()));
         c.tasks.insert(t.id, t);
     }
+}
+
+pub(crate) fn stop_child_from_tool(
+    p: &Projection,
+    l: &BTreeMap<ThreadId, LiveThread>,
+    c: &mut ChangeSet,
+    child: ThreadId,
+    now: Millis,
+) {
+    stop_one(p, l, c, child, now);
+    for effect in &mut c.effects {
+        if let Effect::Control {
+            control: SessionControl::Interrupt { reason, .. },
+            ..
+        } = effect
+        {
+            *reason = StopReason::Parent;
+        }
+    }
+    for turn in c.turns.values_mut().filter(|turn| turn.thread == child) {
+        if let TurnState::Ended {
+            outcome: TurnOutcome::Interrupted { reason },
+            ..
+        } = &mut turn.state
+        {
+            *reason = StopReason::Parent.text().into();
+        }
+    }
+    settle_tasks(
+        p,
+        c,
+        child,
+        Some(TurnOutcome::Interrupted {
+            reason: StopReason::Parent.text().into(),
+        }),
+        now,
+    );
 }

@@ -8,6 +8,7 @@ pub mod domain;
 pub mod events;
 pub mod fixture;
 pub mod live;
+pub mod mcp;
 pub mod platform;
 pub mod process;
 pub mod provider;
@@ -16,6 +17,7 @@ pub mod record;
 pub mod store;
 #[cfg(test)]
 mod tests;
+pub mod tools;
 
 use actor::{Actor, EngineMsg};
 use commands::{Ack, Command, CommandError};
@@ -55,6 +57,7 @@ struct EngineInner {
 #[derive(Default)]
 pub(crate) struct RuntimeState {
     pub awake: AtomicBool,
+    pub catalog: Arc<Mutex<std::collections::BTreeMap<provider::ProviderKind, provider::Probe>>>,
     pub closing: Arc<LaunchGate>,
     pub window_threads: Mutex<std::collections::BTreeMap<ThreadId, WindowThread>>,
     #[cfg(debug_assertions)]
@@ -194,7 +197,20 @@ impl Engine {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(store::StoreError::from)?;
         let (sender, receiver) = mpsc::channel(256);
-        let actor = Actor::new(db, sender.clone(), spawner)?;
+        let mut actor = Actor::new(db, sender.clone(), spawner)?;
+        let data = actor
+            .db
+            .path()
+            .filter(|path| !path.is_empty())
+            .and_then(|path| std::path::Path::new(path).parent());
+        if let (Spawner::Cli(env), Some(data)) = (&mut actor.spawner, data) {
+            let _entered = runtime.enter();
+            env.mcp = Some(std::sync::Arc::new(mcp::Server::bind(
+                data,
+                std::env::current_exe()?,
+                sender.clone(),
+            )?));
+        }
         let state = actor.state.clone();
         let groups = match &actor.spawner {
             Spawner::Cli(env) => env.groups.clone(),
@@ -270,6 +286,7 @@ impl Engine {
         let mut env = provider::env::ChildEnv::load();
         env.closing = self.inner.state.closing.clone();
         env.groups = self.inner.groups.clone();
+        env.catalog = self.inner.state.catalog.clone();
         env
     }
     pub fn window_threads(&self) -> std::collections::BTreeMap<ThreadId, WindowThread> {

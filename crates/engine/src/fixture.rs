@@ -25,6 +25,16 @@ pub enum Record {
         #[serde(default = "once")]
         repeat: usize,
     },
+    McpStart,
+    McpSend {
+        line: Value,
+    },
+    McpExpect {
+        line: Value,
+    },
+    RecordArgv {
+        path: String,
+    },
     Touch {
         path: String,
     },
