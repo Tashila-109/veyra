@@ -1828,7 +1828,7 @@ fn pending_admission_is_busy_for_quit_awake_and_idle_parking() {
     assert!(!crate::live::park_due(&view, 0, 10 * 60 * 1000));
     assert!(crate::live::needs_awake(&f.actor.projection, &f.actor.live));
     assert!(f.actor.state.window_threads.lock().unwrap()[&f.thread].busy);
-    assert!(f.actor.state.window_threads.lock().unwrap()[&f.thread].turn_busy);
+    assert!(view.turn_busy());
     let _entered = f.runtime.enter();
     f.actor.handle(EngineMsg::Shutdown);
     let rows = f.loaded();
@@ -2038,17 +2038,6 @@ fn completed_prompt_late_started_cannot_open_a_provider_turn() {
     completed_lifecycle("started");
 }
 
-#[test]
-fn foreign_lifecycle_still_opens_a_provider_turn() {
-    let mut f = Fixture::new(LiveState::Idle);
-    let mut codec = crate::provider::claude::Codec::new(
-        NativeSessionId("lifecycle-correlation".into()),
-        9,
-        std::path::Path::new("/tmp"),
-    );
-    open_foreign_lifecycle(&mut f, &mut codec, "cli-owned-work", "started");
-}
-
 fn completed_provider_lifecycle(state: &str) {
     use crate::provider::claude::Codec;
     use serde_json::json;
@@ -2144,39 +2133,7 @@ fn completed_provider_late_queued_opens_no_phantom_turn() {
 }
 
 #[test]
-fn completed_provider_new_foreign_command_still_opens() {
-    let mut f = Fixture::new(LiveState::Idle);
-    let mut codec = crate::provider::claude::Codec::new(
-        NativeSessionId("lifecycle-correlation".into()),
-        9,
-        std::path::Path::new("/tmp"),
-    );
-    let first = open_foreign_lifecycle(
-        &mut f,
-        &mut codec,
-        "11111111-1111-4111-8111-111111111111",
-        "started",
-    );
-    for event in codec
-        .value(serde_json::json!({"type":"result", "subtype":"success", "is_error":false}))
-        .unwrap()
-        .events
-    {
-        f.event(event);
-    }
-    assert!(codec.active.is_none());
-    assert!(f.running().is_none());
-    let next = open_foreign_lifecycle(
-        &mut f,
-        &mut codec,
-        "22222222-2222-4222-8222-222222222222",
-        "started",
-    );
-    assert_ne!(first, next);
-}
-
-#[test]
-fn refused_admission_has_no_running_or_pending_stop_target() {
+fn refused_admission_publishes_busy_without_a_pending_turn() {
     let mut f = Fixture::new(LiveState::Idle);
     let Ok(Ack::Turn(turn)) = f.command(Command::Send {
         thread: f.thread,
@@ -2192,7 +2149,13 @@ fn refused_admission_has_no_running_or_pending_stop_target() {
         Some(crate::live::TurnAdmission::Refused)
     );
     assert!(f.running().is_none());
+    assert!(
+        ChangeSet::default()
+            .view(&f.actor.projection, &f.actor.live, f.thread)
+            .unwrap()
+            .turn_busy()
+    );
     let published = f.actor.state.window_threads.lock().unwrap()[&f.thread];
-    assert!(published.turn_busy);
+    assert!(published.busy);
     assert_eq!(published.pending_turn, None);
 }

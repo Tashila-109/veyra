@@ -1393,7 +1393,6 @@ impl Actor {
                     crate::WindowThread {
                         wait_reason: wait_reason(&view),
                         busy: crate::live::busy(&view),
-                        turn_busy: view.turn_busy(),
                         pending_turn: view.live.pending_turn(),
                     },
                 );

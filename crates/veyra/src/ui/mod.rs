@@ -59,6 +59,18 @@ struct AppState {
     max_batch_gap_ms: f64,
     last_text_batch: Option<Instant>,
 }
+fn stop_target(
+    thread: ThreadId,
+    turns: &BTreeMap<TurnId, Turn>,
+    published: Option<&veyra_engine::WindowThread>,
+) -> Option<StopTarget> {
+    let turn = turns
+        .values()
+        .find(|turn| turn.thread == thread && matches!(turn.state, TurnState::Running { .. }))
+        .map(|turn| turn.id)
+        .or_else(|| published.and_then(|state| state.pending_turn))?;
+    Some(StopTarget { thread, turn })
+}
 fn event_thread(event: &UiEvent) -> Option<(ThreadId, u64)> {
     match event {
         UiEvent::Change {
@@ -922,10 +934,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(reason) = self.disabled_reason() {
-            self.notice(reason, cx);
-            return;
-        }
         let text = self.input.read(cx).value().to_string();
         if text.trim().is_empty() && stop_target.is_some() {
             window.dispatch_action(
@@ -934,6 +942,10 @@ impl Shell {
                 }),
                 cx,
             );
+            return;
+        }
+        if let Some(reason) = self.disabled_reason() {
+            self.notice(reason, cx);
             return;
         }
         if text.trim().is_empty() {
@@ -967,19 +979,11 @@ impl Shell {
     }
     fn stop_target(&self) -> Option<StopTarget> {
         let thread = self.view.chat()?;
-        let turn = self
-            .state
-            .turns
-            .values()
-            .find(|turn| turn.thread == thread && matches!(turn.state, TurnState::Running { .. }))
-            .map(|turn| turn.id)
-            .or_else(|| {
-                self.engine
-                    .window_threads()
-                    .get(&thread)
-                    .and_then(|state| state.pending_turn)
-            })?;
-        Some(StopTarget { thread, turn })
+        stop_target(
+            thread,
+            &self.state.turns,
+            self.engine.window_threads().get(&thread),
+        )
     }
     fn stop(&mut self, target: Option<StopTarget>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(StopTarget { thread, turn }) = target {
@@ -2083,6 +2087,96 @@ mod tests {
         cx.update(|window, _| window.activate_window());
         draw(cx);
         check(shell, cx, dispatched, sender);
+    }
+
+    #[test]
+    fn stop_target_uses_running_or_pending_turn() {
+        let thread = ThreadId::new();
+        let running = TurnId::new();
+        let pending = TurnId::new();
+        let other_thread = ThreadId::new();
+        let other_turn = TurnId::new();
+        let mut turns = BTreeMap::from([
+            (
+                running,
+                Turn {
+                    id: running,
+                    thread,
+                    ordinal: 1,
+                    origin: TurnOrigin::Provider,
+                    state: TurnState::Running { since: 0 },
+                },
+            ),
+            (
+                other_turn,
+                Turn {
+                    id: other_turn,
+                    thread: other_thread,
+                    ordinal: 1,
+                    origin: TurnOrigin::Provider,
+                    state: TurnState::Running { since: 0 },
+                },
+            ),
+        ]);
+        let mut published = veyra_engine::WindowThread {
+            wait_reason: Some(WaitReason::TurnRunning),
+            busy: true,
+            pending_turn: Some(pending),
+        };
+        for (state, pending_turn, expected) in [
+            (
+                TurnState::Running { since: 0 },
+                Some(pending),
+                Some(running),
+            ),
+            (TurnState::Queued, Some(pending), Some(pending)),
+            (TurnState::Queued, None, None),
+        ] {
+            turns.get_mut(&running).unwrap().state = state;
+            published.pending_turn = pending_turn;
+            let target = super::stop_target(thread, &turns, Some(&published));
+            assert_eq!(
+                target.map(|target| (target.thread, target.turn)),
+                expected.map(|turn| (thread, turn))
+            );
+            assert_eq!(
+                super::stop_target(thread, &turns, Some(&published)).is_some(),
+                expected.is_some()
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn empty_send_stops_while_provider_is_checking(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, dispatched, _| {
+            let target = shell.update(cx, |shell, cx| {
+                shell.providers.clear();
+                cx.notify();
+                shell.stop_target().unwrap()
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.disabled_reason()),
+                Some("Checking Claude Code…".into())
+            );
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["stop_visible"]
+                    .clone()),
+                true
+            );
+            cx.simulate_keystrokes("secondary-enter");
+            cx.run_until_parked();
+            draw(cx);
+            assert_eq!(dispatched.borrow().as_slice(), ["Stop"]);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell
+                    .sent_interrupts
+                    .iter()
+                    .map(|target| (target.thread, target.turn))
+                    .collect::<Vec<_>>()),
+                [(target.thread, target.turn)]
+            );
+        });
     }
 
     #[gpui::test]

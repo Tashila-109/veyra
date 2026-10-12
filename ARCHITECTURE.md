@@ -105,7 +105,7 @@ The debug listener binds before the window opens.
 
 ## Quit and shutdown
 
-Quit opens a sheet listing running, pending-admission, Starting and background-busy threads, or runs ConfirmQuit immediately when none are busy.
+Quit opens a sheet listing running, pending- or refused-admission, Starting and background-busy threads, or runs ConfirmQuit immediately when none are busy.
 CancelQuit dismisses it and restores composer focus until ConfirmQuit begins; afterward Escape and CancelQuit keep the sheet open.
 ConfirmQuit synchronously closes the engine and cancels readiness probes and the branch task, then awaits Engine::shutdown_wait in a gpui task and calls cx.quit.
 The debug ctl quit verb dispatches ConfirmQuit directly.
@@ -153,7 +153,7 @@ It receives typed messages through a 256-slot tokio channel.
 A timer sends Tick every five seconds; text uses separate flush and write messages.
 The actor never waits for provider I/O.
 The actor trims stored tool output to its last 10,000 characters.
-The actor publishes window thread wait reasons, busy flags and turn-busy flags after reconciliation, then updates only threads whose thread, turn, request or live rows changed.
+The actor publishes window thread wait reasons, busy flags and pending-admission turn ids after reconciliation, then updates only threads whose thread, turn, request or live rows changed.
 Engine::window_threads reads that snapshot, including the pending-admission turn id for window Stop targeting.
 ThreadView::turn_busy includes a running row or any admission state, Pending or Refused; live::busy adds Starting and background work, and live::busy_threads supplies the shared walk for shutdown holds and needs_awake.
 Every actor message is timed, and a message over 50 ms logs its kind and duration.
@@ -211,7 +211,7 @@ The actor waits for Exited before parking and spawning eligible queued work.
 A late end cannot settle another turn.
 Idle structured sessions park after ten minutes without a busy turn, pending request or background work.
 The engine supports holds, queue reasons, cascaded StopThread/ArchiveThread, Interrupt, Respond, wake delivery and task settlement.
-The composer's Stop button, Ctrl+C and Send with an empty draft during a running turn or one awaiting admission dispatch the Stop action, which carries the rendered thread and turn into the engine's Interrupt command.
+The composer's Stop button, Ctrl+C and Send with an empty draft during a running turn or a pending admission dispatch the Stop action, which carries the rendered thread and turn into the engine's Interrupt command.
 The root render captures one StopTarget for both its keyboard handlers and the composer button.
 A Stop button id names its displayed turn, so releasing an earlier mouse press after a repaint cannot stop a later turn.
 The sidebar's StopThread action sends the engine's StopThread command.
@@ -520,8 +520,10 @@ The focused approval chords are Command+Return, Command+Option+Return and Comman
 Grant button captions keep whitespace in their visible first line, add an ellipsis at a newline, and truncate to their width.
 Their accessibility labels retain the whole original caption.
 NextNeedsYou scans sidebar order for NeedsYou before Failed, wrapping once and including child rows.
-The composer shows Stop only when stop_target names a running or pending-admission turn and its draft is empty.
-Stop visibility, the dump and empty Send use that same target; held reasons and Continue remain separate controls.
+The pure stop_target function selects a Running row for the selected thread, or its published WindowThread pending_turn when no Running row exists.
+The composer shows Stop only when that function names a turn and its draft is empty.
+Stop visibility, the dump and empty Send use that same target; empty Send dispatches Stop before checking provider readiness.
+A Refused admission with no Running row has no Stop target; held reasons and Continue remain separate controls.
 Discard queued appears only when a held thread has queued turns.
 The quit sheet overlays the existing window content.
 The Theme global owns all colours, geometry, type, radii and motion tokens.
@@ -637,7 +639,9 @@ Dock regressions reject an old Allow once render, stale approval ids and an alre
 A blocked real-session writer completes Provider B after dropping A's queued interrupt; a duplex-writer test checks the target again after a pending first-byte write.
 Delayed actor Stop tests leave the later turn Completed and create no hold or drain, and synthetic-window tests check rendered Stop identity, Ctrl+C dispatch and a mouse release across a turn-changing repaint.
 Completed-prompt and completed-Provider lifecycle tests reject late queued and started frames and feed fresh command ids through the codec and actor to prove new Provider work still opens.
-Refused-admission tests check the busy snapshot has no running or pending target, and a synthetic-window test hides Stop and refuses empty Send without a target.
+An engine Refused-admission test checks busy is published with no Running row or pending_turn.
+stop_target_uses_running_or_pending_turn checks the pure window rule on Running, pending-admission and busy Refused snapshots, including a Running row from another thread.
+A synthetic-window test hides Stop and refuses empty Send without a target, and empty_send_stops_while_provider_is_checking checks empty Command+Return dispatches Stop with the running turn before readiness.
 Admission tests cover Stop, Interrupt, Configure, SwitchView, Quit, keep-awake, idle parking and refusal waiting for a CLI end.
 A composer unit test checks the preview cut notice; a synthetic window checks that long approval text scrolls within a bounded area while decision buttons stay on-screen.
 The approvals-questions screenshots show the real-window scroll area.
