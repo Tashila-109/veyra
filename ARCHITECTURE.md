@@ -179,8 +179,9 @@ The first prompt waits for Ready.
 The codec admits StartTurn only with no active turn, and the session reports StartTurnRefused when CLI work is already running.
 ProviderTurnStarted opens the CLI's own turn under its reported id and restores a pending Veyra turn to Queued with its original ordinal.
 The queue waits with TurnRunning while that Provider turn runs, an admission remains pending, or a refused start waits for the CLI turn to end.
-Pending or Refused admission counts as busy for StopThread, Archive, Interrupt, Configure, SwitchView, idle parking, keep-awake and Quit.
-StopThread and Archive target both a running row and a pending start; Interrupt targets only its named running or pending turn, and the session ignores a target unless it accepted that turn.
+Pending or Refused admission counts as busy for StopThread, Archive, Configure, SwitchView, idle parking, keep-awake and Quit.
+StopThread and Archive target both a running row and a pending start; Interrupt targets only its named running or pending turn on a Structured session, and the session ignores a target unless it accepted that turn.
+A Refused admission names no turn, so window Stop has no target unless a Running row is also rendered.
 A refusal replaces Pending admission with Refused until the next CLI turn end; the first correlated turn event confirms an admitted prompt and restores its Running row if CLI work displaced it.
 The Provider end applies start_changed, which retries eligible queued work once pending admission has resolved.
 The codec also emits Ready on system/init, so an early system/init can open the Ready gate before the initialize reply.
@@ -216,11 +217,12 @@ A Stop button id names its displayed turn, so releasing an earlier mouse press a
 The sidebar's StopThread action sends the engine's StopThread command.
 Respond, Continue and DiscardQueued also have window controls.
 Archive has no window control, and task cards remain unimplemented.
-On a Starting thread, StopThread and Archive send Shutdown and wait in Stopping for Exited; Interrupt does so only with a matching active target.
+On a Starting thread, StopThread and Archive send Shutdown and wait in Stopping for Exited.
+Interrupt is a no-op outside Structured, including Starting because it has no running or pending turn.
 The session receives that control before stdout.
 A Shutdown already pending at the launch decision prevents launch and emits Exited; if it arrives during launch, the session stops the owned group once launch returns and emits no Ready.
-A Ready that arrives after StopThread, Archive or Interrupt has moved the thread to Stopping is dropped because Stopping holds no session.
-On a running Structured thread, those controls end the engine turn with Interrupted and "Stopped by you", keep its session and send an Interrupt control for that turn; the codec writes the protocol interrupt only while that turn remains active.
+A Ready that arrives after StopThread or Archive has moved the thread to Stopping is dropped because Stopping holds no session.
+On a running Structured thread, Interrupt, StopThread and Archive end the engine turn with Interrupted and "Stopped by you", keep its session and send an Interrupt control for that turn; the codec writes the protocol interrupt only while that turn remains active.
 `Live::Structured.draining` keeps that ended turn's id until its own CLI end arrives.
 Queued work with no hold waits with `WaitReason::Stopping` during the drain.
 Send keeps an existing hold only while a turn is queued.
@@ -328,12 +330,12 @@ Storage failure uses InterruptActive with StopReason::StorageBlocked to stop whi
 Veyra-started turns use their stored turn id; CLI-started Provider turns open under the fresh id reported by ProviderTurnStarted before their first content event.
 The actor drops unannounced Provider content instead of inventing an id the codec cannot match.
 StopThread and Archive capture the running and pending-admission turn ids before ending their rows.
-A targeted Interrupt whose named turn is no longer running or pending is a no-op, creating no hold, drain, control or outcome change.
+A targeted Interrupt whose named turn belongs to another thread or is no longer running or pending is a no-op, creating no hold, drain, control or outcome change.
 Shutdown and startup recovery use StopReason::AppClosing for their shared turn-end reason.
 The codec ignores an interrupt whose target is no longer active, including when a later Provider turn has opened.
 Only a matching targeted interrupt cancels that turn's open requests and arms its ladder; active-turn interruptions resolve the target directly from the codec.
-The codec returns outbound Message or Interrupt values, with each Interrupt carrying its target turn and supplying its own protocol JSON.
-The stdin queue preserves that type, and the writer checks an Interrupt's target against the codec's shared active id at each poll until its first byte is written.
+The codec returns outbound Prompt, Message or Interrupt values, with each Interrupt carrying its target turn and supplying its own protocol JSON.
+The stdin queue preserves that type, the writer applies its quit commitment check only to Prompt, and it checks an Interrupt's target against the codec's shared active id at each poll until its first byte is written.
 An unsent interrupt for an ended target is discarded; its preceding cancel replies remain ordered before any matching interrupt.
 Once writing begins, the writer finishes that frame before another frame.
 A turn end clears its ladder; an admitted new prompt starts with no active turn or old ladder.
@@ -346,7 +348,7 @@ A group still present after the final cleanup deadline produces a bounded warnin
 The normal session path discards other cleanup errors.
 A supervisor waits for registered cleanup even if the session task panics.
 The actor stores pid and group on Ready; Exited ends both running and pending-admission rows before parking.
-After StopThread, Archive or Interrupt it only parks.
+After StopThread or Archive moves the thread to Stopping, Exited only parks it.
 
 `claude::Codec` owns stream-json envelopes, prompt correlation, native block keys, request references, approval and question classification (see Actor decisions) and background-work replacement.
 Unknown protocol metadata logs its category without frame content, and unsupported or malformed control requests get an error reply.
@@ -354,8 +356,9 @@ Spawns before Ready binds a native id use --session-id with the Veyra UUID; spaw
 Mode maps to default, acceptEdits or bypassPermissions plus --allow-dangerously-skip-permissions.
 An initialize reply can open the Ready gate before the prompt causes system/init to supply native id, version and capabilities.
 Prompt UUID echoes and lifecycle acknowledgements separate Veyra prompts from foreign results and Provider-origin work.
-The codec retains submitted prompt ids for its session lifetime and ignores queued or started lifecycle frames for those ids after completion.
-Foreign or unknown command ids can still open new Provider work; the submitted-id set is discarded with the session codec.
+The codec retains submitted prompt ids and the command ids of CLI-started Provider turns it has opened for its CLI process lifetime.
+Queued or started lifecycle frames for completed commands open no turn; genuinely new command ids still open Provider work.
+The seen-command set is discarded with that CLI process's codec.
 Uncorrelated CLI work may open a Provider turn after the foreground turn completes.
 Assistant error words latch per prompt, and account-related classes park the process.
 An active Veyra interrupt overrides that error outcome and suppresses newly arriving diagnostic text, including streamed blocks.
@@ -517,7 +520,8 @@ The focused approval chords are Command+Return, Command+Option+Return and Comman
 Grant button captions keep whitespace in their visible first line, add an ellipsis at a newline, and truncate to their width.
 Their accessibility labels retain the whole original caption.
 NextNeedsYou scans sidebar order for NeedsYou before Failed, wrapping once and including child rows.
-The composer shows Stop while a turn runs or awaits admission and its draft is empty, plus held reasons and Continue.
+The composer shows Stop only when stop_target names a running or pending-admission turn and its draft is empty.
+Stop visibility, the dump and empty Send use that same target; held reasons and Continue remain separate controls.
 Discard queued appears only when a held thread has queued turns.
 The quit sheet overlays the existing window content.
 The Theme global owns all colours, geometry, type, radii and motion tokens.
@@ -632,7 +636,8 @@ Application tests enable gpui test-support to exercise Shell selection, its even
 Dock regressions reject an old Allow once render, stale approval ids and an already-answered question index, with current-request controls.
 A blocked real-session writer completes Provider B after dropping A's queued interrupt; a duplex-writer test checks the target again after a pending first-byte write.
 Delayed actor Stop tests leave the later turn Completed and create no hold or drain, and synthetic-window tests check rendered Stop identity, Ctrl+C dispatch and a mouse release across a turn-changing repaint.
-Completed-prompt lifecycle tests reject late queued and started frames while a foreign-command control still opens Provider work.
+Completed-prompt and completed-Provider lifecycle tests reject late queued and started frames and feed fresh command ids through the codec and actor to prove new Provider work still opens.
+Refused-admission tests check the busy snapshot has no running or pending target, and a synthetic-window test hides Stop and refuses empty Send without a target.
 Admission tests cover Stop, Interrupt, Configure, SwitchView, Quit, keep-awake, idle parking and refusal waiting for a CLI end.
 A composer unit test checks the preview cut notice; a synthetic window checks that long approval text scrolls within a bounded area while decision buttons stay on-screen.
 The approvals-questions screenshots show the real-window scroll area.

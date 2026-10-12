@@ -927,7 +927,7 @@ impl Shell {
             return;
         }
         let text = self.input.read(cx).value().to_string();
-        if text.trim().is_empty() && self.view.chat().is_some_and(|thread| self.running(thread)) {
+        if text.trim().is_empty() && stop_target.is_some() {
             window.dispatch_action(
                 Box::new(Stop {
                     target: stop_target,
@@ -951,15 +951,6 @@ impl Shell {
             }
         };
         self.send_command(command, window, cx);
-    }
-    fn running(&self, thread: ThreadId) -> bool {
-        self.engine
-            .window_threads()
-            .get(&thread)
-            .is_some_and(|state| state.turn_busy)
-            || self.state.turns.values().any(|turn| {
-                turn.thread == thread && matches!(turn.state, TurnState::Running { .. })
-            })
     }
     fn busy_threads(&self) -> Vec<String> {
         self.engine
@@ -1406,7 +1397,7 @@ impl Shell {
             "send_enabled":reason.is_none(), "disabled_reason":reason,
             "provider_picker_open":self.provider_picker.is_some(),
             "provider_picker_labels":self.provider_picker.as_ref().map(|_| &self.provider_picker_labels),
-            "stop_visible":self.view.chat().is_some_and(|thread| self.running(thread))
+            "stop_visible":self.stop_target().is_some()
                 && self.input.read(cx).value().trim().is_empty(),
             "discard_queued_visible":self.discard_queued_visible(),
             "dock":self.dock_target().and_then(|target| self.pending_request(Some(target.request)).map(|request| {
@@ -2111,6 +2102,35 @@ mod tests {
             cx.run_until_parked();
             draw(cx);
             assert_eq!(dispatched.borrow().as_slice(), ["Stop", "Stop"]);
+        });
+    }
+
+    #[gpui::test]
+    fn empty_send_without_a_turn_is_refused(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, dispatched, _| {
+            shell.update(cx, |shell, cx| {
+                for turn in shell.state.turns.values_mut() {
+                    turn.state = TurnState::Queued;
+                }
+                shell.state.requests.clear();
+                cx.notify();
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.stop_target().is_none()));
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["stop_visible"]
+                    .clone()),
+                false
+            );
+            shell.update_in(cx, |shell, window, cx| {
+                shell.send(shell.stop_target(), window, cx);
+            });
+            cx.run_until_parked();
+            assert!(dispatched.borrow().is_empty());
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.notice.clone()),
+                Some("Write a message before sending".into())
+            );
         });
     }
 

@@ -35,6 +35,14 @@ fn cell(row: Row, state: LiveState) {
         } else {
             None
         };
+        let interrupt_target = if matches!(row, Row::Interrupt) {
+            Some(
+                f.active_turn()
+                    .unwrap_or_else(|| f.user("interrupt target")),
+            )
+        } else {
+            None
+        };
         let result = match row {
             Row::Send | Row::SendHeld => f.command(Command::Send {
                 thread: f.thread,
@@ -61,7 +69,7 @@ fn cell(row: Row, state: LiveState) {
             }),
             Row::Interrupt => f.command(Command::Interrupt {
                 thread: f.thread,
-                turn: f.active_turn().unwrap_or_default(),
+                turn: interrupt_target.unwrap(),
             }),
             Row::Respond => f.command(Command::Respond {
                 request: req.unwrap(),
@@ -169,8 +177,21 @@ fn cell(row: Row, state: LiveState) {
                 if state != LiveState::Running {
                     assert!(f.controls.try_recv().is_err());
                 }
-                if state == LiveState::Starting {
-                    assert!(matches!(live, Live::Starting { .. }));
+                if state != LiveState::Running {
+                    assert_eq!(p.turns[&interrupt_target.unwrap()].state, TurnState::Queued);
+                    assert!(match state {
+                        LiveState::Parked => matches!(live, Live::Parked),
+                        LiveState::Starting => matches!(live, Live::Starting { .. }),
+                        LiveState::Idle => matches!(live, Live::Structured { draining: None, .. }),
+                        LiveState::Terminal => matches!(live, Live::Terminal { .. }),
+                        LiveState::Stopping => matches!(
+                            live,
+                            Live::Stopping {
+                                then: AfterStop::StartTerminal
+                            }
+                        ),
+                        LiveState::Running => unreachable!(),
+                    });
                 }
                 assert_eq!(
                     t.hold,

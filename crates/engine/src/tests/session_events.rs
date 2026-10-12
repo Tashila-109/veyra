@@ -1949,6 +1949,28 @@ fn session_exit_ends_running_and_pending_admission_rows() {
     assert!(f.controls.try_recv().is_err());
 }
 
+fn open_foreign_lifecycle(
+    f: &mut Fixture,
+    codec: &mut crate::provider::claude::Codec,
+    command: &str,
+    state: &str,
+) -> TurnId {
+    let decoded = codec
+        .value(serde_json::json!({"type":"command_lifecycle",
+            "command_uuid":command, "state":state}))
+        .unwrap();
+    let turn = decoded.provider_turn.unwrap();
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        provider_turn: turn,
+    }));
+    for event in decoded.events {
+        f.event(event);
+    }
+    assert_eq!(f.running(), Some(turn));
+    assert_eq!(f.loaded().turns[&turn].origin, TurnOrigin::Provider);
+    turn
+}
+
 fn completed_lifecycle(state: &str) {
     use crate::provider::claude::Codec;
     use serde_json::json;
@@ -1964,7 +1986,7 @@ fn completed_lifecycle(state: &str) {
         _ => panic!(),
     };
     let mut codec = Codec::new(
-        NativeSessionId("review-only".into()),
+        NativeSessionId("lifecycle-correlation".into()),
         9,
         std::path::Path::new("/tmp"),
     );
@@ -2003,6 +2025,7 @@ fn completed_lifecycle(state: &str) {
         "late {state} for completed A opened phantom {:?}",
         f.running()
     );
+    open_foreign_lifecycle(&mut f, &mut codec, "fresh-cli-work", state);
 }
 
 #[test]
@@ -2017,16 +2040,159 @@ fn completed_prompt_late_started_cannot_open_a_provider_turn() {
 
 #[test]
 fn foreign_lifecycle_still_opens_a_provider_turn() {
-    use crate::provider::claude::Codec;
-    use serde_json::json;
-    let mut codec = Codec::new(
-        NativeSessionId("review-only".into()),
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut codec = crate::provider::claude::Codec::new(
+        NativeSessionId("lifecycle-correlation".into()),
         9,
         std::path::Path::new("/tmp"),
     );
-    let decoded = codec
-        .value(json!({"type":"command_lifecycle",
-        "command_uuid":"cli-owned-work", "state":"started"}))
+    open_foreign_lifecycle(&mut f, &mut codec, "cli-owned-work", "started");
+}
+
+fn completed_provider_lifecycle(state: &str) {
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut codec = Codec::new(
+        NativeSessionId("lifecycle-correlation".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    let command = "11111111-1111-4111-8111-111111111111";
+    let first = open_foreign_lifecycle(&mut f, &mut codec, command, "started");
+    let end = codec
+        .value(
+            json!({"type":"result", "subtype":"success", "is_error":false,
+            "origin":{"kind":"background"}}),
+        )
         .unwrap();
-    assert!(decoded.provider_turn.is_some());
+    for event in end.events {
+        f.event(event);
+    }
+    assert!(codec.active.is_none());
+    assert!(f.running().is_none());
+    assert!(matches!(
+        f.loaded().turns[&first].state,
+        TurnState::Ended {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
+    let late = codec
+        .value(json!({"type":"command_lifecycle", "command_uuid":command, "state":state}))
+        .unwrap();
+    let reopened = late.provider_turn;
+    if let Some(provider_turn) = reopened {
+        f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+            provider_turn,
+        }));
+    }
+    for event in late.events {
+        f.event(event);
+    }
+    assert!(
+        reopened.is_none(),
+        "late lifecycle reopened completed CLI work"
+    );
+    assert!(f.running().is_none());
+    assert_eq!(
+        f.loaded()
+            .turns_for(f.thread)
+            .filter(|turn| turn.origin == TurnOrigin::Provider)
+            .count(),
+        1
+    );
+    let fresh = open_foreign_lifecycle(
+        &mut f,
+        &mut codec,
+        "22222222-2222-4222-8222-222222222222",
+        state,
+    );
+    assert_ne!(first, fresh);
+    for event in codec
+        .value(json!({"type":"result", "subtype":"success", "is_error":false}))
+        .unwrap()
+        .events
+    {
+        f.event(event);
+    }
+    let user = match f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "next user prompt".into(),
+        })
+        .unwrap()
+    {
+        Ack::Turn(turn) => turn,
+        _ => panic!(),
+    };
+    assert!(matches!(
+        f.loaded().turns[&user].state,
+        TurnState::Running { .. }
+    ));
+    assert!(
+        matches!(f.controls.try_recv().unwrap(), SessionControl::StartTurn { turn, .. } if turn == user)
+    );
+}
+#[test]
+fn completed_provider_late_started_opens_no_phantom_turn() {
+    completed_provider_lifecycle("started");
+}
+#[test]
+fn completed_provider_late_queued_opens_no_phantom_turn() {
+    completed_provider_lifecycle("queued");
+}
+
+#[test]
+fn completed_provider_new_foreign_command_still_opens() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut codec = crate::provider::claude::Codec::new(
+        NativeSessionId("lifecycle-correlation".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    let first = open_foreign_lifecycle(
+        &mut f,
+        &mut codec,
+        "11111111-1111-4111-8111-111111111111",
+        "started",
+    );
+    for event in codec
+        .value(serde_json::json!({"type":"result", "subtype":"success", "is_error":false}))
+        .unwrap()
+        .events
+    {
+        f.event(event);
+    }
+    assert!(codec.active.is_none());
+    assert!(f.running().is_none());
+    let next = open_foreign_lifecycle(
+        &mut f,
+        &mut codec,
+        "22222222-2222-4222-8222-222222222222",
+        "started",
+    );
+    assert_ne!(first, next);
+}
+
+#[test]
+fn refused_admission_has_no_running_or_pending_stop_target() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let Ok(Ack::Turn(turn)) = f.command(Command::Send {
+        thread: f.thread,
+        text: "refused prompt".into(),
+    }) else {
+        panic!()
+    };
+    f.event(ProviderEvent::Session(SessionEvent::StartTurnRefused {
+        turn,
+    }));
+    assert_eq!(
+        f.actor.live[&f.thread].admission,
+        Some(crate::live::TurnAdmission::Refused)
+    );
+    assert!(f.running().is_none());
+    let published = f.actor.state.window_threads.lock().unwrap()[&f.thread];
+    assert!(published.turn_busy);
+    assert_eq!(published.pending_turn, None);
 }

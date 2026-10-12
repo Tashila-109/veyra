@@ -494,13 +494,14 @@ struct Tool {
     subagent: Option<Box<Codec>>,
 }
 pub(crate) enum Outbound {
+    Prompt(Value),
     Message(Value),
     Interrupt(TurnId),
 }
 impl Outbound {
     pub fn value(&self) -> Value {
         match self {
-            Self::Message(line) => line.clone(),
+            Self::Prompt(line) | Self::Message(line) => line.clone(),
             Self::Interrupt(_) => json!({
                 "type":"control_request", "request_id":"veyra-interrupt",
                 "request":{"subtype":"interrupt"}
@@ -520,7 +521,7 @@ pub(crate) struct Codec {
     interrupted: Option<Interruption>,
     requests: BTreeMap<String, PendingRequest>,
     seen_requests: BTreeSet<String>,
-    submitted_prompts: BTreeSet<String>,
+    seen_commands: BTreeSet<String>,
 }
 #[derive(Default)]
 pub(crate) struct Decoded {
@@ -542,22 +543,22 @@ impl Codec {
             tools: BTreeMap::new(),
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
-            submitted_prompts: BTreeSet::new(),
+            seen_commands: BTreeSet::new(),
         }
     }
-    pub fn start(&mut self, turn: TurnId, text: String) -> Option<Value> {
+    pub fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
         if self.active.is_some() {
             return None;
         }
-        self.submitted_prompts.insert(turn.to_string());
+        self.seen_commands.insert(turn.to_string());
         self.active = Some(ActiveTurn::Veyra(turn));
         self.stream = MessageStream::default();
         self.error = None;
         self.interrupted = None;
-        Some(json!({
+        Some(Outbound::Prompt(json!({
             "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
             "parent_tool_use_id":null, "message":{"role":"user","content":text}
-        }))
+        })))
     }
     fn prompt(&self) -> Option<TurnId> {
         self.active.and_then(ActiveTurn::id)
@@ -693,8 +694,8 @@ impl Codec {
                         events.push(TurnEvent::Accepted);
                     }
                 } else if self.active.is_none()
-                    && !self.submitted_prompts.contains(&lifecycle.command_uuid)
                     && ["queued", "started"].contains(&lifecycle.state.as_str())
+                    && self.seen_commands.insert(lifecycle.command_uuid)
                 {
                     events.push(TurnEvent::Started);
                 }

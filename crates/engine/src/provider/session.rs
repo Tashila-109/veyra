@@ -553,10 +553,12 @@ async fn run_one(
             let mut bytes = serde_json::to_vec(&line)?;
             bytes.push(b'\n');
             #[cfg(test)]
-            if line["type"] == "user" && close_before_user_write.swap(false, Ordering::AcqRel) {
+            if matches!(&outbound, Outbound::Prompt(_))
+                && close_before_user_write.swap(false, Ordering::AcqRel)
+            {
                 writer_closing.close();
             }
-            if line["type"] == "user" && writer_closing.is_closing() {
+            if matches!(&outbound, Outbound::Prompt(_)) && writer_closing.is_closing() {
                 continue;
             }
             if let Outbound::Interrupt(turn) = outbound {
@@ -588,7 +590,7 @@ async fn run_one(
             _ = out.closed() => { consumer_gone = true; break; }
             message = control.recv() => match message {
                 Some(SessionControl::StartTurn { turn, text }) => {
-                    let Some(line) = codec.start(turn, text) else {
+                    let Some(prompt) = codec.start(turn, text) else {
                         if !emit(out, thread, epoch, ProviderEvent::Session(
                             SessionEvent::StartTurnRefused { turn }
                         )).await { consumer_gone = true; break; }
@@ -599,7 +601,7 @@ async fn run_one(
                         recorder.bind(turn.to_string(), format!("<id:turn:{turn}>"));
                     }
                     *active_turn.lock().unwrap() = codec.active.map(claude::ActiveTurn::target);
-                    if let Err(error) = process.send(&writer, Outbound::Message(line)) {
+                    if let Err(error) = process.send(&writer, prompt) {
                         failure = Some(error.to_string());
                         break;
                     }

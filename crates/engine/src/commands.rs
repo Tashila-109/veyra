@@ -292,38 +292,31 @@ fn interrupt(
     else {
         return Ok(());
     };
-    match &l[&thread].live {
-        Live::Starting { .. } => {
-            control(c, thread, SessionControl::Shutdown);
-            stopping(l, c, thread, AfterStop::Park);
-        }
-        Live::Structured { .. } => {
-            let mut live = c.live(l, thread).clone();
-            if let Live::Structured { draining, .. } = &mut live.live {
-                *draining = Some(turn);
-            }
-            c.live.insert(thread, live);
-            control(
-                c,
-                thread,
-                SessionControl::Interrupt {
-                    turn,
-                    reason: StopReason::User,
-                },
-            );
-            end_turn(
-                p,
-                c,
-                target.clone(),
-                TurnOutcome::Interrupted {
-                    reason: StopReason::User.text().into(),
-                },
-                now,
-            );
-        }
-        Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
-        Live::Parked | Live::Stopping { .. } => {}
+    if !matches!(l[&thread].live, Live::Structured { .. }) {
+        return Ok(());
     }
+    let mut live = c.live(l, thread).clone();
+    if let Live::Structured { draining, .. } = &mut live.live {
+        *draining = Some(turn);
+    }
+    c.live.insert(thread, live);
+    control(
+        c,
+        thread,
+        SessionControl::Interrupt {
+            turn,
+            reason: StopReason::User,
+        },
+    );
+    end_turn(
+        p,
+        c,
+        target.clone(),
+        TurnOutcome::Interrupted {
+            reason: StopReason::User.text().into(),
+        },
+        now,
+    );
     set_hold(p, c, thread, Some(HoldReason::Interrupted));
     Ok(())
 }
