@@ -172,6 +172,7 @@ mod tests {
         use crate::{domain::ThreadId, provider::env::ChildEnv};
         let Some(root) = std::env::var_os("VEYRA_TEST_VERSIONED") else {
             let root = Path::new("/tmp").join(format!("veyra-reap-{}", ThreadId::new()));
+            let _scratch = crate::tests::Scratch(root.clone());
             std::fs::create_dir_all(root.join("versions")).unwrap();
             std::fs::write(
                 root.join("stand-in.c"),
@@ -222,7 +223,6 @@ mod tests {
                 );
                 output
             });
-            std::fs::remove_dir_all(root).unwrap();
             assert!(
                 output.status.success(),
                 "{}{}",

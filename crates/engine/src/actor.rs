@@ -148,7 +148,8 @@ impl Actor {
             match result {
                 Ok(rows)=>rows,
                 Err(error)=> {
-                    let kept=crate::platform::quarantine_file(path);
+                    let destination = path.with_file_name(format!("storage-blocked-lost-{}.json", uuid::Uuid::now_v7()));
+                    let kept=crate::platform::quarantine_file(path, &destination).map(|_|destination);
                     match kept {
                         Ok(path)=>tracing::warn!(error_kind=?error.kind(),path=%path.display(),"lost storage receipt kept privately"),
                         Err(keep_error)=>tracing::warn!(error_kind=?error.kind(),%keep_error,"could not preserve lost storage receipt"),

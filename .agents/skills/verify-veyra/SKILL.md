@@ -163,6 +163,13 @@ def marked_processes(parents=None):
                 remaining.append(pid)
                 break
     return remaining
+def saved_marked_processes(marked, pids, groups):
+    owned = []
+    for pid in marked:
+        try: group = os.getpgid(pid)
+        except ProcessLookupError: continue
+        if pid in pids or group in groups: owned.append(pid)
+    return owned
 def page_done(name):
     with (PROOF/'pages-run').open('a') as out: out.write(name+'\n')
 def save(name, value):
@@ -378,6 +385,7 @@ def stage_family(parent='waiting', child='complete'):
         for record in child_records:
             wire = record.get('line',{})
             if wire.get('type') == 'assistant':
+                record['after_ms'] = 2000
                 wire['message']['content'][0]['text'] = 'First report line\n**Second report line**\nThird report line\n\n- A list item\n- Another item\n\n~~~text\ncode line one\ncode line two\n~~~'
             if wire.get('type') == 'result': record['after_ms'] = 30000
     else:
@@ -443,6 +451,7 @@ A failed launch may still own a process: run Cleanup before reporting.
 Relaunches use `start_new_session=True`, preserving the same pid-equals-group invariant without a previous shell's job table.
 The slowed `ok` fixture uses 500 ms, the design's stderr-wait bound, between its two text deltas and before the result.
 The background proof uses three-second intervals, the design's interrupt grace, before ambient-only and empty lists.
+The family proof delays its child reply by two seconds so selection precedes the text batch and the visible counter can observe it.
 Those delays affect proof copies only; the committed capture-derived fixture is unchanged.
 
 ## Doctor
@@ -498,6 +507,7 @@ A connection or driver failure writes `veyra ctl driver error:` with its cause.
 Every exit-1 expectation must also assert its named stderr line.
 `quit` dispatches `veyra::ConfirmQuit`; `veyra::Quit` opens the sheet while work runs.
 A timeout does not cancel an enqueued action; run Doctor before retrying.
+Commands remain bounded at 64 KiB; the client accepts replies up to 4 MiB so the seeded 5,000-item transcript can be measured without truncating its dump.
 After another Send on an existing thread, gate `wait Done` on the new turn row or a changed status so the preceding Done cannot satisfy it.
 
 The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
@@ -537,6 +547,10 @@ Each transcript item carries `delta_count`, the actual text-stream deltas observ
 `perf.mailbox_free` is the engine mailbox's unreserved capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 Engine commands await space in the window's gpui task, so Stop is retained when that capacity is zero.
 `perf.repaints` counts window renders and `perf.max_batch_events` counts the largest applied pump batch.
+`perf.visible` holds `thread`, `applied_batches` and `max_batch_gap_ms` for the selected Chat thread.
+Its count and largest gap reset on selection changes and on that thread's TurnStarted; hidden text changes neither counter.
+`perf.transcript_open_ms` stamps the first render of the installed snapshot, measured from its Snapshot request.
+It is null until a transcript opens, and each open replaces it.
 The debug-only `veyra::DebugNotificationResponse` action takes a banner `tag` and invokes the native response handler.
 The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and blocks the main thread for that interval.
 `settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
@@ -628,9 +642,10 @@ Do not count native typing, pointer dragging, IME or a manual theme change as dr
 Read `live_pgid` before quitting or removing anything.
 Quit the app, then send SIGTERM to saved provider groups and SIGKILL one second later.
 Signal only groups saved in this run's database and the app group this run started.
-The leftover checks retry for five seconds before failing.
+The leftover checks retry for five seconds and fail only for saved run-owned pids or groups.
+Other processes carrying the parent marker are allowed up to ten seconds to drain; their counts and elapsed time are recorded without making them a provider-cleanup failure.
 The marker check uses Darwin's `KERN_PROCARGS2` through `sysctl` in memory, never printing arguments or environment values.
-It checks live processes with this run's effective user for `VEYRA_PARENT_PID` naming any app pid this run started.
+It reads same-user parent markers in memory, then counts only saved app/provider pids and members of saved provider groups as owned leftovers.
 macOS refuses argument reads for privileged processes whose real uid is the user but effective uid is root; a fake CLI lane cannot create such a process.
 Zombies have no argument/environment block on Darwin and are excluded before the read; owned app pids must still be absent.
 ESRCH or an empty argument block after either sysctl read means the process is gone.
@@ -647,6 +662,7 @@ PID=$(<"$PROOF/pid")
 PGID=$(<"$PROOF/pgid")
 test "$PID" = "$PGID"
 sqlite3 "$DATA/veyra.db" 'select live_pgid from threads where live_pgid is not null' >"$PROOF/provider-groups.txt"
+sqlite3 "$DATA/veyra.db" 'select live_pid from threads where live_pid is not null' >"$PROOF/provider-pids.txt"
 test ! -f "$DATA/logs/veyra.log" || cp "$DATA/logs/veyra.log" "$PROOF/veyra.log"
 if kill -0 "$PID" 2>/dev/null; then
     test "$(ps -o pgid= -p "$PID" | tr -d ' ')" = "$PGID"
@@ -681,19 +697,28 @@ def groups_gone():
         except ProcessLookupError: continue
         remaining.append(group)
     return remaining
-from driver import marked_processes
+from driver import marked_processes, saved_marked_processes
+pids = parents | {int(pid) for pid in (proof/'provider-pids.txt').read_text().split()}
 end = time.monotonic()+5
 while True:
     remaining_groups = groups_gone()
-    remaining_markers = marked_processes(parents)
+    marked = marked_processes(parents)
+    remaining_markers = saved_marked_processes(marked, pids, groups)
     with (proof/'leftover-checks.jsonl').open('a') as out:
         out.write(json.dumps({'groups':len(remaining_groups),'markers':len(remaining_markers),
             'time':time.monotonic()})+'\n')
     if not remaining_groups and not remaining_markers: break
     assert time.monotonic()<end, (remaining_groups,remaining_markers)
     time.sleep(.05)
-(proof/'marker-check.txt').write_text(f'PASS no marked processes for owned app pids {sorted(parents)}\n')
-print('PASS owned pids, provider groups and marker check')
+started = time.monotonic()
+while True:
+    other_markers = marked_processes(parents)
+    if not other_markers or time.monotonic()-started >= 10: break
+    time.sleep(.05)
+(proof/'hook-drain.json').write_text(json.dumps({'remaining':len(other_markers),
+    'elapsed_seconds':time.monotonic()-started})+'\n')
+(proof/'marker-check.txt').write_text(f'PASS no saved owned pids or provider groups for app pids {sorted(parents)}\n')
+print('PASS saved owned pids, provider groups and marker check; other marker drain seconds='+str(round(time.monotonic()-started,3)))
 PY
 test "$DATA" = "/tmp/veyra-verify-$RUN"
 rm -rf "$DATA"
@@ -708,11 +733,10 @@ Never kill by name.
 
 ### Gotchas
 
-A live lane's own Claude session-end hooks can spawn processes at quit that inherit VEYRA_PARENT_PID and exit after the five-second check window.
-Distinguish them from a surviving provider by checking only saved pids, parent/group ids and executable basenames in memory: hook chains begin after quit, often have parent pid 1 and a group different from the recorded provider group.
-The observed chain was bash to Python to a versioned Claude executable; a provider leader remains in its saved group.
-Record counts and timing without printing arguments or environments, and let hook processes drain before retrying Cleanup.
-Keep the five-second leftover check unchanged, and signal only groups this run started and recorded.
+A live provider's session-end hook chains have been observed carrying the parent marker for up to nine seconds after quit or reap.
+Cleanup signals and fails only on the saved run-owned pids and groups, while other marked processes get a separate ten-second drain wait.
+The drain wait adds one second of margin to that observed chain lifetime, records counts and elapsed time, and never prints arguments or environments.
+It does not signal an unrecorded group.
 
 ## Helpers
 

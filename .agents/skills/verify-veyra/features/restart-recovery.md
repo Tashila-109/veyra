@@ -1,6 +1,6 @@
 # Restart and recovery
 
-Status: not run, 2026-10-12, 833bbce, slice-2 child crash and rerun
+Status: not run, 2026-10-12, 833bbce, child crash and recovery
 
 ## Sub-features
 
@@ -140,7 +140,7 @@ poll('restart-family-ready',lambda d:d['providers'][0]['readiness']=='ready')
 for row in ctl('restart-earlier-rows','dump')['sidebar']['rows']:
     if row['kind']=='thread': action('restart-archive-earlier-'+row['id'],'Archive',{'thread':row['id']})
 poll('restart-earlier-hidden',lambda d:all(row['kind']!='thread' for row in d['sidebar']['rows']))
-root,child,task = create_family('M4 child recovery',child='running')
+root,child,task = create_family('child recovery',child='running')
 poll('restart-child-running',lambda d:d['selected_thread']['status']=='Done'
     and d['transcript']['family_card']['rows'][0]['status']=='Working')
 select('restart-child-before-crash',child)
@@ -187,7 +187,7 @@ The process checks show every owned provider group gone before orderly relaunch.
 `restart-expired.json` has no dock; SQLite retains Veyra is closing.
 `restart-crash-held.json` and its PNG show the same hold after a crash, without starting the queued turn.
 `restart-child-interrupted.png` shows the recovered child and Continue, `restart-child-parent-held.png` shows its pending held wake, and `restart-child-delivered.json` agrees with SQLite delivered.
-Both Archive and ArchiveKeepChildren and the M4 top-level tasks key are named here; the archive choices are exercised on multi-agent.
+Both Archive and ArchiveKeepChildren and the top-level tasks key are named here; the archive choices are exercised on multi-agent.
 
 ## Gotchas
 

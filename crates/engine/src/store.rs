@@ -379,7 +379,9 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             origin: parse(r.get(3)?)?,
             state,
         };
-        if let Some(start) = r.get::<_, Option<Millis>>(6)? {
+        if t.state == TurnState::Queued
+            && let Some(start) = r.get::<_, Option<Millis>>(6)?
+        {
             p.attempted_starts.insert(t.id, start);
         }
         p.insert_turn(t);

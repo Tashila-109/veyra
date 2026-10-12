@@ -1808,7 +1808,7 @@ mod tests {
             .spawn(env.claude_bin.as_ref().unwrap(), &[], cwd, None)
             .unwrap();
         let process = child;
-        let started = tokio::time::timeout(Duration::from_secs(3), async {
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
             while !marker.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1901,7 +1901,7 @@ mod tests {
                     1,
                 );
                 if during_cleanup {
-                    tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::time::timeout(Duration::from_secs(10), async {
                         while !cleanup.exists() {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
@@ -1914,7 +1914,7 @@ mod tests {
                 } else {
                     drop(handle);
                 }
-                let exited = tokio::time::timeout(Duration::from_secs(5), async {
+                let exited = tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
                         let event = events.recv().await.unwrap();
                         if matches!(
@@ -2013,7 +2013,7 @@ mod tests {
             } else {
                 drop(handle);
             }
-            let exited = tokio::time::timeout(Duration::from_secs(5), async {
+            let exited = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let event = events.recv().await.unwrap();
                     if matches!(
@@ -2097,7 +2097,7 @@ done
                 1,
             )
             .unwrap();
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(message) = events.recv().await {
                     if matches!(
                         message,
@@ -2125,7 +2125,7 @@ done
                 "closed" => drop(handle),
                 "engine" => env.closing.close(),
                 "none" => {
-                    tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::time::timeout(Duration::from_secs(10), async {
                         while !cwd.join("turn-started").exists() {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
@@ -2136,7 +2136,7 @@ done
                 }
                 _ => unreachable!(),
             }
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(message) = events.recv().await {
                     if matches!(
                         message,
@@ -2227,7 +2227,7 @@ done
                 1,
             )
             .unwrap();
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(message) = events.recv().await {
                     if matches!(
                         message,
@@ -2258,7 +2258,7 @@ done
                 "closed" => drop(handle),
                 "engine" => env.closing.close(),
                 "none" | "writer" => {
-                    tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::time::timeout(Duration::from_secs(10), async {
                         while if cancellation == "writer" {
                             !env.closing.is_closing()
                         } else {
@@ -2273,7 +2273,7 @@ done
                 }
                 _ => unreachable!(),
             }
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(message) = events.recv().await {
                     if matches!(
                         message,

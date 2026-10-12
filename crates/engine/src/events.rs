@@ -281,7 +281,7 @@ impl ChangeSet {
             .turns(p, id)
             .find(|t| matches!(t.state, TurnState::Running { .. }));
         let queued = self.turns(p, id).any(|t| t.state == TurnState::Queued);
-        let last = self.turns(p, id).max_by_key(|t| t.ordinal);
+        let last = self.turns(p, id).max_by_key(|t| t.recency());
         let pending_request = self
             .requests(p, id)
             .any(|r| r.state == RequestState::Pending);

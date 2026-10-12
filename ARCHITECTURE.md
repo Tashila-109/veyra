@@ -70,8 +70,8 @@ Relative overrides become absolute paths.
 It validates the longest socket path before creating the data folder, `logs/` and `run/` at mode 0700.
 The platform limit is 103 usable socket-path bytes.
 Debug builds validate the longer `control.sock` path; release builds validate `veyra.sock`.
-File-backed Engine startup binds veyra.sock in both builds; command-path, private-folder and bind failures refuse startup.
-Before binding, startup removes stale mcp.json files in UUID-named run folders, including configs left by a crash.
+File-backed Engine startup binds veyra.sock in both builds; command-path, private-folder, stale-config removal and bind failures refuse startup.
+Before binding, mcp::remove_stale_configs removes stale mcp.json files in UUID-named run folders, including configs left by a crash; a sweep error refuses startup.
 
 `Engine::start` locks the folder, opens `veyra.db` through a private 0600 file, migrates, reaps stored orphan groups, reconciles stored work and consumes the storage recovery receipt, removes stale run configs, binds veyra.sock, then starts the actor on a dedicated `std::thread`.
 The actor keeps the lock file alive.
@@ -130,13 +130,13 @@ If the shutdown write fails, a Starting thread that still owns a session can ins
 A posted spawn error for a sessionless Starting thread meets its Parked runtime state and keeps the queued turn held.
 Actor::prepare_commit debug-asserts that no start or spawn effect leaves a shutdown decision.
 It expires pending requests with "Veyra is closing" before ending turns.
-A root's Restarted hold remains Held even without a queued turn; a child without queued work shows its Interrupted outcome and retains Continue.
+A root's Restarted hold remains Held even without a queued turn; a recovered child without queued work shows its latest turn's outcome, Interrupted after recovery of a running turn, and retains Continue.
 Send with an empty queue or Continue clears the hold.
 Sessions queue deny/cancel replies before the protocol interrupt and give the writer up to one second to drain before group cleanup.
 Cleanup terminates their owned groups and kills survivors one second later.
 Shutdown first acknowledges any streamed buffer already materialized in its retained changes, installs their projection without publishing or dispatching their earlier effects, then combines them with shutdown changes for one write.
 Acknowledgement moves text ownership into those retained item rows even while their write remains blocked, so shutdown finalization appends it only once.
-Persistent actors retry a blocked shutdown write every 50 ms within the existing three-second deadline.
+Persistent actors retry a blocked shutdown write every 50 ms within the existing three-second deadline; this is Veyra's implementation choice to give a released database lock another chance without a busy loop.
 In-memory actors still end promptly when no session remains.
 After the shutdown commit attempt, a three-second deadline ends the actor's session wait when its message is handled.
 If that write fails, pending row changes remain blocked while sessions still receive Shutdown, and sessionless Starting threads still park in runtime state.
@@ -244,7 +244,8 @@ A Stop button id names its displayed turn, so releasing an earlier mouse press a
 The sidebar's StopThread action sends the engine's StopThread command.
 Respond, Continue and DiscardQueued also have window controls.
 Archive and ArchiveKeepChildren are window actions bound in the shared key table and exposed in each thread row menu.
-Archive stops and hides a whole root family; ArchiveKeepChildren stops and hides the root while its unarchived children keep running.
+Archive on a root stops and hides its whole family; Archive on a child stops and hides only that child and holds its parent as ChildReport unless it already has a hold.
+ArchiveKeepChildren acts only on a root with an unarchived child, matching the row menu, and keeps those children running.
 Task and family cards read the existing task, lineage and status projection.
 On a Starting thread, StopThread and Archive send Shutdown and wait in Stopping for Exited.
 Interrupt is a no-op outside Structured, including Starting because it has no running or pending turn.
@@ -299,7 +300,8 @@ Migrations use `PRAGMA user_version` in transactions and refuse newer schemas.
 The eight tables are projects, threads, turns, items, requests, grants, tasks and settings.
 User text lives once in an item referenced by its turn.
 An ended turn carries both its optional start time and end time, including after load.
-A requeued turn retains started_at in SQLite, and Projection.attempted_starts keeps that persisted admission attempt visible to reconcile.
+A requeued turn retains started_at in SQLite, and store::load fills Projection.attempted_starts only for queued rows with a stored start so reconcile can see an uncertain admission.
+Runtime turn insertion does not fill that recovery-only index.
 Reconcile interrupts a queued turn with an earlier start attempt because it cannot know whether the CLI received the dispatched prompt.
 The prompt remains in its existing user item, and Continue cannot resend that uncertain attempt.
 Unstarted queued turns remain queued and held; pending wakes keep the existing safer duplicate-report recovery.
@@ -438,12 +440,13 @@ Tests supply the built Veyra executable and reach it from the fake CLI's direct-
 Accepted and refused connections log the thread id when the token identifies one, and tools/call logs the thread and supported tool name without arguments.
 Unknown tool names log as unknown.
 Socket lines reuse the provider's bounded 4 MiB ByteLines reader.
-The authentication line and pending launch registration each have a three-second bound.
+The authentication line has a three-second bound, Veyra's implementation choice to prevent an idle unauthenticated client from holding the connection open indefinitely.
+Pending launch registration also waits three seconds, Veyra's implementation choice to allow launch publication while bounding a stuck spawn; timeout and closed registration log the known thread and refusal reason.
 The server serves initialize, ping, tools/list and tools/call over newline-delimited JSON-RPC.
 Every unsupported request, including Claude's server/discover, receives -32601 immediately, and notifications receive no reply.
-Live lane 0 measured Claude 2.1.296 starting the relay directly, supporting the executable and parent checks.
-That lane observed system/init list veyra as connected with source dynamic after the first user message.
-Lane 0 observed initialize instructions from the start and tool descriptions deferred until ToolSearch loaded their schemas.
+A live Claude 2.1.296 run measured the relay starting directly, supporting the executable and parent checks.
+That run observed system/init list veyra as connected with source dynamic after the first user message.
+The same run observed initialize instructions from the start and tool descriptions deferred until ToolSearch loaded their schemas.
 A CLI version that starts the relay through an intermediate process fails the direct-parent check; refusals are logged and the server stays unavailable.
 Instructions therefore contain the complete first-call rules, and each tool description also teaches its own common rule.
 Configuration uses platform::private_dir and platform::private_file to write the sole token-bearing file, 0600 DATA/run/THREAD/mcp.json under a 0700 folder.
@@ -458,7 +461,8 @@ The CLI actor refuses a tool request without its originating session; only scrip
 The token never enters argv, logs, evidence, fixture text or crash text.
 
 Actor::handle_inner sends every tool decision through tools::decide, the existing ChangeSet commit and the existing effects path.
-list_providers reads the shared readiness catalog and offers only the built Claude adapter with Ready and a resolved path, its models, the caller's mode ceiling and remaining fan-out.
+ProviderKind::is_built owns provider availability for the spawner, tool catalog, start validation and start_thread schema.
+list_providers reads the shared readiness catalog and offers built adapters with Ready and a resolved path, their models, the caller's mode ceiling and remaining fan-out.
 start_thread refuses Codex and Grok with the unsupported-version rule and a list_providers call, even when their placeholder probes are Ready.
 Probes populate that catalog and Engine::child_env shares it with the actor.
 start_thread creates a child lineage, first task turn and UUID-v5 task keyed by caller and start_thread:client_request_id.
@@ -477,7 +481,8 @@ A retry compares the stored first user item and child provider, and message_thre
 Reusing a key with different text, provider or target is refused, while the two tool names create separate key namespaces.
 Prompts and follow-ups are capped at 100,000 Unicode characters.
 Refusals name the rule, applicable count and limit, and a next tool with the identifiers or argument shape needed to recover.
-The first task prompt alone prepends two child-guidance sentences; stored user text and later task or user prompts stay literal.
+start_thread stores two child-guidance sentences before the parent's prompt in the child's first task item, so the transcript, database and provider receive the same text.
+Retries compare the parent's original prompt after removing that exact stored guidance prefix; later task and user items stay literal.
 The existing settlement path waits for no running or queued child turn and no background work, or handles Stop and recovered-child Continue.
 It coalesces reports into a queued wake and records Pending delivery in the same transaction.
 A settlement while a wake runs creates a successor wake.
@@ -485,7 +490,7 @@ Wake text frames each child's final assistant message as a report and caps its s
 The ordinary start rule waits for the parent to be idle and unheld, so a wake never interrupts or steers.
 Accepted changes task delivery to Delivered, and the actor logs thread, turn and acceptance time for each admitted acceptance.
 Any wake ending before Accepted moves pending reports into a new queued wake; delivery is at least once until acceptance, can repeat, and is final once Delivered.
-Parent Stop preserves a held wake, a kept child settles into its archived root's pending wake, and a user stop of one child holds the parent as ChildReport without replacing an earlier hold.
+Parent Stop preserves a held wake, a kept child settles into its archived root's pending wake, and a user stop or archive of one child holds the parent as ChildReport without replacing an earlier hold.
 
 ## Platform and keep-awake
 
@@ -557,14 +562,18 @@ Recorder and override read sites are compile-time debug-only; release string che
 `MainView::Chat` carries its thread id; Settings keeps an optional return thread.
 It subscribes before requesting snapshots.
 The subscription starts with SettingsChanged, projects, threads, turn rows, task state and delivery rows, and one status per thread.
-It also sends StorageBlocked if storage is blocked.
+It also sends StorageBlocked if storage is blocked and RecoveryNotice when startup could not read its storage receipt.
 Every thread-scoped initial row advances that thread's counter.
 The gpui pump drains every queued event into one entity update, applies it and notifies once.
 AppState counts applied batches and the largest measured gap between text-bearing batches.
+Debug-only VisiblePerf counts applied TextAppended batches for the selected Chat thread and their largest gap, ignoring hidden text.
+Its count, gap and previous-batch timestamp reset on selection changes and on that thread's TurnStarted.
+Debug-only TranscriptOpen records the Snapshot request identity and time, marks its installation, and ui::transcript::render stamps the first render of that installed snapshot.
+The dump exposes perf.visible and perf.transcript_open_ms, which is null until an open and replaced on every open.
 A theme-cadence task refreshes Working time once a second while any thread is Working, including an unselected row.
 AppState keeps a per-thread activity clock from TextAppended, ItemAdded, ItemCompleted and RequestOpened; TurnStarted resets it to that turn's start.
 quiet_for derives Quiet for N min after ten minutes without activity while Working, with no unfinished tool row and no pending dock request.
-The header and sidebar share that hint, and the engine status remains Working.
+The header and sidebar retain the title beside that hint and reserve its full text width, truncating the title when space is narrow; the engine status remains Working.
 
 Opening a transcript requests an actor snapshot, never SQLite from the UI.
 Every snapshot request has an identity.
@@ -575,6 +584,7 @@ It installs stored items plus buffered text and replays only item events above t
 Snapshot installation and fence release do not await the header's Git branch lookup.
 Later stale transcript events are ignored, but metadata stays on the ordered event stream: an items-only snapshot does not carry native-id, turn or live-state rows and cannot fence those updates.
 This joins the item snapshot and event stream without duplicated or missing text.
+When the selected Chat thread becomes archived, both the event pump and acknowledgement path call leave_archived_thread to open New thread with the stored default mode and reset its draft, picker, notice and branch.
 
 The sidebar reads projects in creation order, then each root and its children on a one-pixel guide, with the root glyph derived from family_status.
 An unarchived child whose root is archived becomes a top-level row and keeps its own status.
@@ -591,11 +601,12 @@ Other view changes and Quit call `forget_branch` to cancel the task and clear th
 Dropping the Shell also cancels the task, and its reply checks the selection identity.
 The centred transcript uses a window-owned MessageScrollerState over gpui ListState and selectable Markdown TextView.
 The transcript and its expansion behavior live in ui/transcript.rs.
-The Started N agents card is the first derived list row with each child's own status glyph and words, SelectThread as Open, and StopThread as Stop.
+The Started N agents card, singular Started 1 agent, is the first derived list row and lists every child, including archived children whose Open is disabled.
+Each row uses its child's own status glyph and words, SelectThread as Open, and StopThread as Stop only while the shared stop_target rule names a turn and the child is unarchived.
 TaskCard rows show Task from the parent provider; Task and Wake turns label the parent title and distinct reporting children respectively.
-A child whose latest task is Delivered labels its last transcript row Report delivered, including when later child work formed that report.
-The window sorts turns by actual started time, using ordinal for ties and unstarted queued turns after started ones; stored queue ordinals retain their admission role.
-ReplyLineBreaks uses the kit's Markdown AST hook to turn only prose soft breaks into rendered line breaks, preserving lists, emphasis, tables and code, with the original Markdown retained for source copying.
+A Delivered task labels its own turn's last assistant row Report delivered; later user work does not move the badge.
+Turn::recency orders the transcript, ThreadView.last, failure cause and Retry by actual start, with ordinal for ties and queued turns after started ones; stored queue ordinals retain their admission role.
+ReplyLineBreaks applies to assistant reply rows and uses the kit's Markdown AST hook to turn prose soft breaks into rendered line breaks, preserving lists, emphasis, tables and code, with the original Markdown retained for source copying.
 AppState caches each thread's ordered item ids and row positions, rebuilding them on item insertion, turn metadata and snapshots.
 It fills shared markdown source strings for assistant and reasoning rows before they enter the cached order, refreshing only the changed item and removing archived rows.
 The row renderer receives that row's cached markdown source without rebuilding it.
@@ -679,7 +690,8 @@ One socket thread serves tagged JSON-line commands serially; a gpui task dispatc
 Named actions dispatch through the window on the Shell's stable root focus; keys use the focused path.
 Quit uses gpui's deferred Window::dispatch_action.
 Replies acknowledge dispatch rather than completed engine work, so verification polls the resulting window state.
-Lines are limited to 65536 bytes, socket reads/writes and UI-reply waits to two seconds, and the request queue to 16.
+Command lines are limited to 65536 bytes, replies to 4 MiB, socket reads/writes and UI-reply waits to two seconds, and the request queue to 16.
+The reply limit is Veyra's implementation choice to carry the 5,000-item snapshot dump while retaining a bounded client allocation; the smaller command limit remains unchanged.
 An incremental same-user sender can keep a line read occupied inside the per-read timeout.
 A full queue rejects before enqueueing; a reply timeout does not cancel an action already queued.
 
@@ -698,12 +710,7 @@ No wait server command exists.
 Its fake lane isolates data and uses only the fake CLI; an explicitly authorized live lane records actual provider wires.
 Proof stays outside disposable scratch, and driver and cleanup actions target only processes this run started.
 Captures require the owned window to remain on-screen and frontmost; the guard prevents covered or stale frames from counting as proof.
-Cleanup checks owned app pids, provider groups and same-user parent markers without printing arguments before removing scratch.
-Release proof uses a disposable HOME and restricted PATH, scans driver/override strings including VEYRA_REAP_PIDS, and checks a release window without a driver socket; its authenticated veyra.sock remains private at 0600.
-Release ignores the debug reap filter, so its launch first refuses any same-user marked process whose VEYRA_PARENT_PID names a dead pid.
-That check holds only at preflight; an orphan created before the release sweep can still be signalled, so release checks must not overlap another run's deliberate orphan.
-After release cleanup, the recipe fails if the preserved log records an orphan-group signal.
-Only one owned Veyra window exists during that release check; it takes no PNG.
+Release ignores the debug reap filter and can signal any validated orphan, so the skill keeps release checks away from another run's deliberate orphan.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, mailbox_free, repaints and max_batch_events.
@@ -731,7 +738,7 @@ DebugStallUi blocks the window thread for its supplied milliseconds so the pump 
 multi_agent tests exercise actor rules, idempotent tasks, guidance, shared status words, settlement, held and successor wakes, grants, uncertain-admission recovery and retained writes and recovery notices.
 mcp_socket uses the built relay and a fake CLI that records only its own argv, then checks foreign-peer refusal, the production relay with a wrong direct parent, a second relay from the same CLI reusing its token, private files and socket modes, RPC method fallback, instruction coverage and config cleanup.
 Removing either the parent or one-use check makes its isolated relay regression fail.
-Revocation and a blocked launch are exercised concurrently, with a bounded wait proving revocation does not wait for that launch.
+mcp.rs launch_lock_tests blocks a launch closure and exercises revocation concurrently, with a bounded wait proving revocation does not wait for that closure.
 mcp_socket also exercises production root session config lifetime, non-connected init cleanup, pre-init exit cleanup, child argv isolation and token redaction.
 
 Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
@@ -750,6 +757,9 @@ Mailbox tests require a full-channel send to wait and two waiting commands to re
 Tests in tests/session_events.rs require duplicate Ready and admission-only changes to retain their runtime and metadata effects without another commit.
 A projection test checks text-only row selection for the open thread, another thread, mixed batches and items absent from the order.
 A projection test checks cached row order, streamed text, completion and archive cleanup.
+Window regressions check visible text counting and both resets, stalled-visible gaps despite hidden text, first-render open timing and replacement, quiet title/hint geometry, conditional family Stop, stored guidance, recency, archive eligibility and reset, and delivered-report anchoring.
+perf_snapshot_large is ignored by ordinary workspace tests, seeds one file-backed thread with 5,000 items across fifty complete tool-heavy turns, times one actor Snapshot and prints the database path it retains for a window drive.
+Its normal seed regression checks the stored shape, and the stream-pause fixture regression checks one 300 ms delay after 1,000 of the 2,000 deltas.
 Shutdown tests check that Quit during a drain, Stopping or missing-session recovery starts no replacement session and keeps queued work held after reload.
 An actor decision test checks that shutdown exits propose no restart or queued-turn start, preserving epochs and earlier holds.
 A storage test checks that a Write tool row stores its content once.
@@ -775,7 +785,7 @@ They do not inspect caffeinate liveness or the OS assertion lifetime.
 Reaper tests check live parents, non-agent argv, the lazy executable/environment-read boundary and stored/swept versioned binaries reached through a provider symlink.
 The versioned-binary test proves that a marked orphan started by its parent harness survives the child test's sweep.
 record_redaction covers token removal, private captures, version/account sanitization and a fixture secret-shape sweep.
-Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits and driver-name coverage.
+Tests guard failure redaction, launch arguments, terminal outcomes, snapshot ordering, metadata delivery, wait exits, driver-name and tool-name coverage.
 Application tests enable gpui test-support to exercise Shell selection, its event pump, typed dock text and focus, chords and empty-Send Stop through the keymap in a synthetic window.
 Dock regressions reject an old Allow once render, stale approval ids and an already-answered question index, with current-request controls.
 A blocked real-session writer completes Provider B after dropping A's queued interrupt; a duplex-writer test checks the target again after a pending first-byte write.
@@ -794,9 +804,9 @@ recheck_after_confirm_quit_launches_no_provider deliberately checks an owned sta
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence, header-branch clearing and cleanup.
 Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.
+The multi-agent page, currently marked not run pending lead acceptance, covers family controls, stored task guidance, delivery, archive choices, quiet titles and the visible/open timing probes.
 Permission-matrix records separately authorized live permission checks.
 Their Status lines record the lead's acceptance, independently of the recipes.
-The app-launch page's release check scans driver/override strings with a debug positive control and runs a release window without a driver socket and checks the private MCP socket.
 The ignored live tests require fresh human consent; workspace tests compile them without running a provider.
 live_claude_approval_round_trip uses the public engine in Ask first to check an exact Bash request, Deny without a file, and AllowOnce on a repeat with the file created.
 Actor tests check account-error retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.

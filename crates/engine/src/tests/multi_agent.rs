@@ -249,6 +249,86 @@ fn request_key_reused_with_other_prompt_refused() {
     );
     assert_eq!(f.loaded().tasks.len(), 1);
 }
+
+#[test]
+fn failed_admitted_prompt_is_latest_in_task_and_window_status() {
+    let mut f = Fixture::new(LiveState::Running);
+    let caller = f.thread;
+    let (child, task) = start(&mut f, "interleaved");
+    let mut changes = ChangeSet::default();
+    let mut prompt = f.loaded().turns[&task_turn(&f, task)].clone();
+    prompt.state = TurnState::Ended {
+        started: Some(300),
+        at: 400,
+        outcome: TurnOutcome::Failed {
+            message: "admitted prompt failed".into(),
+        },
+    };
+    changes.turns.insert(prompt.id, prompt);
+    let earlier = Turn {
+        id: TurnId::new(),
+        thread: child,
+        ordinal: 2,
+        origin: TurnOrigin::Provider,
+        state: TurnState::Ended {
+            started: Some(100),
+            at: 200,
+            outcome: TurnOutcome::Completed,
+        },
+    };
+    changes.turns.insert(earlier.id, earlier);
+    changes.live.insert(child, LiveThread::default());
+    f.save(changes);
+    let task = success(call(&mut f, caller, "get_task", json!({"task_id":task})));
+    assert_eq!(task["status"], "Failed");
+    let (out, mut events) = mpsc::unbounded_channel();
+    f.actor.handle(EngineMsg::Subscribe(out));
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(event,
+        UiEvent::Change { event: crate::events::ChangeEvent::ThreadStatusChanged { thread, status: Status::Failed }, .. } if thread == child)));
+}
+
+#[test]
+fn start_thread_schema_offers_only_built_providers() {
+    let tools = crate::tools::list();
+    let start = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "start_thread")
+        .unwrap();
+    assert_eq!(
+        start["inputSchema"]["properties"]["provider"]["enum"],
+        json!(["claude"])
+    );
+}
+
+#[test]
+fn attempted_starts_belong_only_to_loaded_queued_turns() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let Ack::Turn(turn) = f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "uncertain admission".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(f.actor.projection.attempted_starts.is_empty());
+    assert!(f.loaded().attempted_starts.is_empty());
+    f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+        provider_turn: TurnId::new(),
+    }));
+    assert!(f.actor.projection.attempted_starts.is_empty());
+    assert_eq!(
+        f.loaded()
+            .attempted_starts
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        [turn]
+    );
+}
 #[test]
 fn request_key_reused_across_tools_makes_two_tasks() {
     let mut f = Fixture::new(LiveState::Running);
@@ -531,12 +611,21 @@ fn child_first_turn_has_guidance() {
     let mut f = Fixture::new(LiveState::Running);
     let (_, task) = start(&mut f, "first");
     let p = f.loaded();
-    let text =
-        crate::commands::turn_text(&p, &ChangeSet::default(), &p.turns[&p.tasks[&task].turn]);
+    let text = p
+        .items_for(p.tasks[&task].child)
+        .find_map(|item| match &item.body {
+            ItemBody::UserText(text) if item.turn == p.tasks[&task].turn => Some(text),
+            _ => None,
+        })
+        .unwrap();
     assert!(text.starts_with("Your last message is your report"));
     assert!(text.contains("4,000 characters"));
     assert!(text.contains("cannot start child threads"));
     assert!(text.ends_with("Report on the files"));
+    assert_eq!(
+        crate::commands::turn_text(&p, &ChangeSet::default(), &p.turns[&p.tasks[&task].turn]),
+        *text
+    );
 }
 #[test]
 fn later_turns_have_no_guidance() {
@@ -552,6 +641,13 @@ fn later_turns_have_no_guidance() {
     let task: TaskId = serde_json::from_value(value["task_id"].clone()).unwrap();
     let p = f.loaded();
     assert_eq!(
+        p.items_for(child).find_map(|item| match &item.body {
+            ItemBody::UserText(text) if item.turn == p.tasks[&task].turn => Some(text.as_str()),
+            _ => None,
+        }),
+        Some("plain follow up")
+    );
+    assert_eq!(
         crate::commands::turn_text(&p, &ChangeSet::default(), &p.turns[&p.tasks[&task].turn]),
         "plain follow up"
     );
@@ -565,6 +661,13 @@ fn later_turns_have_no_guidance() {
         panic!()
     };
     let p = f.loaded();
+    assert_eq!(
+        p.items_for(child).find_map(|item| match &item.body {
+            ItemBody::UserText(text) if item.turn == user => Some(text.as_str()),
+            _ => None,
+        }),
+        Some("plain user text")
+    );
     assert_eq!(
         crate::commands::turn_text(&p, &ChangeSet::default(), &p.turns[&user]),
         "plain user text"
@@ -1060,6 +1163,7 @@ fn malformed_storage_receipt_does_not_prevent_startup() {
     for unreadable in [false, true] {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../../target/lost-receipt-{}", ThreadId::new()));
+        let _scratch = Scratch(root.clone());
         crate::platform::private_dir(&root.join("run")).unwrap();
         let mut db = Connection::open(root.join("veyra.db")).unwrap();
         store::initialize(&mut db).unwrap();
@@ -1102,7 +1206,6 @@ fn malformed_storage_receipt_does_not_prevent_startup() {
             assert_eq!(std::fs::read_to_string(kept).unwrap(), "invalid receipt");
         }
         drop(actor);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -1112,6 +1215,7 @@ fn quit_retries_retained_changes_after_the_write_lock_clears() {
     let f = Fixture::new(LiveState::Running);
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!("../../target/quit-retry-{}", ThreadId::new()));
+    let _scratch = Scratch(root.clone());
     crate::platform::private_dir(&root.join("run")).unwrap();
     let path = root.join("veyra.db");
     f.actor
@@ -1149,5 +1253,4 @@ fn quit_retries_retained_changes_after_the_write_lock_clears() {
     let loaded = store::load(&Connection::open(&path).unwrap()).unwrap();
     assert!(loaded.items_for(f.thread).any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text=="retained across quit retries")));
     assert!(!root.join("run/storage-blocked.json").exists());
-    std::fs::remove_dir_all(root).unwrap();
 }

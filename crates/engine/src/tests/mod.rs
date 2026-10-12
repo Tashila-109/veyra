@@ -262,6 +262,27 @@ fn turn_event(turn: Option<TurnId>, event: TurnEvent) -> ProviderEvent {
 pub(crate) struct Scratch(pub(crate) std::path::PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "scratch cleanup failed: {error}"
+            );
+        }
     }
+}
+
+#[test]
+fn scratch_cleanup_handles_unwind_and_an_absent_folder() {
+    let path = std::env::temp_dir().join(format!("veyra-scratch-{}", ThreadId::new()));
+    std::fs::create_dir(&path).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        let _scratch = Scratch(path.clone());
+        std::fs::write(path.join("owned-file"), "owned").unwrap();
+        panic!("unwind scratch");
+    });
+    assert!(result.is_err());
+    assert!(!path.exists());
+    drop(Scratch(path.clone()));
+    assert!(!path.exists());
 }

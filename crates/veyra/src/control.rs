@@ -16,6 +16,7 @@ use veyra_engine::platform;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_LINE: u64 = 65536;
+const MAX_REPLY: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -33,11 +34,11 @@ pub struct Request {
     reply: mpsc::SyncSender<Value>,
 }
 
-fn read_line(reader: impl Read) -> anyhow::Result<String> {
+fn read_line(reader: impl Read, limit: u64) -> anyhow::Result<String> {
     let mut line = String::new();
-    BufReader::new(reader.take(MAX_LINE + 1)).read_line(&mut line)?;
-    if line.len() as u64 > MAX_LINE || !line.ends_with('\n') {
-        bail!("control command must be one JSON line of at most {MAX_LINE} bytes");
+    BufReader::new(reader.take(limit + 1)).read_line(&mut line)?;
+    if line.len() as u64 > limit || !line.ends_with('\n') {
+        bail!("control line must be one JSON line of at most {limit} bytes");
     }
     Ok(line)
 }
@@ -70,7 +71,7 @@ fn serve(
     sender: &channel::Sender<Request>,
     schema_version: u32,
 ) -> anyhow::Result<Value> {
-    let command = serde_json::from_str(&read_line(&mut *stream)?)?;
+    let command = serde_json::from_str(&read_line(&mut *stream, MAX_LINE)?)?;
     let (reply, response) = mpsc::sync_channel(1);
     sender
         .try_send(Request {
@@ -259,7 +260,7 @@ fn request_inner(data_dir: &Path, command: &Command) -> anyhow::Result<Value> {
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     writeln!(stream, "{}", serde_json::to_string(command)?)?;
-    let reply: Value = serde_json::from_str(&read_line(stream)?)?;
+    let reply: Value = serde_json::from_str(&read_line(stream, MAX_REPLY)?)?;
     if let Some(error) = reply.get("error").and_then(Value::as_str) {
         bail!("{error}");
     }
@@ -369,8 +370,51 @@ mod tests {
     }
     #[test]
     fn driver_rejects_oversized_or_unterminated_lines() {
-        assert!(read_line("{}\n".as_bytes()).is_ok());
-        assert!(read_line("{}".as_bytes()).is_err());
-        assert!(read_line(format!("{}\n", "x".repeat(MAX_LINE as usize)).as_bytes()).is_err());
+        assert!(read_line("{}".as_bytes(), MAX_REPLY).is_err());
+        assert!(
+            read_line(
+                format!("{}\n", "x".repeat(MAX_REPLY as usize)).as_bytes(),
+                MAX_REPLY
+            )
+            .is_err()
+        );
+        assert!(read_line("{}\n".as_bytes(), MAX_LINE).is_ok());
+        assert!(read_line("{}".as_bytes(), MAX_LINE).is_err());
+        assert!(
+            read_line(
+                format!("{}\n", "x".repeat(MAX_LINE as usize)).as_bytes(),
+                MAX_LINE
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn driver_client_reads_a_transcript_reply_above_command_size() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let root = std::path::Path::new("/tmp").join(format!(
+            "veyra-m4s3-r-{}",
+            veyra_engine::domain::ThreadId::new()
+        ));
+        platform::private_dir(&root).unwrap();
+        let _scratch = Scratch(root.clone());
+        let listener = platform::bind_socket(&root.join("control.sock")).unwrap();
+        let expected = json!({"transcript":{"items":vec![json!({"text":"x".repeat(100)});1000]}});
+        let reply = expected.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&read_line(&mut stream, MAX_LINE).unwrap()).unwrap(),
+                json!({"command":"dump"})
+            );
+            let _ = writeln!(stream, "{reply}");
+        });
+        let response = request_inner(&root, &Command::Dump);
+        server.join().unwrap();
+        assert_eq!(response.unwrap(), expected);
     }
 }

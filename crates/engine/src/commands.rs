@@ -800,13 +800,13 @@ pub fn turn_text(p: &Projection, c: &ChangeSet, turn: &Turn) -> String {
             let ItemBody::UserText(text) = &item.body else { unreachable!() };
             text.clone()
         }
-        TurnOrigin::Task { task } => crate::tools::task_text(p, turn, c
+        TurnOrigin::Task { task } => c
             .items(p, turn.thread)
             .find_map(|i| match &i.body {
                 ItemBody::UserText(text) if i.turn == turn.id => Some(text.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| format!("Task {task}"))),
+            .unwrap_or_else(|| format!("Task {task}")),
         TurnOrigin::Wake { tasks } => tasks
             .iter()
             .filter_map(|id| c.tasks.get(id).or_else(|| p.tasks.get(id)))

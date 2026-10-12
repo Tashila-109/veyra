@@ -84,7 +84,7 @@ impl Tool {
         let (properties, required) = match self {
             Self::ListProviders => (json!({}), json!([])),
             Self::StartThread => (
-                json!({"provider":{"type":"string","enum":["claude","codex","grok"]},"model":{"type":"string"},"mode":{"type":"string","enum":["ask_first","accept_edits","full_access"]},"title":{"type":"string"},"prompt":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
+                json!({"provider":{"type":"string","enum":ProviderKind::ALL.into_iter().filter(|provider|provider.is_built()).collect::<Vec<_>>()},"model":{"type":"string"},"mode":{"type":"string","enum":["ask_first","accept_edits","full_access"]},"title":{"type":"string"},"prompt":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
                 json!(["provider", "title", "prompt", "client_request_id"]),
             ),
             Self::GetTask => (
@@ -223,7 +223,11 @@ fn prior_text<'a>(p: &'a Projection, task: &Task) -> Option<&'a str> {
     p.items_for(task.child)
         .filter(|item| item.turn == task.turn)
         .find_map(|item| match &item.body {
-            ItemBody::UserText(text) => Some(text.as_str()),
+            ItemBody::UserText(text) => Some(if task.request_key.starts_with("start_thread:") {
+                text.strip_prefix(CHILD_GUIDANCE.as_str()).unwrap_or(text)
+            } else {
+                text.as_str()
+            }),
             _ => None,
         })
 }
@@ -317,7 +321,7 @@ pub fn decide(
                 ));
             }
             let open = open_children(p, caller);
-            json!({"providers":providers.iter().filter(|probe|probe.provider == ProviderKind::Claude && probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models})).collect::<Vec<_>>(),"mode_ceiling":parent.config.mode,"remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
+            json!({"providers":providers.iter().filter(|probe|probe.provider.is_built() && probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models})).collect::<Vec<_>>(),"mode_ceiling":parent.config.mode,"remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
         }
         Tool::StartThread => {
             let args: Start = parse(call.arguments, tool)?;
@@ -345,7 +349,7 @@ pub fn decide(
                     serde_json::to_value(parent.config.mode).unwrap()
                 )));
             }
-            if args.provider != ProviderKind::Claude {
+            if !args.provider.is_built() {
                 return Err(invalid(format!(
                     "provider {} is not built in this version; call list_providers with {{}} and choose a supported provider",
                     args.provider.label()
@@ -397,7 +401,14 @@ pub fn decide(
             c.events.push(Ev::ThreadCreated(child.clone()));
             c.threads.insert(child_id, child);
             c.live.insert(child_id, LiveThread::default());
-            let task = queue_task(p, &mut c, caller, child_id, key, args.prompt);
+            let task = queue_task(
+                p,
+                &mut c,
+                caller,
+                child_id,
+                key,
+                format!("{}{}", CHILD_GUIDANCE.as_str(), args.prompt),
+            );
             json!({"task_id":task.id,"thread_id":child_id})
         }
         Tool::GetTask => {
@@ -440,15 +451,4 @@ pub fn decide(
     };
     commands::start_changed(p, l, &mut c, now);
     Ok((c, result))
-}
-pub fn task_text(p: &Projection, turn: &Turn, text: String) -> String {
-    if p.turns_for(turn.thread)
-        .filter(|prior| matches!(prior.origin, TurnOrigin::Task { .. }))
-        .min_by_key(|prior| prior.ordinal)
-        .is_some_and(|first| first.id == turn.id)
-    {
-        format!("{}{text}", CHILD_GUIDANCE.as_str())
-    } else {
-        text
-    }
 }

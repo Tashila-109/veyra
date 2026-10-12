@@ -857,6 +857,7 @@ mod cli {
     impl CliFixture {
         fn new(name: &str) -> Self {
             let root = std::env::temp_dir().join(format!("veyra-stop-{}", ThreadId::new()));
+            let scratch = Scratch(root.clone());
             std::fs::create_dir(&root).unwrap();
             let source =
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude");
@@ -883,7 +884,7 @@ mod cli {
             Self {
                 f,
                 messages,
-                scratch: Scratch(root),
+                scratch,
             }
         }
         fn send(&mut self, text: &str) -> TurnId {

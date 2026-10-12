@@ -108,6 +108,18 @@ pub struct Turn {
     pub origin: TurnOrigin,
     pub state: TurnState,
 }
+impl Turn {
+    pub fn recency(&self) -> (bool, Millis, u32) {
+        (
+            self.state == TurnState::Queued,
+            self.state.started().unwrap_or(match self.state {
+                TurnState::Ended { at, .. } => at,
+                _ => i64::MAX,
+            }),
+            self.ordinal,
+        )
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnOrigin {
     User { item: ItemId },
@@ -412,9 +424,6 @@ pub struct Projection {
 }
 impl Projection {
     pub fn insert_turn(&mut self, turn: Turn) {
-        if let Some(start) = turn.state.started() {
-            self.attempted_starts.insert(turn.id, start);
-        }
         self.turn_ids
             .entry(turn.thread)
             .or_default()

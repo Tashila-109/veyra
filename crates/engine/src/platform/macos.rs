@@ -364,33 +364,13 @@ pub fn private_text(path: &Path, text: &str) -> io::Result<()> {
     file.sync_all()?;
     fs::rename(temporary, path)
 }
-pub fn quarantine_file(path: &Path) -> io::Result<PathBuf> {
-    let destination = path.with_file_name(format!(
-        "storage-blocked-lost-{}.json",
-        uuid::Uuid::now_v7()
-    ));
-    fs::rename(path, &destination)?;
-    let metadata = fs::symlink_metadata(&destination)?;
+pub fn quarantine_file(path: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(path, destination)?;
+    let metadata = fs::symlink_metadata(destination)?;
     if metadata.is_file() {
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
     } else if metadata.is_dir() {
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(destination)
-}
-pub fn remove_stale_mcp_configs(data: &Path) -> io::Result<()> {
-    let entries = match fs::read_dir(data.join("run")) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_dir()
-            && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok()
-        {
-            remove_optional_file(&entry.path().join("mcp.json"))?;
-        }
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -530,26 +510,24 @@ mod tests {
             "veyra-shell-pipe-{}",
             crate::domain::ThreadId::new()
         ));
+        let _scratch = crate::tests::Scratch(root.clone());
         fs::create_dir(&root).unwrap();
         let shell = root.join("shell");
         let marker = root.join("escaped-pid");
-        fs::write(
-            &shell,
-            format!(
-                r#"#!/usr/bin/env python3
-import os, time
-if os.fork() == 0:
-    os.setsid()
-    with open('{}', 'w') as marker: marker.write(str(os.getpid()))
-    time.sleep(4)
-    os._exit(0)
-time.sleep(60)
-"#,
-                marker.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = root.join("stand-in.c");
+        fs::write(&source, format!(
+            "#include <unistd.h>\n#include <stdio.h>\nint main(void) {{ if (fork() == 0) {{ setsid(); FILE *f = fopen(\"{}\", \"w\"); fprintf(f, \"%d\", getpid()); fclose(f); sleep(4); _exit(0); }} sleep(60); }}\n",
+            marker.display()
+        )).unwrap();
+        assert!(
+            Command::new("/usr/bin/cc")
+                .arg(source)
+                .arg("-o")
+                .arg(&shell)
+                .status()
+                .unwrap()
+                .success()
+        );
         let start = std::time::Instant::now();
         let result = bounded_shell_path(shell.as_os_str(), std::time::Duration::from_secs(2));
         let elapsed = start.elapsed();
@@ -557,7 +535,6 @@ time.sleep(60)
         unsafe {
             libc::kill(escaped, libc::SIGKILL);
         }
-        fs::remove_dir_all(root).unwrap();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(
             elapsed < std::time::Duration::from_secs(3),
@@ -571,6 +548,7 @@ time.sleep(60)
             return;
         }
         let root = env::temp_dir().join(format!("veyra-shell-{}", crate::domain::ThreadId::new()));
+        let _scratch = crate::tests::Scratch(root.clone());
         fs::create_dir(&root).unwrap();
         let shell = root.join("shell");
         fs::write(
@@ -596,7 +574,6 @@ time.sleep(60)
             .parse()
             .unwrap();
         let alive = group_exists(pid).unwrap();
-        fs::remove_dir_all(root).unwrap();
         assert!(
             result.status.success(),
             "{}",

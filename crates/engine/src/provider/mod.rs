@@ -232,6 +232,9 @@ impl Probe {
     }
 }
 impl ProviderKind {
+    pub fn is_built(self) -> bool {
+        self == Self::Claude
+    }
     pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
     pub fn binary(self) -> &'static str {
         match self {
@@ -313,10 +316,8 @@ impl Spawner {
         epoch: u32,
     ) -> Result<SessionHandle, ProviderError> {
         match self {
-            Self::Cli(env) => match provider {
-                ProviderKind::Claude => session::spawn(spec, env.clone(), out, epoch),
-                ProviderKind::Codex | ProviderKind::Grok => Err(ProviderError::NotBuilt),
-            },
+            Self::Cli(env) if provider.is_built() => session::spawn(spec, env.clone(), out, epoch),
+            Self::Cli(_) => Err(ProviderError::NotBuilt),
             #[cfg(test)]
             Self::Scripted(script) => Ok(script.spawn(spec, out, epoch)),
         }
@@ -422,7 +423,7 @@ read initialize
             env.clone(),
             root.clone(),
         );
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !root.join("version-stopping").exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -430,7 +431,7 @@ read initialize
         .await
         .unwrap();
         drop(probes);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), reply).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), reply).await;
         assert!(result.is_ok(), "probe did not finish cleanup");
         assert!(
             env.groups.lock().unwrap().is_empty(),

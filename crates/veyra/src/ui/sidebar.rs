@@ -14,6 +14,21 @@ pub fn glyph(status: &Status) -> &'static str {
         _ => "·",
     }
 }
+pub(super) fn glyph_color(status: &Status, theme: &Theme) -> Hsla {
+    match status {
+        Status::Working { .. } => theme.colors.accent,
+        Status::Failed => theme.colors.danger,
+        Status::Done { .. } => theme.colors.success,
+        _ => theme.colors.text_muted,
+    }
+}
+pub(super) fn row_status(state: &super::AppState, thread: &veyra_engine::domain::Thread) -> Status {
+    if thread.root() == thread.id {
+        state.family_status(thread.id)
+    } else {
+        state.status(thread.id)
+    }
+}
 pub(super) fn ordered_threads(state: &super::AppState) -> Vec<ThreadId> {
     let mut order = vec![];
     for project in state.projects.values() {
@@ -102,11 +117,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
             .filter(|thread| thread.project == project.id)
         {
             let id = thread.id;
-            let status = if thread.root() == thread.id {
-                shell.state.family_status(thread.id)
-            } else {
-                shell.state.status(thread.id)
-            };
+            let quiet = shell.state.quiet_minutes(id);
+            let status = row_status(&shell.state, thread);
             let menu = shell
                 .thread_menu
                 .as_ref()
@@ -143,6 +155,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     .items_center()
                     .h(t.layout.thread_row)
                     .gap(t.space.0[3])
+                    .when(quiet.is_some(), |row| row.v_flex().h_auto().gap_0())
                     .when(nested(&shell.state, thread), |row| {
                         row.ml(t.layout.agent_margin)
                             .pl(t.space.0[3])
@@ -151,50 +164,75 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     })
                     .child(
                         div()
-                            .w(t.layout.status_glyph)
-                            .text_color(match status {
-                                Status::Working { .. } => t.colors.accent,
-                                Status::Failed => t.colors.danger,
-                                Status::Done { .. } => t.colors.success,
-                                _ => t.colors.text_muted,
-                            })
-                            .child(glyph(&status)),
-                    )
-                    .child(
-                        labelled_button(
-                            SharedString::from(format!("thread-{id}")),
-                            thread.title.clone(),
-                            cx,
-                        )
-                        .flex_1()
-                        .min_w_0()
-                        .justify_start()
-                        .child(div().flex_1())
-                        .selected(shell.view.chat() == Some(thread.id))
-                        .tooltip(status.words())
-                        .on_click(move |_, window, cx| {
-                            window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
-                        }),
-                    )
-                    .when_some(shell.state.quiet_minutes(id), |row, minutes| {
-                        row.child(
-                            div()
-                                .text_size(t.text.meta.size)
-                                .text_color(t.colors.text_muted)
-                                .child(format!("Quiet for {minutes} min")),
-                        )
-                    })
-                    .child(
-                        labelled_button(SharedString::from(format!("stop-thread-{id}")), "■", cx)
-                            .w(t.layout.icon_button)
-                            .accessibility_label("Stop thread")
-                            .tooltip("Stop thread")
-                            .on_click(move |_, window, cx| {
-                                window
-                                    .dispatch_action(Box::new(StopThread { thread: Some(id) }), cx)
+                            .h_flex()
+                            .items_center()
+                            .h(t.layout.icon_button)
+                            .flex_1()
+                            .min_w_0()
+                            .gap(t.space.0[3])
+                            .when(quiet.is_some(), |row| row.w_full().gap_0())
+                            .child(
+                                div()
+                                    .w(t.layout.status_glyph)
+                                    .text_color(glyph_color(&status, t))
+                                    .child(glyph(&status)),
+                            )
+                            .child(
+                                labelled_button(
+                                    SharedString::from(format!("thread-{id}")),
+                                    thread.title.clone(),
+                                    cx,
+                                )
+                                .debug_selector(|| "sidebar-thread-title".into())
+                                .flex_1()
+                                .min_w_0()
+                                .justify_start()
+                                .selected(shell.view.chat() == Some(thread.id))
+                                .tooltip(status.words())
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(SelectThread { thread: Some(id) }),
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .when_some(quiet, |row, minutes| {
+                                row.child(
+                                    div()
+                                        .debug_selector(|| "sidebar-quiet".into())
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_size(t.text.meta.size)
+                                        .text_color(t.colors.text_muted)
+                                        .child(format!("Quiet for {minutes} min")),
+                                )
                             }),
                     )
-                    .child(row_menu)
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap(t.space.0[3])
+                            .flex_none()
+                            .when(quiet.is_some(), |row| row.w_full().justify_end())
+                            .child(
+                                labelled_button(
+                                    SharedString::from(format!("stop-thread-{id}")),
+                                    "■",
+                                    cx,
+                                )
+                                .w(t.layout.icon_button)
+                                .accessibility_label("Stop thread")
+                                .tooltip("Stop thread")
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(StopThread { thread: Some(id) }),
+                                        cx,
+                                    )
+                                }),
+                            )
+                            .child(row_menu),
+                    )
                     .into_any_element(),
             );
         }

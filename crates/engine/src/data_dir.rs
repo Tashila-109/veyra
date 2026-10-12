@@ -153,6 +153,7 @@ mod tests {
     #[test]
     fn lock_refuses_second() {
         let path = scratch();
+        let _scratch = crate::tests::Scratch(path.clone());
         let dir = DataDir::at(path.clone()).unwrap();
         let first = dir.lock().unwrap();
         assert!(matches!(dir.lock(), Err(LockError::AlreadyRunning)));
@@ -162,12 +163,12 @@ mod tests {
         );
         drop(first);
         assert!(dir.lock().is_ok());
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn private_folders_and_stale_socket() {
         let path = scratch();
+        let _scratch = crate::tests::Scratch(path.clone());
         let dir = DataDir::at(path.clone()).unwrap();
         for folder in [&path, &path.join("logs"), &path.join("run")] {
             assert!(platform::is_private(folder).unwrap());
@@ -186,6 +187,5 @@ mod tests {
             let (peer, _) = listener.accept().unwrap();
             drop((stream, peer, listener));
         }
-        fs::remove_dir_all(path).unwrap();
     }
 }

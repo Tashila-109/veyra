@@ -399,6 +399,9 @@ pub(super) fn family_children(state: &super::AppState, parent: ThreadId) -> Vec<
         .filter(|thread| thread.id != parent && thread.root() == parent)
         .collect()
 }
+pub(super) fn family_title(count: usize) -> String {
+    format!("Started {count} agent{}", if count == 1 { "" } else { "s" })
+}
 fn family_card(shell: &Shell, parent: ThreadId, cx: &App) -> AnyElement {
     let t = cx.global::<Theme>();
     let children = family_children(&shell.state, parent);
@@ -413,7 +416,7 @@ fn family_card(shell: &Shell, parent: ThreadId, cx: &App) -> AnyElement {
         .border_color(t.colors.border)
         .p(t.space.0[4])
         .gap(t.space.0[3])
-        .child(format!("Started {} agents", children.len()))
+        .child(family_title(children.len()))
         .children(children.into_iter().map(|child| {
             let id = child.id;
             let status = shell.state.status(id);
@@ -424,12 +427,7 @@ fn family_card(shell: &Shell, parent: ThreadId, cx: &App) -> AnyElement {
                 .child(
                     div()
                         .w(t.layout.status_glyph)
-                        .text_color(match status {
-                            Status::Working { .. } => t.colors.accent,
-                            Status::Failed => t.colors.danger,
-                            Status::Done { .. } => t.colors.success,
-                            _ => t.colors.text_muted,
-                        })
+                        .text_color(super::sidebar::glyph_color(&status, t))
                         .child(super::sidebar::glyph(&status)),
                 )
                 .child(div().flex_1().min_w_0().child(child.title.clone()))
@@ -446,22 +444,29 @@ fn family_card(shell: &Shell, parent: ThreadId, cx: &App) -> AnyElement {
                             window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
                         }),
                 )
-                .child(
-                    labelled_button(SharedString::from(format!("child-stop-{id}")), "Stop", cx)
-                        .disabled(child.archived)
-                        .on_click(move |_, window, cx| {
-                            window.dispatch_action(Box::new(StopThread { thread: Some(id) }), cx)
-                        }),
+                .when(
+                    !child.archived && shell.thread_stop_target(id).is_some(),
+                    |row| {
+                        row.child(
+                            labelled_button(
+                                SharedString::from(format!("child-stop-{id}")),
+                                "Stop",
+                                cx,
+                            )
+                            .debug_selector(|| "family-child-stop".into())
+                            .disabled(child.archived)
+                            .on_click(move |_, window, cx| {
+                                window
+                                    .dispatch_action(Box::new(StopThread { thread: Some(id) }), cx)
+                            }),
+                        )
+                    },
                 )
         }))
         .into_any_element()
 }
 fn task_card(state: &super::AppState, task: TaskId, cx: &App) -> AnyElement {
     let t = cx.global::<Theme>();
-    let parent = state
-        .tasks
-        .get(&task)
-        .and_then(|task| state.threads.get(&task.parent));
     div()
         .debug_selector(|| "task-card".into())
         .rounded(t.radius.card)
@@ -469,13 +474,22 @@ fn task_card(state: &super::AppState, task: TaskId, cx: &App) -> AnyElement {
         .border(t.layout.border)
         .border_color(t.colors.border)
         .p(t.space.0[4])
-        .child(format!(
-            "Task from {}",
-            parent
-                .map(|thread| thread.provider.label())
-                .unwrap_or("parent")
-        ))
+        .child(task_card_text(state, task))
         .into_any_element()
+}
+fn task_from(name: &str) -> String {
+    format!("Task from {name}")
+}
+pub(super) fn task_card_text(state: &super::AppState, task: TaskId) -> String {
+    let parent = state
+        .tasks
+        .get(&task)
+        .and_then(|task| state.threads.get(&task.parent));
+    task_from(
+        parent
+            .map(|thread| thread.provider.label())
+            .unwrap_or("parent"),
+    )
 }
 pub(super) fn turn_label(state: &super::AppState, turn: &Turn) -> Option<String> {
     match &turn.origin {
@@ -483,7 +497,7 @@ pub(super) fn turn_label(state: &super::AppState, turn: &Turn) -> Option<String>
             .tasks
             .get(task)
             .and_then(|task| state.threads.get(&task.parent))
-            .map(|parent| format!("Task from {}", parent.title)),
+            .map(|parent| task_from(&parent.title)),
         TurnOrigin::Wake { tasks } => {
             let count = tasks
                 .iter()
@@ -498,14 +512,13 @@ pub(super) fn turn_label(state: &super::AppState, turn: &Turn) -> Option<String>
         TurnOrigin::User { .. } | TurnOrigin::Provider => None,
     }
 }
-pub(super) fn report_delivered(state: &super::AppState, item: &Item, next: Option<&Item>) -> bool {
-    next.is_none()
+pub(super) fn report_delivered(state: &super::AppState, item: &Item) -> bool {
+    matches!(item.body, ItemBody::AssistantText { .. })
         && state
             .tasks
             .values()
-            .filter(|task| task.child == item.thread)
-            .max_by_key(|task| state.turns.get(&task.turn).map_or(0, |turn| turn.ordinal))
-            .is_some_and(|task| {
+            .filter(|task| task.child == item.thread && task.turn == item.turn)
+            .any(|task| {
                 matches!(
                     task.state,
                     TaskState::Settled {
@@ -514,8 +527,25 @@ pub(super) fn report_delivered(state: &super::AppState, item: &Item, next: Optio
                     }
                 )
             })
+        && state.items.get(&item.thread).is_some_and(|items| {
+            items
+                .values()
+                .filter(|row| {
+                    row.turn == item.turn && matches!(row.body, ItemBody::AssistantText { .. })
+                })
+                .max_by_key(|row| row.seq)
+                .is_some_and(|row| row.id == item.id)
+        })
 }
-pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
+pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
+    #[cfg(debug_assertions)]
+    if let Some(open) = &mut shell.state.transcript_open
+        && shell.view.chat() == Some(open.thread)
+        && open.installed
+        && open.milliseconds.is_none()
+    {
+        open.milliseconds = Some(open.requested.elapsed().as_secs_f64() * 1000.);
+    }
     let t = cx.global::<Theme>();
     let thread = shell.view.chat();
     let entity = cx.entity();
@@ -605,14 +635,14 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .child(
                     list(shell.scroller.read(cx).list.clone(), move |index, _, cx| {
                         let shell = entity.read(cx);
-                        let family = thread
-                            .filter(|thread| !family_children(&shell.state, *thread).is_empty());
+                        let offset = thread.map_or(0, |thread| shell.state.family_offset(thread));
+                        let family = thread.filter(|_| offset > 0);
                         if let Some(parent) = family
                             && index == 0
                         {
                             return family_card(shell, parent, cx);
                         }
-                        let index = index - usize::from(family.is_some());
+                        let index = index - offset;
                         thread
                             .and_then(|thread| shell.state.transcript_item(thread, index))
                             .map(|item| {
@@ -653,7 +683,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                             cx,
                                         )
                                     })
-                                    .when(report_delivered(&shell.state, item, next), |row| {
+                                    .when(report_delivered(&shell.state, item), |row| {
                                         row.child(
                                             div()
                                                 .text_size(t.text.meta.size)

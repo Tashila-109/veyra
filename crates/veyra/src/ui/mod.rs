@@ -45,6 +45,52 @@ struct TranscriptOrder {
     ids: Vec<ItemId>,
     positions: BTreeMap<ItemId, usize>,
 }
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct VisiblePerf {
+    thread: Option<ThreadId>,
+    applied_batches: u64,
+    max_batch_gap_ms: f64,
+    last_text_batch: Option<Instant>,
+}
+#[cfg(debug_assertions)]
+impl VisiblePerf {
+    fn apply(&mut self, events: &[UiEvent]) {
+        let Some(thread) = self.thread else {
+            return;
+        };
+        if events.iter().any(|event| {
+            matches!(event,
+            UiEvent::Change { event: ChangeEvent::TurnStarted(turn), .. } if turn.thread == thread)
+        }) {
+            *self = Self {
+                thread: Some(thread),
+                ..Self::default()
+            };
+        }
+        if events.iter().any(|event| {
+            matches!(event,
+            UiEvent::TextAppended { thread: id, .. } if *id == thread)
+        }) {
+            let now = Instant::now();
+            if let Some(last) = self.last_text_batch {
+                self.max_batch_gap_ms = self
+                    .max_batch_gap_ms
+                    .max(now.duration_since(last).as_secs_f64() * 1000.);
+            }
+            self.last_text_batch = Some(now);
+            self.applied_batches += 1;
+        }
+    }
+}
+#[cfg(debug_assertions)]
+struct TranscriptOpen {
+    thread: ThreadId,
+    request: SnapshotRequest,
+    requested: Instant,
+    installed: bool,
+    milliseconds: Option<f64>,
+}
 #[derive(Default)]
 struct AppState {
     projects: BTreeMap<ProjectId, Project>,
@@ -67,6 +113,10 @@ struct AppState {
     max_batch_gap_ms: f64,
     last_text_batch: Option<Instant>,
     last_activity: BTreeMap<ThreadId, Millis>,
+    #[cfg(debug_assertions)]
+    visible_perf: VisiblePerf,
+    #[cfg(debug_assertions)]
+    transcript_open: Option<TranscriptOpen>,
 }
 fn stop_target(
     thread: ThreadId,
@@ -97,6 +147,7 @@ impl AppState {
         #[cfg(debug_assertions)]
         {
             self.max_batch_events = self.max_batch_events.max(events.len());
+            self.visible_perf.apply(&events);
         }
         self.applied_batches += 1;
         if events.iter().any(|event| {
@@ -275,6 +326,16 @@ impl AppState {
     fn begin_snapshot(&mut self, thread: ThreadId) -> SnapshotRequest {
         self.snapshot_sequence += 1;
         let request = SnapshotRequest(self.snapshot_sequence);
+        #[cfg(debug_assertions)]
+        {
+            self.transcript_open = Some(TranscriptOpen {
+                thread,
+                request,
+                requested: Instant::now(),
+                installed: false,
+                milliseconds: None,
+            });
+        }
         let buffered = match self.fences.remove(&thread) {
             Some(Fence::Loading { buffered, .. }) => buffered,
             _ => vec![],
@@ -305,6 +366,13 @@ impl AppState {
     ) -> bool {
         if !self.current_snapshot(thread, request) {
             return false;
+        }
+        #[cfg(debug_assertions)]
+        if let Some(open) = &mut self.transcript_open
+            && open.thread == thread
+            && open.request == request
+        {
+            open.installed = true;
         }
         let buffered = match self.fences.remove(&thread) {
             Some(Fence::Loading { buffered, .. }) => buffered,
@@ -359,16 +427,7 @@ impl AppState {
             (
                 self.turns
                     .get(&item.turn)
-                    .map(|turn| {
-                        (
-                            turn.state == TurnState::Queued,
-                            turn.state.started().unwrap_or(match turn.state {
-                                TurnState::Ended { at, .. } => at,
-                                _ => i64::MAX,
-                            }),
-                            turn.ordinal,
-                        )
-                    })
+                    .map(Turn::recency)
                     .unwrap_or((true, i64::MAX, 0)),
                 item.seq,
             )
@@ -387,17 +446,17 @@ impl AppState {
             .map_or(0, |order| order.ids.len())
     }
     fn transcript_rows(&self, thread: ThreadId) -> usize {
-        self.transcript_len(thread)
-            + usize::from(!transcript::family_children(self, thread).is_empty())
+        self.transcript_len(thread) + self.family_offset(thread)
+    }
+    fn family_offset(&self, thread: ThreadId) -> usize {
+        usize::from(!transcript::family_children(self, thread).is_empty())
     }
     fn transcript_position(&self, thread: ThreadId, item: ItemId) -> Option<usize> {
         self.item_order
             .get(&thread)?
             .positions
             .get(&item)
-            .map(|index| {
-                *index + usize::from(!transcript::family_children(self, thread).is_empty())
-            })
+            .map(|index| *index + self.family_offset(thread))
     }
     fn transcript_item(&self, thread: ThreadId, index: usize) -> Option<&Item> {
         let id = self.item_order.get(&thread)?.ids.get(index)?;
@@ -476,7 +535,7 @@ impl AppState {
             .turns
             .values()
             .filter(|turn| turn.thread == thread && turn.state != TurnState::Queued)
-            .max_by_key(|turn| turn.ordinal)?;
+            .max_by_key(|turn| turn.recency())?;
         if !matches!(
             turn.state,
             TurnState::Ended {
@@ -498,7 +557,7 @@ impl AppState {
         self.turns
             .values()
             .filter(|turn| turn.thread == thread && turn.state != TurnState::Queued)
-            .max_by_key(|turn| turn.ordinal)
+            .max_by_key(|turn| turn.recency())
             .and_then(|turn| match &turn.state {
                 TurnState::Ended {
                     outcome: TurnOutcome::Failed { message },
@@ -547,6 +606,8 @@ pub struct Shell {
     sent_responses: std::rc::Rc<std::cell::RefCell<Vec<(RequestId, Decision)>>>,
     #[cfg(test)]
     sent_interrupts: Vec<StopTarget>,
+    #[cfg(test)]
+    sent_archives: Vec<(ThreadId, bool)>,
     #[cfg(debug_assertions)]
     repaints: u64,
     focus: FocusHandle,
@@ -638,14 +699,14 @@ impl Shell {
                     window.dispatch_action(Box::new(Send), cx);
                 }
             });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             while let Some(first) = events.recv().await {
                 let mut batch = vec![first];
                 while let Ok(event) = events.try_recv() {
                     batch.push(event);
                 }
                 if this
-                    .update(cx, |shell, cx| {
+                    .update_in(cx, |shell, window, cx| {
                         let old_default = shell.state.settings.default_mode;
                         for event in &batch {
                             match event {
@@ -665,20 +726,12 @@ impl Shell {
                             .map(|thread| (thread.root(), shell.state.family_status(thread.root())))
                             .collect();
                         let text_rows = shell.state.text_rows(&batch, shell.view.chat());
-                        let had_family = shell.view.chat().is_some_and(|thread| {
-                            !transcript::family_children(&shell.state, thread).is_empty()
-                        });
+                        let had_family = shell
+                            .view
+                            .chat()
+                            .map_or(0, |thread| shell.state.family_offset(thread));
                         shell.state.apply_all(batch);
-                        if shell.view.chat().is_some_and(|id| {
-                            shell
-                                .state
-                                .threads
-                                .get(&id)
-                                .is_some_and(|thread| thread.archived)
-                        }) {
-                            shell.show(MainView::NewThread);
-                            shell.config.mode = shell.state.settings.default_mode;
-                        }
+                        shell.leave_archived_thread(window, cx);
                         shell.post_banners(&families, cx);
                         shell.start_branch_lookup(cx);
                         if shell.project.is_none() {
@@ -694,11 +747,12 @@ impl Shell {
                             .chat()
                             .map(|thread| shell.state.transcript_rows(thread))
                             .unwrap_or_default();
-                        let has_family = shell.view.chat().is_some_and(|thread| {
-                            !transcript::family_children(&shell.state, thread).is_empty()
-                        });
+                        let has_family = shell
+                            .view
+                            .chat()
+                            .map_or(0, |thread| shell.state.family_offset(thread));
                         shell.scroller.update(cx, |state, cx| {
-                            if has_family && !had_family {
+                            if has_family > had_family {
                                 state.prepend(cx);
                             }
                             if count > state.item_count() {
@@ -756,6 +810,8 @@ impl Shell {
             sent_responses: Default::default(),
             #[cfg(test)]
             sent_interrupts: Vec::new(),
+            #[cfg(test)]
+            sent_archives: Vec::new(),
             sidebar_width: cx.global::<Theme>().layout.sidebar_default,
             resizing: false,
             notice: None,
@@ -871,6 +927,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if let Some(thread) = thread.or_else(|| self.view.chat()) {
+            if keep_children && !sidebar::can_keep_children(&self.state, thread) {
+                return;
+            }
             self.thread_menu = None;
             self.send_command(
                 Command::ArchiveThread {
@@ -889,6 +948,14 @@ impl Shell {
         cx.notify();
     }
     fn send_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if let Command::ArchiveThread {
+            thread,
+            keep_children,
+        } = &command
+        {
+            self.sent_archives.push((*thread, *keep_children));
+        }
         #[cfg(test)]
         if let Command::Respond { request, decision } = &command {
             self.sent_responses
@@ -925,15 +992,7 @@ impl Shell {
                     cx.notify();
                 }
                 Ok(Ok(Ack::Applied)) => {
-                    if shell.view.chat().is_some_and(|id| {
-                        shell
-                            .state
-                            .threads
-                            .get(&id)
-                            .is_some_and(|thread| thread.archived)
-                    }) {
-                        shell.new_thread(window, cx);
-                    }
+                    shell.leave_archived_thread(window, cx);
                     shell.notice = None;
                     cx.notify();
                 }
@@ -948,6 +1007,13 @@ impl Shell {
         self.branch.clear();
     }
     fn show(&mut self, view: MainView) {
+        #[cfg(debug_assertions)]
+        if self.view.chat() != view.chat() {
+            self.state.visible_perf = VisiblePerf {
+                thread: view.chat(),
+                ..VisiblePerf::default()
+            };
+        }
         if matches!(view, MainView::Settings { .. }) {
             self.branch.clear();
         } else {
@@ -1180,6 +1246,9 @@ impl Shell {
     }
     fn stop_target(&self) -> Option<StopTarget> {
         let thread = self.view.chat()?;
+        self.thread_stop_target(thread)
+    }
+    fn thread_stop_target(&self, thread: ThreadId) -> Option<StopTarget> {
         stop_target(
             thread,
             &self.state.turns,
@@ -1426,6 +1495,16 @@ impl Shell {
         });
         cx.notify();
     }
+    fn leave_archived_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view.chat().is_some_and(|id| {
+            self.state
+                .threads
+                .get(&id)
+                .is_some_and(|thread| thread.archived)
+        }) {
+            self.new_thread(window, cx);
+        }
+    }
     fn add_project(&mut self, action: &AddProject, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = &action.path {
             self.send_command(Command::AddProject { path: path.into() }, window, cx);
@@ -1519,7 +1598,7 @@ impl Shell {
                     "kind":"thread", "id":thread.id, "title":thread.title,
                     "status":self.state.status(thread.id).words(),
                     "archived":thread.archived, "mode":thread.config.mode, "lineage":thread.lineage,
-                    "row_status":if thread.root()==thread.id {self.state.family_status(thread.id)} else {self.state.status(thread.id)}.words(),
+                    "row_status":sidebar::row_status(&self.state,thread).words(),
                     "depth":usize::from(sidebar::nested(&self.state,thread)),
                     "quiet_minutes":self.state.quiet_minutes(thread.id),
                     "archive_keep_children":sidebar::can_keep_children(&self.state,thread.id)
@@ -1542,7 +1621,7 @@ impl Shell {
                     "status":status.words(), "header_status":self.state.header_status(thread.id),
                     "quiet_minutes":self.state.quiet_minutes(thread.id),
                     "breadcrumb":self.state.parent(thread.id).map(|parent| serde_json::json!({"thread":parent.id,"title":parent.title,"linked":!parent.archived})),
-                    "parent_attention":self.state.parent(thread.id).filter(|parent| self.state.status(parent.id)==Status::NeedsYou).map(|parent|format!("{} needs you",parent.provider.label())),
+                    "parent_attention":header::parent_attention(&self.state,thread.id),
                     "failure":self.state.failure(thread.id), "hold":thread.hold,
                     "wait_reason":self.engine.window_threads().get(&thread.id)
                         .and_then(|state| state.wait_reason).map(|reason| reason.to_string())
@@ -1587,20 +1666,10 @@ impl Shell {
                     .filter(|_| first)
                     .and_then(|turn| transcript::turn_label(&self.state, turn))
                     .into();
-                row["report_delivered"] =
-                    transcript::report_delivered(&self.state, item, items.get(index + 1)).into();
+                row["report_delivered"] = transcript::report_delivered(&self.state, item).into();
                 if let ItemBody::TaskCard(task) = item.body {
                     row["kind"] = "task_card".into();
-                    row["text"] = format!(
-                        "Task from {}",
-                        self.state
-                            .tasks
-                            .get(&task)
-                            .and_then(|task| self.state.threads.get(&task.parent))
-                            .map(|parent| parent.provider.label())
-                            .unwrap_or("parent")
-                    )
-                    .into();
+                    row["text"] = transcript::task_card_text(&self.state, task).into();
                 }
                 row["outcome"] =
                     transcript::row_outcome(item, items.get(index + 1), &self.state.turns).into();
@@ -1662,11 +1731,12 @@ impl Shell {
         let perf = self.engine.perf();
         let mut transcript = self.scroller.read(cx).dump();
         transcript["items"] = serde_json::json!(self.dump_transcript());
-        transcript["family_card"] = self.view.chat().filter(|thread|!transcript::family_children(&self.state,*thread).is_empty())
-            .map(|thread|serde_json::json!({"title":format!("Started {} agents",transcript::family_children(&self.state,thread).len()),
+        transcript["family_card"] = self.view.chat().filter(|thread|self.state.family_offset(*thread)>0)
+            .map(|thread|serde_json::json!({"title":transcript::family_title(transcript::family_children(&self.state,thread).len()),
                 "rows":transcript::family_children(&self.state,thread).into_iter().map(|child|serde_json::json!({
                     "thread":child.id,"title":child.title,"glyph":sidebar::glyph(&self.state.status(child.id)),
-                    "status":self.state.status(child.id).words(),"open_action":"veyra::SelectThread","stop_action":"veyra::StopThread"
+                    "status":self.state.status(child.id).words(),"open_action":"veyra::SelectThread",
+                    "stop_action":(!child.archived && self.thread_stop_target(child.id).is_some()).then_some("veyra::StopThread")
                 })).collect::<Vec<_>>()})).into();
         serde_json::json!({
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
@@ -1678,6 +1748,9 @@ impl Shell {
             "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
             "awake":self.engine.awake(), "processes":self.engine.processes(),
             "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.max_batch_gap_ms,
+                "visible":{"thread":self.state.visible_perf.thread,"applied_batches":self.state.visible_perf.applied_batches,
+                    "max_batch_gap_ms":self.state.visible_perf.max_batch_gap_ms},
+                "transcript_open_ms":self.state.transcript_open.as_ref().and_then(|open|open.milliseconds),
                 "mailbox_free":perf.mailbox_free,
                 "commits":perf.commits, "actor_max_ms":perf.actor_max_ms, "actor_busy_ms":perf.actor_busy_ms,
                 "repaints":self.repaints, "max_batch_events":self.state.max_batch_events},
@@ -1714,7 +1787,6 @@ impl Render for Shell {
         let dock_request = dock_target.map(|target| target.request);
         let dock_question = dock_target.map(|target| target.question);
         self.rendered_stop = self.stop_target();
-        let stop_target = self.rendered_stop;
         let root = div()
             .h_flex()
             .size_full()
@@ -1731,8 +1803,8 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
             .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
-            .on_action(cx.listener(move |shell, action: &Stop, window, cx| {
-                shell.stop(action.target.or(stop_target), window, cx)
+            .on_action(cx.listener(|shell, action: &Stop, window, cx| {
+                shell.stop(action.target.or(shell.rendered_stop), window, cx)
             }))
             .on_action(cx.listener(|shell, _: &Continue, window, cx| {
                 shell.continue_queue(false, window, cx)
@@ -2400,12 +2472,6 @@ mod tests {
             shell.update_in(cx, |shell, window, cx| {
                 shell.state.turns.clear();
                 assert!(shell.stop_target().is_none());
-                assert_eq!(
-                    shell
-                        .shown_stop(cx)
-                        .map(|target| (target.thread, target.turn)),
-                    Some((target.thread, target.turn))
-                );
                 for (draft, expected) in [("", true), ("draft", false), (" \n", true)] {
                     shell
                         .input
@@ -2423,6 +2489,513 @@ mod tests {
                     .map(|target| (target.thread, target.turn))),
                 Some((target.thread, target.turn))
             );
+        });
+    }
+
+    fn text_batch(thread: ThreadId) -> Vec<UiEvent> {
+        vec![UiEvent::TextAppended {
+            thread,
+            item: ItemId::new(),
+            text: "text".into(),
+            counter: 1,
+            #[cfg(debug_assertions)]
+            delta_count: 1,
+        }]
+    }
+
+    fn add_family(
+        shell: &mut super::Shell,
+        cx: &mut Context<super::Shell>,
+    ) -> (ThreadId, ThreadId, TurnId) {
+        let root = shell.view.chat().unwrap();
+        let project = ProjectId::new();
+        shell.state.projects.insert(
+            project,
+            Project {
+                id: project,
+                path: "/tmp".into(),
+                name: "Project".into(),
+            },
+        );
+        let parent = Thread {
+            id: root,
+            project,
+            title: "Root title".into(),
+            lineage: Lineage::Root,
+            provider: ProviderKind::Claude,
+            config: shell.config.clone(),
+            cwd: "/tmp".into(),
+            native: None,
+            native_cursor: None,
+            cli_version: None,
+            hold: None,
+            view: View::Chat,
+            import_pending: false,
+            archived: false,
+        };
+        shell.state.threads.insert(root, parent.clone());
+        let child = ThreadId::new();
+        shell.state.threads.insert(
+            child,
+            Thread {
+                id: child,
+                title: "File reporter".into(),
+                lineage: Lineage::Child {
+                    parent: root,
+                    root,
+                    relationship: Relationship::Subagent,
+                },
+                ..parent
+            },
+        );
+        let turn = TurnId::new();
+        shell.state.turns.insert(
+            turn,
+            Turn {
+                id: turn,
+                thread: child,
+                ordinal: 1,
+                origin: TurnOrigin::Provider,
+                state: TurnState::Running { since: 1 },
+            },
+        );
+        shell
+            .state
+            .statuses
+            .insert(child, Status::Working { since: 1 });
+        shell.state.requests.clear();
+        shell.scroller.update(cx, |state, cx| {
+            state.reset(shell.state.transcript_rows(root), cx)
+        });
+        cx.notify();
+        (root, child, turn)
+    }
+
+    #[gpui::test]
+    fn quiet_row_retains_title_and_untruncated_hint(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| super::theme::register_fonts(cx).unwrap());
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (_, child, _) = shell.update(cx, |shell, cx| {
+                let family = add_family(shell, cx);
+                shell
+                    .state
+                    .last_activity
+                    .insert(family.1, veyra_engine::actor::now() - 600_000);
+                shell.sidebar_width = cx.global::<super::Theme>().layout.sidebar_default;
+                family
+            });
+            draw(cx);
+            let layout = cx.update(|_, cx| cx.global::<super::Theme>().layout.clone());
+            for width in [layout.sidebar_default, layout.sidebar_min] {
+                shell.update(cx, |shell, cx| {
+                    shell.sidebar_width = width;
+                    cx.notify();
+                });
+                draw(cx);
+                let title = cx.debug_bounds("sidebar-thread-title").unwrap();
+                let hint = cx.debug_bounds("sidebar-quiet").unwrap();
+                assert!(
+                    title.size.width >= layout.small_icon_button,
+                    "title vanished at sidebar width {width}: {title:?}; hint {hint:?}"
+                );
+                assert!(
+                    hint.size.width >= layout.status_glyph * 6.,
+                    "quiet hint shrank: {hint:?}"
+                );
+                assert!(hint.right() <= width, "hint left sidebar: {hint:?}");
+            }
+            shell.update(cx, |shell, cx| {
+                shell.show(super::MainView::Chat(child));
+                cx.notify();
+            });
+            draw(cx);
+            assert!(cx.debug_bounds("header-title").unwrap().size.width > layout.small_icon_button);
+            assert!(
+                cx.debug_bounds("header-status").unwrap().size.width > layout.status_glyph * 10.
+            );
+            assert!(
+                shell
+                    .read_with(cx, |shell, _| shell.state.header_status(child))
+                    .contains("Working")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn family_card_stop_tracks_the_shared_turn_target(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (_, child, turn) = shell.update(cx, add_family);
+            draw(cx);
+            assert!(cx.debug_bounds("family-child-stop").is_some());
+            for outcome in [
+                TurnOutcome::Completed,
+                TurnOutcome::Interrupted {
+                    reason: "Stopped by you".into(),
+                },
+            ] {
+                shell.update(cx, |shell, cx| {
+                    shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
+                        started: Some(1),
+                        at: 2,
+                        outcome,
+                    };
+                    cx.notify();
+                });
+                draw(cx);
+                assert!(
+                    cx.debug_bounds("family-child-stop").is_none(),
+                    "ended child still shows Stop"
+                );
+                assert!(shell.read_with(cx, |shell, cx| {
+                    shell.dump(std::path::Path::new("/tmp"), cx)
+                        ["transcript"]["family_card"]["rows"][0]["stop_action"]
+                        .is_null()
+                }));
+            }
+            shell.update(cx, |shell, cx| {
+                shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Running { since: 3 };
+                shell.state.threads.get_mut(&child).unwrap().archived = true;
+                cx.notify();
+            });
+            draw(cx);
+            assert!(cx.debug_bounds("family-child-stop").is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn family_card_uses_singular_and_plural_agent_labels(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (_, child, _) = add_family(shell, cx);
+                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["transcript"]["family_card"]["title"], "Started 1 agent");
+                let mut second = shell.state.threads[&child].clone();
+                second.id = ThreadId::new();
+                shell.state.threads.insert(second.id, second);
+                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["transcript"]["family_card"]["title"], "Started 2 agents");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn failed_admitted_prompt_keeps_its_cause_and_retry(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (_, child, turn) = add_family(shell, cx);
+                let item = ItemId::new();
+                shell.state.turns.get_mut(&turn).unwrap().origin = TurnOrigin::User { item };
+                shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
+                    started: Some(300),
+                    at: 400,
+                    outcome: TurnOutcome::Failed {
+                        message: "admitted prompt failed".into(),
+                    },
+                };
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemAdded(Item {
+                        id: item,
+                        thread: child,
+                        turn,
+                        seq: 0,
+                        body: ItemBody::UserText("Retry this prompt".into()),
+                    }),
+                });
+                let earlier = Turn {
+                    id: TurnId::new(),
+                    thread: child,
+                    ordinal: 2,
+                    origin: TurnOrigin::Provider,
+                    state: TurnState::Ended {
+                        started: Some(100),
+                        at: 200,
+                        outcome: TurnOutcome::Completed,
+                    },
+                };
+                shell.state.turns.insert(earlier.id, earlier);
+                shell.show(super::MainView::Chat(child));
+                assert_eq!(shell.state.failure(child), Some("admitted prompt failed"));
+                assert_eq!(
+                    shell.state.retry_prompt(child),
+                    Some("Retry this prompt".into())
+                );
+                assert_eq!(shell.view_name(), "failed_thread");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn archive_keep_children_key_acts_only_on_an_eligible_root(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, child, _) = shell.update(cx, add_family);
+            draw(cx);
+            cx.simulate_keystrokes("secondary-alt-shift-a");
+            cx.run_until_parked();
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_archives.clone()),
+                [(root, true)]
+            );
+            shell.update(cx, |shell, cx| {
+                shell.show(super::MainView::Chat(child));
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-alt-shift-a");
+            cx.run_until_parked();
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_archives.clone()),
+                [(root, true)]
+            );
+            shell.update(cx, |shell, cx| {
+                shell.state.threads.get_mut(&child).unwrap().archived = true;
+                shell.show(super::MainView::Chat(root));
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-alt-shift-a");
+            cx.run_until_parked();
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_archives.clone()),
+                [(root, true)]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn archived_selection_resets_draft_mode_picker_and_branch(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, events| {
+            let root = shell.update_in(cx, |shell, window, cx| {
+                let (root, _, _) = add_family(shell, cx);
+                shell.state.settings.default_mode = PermissionMode::AskFirst;
+                shell.config.mode = PermissionMode::FullAccess;
+                shell.branch = "selected-branch".into();
+                shell.notice = Some("selected notice".into());
+                shell.input.update(cx, |input, cx| {
+                    input.set_value("selected draft", window, cx)
+                });
+                shell.set_provider_picker(true, window, cx);
+                root
+            });
+            events
+                .send(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ThreadArchived { thread: root },
+                })
+                .unwrap();
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, cx| {
+                assert!(matches!(shell.view, super::MainView::NewThread));
+                assert_eq!(shell.config.mode, PermissionMode::AskFirst);
+                assert_eq!(shell.input.read(cx).value().as_ref(), "");
+                assert!(shell.provider_picker.is_none());
+                assert!(shell.branch.is_empty());
+                assert!(shell.notice.is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn delivered_report_stays_on_its_task_after_later_user_work(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (parent, child, turn) = add_family(shell, cx);
+                let task = TaskId::new();
+                shell.state.tasks.insert(
+                    task,
+                    veyra_engine::domain::Task {
+                        id: task,
+                        parent,
+                        child,
+                        turn,
+                        request_key: "start_thread:report".into(),
+                        state: TaskState::Settled {
+                            outcome: TurnOutcome::Completed,
+                            summary: "delivered report".into(),
+                            delivery: Delivery::Delivered {
+                                wake: TurnId::new(),
+                            },
+                        },
+                    },
+                );
+                let report = Item {
+                    id: ItemId::new(),
+                    thread: child,
+                    turn,
+                    seq: 1,
+                    body: ItemBody::AssistantText {
+                        text: "delivered report".into(),
+                        done: true,
+                    },
+                };
+                let user_turn = TurnId::new();
+                shell.state.turns.insert(
+                    user_turn,
+                    Turn {
+                        id: user_turn,
+                        thread: child,
+                        ordinal: 2,
+                        origin: TurnOrigin::User {
+                            item: ItemId::new(),
+                        },
+                        state: TurnState::Running { since: 2 },
+                    },
+                );
+                let later = Item {
+                    id: ItemId::new(),
+                    thread: child,
+                    turn: user_turn,
+                    seq: 2,
+                    body: ItemBody::AssistantText {
+                        text: "later user reply".into(),
+                        done: true,
+                    },
+                };
+                for item in [&report, &later] {
+                    shell.state.apply(UiEvent::Change {
+                        counter: None,
+                        event: ChangeEvent::ItemAdded(item.clone()),
+                    });
+                }
+                shell.show(super::MainView::Chat(child));
+                let rows = shell.dump_transcript();
+                assert_eq!(rows[0]["report_delivered"], true);
+                assert_eq!(rows[1]["report_delivered"], false);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn visible_perf_counts_only_selected_text_and_resets(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let thread = shell.view.chat().unwrap();
+                let other = ThreadId::new();
+                shell.show(super::MainView::NewThread);
+                shell.show(super::MainView::Chat(thread));
+                shell.state.apply_all(text_batch(other));
+                shell.state.apply_all(text_batch(thread));
+                let dump = shell.dump(std::path::Path::new("/tmp"), cx);
+                assert_eq!(dump["perf"]["visible"]["thread"], serde_json::json!(thread));
+                assert_eq!(dump["perf"]["visible"]["applied_batches"], 1);
+                let running = shell.state.turns.values().next().unwrap().clone();
+                shell.state.apply_all(vec![UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::TurnStarted(Turn { thread: other, ..running.clone() }),
+                }]);
+                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"]["applied_batches"], 1);
+                shell.state.apply_all(vec![UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::TurnStarted(running),
+                }]);
+                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"]["applied_batches"], 0);
+                shell.state.apply_all(text_batch(thread));
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                shell.state.apply_all(text_batch(thread));
+                assert!(shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"]["max_batch_gap_ms"].as_f64().unwrap() >= 100.);
+                shell.show(super::MainView::Chat(other));
+                let visible = &shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"];
+                assert_eq!(visible["thread"], serde_json::json!(other));
+                assert_eq!(visible["applied_batches"], 0);
+                assert_eq!(visible["max_batch_gap_ms"], 0.);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn visible_perf_sees_a_pause_despite_hidden_text(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let thread = shell.update(cx, |shell, _| {
+                let thread = shell.view.chat().unwrap();
+                shell.show(super::MainView::NewThread);
+                shell.show(super::MainView::Chat(thread));
+                shell.state.apply_all(text_batch(thread));
+                thread
+            });
+            let hidden = ThreadId::new();
+            for _ in 0..6 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                shell.update(cx, |shell, _| shell.state.apply_all(text_batch(hidden)));
+            }
+            shell.update(cx, |shell, cx| {
+                shell.state.apply_all(text_batch(thread));
+                let dump = shell.dump(std::path::Path::new("/tmp"), cx);
+                assert_eq!(dump["perf"]["visible"]["applied_batches"], 2);
+                assert!(dump["perf"]["visible"]["max_batch_gap_ms"].as_f64().unwrap() >= 100.);
+                let running = shell.state.turns.values().next().unwrap().clone();
+                shell.state.apply_all(vec![UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::TurnStarted(running),
+                }]);
+                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"]["max_batch_gap_ms"], 0.);
+                shell.state.apply_all(text_batch(thread));
+                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"]["max_batch_gap_ms"], 0.);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn transcript_open_perf_stamps_first_installed_render_and_replaces(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let empty = || ThreadSnapshot {
+                items: vec![],
+                buffered_text: BTreeMap::new(),
+                counter: 1,
+                #[cfg(debug_assertions)]
+                delta_counts: BTreeMap::new(),
+            };
+            let (thread, request) = shell.update(cx, |shell, cx| {
+                assert!(
+                    shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["transcript_open_ms"]
+                        .is_null()
+                );
+                let thread = shell.view.chat().unwrap();
+                (thread, shell.state.begin_snapshot(thread))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            draw(cx);
+            shell.update(cx, |shell, cx| {
+                assert!(
+                    shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["transcript_open_ms"]
+                        .is_null()
+                );
+                assert!(shell.state.finish_snapshot(thread, request, empty()));
+                assert!(
+                    shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["transcript_open_ms"]
+                        .is_null()
+                );
+                cx.notify();
+            });
+            draw(cx);
+            let first = shell.read_with(cx, |shell, cx| {
+                shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["transcript_open_ms"]
+                    .as_f64()
+                    .unwrap()
+            });
+            assert!(first >= 100.);
+            draw(cx);
+            shell.update(cx, |shell, cx| {
+                assert_eq!(
+                    shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["transcript_open_ms"],
+                    first
+                );
+                let old = shell.state.begin_snapshot(thread);
+                let current = shell.state.begin_snapshot(thread);
+                assert!(!shell.state.finish_snapshot(thread, old, empty()));
+                assert!(shell.state.finish_snapshot(thread, current, empty()));
+                assert!(
+                    shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["transcript_open_ms"]
+                        .is_null()
+                );
+                cx.notify();
+            });
+            draw(cx);
+            let second = shell.read_with(cx, |shell, cx| {
+                shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["transcript_open_ms"]
+                    .as_f64()
+                    .unwrap()
+            });
+            assert_ne!(second, first);
         });
     }
 
@@ -3827,9 +4400,6 @@ mod tests {
                 event: ChangeEvent::ItemAdded(item.clone()),
             });
         }
-        assert_eq!(state.markdown_text[&assistant.id].as_ref(), "Reply ▏");
-        assert_eq!(state.markdown_text[&reasoning.id].as_ref(), "Thinking");
-        assert_eq!(state.markdown_text[&elsewhere.id].as_ref(), "Reply ▏");
         let text = |thread, item| UiEvent::TextAppended {
             thread,
             item,
@@ -4032,18 +4602,18 @@ mod tests {
         let later_reply = Item {
             id: ItemId::new(),
             thread: child,
-            turn: TurnId::new(),
+            turn: task_turn,
             seq: 3,
             body: ItemBody::AssistantText {
                 text: "report".into(),
                 done: true,
             },
         };
-        assert!(!super::transcript::report_delivered(
-            &state,
-            &later_reply,
-            None
-        ));
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ItemAdded(later_reply.clone()),
+        });
+        assert!(!super::transcript::report_delivered(&state, &later_reply));
         task.state = TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "report".into(),
@@ -4053,16 +4623,7 @@ mod tests {
             counter: None,
             event: ChangeEvent::TaskDelivered(task),
         });
-        assert!(super::transcript::report_delivered(
-            &state,
-            &later_reply,
-            None
-        ));
-        assert!(!super::transcript::report_delivered(
-            &state,
-            &later_reply,
-            Some(&later_reply)
-        ));
+        assert!(super::transcript::report_delivered(&state, &later_reply));
         let mut followup = state.tasks.values().next().unwrap().clone();
         followup.id = TaskId::new();
         followup.turn = TurnId::new();
@@ -4089,11 +4650,7 @@ mod tests {
             counter: None,
             event: ChangeEvent::TaskSettled(followup.clone()),
         });
-        assert!(!super::transcript::report_delivered(
-            &state,
-            &later_reply,
-            None
-        ));
+        assert!(super::transcript::report_delivered(&state, &later_reply));
         report.origin = TurnOrigin::Wake {
             tasks: state.tasks.keys().copied().collect(),
         };
@@ -4110,11 +4667,7 @@ mod tests {
             counter: None,
             event: ChangeEvent::TaskDelivered(followup),
         });
-        assert!(super::transcript::report_delivered(
-            &state,
-            &later_reply,
-            None
-        ));
+        assert!(super::transcript::report_delivered(&state, &later_reply));
         state.apply(UiEvent::Change {
             counter: None,
             event: ChangeEvent::ThreadArchived { thread: root },
@@ -4266,6 +4819,27 @@ mod tests {
                 done: false,
             },
         };
+        for item in [&old, &growing] {
+            state.apply(UiEvent::Change {
+                counter: None,
+                event: ChangeEvent::ItemAdded(item.clone()),
+            });
+        }
+        let reasoning = Item {
+            id: ItemId::new(),
+            seq: 2,
+            body: ItemBody::Reasoning {
+                text: "Thinking".into(),
+                done: false,
+            },
+            ..growing.clone()
+        };
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ItemAdded(reasoning.clone()),
+        });
+        assert_eq!(state.markdown_text[&growing.id].as_ref(), "New ▏");
+        assert_eq!(state.markdown_text[&reasoning.id].as_ref(), "Thinking");
         let request = state.begin_snapshot(thread);
         assert!(state.finish_snapshot(
             thread,
@@ -4281,7 +4855,6 @@ mod tests {
         assert_eq!(state.transcript_len(thread), 2);
         assert_eq!(state.transcript_item(thread, 0), Some(&old));
         assert_eq!(state.item_order[&thread].positions[&growing.id], 1);
-        assert_eq!(state.markdown_text[&growing.id].as_ref(), "New ▏");
         state.apply(UiEvent::TextAppended {
             thread,
             item: growing.id,

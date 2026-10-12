@@ -60,6 +60,12 @@ pub(super) fn cadence_due(statuses: &BTreeMap<ThreadId, Status>) -> bool {
         .values()
         .any(|status| matches!(status, Status::Working { .. }))
 }
+pub(super) fn parent_attention(state: &super::AppState, thread: ThreadId) -> Option<String> {
+    state
+        .parent(thread)
+        .filter(|parent| state.status(parent.id) == Status::NeedsYou)
+        .map(|parent| format!("{} needs you", parent.provider.label()))
+}
 pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let title = match shell.view {
@@ -80,9 +86,10 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
         .view
         .chat()
         .and_then(|thread| shell.state.parent(thread));
-    let attention = parent
-        .filter(|parent| shell.state.status(parent.id) == Status::NeedsYou)
-        .map(|parent| format!("{} needs you", parent.provider.label()));
+    let attention = shell
+        .view
+        .chat()
+        .and_then(|thread| parent_attention(&shell.state, thread));
     let project = shell
         .view
         .chat()
@@ -127,7 +134,13 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                     .child("/"),
             )
         })
-        .child(div().overflow_hidden().child(title))
+        .child(
+            div()
+                .debug_selector(|| "header-title".into())
+                .min_w_0()
+                .truncate()
+                .child(title),
+        )
         .when_some(attention, |header, attention| {
             header.child(
                 div()
@@ -139,6 +152,9 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
         .when_some(text, |this, text| {
             this.child(
                 div()
+                    .debug_selector(|| "header-status".into())
+                    .flex_none()
+                    .whitespace_nowrap()
                     .text_size(t.text.meta.size)
                     .text_color(t.colors.text_muted)
                     .child(text),

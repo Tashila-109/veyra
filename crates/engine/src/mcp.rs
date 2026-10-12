@@ -18,6 +18,23 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
 };
 
+fn remove_stale_configs(data: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(data.join("run")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok()
+        {
+            platform::remove_optional_file(&entry.path().join("mcp.json"))?;
+        }
+    }
+    Ok(())
+}
+
 pub struct McpToken(String);
 impl McpToken {
     pub fn new() -> Self {
@@ -117,7 +134,7 @@ impl Server {
         if !platform::is_private(data)? {
             return Err(std::io::Error::other("MCP data folder must be mode 0700"));
         }
-        platform::remove_stale_mcp_configs(data)?;
+        remove_stale_configs(data)?;
         let server = Self {
             socket: data.join("veyra.sock"),
             command: command.canonicalize()?,
@@ -222,8 +239,17 @@ impl Server {
                 pending.pid.wait_for(|pid| pid.is_some()),
             )
             .await;
-            if !matches!(registered, Ok(Ok(_))) {
-                return;
+            match registered {
+                Ok(Ok(_)) => {}
+                failed => {
+                    let reason = if failed.is_err() {
+                        "registration timeout"
+                    } else {
+                        "closed registration"
+                    };
+                    tracing::warn!(thread=%pending.thread, reason, "MCP connection refused");
+                    return;
+                }
             }
         }
         let credential = {
@@ -428,6 +454,93 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Clone, Default)]
+    struct Refusals(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+    impl tracing::Subscriber for Refusals {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().into(), value.into());
+                }
+            }
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+    async fn registration_failure(closed: bool) {
+        use tracing::instrument::WithSubscriber;
+        let server = Server {
+            socket: PathBuf::new(),
+            command: PathBuf::new(),
+            credentials: Default::default(),
+        };
+        let thread = ThreadId::new();
+        let token = McpToken::new();
+        let (registration, pid) = watch::channel(None);
+        server.credentials.lock().unwrap().insert(
+            token.hash(),
+            Credential {
+                thread,
+                epoch: 1,
+                pid,
+                used: false,
+            },
+        );
+        let registration = (!closed).then_some(registration);
+        let (socket, mut client) = platform::Socket::pair().unwrap();
+        client
+            .write_all(format!("{}\n", token.0).as_bytes())
+            .await
+            .unwrap();
+        let (out, _messages) = mpsc::channel(1);
+        let logs = Refusals::default();
+        server
+            .connection(socket, out)
+            .with_subscriber(logs.clone())
+            .await;
+        let reason = if closed {
+            "closed registration"
+        } else {
+            "registration timeout"
+        };
+        let events = logs.0.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event
+                .get("message")
+                .is_some_and(|text| text == "MCP connection refused")
+                && event.get("thread") == Some(&thread.to_string())
+                && event.get("reason") == Some(&reason.to_owned())),
+            "missing refusal for {reason}: {events:?}"
+        );
+        drop(registration);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn pending_registration_timeout_logs_thread_and_reason() {
+        registration_failure(false).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn closed_registration_logs_thread_and_reason() {
+        registration_failure(true).await;
+    }
     #[test]
     fn revoked_or_replaced_session_cannot_authorize_a_queued_call() {
         let server = Server {
