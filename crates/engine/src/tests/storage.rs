@@ -189,7 +189,7 @@ fn spawn_failure_survives_full_actor_mailbox() {
     assert!(hold_seen);
 }
 #[test]
-fn full_actor_queue_refuses_commands_and_read_requests() {
+fn full_actor_queue_refuses_read_requests() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (sender, _receiver) = mpsc::channel(1);
     sender.try_send(EngineMsg::Tick).unwrap();
@@ -202,15 +202,6 @@ fn full_actor_queue_refuses_commands_and_read_requests() {
             groups: Default::default(),
         }),
     };
-    assert!(matches!(
-        engine
-            .send(Command::SetDefaultMode {
-                mode: PermissionMode::AskFirst
-            })
-            .blocking_recv()
-            .unwrap(),
-        Err(CommandError::QueueFull)
-    ));
     assert!(matches!(
         engine.subscribe().try_recv(),
         Err(mpsc::error::TryRecvError::Disconnected)
@@ -235,11 +226,10 @@ fn closed_actor_queue_reports_closed_instead_of_full() {
         }),
     };
     assert!(matches!(
-        engine
-            .send(Command::SetDefaultMode {
+        runtime
+            .block_on(engine.send(Command::SetDefaultMode {
                 mode: PermissionMode::AskFirst
-            })
-            .blocking_recv()
+            }))
             .unwrap(),
         Err(CommandError::Closed)
     ));
@@ -671,4 +661,109 @@ fn storage_failure_stops_session_before_provider_turn_is_registered() {
             } }] if reason == StopReason::StorageBlocked.text()
         )
     );
+}
+
+#[test]
+fn send_waits_when_mailbox_full() {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let runtime = Runtime::new().unwrap();
+    let (sender, mut receiver) = mpsc::channel(1);
+    sender.try_send(EngineMsg::Tick).unwrap();
+    let engine = crate::Engine {
+        inner: std::sync::Arc::new(crate::EngineInner {
+            sender,
+            schema_version: 2,
+            state: Default::default(),
+            runtime: runtime.handle().clone(),
+            groups: Default::default(),
+        }),
+    };
+    #[cfg(debug_assertions)]
+    assert_eq!(engine.perf().mailbox_free, 0);
+    let mut send = std::pin::pin!(engine.send(Command::SetDefaultMode {
+        mode: PermissionMode::AskFirst,
+    }));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(send.as_mut().poll(&mut cx).is_pending());
+    assert!(matches!(receiver.try_recv().unwrap(), EngineMsg::Tick));
+    assert!(send.as_mut().poll(&mut cx).is_pending());
+    let EngineMsg::Command { command, reply } = receiver.try_recv().unwrap() else {
+        panic!("command missing after mailbox space opened");
+    };
+    assert!(matches!(
+        command,
+        Command::SetDefaultMode {
+            mode: PermissionMode::AskFirst
+        }
+    ));
+    reply.send(Ok(Ack::Applied)).unwrap();
+    assert!(matches!(
+        send.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(Ok(Ack::Applied)))
+    ));
+}
+
+#[test]
+fn waiting_commands_reach_actor_in_send_order() {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+    let runtime = Runtime::new().unwrap();
+    let (sender, mut receiver) = mpsc::channel(1);
+    sender.try_send(EngineMsg::Tick).unwrap();
+    let engine = crate::Engine {
+        inner: std::sync::Arc::new(crate::EngineInner {
+            sender,
+            schema_version: 2,
+            state: Default::default(),
+            runtime: runtime.handle().clone(),
+            groups: Default::default(),
+        }),
+    };
+    let mut first = std::pin::pin!(engine.send(Command::SetDefaultMode {
+        mode: PermissionMode::AskFirst,
+    }));
+    let mut second = std::pin::pin!(engine.send(Command::SetDefaultMode {
+        mode: PermissionMode::AcceptEdits,
+    }));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert!(matches!(receiver.try_recv().unwrap(), EngineMsg::Tick));
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert!(receiver.try_recv().is_err());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    let EngineMsg::Command { command, reply } = receiver.try_recv().unwrap() else {
+        panic!("first command missing");
+    };
+    assert!(matches!(
+        command,
+        Command::SetDefaultMode {
+            mode: PermissionMode::AskFirst
+        }
+    ));
+    reply.send(Ok(Ack::Applied)).unwrap();
+    assert!(matches!(
+        first.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(Ok(Ack::Applied)))
+    ));
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    let EngineMsg::Command { command, reply } = receiver.try_recv().unwrap() else {
+        panic!("second command missing");
+    };
+    assert!(matches!(
+        command,
+        Command::SetDefaultMode {
+            mode: PermissionMode::AcceptEdits
+        }
+    ));
+    reply.send(Ok(Ack::Applied)).unwrap();
+    assert!(matches!(
+        second.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(Ok(Ack::Applied)))
+    ));
 }

@@ -41,11 +41,18 @@ enum Fence {
     Live(u64),
 }
 #[derive(Default)]
+struct TranscriptOrder {
+    ids: Vec<ItemId>,
+    positions: BTreeMap<ItemId, usize>,
+}
+#[derive(Default)]
 struct AppState {
     projects: BTreeMap<ProjectId, Project>,
     threads: BTreeMap<ThreadId, Thread>,
     turns: BTreeMap<TurnId, Turn>,
     items: BTreeMap<ThreadId, BTreeMap<ItemId, Item>>,
+    item_order: BTreeMap<ThreadId, TranscriptOrder>,
+    markdown_text: BTreeMap<ItemId, SharedString>,
     #[cfg(debug_assertions)]
     delta_counts: BTreeMap<ItemId, u64>,
     fences: BTreeMap<ThreadId, Fence>,
@@ -130,7 +137,11 @@ impl AppState {
                     if let Some(row) = self.threads.get_mut(thread) {
                         row.archived = true;
                     }
+                    self.item_order.remove(thread);
                     if let Some(items) = self.items.remove(thread) {
+                        for id in items.keys() {
+                            self.markdown_text.remove(id);
+                        }
                         #[cfg(debug_assertions)]
                         for id in items.keys() {
                             self.delta_counts.remove(id);
@@ -168,6 +179,7 @@ impl AppState {
                 | ChangeEvent::TurnStarted(turn)
                 | ChangeEvent::TurnEnded(turn) => {
                     self.turns.insert(turn.id, turn.clone());
+                    self.sort_transcript(turn.thread);
                 }
                 ChangeEvent::SettingsChanged(settings) => self.settings = *settings,
                 ChangeEvent::RequestOpened(request) | ChangeEvent::RequestClosed(request) => {
@@ -215,10 +227,17 @@ impl AppState {
                 event: ChangeEvent::ItemAdded(item) | ChangeEvent::ItemCompleted(item),
                 ..
             } => {
-                self.items
-                    .entry(item.thread)
-                    .or_default()
-                    .insert(item.id, item);
+                let thread = item.thread;
+                let id = item.id;
+                if let Some(text) = transcript::markdown_text(&item) {
+                    self.markdown_text.insert(id, text);
+                } else {
+                    self.markdown_text.remove(&id);
+                }
+                let old = self.items.entry(thread).or_default().insert(id, item);
+                if old.is_none() {
+                    self.sort_transcript(thread);
+                }
             }
             UiEvent::TextAppended {
                 thread,
@@ -238,6 +257,9 @@ impl AppState {
                     | ItemBody::Reasoning { text: body, .. } = &mut item.body
                 {
                     body.push_str(&text);
+                    if let Some(text) = transcript::markdown_text(item) {
+                        self.markdown_text.insert(item.id, text);
+                    }
                 }
             }
             _ => {}
@@ -291,7 +313,18 @@ impl AppState {
             }
             items.insert(item.id, item);
         }
+        if let Some(old) = self.items.get(&thread) {
+            for id in old.keys() {
+                self.markdown_text.remove(id);
+            }
+        }
+        for item in items.values() {
+            if let Some(text) = transcript::markdown_text(item) {
+                self.markdown_text.insert(item.id, text);
+            }
+        }
         self.items.insert(thread, items);
+        self.sort_transcript(thread);
         #[cfg(debug_assertions)]
         {
             self.delta_counts
@@ -309,15 +342,13 @@ impl AppState {
         }
         true
     }
-    fn transcript(&self, thread: ThreadId) -> Vec<Item> {
-        let mut items: Vec<_> = self
-            .items
-            .get(&thread)
-            .into_iter()
-            .flat_map(|items| items.values())
-            .cloned()
-            .collect();
-        items.sort_by_key(|item| {
+    fn sort_transcript(&mut self, thread: ThreadId) {
+        let Some(items) = self.items.get(&thread) else {
+            return;
+        };
+        let mut ids: Vec<_> = items.keys().copied().collect();
+        ids.sort_by_key(|id| {
+            let item = &items[id];
             (
                 self.turns
                     .get(&item.turn)
@@ -326,7 +357,27 @@ impl AppState {
                 item.seq,
             )
         });
-        items
+        let positions = ids
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| (id, index))
+            .collect();
+        self.item_order
+            .insert(thread, TranscriptOrder { ids, positions });
+    }
+    fn transcript_len(&self, thread: ThreadId) -> usize {
+        self.item_order
+            .get(&thread)
+            .map_or(0, |order| order.ids.len())
+    }
+    fn transcript_item(&self, thread: ThreadId, index: usize) -> Option<&Item> {
+        let id = self.item_order.get(&thread)?.ids.get(index)?;
+        self.items.get(&thread)?.get(id)
+    }
+    fn transcript(&self, thread: ThreadId) -> Vec<Item> {
+        (0..self.transcript_len(thread))
+            .filter_map(|index| self.transcript_item(thread, index).cloned())
+            .collect()
     }
     fn pending_requests(&self, thread: ThreadId) -> Vec<&Request> {
         self.requests
@@ -543,6 +594,30 @@ impl Shell {
                             .values()
                             .map(|thread| (thread.root(), shell.state.family_status(thread.root())))
                             .collect();
+                        let text_rows = batch
+                            .iter()
+                            .all(|event| matches!(event, UiEvent::TextAppended { .. }))
+                            .then(|| {
+                                batch
+                                    .iter()
+                                    .filter_map(|event| {
+                                        let UiEvent::TextAppended { thread, item, .. } = event
+                                        else {
+                                            return None;
+                                        };
+                                        if Some(*thread) != shell.view.chat() {
+                                            return None;
+                                        }
+                                        shell
+                                            .state
+                                            .item_order
+                                            .get(thread)?
+                                            .positions
+                                            .get(item)
+                                            .copied()
+                                    })
+                                    .collect::<BTreeSet<_>>()
+                            });
                         shell.state.apply_all(batch);
                         shell.post_banners(&families, cx);
                         shell.start_branch_lookup(cx);
@@ -557,7 +632,7 @@ impl Shell {
                         let count = shell
                             .view
                             .chat()
-                            .map(|thread| shell.state.transcript(thread).len())
+                            .map(|thread| shell.state.transcript_len(thread))
                             .unwrap_or_default();
                         shell.scroller.update(cx, |state, cx| {
                             if count > state.item_count() {
@@ -565,7 +640,13 @@ impl Shell {
                             } else if count < state.item_count() {
                                 state.reset(count, cx);
                             }
-                            state.remeasure(cx);
+                            if let Some(rows) = &text_rows {
+                                for &index in rows {
+                                    state.remeasure_item(index, cx);
+                                }
+                            } else {
+                                state.remeasure(cx);
+                            }
                         });
                         cx.notify();
                     })
@@ -814,7 +895,7 @@ impl Shell {
                     }
                 };
                 if applied && shell.view.chat() == Some(thread) {
-                    let count = shell.state.transcript(thread).len();
+                    let count = shell.state.transcript_len(thread);
                     shell
                         .scroller
                         .update(cx, |state, cx| state.reset(count, cx));
@@ -1432,6 +1513,7 @@ impl Shell {
             "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
             "awake":self.engine.awake(), "processes":self.engine.processes(),
             "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.max_batch_gap_ms,
+                "mailbox_free":perf.mailbox_free,
                 "commits":perf.commits, "actor_max_ms":perf.actor_max_ms, "actor_busy_ms":perf.actor_busy_ms,
                 "repaints":self.repaints, "max_batch_events":self.state.max_batch_events},
             "window_active":self.window_active, "notifications":{"posted":self.notifications_posted},
@@ -3533,5 +3615,87 @@ mod tests {
                 )]
             );
         });
+    }
+    #[test]
+    fn transcript_cache_keeps_order_text_and_completion() {
+        let thread = ThreadId::new();
+        let first = TurnId::new();
+        let last = TurnId::new();
+        let mut state = AppState::default();
+        for (id, ordinal) in [(first, 1), (last, 2)] {
+            state.apply(UiEvent::Change {
+                counter: None,
+                event: ChangeEvent::TurnStarted(Turn {
+                    id,
+                    thread,
+                    ordinal,
+                    origin: TurnOrigin::Provider,
+                    state: TurnState::Running { since: 1 },
+                }),
+            });
+        }
+        let old = Item {
+            id: ItemId::new(),
+            thread,
+            turn: first,
+            seq: 9,
+            body: ItemBody::AssistantText {
+                text: "Earlier".into(),
+                done: true,
+            },
+        };
+        let mut growing = Item {
+            id: ItemId::new(),
+            thread,
+            turn: last,
+            seq: 1,
+            body: ItemBody::AssistantText {
+                text: "New".into(),
+                done: false,
+            },
+        };
+        let request = state.begin_snapshot(thread);
+        assert!(state.finish_snapshot(
+            thread,
+            request,
+            ThreadSnapshot {
+                items: vec![growing.clone(), old.clone()],
+                buffered_text: BTreeMap::new(),
+                #[cfg(debug_assertions)]
+                delta_counts: BTreeMap::new(),
+                counter: 1,
+            }
+        ));
+        assert_eq!(state.transcript_len(thread), 2);
+        assert_eq!(state.transcript_item(thread, 0), Some(&old));
+        assert_eq!(state.item_order[&thread].positions[&growing.id], 1);
+        assert_eq!(state.markdown_text[&growing.id].as_ref(), "New ▏");
+        state.apply(UiEvent::TextAppended {
+            thread,
+            item: growing.id,
+            counter: 2,
+            text: " text".into(),
+            #[cfg(debug_assertions)]
+            delta_count: 1,
+        });
+        assert_eq!(state.markdown_text[&growing.id].as_ref(), "New text ▏");
+        assert_eq!(state.markdown_text[&old.id].as_ref(), "Earlier");
+        growing.body = ItemBody::AssistantText {
+            text: "New text".into(),
+            done: true,
+        };
+        state.apply(UiEvent::Change {
+            counter: Some(3),
+            event: ChangeEvent::ItemCompleted(growing.clone()),
+        });
+        assert_eq!(state.markdown_text[&growing.id].as_ref(), "New text");
+        assert_eq!(state.transcript(thread), [old.clone(), growing.clone()]);
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ThreadArchived { thread },
+        });
+        assert_eq!(state.transcript_len(thread), 0);
+        assert!(!state.markdown_text.contains_key(&old.id));
+        assert!(!state.markdown_text.contains_key(&growing.id));
     }
 }

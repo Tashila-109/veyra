@@ -16,9 +16,17 @@ fn quit_during_database_write(native: bool, locked: bool) -> std::time::Duration
     let mut pending = None;
     if locked {
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-        pending = Some(engine.send(Command::SetDefaultMode {
+        let mut send = Box::pin(engine.send(Command::SetDefaultMode {
             mode: PermissionMode::AskFirst,
         }));
+        assert!(
+            std::future::Future::poll(
+                send.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        pending = Some(send);
         let wait = Instant::now();
         while engine.perf().actor_busy_ms < 100.0 {
             assert!(wait.elapsed() < Duration::from_secs(2));
@@ -513,13 +521,18 @@ fn shutdown_request_rejects_backlogged_start_commands() {
                 groups: Default::default(),
             }),
         };
-        let mut reply = engine.send(Command::Send {
+        let mut reply = std::pin::pin!(engine.send(Command::Send {
             thread: f.thread,
             text: "queued before quit".into(),
-        });
+        }));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(reply.as_mut(), &mut cx).is_pending());
         engine.shutdown();
         f.actor.handle(receiver.try_recv().unwrap());
-        if !matches!(reply.try_recv().unwrap(), Err(CommandError::Closed)) {
+        if !matches!(
+            std::future::Future::poll(reply.as_mut(), &mut cx),
+            std::task::Poll::Ready(Ok(Err(CommandError::Closed)))
+        ) {
             accepted.push(state);
         }
     }

@@ -150,6 +150,9 @@ The writer takes no gate and an already committed write can finish after closing
 
 `Actor` owns the SQLite connection, projection rows, live-thread map, item-key map, text buffers and per-thread event counters.
 It receives typed messages through a 256-slot tokio channel.
+Engine::send returns a future that awaits mailbox space and then the command acknowledgement.
+The window awaits that future in its gpui task; tokio's FIFO permit queue preserves the order of waiting sends.
+Subscription and snapshot requests still use try_send and close their reply channels when the mailbox is full.
 A timer sends Tick every five seconds; text uses separate flush and write messages.
 The actor never waits for provider I/O.
 The actor trims stored tool output to its last 10,000 characters.
@@ -164,6 +167,9 @@ Projection indexes identify each thread's turn and item ids; command overlays re
 The actor completes buffered text for ended turns and finalizes newly settled task summaries before opening one transaction.
 It calls `store::apply`, commits, installs the changed rows/runtime, publishes numbered events, then dispatches effects.
 `ChangeSet::stores_nothing` owns an exhaustive check of its row and live-state fields; `Actor::write` skips the transaction when it returns true.
+A repeated Ready stores thread metadata only when it changed.
+The live pid/group UPDATE affects only rows whose stored pair differs.
+Actor::write rolls back a transaction with no affected rows rather than committing or counting it; runtime changes and events still install.
 It still installs text buffers and publishes events/effects, so pure streaming deltas do not require a SQLite write.
 Row-bearing events resolve from the final changed rows rather than being patched individually.
 StartTurn effects name the turn until install builds its text from committed items and dispatches its control.
@@ -196,7 +202,7 @@ A command write failure returns an error without publishing the decision.
 A provider, Tick or text write failure retains changes, interrupts active turns with the database-blocked reason, refuses commands and publishes StorageBlocked.
 Starting sessions receive Shutdown; every structured session receives InterruptActive, which interrupts the codec's active turn even before its actor row exists and leaves an idle codec without a ladder.
 Tick retries before draining deferred process events.
-Full and closed command queues are distinct errors; Busy carries a typed WaitReason and a closed request is distinct from either.
+A closed actor channel returns Closed; Busy carries a typed WaitReason and a closed request is distinct from either.
 The UI shows command and acknowledgement failures as notices.
 
 `LiveThread` owns an epoch outside its runtime variants, capabilities, the background-work flag and optional TurnAdmission, either Pending with a turn id or Refused.
@@ -475,6 +481,12 @@ Other view changes and Quit call `forget_branch` to cancel the task and clear th
 Dropping the Shell also cancels the task, and its reply checks the selection identity.
 The centred transcript uses a window-owned MessageScrollerState over gpui ListState and selectable Markdown TextView.
 The transcript and its expansion behavior live in ui/transcript.rs.
+AppState caches each thread's ordered item ids and row positions, rebuilding them on item insertion, turn metadata and snapshots.
+It retains shared markdown source strings for assistant and reasoning rows, refreshing only the changed item and removing archived rows.
+The list reads items and turns directly from the projection instead of cloning the transcript on every render.
+A text-only pump batch remeasures only its changed rows in the open thread.
+Other batches still remeasure the list for structural, outcome and queue-label changes.
+The inline streaming caret remains part of the markdown source, so a growing assistant row still takes the kit's full-replacement parse path.
 Failed tools show their last nonempty output line, truncated to one row at its width.
 The window and dump share row_outcome, which annotates only each ended turn's final item.
 A user scroll detaches following; new text, requests and tool rows preserve that state.
@@ -576,7 +588,8 @@ After release cleanup, the recipe fails if the preserved log records an orphan-g
 Only one owned Veyra window exists during that release check; it takes no PNG.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
-Debug perf reports commits, actor_max_ms, actor_busy_ms, repaints and max_batch_events.
+Debug perf reports commits, actor_max_ms, actor_busy_ms, mailbox_free, repaints and max_batch_events.
+mailbox_free is the command sender's remaining channel capacity, including permits already reserved by waiting sends.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
@@ -608,6 +621,9 @@ A Stop before refusal preserves the stopped prompt's end and allows the later Pr
 stop_targets_reported_provider_turn stops B with the real session's ProviderTurnStarted id and requires Interrupted.
 Storage-failure tests require an active-turn control before the Provider row is registered and prove that an unregistered CLI turn ends with the storage-blocked reason.
 Actor tests cover retirement before queued work, the Stop drain, Provider-tail rejection and skipped text-only transactions.
+Mailbox tests require a full-channel send to wait and two waiting commands to reach the actor in order, even when the second future is polled first after capacity opens.
+Storage tests require duplicate Ready and admission-only changes to retain their runtime and metadata effects without another commit.
+A projection test checks cached row order, streamed text, completion and archive cleanup.
 Shutdown tests check that Quit during a drain, Stopping or missing-session recovery starts no replacement session and keeps queued work held after reload.
 An actor decision test checks that shutdown exits propose no restart or queued-turn start, preserving epochs and earlier holds.
 A storage test checks that a Write tool row stores its content once.

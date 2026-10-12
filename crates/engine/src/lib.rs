@@ -132,6 +132,7 @@ pub struct Perf {
     pub commits: u64,
     pub actor_max_ms: f64,
     pub actor_busy_ms: f64,
+    pub mailbox_free: usize,
 }
 #[cfg(debug_assertions)]
 #[derive(serde::Serialize)]
@@ -285,6 +286,7 @@ impl Engine {
         let counters = self.inner.state.counters.lock().unwrap();
         Perf {
             commits: counters.commits,
+            mailbox_free: self.inner.sender.capacity(),
             actor_max_ms: counters.actor_max_ms,
             actor_busy_ms: counters
                 .started
@@ -309,29 +311,26 @@ impl Engine {
     pub fn schema_version(&self) -> u32 {
         self.inner.schema_version
     }
-    pub fn send(&self, command: Command) -> oneshot::Receiver<Result<Ack, CommandError>> {
-        let (reply, rx) = oneshot::channel();
-        if self.inner.state.closing.is_closing() {
-            let _ = reply.send(Err(CommandError::Closed));
-            return rx;
-        }
-        match self
-            .inner
-            .sender
-            .try_send(EngineMsg::Command { command, reply })
-        {
-            Ok(()) => {}
-            Err(error) => {
-                let cause = match &error {
-                    mpsc::error::TrySendError::Full(_) => CommandError::QueueFull,
-                    mpsc::error::TrySendError::Closed(_) => CommandError::Closed,
-                };
-                if let EngineMsg::Command { reply, .. } = error.into_inner() {
-                    let _ = reply.send(Err(cause));
-                }
+    pub fn send(
+        &self,
+        command: Command,
+    ) -> impl std::future::Future<
+        Output = Result<Result<Ack, CommandError>, oneshot::error::RecvError>,
+    > + Send
+    + 'static {
+        let sender = self.inner.sender.clone();
+        let closing = self.inner.state.closing.clone();
+        async move {
+            let (reply, rx) = oneshot::channel();
+            if closing.is_closing() {
+                let _ = reply.send(Err(CommandError::Closed));
+            } else if let Err(error) = sender.send(EngineMsg::Command { command, reply }).await
+                && let EngineMsg::Command { reply, .. } = error.0
+            {
+                let _ = reply.send(Err(CommandError::Closed));
             }
+            rx.await
         }
-        rx
     }
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<UiEvent> {
         let (tx, rx) = mpsc::unbounded_channel();

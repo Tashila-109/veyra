@@ -166,7 +166,7 @@ PY
 The two pmset files retain OS assertion evidence around awake.
 `notifications-needs-you.json`, `notifications-done-away.json` and the frontmost check prove the banner decision.
 `notifications-background.json` proves no Done banner at foreground end while work remains.
-`processes`, `perf.commits`, `perf.actor_max_ms`, `perf.actor_busy_ms`, `perf.repaints` and `perf.max_batch_events` remain available to an authorized performance run.
+`processes`, `perf.commits`, `perf.actor_max_ms`, `perf.actor_busy_ms`, `perf.mailbox_free`, `perf.repaints` and `perf.max_batch_events` remain available to an authorized performance run.
 The debug-only DebugStallUi action remains available for that lane.
 
 ## Gotchas

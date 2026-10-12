@@ -66,8 +66,6 @@ pub enum CommandError {
     Busy(WaitReason),
     #[error("This request is no longer pending")]
     RequestClosed,
-    #[error("The engine command queue is full; try again")]
-    QueueFull,
     #[error("{0} was not found")]
     NotFound(String),
     #[error("{0}")]

@@ -62,6 +62,10 @@ impl MessageScrollerState {
         self.list.splice(end..end, count);
         cx.notify();
     }
+    pub fn remeasure_item(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.list.remeasure_items(index..index + 1);
+        cx.notify();
+    }
     pub fn remeasure(&mut self, cx: &mut Context<Self>) {
         let count = self.item_count();
         self.list.remeasure_items(0..count);
@@ -115,7 +119,23 @@ impl MessageScrollerState {
         cx.notify();
     }
 }
-fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
+pub(super) fn markdown_text(item: &Item) -> Option<SharedString> {
+    match &item.body {
+        ItemBody::AssistantText { text, done } => Some(if *done {
+            text.clone().into()
+        } else {
+            format!("{text} ▏").into()
+        }),
+        ItemBody::Reasoning { text, .. } => Some(text.clone().into()),
+        _ => None,
+    }
+}
+fn row(
+    item: &Item,
+    expanded: bool,
+    markdown: &std::collections::BTreeMap<ItemId, SharedString>,
+    cx: &App,
+) -> AnyElement {
     let t = cx.global::<Theme>();
     let mut row = div()
         .v_flex()
@@ -134,17 +154,16 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                     .child(text.clone()),
             )
         }
-        ItemBody::AssistantText { text, done } => {
+        ItemBody::AssistantText { .. } => {
             row = row.child(TextView::markdown(
                 SharedString::from(format!("assistant-{}", item.id)),
-                if *done {
-                    text.clone()
-                } else {
-                    format!("{text} ▏")
-                },
+                markdown
+                    .get(&item.id)
+                    .cloned()
+                    .unwrap_or_else(|| markdown_text(item).unwrap()),
             ));
         }
-        ItemBody::Reasoning { text, .. } => {
+        ItemBody::Reasoning { .. } => {
             let id = item.id;
             row = row
                 .child(
@@ -166,7 +185,10 @@ fn row(item: &Item, expanded: bool, cx: &App) -> AnyElement {
                 .when(expanded, |row| {
                     row.child(TextView::markdown(
                         SharedString::from(format!("reasoning-text-{}", item.id)),
-                        text.clone(),
+                        markdown
+                            .get(&item.id)
+                            .cloned()
+                            .unwrap_or_else(|| markdown_text(item).unwrap()),
                     ))
                 });
         }
@@ -271,6 +293,7 @@ fn tool_output(tool: &ToolItem) -> Option<&str> {
         .and_then(|result| result.output_tail.as_deref())
         .or_else(|| (!tool.output_tail.is_empty()).then_some(tool.output_tail.as_str()))
 }
+#[cfg(any(test, debug_assertions))]
 pub fn row_outcome(
     items: &[Item],
     index: usize,
@@ -321,13 +344,8 @@ fn tool_input(call: &ToolCall) -> String {
 }
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
-    let items = shell
-        .view
-        .chat()
-        .map(|thread| shell.state.transcript(thread))
-        .unwrap_or_default();
-    let expanded = shell.expanded.clone();
-    let turns = shell.state.turns.clone();
+    let thread = shell.view.chat();
+    let entity = cx.entity();
     let wait_reason = shell
         .view
         .chat()
@@ -413,17 +431,28 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .vertical_scrollbar(&shell.scroller.read(cx).list)
                 .child(
                     list(shell.scroller.read(cx).list.clone(), move |index, _, cx| {
-                        items
-                            .get(index)
+                        let shell = entity.read(cx);
+                        thread
+                            .and_then(|thread| shell.state.transcript_item(thread, index))
                             .map(|item| {
                                 let t = cx.global::<Theme>();
-                                let turn = turns.get(&item.turn);
-                                let outcome = row_outcome(&items, index, &turns);
+                                let turn = shell.state.turns.get(&item.turn);
+                                let last = thread
+                                    .and_then(|thread| {
+                                        shell.state.transcript_item(thread, index + 1)
+                                    })
+                                    .is_none_or(|next| next.turn != item.turn);
+                                let outcome = turn.filter(|_| last).and_then(turn_outcome_line);
                                 div()
                                     .v_flex()
                                     .w_full()
                                     .gap(t.space.0[3])
-                                    .child(row(item, expanded.contains(&item.id), cx))
+                                    .child(row(
+                                        item,
+                                        shell.expanded.contains(&item.id),
+                                        &shell.state.markdown_text,
+                                        cx,
+                                    ))
                                     .when_some(
                                         turn.filter(|turn| turn.state == TurnState::Queued)
                                             .and(wait_reason.as_ref()),
@@ -558,7 +587,7 @@ mod tests {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 div()
                     .w(cx.global::<super::Theme>().layout.transcript_min)
-                    .child(super::row(&self.0, false, cx))
+                    .child(super::row(&self.0, false, &Default::default(), cx))
             }
         }
         cx.update(gpui_kit::init);

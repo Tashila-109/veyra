@@ -423,8 +423,13 @@ impl Actor {
         if c.stores_nothing() {
             return Ok(());
         }
+        let changes = self.db.total_changes();
         let tx = self.db.transaction()?;
         store::apply(&tx, c, now())?;
+        if tx.total_changes() == changes {
+            tx.rollback()?;
+            return Ok(());
+        }
         tx.commit()?;
         #[cfg(debug_assertions)]
         {
@@ -794,7 +799,9 @@ impl Actor {
                 }
                 let cli_version = t.cli_version.clone();
                 t.import_pending = false;
-                c.threads.insert(thread, t);
+                if t != self.projection.threads[&thread] {
+                    c.threads.insert(thread, t);
+                }
                 c.events.push(Ev::NativeSessionBound {
                     thread,
                     native,

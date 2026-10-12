@@ -287,7 +287,8 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             _ => (None, None),
         };
         tx.execute(
-            "UPDATE threads SET live_pid=?1,live_pgid=?2 WHERE id=?3",
+            "UPDATE threads SET live_pid=?1,live_pgid=?2 WHERE id=?3
+             AND (live_pid IS NOT ?1 OR live_pgid IS NOT ?2)",
             params![pid, pgid, id.to_string()],
         )?;
     }

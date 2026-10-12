@@ -2163,3 +2163,72 @@ fn refused_admission_publishes_busy_without_a_pending_turn() {
     assert!(published.busy);
     assert_eq!(published.pending_turn, None);
 }
+
+#[test]
+fn repeated_ready_preserves_metadata_without_a_commit() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let ready = ProviderEvent::Session(SessionEvent::Ready {
+        native: NativeSessionId("same-session".into()),
+        cli_version: Some("test-version".into()),
+        pid: 9,
+        pgid: 9,
+        capabilities: vec!["streaming".into()],
+    });
+    let before = f.actor.test_commits;
+    f.event(ready.clone());
+    assert_eq!(f.actor.test_commits, before + 1);
+    f.event(ready);
+    assert_eq!(f.actor.test_commits, before + 1);
+    let stored = f.loaded();
+    assert_eq!(
+        stored.threads[&f.thread].native,
+        Some(NativeSessionId("same-session".into()))
+    );
+    assert_eq!(
+        stored.threads[&f.thread].cli_version.as_deref(),
+        Some("test-version")
+    );
+    assert_eq!(f.actor.live[&f.thread].capabilities, ["streaming"]);
+    f.event(ProviderEvent::Session(SessionEvent::Ready {
+        native: NativeSessionId("changed-session".into()),
+        cli_version: Some("new-version".into()),
+        pid: 9,
+        pgid: 9,
+        capabilities: vec![],
+    }));
+    assert_eq!(f.actor.test_commits, before + 2);
+    assert_eq!(
+        f.loaded().threads[&f.thread].native,
+        Some(NativeSessionId("changed-session".into()))
+    );
+}
+
+#[test]
+fn accepted_turn_clears_admission_without_a_commit() {
+    let mut f = Fixture::new(LiveState::Running);
+    let turn = f.running().unwrap();
+    f.actor.live.get_mut(&f.thread).unwrap().admission =
+        Some(crate::live::TurnAdmission::Pending(turn));
+    let before = f.actor.test_commits;
+    f.event(turn_event(Some(turn), TurnEvent::Accepted));
+    assert_eq!(f.actor.live[&f.thread].admission, None);
+    assert_eq!(f.actor.test_commits, before);
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::TextDelta {
+            key: NativeItemKey("reply".into()),
+            text: "accepted reply".into(),
+            streamed: true,
+        },
+    ));
+    assert_eq!(f.actor.test_commits, before + 1);
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+            park: false,
+        },
+    ));
+    assert!(f.loaded().items.values().any(|item| matches!(&item.body,
+        ItemBody::AssistantText { text, done: true } if text=="accepted reply")));
+}
