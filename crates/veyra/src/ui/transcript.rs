@@ -4,9 +4,12 @@ use super::{
     composer::{self, labelled_button},
     theme::Theme,
 };
+use gpui_kit::base::Disableable;
 use gpui_kit::component::StyledExt;
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::text::TextView;
+use gpui_kit::component::text::{
+    MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, markdown_ast,
+};
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::*;
 pub(super) struct MessageScrollerState {
@@ -56,6 +59,10 @@ impl MessageScrollerState {
     pub fn reset(&mut self, count: usize, cx: &mut Context<Self>) {
         self.list.reset(count);
         self.scroll_to_end(cx);
+    }
+    pub fn prepend(&mut self, cx: &mut Context<Self>) {
+        self.list.splice(0..0, 1);
+        cx.notify();
     }
     pub fn append(&mut self, count: usize, cx: &mut Context<Self>) {
         let end = self.item_count();
@@ -130,6 +137,62 @@ pub(super) fn markdown_text(item: &Item) -> Option<SharedString> {
         _ => None,
     }
 }
+struct ReplyLineBreaks;
+fn soft_break_offsets(node: &markdown_ast::Node, source: &str, offsets: &mut Vec<usize>) {
+    if let markdown_ast::Node::Text(text) = node {
+        if text.value.contains(['\n', '\r'])
+            && let Some(position) = node.position()
+        {
+            let raw = &source[position.start.offset..position.end.offset];
+            offsets.extend(raw.char_indices().filter_map(|(index, ch)| {
+                (ch == '\r' || (ch == '\n' && !raw[..index].ends_with('\r')))
+                    .then_some(position.start.offset + index)
+            }));
+        }
+    } else if let Some(children) = node.children() {
+        for child in children {
+            soft_break_offsets(child, source, offsets);
+        }
+    }
+}
+impl MarkdownPlugin for ReplyLineBreaks {
+    fn name(&self) -> &str {
+        "veyra-reply-lines"
+    }
+    fn is_block(&self) -> bool {
+        true
+    }
+    fn parse(
+        &self,
+        node: &markdown_ast::Node,
+        cx: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let mut offsets = Vec::new();
+        soft_break_offsets(node, cx.source(), &mut offsets);
+        if offsets.is_empty() {
+            return None;
+        }
+        let position = node.position()?;
+        let mut source = cx.node_source(node)?.to_owned();
+        for offset in offsets.into_iter().rev() {
+            source.insert(offset - position.start.offset, '\\');
+        }
+        Some(
+            MarkdownNode::new(self.name(), source.clone())
+                .text(cx.node_source(node)?.to_owned())
+                .markdown(cx.node_source(node)?.to_owned()),
+        )
+    }
+    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+        TextView::markdown(
+            SharedString::from(format!(
+                "reply-lines-{:?}",
+                node.source_range().map(|range| range.start)
+            )),
+            node.data::<String>().expect("reply line source").clone(),
+        )
+    }
+}
 fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) -> AnyElement {
     let t = cx.global::<Theme>();
     let mut row = div()
@@ -150,10 +213,13 @@ fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) ->
             )
         }
         ItemBody::AssistantText { .. } => {
-            row = row.child(TextView::markdown(
-                SharedString::from(format!("assistant-{}", item.id)),
-                markdown.expect("markdown rows have cached text"),
-            ));
+            row = row.child(
+                TextView::markdown(
+                    SharedString::from(format!("assistant-{}", item.id)),
+                    markdown.expect("markdown rows have cached text"),
+                )
+                .plugin(ReplyLineBreaks),
+            );
         }
         ItemBody::Reasoning { .. } => {
             let id = item.id;
@@ -326,6 +392,129 @@ fn tool_input(call: &ToolCall) -> String {
         })
         .unwrap_or_else(|| arguments.to_string())
 }
+pub(super) fn family_children(state: &super::AppState, parent: ThreadId) -> Vec<&Thread> {
+    state
+        .threads
+        .values()
+        .filter(|thread| thread.id != parent && thread.root() == parent)
+        .collect()
+}
+fn family_card(shell: &Shell, parent: ThreadId, cx: &App) -> AnyElement {
+    let t = cx.global::<Theme>();
+    let children = family_children(&shell.state, parent);
+    div()
+        .debug_selector(|| "family-card".into())
+        .v_flex()
+        .w_full()
+        .max_w(t.layout.transcript_max)
+        .rounded(t.radius.card)
+        .bg(t.colors.card)
+        .border(t.layout.border)
+        .border_color(t.colors.border)
+        .p(t.space.0[4])
+        .gap(t.space.0[3])
+        .child(format!("Started {} agents", children.len()))
+        .children(children.into_iter().map(|child| {
+            let id = child.id;
+            let status = shell.state.status(id);
+            div()
+                .h_flex()
+                .items_center()
+                .gap(t.space.0[3])
+                .child(
+                    div()
+                        .w(t.layout.status_glyph)
+                        .text_color(match status {
+                            Status::Working { .. } => t.colors.accent,
+                            Status::Failed => t.colors.danger,
+                            Status::Done { .. } => t.colors.success,
+                            _ => t.colors.text_muted,
+                        })
+                        .child(super::sidebar::glyph(&status)),
+                )
+                .child(div().flex_1().min_w_0().child(child.title.clone()))
+                .child(
+                    div()
+                        .text_size(t.text.meta.size)
+                        .text_color(t.colors.text_muted)
+                        .child(status.words()),
+                )
+                .child(
+                    labelled_button(SharedString::from(format!("child-open-{id}")), "Open", cx)
+                        .disabled(child.archived)
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
+                        }),
+                )
+                .child(
+                    labelled_button(SharedString::from(format!("child-stop-{id}")), "Stop", cx)
+                        .disabled(child.archived)
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(StopThread { thread: Some(id) }), cx)
+                        }),
+                )
+        }))
+        .into_any_element()
+}
+fn task_card(state: &super::AppState, task: TaskId, cx: &App) -> AnyElement {
+    let t = cx.global::<Theme>();
+    let parent = state
+        .tasks
+        .get(&task)
+        .and_then(|task| state.threads.get(&task.parent));
+    div()
+        .debug_selector(|| "task-card".into())
+        .rounded(t.radius.card)
+        .bg(t.colors.card)
+        .border(t.layout.border)
+        .border_color(t.colors.border)
+        .p(t.space.0[4])
+        .child(format!(
+            "Task from {}",
+            parent
+                .map(|thread| thread.provider.label())
+                .unwrap_or("parent")
+        ))
+        .into_any_element()
+}
+pub(super) fn turn_label(state: &super::AppState, turn: &Turn) -> Option<String> {
+    match &turn.origin {
+        TurnOrigin::Task { task } => state
+            .tasks
+            .get(task)
+            .and_then(|task| state.threads.get(&task.parent))
+            .map(|parent| format!("Task from {}", parent.title)),
+        TurnOrigin::Wake { tasks } => {
+            let count = tasks
+                .iter()
+                .filter_map(|task| state.tasks.get(task).map(|task| task.child))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            Some(format!(
+                "Reports from {count} child thread{}",
+                if count == 1 { "" } else { "s" }
+            ))
+        }
+        TurnOrigin::User { .. } | TurnOrigin::Provider => None,
+    }
+}
+pub(super) fn report_delivered(state: &super::AppState, item: &Item, next: Option<&Item>) -> bool {
+    next.is_none()
+        && state
+            .tasks
+            .values()
+            .filter(|task| task.child == item.thread)
+            .max_by_key(|task| state.turns.get(&task.turn).map_or(0, |turn| turn.ordinal))
+            .is_some_and(|task| {
+                matches!(
+                    task.state,
+                    TaskState::Settled {
+                        delivery: Delivery::Delivered { .. },
+                        ..
+                    }
+                )
+            })
+}
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let thread = shell.view.chat();
@@ -416,6 +605,14 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .child(
                     list(shell.scroller.read(cx).list.clone(), move |index, _, cx| {
                         let shell = entity.read(cx);
+                        let family = thread
+                            .filter(|thread| !family_children(&shell.state, *thread).is_empty());
+                        if let Some(parent) = family
+                            && index == 0
+                        {
+                            return family_card(shell, parent, cx);
+                        }
+                        let index = index - usize::from(family.is_some());
                         thread
                             .and_then(|thread| shell.state.transcript_item(thread, index))
                             .map(|item| {
@@ -425,16 +622,45 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                     shell.state.transcript_item(thread, index + 1)
                                 });
                                 let outcome = row_outcome(item, next, &shell.state.turns);
+                                let first = index == 0
+                                    || thread
+                                        .and_then(|thread| {
+                                            shell.state.transcript_item(thread, index - 1)
+                                        })
+                                        .is_none_or(|previous| previous.turn != item.turn);
+                                let label = turn
+                                    .filter(|_| first)
+                                    .and_then(|turn| turn_label(&shell.state, turn));
                                 div()
                                     .v_flex()
                                     .w_full()
                                     .gap(t.space.0[3])
-                                    .child(row(
-                                        item,
-                                        shell.expanded.contains(&item.id),
-                                        shell.state.markdown_text.get(&item.id).cloned(),
-                                        cx,
-                                    ))
+                                    .when_some(label, |row, label| {
+                                        row.child(
+                                            div()
+                                                .text_size(t.text.meta.size)
+                                                .text_color(t.colors.text_muted)
+                                                .child(label),
+                                        )
+                                    })
+                                    .child(if let ItemBody::TaskCard(task) = item.body {
+                                        task_card(&shell.state, task, cx)
+                                    } else {
+                                        row(
+                                            item,
+                                            shell.expanded.contains(&item.id),
+                                            shell.state.markdown_text.get(&item.id).cloned(),
+                                            cx,
+                                        )
+                                    })
+                                    .when(report_delivered(&shell.state, item, next), |row| {
+                                        row.child(
+                                            div()
+                                                .text_size(t.text.meta.size)
+                                                .text_color(t.colors.text_muted)
+                                                .child("Report delivered"),
+                                        )
+                                    })
                                     .when_some(
                                         turn.filter(|turn| turn.state == TurnState::Queued)
                                             .and(wait_reason.as_ref()),
@@ -500,6 +726,60 @@ mod tests {
     use super::tool_input;
     use gpui_kit::AppContext;
     use veyra_engine::domain::*;
+    #[gpui::test]
+    fn reply_preserves_single_newlines(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::{prelude::*, *};
+        struct Reply(Item);
+        impl Render for Reply {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(cx.global::<super::Theme>().layout.transcript_min)
+                    .child(
+                        div()
+                            .debug_selector(|| "reply-lines".into())
+                            .child(super::row(
+                                &self.0,
+                                false,
+                                super::markdown_text(&self.0),
+                                cx,
+                            )),
+                    )
+            }
+        }
+        cx.update(gpui_kit::init);
+        let item = Item {
+            id: ItemId::new(),
+            thread: ThreadId::new(),
+            turn: TurnId::new(),
+            seq: 0,
+            body: ItemBody::AssistantText {
+                text: "first line\n**second line**\nthird line".into(),
+                done: true,
+            },
+        };
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+            Reply(item)
+        });
+        let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+        let line = cx.update(|window, _| theme.text.read.line_height.to_pixels(window.rem_size()));
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.draw(
+                Point::default(),
+                size(
+                    AvailableSpace::Definite(theme.layout.transcript_min),
+                    AvailableSpace::Definite(theme.layout.window_default.height),
+                ),
+                |_, _| div().child(view.clone()),
+            );
+        }
+        let height = cx.debug_bounds("reply-lines").unwrap().size.height;
+        assert!(
+            height >= line * 3.,
+            "three provider lines collapsed: {height:?}"
+        );
+    }
     #[test]
     fn tool_input_formats_arguments_without_a_stored_summary() {
         for (name, arguments, expected) in [
@@ -619,6 +899,18 @@ mod tests {
             bounds.size.width <= theme.layout.transcript_min,
             "preview exceeded its row width"
         );
+    }
+    #[gpui::test]
+    fn inserting_family_card_keeps_the_detached_item(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(super::Theme::new(crate::ui::theme::Appearance::Dark)));
+        let state = cx.new(|cx| super::MessageScrollerState::new(3, cx));
+        state.update(cx, |state, cx| state.scroll_to_item(1, cx));
+        state.update(cx, |state, cx| state.prepend(cx));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.list.logical_scroll_top().item_ix, 2);
+            assert_eq!(state.item_count(), 4);
+            assert!(!state.follow);
+        });
     }
     #[gpui::test]
     fn latest_is_hidden_when_detached_at_bottom(cx: &mut gpui::TestAppContext) {

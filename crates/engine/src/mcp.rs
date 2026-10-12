@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
 };
 
 pub struct McpToken(String);
@@ -95,11 +95,11 @@ pub struct Caller {
     pub pid: u32,
     pub token: TokenHash,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Credential {
     thread: ThreadId,
     epoch: u32,
-    pid: u32,
+    pid: watch::Receiver<Option<u32>>,
     used: bool,
 }
 #[derive(Clone, Debug)]
@@ -117,6 +117,7 @@ impl Server {
         if !platform::is_private(data)? {
             return Err(std::io::Error::other("MCP data folder must be mode 0700"));
         }
+        platform::remove_stale_mcp_configs(data)?;
         let server = Self {
             socket: data.join("veyra.sock"),
             command: command.canonicalize()?,
@@ -148,19 +149,31 @@ impl Server {
         spawn: impl FnOnce(&McpToken) -> Result<(T, u32), crate::provider::ProviderError>,
     ) -> Result<T, crate::provider::ProviderError> {
         let token = McpToken::new();
-        let mut credentials = self.credentials.lock().unwrap();
-        credentials.retain(|_, entry| entry.thread != thread);
-        let (value, pid) = spawn(&token)?;
-        credentials.insert(
-            token.hash(),
-            Credential {
-                thread,
-                epoch,
-                pid,
-                used: false,
-            },
-        );
-        Ok(value)
+        let hash = token.hash();
+        let (ready, pid) = watch::channel(None);
+        {
+            let mut credentials = self.credentials.lock().unwrap();
+            credentials.retain(|_, entry| entry.thread != thread);
+            credentials.insert(
+                hash,
+                Credential {
+                    thread,
+                    epoch,
+                    pid,
+                    used: false,
+                },
+            );
+        }
+        match spawn(&token) {
+            Ok((value, pid)) => {
+                let _ = ready.send(Some(pid));
+                Ok(value)
+            }
+            Err(error) => {
+                self.credentials.lock().unwrap().remove(&hash);
+                Err(error)
+            }
+        }
     }
     pub fn revoke(&self, thread: ThreadId, epoch: u32) {
         self.credentials
@@ -176,7 +189,7 @@ impl Server {
             .is_some_and(|entry| {
                 entry.thread == thread
                     && entry.epoch == caller.epoch
-                    && entry.pid == caller.pid
+                    && *entry.pid.borrow() == Some(caller.pid)
                     && entry.used
             })
     }
@@ -202,17 +215,28 @@ impl Server {
         };
         let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         drop(token);
+        let pending = self.credentials.lock().unwrap().get(&hash).cloned();
+        if let Some(mut pending) = pending {
+            let registered = tokio::time::timeout(
+                Duration::from_secs(3),
+                pending.pid.wait_for(|pid| pid.is_some()),
+            )
+            .await;
+            if !matches!(registered, Ok(Ok(_))) {
+                return;
+            }
+        }
         let credential = {
             let mut credentials = self.credentials.lock().unwrap();
             match credentials.get_mut(&hash) {
                 Some(entry)
                     if !entry.used
                         && peer.as_ref().is_ok_and(|(parent, exe)| {
-                            *parent == entry.pid && *exe == self.command
+                            Some(*parent) == *entry.pid.borrow() && *exe == self.command
                         }) =>
                 {
                     entry.used = true;
-                    Some(*entry)
+                    Some(entry.clone())
                 }
                 entry => {
                     tracing::warn!(thread=%entry.map(|entry|entry.thread.to_string()).unwrap_or_else(||"unknown".into()),reason="peer, token, or single-connection rule","MCP connection refused");
@@ -222,6 +246,7 @@ impl Server {
         };
         let Some(credential) = credential else { return };
         tracing::info!(thread=%credential.thread,"MCP connection accepted");
+        let pid = (*credential.pid.borrow()).expect("registered CLI pid");
         loop {
             let line = tokio::select! {result=lines.next()=>result,_=out.closed()=>break};
             if !self.active(&hash) {
@@ -242,7 +267,7 @@ impl Server {
                 credential.thread,
                 Some(Caller {
                     epoch: credential.epoch,
-                    pid: credential.pid,
+                    pid,
                     token: TokenHash(hash),
                 }),
                 value,
@@ -287,16 +312,9 @@ async fn response_for(
                     json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"tools/call needs a tool name"}}),
                 );
             };
-            let logged_name = if tools::list()
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool["name"] == name)
-            {
-                name
-            } else {
-                "unknown"
-            };
+            let logged_name = tools::Tool::from_name(name)
+                .map(tools::Tool::name)
+                .unwrap_or("unknown");
             tracing::info!(thread=%caller,tool=logged_name,"MCP tools/call");
             let (reply, rx) = oneshot::channel();
             let call = ToolCall {
@@ -429,7 +447,7 @@ mod tests {
             Credential {
                 thread,
                 epoch: 1,
-                pid: 10,
+                pid: watch::channel(Some(10)).1,
                 used: true,
             },
         );
@@ -441,10 +459,45 @@ mod tests {
             Credential {
                 thread,
                 epoch: 1,
-                pid: 11,
+                pid: watch::channel(Some(11)).1,
                 used: true,
             },
         );
         assert!(!server.allows(thread, caller));
+    }
+}
+
+#[cfg(test)]
+mod launch_lock_tests {
+    use super::*;
+    #[test]
+    fn revocation_does_not_wait_for_a_pending_launch() {
+        let server = Server {
+            socket: PathBuf::new(),
+            command: PathBuf::new(),
+            credentials: Default::default(),
+        };
+        let thread = ThreadId::new();
+        let (entered, seen) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let launching = server.clone();
+        let launch = std::thread::spawn(move || {
+            launching.for_spawn(thread, 1, |_| {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(((), 1))
+            })
+        });
+        seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let revoke = std::thread::spawn(move || {
+            server.revoke(thread, 1);
+            done.send(()).unwrap();
+        });
+        let prompt = finished.recv_timeout(Duration::from_secs(1)).is_ok();
+        release.send(()).unwrap();
+        launch.join().unwrap().unwrap();
+        revoke.join().unwrap();
+        assert!(prompt, "revocation waited for the launch gate owner");
     }
 }

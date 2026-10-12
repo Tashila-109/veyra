@@ -506,7 +506,9 @@ pub fn thread_status(v: &ThreadView<'_>) -> Status {
     if v.pending_request {
         return Status::NeedsYou;
     }
-    if v.thread.hold == Some(HoldReason::Restarted) || (v.thread.hold.is_some() && v.queued) {
+    if (v.thread.hold == Some(HoldReason::Restarted) && v.thread.lineage == Lineage::Root)
+        || (v.thread.hold.is_some() && v.queued)
+    {
         return Status::Held;
     }
     if let Some(Turn {

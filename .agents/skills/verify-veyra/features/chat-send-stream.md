@@ -185,6 +185,7 @@ records.insert(delta+1,part)
 stage_records(records)
 follow_thread = create('chat-follow','Show a long reply',scenario=None)
 poll('chat-follow-streaming',lambda d: any(item['kind']=='assistant' and len(item['text'])>1000 for item in d['transcript']['items']))
+poll('chat-follow-laid-out',lambda d:d['transcript']['top_offset']>200)
 assert ctl('chat-follow-attached','dump')['transcript']['follow']
 action('chat-follow-scroll','DebugScrollTranscript',{'pixels':-200})
 detached = poll('chat-follow-detached',lambda d: not d['transcript']['follow'])

@@ -9,51 +9,150 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CHILD_GUIDANCE: &str = "Your last message is your report to the parent; Veyra delivers up to 4,000 characters after its current turn ends. You cannot start child threads.\n\n";
-const DESCRIPTIONS: [(&str, &str); 5] = [
-    (
-        "list_providers",
-        "Read available providers, models, your permission ceiling and remaining child slots before delegating. A refusal explains the fix.",
-    ),
-    (
-        "start_thread",
-        "Start a child only when the user's request needs one, using a fresh client_request_id. Children inherit your mode unless you choose a narrower one and cannot delegate. A refusal explains the fix.",
-    ),
-    (
-        "get_task",
-        "Read one of your tasks when you need its status or report. Reports arrive in a new turn after your current turn ends; do not poll for them. A refusal explains the fix.",
-    ),
-    (
-        "message_thread",
-        "Send a follow-up to your own child with a fresh client_request_id. Read delivery and waits_for: queued work must not be resent. A refusal explains the fix.",
-    ),
-    (
-        "stop_thread",
-        "Stop your own child when its work is no longer needed. Its report arrives after your current turn ends. A refusal explains the fix.",
-    ),
-];
+pub const OPEN_CHILD_LIMIT: usize = 4;
+pub const FAMILY_LIMIT: usize = 16;
+pub const PROMPT_CHARS: usize = 100_000;
+pub const REPORT_CHARS: usize = 4_000;
+fn grouped(value: usize) -> String {
+    let digits = value.to_string();
+    digits
+        .chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                format!(",{ch}")
+            } else {
+                ch.to_string()
+            }
+        })
+        .collect()
+}
+pub static CHILD_GUIDANCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "Your last message is your report to the parent; Veyra delivers up to {} characters after its current turn ends. You cannot start child threads.\n\n",
+        grouped(REPORT_CHARS)
+    )
+});
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tool {
+    ListProviders,
+    StartThread,
+    GetTask,
+    MessageThread,
+    StopThread,
+}
+impl Tool {
+    pub const ALL: [Self; 5] = [
+        Self::ListProviders,
+        Self::StartThread,
+        Self::GetTask,
+        Self::MessageThread,
+        Self::StopThread,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ListProviders => "list_providers",
+            Self::StartThread => "start_thread",
+            Self::GetTask => "get_task",
+            Self::MessageThread => "message_thread",
+            Self::StopThread => "stop_thread",
+        }
+    }
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.name() == name)
+    }
+    fn description(self) -> &'static str {
+        match self {
+            Self::ListProviders => {
+                "Read available providers, models, your permission ceiling and remaining child slots before delegating. A refusal explains the fix."
+            }
+            Self::StartThread => {
+                "Start a child only when the user's request needs one, using a fresh client_request_id. Children inherit your mode unless you choose a narrower one and cannot delegate. A refusal explains the fix."
+            }
+            Self::GetTask => {
+                "Read one of your tasks when you need its status or report. Reports arrive in a new turn after your current turn ends; do not poll for them. A refusal explains the fix."
+            }
+            Self::MessageThread => {
+                "Send a follow-up to your own child with a fresh client_request_id. Read delivery and waits_for: queued work must not be resent. A refusal explains the fix."
+            }
+            Self::StopThread => {
+                "Stop your own child when its work is no longer needed. Its report arrives after your current turn ends. A refusal explains the fix."
+            }
+        }
+    }
+    fn schema(self) -> Value {
+        let (properties, required) = match self {
+            Self::ListProviders => (json!({}), json!([])),
+            Self::StartThread => (
+                json!({"provider":{"type":"string","enum":["claude","codex","grok"]},"model":{"type":"string"},"mode":{"type":"string","enum":["ask_first","accept_edits","full_access"]},"title":{"type":"string"},"prompt":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
+                json!(["provider", "title", "prompt", "client_request_id"]),
+            ),
+            Self::GetTask => (
+                json!({"task_id":{"type":"string","format":"uuid"}}),
+                json!(["task_id"]),
+            ),
+            Self::MessageThread => (
+                json!({"thread_id":{"type":"string","format":"uuid"},"text":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
+                json!(["thread_id", "text", "client_request_id"]),
+            ),
+            Self::StopThread => (
+                json!({"thread_id":{"type":"string","format":"uuid"}}),
+                json!(["thread_id"]),
+            ),
+        };
+        json!({"name":self.name(),"description":self.description(),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
+    }
+}
 pub fn instructions() -> String {
     format!(
-        "{}\nOnly a running root may delegate, and you may read or control only your own tasks and children. Depth is 1. At most 4 children may have open tasks and a family may have 16 threads in total, including archived threads. Children default to your mode and may never use a broader mode: ask_first < accept_edits < full_access. Prompts and follow-ups may contain at most 100,000 characters. Use a client_request_id for start_thread and message_thread; retry the same key only with the same provider, target and text. Child reports carry up to 4,000 characters and arrive as a wake after your turn ends, so do not poll. Every refusal names the rule, its limit when applicable, and the next tool and ids needed to fix it.",
-        DESCRIPTIONS
-            .iter()
-            .map(|(name, text)| format!("{name}: {text}"))
+        "{}\nOnly a running root may delegate, and you may read or control only your own tasks and children. Depth is 1. At most {} children may have open tasks and a family may have {} threads in total, including archived threads. Children default to your mode and may never use a broader mode: ask_first < accept_edits < full_access. Prompts and follow-ups may contain at most {} characters. Use a client_request_id for start_thread and message_thread; retry the same key only with the same provider, target and text. Child reports carry up to {} characters and arrive as a wake after your turn ends, so do not poll. Every refusal names the rule, its limit when applicable, and the next tool and ids needed to fix it.",
+        Tool::ALL
+            .into_iter()
+            .map(|tool| format!("{}: {}", tool.name(), tool.description()))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        OPEN_CHILD_LIMIT,
+        FAMILY_LIMIT,
+        grouped(PROMPT_CHARS),
+        grouped(REPORT_CHARS)
     )
 }
 pub fn list() -> Value {
-    Value::Array(DESCRIPTIONS.iter().map(|(name,description)| {
-        let (properties,required) = match *name {
-            "list_providers" => (json!({}), json!([])),
-            "start_thread" => (json!({"provider":{"type":"string","enum":["claude","codex","grok"]},"model":{"type":"string"},"mode":{"type":"string","enum":["ask_first","accept_edits","full_access"]},"title":{"type":"string"},"prompt":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),json!(["provider","title","prompt","client_request_id"])),
-            "get_task" => (json!({"task_id":{"type":"string","format":"uuid"}}),json!(["task_id"])),
-            "message_thread" => (json!({"thread_id":{"type":"string","format":"uuid"},"text":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),json!(["thread_id","text","client_request_id"])),
-            "stop_thread" => (json!({"thread_id":{"type":"string","format":"uuid"}}),json!(["thread_id"])),
-            _ => unreachable!(),
-        };
-        json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
-    }).collect())
+    Value::Array(Tool::ALL.into_iter().map(Tool::schema).collect())
+}
+pub(crate) fn storage_recovery(call: &ToolCall) -> String {
+    let (name, args) = Tool::from_name(&call.name)
+        .map(|tool| (tool.name(), call.arguments.clone()))
+        .unwrap_or((Tool::ListProviders.name(), json!({})));
+    format!(
+        "When storage recovers and this root has a running turn, retry {name} with {args}, keeping the same client_request_id for a task request"
+    )
+}
+fn open_children(p: &Projection, parent: ThreadId) -> BTreeSet<ThreadId> {
+    p.tasks
+        .values()
+        .filter(|task| task.parent == parent && task.state == TaskState::Running)
+        .map(|task| task.child)
+        .collect()
+}
+fn check_child_slot(
+    p: &Projection,
+    parent: ThreadId,
+    child: Option<ThreadId>,
+) -> Result<(), CommandError> {
+    let open = open_children(p, parent);
+    if child.is_some_and(|child| open.contains(&child)) || open.len() < OPEN_CHILD_LIMIT {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "this parent has {} child threads with open tasks against the limit {}; wait for a report or call stop_thread with one of these thread_id values: {}",
+        open.len(),
+        OPEN_CHILD_LIMIT,
+        open.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,7 +181,8 @@ struct Get {
 struct Stop {
     thread_id: ThreadId,
 }
-fn parse<T: serde::de::DeserializeOwned>(arguments: Value, tool: &str) -> Result<T, CommandError> {
+fn parse<T: serde::de::DeserializeOwned>(arguments: Value, tool: Tool) -> Result<T, CommandError> {
+    let tool = tool.name();
     serde_json::from_value(arguments).map_err(|_| {
         invalid(format!(
             "invalid {tool} arguments; call {tool} with the fields shown by tools/list"
@@ -92,16 +192,18 @@ fn parse<T: serde::de::DeserializeOwned>(arguments: Value, tool: &str) -> Result
 fn invalid(text: String) -> CommandError {
     CommandError::Invalid(text)
 }
-fn prompt_cap(text: &str, tool: &str) -> Result<(), CommandError> {
+fn prompt_cap(text: &str, tool: Tool) -> Result<(), CommandError> {
+    let tool = tool.name();
     let count = text.chars().count();
-    if count > 100000 {
+    if count > PROMPT_CHARS {
         return Err(invalid(format!(
-            "prompt has {count} characters against the 100000 character limit; shorten it and call {tool} with a new client_request_id"
+            "prompt has {count} characters against the {PROMPT_CHARS} character limit; shorten it and call {tool} with a new client_request_id"
         )));
     }
     Ok(())
 }
-fn request_key(tool: &str, id: &str) -> Result<String, CommandError> {
+fn request_key(tool: Tool, id: &str) -> Result<String, CommandError> {
+    let tool = tool.name();
     if id.is_empty() {
         return Err(invalid(format!(
             "client_request_id must be nonempty; call {tool} with a new client_request_id"
@@ -205,29 +307,25 @@ pub fn decide(
     {
         return Err(invalid("tools require a running turn; finish this call and call list_providers in your next running turn".into()));
     }
-    let result = match call.name.as_str() {
-        "list_providers" => {
-            let args: BTreeMap<String, Value> = parse(call.arguments, "list_providers")?;
+    let tool=Tool::from_name(&call.name).ok_or_else(||invalid("unknown tool; call list_providers with {} or inspect tools/list for the supported tools".into()))?;
+    let result = match tool {
+        Tool::ListProviders => {
+            let args: BTreeMap<String, Value> = parse(call.arguments, tool)?;
             if !args.is_empty() {
                 return Err(invalid(
                     "list_providers takes no arguments; call list_providers with {}".into(),
                 ));
             }
-            let open: BTreeSet<_> = p
-                .tasks
-                .values()
-                .filter(|task| task.parent == caller && task.state == TaskState::Running)
-                .map(|task| task.child)
-                .collect();
-            json!({"providers":providers.iter().filter(|probe|probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models})).collect::<Vec<_>>(),"mode_ceiling":parent.config.mode,"remaining_fan_out":4usize.saturating_sub(open.len())})
+            let open = open_children(p, caller);
+            json!({"providers":providers.iter().filter(|probe|probe.provider == ProviderKind::Claude && probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models})).collect::<Vec<_>>(),"mode_ceiling":parent.config.mode,"remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
         }
-        "start_thread" => {
-            let args: Start = parse(call.arguments, "start_thread")?;
+        Tool::StartThread => {
+            let args: Start = parse(call.arguments, tool)?;
             if !matches!(parent.lineage, Lineage::Root) {
                 return Err(invalid("depth limit is 1: a child cannot start threads; report to your parent, which can call get_task with its task_id".into()));
             }
-            prompt_cap(&args.prompt, "start_thread")?;
-            let key = request_key("start_thread", &args.client_request_id)?;
+            prompt_cap(&args.prompt, tool)?;
+            let key = request_key(tool, &args.client_request_id)?;
             if let Some(task) = prior_task(p, caller, &key) {
                 if p.threads[&task.child].provider != args.provider
                     || prior_text(p, task) != Some(&args.prompt)
@@ -247,6 +345,12 @@ pub fn decide(
                     serde_json::to_value(parent.config.mode).unwrap()
                 )));
             }
+            if args.provider != ProviderKind::Claude {
+                return Err(invalid(format!(
+                    "provider {} is not built in this version; call list_providers with {{}} and choose a supported provider",
+                    args.provider.label()
+                )));
+            }
             if !providers.iter().any(|probe| {
                 probe.provider == args.provider
                     && probe.readiness == Readiness::Ready
@@ -254,30 +358,15 @@ pub fn decide(
             }) {
                 return Err(invalid("provider is not installed and ready; call list_providers and choose an available provider".into()));
             }
-            let open: BTreeSet<_> = p
-                .tasks
-                .values()
-                .filter(|task| task.parent == caller && task.state == TaskState::Running)
-                .map(|task| task.child)
-                .collect();
-            if open.len() >= 4 {
-                return Err(invalid(format!(
-                    "this parent has {} child threads with open tasks against the limit 4; wait for a report or call stop_thread with one of these thread_id values: {}",
-                    open.len(),
-                    open.iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
+            check_child_slot(p, caller, None)?;
             let family = p
                 .threads
                 .values()
                 .filter(|row| row.root() == parent.root())
                 .count();
-            if family >= 16 {
+            if family >= FAMILY_LIMIT {
                 return Err(invalid(format!(
-                    "family has {family} threads against the limit 16, including archived threads; call message_thread with an existing child thread_id, text and a new client_request_id"
+                    "family has {family} threads against the limit {FAMILY_LIMIT}, including archived threads; call message_thread with an existing child thread_id, text and a new client_request_id"
                 )));
             }
             let child = Thread {
@@ -311,17 +400,17 @@ pub fn decide(
             let task = queue_task(p, &mut c, caller, child_id, key, args.prompt);
             json!({"task_id":task.id,"thread_id":child_id})
         }
-        "get_task" => {
-            let args: Get = parse(call.arguments, "get_task")?;
+        Tool::GetTask => {
+            let args: Get = parse(call.arguments, tool)?;
             let task=p.tasks.get(&args.task_id).filter(|task|task.parent==caller).ok_or_else(||invalid(format!("task {} is not your own task; call get_task with a task_id returned to this thread by start_thread or message_thread",args.task_id)))?;
             let view = c.view(p, l, task.child).unwrap();
             json!({"task_id":task.id,"thread_id":task.child,"status":thread_status(&view).words(),"summary":match &task.state {TaskState::Running=>None,TaskState::Settled{summary,..}=>Some(summary)}})
         }
-        "message_thread" => {
-            let args: Message = parse(call.arguments, "message_thread")?;
+        Tool::MessageThread => {
+            let args: Message = parse(call.arguments, tool)?;
             let child = owned_child(p, caller, args.thread_id)?;
-            prompt_cap(&args.text, "message_thread")?;
-            let key = request_key("message_thread", &args.client_request_id)?;
+            prompt_cap(&args.text, tool)?;
+            let key = request_key(tool, &args.client_request_id)?;
             if let Some(task) = prior_task(p, caller, &key) {
                 if task.child != args.thread_id || prior_text(p, task) != Some(&args.text) {
                     return Err(invalid(format!(
@@ -337,20 +426,17 @@ pub fn decide(
                     child.id
                 )));
             }
+            check_child_slot(p, caller, Some(child.id))?;
             let task = queue_task(p, &mut c, caller, child.id, key, args.text);
             commands::start_changed(p, l, &mut c, now);
             message_result(p, l, &c, &task)
         }
-        "stop_thread" => {
-            let args: Stop = parse(call.arguments, "stop_thread")?;
+        Tool::StopThread => {
+            let args: Stop = parse(call.arguments, tool)?;
             owned_child(p, caller, args.thread_id)?;
             commands::stop_child_from_tool(p, l, &mut c, args.thread_id, now);
             json!({"thread_id":args.thread_id,"stopped":true})
         }
-        _ => return Err(invalid(
-            "unknown tool; call list_providers or inspect tools/list for the five supported tools"
-                .into(),
-        )),
     };
     commands::start_changed(p, l, &mut c, now);
     Ok((c, result))
@@ -361,7 +447,7 @@ pub fn task_text(p: &Projection, turn: &Turn, text: String) -> String {
         .min_by_key(|prior| prior.ordinal)
         .is_some_and(|first| first.id == turn.id)
     {
-        format!("{CHILD_GUIDANCE}{text}")
+        format!("{}{text}", CHILD_GUIDANCE.as_str())
     } else {
         text
     }

@@ -66,6 +66,7 @@ struct AppState {
     max_batch_events: usize,
     max_batch_gap_ms: f64,
     last_text_batch: Option<Instant>,
+    last_activity: BTreeMap<ThreadId, Millis>,
 }
 fn stop_target(
     thread: ThreadId,
@@ -126,6 +127,9 @@ impl AppState {
         }
     }
     fn apply(&mut self, event: UiEvent) {
+        if let Some((thread, time)) = header::note_activity(&event, veyra_engine::actor::now()) {
+            self.last_activity.insert(thread, time);
+        }
         if let UiEvent::Change { event, .. } = &event {
             match event {
                 ChangeEvent::ProjectAdded(project) => {
@@ -138,6 +142,7 @@ impl AppState {
                     if let Some(row) = self.threads.get_mut(thread) {
                         row.archived = true;
                     }
+                    self.last_activity.remove(thread);
                     self.item_order.remove(thread);
                     if let Some(items) = self.items.remove(thread) {
                         for id in items.keys() {
@@ -354,8 +359,17 @@ impl AppState {
             (
                 self.turns
                     .get(&item.turn)
-                    .map(|turn| turn.ordinal)
-                    .unwrap_or_default(),
+                    .map(|turn| {
+                        (
+                            turn.state == TurnState::Queued,
+                            turn.state.started().unwrap_or(match turn.state {
+                                TurnState::Ended { at, .. } => at,
+                                _ => i64::MAX,
+                            }),
+                            turn.ordinal,
+                        )
+                    })
+                    .unwrap_or((true, i64::MAX, 0)),
                 item.seq,
             )
         });
@@ -371,6 +385,19 @@ impl AppState {
         self.item_order
             .get(&thread)
             .map_or(0, |order| order.ids.len())
+    }
+    fn transcript_rows(&self, thread: ThreadId) -> usize {
+        self.transcript_len(thread)
+            + usize::from(!transcript::family_children(self, thread).is_empty())
+    }
+    fn transcript_position(&self, thread: ThreadId, item: ItemId) -> Option<usize> {
+        self.item_order
+            .get(&thread)?
+            .positions
+            .get(&item)
+            .map(|index| {
+                *index + usize::from(!transcript::family_children(self, thread).is_empty())
+            })
     }
     fn transcript_item(&self, thread: ThreadId, index: usize) -> Option<&Item> {
         let id = self.item_order.get(&thread)?.ids.get(index)?;
@@ -390,7 +417,7 @@ impl AppState {
                         if Some(*thread) != chat {
                             return None;
                         }
-                        self.item_order.get(thread)?.positions.get(item).copied()
+                        self.transcript_position(*thread, *item)
                     })
                     .collect()
             })
@@ -399,6 +426,33 @@ impl AppState {
         (0..self.transcript_len(thread))
             .filter_map(|index| self.transcript_item(thread, index).cloned())
             .collect()
+    }
+    fn parent(&self, thread: ThreadId) -> Option<&Thread> {
+        let Lineage::Child { parent, .. } = self.threads.get(&thread)?.lineage else {
+            return None;
+        };
+        self.threads.get(&parent)
+    }
+    fn quiet_minutes(&self, thread: ThreadId) -> Option<Millis> {
+        let open_tool = self.items.get(&thread).is_some_and(|items| {
+            items
+                .values()
+                .any(|item| matches!(&item.body, ItemBody::Tool(tool) if tool.result.is_none()))
+        });
+        header::quiet_for(
+            &self.status(thread),
+            self.last_activity.get(&thread).copied(),
+            veyra_engine::actor::now(),
+            open_tool,
+            !self.pending_requests(thread).is_empty(),
+        )
+    }
+    fn header_status(&self, thread: ThreadId) -> String {
+        let mut text = header::status_text(&self.status(thread));
+        if let Some(minutes) = self.quiet_minutes(thread) {
+            text.push_str(&format!(" · Quiet for {minutes} min"));
+        }
+        text
     }
     fn pending_requests(&self, thread: ThreadId) -> Vec<&Request> {
         self.requests
@@ -524,6 +578,7 @@ pub struct Shell {
     branch: String,
     branch_task: tokio::task::JoinSet<()>,
     provider_picker: Option<Entity<PopupMenu>>,
+    thread_menu: Option<(ThreadId, Entity<PopupMenu>)>,
     #[cfg(debug_assertions)]
     provider_picker_labels: Vec<String>,
     _input_subscription: Subscription,
@@ -593,8 +648,14 @@ impl Shell {
                     .update(cx, |shell, cx| {
                         let old_default = shell.state.settings.default_mode;
                         for event in &batch {
-                            if let UiEvent::StorageBlocked { error } = event {
-                                shell.notice = error.clone().map(Into::into);
+                            match event {
+                                UiEvent::StorageBlocked { error } => {
+                                    shell.notice = error.clone().map(Into::into)
+                                }
+                                UiEvent::RecoveryNotice(notice) => {
+                                    shell.notice = Some(notice.clone().into())
+                                }
+                                _ => {}
                             }
                         }
                         let families: BTreeMap<_, _> = shell
@@ -604,7 +665,20 @@ impl Shell {
                             .map(|thread| (thread.root(), shell.state.family_status(thread.root())))
                             .collect();
                         let text_rows = shell.state.text_rows(&batch, shell.view.chat());
+                        let had_family = shell.view.chat().is_some_and(|thread| {
+                            !transcript::family_children(&shell.state, thread).is_empty()
+                        });
                         shell.state.apply_all(batch);
+                        if shell.view.chat().is_some_and(|id| {
+                            shell
+                                .state
+                                .threads
+                                .get(&id)
+                                .is_some_and(|thread| thread.archived)
+                        }) {
+                            shell.show(MainView::NewThread);
+                            shell.config.mode = shell.state.settings.default_mode;
+                        }
                         shell.post_banners(&families, cx);
                         shell.start_branch_lookup(cx);
                         if shell.project.is_none() {
@@ -618,9 +692,15 @@ impl Shell {
                         let count = shell
                             .view
                             .chat()
-                            .map(|thread| shell.state.transcript_len(thread))
+                            .map(|thread| shell.state.transcript_rows(thread))
                             .unwrap_or_default();
+                        let has_family = shell.view.chat().is_some_and(|thread| {
+                            !transcript::family_children(&shell.state, thread).is_empty()
+                        });
                         shell.scroller.update(cx, |state, cx| {
+                            if has_family && !had_family {
+                                state.prepend(cx);
+                            }
                             if count > state.item_count() {
                                 state.append(count - state.item_count(), cx);
                             } else if count < state.item_count() {
@@ -649,12 +729,7 @@ impl Shell {
                 cx.background_executor().timer(cadence).await;
                 if this
                     .update(cx, |shell, cx| {
-                        if shell
-                            .state
-                            .statuses
-                            .values()
-                            .any(|status| matches!(status, Status::Working { .. }))
-                        {
+                        if header::cadence_due(&shell.state.statuses) {
                             cx.notify();
                         }
                     })
@@ -705,6 +780,7 @@ impl Shell {
             branch: String::new(),
             branch_task: Default::default(),
             provider_picker: None,
+            thread_menu: None,
             #[cfg(debug_assertions)]
             provider_picker_labels: vec![],
             _input_subscription: subscription,
@@ -752,6 +828,60 @@ impl Shell {
         });
         cx.notify();
     }
+    fn set_thread_menu(
+        &mut self,
+        thread: Option<ThreadId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.thread_menu = thread
+            .filter(|id| self.state.threads.get(id).is_some_and(|row| !row.archived))
+            .map(|id| {
+                let keep = sidebar::can_keep_children(&self.state, id);
+                let focus = self.focus.clone();
+                let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+                    let menu = menu
+                        .action_context(focus)
+                        .menu("Stop thread", Box::new(StopThread { thread: Some(id) }))
+                        .menu("Archive", Box::new(Archive { thread: Some(id) }));
+                    if keep {
+                        menu.menu(
+                            "Archive, keep child threads",
+                            Box::new(ArchiveKeepChildren { thread: Some(id) }),
+                        )
+                    } else {
+                        menu
+                    }
+                });
+                cx.subscribe_in(&menu, window, |shell, _, _: &DismissEvent, window, cx| {
+                    shell.thread_menu = None;
+                    shell.input.update(cx, |input, cx| input.focus(window, cx));
+                    cx.notify();
+                })
+                .detach();
+                (id, menu)
+            });
+        cx.notify();
+    }
+    fn archive(
+        &mut self,
+        thread: Option<ThreadId>,
+        keep_children: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(thread) = thread.or_else(|| self.view.chat()) {
+            self.thread_menu = None;
+            self.send_command(
+                Command::ArchiveThread {
+                    thread,
+                    keep_children,
+                },
+                window,
+                cx,
+            );
+        }
+    }
     pub(crate) fn notice(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         let message = message.into();
         tracing::info!(message = message.as_ref(), "window notice");
@@ -795,6 +925,15 @@ impl Shell {
                     cx.notify();
                 }
                 Ok(Ok(Ack::Applied)) => {
+                    if shell.view.chat().is_some_and(|id| {
+                        shell
+                            .state
+                            .threads
+                            .get(&id)
+                            .is_some_and(|thread| thread.archived)
+                    }) {
+                        shell.new_thread(window, cx);
+                    }
                     shell.notice = None;
                     cx.notify();
                 }
@@ -881,7 +1020,7 @@ impl Shell {
                     }
                 };
                 if applied && shell.view.chat() == Some(thread) {
-                    let count = shell.state.transcript_len(thread);
+                    let count = shell.state.transcript_rows(thread);
                     shell
                         .scroller
                         .update(cx, |state, cx| state.reset(count, cx));
@@ -1369,14 +1508,21 @@ impl Shell {
             }));
             for thread in self
                 .state
-                .threads
-                .values()
-                .filter(|thread| thread.project == project.id && !thread.archived)
+                .projects
+                .get(&project.id)
+                .into_iter()
+                .flat_map(|_| sidebar::ordered_threads(&self.state))
+                .map(|id| &self.state.threads[&id])
+                .filter(|thread| thread.project == project.id)
             {
                 rows.push(serde_json::json!({
                     "kind":"thread", "id":thread.id, "title":thread.title,
                     "status":self.state.status(thread.id).words(),
-                    "archived":thread.archived, "mode":thread.config.mode, "lineage":thread.lineage
+                    "archived":thread.archived, "mode":thread.config.mode, "lineage":thread.lineage,
+                    "row_status":if thread.root()==thread.id {self.state.family_status(thread.id)} else {self.state.status(thread.id)}.words(),
+                    "depth":usize::from(sidebar::nested(&self.state,thread)),
+                    "quiet_minutes":self.state.quiet_minutes(thread.id),
+                    "archive_keep_children":sidebar::can_keep_children(&self.state,thread.id)
                 }));
             }
         }
@@ -1393,7 +1539,10 @@ impl Shell {
                     "id":thread.id, "title":thread.title, "lineage":thread.lineage,
                     "native_id":thread.native.as_ref().map(|native| &native.0),
                     "cli_version":thread.cli_version, "config":thread.config,
-                    "status":status.words(), "header_status":header::status_text(&status),
+                    "status":status.words(), "header_status":self.state.header_status(thread.id),
+                    "quiet_minutes":self.state.quiet_minutes(thread.id),
+                    "breadcrumb":self.state.parent(thread.id).map(|parent| serde_json::json!({"thread":parent.id,"title":parent.title,"linked":!parent.archived})),
+                    "parent_attention":self.state.parent(thread.id).filter(|parent| self.state.status(parent.id)==Status::NeedsYou).map(|parent|format!("{} needs you",parent.provider.label())),
                     "failure":self.state.failure(thread.id), "hold":thread.hold,
                     "wait_reason":self.engine.window_threads().get(&thread.id)
                         .and_then(|state| state.wait_reason).map(|reason| reason.to_string())
@@ -1430,6 +1579,29 @@ impl Shell {
             .map(|(index, item)| {
                 let mut row = transcript::dump_item(item);
                 row["expanded"] = serde_json::json!(self.expanded.contains(&item.id));
+                let first = index == 0 || items[index - 1].turn != item.turn;
+                row["turn_label"] = self
+                    .state
+                    .turns
+                    .get(&item.turn)
+                    .filter(|_| first)
+                    .and_then(|turn| transcript::turn_label(&self.state, turn))
+                    .into();
+                row["report_delivered"] =
+                    transcript::report_delivered(&self.state, item, items.get(index + 1)).into();
+                if let ItemBody::TaskCard(task) = item.body {
+                    row["kind"] = "task_card".into();
+                    row["text"] = format!(
+                        "Task from {}",
+                        self.state
+                            .tasks
+                            .get(&task)
+                            .and_then(|task| self.state.threads.get(&task.parent))
+                            .map(|parent| parent.provider.label())
+                            .unwrap_or("parent")
+                    )
+                    .into();
+                }
                 row["outcome"] =
                     transcript::row_outcome(item, items.get(index + 1), &self.state.turns).into();
                 row["wait_reason"] = self
@@ -1490,11 +1662,17 @@ impl Shell {
         let perf = self.engine.perf();
         let mut transcript = self.scroller.read(cx).dump();
         transcript["items"] = serde_json::json!(self.dump_transcript());
+        transcript["family_card"] = self.view.chat().filter(|thread|!transcript::family_children(&self.state,*thread).is_empty())
+            .map(|thread|serde_json::json!({"title":format!("Started {} agents",transcript::family_children(&self.state,thread).len()),
+                "rows":transcript::family_children(&self.state,thread).into_iter().map(|child|serde_json::json!({
+                    "thread":child.id,"title":child.title,"glyph":sidebar::glyph(&self.state.status(child.id)),
+                    "status":self.state.status(child.id).words(),"open_action":"veyra::SelectThread","stop_action":"veyra::StopThread"
+                })).collect::<Vec<_>>()})).into();
         serde_json::json!({
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
             "header_branch":self.branch,
-            "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows()},
+            "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows(), "menu_thread":self.thread_menu.as_ref().map(|(id,_)|id)},
             "selected_thread":self.dump_selected(), "transcript":transcript,
             "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(cx),
             "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
@@ -1567,6 +1745,17 @@ impl Render for Shell {
                     shell.send_command(Command::StopThread { thread }, window, cx);
                 }
             }))
+            .on_action(cx.listener(|shell, action: &OpenThreadMenu, window, cx| {
+                shell.set_thread_menu(action.thread.or_else(|| shell.view.chat()), window, cx);
+            }))
+            .on_action(cx.listener(|shell, action: &Archive, window, cx| {
+                shell.archive(action.thread, false, window, cx);
+            }))
+            .on_action(
+                cx.listener(|shell, action: &ArchiveKeepChildren, window, cx| {
+                    shell.archive(action.thread, true, window, cx);
+                }),
+            )
             .on_action(cx.listener(|shell, _: &NextNeedsYou, window, cx| {
                 if let Some(thread) = sidebar::next_needs_you(
                     &sidebar::ordered_threads(&shell.state),
@@ -1774,11 +1963,7 @@ impl Render for Shell {
                 }
                 shell.scroller.update(cx, |state, cx| {
                     if let Some(index) = shell.view.chat().and_then(|thread| {
-                        shell
-                            .state
-                            .transcript(thread)
-                            .iter()
-                            .position(|row| Some(row.id) == item)
+                        item.and_then(|item| shell.state.transcript_position(thread, item))
                     }) {
                         state.expand(index, cx);
                     } else {
@@ -3687,6 +3872,361 @@ mod tests {
             state.text_rows(&[text(thread, ItemId::new())], Some(thread)),
             Some(BTreeSet::new())
         );
+    }
+    #[test]
+    fn family_rows_labels_and_delivery_read_the_projection() {
+        let root = ThreadId::new();
+        let child = ThreadId::new();
+        let project = ProjectId::new();
+        let mut state = AppState::default();
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ProjectAdded(Project {
+                id: project,
+                path: "/tmp".into(),
+                name: "Project".into(),
+            }),
+        });
+        let parent = Thread {
+            id: root,
+            project,
+            title: "Parent".into(),
+            lineage: Lineage::Root,
+            provider: ProviderKind::Claude,
+            config: ThreadConfig {
+                model: None,
+                effort: None,
+                mode: PermissionMode::FullAccess,
+            },
+            cwd: "/tmp".into(),
+            native: None,
+            native_cursor: None,
+            cli_version: None,
+            hold: None,
+            view: View::Chat,
+            import_pending: false,
+            archived: false,
+        };
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ThreadCreated(parent.clone()),
+        });
+        let turn = TurnId::new();
+        let item = ItemId::new();
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::TurnStarted(Turn {
+                id: turn,
+                thread: root,
+                ordinal: 1,
+                origin: TurnOrigin::Provider,
+                state: TurnState::Running { since: 1000 },
+            }),
+        });
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ItemAdded(Item {
+                id: item,
+                thread: root,
+                turn,
+                seq: 1,
+                body: ItemBody::AssistantText {
+                    text: "Root reply".into(),
+                    done: false,
+                },
+            }),
+        });
+        assert_eq!(state.transcript_position(root, item), Some(0));
+        let mut worker = parent;
+        worker.id = child;
+        worker.title = "Child".into();
+        worker.lineage = Lineage::Child {
+            parent: root,
+            relationship: Relationship::Subagent,
+            root,
+        };
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ThreadCreated(worker),
+        });
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ThreadStatusChanged {
+                thread: root,
+                status: Status::Done { took: 1 },
+            },
+        });
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ThreadStatusChanged {
+                thread: child,
+                status: Status::Working { since: 1000 },
+            },
+        });
+        assert_eq!(super::sidebar::ordered_threads(&state), [root, child]);
+        assert!(super::sidebar::nested(&state, &state.threads[&child]));
+        assert!(super::sidebar::can_keep_children(&state, root));
+        assert_eq!(state.family_status(root), Status::Working { since: 1000 });
+        assert_eq!(state.transcript_position(root, item), Some(1));
+        assert_eq!(state.transcript_rows(root), 2);
+        let batch = vec![UiEvent::TextAppended {
+            thread: root,
+            item,
+            text: " text".into(),
+            counter: 1,
+            #[cfg(debug_assertions)]
+            delta_count: 1,
+        }];
+        assert_eq!(
+            state.text_rows(&batch, Some(root)),
+            Some(BTreeSet::from([1]))
+        );
+        let task = TaskId::new();
+        let task_turn = TurnId::new();
+        let wake = TurnId::new();
+        let mut task = veyra_engine::domain::Task {
+            id: task,
+            parent: root,
+            child,
+            turn: task_turn,
+            request_key: "start_thread:labels".into(),
+            state: TaskState::Settled {
+                outcome: TurnOutcome::Completed,
+                summary: "report".into(),
+                delivery: Delivery::Pending { wake },
+            },
+        };
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::TaskSettled(task.clone()),
+        });
+        let origin = Turn {
+            id: task_turn,
+            thread: child,
+            ordinal: 1,
+            origin: TurnOrigin::Task { task: task.id },
+            state: TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                started: Some(1000),
+                at: 2000,
+            },
+        };
+        assert_eq!(
+            super::transcript::turn_label(&state, &origin),
+            Some("Task from Parent".into())
+        );
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::TurnEnded(origin.clone()),
+        });
+        let mut report = origin;
+        report.id = wake;
+        report.thread = root;
+        report.origin = TurnOrigin::Wake {
+            tasks: vec![task.id],
+        };
+        assert_eq!(
+            super::transcript::turn_label(&state, &report),
+            Some("Reports from 1 child thread".into())
+        );
+        let later_reply = Item {
+            id: ItemId::new(),
+            thread: child,
+            turn: TurnId::new(),
+            seq: 3,
+            body: ItemBody::AssistantText {
+                text: "report".into(),
+                done: true,
+            },
+        };
+        assert!(!super::transcript::report_delivered(
+            &state,
+            &later_reply,
+            None
+        ));
+        task.state = TaskState::Settled {
+            outcome: TurnOutcome::Completed,
+            summary: "report".into(),
+            delivery: Delivery::Delivered { wake },
+        };
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::TaskDelivered(task),
+        });
+        assert!(super::transcript::report_delivered(
+            &state,
+            &later_reply,
+            None
+        ));
+        assert!(!super::transcript::report_delivered(
+            &state,
+            &later_reply,
+            Some(&later_reply)
+        ));
+        let mut followup = state.tasks.values().next().unwrap().clone();
+        followup.id = TaskId::new();
+        followup.turn = TurnId::new();
+        followup.state = TaskState::Settled {
+            outcome: TurnOutcome::Completed,
+            summary: "new report".into(),
+            delivery: Delivery::Pending { wake },
+        };
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::TurnEnded(Turn {
+                id: followup.turn,
+                thread: child,
+                ordinal: 2,
+                origin: TurnOrigin::Task { task: followup.id },
+                state: TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(3000),
+                    at: 4000,
+                },
+            }),
+        });
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::TaskSettled(followup.clone()),
+        });
+        assert!(!super::transcript::report_delivered(
+            &state,
+            &later_reply,
+            None
+        ));
+        report.origin = TurnOrigin::Wake {
+            tasks: state.tasks.keys().copied().collect(),
+        };
+        assert_eq!(
+            super::transcript::turn_label(&state, &report),
+            Some("Reports from 1 child thread".into())
+        );
+        followup.state = TaskState::Settled {
+            outcome: TurnOutcome::Completed,
+            summary: "new report".into(),
+            delivery: Delivery::Delivered { wake },
+        };
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::TaskDelivered(followup),
+        });
+        assert!(super::transcript::report_delivered(
+            &state,
+            &later_reply,
+            None
+        ));
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::ThreadArchived { thread: root },
+        });
+        assert_eq!(super::sidebar::ordered_threads(&state), [child]);
+        assert!(!super::sidebar::nested(&state, &state.threads[&child]));
+        assert!(state.parent(child).unwrap().archived);
+    }
+    #[test]
+    fn transcript_orders_started_turns_before_queued_turns() {
+        let thread = ThreadId::new();
+        let user = TurnId::new();
+        let provider = TurnId::new();
+        let wake = TurnId::new();
+        let task = TurnId::new();
+        let mut state = AppState::default();
+        let mut items = Vec::new();
+        for (id, ordinal, origin, turn_state, text) in [
+            (
+                user,
+                1,
+                TurnOrigin::User {
+                    item: ItemId::new(),
+                },
+                TurnState::Queued,
+                "queued user",
+            ),
+            (
+                provider,
+                2,
+                TurnOrigin::Provider,
+                TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(2000),
+                    at: 2500,
+                },
+                "provider reply first",
+            ),
+            (
+                wake,
+                3,
+                TurnOrigin::Wake {
+                    tasks: vec![TaskId::new()],
+                },
+                TurnState::Running { since: 4000 },
+                "wake",
+            ),
+            (
+                task,
+                4,
+                TurnOrigin::Task {
+                    task: TaskId::new(),
+                },
+                TurnState::Queued,
+                "queued task",
+            ),
+        ] {
+            state.apply(UiEvent::Change {
+                counter: None,
+                event: ChangeEvent::TurnQueued(Turn {
+                    id,
+                    thread,
+                    ordinal,
+                    origin,
+                    state: turn_state,
+                }),
+            });
+            let item = Item {
+                id: ItemId::new(),
+                thread,
+                turn: id,
+                seq: 1,
+                body: ItemBody::UserText(text.into()),
+            };
+            items.push(item.clone());
+            state.apply(UiEvent::Change {
+                counter: None,
+                event: ChangeEvent::ItemAdded(item),
+            });
+        }
+        let order = |state: &AppState| {
+            state
+                .transcript(thread)
+                .iter()
+                .map(|item| item.turn)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&state), [provider, wake, user, task]);
+        let mut admitted = state.turns[&user].clone();
+        admitted.state = TurnState::Ended {
+            outcome: TurnOutcome::Completed,
+            started: Some(3000),
+            at: 3500,
+        };
+        state.apply(UiEvent::Change {
+            counter: None,
+            event: ChangeEvent::TurnEnded(admitted),
+        });
+        assert_eq!(order(&state), [provider, user, wake, task]);
+        let request = state.begin_snapshot(thread);
+        state.finish_snapshot(
+            thread,
+            request,
+            ThreadSnapshot {
+                items,
+                buffered_text: BTreeMap::new(),
+                #[cfg(debug_assertions)]
+                delta_counts: BTreeMap::new(),
+                counter: 1,
+            },
+        );
+        assert_eq!(order(&state), [provider, user, wake, task]);
     }
     #[test]
     fn transcript_cache_keeps_order_text_and_completion() {

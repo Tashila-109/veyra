@@ -355,6 +355,64 @@ def create(name, prompt, slow=False, scenario='ok-reply'):
     dump = poll(name+'-selected',lambda d: d['selected_thread'] is not None
         and int(sql('select count(*) from threads')) == before+1)
     return dump['selected_thread']['id']
+def stage_family(parent='waiting', child='complete'):
+    pid = identity()
+    counter = PROOF/'family-lanes.json'
+    lanes = json.loads(counter.read_text()) if counter.exists() else {}
+    number = lanes.get('next',1) if lanes.get('pid') == pid else 1
+    counter.write_text(json.dumps({'pid':pid,'next':number+2})+'\n')
+    records = [json.loads(line) for line in (SOURCE/'parent-start-thread.jsonl').read_text().splitlines()]
+    first = next(i for i,record in enumerate(records) if record.get('line',{}).get('type') == 'result')
+    if parent == 'running':
+        records.insert(first, {'type':'expect_outbound','line':{'type':'control_request','request_id':'veyra-interrupt','request':{'subtype':'interrupt'}}})
+        records[first+1]['after_ms'] = 0
+        records[first+1]['line']['subtype'] = 'error_during_execution'
+    elif parent == 'attention':
+        approval = [json.loads(line) for line in (SOURCE/'approval-deny.jsonl').read_text().splitlines()]
+        insertion = next(i for i,record in enumerate(records) if record.get('type') == 'mcp_expect' and record.get('line',{}).get('id') == 3)+1
+        records[insertion:insertion] = approval[4:6]
+    else:
+        assert parent == 'waiting'
+    if child == 'complete':
+        child_records = [json.loads(line) for line in (SOURCE/'child-task.jsonl').read_text().splitlines()]
+        for record in child_records:
+            wire = record.get('line',{})
+            if wire.get('type') == 'assistant':
+                wire['message']['content'][0]['text'] = 'First report line\n**Second report line**\nThird report line\n\n- A list item\n- Another item\n\n~~~text\ncode line one\ncode line two\n~~~'
+            if wire.get('type') == 'result': record['after_ms'] = 30000
+    else:
+        assert child == 'running'
+        child_records = [json.loads(line) for line in (SOURCE/'long-reply.jsonl').read_text().splitlines()]
+    def write(lane,epoch,records):
+        (FIXTURES/f't{lane}-s{epoch}.jsonl').write_text('\n'.join(json.dumps(record) for record in records)+'\n')
+    write(number,1,records)
+    write(number+1,1,child_records)
+    resumed = [json.loads(line) for line in (SOURCE/'parent-wake.jsonl').read_text().splitlines()]
+    for epoch in [2,3]: write(number,epoch,resumed)
+    return number
+def create_family(name, parent='waiting', child='complete'):
+    stage_family(parent,child)
+    action(name+'-new','NewThread')
+    ctl(name+'-text','text',name)
+    before = int(sql('select count(*) from threads'))
+    ctl(name+'-send','keys','secondary-enter')
+    dump = poll(name+'-root',lambda d:d['selected_thread'] is not None
+        and d['selected_thread']['lineage']=='Root' and d['selected_thread']['title']==name
+        and int(sql('select count(*) from threads'))>=before+1)
+    root = dump['selected_thread']['id']
+    poll(name+'-task',lambda d:any(task['parent']==root for task in d['tasks']))
+    row = sql("select child_thread_id||'|'||id from tasks where parent_thread_id='"+root+"'").split('|')
+    assert len(row)==2
+    return root,row[0],row[1]
+def select(name, thread):
+    action(name+'-select','SelectThread',{'thread':thread})
+    return poll(name,lambda d:d['selected_thread'] is not None and d['selected_thread']['id']==thread
+        and len(d['transcript']['items'])>0)
+def family_delivered(name, root, task):
+    return poll(name,lambda d:sql("select delivery from tasks where id='"+task+"'")=='delivered'
+        and any(row['id']==root and row['status']=='Done' for row in d['sidebar']['rows'] if row['kind']=='thread'))
+def pending_wake(root):
+    return sql("select count(*) from tasks where parent_thread_id='"+root+"' and delivery='pending'")=='1'
 PY
 RUN="$RUN" PYTHONPATH="$PROOF" python3 - <<'PY'
 from driver import *
@@ -420,6 +478,7 @@ PY
 
 Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.md), [chat-send-stream](features/chat-send-stream.md) and [settings](features/settings.md).
 Also run [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
+Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
 The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
 Use the same exported `RUN` in every fresh shell.
@@ -444,7 +503,15 @@ After another Send on an existing thread, gate `wait Done` on the new turn row o
 The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
 `header_branch` is the branch text used by the header and is empty after leaving Chat.
 `view` is `new_thread`, `chat`, `failed_thread` or `settings`.
-`sidebar.rows` holds project and thread rows, with each thread's own status.
+`sidebar.rows` holds project and thread rows in tree order, with status for each thread, row_status for its rendered family glyph, depth, quiet_minutes and archive_keep_children.
+`sidebar.menu_thread` names the open row menu.
+OpenThreadMenu, Archive and ArchiveKeepChildren accept a thread id; the latter keeps a root's children running.
+Each thread and selected_thread has lineage, and top-level tasks carries task state and delivery.
+The child breadcrumb includes its root title and whether its SelectThread link is available; parent_attention names a parent that needs you.
+`transcript.family_card` carries the first derived list row, Started N agents, and its Open and Stop actions.
+`transcript.items` contains the stored item rows; item_tops includes the family card first when present.
+Task and Wake rows carry turn_label, task_card text, and report_delivered on the delivered task's final item.
+`selected_thread.quiet_minutes` and header_status share Quiet for N min without changing status.
 `selected_thread` includes its native id, configuration, failure cause and `header_status`, the rendered status with elapsed seconds.
 `composer` includes the chosen provider and permission mode, plus Send's readiness and disabled reason.
 `providers` reports each probe's path, version, models, readiness and `account`, either `known` or `unknown`, with no account value.
@@ -518,7 +585,11 @@ required = {
         'approval-notebook-edit.png','approval-mcp.png','approval-long-command.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
-    'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json'],
+    'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json',
+        'restart-child-interrupted.png','restart-child-parent-held.png','restart-child-delivered.json'],
+    'multi-agent':['multi-tree-working.png','multi-child-task.png','multi-family-done.png','multi-report-delivered.png',
+        'multi-child-parent-needs.png','multi-menu.png','multi-child-stop-held.png','multi-parent-stop-held.png',
+        'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
         'settings-existing.json','settings-new.json'],
     'new-thread-live':['new-thread-live.json','new-thread-live.png'],

@@ -83,11 +83,31 @@ fn verify_map_names() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let skill = root.join(".agents/skills/verify-veyra");
     let mut map = fs::read_to_string(skill.join("SKILL.md")).unwrap();
+    let mut features = String::new();
     for entry in fs::read_dir(skill.join("features")).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "md") {
-            map.push_str(&fs::read_to_string(path).unwrap());
+            let page = fs::read_to_string(path).unwrap();
+            features.push_str(&page);
+            map.push_str(&page);
         }
+    }
+    let feature_names: BTreeSet<_> = identifiers(&features).collect();
+    for tool in veyra_engine::tools::list()
+        .as_array()
+        .expect("engine tool list")
+    {
+        let name = tool["name"].as_str().expect("tool name");
+        assert!(
+            tool["description"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "empty description for {name}"
+        );
+        assert!(
+            feature_names.contains(name),
+            "feature map is missing tool {name}"
+        );
     }
     let mapped: BTreeSet<_> = identifiers(&map).collect();
     let actions = fs::read_to_string(root.join("crates/veyra/src/ui/actions.rs")).unwrap();

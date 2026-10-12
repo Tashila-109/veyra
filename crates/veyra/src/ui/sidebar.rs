@@ -1,6 +1,6 @@
 use super::{Shell, actions::*, composer::labelled_button, theme::Theme};
 use gpui_kit::base::Selectable;
-use gpui_kit::component::StyledExt;
+use gpui_kit::component::{StyledExt, popover::Popover};
 use gpui_kit::{prelude::*, *};
 use std::collections::BTreeMap;
 use veyra_engine::domain::{Status, ThreadId};
@@ -58,7 +58,24 @@ pub fn next_needs_you(
     }
     None
 }
-pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
+pub(super) fn nested(state: &super::AppState, thread: &veyra_engine::domain::Thread) -> bool {
+    thread.root() != thread.id
+        && state
+            .threads
+            .get(&thread.root())
+            .is_some_and(|root| !root.archived)
+}
+pub(super) fn can_keep_children(state: &super::AppState, root: ThreadId) -> bool {
+    state
+        .threads
+        .get(&root)
+        .is_some_and(|thread| thread.root() == root)
+        && state
+            .threads
+            .values()
+            .any(|thread| thread.root() == root && thread.id != root && !thread.archived)
+}
+pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let mut rows = Vec::new();
     for project in shell.state.projects.values() {
@@ -90,14 +107,47 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
             } else {
                 shell.state.status(thread.id)
             };
+            let menu = shell
+                .thread_menu
+                .as_ref()
+                .filter(|(thread, _)| *thread == id)
+                .map(|(_, menu)| menu.clone());
+            let this = cx.entity().downgrade();
+            let row_menu = Popover::new(SharedString::from(format!("thread-menu-{id}")))
+                .appearance(false)
+                .open(menu.is_some())
+                .when_some(menu.as_ref(), |popover, menu| {
+                    popover.track_focus(&menu.focus_handle(cx))
+                })
+                .trigger(
+                    labelled_button(
+                        SharedString::from(format!("thread-menu-trigger-{id}")),
+                        "…",
+                        cx,
+                    )
+                    .accessibility_label("Thread actions")
+                    .tooltip("Thread actions"),
+                )
+                .on_open_change(move |open, window, cx| {
+                    if *open {
+                        window.dispatch_action(Box::new(OpenThreadMenu { thread: Some(id) }), cx);
+                    } else {
+                        let _ =
+                            this.update(cx, |shell, cx| shell.set_thread_menu(None, window, cx));
+                    }
+                })
+                .content(move |_, _, _| div().children(menu.clone()));
             rows.push(
                 div()
                     .h_flex()
                     .items_center()
                     .h(t.layout.thread_row)
                     .gap(t.space.0[3])
-                    .when(thread.root() != thread.id, |row| {
-                        row.pl(t.layout.agent_margin)
+                    .when(nested(&shell.state, thread), |row| {
+                        row.ml(t.layout.agent_margin)
+                            .pl(t.space.0[3])
+                            .border_l(t.layout.border)
+                            .border_color(t.colors.border)
                     })
                     .child(
                         div()
@@ -126,6 +176,14 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                             window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
                         }),
                     )
+                    .when_some(shell.state.quiet_minutes(id), |row, minutes| {
+                        row.child(
+                            div()
+                                .text_size(t.text.meta.size)
+                                .text_color(t.colors.text_muted)
+                                .child(format!("Quiet for {minutes} min")),
+                        )
+                    })
                     .child(
                         labelled_button(SharedString::from(format!("stop-thread-{id}")), "■", cx)
                             .w(t.layout.icon_button)
@@ -136,6 +194,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                                     .dispatch_action(Box::new(StopThread { thread: Some(id) }), cx)
                             }),
                     )
+                    .child(row_menu)
                     .into_any_element(),
             );
         }

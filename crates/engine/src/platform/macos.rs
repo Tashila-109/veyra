@@ -364,6 +364,36 @@ pub fn private_text(path: &Path, text: &str) -> io::Result<()> {
     file.sync_all()?;
     fs::rename(temporary, path)
 }
+pub fn quarantine_file(path: &Path) -> io::Result<PathBuf> {
+    let destination = path.with_file_name(format!(
+        "storage-blocked-lost-{}.json",
+        uuid::Uuid::now_v7()
+    ));
+    fs::rename(path, &destination)?;
+    let metadata = fs::symlink_metadata(&destination)?;
+    if metadata.is_file() {
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+    } else if metadata.is_dir() {
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(destination)
+}
+pub fn remove_stale_mcp_configs(data: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(data.join("run")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok()
+        {
+            remove_optional_file(&entry.path().join("mcp.json"))?;
+        }
+    }
+    Ok(())
+}
 pub fn optional_text(path: &Path) -> io::Result<Option<String>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),

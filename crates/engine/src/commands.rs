@@ -505,7 +505,7 @@ fn stop_thread(
     get_thread(p, thread)?;
     let ids = reached(p, thread, false);
     for &id in &ids {
-        stop_one(p, l, c, id, now);
+        stop_one(p, l, c, id, StopReason::User, now);
     }
     for id in ids {
         settle_tasks(
@@ -537,7 +537,7 @@ fn archive_thread(
     }
     let ids = reached(p, thread, keep_children);
     for &id in &ids {
-        stop_one(p, l, c, id, now);
+        stop_one(p, l, c, id, StopReason::User, now);
         let mut t = c.thread(p, id).unwrap().clone();
         if !t.archived {
             t.archived = true;
@@ -569,6 +569,7 @@ fn interrupt_active(
     l: &BTreeMap<ThreadId, LiveThread>,
     c: &mut ChangeSet,
     thread: ThreadId,
+    reason: StopReason,
 ) {
     let view = c.view(p, l, thread).unwrap();
     let running = view.running.map(|turn| turn.id);
@@ -582,14 +583,7 @@ fn interrupt_active(
         .into_iter()
         .chain(pending.filter(|turn| Some(*turn) != running))
     {
-        control(
-            c,
-            thread,
-            SessionControl::Interrupt {
-                turn,
-                reason: StopReason::User,
-            },
-        );
+        control(c, thread, SessionControl::Interrupt { turn, reason });
     }
 }
 pub(crate) fn stop_one(
@@ -597,6 +591,7 @@ pub(crate) fn stop_one(
     l: &BTreeMap<ThreadId, LiveThread>,
     c: &mut ChangeSet,
     thread: ThreadId,
+    reason: StopReason,
     now: Millis,
 ) {
     match &l[&thread].live {
@@ -605,7 +600,7 @@ pub(crate) fn stop_one(
             stopping(l, c, thread, AfterStop::Park);
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
-            interrupt_active(p, l, c, thread);
+            interrupt_active(p, l, c, thread, reason);
         }
         Live::Terminal { .. } => {
             c.effects.push(Effect::StopTerminal { thread });
@@ -618,7 +613,7 @@ pub(crate) fn stop_one(
         }
         Live::Parked | Live::Structured { .. } => {}
     }
-    end_active(p, l, c, thread, StopReason::User, now);
+    end_active(p, l, c, thread, reason, now);
     drop_turns(p, c, thread, false, now);
     set_hold(p, c, thread, Some(HoldReason::Stopped));
 }
@@ -835,7 +830,7 @@ pub fn task_summary(p: &Projection, c: &ChangeSet, child: ThreadId) -> String {
             _ => None,
         })
         .max_by_key(|(seq, _)| *seq)
-        .map(|(_, text)| text.chars().take(4000).collect())
+        .map(|(_, text)| text.chars().take(crate::tools::REPORT_CHARS).collect())
         .unwrap_or_default()
 }
 
@@ -952,25 +947,7 @@ pub(crate) fn stop_child_from_tool(
     child: ThreadId,
     now: Millis,
 ) {
-    stop_one(p, l, c, child, now);
-    for effect in &mut c.effects {
-        if let Effect::Control {
-            control: SessionControl::Interrupt { reason, .. },
-            ..
-        } = effect
-        {
-            *reason = StopReason::Parent;
-        }
-    }
-    for turn in c.turns.values_mut().filter(|turn| turn.thread == child) {
-        if let TurnState::Ended {
-            outcome: TurnOutcome::Interrupted { reason },
-            ..
-        } = &mut turn.state
-        {
-            *reason = StopReason::Parent.text().into();
-        }
-    }
+    stop_one(p, l, c, child, StopReason::Parent, now);
     settle_tasks(
         p,
         c,

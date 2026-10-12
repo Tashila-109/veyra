@@ -104,6 +104,7 @@ pub struct Actor {
     write_scheduled: bool,
     blocked: Option<Blocked>,
     storage_receipt: Option<std::path::PathBuf>,
+    recovery_notice: Option<String>,
     #[cfg(test)]
     pub(crate) fail_write: bool,
     #[cfg(test)]
@@ -140,12 +141,23 @@ impl Actor {
             .filter(|path| !path.is_empty())
             .and_then(|path| std::path::Path::new(path).parent())
             .map(|root| root.join("run/storage-blocked.json"));
-        let lost = storage_receipt
-            .as_ref()
-            .map(|path| crate::platform::optional_text(path))
-            .transpose()
-            .map_err(|error| StoreError::Invalid(error.to_string()))?
-            .flatten();
+        let mut recovery_notice = None;
+        let lost=storage_receipt.as_ref().and_then(|path| {
+            let result=crate::platform::optional_text(path).and_then(|text|text.map(|text|serde_json::from_str::<BTreeMap<ThreadId,String>>(&text)
+                .map_err(std::io::Error::other)).transpose());
+            match result {
+                Ok(rows)=>rows,
+                Err(error)=> {
+                    let kept=crate::platform::quarantine_file(path);
+                    match kept {
+                        Ok(path)=>tracing::warn!(error_kind=?error.kind(),path=%path.display(),"lost storage receipt kept privately"),
+                        Err(keep_error)=>tracing::warn!(error_kind=?error.kind(),%keep_error,"could not preserve lost storage receipt"),
+                    }
+                    recovery_notice=Some("Veyra could not read its storage recovery receipt. A private copy was kept when possible. Check the provider conversations before sending more work.".into());
+                    None
+                }
+            }
+        });
         let c = reconcile::decide(&projection, now());
         let live = projection
             .threads
@@ -188,6 +200,7 @@ impl Actor {
             write_scheduled: false,
             blocked: None,
             storage_receipt,
+            recovery_notice,
             #[cfg(test)]
             fail_write: false,
             #[cfg(test)]
@@ -196,9 +209,7 @@ impl Actor {
             test_commits: 0,
         };
         let mut c = c;
-        if let Some(lost) = lost {
-            let rows: BTreeMap<ThreadId, String> = serde_json::from_str(&lost)
-                .map_err(|error| StoreError::Invalid(error.to_string()))?;
+        if let Some(rows) = lost {
             for (thread, what) in rows {
                 if let Some(turn) = actor
                     .projection
@@ -334,10 +345,14 @@ impl Actor {
                     blocked.deferred.push_back(msg);
                     return;
                 }
-                EngineMsg::Tool { reply, .. } => {
+                EngineMsg::Tool { call, reply, .. } => {
                     let _ = reply.send(ToolResult {
                         ok: false,
-                        output_tail: Some(format!("database is blocked: {}", blocked.error)),
+                        output_tail: Some(format!(
+                            "database storage is blocked: {}. {}",
+                            blocked.error,
+                            crate::tools::storage_recovery(&call)
+                        )),
                     });
                     return;
                 }
@@ -465,6 +480,7 @@ impl Actor {
                         })
                         .collect(),
                 };
+                let recovery = crate::tools::storage_recovery(&call);
                 let result = crate::tools::decide(
                     &self.projection,
                     &self.live,
@@ -486,7 +502,12 @@ impl Actor {
                     },
                     Err(error) => ToolResult {
                         ok: false,
-                        output_tail: Some(error.to_string()),
+                        output_tail: Some(match error {
+                            CommandError::Store(error) => {
+                                format!("database storage write failed: {error}. {recovery}")
+                            }
+                            other => other.to_string(),
+                        }),
                     },
                 };
                 let _ = reply.send(result);
@@ -567,6 +588,9 @@ impl Actor {
                 for event in initial {
                     let counter = event.thread().map(|id| self.next_counter(id));
                     let _ = tx.send(UiEvent::Change { counter, event });
+                }
+                if let Some(notice) = &self.recovery_notice {
+                    let _ = tx.send(UiEvent::RecoveryNotice(notice.clone()));
                 }
                 self.subscribers.push(tx);
             }
@@ -687,23 +711,7 @@ impl Actor {
             })
             .map(|item| item.id)
             .collect();
-        for item in c.items.values() {
-            if let Some(buffer) = self.buffers.get_mut(&item.id) {
-                let stored = match self.projection.items.get(&item.id).map(|item| &item.body) {
-                    Some(
-                        ItemBody::AssistantText { text, .. } | ItemBody::Reasoning { text, .. },
-                    ) => text.len(),
-                    _ => 0,
-                };
-                if let ItemBody::AssistantText { text, .. } | ItemBody::Reasoning { text, .. } =
-                    &item.body
-                    && text.len() == stored + buffer.unpersisted.len()
-                    && text.ends_with(&buffer.unpersisted)
-                {
-                    buffer.unpersisted.clear();
-                }
-            }
-        }
+        self.acknowledge_text(&c);
         let changed: Vec<_> = c
             .turns
             .values()
@@ -1458,6 +1466,25 @@ impl Actor {
             }
         }
     }
+    fn acknowledge_text(&mut self, c: &ChangeSet) {
+        for item in c.items.values() {
+            if let Some(buffer) = self.buffers.get_mut(&item.id) {
+                let stored = match self.projection.items.get(&item.id).map(|item| &item.body) {
+                    Some(
+                        ItemBody::AssistantText { text, .. } | ItemBody::Reasoning { text, .. },
+                    ) => text.len(),
+                    _ => 0,
+                };
+                if let ItemBody::AssistantText { text, .. } | ItemBody::Reasoning { text, .. } =
+                    &item.body
+                    && text.len() == stored + buffer.unpersisted.len()
+                    && text.ends_with(&buffer.unpersisted)
+                {
+                    buffer.unpersisted.clear();
+                }
+            }
+        }
+    }
     fn append_buffer(&self, item: &mut Item) {
         if let Some(b) = self.buffers.get(&item.id) {
             match &mut item.body {
@@ -1672,6 +1699,7 @@ impl Actor {
         let mut c = if let Some(blocked) = self.blocked.take() {
             let mut changes = blocked.changes;
             changes.effects.clear();
+            self.acknowledge_text(&changes);
             changes
                 .clone()
                 .install(&mut self.projection, &mut self.live);

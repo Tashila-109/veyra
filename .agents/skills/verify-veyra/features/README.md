@@ -8,6 +8,7 @@
 [approvals-questions](approvals-questions.md) covers approval decisions, exact grants, question keys and NextNeedsYou.
 [stop-interrupt](stop-interrupt.md) covers Stop, held queues, awake and banners.
 [restart-recovery](restart-recovery.md) covers the quit sheet, ConfirmQuit, ctl quit and recovery.
+[multi-agent](multi-agent.md) covers child rows, task and family cards, archive choices, held wakes, report delivery and quiet time.
 [permission-matrix](permission-matrix.md) records the live provider permission grid.
 
 ## Preconditions

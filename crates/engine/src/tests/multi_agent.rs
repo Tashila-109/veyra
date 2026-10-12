@@ -107,7 +107,10 @@ fn fifth_child_refused() {
             "start_thread",
             json!({"provider":"claude","title":"Fifth","prompt":"extra","client_request_id":"five"}),
         ),
-        &["4", "limit", "stop_thread"],
+        &[
+            "4 child threads with open tasks against the limit 4",
+            "stop_thread",
+        ],
     );
     assert_eq!(f.loaded().tasks.len(), 4);
     assert_eq!(children.len(), 4);
@@ -180,7 +183,7 @@ fn child_caller_refused() {
             "start_thread",
             json!({"provider":"claude","title":"Grandchild","prompt":"x","client_request_id":"nested"}),
         ),
-        &["depth", "1", "get_task"],
+        &["depth limit is 1: a child cannot start threads", "get_task"],
     );
     assert_eq!(f.loaded().threads.len(), 2);
 }
@@ -195,7 +198,10 @@ fn prompt_cap_refused() {
             "start_thread",
             json!({"provider":"claude","title":"Long","prompt":"é".repeat(100001),"client_request_id":"long"}),
         ),
-        &["100001", "100000", "start_thread"],
+        &[
+            "prompt has 100001 characters against the 100000 character limit",
+            "start_thread",
+        ],
     );
     let (_, task) = start(&mut f, "short");
     assert_eq!(f.loaded().tasks[&task].state, TaskState::Running);
@@ -219,7 +225,10 @@ fn family_cap_refused() {
             "start_thread",
             json!({"provider":"claude","title":"extra","prompt":"x","client_request_id":"cap"}),
         ),
-        &["16", "limit", "message_thread"],
+        &[
+            "family has 16 threads against the limit 16",
+            "message_thread",
+        ],
     );
     assert_eq!(f.loaded().threads.len(), 16);
 }
@@ -319,7 +328,7 @@ fn cross_family_task_refused() {
     assert_eq!(f.loaded().tasks[&task].parent, caller);
 }
 #[test]
-fn c1_attempted_prompt_is_interrupted_after_crash() {
+fn attempted_prompt_is_interrupted_after_crash() {
     let mut f = Fixture::new(LiveState::Idle);
     let Ack::Turn(turn) = f
         .command(Command::Send {
@@ -355,7 +364,30 @@ fn c1_attempted_prompt_is_interrupted_after_crash() {
 }
 
 #[test]
-fn c2_blocked_changes_are_written_during_quit() {
+fn recovered_child_without_a_queue_is_interrupted() {
+    let mut f = Fixture::new(LiveState::Running);
+    let (child, _) = start(&mut f, "recovered status");
+    ready_child(&mut f, child);
+    let recovered = crate::reconcile::decide(&f.loaded(), now());
+    f.save(recovered);
+    for (thread, expected) in [(f.thread, Status::Held), (child, Status::Interrupted)] {
+        assert_eq!(
+            thread_status(
+                &ChangeSet::default()
+                    .view(&f.actor.projection, &f.actor.live, thread)
+                    .unwrap()
+            ),
+            expected
+        );
+        assert_eq!(
+            f.actor.projection.threads[&thread].hold,
+            Some(HoldReason::Restarted)
+        );
+    }
+}
+
+#[test]
+fn blocked_changes_are_written_during_quit() {
     let mut f = Fixture::new(LiveState::Running);
     f.actor.fail_write = true;
     f.event(ProviderEvent::Session(SessionEvent::Notice {
@@ -795,9 +827,9 @@ fn get_task_status_matches_window() {
 }
 
 #[test]
-fn c2_storage_loss_notice_survives_a_process_end() {
+fn storage_loss_notice_survives_a_process_end() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../../target/c2-{}", ThreadId::new()));
+        .join(format!("../../target/storage-loss-{}", ThreadId::new()));
     crate::platform::private_dir(&root.join("run")).unwrap();
     let _scratch = Scratch(root.clone());
     let mut f = Fixture::new(LiveState::Running);
@@ -881,4 +913,241 @@ fn tool_request_without_session_is_refused_by_cli_actor() {
         call(&mut f, caller, "list_providers", json!({})),
         &["session", "list_providers"],
     );
+}
+
+#[test]
+fn message_thread_cannot_reopen_a_fifth_child_slot() {
+    let mut f = Fixture::new(LiveState::Running);
+    let caller = f.thread;
+    let (finished, task) = start(&mut f, "finished");
+    ready_child(&mut f, finished);
+    let (occupied, _) = start(&mut f, "occupied");
+    for key in ["third", "fourth"] {
+        start(&mut f, key);
+    }
+    end_child(&mut f, finished, task);
+    start(&mut f, "replacement");
+    let args = json!({"thread_id":occupied,"text":"more","client_request_id":"same-slot"});
+    let first = success(call(&mut f, caller, "message_thread", args.clone()));
+    assert_eq!(success(call(&mut f, caller, "message_thread", args)), first);
+    refusal(
+        call(
+            &mut f,
+            caller,
+            "message_thread",
+            json!({"thread_id":finished,"text":"more","client_request_id":"fifth"}),
+        ),
+        &[
+            "4 child threads with open tasks against the limit 4",
+            "stop_thread",
+        ],
+    );
+    let p = f.loaded();
+    let open: std::collections::BTreeSet<_> = p
+        .tasks
+        .values()
+        .filter(|task| task.state == TaskState::Running)
+        .map(|task| task.child)
+        .collect();
+    assert_eq!(open.len(), 4);
+}
+#[test]
+fn blocked_streamed_text_is_stored_once_at_quit() {
+    let mut f = Fixture::new(LiveState::Running);
+    let turn = f.running().unwrap();
+    f.event(turn_event(
+        Some(turn),
+        TurnEvent::TextDelta {
+            key: NativeItemKey("reply".into()),
+            text: "one copy".into(),
+            streamed: true,
+        },
+    ));
+    f.actor.fail_write = true;
+    {
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::TextWrite);
+    }
+    f.actor.fail_write = false;
+    {
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::Shutdown);
+    }
+    let p = f.loaded();
+    let text = p
+        .items_for(f.thread)
+        .find_map(|item| match &item.body {
+            ItemBody::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(text, "one copy");
+}
+#[test]
+fn storage_tool_refusals_name_a_recovery_call() {
+    let mut f = Fixture::new(LiveState::Running);
+    let caller = f.thread;
+    f.actor.fail_write = true;
+    refusal(
+        call(
+            &mut f,
+            caller,
+            "start_thread",
+            json!({"provider":"claude","title":"Worker","prompt":"x","client_request_id":"retry-me"}),
+        ),
+        &["storage", "retry", "start_thread", "retry-me"],
+    );
+    f.event(ProviderEvent::Session(SessionEvent::Notice {
+        text: "blocked notice".into(),
+    }));
+    refusal(
+        call(&mut f, caller, "list_providers", json!({})),
+        &["storage", "list_providers", "{}"],
+    );
+}
+#[test]
+fn tool_catalog_refuses_unbuilt_providers() {
+    let mut f = Fixture::new(LiveState::Running);
+    let caller = f.thread;
+    let listed = success(call(&mut f, caller, "list_providers", json!({})));
+    let names: Vec<_> = listed["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|provider| provider["provider"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["claude"]);
+    for provider in ["codex", "grok"] {
+        refusal(
+            call(
+                &mut f,
+                caller,
+                "start_thread",
+                json!({"provider":provider,"title":"Worker","prompt":"x","client_request_id":provider}),
+            ),
+            &["not built", "list_providers", "{}"],
+        );
+    }
+}
+#[test]
+fn parent_stop_keeps_the_discarded_queue_reason() {
+    let mut f = Fixture::new(LiveState::Running);
+    let (child, _) = start(&mut f, "reason");
+    ready_child(&mut f, child);
+    let Ack::Turn(queued) = f
+        .command(Command::Send {
+            thread: child,
+            text: "queued".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    let caller = f.thread;
+    success(call(
+        &mut f,
+        caller,
+        "stop_thread",
+        json!({"thread_id":child}),
+    ));
+    let p = f.loaded();
+    assert!(
+        matches!(&p.turns[&queued].state,TurnState::Ended{outcome:TurnOutcome::Interrupted{reason},..} if reason=="Queued turn discarded")
+    );
+}
+#[test]
+fn malformed_storage_receipt_does_not_prevent_startup() {
+    for unreadable in [false, true] {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/lost-receipt-{}", ThreadId::new()));
+        crate::platform::private_dir(&root.join("run")).unwrap();
+        let mut db = Connection::open(root.join("veyra.db")).unwrap();
+        store::initialize(&mut db).unwrap();
+        let receipt = root.join("run/storage-blocked.json");
+        if unreadable {
+            crate::platform::private_dir(&receipt).unwrap();
+        } else {
+            crate::platform::private_text(&receipt, "invalid receipt").unwrap();
+        }
+        let (out, _rx) = mpsc::channel(16);
+        let mut actor = Actor::new(db, out, Spawner::Scripted(Scripted::default()))
+            .expect("a lost receipt refused startup");
+        let (events, mut received) = mpsc::unbounded_channel();
+        actor.handle(EngineMsg::Subscribe(events));
+        let mut notices = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            if let UiEvent::RecoveryNotice(text) = event {
+                notices.push(text);
+            }
+        }
+        assert_eq!(
+            notices,
+            [
+                "Veyra could not read its storage recovery receipt. A private copy was kept when possible. Check the provider conversations before sending more work."
+            ]
+        );
+        assert!(!receipt.exists());
+        let kept = std::fs::read_dir(root.join("run"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("storage-blocked-lost-")
+            })
+            .unwrap();
+        assert!(crate::platform::is_private(&kept).unwrap());
+        if !unreadable {
+            assert_eq!(std::fs::read_to_string(kept).unwrap(), "invalid receipt");
+        }
+        drop(actor);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[test]
+fn quit_retries_retained_changes_after_the_write_lock_clears() {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new(LiveState::Running);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../target/quit-retry-{}", ThreadId::new()));
+    crate::platform::private_dir(&root.join("run")).unwrap();
+    let path = root.join("veyra.db");
+    f.actor
+        .db
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    let db = Connection::open(&path).unwrap();
+    let (out, rx) = mpsc::channel(16);
+    let mut actor = Actor::new(db, out.clone(), Spawner::Scripted(Scripted::default())).unwrap();
+    actor.db.busy_timeout(Duration::ZERO).unwrap();
+    let lock = Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    {
+        let _entered = f.runtime.enter();
+        actor.handle(EngineMsg::Provider {
+            thread: f.thread,
+            epoch: actor.live[&f.thread].epoch,
+            event: ProviderEvent::Session(SessionEvent::Notice {
+                text: "retained across quit retries".into(),
+            }),
+        });
+    }
+    assert!(root.join("run/storage-blocked.json").exists());
+    let (seen, shutdown) = std::sync::mpsc::channel();
+    actor.after_admission = Some(Box::new(move || seen.send(()).unwrap()));
+    let runtime = f.runtime.handle().clone();
+    let running = std::thread::spawn(move || actor.run(rx, runtime));
+    out.blocking_send(EngineMsg::Shutdown).unwrap();
+    shutdown.recv_timeout(Duration::from_secs(1)).unwrap();
+    let waiting = Instant::now();
+    std::thread::sleep(Duration::from_millis(125));
+    lock.execute_batch("ROLLBACK").unwrap();
+    running.join().unwrap();
+    assert!(waiting.elapsed() < Duration::from_secs(2));
+    let loaded = store::load(&Connection::open(&path).unwrap()).unwrap();
+    assert!(loaded.items_for(f.thread).any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text=="retained across quit retries")));
+    assert!(!root.join("run/storage-blocked.json").exists());
+    std::fs::remove_dir_all(root).unwrap();
 }

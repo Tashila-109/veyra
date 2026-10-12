@@ -79,6 +79,9 @@ choice_action!(PickPermission, mode, PermissionMode);
 choice_action!(SetDefaultMode, mode, PermissionMode);
 choice_action!(SelectThread, thread, ThreadId);
 choice_action!(StopThread, thread, ThreadId);
+choice_action!(OpenThreadMenu, thread, ThreadId);
+choice_action!(Archive, thread, ThreadId);
+choice_action!(ArchiveKeepChildren, thread, ThreadId);
 choice_action!(AllowOnce, request, RequestId);
 choice_action!(AllowInThread, request, RequestId);
 choice_action!(Deny, request, RequestId);
@@ -168,6 +171,9 @@ pub fn bindings() -> Vec<Binding> {
         binding!(Stop, "ctrl-c", Some("VeyraComposer")),
         binding!(Continue, "secondary-shift-enter", Some("Veyra")),
         binding!(DiscardQueued, "secondary-shift-backspace", Some("Veyra")),
+        binding!(OpenThreadMenu, "secondary-alt-shift-m", Some("Veyra")),
+        binding!(Archive, "secondary-shift-a", Some("Veyra")),
+        binding!(ArchiveKeepChildren, "secondary-alt-shift-a", Some("Veyra")),
         binding!(StopThread, "secondary-alt-shift-s", Some("Veyra")),
         binding!(NextNeedsYou, "secondary-shift-j", Some("Veyra")),
         binding!(AllowOnce, "secondary-enter", Some("VeyraApproval")),

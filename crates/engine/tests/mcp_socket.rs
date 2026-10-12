@@ -32,10 +32,9 @@ impl Drop for Run {
     }
 }
 fn root() -> Run {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "../../target/mcp-{}",
-        &ThreadId::new().to_string()[28..]
-    ));
+    let test = std::env::current_exe().expect("test executable");
+    let target = test.parent().unwrap().parent().unwrap().parent().unwrap();
+    let root = target.join(format!("mcp-{}", &ThreadId::new().to_string()[28..]));
     platform::private_dir(&root).unwrap();
     Run {
         root: root.canonicalize().unwrap(),
@@ -44,10 +43,18 @@ fn root() -> Run {
     }
 }
 fn relay() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/veyra")
-        .canonicalize()
-        .expect("cargo build --workspace must build the production relay")
+    let test = std::env::current_exe().expect("test executable");
+    let directory = test.parent().unwrap().parent().unwrap();
+    let relay = directory.join("veyra");
+    let metadata=std::fs::metadata(&relay).unwrap_or_else(|_|panic!("build the production relay first: cargo build --workspace using the same CARGO_TARGET_DIR and profile; missing {}",relay.display()));
+    for source in ["../veyra/src/relay.rs", "../veyra/src/main.rs"] {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(source);
+        assert!(
+            metadata.modified().unwrap() >= std::fs::metadata(source).unwrap().modified().unwrap(),
+            "production relay is stale; run cargo build --workspace using the same CARGO_TARGET_DIR and profile"
+        );
+    }
+    relay.canonicalize().unwrap()
 }
 fn fixture(run: &Run) -> PathBuf {
     let path = run.root.join("fixture.jsonl");
@@ -78,9 +85,15 @@ fn fixture(run: &Run) -> PathBuf {
     path
 }
 async fn started(run: &mut Run) -> (Server, mpsc::Receiver<EngineMsg>, String, ThreadId) {
+    let fixture = fixture(run);
+    started_fixture(run, fixture).await
+}
+async fn started_fixture(
+    run: &mut Run,
+    fixture: PathBuf,
+) -> (Server, mpsc::Receiver<EngineMsg>, String, ThreadId) {
     let (out, rx) = mpsc::channel(16);
     let server = Server::bind(&run.root, relay(), out).unwrap();
-    let fixture = fixture(run);
     let mut copy = None;
     let thread = ThreadId::new();
     let child = server
@@ -491,4 +504,105 @@ fn session_hash_redacts_token_in_nested_values_and_hex_neighbors() {
         value,
         json!({"<id:token>":["a<id:token>b",{"content":"prefix <id:token> suffix"}]})
     );
+}
+
+#[tokio::test]
+async fn startup_removes_dead_session_configs() {
+    let run = root();
+    let stale = run
+        .root
+        .join("run")
+        .join(ThreadId::new().to_string())
+        .join("mcp.json");
+    platform::private_dir(stale.parent().unwrap()).unwrap();
+    platform::private_text(&stale, "expired configuration").unwrap();
+    let (out, _rx) = mpsc::channel(1);
+    let _server = Server::bind(&run.root, relay(), out).unwrap();
+    assert!(!stale.exists(), "startup kept a dead session config");
+}
+
+#[tokio::test]
+async fn production_relay_with_wrong_parent_is_refused() {
+    let mut run = root();
+    let (server, _rx, token, _thread) = started(&mut run).await;
+    let mut child = tokio::process::Command::new(relay())
+        .arg("mcp")
+        .env("VEYRA_SOCKET", &server.socket)
+        .env("VEYRA_MCP_TOKEN", &token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    let read = tokio::time::timeout(
+        Duration::from_secs(3),
+        child.stdout.take().unwrap().read_to_end(&mut output),
+    )
+    .await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    assert!(
+        matches!(read, Ok(Ok(_))),
+        "wrong-parent relay did not close"
+    );
+    assert!(output.is_empty(), "wrong-parent relay received authority");
+    go(&mut run).await;
+    finish(&mut run).await;
+}
+#[tokio::test]
+async fn second_relay_from_the_same_cli_cannot_reuse_a_token() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let run = root();
+    let (out, _rx) = mpsc::channel(16);
+    let server = Server::bind(&run.root, relay(), out).unwrap();
+    let token = server
+        .for_spawn(ThreadId::new(), 1, |token| {
+            Ok((token.expose().to_owned(), std::process::id()))
+        })
+        .unwrap();
+    for connection in 1..=2 {
+        let mut child = tokio::process::Command::new(relay())
+            .arg("mcp")
+            .env("VEYRA_SOCKET", &server.socket)
+            .env("VEYRA_MCP_TOKEN", &token)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+            .await
+            .unwrap();
+        let mut output = String::new();
+        let read = tokio::time::timeout(
+            Duration::from_secs(3),
+            BufReader::new(child.stdout.take().unwrap()).read_line(&mut output),
+        )
+        .await;
+        drop(input);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        assert!(
+            matches!(read, Ok(Ok(_))),
+            "relay response exceeded its bound"
+        );
+        if connection == 1 {
+            let value: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["result"]["serverInfo"]["name"], "veyra");
+        } else {
+            assert!(output.is_empty(), "second relay's init was accepted");
+        }
+    }
 }

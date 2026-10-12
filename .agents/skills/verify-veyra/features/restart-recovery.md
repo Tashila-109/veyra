@@ -1,6 +1,6 @@
 # Restart and recovery
 
-Status: passed, 2026-10-12, 950317c, none
+Status: not run, 2026-10-12, 833bbce, slice-2 child crash and rerun
 
 ## Sub-features
 
@@ -9,6 +9,7 @@ Status: passed, 2026-10-12, 950317c, none
 - Orderly quit persists Interrupted and Restarted; a relaunch shows Held and Continue.
 - A crash expires pending requests and holds queued work without resending it.
 - An idle Quit exits immediately.
+- A crashed child shows Interrupted with Continue, settles its task on Continue, and leaves a held parent wake until Continue there.
 
 ## How to get to it (user POV)
 
@@ -23,7 +24,7 @@ After ConfirmQuit begins, Escape keeps the quit sheet visible until the app exit
 ## Driving it with veyra ctl
 
 Run Launch, Doctor and new-thread first, with fake CLI only.
-This is a single-thread recovery recipe; it adds no child-task behavior.
+The final section adds a child task through the production relay, then crashes and relaunches the owned app.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -135,6 +136,43 @@ pid = identity()
 action('restart-idle-quit','Quit')
 wait_gone(pid)
 start('restart-final-idle')
+poll('restart-family-ready',lambda d:d['providers'][0]['readiness']=='ready')
+for row in ctl('restart-earlier-rows','dump')['sidebar']['rows']:
+    if row['kind']=='thread': action('restart-archive-earlier-'+row['id'],'Archive',{'thread':row['id']})
+poll('restart-earlier-hidden',lambda d:all(row['kind']!='thread' for row in d['sidebar']['rows']))
+root,child,task = create_family('M4 child recovery',child='running')
+poll('restart-child-running',lambda d:d['selected_thread']['status']=='Done'
+    and d['transcript']['family_card']['rows'][0]['status']=='Working')
+select('restart-child-before-crash',child)
+pid = identity()
+groups = [int(x) for x in sql('select live_pgid from threads where live_pgid is not null').splitlines()]
+os.kill(pid,signal.SIGKILL)
+wait_gone(pid)
+shutil.copy2(SOURCE/'parent-wake.jsonl',FIXTURES/'t1-s1.jsonl')
+start('restart-child-crash')
+owned_groups_gone(groups)
+assert not marked_processes({pid})
+assert not list((DATA/'run').glob('*/mcp.json'))
+select('restart-child-interrupted',child)
+interrupted = poll('restart-child-interrupted',lambda d:d['selected_thread']['status']=='Interrupted')
+assert interrupted['selected_thread']['hold']=='restarted'
+assert sql("select state from tasks where id='"+task+"'")=='running'
+capture('restart-child-interrupted')
+action('restart-child-continue','Continue')
+select('restart-child-parent-held',root)
+held = poll('restart-child-parent-held',lambda d:d['selected_thread']['status']=='Held' and pending_wake(root))
+assert held['selected_thread']['hold']=='child_report'
+assert sql("select state from tasks where id='"+task+"'")=='settled'
+assert sql("select json_type(outcome_json,'$.Interrupted') from tasks where id='"+task+"'")=='object'
+capture('restart-child-parent-held')
+action('restart-child-parent-continue','Continue')
+family_delivered('restart-child-delivered',root,task)
+assert sql("select delivery from tasks where id='"+task+"'")=='delivered'
+capture('restart-child-delivered')
+poll('restart-child-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+action('restart-archive-recovered','Archive',{'thread':root})
+poll('restart-archive-hidden',lambda d:all(row.get('id') not in [root,child] for row in d['sidebar']['rows']))
+restart('restart-final-family-idle')
 page_done('restart-recovery')
 print('PASS quit sheet, Cancel, ConfirmQuit, ctl quit, Interrupted/Restarted holds, crash and idle quit')
 PY
@@ -148,12 +186,16 @@ The process checks show every owned provider group gone before orderly relaunch.
 `restart-held.json`, its PNG and SQLite show Interrupted, Held with Restarted and one queued turn.
 `restart-expired.json` has no dock; SQLite retains Veyra is closing.
 `restart-crash-held.json` and its PNG show the same hold after a crash, without starting the queued turn.
+`restart-child-interrupted.png` shows the recovered child and Continue, `restart-child-parent-held.png` shows its pending held wake, and `restart-child-delivered.json` agrees with SQLite delivered.
+Both Archive and ArchiveKeepChildren and the M4 top-level tasks key are named here; the archive choices are exercised on multi-agent.
 
 ## Gotchas
 
 Normal startup sweeps same-user marked orphans across data folders.
 Verification's debug-only VEYRA_REAP_PIDS filter admits only provider pids saved by this run.
 The harness only signals the pids and groups it started.
-Crash recovery proves one thread; child-task recovery needs its own feature recipe.
+The child sequence also checks stale run configs are removed and the old app's marker count is zero.
+Archive and ArchiveKeepChildren are the two actions behind Archive and Archive, keep child threads; the multi-agent page drives both.
+The top-level tasks dump key carries child task state and Pending or Delivered, while sidebar, selected_thread and transcript carry lineage, breadcrumbs and family controls.
 `scripts/bundle-app.sh`, process inspection and `pmset` run only on macOS.
 Update Status from candidate acceptance.

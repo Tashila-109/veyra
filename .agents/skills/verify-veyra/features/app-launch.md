@@ -12,7 +12,7 @@ Status: passed, 2026-10-12, 950317c, none
 - `launch-lock`: a second process refuses the same folder while the first still answers.
 - `launch-controls`: live width and notice transitions through actions and individual keys.
 - `launch-log`: the ready line and rejected Send notice reach the application log.
-- `launch-release`: no driver or provider override strings, ctl rejected, no release socket.
+- `launch-release`: no driver or provider override strings, ctl rejected, private MCP socket and no driver socket.
 - `launch-quit`: owned processes gone, scratch removed and proof kept.
 
 ## How to get to it (user POV)
@@ -208,7 +208,9 @@ done
 grep -q "^veyra ready pid=$REL_PID data_dir=$REL_DATA$" "$REL_PROOF/stderr.log"
 /bin/ls -laR "$REL_DATA" >"$REL_PROOF/data-listing.txt"
 test ! -e "$REL_DATA/control.sock"
-printf 'PASS release usage exit=2; driver and override strings absent; no socket\n'
+test -S "$REL_DATA/veyra.sock"
+test "$(stat -f %Lp "$REL_DATA/veyra.sock")" = 600
+printf 'PASS release usage exit=2; driver and override strings absent; no driver socket\n'
 stop_release
 trap - EXIT
 test -s "$REL_PROOF/veyra.log"
@@ -231,7 +233,7 @@ PY
 - Controls: `drive.log` records exit codes and all asserted width, text and notice transitions.
 - Log: `veyra.log` retains the asserted ready line and rejected Send notice.
 - Recovery: `persisted-project.txt` matches the SQLite row after both relaunches; migration, WAL, tables, mode and inode are asserted every time.
-- Release: `release/strings.txt` has zero release counts and positive debug controls for every driver and override name, `ctl.txt` exits 2 and `data-listing.txt` has no socket.
+- Release: `release/strings.txt` has zero release counts and positive debug controls for every driver and override name, `ctl.txt` exits 2 and `data-listing.txt` has no driver socket.
 - Release: `release/veyra.log` contains no `reaper signalled orphan group` line.
 - Cleanup: `marker-check.txt` passes and DATA is absent while proof remains.
 

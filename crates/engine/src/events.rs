@@ -56,6 +56,7 @@ impl ChangeEvent {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
+    RecoveryNotice(String),
     Change {
         counter: Option<u64>,
         event: ChangeEvent,
