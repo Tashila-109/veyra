@@ -928,17 +928,12 @@ impl Shell {
         }
         None
     }
-    fn send(
-        &mut self,
-        stop_target: Option<StopTarget>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
-        if text.trim().is_empty() && stop_target.is_some() {
+        if let Some(target) = self.shown_stop(cx) {
             window.dispatch_action(
                 Box::new(Stop {
-                    target: stop_target,
+                    target: Some(target),
                 }),
                 cx,
             );
@@ -984,6 +979,10 @@ impl Shell {
             &self.state.turns,
             self.engine.window_threads().get(&thread),
         )
+    }
+    fn shown_stop(&self, cx: &App) -> Option<StopTarget> {
+        self.rendered_stop
+            .filter(|_| self.input.read(cx).value().trim().is_empty())
     }
     fn stop(&mut self, target: Option<StopTarget>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(StopTarget { thread, turn }) = target {
@@ -1401,8 +1400,7 @@ impl Shell {
             "send_enabled":reason.is_none(), "disabled_reason":reason,
             "provider_picker_open":self.provider_picker.is_some(),
             "provider_picker_labels":self.provider_picker.as_ref().map(|_| &self.provider_picker_labels),
-            "stop_visible":self.stop_target().is_some()
-                && self.input.read(cx).value().trim().is_empty(),
+            "stop_visible":self.shown_stop(cx).is_some(),
             "discard_queued_visible":self.discard_queued_visible(),
             "dock":self.dock_target().and_then(|target| self.pending_request(Some(target.request)).map(|request| {
                 let text = match &request.kind {
@@ -1484,9 +1482,7 @@ impl Render for Shell {
                 shell.add_project(action, window, cx)
             }))
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
-            .on_action(
-                cx.listener(move |shell, _: &Send, window, cx| shell.send(stop_target, window, cx)),
-            )
+            .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
             .on_action(cx.listener(move |shell, action: &Stop, window, cx| {
                 shell.stop(action.target.or(stop_target), window, cx)
             }))
@@ -2139,11 +2135,40 @@ mod tests {
                 target.map(|target| (target.thread, target.turn)),
                 expected.map(|turn| (thread, turn))
             );
-            assert_eq!(
-                super::stop_target(thread, &turns, Some(&published)).is_some(),
-                expected.is_some()
-            );
         }
+    }
+
+    #[gpui::test]
+    fn shown_stop_follows_rendered_target_and_empty_draft(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, dispatched, _| {
+            let target = shell.read_with(cx, |shell, _| shell.rendered_stop.unwrap());
+            shell.update_in(cx, |shell, window, cx| {
+                shell.state.turns.clear();
+                assert!(shell.stop_target().is_none());
+                assert_eq!(
+                    shell
+                        .shown_stop(cx)
+                        .map(|target| (target.thread, target.turn)),
+                    Some((target.thread, target.turn))
+                );
+                for (draft, expected) in [("", true), ("draft", false), (" \n", true)] {
+                    shell
+                        .input
+                        .update(cx, |input, cx| input.set_value(draft, window, cx));
+                    assert_eq!(shell.dump_composer(cx)["stop_visible"], expected);
+                }
+                shell.send(window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(dispatched.borrow().as_slice(), ["Stop"]);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell
+                    .sent_interrupts
+                    .last()
+                    .map(|target| (target.thread, target.turn))),
+                Some((target.thread, target.turn))
+            );
+        });
     }
 
     #[gpui::test]
@@ -2182,9 +2207,7 @@ mod tests {
     #[gpui::test]
     fn empty_send_dispatches_stop_action(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, dispatched, _| {
-            shell.update_in(cx, |shell, window, cx| {
-                shell.send(shell.stop_target(), window, cx)
-            });
+            shell.update_in(cx, |shell, window, cx| shell.send(window, cx));
             cx.run_until_parked();
             draw(cx);
             assert_eq!(
@@ -2217,7 +2240,7 @@ mod tests {
                 false
             );
             shell.update_in(cx, |shell, window, cx| {
-                shell.send(shell.stop_target(), window, cx);
+                shell.send(window, cx);
             });
             cx.run_until_parked();
             assert!(dispatched.borrow().is_empty());

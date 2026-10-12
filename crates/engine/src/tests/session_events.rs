@@ -1828,6 +1828,10 @@ fn pending_admission_is_busy_for_quit_awake_and_idle_parking() {
     assert!(!crate::live::park_due(&view, 0, 10 * 60 * 1000));
     assert!(crate::live::needs_awake(&f.actor.projection, &f.actor.live));
     assert!(f.actor.state.window_threads.lock().unwrap()[&f.thread].busy);
+    assert_eq!(
+        f.actor.state.window_threads.lock().unwrap()[&f.thread].pending_turn,
+        Some(next)
+    );
     assert!(view.turn_busy());
     let _entered = f.runtime.enter();
     f.actor.handle(EngineMsg::Shutdown);

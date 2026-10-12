@@ -522,7 +522,7 @@ Their accessibility labels retain the whole original caption.
 NextNeedsYou scans sidebar order for NeedsYou before Failed, wrapping once and including child rows.
 The pure stop_target function selects a Running row for the selected thread, or its published WindowThread pending_turn when no Running row exists.
 The composer shows Stop only when that function names a turn and its draft is empty.
-Stop visibility, the dump and empty Send use that same target; empty Send dispatches Stop before checking provider readiness.
+Shell::shown_stop returns the rendered Stop target when the draft is empty, and the composer, dump and empty Send use it before Send checks provider readiness.
 A Refused admission with no Running row has no Stop target; held reasons and Continue remain separate controls.
 Discard queued appears only when a held thread has queued turns.
 The quit sheet overlays the existing window content.

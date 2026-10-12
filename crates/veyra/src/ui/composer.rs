@@ -166,10 +166,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         });
     let reason = shell.disabled_reason();
     let thread = shell.view.chat();
-    let stop_target = shell.rendered_stop;
-    let stop = stop_target.is_some() && shell.input.read(cx).value().trim().is_empty();
+    let stop_target = shell.shown_stop(cx);
+    let stop = stop_target.is_some();
     let submit_id = stop_target
-        .filter(|_| stop)
         .map(|target| SharedString::from(format!("stop-{}-{}", target.thread, target.turn)))
         .unwrap_or_else(|| "send".into());
     let pending = thread
