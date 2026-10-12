@@ -56,7 +56,7 @@ Fill Claude's row only from an authorized live permission run.
 
 Live run RUN `d654ddf0`, Claude 2.1.296, model `sonnet`, 2026-10-11, checkout `8ea19cf`.
 One prompt per mode was sent through Send after PickPermission; every dock was captured and answered Allow once with dock focus.
-Proof paths below name the preserved lane evidence.
+Observed results below describe the preserved mode checks.
 
 ### Preserved live evidence
 
@@ -67,7 +67,6 @@ Proof paths below name the preserved lane evidence.
 - Docks (2): `Write` `{"file_path":"/private/tmp/veyra-verify-d654ddf0/project/permission-project.txt","content":"veyra permission probe\n"}`; `Write` `{"file_path":"/tmp/veyra-outside-d654ddf0.txt","content":"veyra permission probe\n"}`.
 - Requests in SQLite: approval answered "AllowOnce"; approval answered "AllowOnce".
 - Effects: `permission-project.txt` = "veyra permission probe\n"; `/tmp/veyra-outside-d654ddf0.txt` = "veyra permission probe\n" (removed after the check).
-- Files: `lane-3/checks/l3-matrix-ask_first.txt`, `lane-3/run/l3-matrix-ask_first-dock-*.{json,png}`, `lane-3/run/l3-matrix-ask_first-done.{json,png}`, `lane-3/samples/l3-matrix-ask_first-*.jsonl`, recording `lane-3/rec/`.
 
 #### Accept edits
 
@@ -76,7 +75,6 @@ Proof paths below name the preserved lane evidence.
 - Docks (1): `Write` `{"file_path":"/tmp/veyra-outside-d654ddf0.txt","content":"veyra permission probe\n"}`.
 - Requests in SQLite: approval answered "AllowOnce".
 - Effects: `permission-project.txt` = "veyra permission probe\n"; `/tmp/veyra-outside-d654ddf0.txt` = "veyra permission probe\n" (removed after the check).
-- Files: `lane-3/checks/l3-matrix-accept_edits.txt`, `lane-3/run/l3-matrix-accept_edits-dock-*.{json,png}`, `lane-3/run/l3-matrix-accept_edits-done.{json,png}`, `lane-3/samples/l3-matrix-accept_edits-*.jsonl`, recording `lane-3/rec/`.
 
 #### Full access
 
@@ -85,7 +83,6 @@ Proof paths below name the preserved lane evidence.
 - Docks (0): none.
 - Requests in SQLite: none.
 - Effects: `permission-project.txt` = "veyra permission probe\n"; `/tmp/veyra-outside-d654ddf0.txt` = "veyra permission probe\n" (removed after the check).
-- Files: `lane-3/checks/l3-matrix-full_access.txt`, `lane-3/run/l3-matrix-full_access-done.{json,png}`, `lane-3/samples/l3-matrix-full_access-*.jsonl`, recording `lane-3/rec/`.
 
 ### Evidence notes
 

@@ -128,7 +128,7 @@ impl MessageScrollerState {
 }
 pub(super) fn markdown_text(item: &Item) -> Option<SharedString> {
     match &item.body {
-        ItemBody::AssistantText { text, done } => Some(if *done {
+        ItemBody::AssistantText { text, done, .. } => Some(if *done {
             text.clone().into()
         } else {
             format!("{text} ▏").into()
@@ -444,24 +444,16 @@ fn family_card(shell: &Shell, parent: ThreadId, cx: &App) -> AnyElement {
                             window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
                         }),
                 )
-                .when(
-                    !child.archived && shell.thread_stop_target(id).is_some(),
-                    |row| {
-                        row.child(
-                            labelled_button(
-                                SharedString::from(format!("child-stop-{id}")),
-                                "Stop",
-                                cx,
-                            )
+                .when(shell.family_stop_visible(child), |row| {
+                    row.child(
+                        labelled_button(SharedString::from(format!("child-stop-{id}")), "Stop", cx)
                             .debug_selector(|| "family-child-stop".into())
-                            .disabled(child.archived)
                             .on_click(move |_, window, cx| {
                                 window
                                     .dispatch_action(Box::new(StopThread { thread: Some(id) }), cx)
                             }),
-                        )
-                    },
-                )
+                    )
+                })
         }))
         .into_any_element()
 }
@@ -513,30 +505,46 @@ pub(super) fn turn_label(state: &super::AppState, turn: &Turn) -> Option<String>
     }
 }
 pub(super) fn report_delivered(state: &super::AppState, item: &Item) -> bool {
-    matches!(item.body, ItemBody::AssistantText { .. })
-        && state
-            .tasks
-            .values()
-            .filter(|task| task.child == item.thread && task.turn == item.turn)
-            .any(|task| {
-                matches!(
-                    task.state,
-                    TaskState::Settled {
-                        delivery: Delivery::Delivered { .. },
-                        ..
-                    }
-                )
-            })
-        && state.items.get(&item.thread).is_some_and(|items| {
-            items
-                .values()
-                .filter(|row| {
-                    row.turn == item.turn && matches!(row.body, ItemBody::AssistantText { .. })
-                })
-                .max_by_key(|row| row.seq)
-                .is_some_and(|row| row.id == item.id)
-        })
+    let ItemBody::AssistantText { text, reports, .. } = &item.body else {
+        return false;
+    };
+    let delivered = |task: &veyra_engine::domain::Task| {
+        task.child == item.thread
+            && matches!(
+                task.state,
+                TaskState::Settled {
+                    delivery: Delivery::Delivered { .. },
+                    ..
+                }
+            )
+    };
+    if reports
+        .iter()
+        .any(|id| state.tasks.get(id).is_some_and(delivered))
+    {
+        return true;
+    }
+    let Some(items) = state.items.get(&item.thread) else {
+        return false;
+    };
+    state.tasks.values().filter(|task| delivered(task)).any(|task| {
+        if items.values().any(|row| {
+            matches!(&row.body, ItemBody::AssistantText { reports, .. } if reports.contains(&task.id))
+        }) {
+            return false;
+        }
+        let TaskState::Settled { summary, .. } = &task.state else {
+            return false;
+        };
+        if !text.chars().take(veyra_engine::tools::REPORT_CHARS).eq(summary.chars()) {
+            return false;
+        }
+        let mut matching = items.values().filter(|row| matches!(&row.body,
+            ItemBody::AssistantText { text, .. } if text.chars().take(veyra_engine::tools::REPORT_CHARS).eq(summary.chars())));
+        matching.next().is_some_and(|row| row.id == item.id) && matching.next().is_none()
+    })
 }
+
 pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
     #[cfg(debug_assertions)]
     if let Some(open) = &mut shell.state.transcript_open
@@ -738,7 +746,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
 pub fn dump_item(item: &Item) -> serde_json::Value {
     let (kind, text, done) = match &item.body {
         ItemBody::UserText(text) => ("user", text.clone(), true),
-        ItemBody::AssistantText { text, done } => ("assistant", text.clone(), *done),
+        ItemBody::AssistantText { text, done, .. } => ("assistant", text.clone(), *done),
         ItemBody::Reasoning { text, done } => ("reasoning", text.clone(), *done),
         ItemBody::Tool(tool) => (
             "tool",
@@ -785,6 +793,7 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "first line\n**second line**\nthird line".into(),
                 done: true,
+                reports: vec![],
             },
         };
         let (view, cx) = cx.add_window_view(|window, cx| {

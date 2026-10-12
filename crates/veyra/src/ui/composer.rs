@@ -72,23 +72,38 @@ pub fn labelled_button(
     label: impl Into<SharedString>,
     cx: &App,
 ) -> Button {
-    let t = cx.global::<Theme>();
     let label = label.into();
+    labelled_button_with(id, label.clone(), button_text(label, cx), cx)
+}
+pub(super) fn labelled_button_with(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    content: impl IntoElement,
+    cx: &App,
+) -> Button {
+    let t = cx.global::<Theme>();
     Button::new(id)
         .ghost()
         .h(t.layout.icon_button)
         .px(t.space.0[3])
-        .accessibility_label(label.clone())
-        .child(
-            div()
-                .text_size(t.text.label.size)
-                .line_height(t.text.label.line_height)
-                .font_weight(t.text.label.weight)
-                .min_w_0()
-                .truncate()
-                .child(button_caption(label)),
-        )
+        .accessibility_label(label.into())
+        .child(content)
 }
+pub(super) fn button_text(label: SharedString, cx: &App) -> Div {
+    let t = cx.global::<Theme>();
+    div()
+        .debug_selector({
+            let label = label.clone();
+            move || format!("caption-{label}")
+        })
+        .text_size(t.text.label.size)
+        .line_height(t.text.label.line_height)
+        .font_weight(t.text.label.weight)
+        .min_w_0()
+        .truncate()
+        .child(button_caption(label))
+}
+
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let config = shell.composer_config().clone();

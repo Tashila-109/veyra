@@ -520,7 +520,7 @@ Each thread and selected_thread has lineage, and top-level tasks carries task st
 The child breadcrumb includes its root title and whether its SelectThread link is available; parent_attention names a parent that needs you.
 `transcript.family_card` carries the first derived list row, Started N agents, and its Open and Stop actions.
 `transcript.items` contains the stored item rows; item_tops includes the family card first when present.
-Task and Wake rows carry turn_label, task_card text, and report_delivered on the delivered task's final item.
+Task and Wake rows carry turn_label and task_card text; report_delivered marks the assistant row whose text the delivered report carried.
 `selected_thread.quiet_minutes` and header_status share Quiet for N min without changing status.
 `selected_thread` includes its native id, configuration, failure cause and `header_status`, the rendered status with elapsed seconds.
 `composer` includes the chosen provider and permission mode, plus Send's readiness and disabled reason.
@@ -603,6 +603,7 @@ required = {
         'restart-child-interrupted.png','restart-child-parent-held.png','restart-child-delivered.json'],
     'multi-agent':['multi-tree-working.png','multi-child-task.png','multi-family-done.png','multi-report-delivered.png',
         'multi-child-parent-needs.png','multi-menu.png','multi-child-stop-held.png','multi-parent-stop-held.png',
+        'multi-child-archive-held.json','multi-child-archive-held.png',
         'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
         'settings-existing.json','settings-new.json'],
@@ -643,7 +644,7 @@ Read `live_pgid` before quitting or removing anything.
 Quit the app, then send SIGTERM to saved provider groups and SIGKILL one second later.
 Signal only groups saved in this run's database and the app group this run started.
 The leftover checks retry for five seconds and fail only for saved run-owned pids or groups.
-Other processes carrying the parent marker are allowed up to ten seconds to drain; their counts and elapsed time are recorded without making them a provider-cleanup failure.
+Other processes carrying the parent marker are allowed up to ten seconds to drain; any remaining marker then fails Cleanup, regardless of its group, with counts and pids only.
 The marker check uses Darwin's `KERN_PROCARGS2` through `sysctl` in memory, never printing arguments or environment values.
 It reads same-user parent markers in memory, then counts only saved app/provider pids and members of saved provider groups as owned leftovers.
 macOS refuses argument reads for privileged processes whose real uid is the user but effective uid is root; a fake CLI lane cannot create such a process.
@@ -717,6 +718,7 @@ while True:
     time.sleep(.05)
 (proof/'hook-drain.json').write_text(json.dumps({'remaining':len(other_markers),
     'elapsed_seconds':time.monotonic()-started})+'\n')
+assert not other_markers, f'{len(other_markers)} marked processes remain after the ten-second drain: {other_markers}'
 (proof/'marker-check.txt').write_text(f'PASS no saved owned pids or provider groups for app pids {sorted(parents)}\n')
 print('PASS saved owned pids, provider groups and marker check; other marker drain seconds='+str(round(time.monotonic()-started,3)))
 PY
@@ -734,7 +736,7 @@ Never kill by name.
 ### Gotchas
 
 A live provider's session-end hook chains have been observed carrying the parent marker for up to nine seconds after quit or reap.
-Cleanup signals and fails only on the saved run-owned pids and groups, while other marked processes get a separate ten-second drain wait.
+Cleanup signals only saved run-owned pids and groups, while other marked processes get a separate ten-second drain wait and fail Cleanup if they remain afterward.
 The drain wait adds one second of margin to that observed chain lifetime, records counts and elapsed time, and never prints arguments or environments.
 It does not signal an unrecorded group.
 

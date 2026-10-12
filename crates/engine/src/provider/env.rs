@@ -258,6 +258,7 @@ mod tests {
             return;
         }
         let root = std::env::temp_dir().join(format!("veyra-resolution-{}", ThreadId::new()));
+        let _scratch = crate::tests::Scratch(root.clone());
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::copy("/bin/echo", root.join("bin/claude")).unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
@@ -270,7 +271,6 @@ mod tests {
             .env("VEYRA_TEST_RESOLUTION", &root)
             .output()
             .unwrap();
-        std::fs::remove_dir_all(root).unwrap();
         assert!(
             result.status.success(),
             "{}",

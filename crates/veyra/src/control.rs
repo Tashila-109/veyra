@@ -390,18 +390,12 @@ mod tests {
     }
     #[test]
     fn driver_client_reads_a_transcript_reply_above_command_size() {
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
         let root = std::path::Path::new("/tmp").join(format!(
-            "veyra-m4s3-r-{}",
+            "veyra-reply-{}",
             veyra_engine::domain::ThreadId::new()
         ));
+        let _scratch = crate::tests::Scratch(root.clone());
         platform::private_dir(&root).unwrap();
-        let _scratch = Scratch(root.clone());
         let listener = platform::bind_socket(&root.join("control.sock")).unwrap();
         let expected = json!({"transcript":{"items":vec![json!({"text":"x".repeat(100)});1000]}});
         let reply = expected.clone();

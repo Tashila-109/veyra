@@ -489,8 +489,9 @@ A settlement while a wake runs creates a successor wake.
 Wake text frames each child's final assistant message as a report and caps its summary at 4,000 characters.
 The ordinary start rule waits for the parent to be idle and unheld, so a wake never interrupts or steers.
 Accepted changes task delivery to Delivered, and the actor logs thread, turn and acceptance time for each admitted acceptance.
-Any wake ending before Accepted moves pending reports into a new queued wake; delivery is at least once until acceptance, can repeat, and is final once Delivered.
-Parent Stop preserves a held wake, a kept child settles into its archived root's pending wake, and a user stop or archive of one child holds the parent as ChildReport without replacing an earlier hold.
+Any wake ending before Accepted moves pending reports into a new queued wake; for an unarchived root delivery is at least once until acceptance, can repeat, and is final once Delivered.
+Parent Stop preserves a held wake, and a user stop or archive of one child holds the parent as ChildReport without replacing an earlier hold.
+A kept child settles into its archived root's queued wake, which stays held and is never delivered because an archived root cannot be continued.
 
 ## Platform and keep-awake
 
@@ -566,7 +567,8 @@ It also sends StorageBlocked if storage is blocked and RecoveryNotice when start
 Every thread-scoped initial row advances that thread's counter.
 The gpui pump drains every queued event into one entity update, applies it and notifies once.
 AppState counts applied batches and the largest measured gap between text-bearing batches.
-Debug-only VisiblePerf counts applied TextAppended batches for the selected Chat thread and their largest gap, ignoring hidden text.
+Debug-only VisiblePerf counts applied TextAppended batches for the selected Chat thread, ignoring other threads' text; batches buffered behind a loading snapshot still count.
+VisiblePerf and the pump use one BatchGap for their largest gap and previous timestamp, while retaining their distinct batch counts.
 Its count, gap and previous-batch timestamp reset on selection changes and on that thread's TurnStarted.
 Debug-only TranscriptOpen records the Snapshot request identity and time, marks its installation, and ui::transcript::render stamps the first render of that installed snapshot.
 The dump exposes perf.visible and perf.transcript_open_ms, which is null until an open and replaced on every open.
@@ -604,8 +606,11 @@ The transcript and its expansion behavior live in ui/transcript.rs.
 The Started N agents card, singular Started 1 agent, is the first derived list row and lists every child, including archived children whose Open is disabled.
 Each row uses its child's own status glyph and words, SelectThread as Open, and StopThread as Stop only while the shared stop_target rule names a turn and the child is unarchived.
 TaskCard rows show Task from the parent provider; Task and Wake turns label the parent title and distinct reporting children respectively.
-A Delivered task labels its own turn's last assistant row Report delivered; later user work does not move the badge.
-Turn::recency orders the transcript, ThreadView.last, failure cause and Retry by actual start, with ordinal for ties and queued turns after started ones; stored queue ordinals retain their admission role.
+Before committing settlement, the actor records task ids on the assistant item used by task_report, in that item's existing JSON body; no column or migration is added.
+A delivered report labels that source assistant row Report delivered, including when queued tasks settle with a later task's reply; later identical user text cannot move the badge.
+Older assistant JSON defaults to no report ids, and a legacy delivery badge appears only when its stored summary identifies one assistant row uniquely.
+Turn::recency orders the transcript, ThreadView.last, failure cause and Retry by actual start, or end time for a turn that ended without starting, with ordinal for ties and queued turns after started ones; stored queue ordinals retain their admission role.
+The actor attaches session and storage-loss notices to a running turn when one exists, otherwise the turn with greatest recency.
 ReplyLineBreaks applies to assistant reply rows and uses the kit's Markdown AST hook to turn prose soft breaks into rendered line breaks, preserving lists, emphasis, tables and code, with the original Markdown retained for source copying.
 AppState caches each thread's ordered item ids and row positions, rebuilding them on item insertion, turn metadata and snapshots.
 It fills shared markdown source strings for assistant and reasoning rows before they enter the cached order, refreshing only the changed item and removing archived rows.
@@ -757,9 +762,11 @@ Mailbox tests require a full-channel send to wait and two waiting commands to re
 Tests in tests/session_events.rs require duplicate Ready and admission-only changes to retain their runtime and metadata effects without another commit.
 A projection test checks text-only row selection for the open thread, another thread, mixed batches and items absent from the order.
 A projection test checks cached row order, streamed text, completion and archive cleanup.
-Window regressions check visible text counting and both resets, stalled-visible gaps despite hidden text, first-render open timing and replacement, quiet title/hint geometry, conditional family Stop, stored guidance, recency, archive eligibility and reset, and delivered-report anchoring.
+Window regressions check visible text counting and both resets, stalled-visible gaps despite other-thread text, first-render open timing and replacement, one-line left-aligned quiet rows, conditional family Stop, recency, archive eligibility and reset, and report-source anchoring.
+The child-task replay checks that the provider receives the stored guidance.
 perf_snapshot_large is ignored by ordinary workspace tests, seeds one file-backed thread with 5,000 items across fifty complete tool-heavy turns, times one actor Snapshot and prints the database path it retains for a window drive.
 Its normal seed regression checks the stored shape, and the stream-pause fixture regression checks one 300 ms delay after 1,000 of the 2,000 deltas.
+Multi-agent's Probe smoke measurements recipe records the pause's visible gap and the seeded transcript's first installed render, copying the retained database into the stopped app's short disposable data folder before reopening it.
 Shutdown tests check that Quit during a drain, Stopping or missing-session recovery starts no replacement session and keeps queued work held after reload.
 An actor decision test checks that shutdown exits propose no restart or queued-turn start, preserving epochs and earlier holds.
 A storage test checks that a Write tool row stores its content once.
@@ -803,8 +810,9 @@ Their current-thread runtimes do not drive readiness tasks before replacing the 
 recheck_after_confirm_quit_launches_no_provider deliberately checks an owned stand-in as its positive control, without running a real provider.
 Clippy with -D warnings and cargo fmt --check check source quality.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence, header-branch clearing and cleanup.
+App-launch's release check proves that release has no driver, using string scans with a debug positive control, ctl refusal and socket checks.
 Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.
-The multi-agent page, currently marked not run pending lead acceptance, covers family controls, stored task guidance, delivery, archive choices, quiet titles and the visible/open timing probes.
+The multi-agent page covers family controls, stored task guidance, delivery, single-child archive holds, archive choices, quiet titles and the visible/open timing probes.
 Permission-matrix records separately authorized live permission checks.
 Their Status lines record the lead's acceptance, independently of the recipes.
 The ignored live tests require fresh human consent; workspace tests compile them without running a provider.

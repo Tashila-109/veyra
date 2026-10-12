@@ -125,6 +125,17 @@ fn clear_drain(live: &mut LiveThread, turn: TurnId) {
         *draining = None;
     }
 }
+fn notice_turn(projection: &Projection, thread: ThreadId) -> Option<TurnId> {
+    projection
+        .turns_for(thread)
+        .max_by_key(|turn| {
+            (
+                matches!(turn.state, TurnState::Running { .. }),
+                turn.recency(),
+            )
+        })
+        .map(|turn| turn.id)
+}
 impl Actor {
     #[cfg(test)]
     pub(crate) fn streaming_entries(&self) -> (usize, usize) {
@@ -212,12 +223,7 @@ impl Actor {
         let mut c = c;
         if let Some(rows) = lost {
             for (thread, what) in rows {
-                if let Some(turn) = actor
-                    .projection
-                    .turns_for(thread)
-                    .max_by_key(|turn| turn.ordinal)
-                {
-                    let turn = turn.id;
+                if let Some(turn) = notice_turn(&actor.projection, thread) {
                     commands::add_item(
                         &actor.projection,
                         &mut c,
@@ -980,18 +986,14 @@ impl Actor {
                 });
             }
             ProviderEvent::Session(SessionEvent::Notice { text }) => {
-                if let Some(turn) = self
-                    .projection
-                    .turns_for(thread)
-                    .max_by_key(|turn| turn.ordinal)
-                {
+                if let Some(turn) = notice_turn(&self.projection, thread) {
                     commands::add_item(
                         &self.projection,
                         &mut c,
                         Item {
                             id: ItemId::new(),
                             thread,
-                            turn: turn.id,
+                            turn,
                             seq: 0,
                             body: ItemBody::Notice(Notice { text }),
                         },
@@ -1375,6 +1377,7 @@ impl Actor {
                             ItemBody::AssistantText {
                                 text: String::new(),
                                 done: false,
+                                reports: vec![],
                             }
                         },
                     },
@@ -1458,12 +1461,25 @@ impl Actor {
                 (
                     task.id,
                     commands::task_summary(&self.projection, c, task.child),
+                    commands::task_report(&self.projection, c, task.child).cloned(),
                 )
             })
             .collect();
-        for (id, text) in summaries {
+        for (id, text, report) in summaries {
             if let TaskState::Settled { summary, .. } = &mut c.tasks.get_mut(&id).unwrap().state {
                 *summary = text;
+            }
+            if let Some(mut report) = report {
+                if let Some(changed) = c.items.get(&report.id) {
+                    report = changed.clone();
+                }
+                if let ItemBody::AssistantText { reports, .. } = &mut report.body
+                    && !reports.contains(&id)
+                {
+                    reports.push(id);
+                }
+                c.events.push(Ev::ItemCompleted(report.clone()));
+                c.items.insert(report.id, report);
             }
         }
     }

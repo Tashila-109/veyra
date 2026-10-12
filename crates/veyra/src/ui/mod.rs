@@ -45,13 +45,28 @@ struct TranscriptOrder {
     ids: Vec<ItemId>,
     positions: BTreeMap<ItemId, usize>,
 }
+#[derive(Default)]
+struct BatchGap {
+    maximum_ms: f64,
+    last: Option<Instant>,
+}
+impl BatchGap {
+    fn note(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last {
+            self.maximum_ms = self
+                .maximum_ms
+                .max(now.duration_since(last).as_secs_f64() * 1000.);
+        }
+        self.last = Some(now);
+    }
+}
 #[cfg(debug_assertions)]
 #[derive(Default)]
 struct VisiblePerf {
     thread: Option<ThreadId>,
     applied_batches: u64,
-    max_batch_gap_ms: f64,
-    last_text_batch: Option<Instant>,
+    gap: BatchGap,
 }
 #[cfg(debug_assertions)]
 impl VisiblePerf {
@@ -72,13 +87,7 @@ impl VisiblePerf {
             matches!(event,
             UiEvent::TextAppended { thread: id, .. } if *id == thread)
         }) {
-            let now = Instant::now();
-            if let Some(last) = self.last_text_batch {
-                self.max_batch_gap_ms = self
-                    .max_batch_gap_ms
-                    .max(now.duration_since(last).as_secs_f64() * 1000.);
-            }
-            self.last_text_batch = Some(now);
+            self.gap.note();
             self.applied_batches += 1;
         }
     }
@@ -110,8 +119,7 @@ struct AppState {
     applied_batches: u64,
     #[cfg(debug_assertions)]
     max_batch_events: usize,
-    max_batch_gap_ms: f64,
-    last_text_batch: Option<Instant>,
+    gap: BatchGap,
     last_activity: BTreeMap<ThreadId, Millis>,
     #[cfg(debug_assertions)]
     visible_perf: VisiblePerf,
@@ -159,19 +167,13 @@ impl AppState {
                 }
             )
         }) {
-            self.last_text_batch = None;
+            self.gap.last = None;
         }
         if events
             .iter()
             .any(|event| matches!(event, UiEvent::TextAppended { .. }))
         {
-            let now = Instant::now();
-            if let Some(last) = self.last_text_batch {
-                self.max_batch_gap_ms = self
-                    .max_batch_gap_ms
-                    .max(now.duration_since(last).as_secs_f64() * 1000.);
-            }
-            self.last_text_batch = Some(now);
+            self.gap.note();
         }
         for event in events {
             self.apply(event);
@@ -726,7 +728,7 @@ impl Shell {
                             .map(|thread| (thread.root(), shell.state.family_status(thread.root())))
                             .collect();
                         let text_rows = shell.state.text_rows(&batch, shell.view.chat());
-                        let had_family = shell
+                        let previous_family_offset = shell
                             .view
                             .chat()
                             .map_or(0, |thread| shell.state.family_offset(thread));
@@ -747,12 +749,12 @@ impl Shell {
                             .chat()
                             .map(|thread| shell.state.transcript_rows(thread))
                             .unwrap_or_default();
-                        let has_family = shell
+                        let family_offset = shell
                             .view
                             .chat()
                             .map_or(0, |thread| shell.state.family_offset(thread));
                         shell.scroller.update(cx, |state, cx| {
-                            if has_family > had_family {
+                            if family_offset > previous_family_offset {
                                 state.prepend(cx);
                             }
                             if count > state.item_count() {
@@ -1255,6 +1257,9 @@ impl Shell {
             self.engine.window_threads().get(&thread),
         )
     }
+    fn family_stop_visible(&self, child: &Thread) -> bool {
+        !child.archived && self.thread_stop_target(child.id).is_some()
+    }
     fn shown_stop(&self, cx: &App) -> Option<StopTarget> {
         self.rendered_stop
             .filter(|_| self.input.read(cx).value().trim().is_empty())
@@ -1736,7 +1741,7 @@ impl Shell {
                 "rows":transcript::family_children(&self.state,thread).into_iter().map(|child|serde_json::json!({
                     "thread":child.id,"title":child.title,"glyph":sidebar::glyph(&self.state.status(child.id)),
                     "status":self.state.status(child.id).words(),"open_action":"veyra::SelectThread",
-                    "stop_action":(!child.archived && self.thread_stop_target(child.id).is_some()).then_some("veyra::StopThread")
+                    "stop_action":self.family_stop_visible(child).then_some("veyra::StopThread")
                 })).collect::<Vec<_>>()})).into();
         serde_json::json!({
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
@@ -1747,9 +1752,9 @@ impl Shell {
             "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(cx),
             "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
             "awake":self.engine.awake(), "processes":self.engine.processes(),
-            "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.max_batch_gap_ms,
+            "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.gap.maximum_ms,
                 "visible":{"thread":self.state.visible_perf.thread,"applied_batches":self.state.visible_perf.applied_batches,
-                    "max_batch_gap_ms":self.state.visible_perf.max_batch_gap_ms},
+                    "max_batch_gap_ms":self.state.visible_perf.gap.maximum_ms},
                 "transcript_open_ms":self.state.transcript_open.as_ref().and_then(|open|open.milliseconds),
                 "mailbox_free":perf.mailbox_free,
                 "commits":perf.commits, "actor_max_ms":perf.actor_max_ms, "actor_busy_ms":perf.actor_busy_ms,
@@ -2260,6 +2265,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::{AppState, provider_rows};
+    use crate::tests::Scratch;
     use gpui::{
         AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
         Styled, Window, div,
@@ -2291,12 +2297,6 @@ mod tests {
             tokio::sync::mpsc::UnboundedSender<UiEvent>,
         ),
     ) {
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
         struct ActionCapture {
             shell: Entity<super::Shell>,
             dispatched: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
@@ -2572,6 +2572,91 @@ mod tests {
     }
 
     #[gpui::test]
+    fn sidebar_titles_stay_left_and_quiet_controls_stay_on_one_line(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| super::theme::register_fonts(cx).unwrap());
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let child = shell.update(cx, |shell, cx| {
+                let child = add_family(shell, cx).1;
+                shell.state.threads.get_mut(&child).unwrap().title = "File".into();
+                shell
+                    .state
+                    .last_activity
+                    .insert(child, veyra_engine::actor::now());
+                child
+            });
+            draw(cx);
+            let button = cx.debug_bounds("sidebar-thread-title").unwrap();
+            let caption = cx.debug_bounds("caption-File").unwrap();
+            let padding = cx.update(|_, cx| cx.global::<super::Theme>().space.0[3]);
+            assert!(
+                f32::from(caption.left() - button.left() - padding).abs() < 1.,
+                "centered title: {caption:?} in {button:?}"
+            );
+            shell.update(cx, |shell, cx| {
+                shell
+                    .state
+                    .last_activity
+                    .insert(child, veyra_engine::actor::now() - 600_000);
+                cx.notify();
+            });
+            draw(cx);
+            let row = cx.debug_bounds("sidebar-thread-row").unwrap();
+            let title = cx.debug_bounds("sidebar-thread-title").unwrap();
+            let hint = cx.debug_bounds("sidebar-quiet").unwrap();
+            let stop = cx.debug_bounds("sidebar-thread-stop").unwrap();
+            let menu = cx.debug_bounds("sidebar-thread-menu").unwrap();
+            let height = cx.update(|_, cx| cx.global::<super::Theme>().layout.thread_row);
+            assert_eq!(row.size.height, height, "quiet row grew: {row:?}");
+            for control in [title, hint, stop, menu] {
+                assert!(
+                    f32::from(control.center().y - title.center().y).abs() < 1.,
+                    "control left row: {control:?}"
+                );
+                assert!(
+                    control.right() <= row.right(),
+                    "control left sidebar: {control:?}"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn queued_task_report_badge_uses_its_report_source(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (parent, child, first_turn) = add_family(shell, cx);
+                let second_turn = TurnId::new();
+                let user_turn = TurnId::new();
+                let first = TaskId::new();
+                let second = TaskId::new();
+                for (task, turn) in [(first,first_turn),(second,second_turn)] {
+                    shell.state.tasks.insert(task, veyra_engine::domain::Task {
+                        id:task,parent,child,turn,request_key:task.to_string(),
+                        state:TaskState::Settled { outcome:TurnOutcome::Completed,
+                            summary:"Reported follow-up".into(), delivery:Delivery::Delivered { wake:TurnId::new() } },
+                    });
+                }
+                for (seq,turn,text,reports) in [(1,first_turn,"First report",vec![]),
+                    (2,second_turn,"Reported follow-up",vec![first,second]),
+                    (3,user_turn,"Reported follow-up",vec![])] {
+                    shell.state.turns.insert(turn, Turn { id:turn,thread:child,ordinal:seq,
+                        origin:if turn==user_turn { TurnOrigin::User { item:ItemId::new() } }
+                            else { TurnOrigin::Task { task:if turn==first_turn { first } else { second } } },
+                        state:TurnState::Ended { started:Some(seq as i64),at:seq as i64+1,outcome:TurnOutcome::Completed },
+                    });
+                    let body=serde_json::from_value(serde_json::json!({"AssistantText":{"text":text,"done":true,"reports":reports}})).unwrap();
+                    shell.state.apply(UiEvent::Change { counter:None,event:ChangeEvent::ItemAdded(Item {
+                        id:ItemId::new(),thread:child,turn,seq,body,
+                    }) });
+                }
+                shell.show(super::MainView::Chat(child));
+                let rows = shell.dump_transcript();
+                assert_eq!(rows.iter().map(|row|row["report_delivered"].as_bool().unwrap()).collect::<Vec<_>>(), [false,true,false]);
+            });
+        });
+    }
+
+    #[gpui::test]
     fn quiet_row_retains_title_and_untruncated_hint(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| super::theme::register_fonts(cx).unwrap());
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -2824,6 +2909,7 @@ mod tests {
                     body: ItemBody::AssistantText {
                         text: "delivered report".into(),
                         done: true,
+                        reports: vec![],
                     },
                 };
                 let user_turn = TurnId::new();
@@ -2847,6 +2933,7 @@ mod tests {
                     body: ItemBody::AssistantText {
                         text: "later user reply".into(),
                         done: true,
+                        reports: vec![],
                     },
                 };
                 for item in [&report, &later] {
@@ -3403,12 +3490,6 @@ mod tests {
 
     #[gpui::test]
     fn native_app_quit_closes_engine_without_quit_action(cx: &mut gpui::TestAppContext) {
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
         let scratch = Scratch(
             std::path::PathBuf::from("/tmp").join(format!("veyra-quit-{}", ThreadId::new())),
         );
@@ -3456,17 +3537,10 @@ mod tests {
     fn chat_branch_loads_when_the_thread_row_follows_selection(cx: &mut gpui::TestAppContext) {
         use std::{path::PathBuf, process::Command, time::Duration};
 
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).expect("remove owned scratch");
-            }
-        }
-
         let thread = ThreadId::new();
         let path = PathBuf::from("/tmp").join(format!("veyra-branch-{thread}"));
-        std::fs::create_dir(&path).unwrap();
         let scratch = Scratch(path);
+        std::fs::create_dir(&scratch.0).unwrap();
         assert!(
             Command::new("git")
                 .args(["init", "-q", "-b", "fixture-branch"])
@@ -3676,6 +3750,7 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "retained".into(),
                 done: true,
+                reports: vec![],
             },
         };
         let mut state = AppState::default();
@@ -3701,6 +3776,7 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "complete".into(),
                 done: true,
+                reports: vec![],
             },
         };
         let mut state = AppState::default();
@@ -3838,6 +3914,7 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "a".into(),
                 done: false,
+                reports: vec![],
             },
         };
         let mut state = AppState::default();
@@ -3889,7 +3966,8 @@ mod tests {
             state.transcript(thread)[0].body,
             ItemBody::AssistantText {
                 text: "abcde".into(),
-                done: false
+                done: false,
+                reports: vec![],
             }
         );
     }
@@ -3958,12 +4036,6 @@ mod tests {
     #[gpui::test]
     fn recheck_after_confirm_quit_launches_no_provider(cx: &mut gpui::TestAppContext) {
         use std::time::Duration;
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
         if std::env::var_os("TEST_QUIT_PROBE_MARKER").is_none() {
             let scratch = Scratch(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4375,6 +4447,7 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "Reply".into(),
                 done: false,
+                reports: vec![],
             },
         };
         let reasoning = Item {
@@ -4503,6 +4576,7 @@ mod tests {
                 body: ItemBody::AssistantText {
                     text: "Root reply".into(),
                     done: false,
+                    reports: vec![],
                 },
             }),
         });
@@ -4607,6 +4681,7 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "report".into(),
                 done: true,
+                reports: vec![],
             },
         };
         state.apply(UiEvent::Change {
@@ -4807,6 +4882,7 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "Earlier".into(),
                 done: true,
+                reports: vec![],
             },
         };
         let mut growing = Item {
@@ -4817,6 +4893,7 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "New".into(),
                 done: false,
+                reports: vec![],
             },
         };
         for item in [&old, &growing] {
@@ -4868,6 +4945,7 @@ mod tests {
         growing.body = ItemBody::AssistantText {
             text: "New text".into(),
             done: true,
+            reports: vec![],
         };
         state.apply(UiEvent::Change {
             counter: Some(3),

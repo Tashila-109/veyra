@@ -122,6 +122,17 @@ assert held['selected_thread']['hold']=='stopped'
 capture('multi-parent-stop-held')
 action('multi-parent-stop-continue','Continue')
 family_delivered('multi-parent-stop-delivered',root,task)
+root,child,task = create_family('archive one child',child='running')
+poll('multi-child-archive-started',lambda d:d['transcript']['family_card']['rows'][0]['status']=='Working')
+action('multi-archive-child','Archive',{'thread':child})
+held = poll('multi-child-archive-held',lambda d:d['selected_thread']['status']=='Held' and pending_wake(root))
+assert held['selected_thread']['hold']=='child_report'
+assert sql("select archived_at is not null from threads where id='"+child+"'")=='1'
+assert sql("select archived_at is null from threads where id='"+root+"'")=='1'
+assert held['transcript']['family_card']['rows'][0]['stop_action'] is None
+capture('multi-child-archive-held')
+action('multi-child-archive-continue','Continue')
+family_delivered('multi-child-archive-delivered',root,task)
 root,child,task = create_family('archive the family',parent='running',child='running')
 action('multi-archive','Archive',{'thread':root})
 archived = poll('multi-archived-family',lambda d:all(row.get('id') not in [root,child] for row in d['sidebar']['rows']))
@@ -168,6 +179,54 @@ print('PASS tree, breadcrumbs, cards, parent attention, held wakes, both archive
 PY
 ```
 
+### Probe smoke measurements
+
+This is one smoke per fixture, not the performance series.
+Run it after the family drive with the fake CLI, before Doctor and Evidence.
+The retained seed path under target is too long for control.sock, so copy its checkpointed database into the stopped app's short disposable DATA folder.
+The source database remains available for later measurements.
+The following section runs in a fresh shell with only RUN carried forward.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+VEYRA_CLAUDE_BIN=/nonexistent/claude TMPDIR=/tmp cargo test -p veyra-engine --lib perf_snapshot_large -- --ignored --nocapture >"$PROOF/large-seed.txt" 2>&1
+PYTHONPATH="$PROOF" python3 - <<'PYPROBE'
+from driver import *
+identity()
+thread = create('probe-pause','Observe the halfway pause',scenario='stream-pause')
+done = ctl('probe-pause-done','wait',thread,'Done')
+assert done['perf']['visible']['applied_batches'] > 0
+assert done['perf']['visible']['max_batch_gap_ms'] > 100
+save('probe-pause-reading',done['perf'])
+capture('probe-pause')
+poll('probe-all-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+mode = ctl('probe-before-copy','dump')['settings']['default_mode']
+stop('probe-before-copy')
+seed = re.search(r'actor_ms=([0-9.]+) thread=([0-9a-f-]+) database=(.+)',(PROOF/'large-seed.txt').read_text())
+assert seed
+for suffix in ['-wal','-shm']: DB.with_name(DB.name+suffix).unlink(missing_ok=True)
+shutil.copy2(pathlib.Path(seed[3]),DB)
+start('probe-large')
+action('probe-restore-default','SetDefaultMode',{'mode':mode})
+poll('probe-default-restored',lambda d:d['settings']['default_mode']==mode)
+thread = seed[2]
+select('probe-large-open',thread)
+opened = poll('probe-large-stamped',lambda d:len(d['transcript']['items'])==5000 and d['perf']['transcript_open_ms'] is not None)
+save('probe-large-reading',{'items':len(opened['transcript']['items']),'actor_ms':float(seed[1]),
+    'transcript_open_ms':opened['perf']['transcript_open_ms'],'source_database':seed[3]})
+capture('probe-large')
+print('PASS probe smokes; pause gap='+str(done['perf']['visible']['max_batch_gap_ms'])
+    +'ms; large open='+str(opened['perf']['transcript_open_ms'])+'ms')
+PYPROBE
+```
+
+The named reading JSON files record the two window measurements, and large-seed.txt records the actor measurement and retained source path.
+The 5,000-item dump exercises the client's 4 MiB reply limit; the command limit remains 64 KiB.
+The original family drive's dumps, screenshots and SQL receipts remain in PROOF after the disposable database is replaced.
+
 ## Observable success
 
 The top-level `tasks` dump key adds task state and Pending or Delivered, while `sidebar`, `selected_thread` and `transcript` contain the lineage and rendered controls.
@@ -176,7 +235,7 @@ The tools `list_providers`, `start_thread`, `get_task`, `message_thread` and `st
 Both pages name `Archive` and `ArchiveKeepChildren`, the two actions behind Archive and Archive, keep child threads.
 Working and Done family screenshots show the same child row change; the task card and final report screenshot show turn_label and report_delivered.
 The held screenshots and SQLite show a pending wake, and Continue changes its delivery to delivered.
-The archive screenshots and queries prove hidden families and kept top-level children.
+The archive screenshots and queries prove hidden families, kept top-level children and a single-child archive holding its unarchived parent for the report.
 The quiet screenshots retain the child title beside its untruncated hint in the sidebar and header after the actual ten-minute interval.
 The Done and Interrupted card rows retain Open and show no Stop.
 The child task bubble shows the stored first-task guidance, and the later user reply keeps Report delivered on its original task report.

@@ -219,11 +219,11 @@ fn prior_task<'a>(p: &'a Projection, caller: ThreadId, key: &str) -> Option<&'a 
         .values()
         .find(|task| task.parent == caller && task.request_key == key)
 }
-fn prior_text<'a>(p: &'a Projection, task: &Task) -> Option<&'a str> {
+fn prior_text<'a>(p: &'a Projection, task: &Task, tool: Tool) -> Option<&'a str> {
     p.items_for(task.child)
         .filter(|item| item.turn == task.turn)
         .find_map(|item| match &item.body {
-            ItemBody::UserText(text) => Some(if task.request_key.starts_with("start_thread:") {
+            ItemBody::UserText(text) => Some(if tool == Tool::StartThread {
                 text.strip_prefix(CHILD_GUIDANCE.as_str()).unwrap_or(text)
             } else {
                 text.as_str()
@@ -332,7 +332,7 @@ pub fn decide(
             let key = request_key(tool, &args.client_request_id)?;
             if let Some(task) = prior_task(p, caller, &key) {
                 if p.threads[&task.child].provider != args.provider
-                    || prior_text(p, task) != Some(&args.prompt)
+                    || prior_text(p, task, Tool::StartThread) != Some(&args.prompt)
                 {
                     return Err(invalid(format!(
                         "request key {key} already names a different provider or prompt; call get_task with task_id {} or start_thread with a new client_request_id",
@@ -423,7 +423,9 @@ pub fn decide(
             prompt_cap(&args.text, tool)?;
             let key = request_key(tool, &args.client_request_id)?;
             if let Some(task) = prior_task(p, caller, &key) {
-                if task.child != args.thread_id || prior_text(p, task) != Some(&args.text) {
+                if task.child != args.thread_id
+                    || prior_text(p, task, Tool::MessageThread) != Some(&args.text)
+                {
                     return Err(invalid(format!(
                         "request key {key} already names different text or a different child than requested {}; call get_task with task_id {} or message_thread with a new client_request_id",
                         args.thread_id, task.id

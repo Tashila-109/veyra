@@ -39,7 +39,7 @@ fn completed_items_and_ended_turns_free_streaming_entries() {
     let texts: Vec<_> = items
         .items_for(f.thread)
         .filter_map(|item| match &item.body {
-            ItemBody::AssistantText { text, done } => Some((text.as_str(), *done)),
+            ItemBody::AssistantText { text, done, .. } => Some((text.as_str(), *done)),
             _ => None,
         })
         .collect();
@@ -217,7 +217,8 @@ fn interrupt_completes_and_preserves_buffered_text() {
         f.loaded().items.values().next().unwrap().body,
         ItemBody::AssistantText {
             text: "kept text".into(),
-            done: true
+            done: true,
+            reports: vec![],
         }
     );
     let events = f.drain();
@@ -311,7 +312,8 @@ fn provider_turn_join() {
         p.items.values().next().unwrap().body,
         ItemBody::AssistantText {
             text: "Hello world".into(),
-            done: true
+            done: true,
+            reports: vec![],
         }
     );
 }
@@ -388,7 +390,8 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         snapshot.items[0].body,
         ItemBody::AssistantText {
             text: String::new(),
-            done: false
+            done: false,
+            reports: vec![],
         }
     );
     assert_eq!(snapshot.buffered_text[&snapshot.items[0].id], "abc");
@@ -418,7 +421,8 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         p.items.values().next().unwrap().body,
         ItemBody::AssistantText {
             text: "abc".into(),
-            done: false
+            done: false,
+            reports: vec![],
         }
     );
     f.event(turn_event(
@@ -440,7 +444,8 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         f.loaded().items.values().next().unwrap().body,
         ItemBody::AssistantText {
             text: "abcd".into(),
-            done: true
+            done: true,
+            reports: vec![],
         }
     );
     for event in f.drain() {
@@ -843,7 +848,8 @@ mod cli {
             f.loaded().items[&item].body,
             ItemBody::AssistantText {
                 text: "one delta".into(),
-                done: true
+                done: true,
+                reports: vec![],
             }
         );
     }
@@ -2231,5 +2237,5 @@ fn accepted_turn_clears_admission_without_a_commit() {
         },
     ));
     assert!(f.loaded().items.values().any(|item| matches!(&item.body,
-        ItemBody::AssistantText { text, done: true } if text=="accepted reply")));
+        ItemBody::AssistantText { text, done: true, .. } if text=="accepted reply")));
 }

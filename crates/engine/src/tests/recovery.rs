@@ -323,6 +323,7 @@ fn startup_completes_interrupted_transcript_items() {
         ItemBody::AssistantText {
             text: "partial reply".into(),
             done: false,
+            reports: vec![],
         },
         ItemBody::Reasoning {
             text: "partial thought".into(),
@@ -359,7 +360,8 @@ fn startup_completes_interrupted_transcript_items() {
         .collect();
     assert!(items.contains(&ItemBody::AssistantText {
         text: "partial reply".into(),
-        done: true
+        done: true,
+        reports: vec![],
     }));
     assert!(items.contains(&ItemBody::Reasoning {
         text: "partial thought".into(),

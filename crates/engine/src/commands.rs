@@ -824,14 +824,23 @@ pub fn turn_text(p: &Projection, c: &ChangeSet, turn: &Turn) -> String {
 }
 
 pub fn task_summary(p: &Projection, c: &ChangeSet, child: ThreadId) -> String {
-    c.items(p, child)
-        .filter_map(|i| match &i.body {
-            ItemBody::AssistantText { text, .. } => Some((i.seq, text)),
+    task_report(p, c, child)
+        .and_then(|item| match &item.body {
+            ItemBody::AssistantText { text, .. } => {
+                Some(text.chars().take(crate::tools::REPORT_CHARS).collect())
+            }
             _ => None,
         })
-        .max_by_key(|(seq, _)| *seq)
-        .map(|(_, text)| text.chars().take(crate::tools::REPORT_CHARS).collect())
         .unwrap_or_default()
+}
+pub(crate) fn task_report<'a>(
+    p: &'a Projection,
+    c: &'a ChangeSet,
+    child: ThreadId,
+) -> Option<&'a Item> {
+    c.items(p, child)
+        .filter(|item| matches!(item.body, ItemBody::AssistantText { .. }))
+        .max_by_key(|item| item.seq)
 }
 
 pub fn queue_wake(

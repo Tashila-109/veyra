@@ -1,6 +1,8 @@
 #[cfg(debug_assertions)]
 mod control;
 mod relay;
+#[cfg(test)]
+mod tests;
 pub mod ui;
 #[cfg(test)]
 mod verify_map;

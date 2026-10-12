@@ -1,4 +1,4 @@
-{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.296","scenario":"respawned parent receives a pending report","source":"Veyra handwritten; MCP init shape from m4 lane 0"}
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.296","scenario":"respawned parent receives a pending report","source":"Veyra handwritten; MCP init shape from a live Claude 2.1.296 run"}
 {"type":"mcp_start"}
 {"type":"mcp_send","line":{"jsonrpc":"2.0","id":1,"method":"server/discover"}}
 {"type":"mcp_expect","line":{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}}

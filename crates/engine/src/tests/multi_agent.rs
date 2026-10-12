@@ -1254,3 +1254,198 @@ fn quit_retries_retained_changes_after_the_write_lock_clears() {
     assert!(loaded.items_for(f.thread).any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text=="retained across quit retries")));
     assert!(!root.join("run/storage-blocked.json").exists());
 }
+
+fn later_started_prompt(f: &mut Fixture, state: TurnState) -> TurnId {
+    let prompt = f.user("Admitted after provider work");
+    f.turn(
+        TurnOrigin::Provider,
+        TurnState::Ended {
+            started: Some(100),
+            at: 200,
+            outcome: TurnOutcome::Completed,
+        },
+    );
+    let mut changes = ChangeSet::default();
+    let mut turn = f.loaded().turns[&prompt].clone();
+    turn.state = state;
+    changes.turns.insert(prompt, turn);
+    f.save(changes);
+    prompt
+}
+
+#[test]
+fn session_notice_follows_later_started_prompt() {
+    for queued in [false, true] {
+        let mut f = Fixture::new(LiveState::Idle);
+        let prompt = later_started_prompt(&mut f, TurnState::Running { since: 300 });
+        if queued {
+            f.user("Queued after the running prompt");
+        }
+        f.event(ProviderEvent::Session(SessionEvent::Notice {
+            text: "Notice during the admitted prompt".into(),
+        }));
+        let loaded = f.loaded();
+        let notice = loaded
+            .items_for(f.thread)
+            .find(|item| {
+                matches!(&item.body,
+            ItemBody::Notice(notice) if notice.text == "Notice during the admitted prompt")
+            })
+            .unwrap();
+        assert_eq!(notice.turn, prompt);
+    }
+}
+
+#[test]
+fn storage_loss_notice_follows_later_started_prompt() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let prompt = later_started_prompt(
+        &mut f,
+        TurnState::Ended {
+            started: Some(300),
+            at: 400,
+            outcome: TurnOutcome::Completed,
+        },
+    );
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../target/notice-recovery-{}", ThreadId::new()));
+    let _scratch = Scratch(root.clone());
+    crate::platform::private_dir(&root.join("run")).unwrap();
+    let path = root.join("veyra.db");
+    f.actor
+        .db
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    crate::platform::private_text(
+        &root.join("run/storage-blocked.json"),
+        &serde_json::to_string(&std::collections::BTreeMap::from([(
+            f.thread,
+            "recent text".to_string(),
+        )]))
+        .unwrap(),
+    )
+    .unwrap();
+    let (out, _) = mpsc::channel(16);
+    let actor = Actor::new(
+        Connection::open(&path).unwrap(),
+        out,
+        Spawner::Scripted(Scripted::default()),
+    )
+    .unwrap();
+    let loaded = store::load(&actor.db).unwrap();
+    let notice = loaded
+        .items_for(f.thread)
+        .find(|item| {
+            matches!(&item.body,
+        ItemBody::Notice(notice) if notice.text.contains("recent text"))
+        })
+        .unwrap();
+    assert_eq!(notice.turn, prompt);
+}
+
+#[test]
+fn queued_tasks_record_the_reported_assistant_item() {
+    let mut f = Fixture::new(LiveState::Running);
+    let parent = f.thread;
+    let (child, first) = start(&mut f, "first report");
+    ready_child(&mut f, child);
+    let second = success(call(
+        &mut f,
+        parent,
+        "message_thread",
+        json!({
+            "thread_id":child,"text":"Second report","client_request_id":"second report"
+        }),
+    ));
+    let second: TaskId = serde_json::from_value(second["task_id"].clone()).unwrap();
+    for (task, text) in [(first, "First report"), (second, "Reported follow-up")] {
+        let turn = task_turn(&f, task);
+        child_event(
+            &mut f,
+            child,
+            turn_event(
+                Some(turn),
+                TurnEvent::TextDelta {
+                    key: NativeItemKey("reply".into()),
+                    text: text.into(),
+                    streamed: true,
+                },
+            ),
+        );
+        child_event(
+            &mut f,
+            child,
+            turn_event(
+                Some(turn),
+                TurnEvent::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                    park: false,
+                },
+            ),
+        );
+        if task == first {
+            assert_eq!(f.loaded().tasks[&first].state, TaskState::Running);
+        }
+    }
+    let loaded = f.loaded();
+    for task in [first, second] {
+        assert!(
+            matches!(&loaded.tasks[&task].state, TaskState::Settled { summary, .. } if summary == "Reported follow-up")
+        );
+    }
+    let report = loaded
+        .items_for(child)
+        .find(|item| {
+            matches!(&item.body,
+        ItemBody::AssistantText { text, .. } if text == "Reported follow-up")
+        })
+        .unwrap();
+    let stored = serde_json::to_value(&report.body).unwrap();
+    let mut tasks: Vec<TaskId> =
+        serde_json::from_value(stored["AssistantText"]["reports"].clone()).unwrap();
+    tasks.sort();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(tasks, expected);
+    assert_eq!(report.turn, task_turn(&f, second));
+}
+
+#[test]
+fn archive_one_child_holds_parent_and_preserves_earlier_hold() {
+    for previous in [None, Some(HoldReason::Stopped), Some(HoldReason::Restarted)] {
+        let mut f = Fixture::new(LiveState::Running);
+        let (child, task) = start(&mut f, "archive one child");
+        ready_child(&mut f, child);
+        f.hold(previous);
+        f.command(Command::ArchiveThread {
+            thread: child,
+            keep_children: false,
+        })
+        .unwrap();
+        let loaded = f.loaded();
+        assert!(loaded.threads[&child].archived);
+        assert!(!loaded.threads[&f.thread].archived);
+        assert_eq!(
+            loaded.threads[&f.thread].hold,
+            previous.or(Some(HoldReason::ChildReport))
+        );
+        let TaskState::Settled {
+            delivery: Delivery::Pending { wake },
+            ..
+        } = loaded.tasks[&task].state
+        else {
+            panic!()
+        };
+        assert_eq!(loaded.turns[&wake].state, TurnState::Queued);
+        assert!(
+            matches!(&loaded.turns[&wake].origin, TurnOrigin::Wake { tasks } if tasks == &[task])
+        );
+    }
+}
+
+#[test]
+fn existing_assistant_json_remains_unchanged_without_reports() {
+    let legacy = serde_json::json!({"AssistantText":{"text":"existing reply","done":true}});
+    let item: ItemBody = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(item).unwrap(), legacy);
+}

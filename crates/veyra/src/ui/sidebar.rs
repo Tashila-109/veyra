@@ -1,4 +1,9 @@
-use super::{Shell, actions::*, composer::labelled_button, theme::Theme};
+use super::{
+    Shell,
+    actions::*,
+    composer::{button_text, labelled_button, labelled_button_with},
+    theme::Theme,
+};
 use gpui_kit::base::Selectable;
 use gpui_kit::component::{StyledExt, popover::Popover};
 use gpui_kit::{prelude::*, *};
@@ -137,6 +142,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         "…",
                         cx,
                     )
+                    .debug_selector(|| "sidebar-thread-menu".into())
                     .accessibility_label("Thread actions")
                     .tooltip("Thread actions"),
                 )
@@ -151,11 +157,12 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .content(move |_, _, _| div().children(menu.clone()));
             rows.push(
                 div()
+                    .debug_selector(|| "sidebar-thread-row".into())
                     .h_flex()
                     .items_center()
                     .h(t.layout.thread_row)
                     .gap(t.space.0[3])
-                    .when(quiet.is_some(), |row| row.v_flex().h_auto().gap_0())
+                    .when(quiet.is_some(), |row| row.gap_0())
                     .when(nested(&shell.state, thread), |row| {
                         row.ml(t.layout.agent_margin)
                             .pl(t.space.0[3])
@@ -170,42 +177,58 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             .flex_1()
                             .min_w_0()
                             .gap(t.space.0[3])
-                            .when(quiet.is_some(), |row| row.w_full().gap_0())
+                            .when(quiet.is_some(), |row| row.gap_0())
                             .child(
                                 div()
                                     .w(t.layout.status_glyph)
                                     .text_color(glyph_color(&status, t))
                                     .child(glyph(&status)),
                             )
-                            .child(
-                                labelled_button(
-                                    SharedString::from(format!("thread-{id}")),
-                                    thread.title.clone(),
-                                    cx,
-                                )
-                                .debug_selector(|| "sidebar-thread-title".into())
-                                .flex_1()
-                                .min_w_0()
-                                .justify_start()
-                                .selected(shell.view.chat() == Some(thread.id))
-                                .tooltip(status.words())
-                                .on_click(move |_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(SelectThread { thread: Some(id) }),
+                            .child({
+                                let label = SharedString::from(thread.title.clone());
+                                let title = if let Some(minutes) = quiet {
+                                    labelled_button_with(
+                                        SharedString::from(format!("thread-{id}")),
+                                        label.clone(),
+                                        div()
+                                            .h_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .items_center()
+                                            .child(button_text(label, cx).flex_1())
+                                            .child(
+                                                div()
+                                                    .debug_selector(|| "sidebar-quiet".into())
+                                                    .flex_none()
+                                                    .whitespace_nowrap()
+                                                    .text_size(t.text.meta.size)
+                                                    .text_color(t.colors.text_muted)
+                                                    .child(format!("Quiet for {minutes} min")),
+                                            ),
                                         cx,
                                     )
-                                }),
-                            )
-                            .when_some(quiet, |row, minutes| {
-                                row.child(
-                                    div()
-                                        .debug_selector(|| "sidebar-quiet".into())
-                                        .flex_none()
-                                        .whitespace_nowrap()
-                                        .text_size(t.text.meta.size)
-                                        .text_color(t.colors.text_muted)
-                                        .child(format!("Quiet for {minutes} min")),
-                                )
+                                    .px_0()
+                                } else {
+                                    labelled_button(
+                                        SharedString::from(format!("thread-{id}")),
+                                        label,
+                                        cx,
+                                    )
+                                    .child(div().flex_1())
+                                };
+                                title
+                                    .debug_selector(|| "sidebar-thread-title".into())
+                                    .flex_1()
+                                    .min_w_0()
+                                    .justify_start()
+                                    .selected(shell.view.chat() == Some(thread.id))
+                                    .tooltip(status.words())
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(SelectThread { thread: Some(id) }),
+                                            cx,
+                                        )
+                                    })
                             }),
                     )
                     .child(
@@ -214,13 +237,14 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             .items_center()
                             .gap(t.space.0[3])
                             .flex_none()
-                            .when(quiet.is_some(), |row| row.w_full().justify_end())
+                            .when(quiet.is_some(), |row| row.gap_0())
                             .child(
                                 labelled_button(
                                     SharedString::from(format!("stop-thread-{id}")),
                                     "■",
                                     cx,
                                 )
+                                .debug_selector(|| "sidebar-thread-stop".into())
                                 .w(t.layout.icon_button)
                                 .accessibility_label("Stop thread")
                                 .tooltip("Stop thread")

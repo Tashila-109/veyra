@@ -156,8 +156,16 @@ pub struct Item {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemBody {
     UserText(String),
-    AssistantText { text: String, done: bool },
-    Reasoning { text: String, done: bool },
+    AssistantText {
+        text: String,
+        done: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reports: Vec<TaskId>,
+    },
+    Reasoning {
+        text: String,
+        done: bool,
+    },
     Tool(ToolItem),
     Plan(Vec<PlanStep>),
     Notice(Notice),
