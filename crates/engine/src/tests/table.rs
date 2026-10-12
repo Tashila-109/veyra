@@ -59,7 +59,10 @@ fn cell(row: Row, state: LiveState) {
                 thread: f.thread,
                 drop_queued,
             }),
-            Row::Interrupt => f.command(Command::Interrupt { thread: f.thread }),
+            Row::Interrupt => f.command(Command::Interrupt {
+                thread: f.thread,
+                turn: f.active_turn().unwrap_or_default(),
+            }),
             Row::Respond => f.command(Command::Respond {
                 request: req.unwrap(),
                 decision: Decision::AllowOnce,
@@ -109,7 +112,7 @@ fn cell(row: Row, state: LiveState) {
             }
         };
         let refused = match row {
-            Row::Interrupt => state == LiveState::Terminal,
+            Row::Interrupt => false,
             Row::Respond => state != LiveState::Running,
             Row::Configure => !matches!(state, LiveState::Parked | LiveState::Idle),
             Row::Switch => !matches!(
@@ -163,22 +166,20 @@ fn cell(row: Row, state: LiveState) {
                 }
             }
             Row::Interrupt => {
+                if state != LiveState::Running {
+                    assert!(f.controls.try_recv().is_err());
+                }
+                if state == LiveState::Starting {
+                    assert!(matches!(live, Live::Starting { .. }));
+                }
                 assert_eq!(
                     t.hold,
-                    if refused {
-                        None
-                    } else {
+                    if state == LiveState::Running {
                         Some(HoldReason::Interrupted)
+                    } else {
+                        None
                     }
                 );
-                if state == LiveState::Starting {
-                    assert!(matches!(
-                        live,
-                        Live::Stopping {
-                            then: AfterStop::Park
-                        }
-                    ));
-                }
                 if state == LiveState::Running {
                     assert_eq!(f.running(), None);
                     assert_eq!(

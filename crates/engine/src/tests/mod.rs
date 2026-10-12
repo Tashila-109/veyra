@@ -189,6 +189,10 @@ impl Fixture {
             .find(|t| t.thread == self.thread && matches!(t.state, TurnState::Running { .. }))
             .map(|t| t.id)
     }
+    fn active_turn(&self) -> Option<TurnId> {
+        self.running()
+            .or(self.actor.live[&self.thread].pending_turn())
+    }
     fn req(&mut self) -> RequestId {
         let turn = self.running().unwrap_or_else(|| {
             self.turn(

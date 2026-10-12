@@ -425,6 +425,7 @@ The fake lane runs those pages without a provider login.
 Use the same exported `RUN` in every fresh shell.
 `action NAME [JSON]` builds a registered gpui action.
 AllowOnce, AllowInThread and Deny accept a request id; AnswerQuestion accepts request, question index and option index.
+Stop accepts a target containing thread and turn ids; without a payload it uses the rendered running or pending-admission turn.
 Without a request payload, consent actions use the rendered dock target, as focused keyboard chords do.
 For an explicit AnswerQuestion request, supply its question index as well.
 Action and key replies acknowledge dispatch; poll `dump` for the resulting view or use `ctl wait` for a thread state.

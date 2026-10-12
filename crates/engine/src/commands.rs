@@ -24,6 +24,7 @@ pub enum Command {
     },
     Interrupt {
         thread: ThreadId,
+        turn: TurnId,
     },
     Respond {
         request: RequestId,
@@ -96,8 +97,8 @@ pub fn decide(
             text,
         } => create_thread(p, l, &mut c, project, provider, config, text)?,
         Command::Send { thread, text } => send(p, l, &mut c, thread, text)?,
-        Command::Interrupt { thread } => {
-            interrupt(p, l, &mut c, thread, now)?;
+        Command::Interrupt { thread, turn } => {
+            interrupt(p, l, &mut c, thread, turn, now)?;
             Ack::Applied
         }
         Command::Respond { request, decision } => {
@@ -280,20 +281,48 @@ fn interrupt(
     l: &BTreeMap<ThreadId, LiveThread>,
     c: &mut ChangeSet,
     thread: ThreadId,
+    turn: TurnId,
     now: Millis,
 ) -> Result<(), CommandError> {
     get_thread(p, thread)?;
+    let Some(target) = p
+        .turns
+        .get(&turn)
+        .filter(|target| target.thread == thread && l[&thread].is_active(target))
+    else {
+        return Ok(());
+    };
     match &l[&thread].live {
         Live::Starting { .. } => {
             control(c, thread, SessionControl::Shutdown);
             stopping(l, c, thread, AfterStop::Park);
         }
-        Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
-            interrupt_active(p, l, c, thread);
-            end_active(p, l, c, thread, StopReason::User, now);
+        Live::Structured { .. } => {
+            let mut live = c.live(l, thread).clone();
+            if let Live::Structured { draining, .. } = &mut live.live {
+                *draining = Some(turn);
+            }
+            c.live.insert(thread, live);
+            control(
+                c,
+                thread,
+                SessionControl::Interrupt {
+                    turn,
+                    reason: StopReason::User,
+                },
+            );
+            end_turn(
+                p,
+                c,
+                target.clone(),
+                TurnOutcome::Interrupted {
+                    reason: StopReason::User.text().into(),
+                },
+                now,
+            );
         }
         Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
-        Live::Parked | Live::Structured { .. } | Live::Stopping { .. } => {}
+        Live::Parked | Live::Stopping { .. } => {}
     }
     set_hold(p, c, thread, Some(HoldReason::Interrupted));
     Ok(())
@@ -690,10 +719,7 @@ pub(crate) fn end_active(
 ) {
     let turns: Vec<_> = c
         .turns(p, thread)
-        .filter(|t| {
-            matches!(t.state, TurnState::Running { .. })
-                || c.live(l, thread).pending_turn() == Some(t.id) && t.state == TurnState::Queued
-        })
+        .filter(|t| c.live(l, thread).is_active(t))
         .cloned()
         .collect();
     for t in turns {

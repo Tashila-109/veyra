@@ -493,6 +493,21 @@ struct Tool {
     key: NativeItemKey,
     subagent: Option<Box<Codec>>,
 }
+pub(crate) enum Outbound {
+    Message(Value),
+    Interrupt(TurnId),
+}
+impl Outbound {
+    pub fn value(&self) -> Value {
+        match self {
+            Self::Message(line) => line.clone(),
+            Self::Interrupt(_) => json!({
+                "type":"control_request", "request_id":"veyra-interrupt",
+                "request":{"subtype":"interrupt"}
+            }),
+        }
+    }
+}
 pub(crate) struct Codec {
     pub active: Option<ActiveTurn>,
     echo: EchoMode,
@@ -505,6 +520,7 @@ pub(crate) struct Codec {
     interrupted: Option<Interruption>,
     requests: BTreeMap<String, PendingRequest>,
     seen_requests: BTreeSet<String>,
+    submitted_prompts: BTreeSet<String>,
 }
 #[derive(Default)]
 pub(crate) struct Decoded {
@@ -526,12 +542,14 @@ impl Codec {
             tools: BTreeMap::new(),
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
+            submitted_prompts: BTreeSet::new(),
         }
     }
     pub fn start(&mut self, turn: TurnId, text: String) -> Option<Value> {
         if self.active.is_some() {
             return None;
         }
+        self.submitted_prompts.insert(turn.to_string());
         self.active = Some(ActiveTurn::Veyra(turn));
         self.stream = MessageStream::default();
         self.error = None;
@@ -675,6 +693,7 @@ impl Codec {
                         events.push(TurnEvent::Accepted);
                     }
                 } else if self.active.is_none()
+                    && !self.submitted_prompts.contains(&lifecycle.command_uuid)
                     && ["queued", "started"].contains(&lifecycle.state.as_str())
                 {
                     events.push(TurnEvent::Started);
@@ -942,20 +961,21 @@ impl Codec {
         self.requests.remove(&native.0);
         Some(Self::response(native.0, response))
     }
-    pub fn interrupt_active(&mut self, reason: StopReason) -> Vec<Value> {
+    pub fn interrupt_active(&mut self, reason: StopReason) -> Vec<Outbound> {
         self.active
             .map(|turn| self.interrupt_lines(turn.target(), reason))
             .unwrap_or_default()
     }
-    pub fn interrupt_lines(&mut self, turn: TurnId, reason: StopReason) -> Vec<Value> {
+    pub fn interrupt_lines(&mut self, turn: TurnId, reason: StopReason) -> Vec<Outbound> {
         if !self.interrupt_for(turn, reason) {
             return Vec::new();
         }
-        let mut lines = self.cancel_requests(reason.text());
-        lines.push(json!({
-            "type":"control_request", "request_id":"veyra-interrupt",
-            "request":{"subtype":"interrupt"}
-        }));
+        let mut lines: Vec<_> = self
+            .cancel_requests(reason.text())
+            .into_iter()
+            .map(Outbound::Message)
+            .collect();
+        lines.push(Outbound::Interrupt(turn));
         lines
     }
     pub fn cancel_requests(&mut self, reason: &str) -> Vec<Value> {

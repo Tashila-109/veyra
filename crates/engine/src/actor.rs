@@ -1083,10 +1083,7 @@ impl Actor {
         let active: Vec<_> = self
             .projection
             .turns_for(thread)
-            .filter(|t| {
-                matches!(t.state, TurnState::Running { .. })
-                    || old.pending_turn() == Some(t.id) && t.state == TurnState::Queued
-            })
+            .filter(|t| old.is_active(t))
             .cloned()
             .collect();
         if active.is_empty() && matches!(old.live, Live::Starting { .. }) {
@@ -1397,6 +1394,7 @@ impl Actor {
                         wait_reason: wait_reason(&view),
                         busy: crate::live::busy(&view),
                         turn_busy: view.turn_busy(),
+                        pending_turn: view.live.pending_turn(),
                     },
                 );
             }

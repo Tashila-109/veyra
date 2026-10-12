@@ -208,7 +208,11 @@ fn interrupt_completes_and_preserves_buffered_text() {
         },
     ));
     f.drain();
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     assert_eq!(
         f.loaded().items.values().next().unwrap().body,
         ItemBody::AssistantText {
@@ -530,7 +534,11 @@ fn provider_stop_tail_opens_no_turn() {
             streamed: true,
         },
     ));
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     f.event(turn_event(
         None,
         TurnEvent::TextDelta {
@@ -1036,6 +1044,7 @@ mod cli {
         run.f
             .command(Command::Interrupt {
                 thread: run.f.thread,
+                turn: first,
             })
             .unwrap();
         run.until(|f| {
@@ -1080,6 +1089,7 @@ mod cli {
         run.f
             .command(Command::Interrupt {
                 thread: run.f.thread,
+                turn: first,
             })
             .unwrap();
         let second = run.send("second");
@@ -1256,11 +1266,19 @@ fn late_stop_of_completed_user_prompt_leaves_provider_turn_unstopped() {
         }
     )));
     assert_eq!(f.running(), Some(first));
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
         panic!("missing Interrupt")
     };
-    let replies = codec.interrupt_lines(turn, reason);
+    let replies = codec
+        .interrupt_lines(turn, reason)
+        .iter()
+        .map(|line| line.value())
+        .collect::<Vec<_>>();
     for event in old_end
         .events
         .into_iter()
@@ -1332,7 +1350,11 @@ fn provider_interrupt_targets_provider_turn_and_preserves_cancel_order() {
             "request":{"subtype":"can_use_tool", "tool_name":"Bash", "input":{"command":"echo ok"}}
         })).unwrap().events);
     }
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
         panic!()
     };
@@ -1353,13 +1375,21 @@ fn provider_interrupt_targets_provider_turn_and_preserves_cancel_order() {
             .count(),
         2
     );
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
         panic!()
     };
     assert_eq!(turn, next);
     assert_eq!(
-        codec.interrupt_lines(turn, reason),
+        codec
+            .interrupt_lines(turn, reason)
+            .iter()
+            .map(|line| line.value())
+            .collect::<Vec<_>>(),
         vec![
             json!({"type":"control_response", "response":{"subtype":"success", "request_id":"approval-a",
             "response":{"behavior":"deny", "message":"Stopped by you", "interrupt":true}}}),
@@ -1541,7 +1571,11 @@ fn refused_stopped_prompt_does_not_strand_provider_turn() {
         )
         .unwrap();
     let provider_turn = provider.provider_turn.unwrap();
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     let SessionControl::Interrupt { turn, reason } = f.controls.try_recv().unwrap() else {
         panic!()
     };
@@ -1652,10 +1686,20 @@ fn apply_admission_controls(
     while let Ok(control) = f.controls.try_recv() {
         eprintln!("control={control:?}");
         match control {
-            SessionControl::Interrupt { turn, reason } => {
-                lines.extend(codec.interrupt_lines(turn, reason))
-            }
-            SessionControl::InterruptActive(reason) => lines.extend(codec.interrupt_active(reason)),
+            SessionControl::Interrupt { turn, reason } => lines.extend(
+                codec
+                    .interrupt_lines(turn, reason)
+                    .iter()
+                    .map(|line| line.value())
+                    .collect::<Vec<_>>(),
+            ),
+            SessionControl::InterruptActive(reason) => lines.extend(
+                codec
+                    .interrupt_active(reason)
+                    .iter()
+                    .map(|line| line.value())
+                    .collect::<Vec<_>>(),
+            ),
             _ => {}
         }
     }
@@ -1683,7 +1727,11 @@ fn stop_reaches_admitted_requeued_prompt() {
 #[test]
 fn interrupt_keeps_admitted_requeued_prompt_held() {
     let (mut f, mut codec, next) = admitted_while_queued();
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     let lines = apply_admission_controls(&mut f, &mut codec);
     eprintln!("codec_lines={lines:?}");
     for e in codec.value(serde_json::json!({
@@ -1899,4 +1947,86 @@ fn session_exit_ends_running_and_pending_admission_rows() {
             TurnState::Ended { outcome: TurnOutcome::Failed { message }, .. } if message == "owned session failed"));
     }
     assert!(f.controls.try_recv().is_err());
+}
+
+fn completed_lifecycle(state: &str) {
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut f = Fixture::new(LiveState::Idle);
+    let first = match f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "first".into(),
+        })
+        .unwrap()
+    {
+        Ack::Turn(turn) => turn,
+        _ => panic!(),
+    };
+    let mut codec = Codec::new(
+        NativeSessionId("review-only".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    codec.start(first, "first".into()).unwrap();
+    let accepted = codec
+        .value(json!({"type":"command_lifecycle",
+            "command_uuid":first.to_string(), "state":"started"}))
+        .unwrap();
+    for event in accepted.events {
+        f.event(event);
+    }
+    let ended = codec
+        .value(
+            json!({"type":"result", "subtype":"success", "is_error":false,
+            "user_message_uuid":first.to_string()}),
+        )
+        .unwrap();
+    for event in ended.events {
+        f.event(event);
+    }
+    assert!(f.running().is_none());
+    let stale = codec
+        .value(json!({"type":"command_lifecycle",
+            "command_uuid":first.to_string(), "state":state}))
+        .unwrap();
+    if let Some(provider_turn) = stale.provider_turn {
+        f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+            provider_turn,
+        }));
+    }
+    for event in stale.events {
+        f.event(event);
+    }
+    assert!(
+        f.running().is_none(),
+        "late {state} for completed A opened phantom {:?}",
+        f.running()
+    );
+}
+
+#[test]
+fn completed_prompt_late_queued_cannot_open_a_provider_turn() {
+    completed_lifecycle("queued");
+}
+
+#[test]
+fn completed_prompt_late_started_cannot_open_a_provider_turn() {
+    completed_lifecycle("started");
+}
+
+#[test]
+fn foreign_lifecycle_still_opens_a_provider_turn() {
+    use crate::provider::claude::Codec;
+    use serde_json::json;
+    let mut codec = Codec::new(
+        NativeSessionId("review-only".into()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    let decoded = codec
+        .value(json!({"type":"command_lifecycle",
+        "command_uuid":"cli-owned-work", "state":"started"}))
+        .unwrap();
+    assert!(decoded.provider_turn.is_some());
 }

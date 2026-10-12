@@ -172,12 +172,12 @@ fn requeued_delivery_keeps_settlement_summary() {
     );
 }
 
-fn command_requeues_wake(command: impl Fn(ThreadId) -> Command, archived: bool) {
+fn command_requeues_wake(command: impl Fn(ThreadId, TurnId) -> Command, archived: bool) {
     let mut f = Fixture::new(LiveState::Idle);
     let (child, task, _) = settle_report(&mut f);
     let wake = f.running().unwrap();
     f.controls.try_recv().unwrap();
-    f.command(command(f.thread)).unwrap();
+    f.command(command(f.thread, wake)).unwrap();
     let p = f.loaded();
     let queued: Vec<_> = p
         .turns
@@ -260,16 +260,16 @@ fn command_requeues_wake(command: impl Fn(ThreadId) -> Command, archived: bool) 
 
 #[test]
 fn interrupt_requeues_unaccepted_wake() {
-    command_requeues_wake(|thread| Command::Interrupt { thread }, false);
+    command_requeues_wake(|thread, turn| Command::Interrupt { thread, turn }, false);
 }
 #[test]
 fn stop_requeues_unaccepted_wake() {
-    command_requeues_wake(|thread| Command::StopThread { thread }, false);
+    command_requeues_wake(|thread, _| Command::StopThread { thread }, false);
 }
 #[test]
 fn archive_requeues_unaccepted_wake_without_restarting() {
     command_requeues_wake(
-        |thread| Command::ArchiveThread {
+        |thread, _| Command::ArchiveThread {
             thread,
             keep_children: false,
         },
@@ -469,7 +469,11 @@ fn child_settlement_keeps_final_buffered_report() {
 fn interrupt_holds_queue() {
     let mut f = Fixture::new(LiveState::Running);
     let queued = f.user("wait for me");
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
     assert_eq!(
         f.loaded().threads[&f.thread].hold,
@@ -636,7 +640,11 @@ fn continue_drop_queued_discards_user_turns() {
 fn interrupt_expires_pending_requests() {
     let mut f = Fixture::new(LiveState::Running);
     let req = f.req();
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     assert!(matches!(
         f.loaded().requests[&req].state,
         RequestState::Expired { .. }
@@ -688,7 +696,11 @@ fn hold_reason_names_its_command() {
         let mut f = Fixture::new(LiveState::Running);
         match command {
             0 => {
-                f.command(Command::Interrupt { thread: f.thread }).unwrap();
+                f.command(Command::Interrupt {
+                    thread: f.thread,
+                    turn: f.active_turn().unwrap(),
+                })
+                .unwrap();
             }
             1 => {
                 f.command(Command::StopThread { thread: f.thread }).unwrap();

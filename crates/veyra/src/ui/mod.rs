@@ -410,15 +410,23 @@ where
     let index = current.and_then(|current| values.iter().position(|value| value == current));
     values.get(index.map(|index| (index + 1) % values.len()).unwrap_or(0))
 }
+#[derive(Clone, Copy)]
+struct DockTarget {
+    request: RequestId,
+    question: usize,
+}
+
 pub struct Shell {
     #[cfg(test)]
     sent_responses: std::rc::Rc<std::cell::RefCell<Vec<(RequestId, Decision)>>>,
+    #[cfg(test)]
+    sent_interrupts: Vec<StopTarget>,
     #[cfg(debug_assertions)]
     repaints: u64,
     focus: FocusHandle,
     dock_focus: FocusHandle,
     dock_focused: bool,
-    dock_press: Option<(RequestId, usize)>,
+    rendered_stop: Option<StopTarget>,
     quit_focus: FocusHandle,
     quit_sheet: bool,
     window_active: bool,
@@ -584,7 +592,7 @@ impl Shell {
             focus,
             dock_focus: cx.focus_handle(),
             dock_focused: false,
-            dock_press: None,
+            rendered_stop: None,
             quit_focus: cx.focus_handle(),
             quit_sheet: false,
             window_active: window.is_window_active(),
@@ -592,6 +600,8 @@ impl Shell {
             question_draft: None,
             #[cfg(test)]
             sent_responses: Default::default(),
+            #[cfg(test)]
+            sent_interrupts: Vec::new(),
             sidebar_width: cx.global::<Theme>().layout.sidebar_default,
             resizing: false,
             notice: None,
@@ -675,6 +685,13 @@ impl Shell {
             self.sent_responses
                 .borrow_mut()
                 .push((*request, decision.clone()));
+        }
+        #[cfg(test)]
+        if let Command::Interrupt { thread, turn } = &command {
+            self.sent_interrupts.push(StopTarget {
+                thread: *thread,
+                turn: *turn,
+            });
         }
         let reply = self.engine.send(command);
         cx.spawn_in(window, async move |this, cx| {
@@ -899,14 +916,24 @@ impl Shell {
         }
         None
     }
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        stop_target: Option<StopTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(reason) = self.disabled_reason() {
             self.notice(reason, cx);
             return;
         }
         let text = self.input.read(cx).value().to_string();
         if text.trim().is_empty() && self.view.chat().is_some_and(|thread| self.running(thread)) {
-            window.dispatch_action(Box::new(Stop), cx);
+            window.dispatch_action(
+                Box::new(Stop {
+                    target: stop_target,
+                }),
+                cx,
+            );
             return;
         }
         if text.trim().is_empty() {
@@ -947,9 +974,25 @@ impl Shell {
             })
             .collect()
     }
-    fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(thread) = self.view.chat() {
-            self.send_command(Command::Interrupt { thread }, window, cx);
+    fn stop_target(&self) -> Option<StopTarget> {
+        let thread = self.view.chat()?;
+        let turn = self
+            .state
+            .turns
+            .values()
+            .find(|turn| turn.thread == thread && matches!(turn.state, TurnState::Running { .. }))
+            .map(|turn| turn.id)
+            .or_else(|| {
+                self.engine
+                    .window_threads()
+                    .get(&thread)
+                    .and_then(|state| state.pending_turn)
+            })?;
+        Some(StopTarget { thread, turn })
+    }
+    fn stop(&mut self, target: Option<StopTarget>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(StopTarget { thread, turn }) = target {
+            self.send_command(Command::Interrupt { thread, turn }, window, cx);
         }
     }
     fn continue_queue(&mut self, drop_queued: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -964,17 +1007,15 @@ impl Shell {
             );
         }
     }
-    fn dock_click(
-        &mut self,
-        event: &ClickEvent,
-        request: RequestId,
-        question: usize,
-    ) -> (RequestId, usize) {
-        if matches!(event, ClickEvent::Mouse(_)) {
-            self.dock_press.take().unwrap_or((request, question))
-        } else {
-            (request, question)
-        }
+    fn dock_target(&self) -> Option<DockTarget> {
+        let thread = self.view.chat()?;
+        let request = self.state.pending_requests(thread).first()?.id;
+        let question = self
+            .question_draft
+            .as_ref()
+            .filter(|(id, _)| *id == request)
+            .map_or(0, |(_, answers)| answers.len());
+        Some(DockTarget { request, question })
     }
     fn pending_request(&self, request: Option<RequestId>) -> Option<&Request> {
         let thread = self.view.chat()?;
@@ -1368,7 +1409,7 @@ impl Shell {
             "stop_visible":self.view.chat().is_some_and(|thread| self.running(thread))
                 && self.input.read(cx).value().trim().is_empty(),
             "discard_queued_visible":self.discard_queued_visible(),
-            "dock":self.view.chat().and_then(|thread| self.state.pending_requests(thread).first().map(|request| {
+            "dock":self.dock_target().and_then(|target| self.pending_request(Some(target.request)).map(|request| {
                 let text = match &request.kind {
                     RequestKind::Approval { action, .. } => Some(composer::approval_text(
                         action, self.chosen_provider().label())),
@@ -1378,9 +1419,8 @@ impl Shell {
                     "action_text":text.as_ref().map(|(label, _, _)| label),
                     "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
                     "preview":text.as_ref().map(|(_, _, preview)| preview),
-                    "count":self.state.pending_requests(thread).len(), "focused":self.dock_focused,
-                    "question_index":self.question_draft.as_ref().filter(|(id, _)| *id == request.id)
-                        .map_or(0, |(_, answers)| answers.len())})
+                    "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
+                    "question_index":target.question})
             }))
         })
     }
@@ -1429,18 +1469,11 @@ impl Render for Shell {
             self.repaints += 1;
         }
         let theme = cx.global::<Theme>().clone();
-        let dock_request = self.view.chat().and_then(|thread| {
-            self.state
-                .pending_requests(thread)
-                .first()
-                .map(|request| request.id)
-        });
-        let dock_question = dock_request.map(|request| {
-            self.question_draft
-                .as_ref()
-                .filter(|(id, _)| *id == request)
-                .map_or(0, |(_, answers)| answers.len())
-        });
+        let dock_target = self.dock_target();
+        let dock_request = dock_target.map(|target| target.request);
+        let dock_question = dock_target.map(|target| target.question);
+        self.rendered_stop = self.stop_target();
+        let stop_target = self.rendered_stop;
         let root = div()
             .h_flex()
             .size_full()
@@ -1456,8 +1489,12 @@ impl Render for Shell {
                 shell.add_project(action, window, cx)
             }))
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
-            .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
-            .on_action(cx.listener(|shell, _: &Stop, window, cx| shell.stop(window, cx)))
+            .on_action(
+                cx.listener(move |shell, _: &Send, window, cx| shell.send(stop_target, window, cx)),
+            )
+            .on_action(cx.listener(move |shell, action: &Stop, window, cx| {
+                shell.stop(action.target.or(stop_target), window, cx)
+            }))
             .on_action(cx.listener(|shell, _: &Continue, window, cx| {
                 shell.continue_queue(false, window, cx)
             }))
@@ -2060,7 +2097,9 @@ mod tests {
     #[gpui::test]
     fn empty_send_dispatches_stop_action(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, dispatched, _| {
-            shell.update_in(cx, |shell, window, cx| shell.send(window, cx));
+            shell.update_in(cx, |shell, window, cx| {
+                shell.send(shell.stop_target(), window, cx)
+            });
             cx.run_until_parked();
             draw(cx);
             assert_eq!(
@@ -2068,7 +2107,7 @@ mod tests {
                 ["Stop"],
                 "empty Send must reach the window's Stop action"
             );
-            cx.dispatch_action(super::Stop);
+            cx.dispatch_action(super::Stop::default());
             cx.run_until_parked();
             draw(cx);
             assert_eq!(dispatched.borrow().as_slice(), ["Stop", "Stop"]);
@@ -3076,6 +3115,100 @@ mod tests {
             "a provider launched after quit began: {launched}"
         );
     }
+    #[gpui::test]
+    fn stop_mouse_release_does_not_retarget_after_repaint(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            draw(cx);
+            let first = shell.read_with(cx, |shell, _| shell.stop_target().unwrap());
+            let button = cx.debug_bounds("composer-submit-button").unwrap().center();
+            cx.simulate_mouse_down(button, gpui::MouseButton::Left, gpui::Modifiers::none());
+            let second = shell.update(cx, |shell, cx| {
+                shell.state.turns.get_mut(&first.turn).unwrap().state = TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(0),
+                    at: 1,
+                };
+                let mut turn = shell.state.turns[&first.turn].clone();
+                turn.id = TurnId::new();
+                turn.ordinal += 1;
+                turn.state = TurnState::Running { since: 1 };
+                let id = turn.id;
+                shell.state.turns.insert(id, turn);
+                cx.notify();
+                id
+            });
+            draw(cx);
+            cx.simulate_mouse_up(button, gpui::MouseButton::Left, gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert!(
+                shell.read_with(cx, |shell, _| shell
+                    .sent_interrupts
+                    .iter()
+                    .all(|target| target.turn != second)),
+                "releasing A's Stop press after repaint must not interrupt B"
+            );
+            draw(cx);
+            let button = cx.debug_bounds("composer-submit-button").unwrap().center();
+            cx.simulate_click(button, gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_interrupts.len()),
+                1
+            );
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_interrupts[0].turn),
+                second
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn stop_and_control_c_keep_the_rendered_turn(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            draw(cx);
+            let first = shell.read_with(cx, |shell, _| shell.stop_target().unwrap());
+            shell.update(cx, |shell, _| {
+                shell.state.turns.get_mut(&first.turn).unwrap().state = TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(0),
+                    at: 1,
+                };
+                let mut second = shell.state.turns[&first.turn].clone();
+                second.id = TurnId::new();
+                second.ordinal += 1;
+                second.state = TurnState::Running { since: 1 };
+                shell.state.turns.insert(second.id, second);
+            });
+            cx.dispatch_action(super::Stop::default());
+            cx.run_until_parked();
+            assert!(shell.read_with(cx, |shell, _| {
+                shell
+                    .sent_interrupts
+                    .iter()
+                    .all(|target| target.thread == first.thread && target.turn == first.turn)
+            }));
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_interrupts.len()),
+                1
+            );
+            draw(cx);
+            let second = shell.read_with(cx, |shell, _| shell.stop_target().unwrap());
+            shell.update_in(cx, |shell, window, cx| {
+                shell.input.update(cx, |input, cx| input.focus(window, cx))
+            });
+            cx.simulate_keystrokes("ctrl-c");
+            cx.run_until_parked();
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_interrupts.last().unwrap().turn),
+                second.turn
+            );
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_interrupts.len()),
+                2
+            );
+        });
+    }
+
     #[gpui::test]
     fn old_rendered_allow_button_does_not_approve_new_request(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {

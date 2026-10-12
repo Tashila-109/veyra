@@ -1,7 +1,7 @@
 use super::{
     ProviderError, ProviderEvent, ProviderKind, SessionControl, SessionEvent, SessionHandle,
     SessionSpec, StopReason, TurnEvent,
-    claude::{self, Codec},
+    claude::{self, Codec, Outbound},
     env::ChildEnv,
 };
 use crate::{
@@ -147,10 +147,6 @@ impl Drop for ProcessGroup {
         self.end();
     }
 }
-struct WriterLine {
-    line: serde_json::Value,
-    interrupt: Option<TurnId>,
-}
 async fn write_interrupt(
     stdin: &mut (impl AsyncWrite + Unpin),
     bytes: &[u8],
@@ -184,21 +180,15 @@ struct Process {
 impl Process {
     fn send(
         &mut self,
-        writer: &mpsc::UnboundedSender<WriterLine>,
-        line: serde_json::Value,
-        turn: Option<TurnId>,
+        writer: &mpsc::UnboundedSender<Outbound>,
+        line: Outbound,
     ) -> Result<(), ProviderError> {
         #[cfg(debug_assertions)]
         if let Some(recorder) = &mut self.recorder {
-            recorder.line(true, line.clone())?;
+            recorder.line(true, line.value())?;
         }
-        let interrupt = if line["request"]["subtype"] == "interrupt" {
-            turn
-        } else {
-            None
-        };
         writer
-            .send(WriterLine { line, interrupt })
+            .send(line)
             .map_err(|_| ProviderError::Protocol("Claude stdin writer closed".into()))
     }
     fn record_inbound(&mut self, line: &serde_json::Value) -> Result<(), ProviderError> {
@@ -551,14 +541,15 @@ async fn run_one(
         }
     });
     let mut stdin = process.child.stdin().expect("piped stdin");
-    let (writer, mut input) = mpsc::unbounded_channel::<WriterLine>();
+    let (writer, mut input) = mpsc::unbounded_channel::<Outbound>();
     let active_turn = Arc::new(Mutex::new(None));
     let writer_turn = active_turn.clone();
     let writer_closing = control.closing.clone();
     #[cfg(test)]
     let close_before_user_write = control.close_before_user_write.clone();
     let mut write_task = tokio::spawn(async move {
-        while let Some(WriterLine { line, interrupt }) = input.recv().await {
+        while let Some(outbound) = input.recv().await {
+            let line = outbound.value();
             let mut bytes = serde_json::to_vec(&line)?;
             bytes.push(b'\n');
             #[cfg(test)]
@@ -568,7 +559,7 @@ async fn run_one(
             if line["type"] == "user" && writer_closing.is_closing() {
                 continue;
             }
-            if let Some(turn) = interrupt {
+            if let Outbound::Interrupt(turn) = outbound {
                 write_interrupt(&mut stdin, &bytes, turn, &writer_turn).await?;
             } else {
                 stdin.write_all(&bytes).await?;
@@ -585,7 +576,7 @@ async fn run_one(
         recorder.bind(process.native.0.clone(), "<id:session>".into());
     }
     let mut failure = process
-        .send(&writer, claude::initialize(), None)
+        .send(&writer, Outbound::Message(claude::initialize()))
         .err()
         .map(|error| error.to_string());
     let mut consumer_gone = false;
@@ -608,16 +599,15 @@ async fn run_one(
                         recorder.bind(turn.to_string(), format!("<id:turn:{turn}>"));
                     }
                     *active_turn.lock().unwrap() = codec.active.map(claude::ActiveTurn::target);
-                    if let Err(error) = process.send(&writer, line, None) {
+                    if let Err(error) = process.send(&writer, Outbound::Message(line)) {
                         failure = Some(error.to_string());
                         break;
                     }
                 }
                 Some(SessionControl::Shutdown) | None => {
-                    let turn = codec.active.map(claude::ActiveTurn::target);
                     let lines = codec.interrupt_active(StopReason::AppClosing);
                     for line in lines {
-                        if let Err(error) = process.send(&writer, line, turn) {
+                        if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
                         }
@@ -630,16 +620,15 @@ async fn run_one(
                 }
                 Some(SessionControl::Interrupt { turn, reason }) => {
                     for line in codec.interrupt_lines(turn, reason) {
-                        if let Err(error) = process.send(&writer, line, Some(turn)) {
+                        if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
                         }
                     }
                 }
                 Some(SessionControl::InterruptActive(reason)) => {
-                    let turn = codec.active.map(claude::ActiveTurn::target);
                     for line in codec.interrupt_active(reason) {
-                        if let Err(error) = process.send(&writer, line, turn) {
+                        if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
                         }
@@ -647,7 +636,7 @@ async fn run_one(
                 }
                 Some(SessionControl::Answer { native, reply }) => {
                     if let Some(line) = codec.answer(native, reply)
-                        && let Err(error) = process.send(&writer, line, None)
+                        && let Err(error) = process.send(&writer, Outbound::Message(line))
                     {
                         failure = Some(error.to_string());
                         break;
@@ -700,7 +689,7 @@ async fn run_one(
                         Ok(decoded) => {
                             *active_turn.lock().unwrap() = codec.active.map(claude::ActiveTurn::target);
                             for reply in decoded.replies {
-                                if let Err(error) = process.send(&writer, reply, None) {
+                                if let Err(error) = process.send(&writer, Outbound::Message(reply)) {
                                     failure = Some(error.to_string());
                                     break;
                                 }

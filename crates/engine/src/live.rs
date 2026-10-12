@@ -1,5 +1,5 @@
 use crate::{
-    domain::{Millis, ThreadView, TurnId, wait_reason},
+    domain::{Millis, ThreadView, Turn, TurnId, TurnState, wait_reason},
     provider::{SessionHandle, TerminalHandle},
 };
 
@@ -17,6 +17,10 @@ pub enum TurnAdmission {
     Refused,
 }
 impl LiveThread {
+    pub fn is_active(&self, turn: &Turn) -> bool {
+        matches!(turn.state, TurnState::Running { .. })
+            || self.pending_turn() == Some(turn.id) && turn.state == TurnState::Queued
+    }
     pub fn pending_turn(&self) -> Option<TurnId> {
         match self.admission {
             Some(TurnAdmission::Pending(turn)) => Some(turn),

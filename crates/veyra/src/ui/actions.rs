@@ -1,6 +1,6 @@
 use gpui_kit::*;
 use veyra_engine::{
-    domain::{ItemId, PermissionMode, ProjectId, RequestId, ThreadId},
+    domain::{ItemId, PermissionMode, ProjectId, RequestId, ThreadId, TurnId},
     provider::ProviderKind,
 };
 
@@ -13,7 +13,6 @@ actions!(
         Quit,
         ConfirmQuit,
         CancelQuit,
-        Stop,
         Continue,
         DiscardQueued,
         NextNeedsYou,
@@ -54,6 +53,23 @@ macro_rules! choice_action {
             pub $field: Option<$kind>,
         }
     };
+}
+#[derive(Clone, Copy, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema)]
+#[schemars(crate = "::gpui::private::schemars")]
+pub struct StopTarget {
+    #[schemars(with = "String")]
+    pub thread: ThreadId,
+    #[schemars(with = "String")]
+    pub turn: TurnId,
+}
+#[derive(
+    Clone, Default, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action,
+)]
+#[serde(default)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct Stop {
+    pub target: Option<StopTarget>,
 }
 choice_action!(AddProject, path, std::path::PathBuf);
 choice_action!(PickProvider, provider, ProviderKind);

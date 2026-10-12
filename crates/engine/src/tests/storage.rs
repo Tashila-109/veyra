@@ -655,7 +655,11 @@ fn storage_failure_stops_session_before_provider_turn_is_registered() {
     };
     assert_eq!(reason, StopReason::StorageBlocked);
     assert_eq!(
-        codec.interrupt_active(reason),
+        codec
+            .interrupt_active(reason)
+            .iter()
+            .map(|line| line.value())
+            .collect::<Vec<_>>(),
         vec![json!({
             "type":"control_request", "request_id":"veyra-interrupt", "request":{"subtype":"interrupt"}
         })]

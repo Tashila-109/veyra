@@ -260,7 +260,11 @@ fn shutdown_expires_requests_with_closing_reason() {
 #[test]
 fn quit_during_stop_drain_keeps_queued_work_held_after_reload() {
     let mut f = Fixture::new(LiveState::Running);
-    f.command(Command::Interrupt { thread: f.thread }).unwrap();
+    f.command(Command::Interrupt {
+        thread: f.thread,
+        turn: f.active_turn().unwrap(),
+    })
+    .unwrap();
     let Ack::Turn(queued) = f
         .command(Command::Send {
             thread: f.thread,

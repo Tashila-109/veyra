@@ -166,12 +166,22 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         });
     let reason = shell.disabled_reason();
     let thread = shell.view.chat();
+    let stop_target = shell.rendered_stop;
     let stop = thread.is_some_and(|thread| shell.running(thread))
         && shell.input.read(cx).value().trim().is_empty();
+    let submit_id = stop_target
+        .filter(|_| stop)
+        .map(|target| SharedString::from(format!("stop-{}-{}", target.thread, target.turn)))
+        .unwrap_or_else(|| "send".into());
     let pending = thread
         .map(|thread| shell.state.pending_requests(thread))
         .unwrap_or_default();
-    let request = pending.first().copied();
+    let target = shell.dock_target();
+    let request = target.and_then(|target| {
+        shell
+            .pending_request(Some(target.request))
+            .map(|request| (target, request))
+    });
     let hold = thread
         .and_then(|thread| shell.state.threads.get(&thread))
         .and_then(|thread| thread.hold);
@@ -238,13 +248,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             ),
                     )
                 })
-                .when_some(request, |composer, request| {
+                .when_some(request, |composer, (target, request)| {
                     let request_id = request.id;
-                    let question_index = shell
-                        .question_draft
-                        .as_ref()
-                        .filter(|(id, _)| *id == request_id)
-                        .map_or(0, |(_, answers)| answers.len());
+                    let question_index = target.question;
                     let mut dock = div()
                         .v_flex()
                         .w_full()
@@ -260,12 +266,6 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         })
                         .track_focus(&shell.dock_focus)
                         .key_context("VeyraDock")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |shell, _, _, _| {
-                                shell.dock_press = Some((request_id, question_index));
-                            }),
-                        )
                         .when(pending.len() > 1, |dock| {
                             dock.child(
                                 div()
@@ -335,12 +335,10 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 shortcut_chip::<Deny>(cx),
                                             )
                                             .on_click(
-                                                cx.listener(move |shell, event, window, cx| {
-                                                    let (request, _) =
-                                                        shell.dock_click(event, request_id, 0);
+                                                cx.listener(move |_, _, window, cx| {
                                                     window.dispatch_action(
                                                         Box::new(Deny {
-                                                            request: Some(request),
+                                                            request: Some(request_id),
                                                         }),
                                                         cx,
                                                     )
@@ -364,18 +362,14 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     shell.dock_focused,
                                                     shortcut_chip::<AllowInThread>(cx),
                                                 )
-                                                .on_click(cx.listener(
-                                                    move |shell, event, window, cx| {
-                                                        let (request, _) =
-                                                            shell.dock_click(event, request_id, 0);
-                                                        window.dispatch_action(
-                                                            Box::new(AllowInThread {
-                                                                request: Some(request),
-                                                            }),
-                                                            cx,
-                                                        )
-                                                    },
-                                                )),
+                                                .on_click(cx.listener(move |_, _, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(AllowInThread {
+                                                            request: Some(request_id),
+                                                        }),
+                                                        cx,
+                                                    )
+                                                })),
                                             )
                                         })
                                         .child(
@@ -393,12 +387,10 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 shortcut_chip::<AllowOnce>(cx),
                                             )
                                             .on_click(
-                                                cx.listener(move |shell, event, window, cx| {
-                                                    let (request, _) =
-                                                        shell.dock_click(event, request_id, 0);
+                                                cx.listener(move |_, _, window, cx| {
                                                     window.dispatch_action(
                                                         Box::new(AllowOnce {
-                                                            request: Some(request),
+                                                            request: Some(request_id),
                                                         }),
                                                         cx,
                                                     )
@@ -422,13 +414,11 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .justify_start()
                                         .child(div().flex_1())
                                         .on_click(
-                                            cx.listener(move |shell, event, window, cx| {
-                                                let (request, question) =
-                                                    shell.dock_click(event, request_id, index);
+                                            cx.listener(move |_, _, window, cx| {
                                                 window.dispatch_action(
                                                     Box::new(AnswerQuestion {
-                                                        request: Some(request),
-                                                        question: Some(question),
+                                                        request: Some(request_id),
+                                                        question: Some(index),
                                                         option: Some(option),
                                                     }),
                                                     cx,
@@ -475,13 +465,19 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         .child(permission_button)
                         .child(div().flex_1())
                         .child(
-                            labelled_button("send", if stop { "Stop" } else { "Send" }, cx)
+                            labelled_button(submit_id, if stop { "Stop" } else { "Send" }, cx)
+                                .debug_selector(|| "composer-submit-button".into())
                                 .primary()
                                 .disabled(!stop && reason.is_some())
                                 .when(stop, |button| button.child(shortcut_chip::<Stop>(cx)))
                                 .on_click(move |_, window, cx| {
                                     if stop {
-                                        window.dispatch_action(Box::new(Stop), cx);
+                                        window.dispatch_action(
+                                            Box::new(Stop {
+                                                target: stop_target,
+                                            }),
+                                            cx,
+                                        );
                                     } else {
                                         window.dispatch_action(Box::new(Send), cx);
                                     }
