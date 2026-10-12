@@ -130,12 +130,7 @@ pub(super) fn markdown_text(item: &Item) -> Option<SharedString> {
         _ => None,
     }
 }
-fn row(
-    item: &Item,
-    expanded: bool,
-    markdown: &std::collections::BTreeMap<ItemId, SharedString>,
-    cx: &App,
-) -> AnyElement {
+fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) -> AnyElement {
     let t = cx.global::<Theme>();
     let mut row = div()
         .v_flex()
@@ -157,10 +152,7 @@ fn row(
         ItemBody::AssistantText { .. } => {
             row = row.child(TextView::markdown(
                 SharedString::from(format!("assistant-{}", item.id)),
-                markdown
-                    .get(&item.id)
-                    .cloned()
-                    .unwrap_or_else(|| markdown_text(item).unwrap()),
+                markdown.expect("markdown rows have cached text"),
             ));
         }
         ItemBody::Reasoning { .. } => {
@@ -185,10 +177,7 @@ fn row(
                 .when(expanded, |row| {
                     row.child(TextView::markdown(
                         SharedString::from(format!("reasoning-text-{}", item.id)),
-                        markdown
-                            .get(&item.id)
-                            .cloned()
-                            .unwrap_or_else(|| markdown_text(item).unwrap()),
+                        markdown.expect("markdown rows have cached text"),
                     ))
                 });
         }
@@ -293,17 +282,12 @@ fn tool_output(tool: &ToolItem) -> Option<&str> {
         .and_then(|result| result.output_tail.as_deref())
         .or_else(|| (!tool.output_tail.is_empty()).then_some(tool.output_tail.as_str()))
 }
-#[cfg(any(test, debug_assertions))]
 pub fn row_outcome(
-    items: &[Item],
-    index: usize,
+    item: &Item,
+    next: Option<&Item>,
     turns: &std::collections::BTreeMap<TurnId, Turn>,
 ) -> Option<String> {
-    let item = items.get(index)?;
-    if items
-        .get(index + 1)
-        .is_some_and(|next| next.turn == item.turn)
-    {
+    if next.is_some_and(|next| next.turn == item.turn) {
         return None;
     }
     turns.get(&item.turn).and_then(turn_outcome_line)
@@ -437,12 +421,10 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             .map(|item| {
                                 let t = cx.global::<Theme>();
                                 let turn = shell.state.turns.get(&item.turn);
-                                let last = thread
-                                    .and_then(|thread| {
-                                        shell.state.transcript_item(thread, index + 1)
-                                    })
-                                    .is_none_or(|next| next.turn != item.turn);
-                                let outcome = turn.filter(|_| last).and_then(turn_outcome_line);
+                                let next = thread.and_then(|thread| {
+                                    shell.state.transcript_item(thread, index + 1)
+                                });
+                                let outcome = row_outcome(item, next, &shell.state.turns);
                                 div()
                                     .v_flex()
                                     .w_full()
@@ -450,7 +432,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                     .child(row(
                                         item,
                                         shell.expanded.contains(&item.id),
-                                        &shell.state.markdown_text,
+                                        shell.state.markdown_text.get(&item.id).cloned(),
                                         cx,
                                     ))
                                     .when_some(
@@ -587,7 +569,7 @@ mod tests {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 div()
                     .w(cx.global::<super::Theme>().layout.transcript_min)
-                    .child(super::row(&self.0, false, &Default::default(), cx))
+                    .child(super::row(&self.0, false, None, cx))
             }
         }
         cx.update(gpui_kit::init);
@@ -691,9 +673,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let turns = [(turn.id, turn)].into_iter().collect();
-        assert_eq!(super::row_outcome(&items, 0, &turns), None);
+        assert_eq!(super::row_outcome(&items[0], items.get(1), &turns), None);
         assert_eq!(
-            super::row_outcome(&items, 1, &turns),
+            super::row_outcome(&items[1], items.get(2), &turns),
             Some("Done in 2s".into())
         );
     }

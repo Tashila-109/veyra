@@ -167,10 +167,10 @@ Projection indexes identify each thread's turn and item ids; command overlays re
 The actor completes buffered text for ended turns and finalizes newly settled task summaries before opening one transaction.
 It calls `store::apply`, commits, installs the changed rows/runtime, publishes numbered events, then dispatches effects.
 `ChangeSet::stores_nothing` owns an exhaustive check of its row and live-state fields; `Actor::write` skips the transaction when it returns true.
+The actor still installs text buffers and publishes events/effects, so pure streaming deltas do not open a SQLite transaction.
 A repeated Ready stores thread metadata only when it changed.
 The live pid/group UPDATE affects only rows whose stored pair differs.
 Actor::write rolls back a transaction with no affected rows rather than committing or counting it; runtime changes and events still install.
-It still installs text buffers and publishes events/effects, so pure streaming deltas do not require a SQLite write.
 Row-bearing events resolve from the final changed rows rather than being patched individually.
 StartTurn effects name the turn until install builds its text from committed items and dispatches its control.
 
@@ -482,9 +482,10 @@ Dropping the Shell also cancels the task, and its reply checks the selection ide
 The centred transcript uses a window-owned MessageScrollerState over gpui ListState and selectable Markdown TextView.
 The transcript and its expansion behavior live in ui/transcript.rs.
 AppState caches each thread's ordered item ids and row positions, rebuilding them on item insertion, turn metadata and snapshots.
-It retains shared markdown source strings for assistant and reasoning rows, refreshing only the changed item and removing archived rows.
+It fills shared markdown source strings for assistant and reasoning rows before they enter the cached order, refreshing only the changed item and removing archived rows.
+The row renderer receives that row's cached markdown source without rebuilding it.
 The list reads items and turns directly from the projection instead of cloning the transcript on every render.
-A text-only pump batch remeasures only its changed rows in the open thread.
+AppState::text_rows selects only a text-only pump batch's changed rows in the open thread for remeasurement.
 Other batches still remeasure the list for structural, outcome and queue-label changes.
 The inline streaming caret remains part of the markdown source, so a growing assistant row still takes the kit's full-replacement parse path.
 Failed tools show their last nonempty output line, truncated to one row at its width.
@@ -589,7 +590,7 @@ Only one owned Veyra window exists during that release check; it takes no PNG.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, mailbox_free, repaints and max_batch_events.
-mailbox_free is the command sender's remaining channel capacity, including permits already reserved by waiting sends.
+mailbox_free is the command sender's unreserved channel capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
@@ -622,7 +623,8 @@ stop_targets_reported_provider_turn stops B with the real session's ProviderTurn
 Storage-failure tests require an active-turn control before the Provider row is registered and prove that an unregistered CLI turn ends with the storage-blocked reason.
 Actor tests cover retirement before queued work, the Stop drain, Provider-tail rejection and skipped text-only transactions.
 Mailbox tests require a full-channel send to wait and two waiting commands to reach the actor in order, even when the second future is polled first after capacity opens.
-Storage tests require duplicate Ready and admission-only changes to retain their runtime and metadata effects without another commit.
+Tests in tests/session_events.rs require duplicate Ready and admission-only changes to retain their runtime and metadata effects without another commit.
+A projection test checks text-only row selection for the open thread, another thread, mixed batches and items absent from the order.
 A projection test checks cached row order, streamed text, completion and archive cleanup.
 Shutdown tests check that Quit during a drain, Stopping or missing-session recovery starts no replacement session and keeps queued work held after reload.
 An actor decision test checks that shutdown exits propose no restart or queued-turn start, preserving epochs and earlier holds.

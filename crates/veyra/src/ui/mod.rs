@@ -374,6 +374,25 @@ impl AppState {
         let id = self.item_order.get(&thread)?.ids.get(index)?;
         self.items.get(&thread)?.get(id)
     }
+    fn text_rows(&self, batch: &[UiEvent], chat: Option<ThreadId>) -> Option<BTreeSet<usize>> {
+        batch
+            .iter()
+            .all(|event| matches!(event, UiEvent::TextAppended { .. }))
+            .then(|| {
+                batch
+                    .iter()
+                    .filter_map(|event| {
+                        let UiEvent::TextAppended { thread, item, .. } = event else {
+                            return None;
+                        };
+                        if Some(*thread) != chat {
+                            return None;
+                        }
+                        self.item_order.get(thread)?.positions.get(item).copied()
+                    })
+                    .collect()
+            })
+    }
     fn transcript(&self, thread: ThreadId) -> Vec<Item> {
         (0..self.transcript_len(thread))
             .filter_map(|index| self.transcript_item(thread, index).cloned())
@@ -594,30 +613,7 @@ impl Shell {
                             .values()
                             .map(|thread| (thread.root(), shell.state.family_status(thread.root())))
                             .collect();
-                        let text_rows = batch
-                            .iter()
-                            .all(|event| matches!(event, UiEvent::TextAppended { .. }))
-                            .then(|| {
-                                batch
-                                    .iter()
-                                    .filter_map(|event| {
-                                        let UiEvent::TextAppended { thread, item, .. } = event
-                                        else {
-                                            return None;
-                                        };
-                                        if Some(*thread) != shell.view.chat() {
-                                            return None;
-                                        }
-                                        shell
-                                            .state
-                                            .item_order
-                                            .get(thread)?
-                                            .positions
-                                            .get(item)
-                                            .copied()
-                                    })
-                                    .collect::<BTreeSet<_>>()
-                            });
+                        let text_rows = shell.state.text_rows(&batch, shell.view.chat());
                         shell.state.apply_all(batch);
                         shell.post_banners(&families, cx);
                         shell.start_branch_lookup(cx);
@@ -1444,7 +1440,8 @@ impl Shell {
             .map(|(index, item)| {
                 let mut row = transcript::dump_item(item);
                 row["expanded"] = serde_json::json!(self.expanded.contains(&item.id));
-                row["outcome"] = transcript::row_outcome(&items, index, &self.state.turns).into();
+                row["outcome"] =
+                    transcript::row_outcome(item, items.get(index + 1), &self.state.turns).into();
                 row["wait_reason"] = self
                     .state
                     .turns
@@ -2019,7 +2016,7 @@ mod tests {
         AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
         Styled, Window, div,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use veyra_engine::{
         domain::*,
         events::{ChangeEvent, ThreadSnapshot, UiEvent},
@@ -3615,6 +3612,90 @@ mod tests {
                 )]
             );
         });
+    }
+    #[test]
+    fn text_rows_selects_only_open_thread_positions() {
+        let thread = ThreadId::new();
+        let other = ThreadId::new();
+        let turn = TurnId::new();
+        let assistant = Item {
+            id: ItemId::new(),
+            thread,
+            turn,
+            seq: 0,
+            body: ItemBody::AssistantText {
+                text: "Reply".into(),
+                done: false,
+            },
+        };
+        let reasoning = Item {
+            id: ItemId::new(),
+            thread,
+            turn,
+            seq: 1,
+            body: ItemBody::Reasoning {
+                text: "Thinking".into(),
+                done: false,
+            },
+        };
+        let elsewhere = Item {
+            id: ItemId::new(),
+            thread: other,
+            turn: TurnId::new(),
+            ..assistant.clone()
+        };
+        let mut state = AppState::default();
+        for item in [&assistant, &reasoning, &elsewhere] {
+            state.apply(UiEvent::Change {
+                counter: None,
+                event: ChangeEvent::ItemAdded(item.clone()),
+            });
+        }
+        assert_eq!(state.markdown_text[&assistant.id].as_ref(), "Reply ▏");
+        assert_eq!(state.markdown_text[&reasoning.id].as_ref(), "Thinking");
+        assert_eq!(state.markdown_text[&elsewhere.id].as_ref(), "Reply ▏");
+        let text = |thread, item| UiEvent::TextAppended {
+            thread,
+            item,
+            counter: 1,
+            text: " more".into(),
+            #[cfg(debug_assertions)]
+            delta_count: 1,
+        };
+        assert_eq!(
+            state.text_rows(
+                &[
+                    text(thread, reasoning.id),
+                    text(thread, assistant.id),
+                    text(thread, reasoning.id),
+                    text(other, elsewhere.id),
+                    text(thread, ItemId::new()),
+                ],
+                Some(thread),
+            ),
+            Some(BTreeSet::from([0, 1]))
+        );
+        assert_eq!(
+            state.text_rows(&[text(other, elsewhere.id)], Some(thread)),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            state.text_rows(
+                &[
+                    text(thread, assistant.id),
+                    UiEvent::Change {
+                        counter: None,
+                        event: ChangeEvent::ItemCompleted(assistant.clone()),
+                    },
+                ],
+                Some(thread),
+            ),
+            None
+        );
+        assert_eq!(
+            state.text_rows(&[text(thread, ItemId::new())], Some(thread)),
+            Some(BTreeSet::new())
+        );
     }
     #[test]
     fn transcript_cache_keeps_order_text_and_completion() {

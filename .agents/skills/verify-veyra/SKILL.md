@@ -467,7 +467,7 @@ Each transcript item carries `delta_count`, the actual text-stream deltas observ
 `awake` reports the engine's idle-sleep guard.
 `processes` lists each reported live CLI with its thread, pid and resident bytes, retaining retiring groups until Exited.
 `perf.commits`, `perf.actor_max_ms` and `perf.actor_busy_ms` expose committed transactions and actor timing.
-`perf.mailbox_free` is the engine mailbox's remaining capacity, including slots reserved by waiting sends.
+`perf.mailbox_free` is the engine mailbox's unreserved capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 Engine commands await space in the window's gpui task, so Stop is retained when that capacity is zero.
 `perf.repaints` counts window renders and `perf.max_batch_events` counts the largest applied pump batch.
 The debug-only `veyra::DebugNotificationResponse` action takes a banner `tag` and invokes the native response handler.
