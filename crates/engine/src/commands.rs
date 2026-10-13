@@ -823,24 +823,20 @@ pub fn turn_text(p: &Projection, c: &ChangeSet, turn: &Turn) -> String {
     }
 }
 
-pub fn task_summary(p: &Projection, c: &ChangeSet, child: ThreadId) -> String {
-    task_report(p, c, child)
-        .and_then(|item| match &item.body {
-            ItemBody::AssistantText { text, .. } => {
-                Some(text.chars().take(crate::tools::REPORT_CHARS).collect())
-            }
+pub fn task_summary(p: &Projection, c: &ChangeSet, child: ThreadId) -> (String, Option<ItemId>) {
+    c.items(p, child)
+        .filter_map(|item| match &item.body {
+            ItemBody::AssistantText { text, .. } => Some((item, text)),
             _ => None,
         })
+        .max_by_key(|(item, _)| item.seq)
+        .map(|(item, text)| {
+            (
+                text.chars().take(crate::tools::REPORT_CHARS).collect(),
+                Some(item.id),
+            )
+        })
         .unwrap_or_default()
-}
-pub(crate) fn task_report<'a>(
-    p: &'a Projection,
-    c: &'a ChangeSet,
-    child: ThreadId,
-) -> Option<&'a Item> {
-    c.items(p, child)
-        .filter(|item| matches!(item.body, ItemBody::AssistantText { .. }))
-        .max_by_key(|item| item.seq)
 }
 
 pub fn queue_wake(
@@ -938,10 +934,11 @@ pub(crate) fn settle_tasks(
         });
         let Some(outcome) = outcome else { continue };
         let wake = queue_wake(p, c, t.parent, [t.id]);
-        let summary = task_summary(p, c, child);
+        let (summary, source) = task_summary(p, c, child);
         t.state = TaskState::Settled {
             outcome,
             summary,
+            source,
             delivery: Delivery::Pending { wake },
         };
         c.events.push(Ev::TaskSettled(t.clone()));

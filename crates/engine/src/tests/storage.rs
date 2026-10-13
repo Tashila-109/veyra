@@ -530,6 +530,10 @@ fn startup_normalizes_empty_cli_versions() {
         .unwrap();
     f.actor.db.pragma_update(None, "user_version", 1).unwrap();
     assert_eq!(f.loaded().threads[&f.thread].cli_version, None);
+    f.actor
+        .db
+        .execute_batch("ALTER TABLE tasks DROP COLUMN source_item_id")
+        .unwrap();
     store::initialize(&mut f.actor.db).unwrap();
     let version: Option<String> = f
         .actor
@@ -542,7 +546,7 @@ fn startup_normalizes_empty_cli_versions() {
             .db
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        2
+        store::MIGRATIONS.len() as u32
     );
     f.actor
         .db

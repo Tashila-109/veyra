@@ -39,7 +39,7 @@ fn completed_items_and_ended_turns_free_streaming_entries() {
     let texts: Vec<_> = items
         .items_for(f.thread)
         .filter_map(|item| match &item.body {
-            ItemBody::AssistantText { text, done, .. } => Some((text.as_str(), *done)),
+            ItemBody::AssistantText { text, done } => Some((text.as_str(), *done)),
             _ => None,
         })
         .collect();
@@ -218,7 +218,6 @@ fn interrupt_completes_and_preserves_buffered_text() {
         ItemBody::AssistantText {
             text: "kept text".into(),
             done: true,
-            reports: vec![],
         }
     );
     let events = f.drain();
@@ -313,7 +312,6 @@ fn provider_turn_join() {
         ItemBody::AssistantText {
             text: "Hello world".into(),
             done: true,
-            reports: vec![],
         }
     );
 }
@@ -391,7 +389,6 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         ItemBody::AssistantText {
             text: String::new(),
             done: false,
-            reports: vec![],
         }
     );
     assert_eq!(snapshot.buffered_text[&snapshot.items[0].id], "abc");
@@ -422,7 +419,6 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         ItemBody::AssistantText {
             text: "abc".into(),
             done: false,
-            reports: vec![],
         }
     );
     f.event(turn_event(
@@ -445,7 +441,6 @@ fn snapshot_joins_buffer_without_duplicate_text() {
         ItemBody::AssistantText {
             text: "abcd".into(),
             done: true,
-            reports: vec![],
         }
     );
     for event in f.drain() {
@@ -489,7 +484,15 @@ fn session_notice_attaches_to_latest_turn() {
             outcome: TurnOutcome::Completed,
         },
     ));
-    let latest = f.user("next prompt");
+    let Ack::Turn(latest) = f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "next prompt".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
     f.event(ProviderEvent::Session(SessionEvent::Notice {
         text: "new session".into(),
     }));
@@ -849,7 +852,6 @@ mod cli {
             ItemBody::AssistantText {
                 text: "one delta".into(),
                 done: true,
-                reports: vec![],
             }
         );
     }
@@ -2237,5 +2239,5 @@ fn accepted_turn_clears_admission_without_a_commit() {
         },
     ));
     assert!(f.loaded().items.values().any(|item| matches!(&item.body,
-        ItemBody::AssistantText { text, done: true, .. } if text=="accepted reply")));
+        ItemBody::AssistantText { text, done: true } if text=="accepted reply")));
 }

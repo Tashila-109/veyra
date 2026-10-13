@@ -66,6 +66,17 @@ fn report_text(child: ThreadId) -> String {
     )
 }
 
+fn report_source(f: &Fixture, child: ThreadId) -> ItemId {
+    f.loaded()
+        .items_for(child)
+        .find(|item| {
+            matches!(&item.body,
+        ItemBody::AssistantText { text, .. } if text == "final report")
+        })
+        .unwrap()
+        .id
+}
+
 #[test]
 fn immediate_wake_receives_final_buffered_report() {
     let mut f = Fixture::new(LiveState::Idle);
@@ -83,6 +94,7 @@ fn immediate_wake_receives_final_buffered_report() {
         TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "final report".into(),
+            source: Some(report_source(&f, child)),
             delivery: Delivery::Pending { wake }
         }
     );
@@ -126,6 +138,7 @@ fn delivery_keeps_settlement_summary_after_later_reply() {
         TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "final report".into(),
+            source: Some(report_source(&f, child)),
             delivery: Delivery::Delivered { wake }
         }
     );
@@ -153,6 +166,7 @@ fn requeued_delivery_keeps_settlement_summary() {
         TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "final report".into(),
+            source: Some(report_source(&f, child)),
             delivery: Delivery::Pending { wake: replacement }
         }
     );
@@ -193,6 +207,7 @@ fn command_requeues_wake(command: impl Fn(ThreadId, TurnId) -> Command, archived
         TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "final report".into(),
+            source: Some(report_source(&f, child)),
             delivery: Delivery::Pending { wake: replacement }
         }
     );
@@ -253,6 +268,7 @@ fn command_requeues_wake(command: impl Fn(ThreadId, TurnId) -> Command, archived
         TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "final report".into(),
+            source: Some(report_source(&f, child)),
             delivery: Delivery::Delivered { wake: replacement }
         }
     );
@@ -323,7 +339,6 @@ fn startup_completes_interrupted_transcript_items() {
         ItemBody::AssistantText {
             text: "partial reply".into(),
             done: false,
-            reports: vec![],
         },
         ItemBody::Reasoning {
             text: "partial thought".into(),
@@ -361,7 +376,6 @@ fn startup_completes_interrupted_transcript_items() {
     assert!(items.contains(&ItemBody::AssistantText {
         text: "partial reply".into(),
         done: true,
-        reports: vec![],
     }));
     assert!(items.contains(&ItemBody::Reasoning {
         text: "partial thought".into(),
@@ -553,6 +567,7 @@ fn pending_delivery(f: &mut Fixture, started: bool) -> (TaskId, TurnId) {
             state: TaskState::Settled {
                 outcome: TurnOutcome::Completed,
                 summary: "a child report".into(),
+                source: None,
                 delivery: Delivery::Pending { wake },
             },
         },

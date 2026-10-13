@@ -2629,29 +2629,155 @@ mod tests {
                 let user_turn = TurnId::new();
                 let first = TaskId::new();
                 let second = TaskId::new();
-                for (task, turn) in [(first,first_turn),(second,second_turn)] {
-                    shell.state.tasks.insert(task, veyra_engine::domain::Task {
-                        id:task,parent,child,turn,request_key:task.to_string(),
-                        state:TaskState::Settled { outcome:TurnOutcome::Completed,
-                            summary:"Reported follow-up".into(), delivery:Delivery::Delivered { wake:TurnId::new() } },
-                    });
+                let report = ItemId::new();
+                for (task, turn) in [(first, first_turn), (second, second_turn)] {
+                    shell.state.tasks.insert(
+                        task,
+                        veyra_engine::domain::Task {
+                            id: task,
+                            parent,
+                            child,
+                            turn,
+                            request_key: task.to_string(),
+                            state: TaskState::Settled {
+                                outcome: TurnOutcome::Completed,
+                                summary: "Reported follow-up".into(),
+                                source: Some(report),
+                                delivery: Delivery::Delivered {
+                                    wake: TurnId::new(),
+                                },
+                            },
+                        },
+                    );
                 }
-                for (seq,turn,text,reports) in [(1,first_turn,"First report",vec![]),
-                    (2,second_turn,"Reported follow-up",vec![first,second]),
-                    (3,user_turn,"Reported follow-up",vec![])] {
-                    shell.state.turns.insert(turn, Turn { id:turn,thread:child,ordinal:seq,
-                        origin:if turn==user_turn { TurnOrigin::User { item:ItemId::new() } }
-                            else { TurnOrigin::Task { task:if turn==first_turn { first } else { second } } },
-                        state:TurnState::Ended { started:Some(seq as i64),at:seq as i64+1,outcome:TurnOutcome::Completed },
+                for (seq, turn, text) in [
+                    (1, first_turn, "First report"),
+                    (2, second_turn, "Reported follow-up"),
+                    (3, user_turn, "Reported follow-up"),
+                ] {
+                    shell.state.turns.insert(
+                        turn,
+                        Turn {
+                            id: turn,
+                            thread: child,
+                            ordinal: seq,
+                            origin: if turn == user_turn {
+                                TurnOrigin::User {
+                                    item: ItemId::new(),
+                                }
+                            } else {
+                                TurnOrigin::Task {
+                                    task: if turn == first_turn { first } else { second },
+                                }
+                            },
+                            state: TurnState::Ended {
+                                started: Some(seq as i64),
+                                at: seq as i64 + 1,
+                                outcome: TurnOutcome::Completed,
+                            },
+                        },
+                    );
+                    shell.state.apply(UiEvent::Change {
+                        counter: None,
+                        event: ChangeEvent::ItemAdded(Item {
+                            id: if turn == second_turn {
+                                report
+                            } else {
+                                ItemId::new()
+                            },
+                            thread: child,
+                            turn,
+                            seq,
+                            body: ItemBody::AssistantText {
+                                text: text.into(),
+                                done: true,
+                            },
+                        }),
                     });
-                    let body=serde_json::from_value(serde_json::json!({"AssistantText":{"text":text,"done":true,"reports":reports}})).unwrap();
-                    shell.state.apply(UiEvent::Change { counter:None,event:ChangeEvent::ItemAdded(Item {
-                        id:ItemId::new(),thread:child,turn,seq,body,
-                    }) });
                 }
                 shell.show(super::MainView::Chat(child));
                 let rows = shell.dump_transcript();
-                assert_eq!(rows.iter().map(|row|row["report_delivered"].as_bool().unwrap()).collect::<Vec<_>>(), [false,true,false]);
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row["report_delivered"].as_bool().unwrap())
+                        .collect::<Vec<_>>(),
+                    [false, true, false]
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn empty_child_report_never_badges_later_work(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (parent, child, first_turn) = add_family(shell, cx);
+                let task = TaskId::new();
+                shell.state.turns.get_mut(&first_turn).unwrap().state = TurnState::Ended {
+                    started: Some(1),
+                    at: 2,
+                    outcome: TurnOutcome::Interrupted {
+                        reason: "Stopped by you".into(),
+                    },
+                };
+                shell.state.tasks.insert(
+                    task,
+                    veyra_engine::domain::Task {
+                        id: task,
+                        parent,
+                        child,
+                        turn: first_turn,
+                        request_key: "empty report".into(),
+                        state: TaskState::Settled {
+                            outcome: TurnOutcome::Interrupted {
+                                reason: "Stopped by you".into(),
+                            },
+                            summary: String::new(),
+                            source: None,
+                            delivery: Delivery::Delivered {
+                                wake: TurnId::new(),
+                            },
+                        },
+                    },
+                );
+                let later_turn = TurnId::new();
+                let mut later = Item {
+                    id: ItemId::new(),
+                    thread: child,
+                    turn: later_turn,
+                    seq: 1,
+                    body: ItemBody::AssistantText {
+                        text: String::new(),
+                        done: false,
+                    },
+                };
+                shell.state.turns.insert(
+                    later_turn,
+                    Turn {
+                        id: later_turn,
+                        thread: child,
+                        ordinal: 2,
+                        origin: TurnOrigin::User {
+                            item: ItemId::new(),
+                        },
+                        state: TurnState::Running { since: 3 },
+                    },
+                );
+                shell.show(super::MainView::Chat(child));
+                for (text, done) in [("", false), ("", true), ("Later unrelated work", true)] {
+                    later.body = ItemBody::AssistantText {
+                        text: text.into(),
+                        done,
+                    };
+                    shell.state.apply(UiEvent::Change {
+                        counter: None,
+                        event: ChangeEvent::ItemCompleted(later.clone()),
+                    });
+                    assert!(!super::transcript::report_delivered(&shell.state, &later));
+                    let rows = shell.dump_transcript();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0]["report_delivered"], false);
+                }
             });
         });
     }
@@ -2884,6 +3010,7 @@ mod tests {
             shell.update(cx, |shell, cx| {
                 let (parent, child, turn) = add_family(shell, cx);
                 let task = TaskId::new();
+                let report_item = ItemId::new();
                 shell.state.tasks.insert(
                     task,
                     veyra_engine::domain::Task {
@@ -2895,6 +3022,7 @@ mod tests {
                         state: TaskState::Settled {
                             outcome: TurnOutcome::Completed,
                             summary: "delivered report".into(),
+                            source: Some(report_item),
                             delivery: Delivery::Delivered {
                                 wake: TurnId::new(),
                             },
@@ -2902,14 +3030,13 @@ mod tests {
                     },
                 );
                 let report = Item {
-                    id: ItemId::new(),
+                    id: report_item,
                     thread: child,
                     turn,
                     seq: 1,
                     body: ItemBody::AssistantText {
                         text: "delivered report".into(),
                         done: true,
-                        reports: vec![],
                     },
                 };
                 let user_turn = TurnId::new();
@@ -2933,7 +3060,6 @@ mod tests {
                     body: ItemBody::AssistantText {
                         text: "later user reply".into(),
                         done: true,
-                        reports: vec![],
                     },
                 };
                 for item in [&report, &later] {
@@ -3750,7 +3876,6 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "retained".into(),
                 done: true,
-                reports: vec![],
             },
         };
         let mut state = AppState::default();
@@ -3776,7 +3901,6 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "complete".into(),
                 done: true,
-                reports: vec![],
             },
         };
         let mut state = AppState::default();
@@ -3914,7 +4038,6 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "a".into(),
                 done: false,
-                reports: vec![],
             },
         };
         let mut state = AppState::default();
@@ -3967,7 +4090,6 @@ mod tests {
             ItemBody::AssistantText {
                 text: "abcde".into(),
                 done: false,
-                reports: vec![],
             }
         );
     }
@@ -4447,7 +4569,6 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "Reply".into(),
                 done: false,
-                reports: vec![],
             },
         };
         let reasoning = Item {
@@ -4576,7 +4697,6 @@ mod tests {
                 body: ItemBody::AssistantText {
                     text: "Root reply".into(),
                     done: false,
-                    reports: vec![],
                 },
             }),
         });
@@ -4625,6 +4745,7 @@ mod tests {
             state.text_rows(&batch, Some(root)),
             Some(BTreeSet::from([1]))
         );
+        let report_item = ItemId::new();
         let task = TaskId::new();
         let task_turn = TurnId::new();
         let wake = TurnId::new();
@@ -4637,6 +4758,7 @@ mod tests {
             state: TaskState::Settled {
                 outcome: TurnOutcome::Completed,
                 summary: "report".into(),
+                source: Some(report_item),
                 delivery: Delivery::Pending { wake },
             },
         };
@@ -4674,14 +4796,13 @@ mod tests {
             Some("Reports from 1 child thread".into())
         );
         let later_reply = Item {
-            id: ItemId::new(),
+            id: report_item,
             thread: child,
             turn: task_turn,
             seq: 3,
             body: ItemBody::AssistantText {
                 text: "report".into(),
                 done: true,
-                reports: vec![],
             },
         };
         state.apply(UiEvent::Change {
@@ -4692,6 +4813,7 @@ mod tests {
         task.state = TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "report".into(),
+            source: Some(report_item),
             delivery: Delivery::Delivered { wake },
         };
         state.apply(UiEvent::Change {
@@ -4705,6 +4827,7 @@ mod tests {
         followup.state = TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "new report".into(),
+            source: None,
             delivery: Delivery::Pending { wake },
         };
         state.apply(UiEvent::Change {
@@ -4736,6 +4859,7 @@ mod tests {
         followup.state = TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "new report".into(),
+            source: None,
             delivery: Delivery::Delivered { wake },
         };
         state.apply(UiEvent::Change {
@@ -4882,7 +5006,6 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "Earlier".into(),
                 done: true,
-                reports: vec![],
             },
         };
         let mut growing = Item {
@@ -4893,7 +5016,6 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "New".into(),
                 done: false,
-                reports: vec![],
             },
         };
         for item in [&old, &growing] {
@@ -4945,7 +5067,6 @@ mod tests {
         growing.body = ItemBody::AssistantText {
             text: "New text".into(),
             done: true,
-            reports: vec![],
         };
         state.apply(UiEvent::Change {
             counter: Some(3),

@@ -50,6 +50,7 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), default_mode TEXT 
 INSERT INTO settings(id) VALUES(1);
 "#,
     "UPDATE threads SET cli_version=NULL WHERE cli_version='';",
+    "ALTER TABLE tasks ADD COLUMN source_item_id TEXT REFERENCES items(id);",
 ];
 
 pub fn open(path: &Path) -> Result<Connection, StoreError> {
@@ -226,11 +227,12 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         )?;
     }
     for t in c.tasks.values() {
-        let (state, outcome, summary, delivery, wake) = match &t.state {
-            TaskState::Running => ("running", None, None, None, None),
+        let (state, outcome, summary, delivery, wake, source) = match &t.state {
+            TaskState::Running => ("running", None, None, None, None, None),
             TaskState::Settled {
                 outcome,
                 summary,
+                source,
                 delivery,
             } => {
                 let (name, wake) = match delivery {
@@ -243,14 +245,16 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
                     Some(summary.as_str()),
                     Some(name),
                     Some(wake.to_string()),
+                    source.map(|id| id.to_string()),
                 )
             }
         };
         tx.execute(
             "INSERT INTO tasks(id,parent_thread_id,child_thread_id,turn_id,request_key,state,
-             outcome_json,summary,delivery,wake_turn) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             outcome_json,summary,delivery,wake_turn,source_item_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(id) DO UPDATE SET state=excluded.state,outcome_json=excluded.outcome_json,
-             summary=excluded.summary,delivery=excluded.delivery,wake_turn=excluded.wake_turn",
+             summary=excluded.summary,delivery=excluded.delivery,wake_turn=excluded.wake_turn,
+             source_item_id=excluded.source_item_id",
             params![
                 t.id.to_string(),
                 t.parent.to_string(),
@@ -262,6 +266,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
                 summary,
                 delivery,
                 wake,
+                source,
             ],
         )?;
     }
@@ -424,7 +429,7 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
     }
     let mut q = db.prepare(
         "SELECT id,parent_thread_id,child_thread_id,turn_id,request_key,state,outcome_json,summary,
-             delivery,wake_turn FROM tasks",
+             delivery,wake_turn,source_item_id FROM tasks",
     )?;
     let mut rows = q.query([])?;
     while let Some(r) = rows.next()? {
@@ -442,6 +447,7 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
                 TaskState::Settled {
                     outcome: parse(r.get(6)?)?,
                     summary: r.get(7)?,
+                    source: r.get::<_, Option<String>>(10)?.map(id).transpose()?,
                     delivery,
                 }
             }

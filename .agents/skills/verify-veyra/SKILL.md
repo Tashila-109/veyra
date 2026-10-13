@@ -259,7 +259,7 @@ def sql(query):
 def database(label, mode):
     values = [sql('pragma user_version'),sql('pragma journal_mode'),
         *sql('.tables').split(),sql('select default_mode from settings')]
-    assert values == ['2','wal',*TABLES,mode], (label,values)
+    assert values == ['3','wal',*TABLES,mode], (label,values)
     (PROOF/(label+'-database.txt')).write_text('\n'.join(values)+'\n')
     (PROOF/(label+'-inode.txt')).write_text(str(DB.stat().st_ino)+'\n')
     save(label,ctl(label+'-dump','dump'))
@@ -516,11 +516,11 @@ The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `ap
 `sidebar.rows` holds project and thread rows in tree order, with status for each thread, row_status for its rendered family glyph, depth, quiet_minutes and archive_keep_children.
 `sidebar.menu_thread` names the open row menu.
 OpenThreadMenu, Archive and ArchiveKeepChildren accept a thread id; the latter keeps a root's children running.
-Each thread and selected_thread has lineage, and top-level tasks carries task state and delivery.
+Each thread and selected_thread has lineage, and top-level tasks carries task state, delivery and its nullable source item id.
 The child breadcrumb includes its root title and whether its SelectThread link is available; parent_attention names a parent that needs you.
 `transcript.family_card` carries the first derived list row, Started N agents, and its Open and Stop actions.
 `transcript.items` contains the stored item rows; item_tops includes the family card first when present.
-Task and Wake rows carry turn_label and task_card text; report_delivered marks the assistant row whose text the delivered report carried.
+Task and Wake rows carry turn_label and task_card text; report_delivered marks only the assistant row named by a Delivered task's source; a null source produces no badge.
 `selected_thread.quiet_minutes` and header_status share Quiet for N min without changing status.
 `selected_thread` includes its native id, configuration, failure cause and `header_status`, the rendered status with elapsed seconds.
 `composer` includes the chosen provider and permission mode, plus Send's readiness and disabled reason.

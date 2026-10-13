@@ -3,7 +3,7 @@
 ## Executive summary
 
 Veyra is one native macOS chat window backed by an orchestration actor and Claude Code's stream-json process.
-SQLite rows are the source of truth for projects, threads, turns, transcript items and the default permission mode.
+SQLite rows are the source of truth for projects, threads, turns, transcript items, tasks and the default permission mode.
 The engine actor is the sole database writer after startup.
 The gpui `Shell` owns window state and a read-only event projection, not another database connection.
 The engine never depends on gpui.
@@ -142,8 +142,8 @@ After the shutdown commit attempt, a three-second deadline ends the actor's sess
 If that write fails, pending row changes remain blocked while sessions still receive Shutdown, and sessionless Starting threads still park in runtime state.
 A blocked write logs affected thread ids and changed item, turn, request, task and metadata identifiers without recording their text.
 A private DATA/run/storage-blocked.json receipt carries that same metadata for the next launch and is removed after a successful write.
-Startup consumes a valid receipt into notice items on affected threads with stored turns before clearing it.
-A receipt entry without a stored turn cannot attach a transcript notice.
+Startup consumes a valid receipt into notice items on affected threads with a started turn before clearing it.
+A receipt entry without a started turn cannot attach a transcript notice.
 An unreadable or malformed receipt is renamed aside privately when possible, logged without its contents and reported through a window recovery notice; it does not refuse startup.
 The notice identifies what may have been lost and asks the user to inspect the provider conversation before sending more work.
 Receipt creation failures are logged; unavailable storage can prevent the next-launch notice from being saved.
@@ -183,7 +183,7 @@ Every actor message is timed, and a message over 50 ms logs its kind and duratio
 
 `commands::decide` reads rows and runtime state, then produces a `ChangeSet` of row changes, events and effects.
 Projection indexes identify each thread's turn and item ids; command overlays read those keyed rows rather than scanning every stored turn or item.
-The actor completes buffered text for ended turns and finalizes newly settled task summaries before opening one transaction.
+The actor completes buffered text for ended turns and finalizes newly settled task summaries and source links before opening one transaction.
 It calls `store::apply`, commits, installs the changed rows/runtime, publishes numbered events, then dispatches effects.
 `ChangeSet::stores_nothing` owns an exhaustive check of its row and live-state fields; `Actor::write` skips the transaction when it returns true.
 The actor still installs text buffers and publishes events/effects, so pure streaming deltas do not open a SQLite transaction.
@@ -295,7 +295,7 @@ AllowInThread stores the exact thread, tool and command in grants, and a later i
 Other commands, tools and threads still dock, including compound commands and requests in Full access.
 Turn completion and process exit expire pending requests and publish RequestClosed in the same transaction.
 
-`store::MIGRATIONS` owns schema 2, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
+`store::MIGRATIONS` owns schema 3, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
 Migrations use `PRAGMA user_version` in transactions and refuse newer schemas.
 The eight tables are projects, threads, turns, items, requests, grants, tasks and settings.
 User text lives once in an item referenced by its turn.
@@ -306,6 +306,7 @@ Reconcile interrupts a queued turn with an earlier start attempt because it cann
 The prompt remains in its existing user item, and Continue cannot resend that uncertain attempt.
 Unstarted queued turns remain queued and held; pending wakes keep the existing safer duplicate-report recovery.
 Migration 2 normalizes older empty CLI versions to NULL once.
+Migration 3 adds the nullable tasks.source_item_id foreign key to items; older tasks load with no source link.
 Loading rows is read-only and treats any remaining empty CLI version as unknown.
 Empty versions become unknown at the codec, probe and row-load boundaries; the actor and writes trust that input.
 `store::apply` writes both live pid and group on Ready, clears both when parked, and preserves the first archive time on later archived writes.
@@ -485,13 +486,15 @@ start_thread stores two child-guidance sentences before the parent's prompt in t
 Retries compare the parent's original prompt after removing that exact stored guidance prefix; later task and user items stay literal.
 The existing settlement path waits for no running or queued child turn and no background work, or handles Stop and recovered-child Continue.
 It coalesces reports into a queued wake and records Pending delivery in the same transaction.
+After completing buffered text, the actor writes each newly settled task's summary and optional source item id from the same latest assistant item in that settlement transaction.
+TaskState::Settled owns the source link beside summary and delivery, and tasks.source_item_id stores it; no assistant item means no source.
 A settlement while a wake runs creates a successor wake.
 Wake text frames each child's final assistant message as a report and caps its summary at 4,000 characters.
 The ordinary start rule waits for the parent to be idle and unheld, so a wake never interrupts or steers.
 Accepted changes task delivery to Delivered, and the actor logs thread, turn and acceptance time for each admitted acceptance.
 Any wake ending before Accepted moves pending reports into a new queued wake; for an unarchived root delivery is at least once until acceptance, can repeat, and is final once Delivered.
 Parent Stop preserves a held wake, and a user stop or archive of one child holds the parent as ChildReport without replacing an earlier hold.
-A kept child settles into its archived root's queued wake, which stays held and is never delivered because an archived root cannot be continued.
+A kept child settles into its archived root's queued wake, which never starts because the start rule refuses an archived thread with WaitReason::Archived, and the window offers it no Continue.
 
 ## Platform and keep-awake
 
@@ -568,8 +571,9 @@ Every thread-scoped initial row advances that thread's counter.
 The gpui pump drains every queued event into one entity update, applies it and notifies once.
 AppState counts applied batches and the largest measured gap between text-bearing batches.
 Debug-only VisiblePerf counts applied TextAppended batches for the selected Chat thread, ignoring other threads' text; batches buffered behind a loading snapshot still count.
-VisiblePerf and the pump use one BatchGap for their largest gap and previous timestamp, while retaining their distinct batch counts.
-Its count, gap and previous-batch timestamp reset on selection changes and on that thread's TurnStarted.
+VisiblePerf and AppState each keep a BatchGap value for their largest gap and previous timestamp, sharing its type while retaining their own counts and resets.
+VisiblePerf resets its count, gap and previous-batch timestamp on selection changes and on that thread's TurnStarted.
+AppState clears only its previous-batch timestamp on any TurnStarted, preserving its lifetime batch count and largest gap.
 Debug-only TranscriptOpen records the Snapshot request identity and time, marks its installation, and ui::transcript::render stamps the first render of that installed snapshot.
 The dump exposes perf.visible and perf.transcript_open_ms, which is null until an open and replaced on every open.
 A theme-cadence task refreshes Working time once a second while any thread is Working, including an unselected row.
@@ -606,11 +610,11 @@ The transcript and its expansion behavior live in ui/transcript.rs.
 The Started N agents card, singular Started 1 agent, is the first derived list row and lists every child, including archived children whose Open is disabled.
 Each row uses its child's own status glyph and words, SelectThread as Open, and StopThread as Stop only while the shared stop_target rule names a turn and the child is unarchived.
 TaskCard rows show Task from the parent provider; Task and Wake turns label the parent title and distinct reporting children respectively.
-Before committing settlement, the actor records task ids on the assistant item used by task_report, in that item's existing JSON body; no column or migration is added.
-A delivered report labels that source assistant row Report delivered, including when queued tasks settle with a later task's reply; later identical user text cannot move the badge.
-Older assistant JSON defaults to no report ids, and a legacy delivery badge appears only when its stored summary identifies one assistant row uniquely.
+A Delivered task labels only its named source assistant row Report delivered, including when queued tasks settle with a later task's reply; later identical user text cannot move the badge.
+A task without a recorded source shows no delivery badge, including older stored tasks and a child stopped before producing an assistant item.
+The row renderer and dump use the same report_delivered predicate over the task's stored link.
 Turn::recency orders the transcript, ThreadView.last, failure cause and Retry by actual start, or end time for a turn that ended without starting, with ordinal for ties and queued turns after started ones; stored queue ordinals retain their admission role.
-The actor attaches session and storage-loss notices to a running turn when one exists, otherwise the turn with greatest recency.
+The actor attaches session and storage-loss notices to a running turn when one exists, otherwise the latest turn with a stored start time; queued and never-started turns cannot take a notice.
 ReplyLineBreaks applies to assistant reply rows and uses the kit's Markdown AST hook to turn prose soft breaks into rendered line breaks, preserving lists, emphasis, tables and code, with the original Markdown retained for source copying.
 AppState caches each thread's ordered item ids and row positions, rebuilding them on item insertion, turn metadata and snapshots.
 It fills shared markdown source strings for assistant and reasoning rows before they enter the cached order, refreshing only the changed item and removing archived rows.
@@ -702,7 +706,7 @@ A full queue rejects before enqueueing; a reply timeout does not cancel an actio
 
 Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler, and quit dispatches ConfirmQuit.
 Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
-Each sidebar thread and selected thread includes lineage, and tasks includes each received task row with its state and delivery.
+Each sidebar thread and selected thread includes lineage, and tasks includes each received task row with its state, delivery and optional report source.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
 Debug counts are removed when their items leave the projection or the thread is archived.
 The driver adds the engine's schema_version without opening the database.
@@ -762,8 +766,8 @@ Mailbox tests require a full-channel send to wait and two waiting commands to re
 Tests in tests/session_events.rs require duplicate Ready and admission-only changes to retain their runtime and metadata effects without another commit.
 A projection test checks text-only row selection for the open thread, another thread, mixed batches and items absent from the order.
 A projection test checks cached row order, streamed text, completion and archive cleanup.
-Window regressions check visible text counting and both resets, stalled-visible gaps despite other-thread text, first-render open timing and replacement, one-line left-aligned quiet rows, conditional family Stop, recency, archive eligibility and reset, and report-source anchoring.
-The child-task replay checks that the provider receives the stored guidance.
+Window regressions check visible text counting and both resets, stalled-visible gaps despite other-thread text, first-render open timing and replacement, left-aligned titles and one-line quiet rows, conditional family Stop, recency, archive eligibility and reset, and report-source anchoring.
+The multi-agent recipe's child-task replay checks that the provider receives the stored guidance.
 perf_snapshot_large is ignored by ordinary workspace tests, seeds one file-backed thread with 5,000 items across fifty complete tool-heavy turns, times one actor Snapshot and prints the database path it retains for a window drive.
 Its normal seed regression checks the stored shape, and the stream-pause fixture regression checks one 300 ms delay after 1,000 of the 2,000 deltas.
 Multi-agent's Probe smoke measurements recipe records the pause's visible gap and the seeded transcript's first installed render, copying the retained database into the stopped app's short disposable data folder before reopening it.

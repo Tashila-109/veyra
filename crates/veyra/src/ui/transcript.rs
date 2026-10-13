@@ -128,7 +128,7 @@ impl MessageScrollerState {
 }
 pub(super) fn markdown_text(item: &Item) -> Option<SharedString> {
     match &item.body {
-        ItemBody::AssistantText { text, done, .. } => Some(if *done {
+        ItemBody::AssistantText { text, done } => Some(if *done {
             text.clone().into()
         } else {
             format!("{text} ▏").into()
@@ -505,44 +505,13 @@ pub(super) fn turn_label(state: &super::AppState, turn: &Turn) -> Option<String>
     }
 }
 pub(super) fn report_delivered(state: &super::AppState, item: &Item) -> bool {
-    let ItemBody::AssistantText { text, reports, .. } = &item.body else {
-        return false;
-    };
-    let delivered = |task: &veyra_engine::domain::Task| {
-        task.child == item.thread
-            && matches!(
-                task.state,
-                TaskState::Settled {
-                    delivery: Delivery::Delivered { .. },
-                    ..
-                }
-            )
-    };
-    if reports
-        .iter()
-        .any(|id| state.tasks.get(id).is_some_and(delivered))
-    {
-        return true;
-    }
-    let Some(items) = state.items.get(&item.thread) else {
-        return false;
-    };
-    state.tasks.values().filter(|task| delivered(task)).any(|task| {
-        if items.values().any(|row| {
-            matches!(&row.body, ItemBody::AssistantText { reports, .. } if reports.contains(&task.id))
-        }) {
-            return false;
-        }
-        let TaskState::Settled { summary, .. } = &task.state else {
-            return false;
-        };
-        if !text.chars().take(veyra_engine::tools::REPORT_CHARS).eq(summary.chars()) {
-            return false;
-        }
-        let mut matching = items.values().filter(|row| matches!(&row.body,
-            ItemBody::AssistantText { text, .. } if text.chars().take(veyra_engine::tools::REPORT_CHARS).eq(summary.chars())));
-        matching.next().is_some_and(|row| row.id == item.id) && matching.next().is_none()
-    })
+    matches!(item.body, ItemBody::AssistantText { .. })
+        && state.tasks.values().any(|task| {
+            task.child == item.thread
+                && matches!(task.state, TaskState::Settled {
+                    source: Some(source), delivery: Delivery::Delivered { .. }, ..
+                } if source == item.id)
+        })
 }
 
 pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
@@ -746,7 +715,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
 pub fn dump_item(item: &Item) -> serde_json::Value {
     let (kind, text, done) = match &item.body {
         ItemBody::UserText(text) => ("user", text.clone(), true),
-        ItemBody::AssistantText { text, done, .. } => ("assistant", text.clone(), *done),
+        ItemBody::AssistantText { text, done } => ("assistant", text.clone(), *done),
         ItemBody::Reasoning { text, done } => ("reasoning", text.clone(), *done),
         ItemBody::Tool(tool) => (
             "tool",
@@ -793,7 +762,6 @@ mod tests {
             body: ItemBody::AssistantText {
                 text: "first line\n**second line**\nthird line".into(),
                 done: true,
-                reports: vec![],
             },
         };
         let (view, cx) = cx.add_window_view(|window, cx| {

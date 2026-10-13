@@ -81,7 +81,6 @@ fn seed_large_snapshot(db: &mut Connection, path: &std::path::Path) -> ThreadId 
                 99 => ItemBody::AssistantText {
                     text: format!("Batch {ordinal} complete"),
                     done: true,
-                    reports: vec![],
                 },
                 _ => ItemBody::Tool(ToolItem {
                     call: ToolCall {

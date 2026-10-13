@@ -800,6 +800,12 @@ fn successor_wake_while_wake_runs() {
         TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "Child report".into(),
+            source: Some(
+                p.items_for(one)
+                    .find(|item| matches!(item.body, ItemBody::AssistantText { .. }))
+                    .unwrap()
+                    .id
+            ),
             delivery: Delivery::Delivered { wake: first_wake }
         }
     );
@@ -1298,6 +1304,15 @@ fn session_notice_follows_later_started_prompt() {
 
 #[test]
 fn storage_loss_notice_follows_later_started_prompt() {
+    check_storage_loss_notice(false);
+}
+
+#[test]
+fn storage_loss_notice_skips_queued_work() {
+    check_storage_loss_notice(true);
+}
+
+fn check_storage_loss_notice(queued: bool) {
     let mut f = Fixture::new(LiveState::Idle);
     let prompt = later_started_prompt(
         &mut f,
@@ -1307,6 +1322,9 @@ fn storage_loss_notice_follows_later_started_prompt() {
             outcome: TurnOutcome::Completed,
         },
     );
+    if queued {
+        f.user("Queued after the completed prompt");
+    }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!("../../target/notice-recovery-{}", ThreadId::new()));
     let _scratch = Scratch(root.clone());
@@ -1400,13 +1418,10 @@ fn queued_tasks_record_the_reported_assistant_item() {
         ItemBody::AssistantText { text, .. } if text == "Reported follow-up")
         })
         .unwrap();
-    let stored = serde_json::to_value(&report.body).unwrap();
-    let mut tasks: Vec<TaskId> =
-        serde_json::from_value(stored["AssistantText"]["reports"].clone()).unwrap();
-    tasks.sort();
-    let mut expected = vec![first, second];
-    expected.sort();
-    assert_eq!(tasks, expected);
+    for task in [first, second] {
+        assert!(matches!(loaded.tasks[&task].state,
+            TaskState::Settled { source: Some(source), .. } if source == report.id));
+    }
     assert_eq!(report.turn, task_turn(&f, second));
 }
 
@@ -1448,4 +1463,191 @@ fn existing_assistant_json_remains_unchanged_without_reports() {
     let legacy = serde_json::json!({"AssistantText":{"text":"existing reply","done":true}});
     let item: ItemBody = serde_json::from_value(legacy.clone()).unwrap();
     assert_eq!(serde_json::to_value(item).unwrap(), legacy);
+}
+
+#[test]
+fn notices_skip_queued_turns_after_the_latest_started_prompt() {
+    for running in [false, true] {
+        let mut f = Fixture::new(LiveState::Idle);
+        let prompt = later_started_prompt(
+            &mut f,
+            if running {
+                TurnState::Running { since: 300 }
+            } else {
+                TurnState::Ended {
+                    started: Some(300),
+                    at: 400,
+                    outcome: TurnOutcome::Completed,
+                }
+            },
+        );
+        f.user("Queued future work");
+        f.turn(
+            TurnOrigin::Provider,
+            TurnState::Ended {
+                started: None,
+                at: 500,
+                outcome: TurnOutcome::Interrupted {
+                    reason: "Never started".into(),
+                },
+            },
+        );
+        f.event(ProviderEvent::Session(SessionEvent::Notice {
+            text: "Provider notice".into(),
+        }));
+        let loaded = f.loaded();
+        let notice = loaded
+            .items_for(f.thread)
+            .find(|item| {
+                matches!(&item.body,
+            ItemBody::Notice(notice) if notice.text == "Provider notice")
+            })
+            .unwrap();
+        assert_eq!(
+            notice.turn, prompt,
+            "a queued or never-started turn took the notice"
+        );
+    }
+    let mut f = Fixture::new(LiveState::Idle);
+    f.user("Only queued work");
+    f.event(ProviderEvent::Session(SessionEvent::Notice {
+        text: "No started turn".into(),
+    }));
+    assert!(
+        !f.loaded()
+            .items_for(f.thread)
+            .any(|item| matches!(&item.body,
+        ItemBody::Notice(notice) if notice.text == "No started turn"))
+    );
+}
+
+#[test]
+fn migration_leaves_older_tasks_without_inferred_report_sources() {
+    let mut f = Fixture::new(LiveState::Running);
+    let (child, task) = start(&mut f, "old report");
+    ready_child(&mut f, child);
+    end_child(&mut f, child, task);
+    let has_source: bool = f
+        .actor
+        .db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='source_item_id')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if has_source {
+        f.actor
+            .db
+            .execute_batch("ALTER TABLE tasks DROP COLUMN source_item_id")
+            .unwrap();
+    }
+    f.actor.db.pragma_update(None, "user_version", 2).unwrap();
+    store::initialize(&mut f.actor.db).unwrap();
+    let source: Option<String> = f
+        .actor
+        .db
+        .query_row(
+            "SELECT source_item_id FROM tasks WHERE id=?1",
+            [task.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, None);
+    assert!(matches!(&f.loaded().tasks[&task].state,
+        TaskState::Settled { summary, .. } if summary == "Child report"));
+    store::initialize(&mut f.actor.db).unwrap();
+    assert_eq!(
+        f.actor
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        store::MIGRATIONS.len() as u32
+    );
+}
+
+#[test]
+fn empty_report_keeps_no_source_after_later_child_work() {
+    let mut f = Fixture::new(LiveState::Running);
+    let parent = f.thread;
+    let (child, task) = start(&mut f, "empty report");
+    ready_child(&mut f, child);
+    f.command(Command::StopThread { thread: child }).unwrap();
+    let parent_turn = f.running().unwrap();
+    f.event(turn_event(
+        Some(parent_turn),
+        TurnEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+            park: false,
+        },
+    ));
+    f.command(Command::Continue {
+        thread: parent,
+        drop_queued: false,
+    })
+    .unwrap();
+    let wake = f.running().unwrap();
+    f.event(turn_event(Some(wake), TurnEvent::Accepted));
+    let stopped = task_turn(&f, task);
+    child_event(
+        &mut f,
+        child,
+        turn_event(
+            Some(stopped),
+            TurnEvent::TurnEnded {
+                outcome: TurnOutcome::Interrupted {
+                    reason: "Stopped by you".into(),
+                },
+                park: false,
+            },
+        ),
+    );
+    let Ack::Turn(later) = f
+        .command(Command::Send {
+            thread: child,
+            text: "Later work".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    child_event(
+        &mut f,
+        child,
+        turn_event(
+            Some(later),
+            TurnEvent::TextDelta {
+                key: NativeItemKey("later reply".into()),
+                text: "Later work reply".into(),
+                streamed: true,
+            },
+        ),
+    );
+    child_event(
+        &mut f,
+        child,
+        turn_event(
+            Some(later),
+            TurnEvent::TurnEnded {
+                outcome: TurnOutcome::Completed,
+                park: false,
+            },
+        ),
+    );
+    let loaded = f.loaded();
+    assert!(matches!(&loaded.tasks[&task].state, TaskState::Settled {
+        summary, delivery: Delivery::Delivered { wake: delivered }, ..
+    } if summary.is_empty() && *delivered == wake));
+    assert!(loaded.items_for(child).any(|item| matches!(&item.body,
+        ItemBody::AssistantText { text, .. } if text == "Later work reply")));
+    let source: Option<String> = f
+        .actor
+        .db
+        .query_row(
+            "SELECT source_item_id FROM tasks WHERE id=?1",
+            [task.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, None);
 }

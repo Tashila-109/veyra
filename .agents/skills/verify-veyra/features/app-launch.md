@@ -94,6 +94,7 @@ PY
 
 The project write is the pre-quit value.
 The helper uses one expected table list in SKILL.md.
+The migration check seeds a stopped schema-2 database with a settled report, then verifies schema 3 adds a null source without inferring a badge; it removes only those fixture rows while stopped.
 A missing or lost WAL row fails the project equality after either relaunch.
 Relaunch updates the pid, group and window records before Doctor or Evidence.
 
@@ -111,6 +112,54 @@ row = sql('select id,path,name from projects order by id')
 assert row
 (PROOF/'persisted-project.txt').write_text(row+'\n')
 database('initial','full_access')
+stop('before-migration')
+import uuid
+root,child,task,turn,wake,report = [str(uuid.uuid4()) for _ in range(6)]
+with sqlite3.connect(DB) as db:
+    db.execute('pragma foreign_keys=on')
+    db.execute('alter table tasks drop column source_item_id')
+    db.execute('pragma user_version=2')
+    project = db.execute('select id from projects order by id').fetchone()[0]
+    config = json.dumps({'model':None,'effort':None,'mode':'full_access'})
+    for thread,parent,title in [(root,None,'Migration parent'),(child,root,'Migration child')]:
+        db.execute("""insert into threads(id,project_id,title,parent_thread_id,relationship,root_thread_id,
+            provider,config_json,cwd,view,import_pending,created_at)
+            values(?,?,?,?,?,?,'claude',?,?,'chat',0,1)""",
+            (thread,project,title,parent,'subagent' if parent else None,root,config,str(DATA/'project')))
+    for identifier,thread,origin in [(turn,child,{'Task':{'task':task}}),(wake,root,{'Wake':{'tasks':[task]}})]:
+        db.execute("""insert into turns(id,thread_id,ordinal,origin_json,state,outcome_json,queued_at,started_at,ended_at)
+            values(?,?,1,?,'ended',?,1,1,2)""",(identifier,thread,json.dumps(origin),json.dumps('Completed')))
+    db.execute("""insert into items(id,thread_id,turn_id,seq,kind,body_json,done)
+        values(?,?,?,1,'assistant_text',?,1)""",
+        (report,child,turn,json.dumps({'AssistantText':{'text':'Legacy report','done':True}})))
+    db.execute("""insert into tasks(id,parent_thread_id,child_thread_id,turn_id,request_key,state,
+        outcome_json,summary,delivery,wake_turn) values(?,?,?,?,?,'settled',?,'Legacy report','delivered',?)""",
+        (task,root,child,turn,'migration report',json.dumps('Completed'),wake))
+assert sql('pragma user_version') == '2'
+start('after-migration')
+database('after-migration','full_access')
+dump = poll('migration-task-loaded',lambda d: any(t['id']==task for t in d['tasks']))
+settled = next(t for t in dump['tasks'] if t['id']==task)['state']['Settled']
+assert settled['summary'] == 'Legacy report' and settled['source'] is None
+assert 'Delivered' in settled['delivery']
+assert sql(f"select source_item_id is null from tasks where id='{task}'") == '1'
+action('migration-select-child','SelectThread',{'thread':child})
+poll('migration-transcript',lambda d: d['selected_thread'] and d['selected_thread']['id']==child
+    and len(d['transcript']['items'])==1)
+assert ctl('migration-unlinked-report','dump')['transcript']['items'][0]['report_delivered'] is False
+capture('migration-unlinked-report')
+stop('migration-fixture-cleanup')
+with sqlite3.connect(DB) as db:
+    db.execute('pragma foreign_keys=on')
+    db.execute('delete from tasks where id=?',(task,))
+    db.execute('delete from items where id=?',(report,))
+    db.execute('delete from turns where id in (?,?)',(turn,wake))
+    for thread in [child,root]: db.execute('delete from threads where id=?',(thread,))
+start('after-migration-cleanup')
+assert sql('select count(*) from threads') == '0'
+assert sql('select id,path,name from projects order by id') == row
+assert (PROOF/'after-migration-inode.txt').read_text() == (PROOF/'initial-inode.txt').read_text()
+print('PASS app-launch schema-2 task migrated with null source, no inferred badge and rows preserved')
 for label,crash in [('after-quit',False),('after-crash',True)]:
     restart(label,crash)
     database(label,'full_access')
@@ -232,6 +281,7 @@ PY
 - Lock: `second-launch.txt` contains the refusal and exit 1; the first process still answers.
 - Controls: `drive.log` records exit codes and all asserted width, text and notice transitions.
 - Log: `veyra.log` retains the asserted ready line and rejected Send notice.
+- Migration: `migration-task-loaded.json` retains the delivered summary with a null source; `migration-unlinked-report.png` shows the legacy reply without a delivery badge after the schema-2 to schema-3 launch.
 - Recovery: `persisted-project.txt` matches the SQLite row after both relaunches; migration, WAL, tables, mode and inode are asserted every time.
 - Release: `release/strings.txt` has zero release counts and positive debug controls for every driver and override name, `ctl.txt` exits 2 and `data-listing.txt` has no driver socket.
 - Release: `release/veyra.log` contains no `reaper signalled orphan group` line.

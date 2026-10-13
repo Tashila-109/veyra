@@ -128,6 +128,7 @@ fn clear_drain(live: &mut LiveThread, turn: TurnId) {
 fn notice_turn(projection: &Projection, thread: ThreadId) -> Option<TurnId> {
     projection
         .turns_for(thread)
+        .filter(|turn| turn.state.started().is_some())
         .max_by_key(|turn| {
             (
                 matches!(turn.state, TurnState::Running { .. }),
@@ -1377,7 +1378,6 @@ impl Actor {
                             ItemBody::AssistantText {
                                 text: String::new(),
                                 done: false,
-                                reports: vec![],
                             }
                         },
                     },
@@ -1461,25 +1461,16 @@ impl Actor {
                 (
                     task.id,
                     commands::task_summary(&self.projection, c, task.child),
-                    commands::task_report(&self.projection, c, task.child).cloned(),
                 )
             })
             .collect();
-        for (id, text, report) in summaries {
-            if let TaskState::Settled { summary, .. } = &mut c.tasks.get_mut(&id).unwrap().state {
+        for (id, (text, item)) in summaries {
+            if let TaskState::Settled {
+                summary, source, ..
+            } = &mut c.tasks.get_mut(&id).unwrap().state
+            {
                 *summary = text;
-            }
-            if let Some(mut report) = report {
-                if let Some(changed) = c.items.get(&report.id) {
-                    report = changed.clone();
-                }
-                if let ItemBody::AssistantText { reports, .. } = &mut report.body
-                    && !reports.contains(&id)
-                {
-                    reports.push(id);
-                }
-                c.events.push(Ev::ItemCompleted(report.clone()));
-                c.items.insert(report.id, report);
+                *source = item;
             }
         }
     }
