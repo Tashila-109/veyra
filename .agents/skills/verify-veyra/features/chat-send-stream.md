@@ -302,7 +302,7 @@ capture('codex-other-thread')
 thread = create_codex('codex-notices',scenario='retry-and-limits')
 done = ctl('codex-notices-wait','wait',thread,'Done')
 save('codex-notices-done',done)
-expected = ['Codex is retrying after a provider error.','Codex updated its usage limits. Check the CLI for the remaining allowance.']
+expected = ['Codex is retrying after a provider error.','Codex is near its usage limit: primary window, 95% used.']
 assert [item['text'] for item in done['transcript']['items'] if item['kind']=='notice']==expected
 stored = sql("select json_extract(body_json,'$.Notice.text') from items where thread_id='"+thread+"' and kind='notice' order by seq").splitlines()
 assert stored==expected

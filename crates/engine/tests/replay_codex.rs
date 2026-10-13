@@ -465,7 +465,7 @@ fn codex_retry_and_limit_notices() {
         n,
         [
             "Codex is retrying after a provider error.",
-            "Codex updated its usage limits. Check the CLI for the remaining allowance."
+            "Codex is near its usage limit: primary window, 95% used."
         ]
     );
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);

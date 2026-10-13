@@ -255,11 +255,11 @@ impl SessionIo {
     }
     fn record_inbound(
         &mut self,
-        line: &mut serde_json::Value,
+        line: serde_json::Value,
         codec: &mut Codec,
     ) -> Result<Decoded, ProviderError> {
         if let Some(RootMcp::Claude(session)) = &self.mcp {
-            session.config.system_init(line)?;
+            session.config.system_init(&line)?;
         }
         let mut decoded_line = line.clone();
         if let Some(mcp) = &self.mcp {
@@ -278,9 +278,6 @@ impl SessionIo {
                 mcp.sanitize(&mut recorded, "<id:token>");
             }
             recorder.line(false, recorded)?;
-        }
-        if let Some(mcp) = &self.mcp {
-            mcp.sanitize(line, "[redacted]");
         }
         decoded
     }
@@ -464,12 +461,10 @@ pub fn spawn_provider(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    match provider {
-        ProviderKind::Claude | ProviderKind::Codex => {
-            env.resolve(provider)?;
-        }
-        ProviderKind::Grok => return Err(ProviderError::NotBuilt),
+    if !provider.is_built() {
+        return Err(ProviderError::NotBuilt);
     }
+    env.resolve(provider)?;
     Ok(start_provider_task(provider, None, spec, env, out, epoch))
 }
 
@@ -844,7 +839,7 @@ async fn run_one(
                     })).await { consumer_gone = true; break; }
                 }
                 Ok(Some(Line::Text(line))) => {
-                    let mut wire = match serde_json::from_str::<serde_json::Value>(&line) {
+                    let wire = match serde_json::from_str::<serde_json::Value>(&line) {
                         Ok(wire) => wire,
                         Err(error) => {
                             tracing::info!(length = line.len(), "skipped non-JSON provider line");
@@ -853,7 +848,7 @@ async fn run_one(
                         }
                     };
                     rejected = None;
-                    match process.record_inbound(&mut wire, &mut codec) {
+                    match process.record_inbound(wire, &mut codec) {
                         Ok(mut decoded) => {
                             *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
                             for line in decoded.take_outbound() {
@@ -915,9 +910,7 @@ async fn run_one(
             .as_ref()
             .map_or_else(|| text.clone(), |mcp| mcp.redact(&text, "[redacted]"))
     });
-    let failure = failure
-        .or(rejected)
-        .map(|text| with_stderr(&text, &lines, None));
+    let failure = failure.or(rejected).map(|text| with_stderr(&text, &lines));
     let missing = profile.resume_from_stderr
         && resume
         && lines
@@ -999,12 +992,12 @@ async fn run_one(
     Completion::Exited(crash)
 }
 
-fn with_stderr(text: &str, lines: &[String], token: Option<&str>) -> String {
-    let mut text = record::redact(text, token);
+fn with_stderr(text: &str, lines: &[String]) -> String {
+    let mut text = record::redact(text, None);
     for line in lines.iter().skip(lines.len().saturating_sub(8)) {
         text.push('\n');
         text.push_str(
-            &record::redact(line, token)
+            &record::redact(line, None)
                 .chars()
                 .take(500)
                 .collect::<String>(),
@@ -1195,7 +1188,6 @@ fn provider_crash_text(provider: ProviderKind, code: Option<i32>, lines: &[Strin
                 .unwrap_or_else(|| "unknown".into())
         ),
         lines,
-        None,
     )
 }
 
@@ -2582,9 +2574,56 @@ done
 mod mcp_record_tests {
     use super::*;
     #[tokio::test]
+    async fn codex_attempt_credentials_are_redacted_from_diagnostics() {
+        let root = std::path::PathBuf::from("/tmp").join(format!("veyra-mcp-{}", ThreadId::new()));
+        platform::private_dir(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let (out, _events) = mpsc::channel(16);
+        let server = Arc::new(
+            crate::mcp::Server::bind(&root, std::env::current_exe().unwrap(), out).unwrap(),
+        );
+        let thread = ThreadId::new();
+        let config = Arc::new(codex::McpConfig::new(server, thread, 1, std::process::id()));
+        let mut codec = codex::Codec::new(
+            SessionSpec {
+                thread,
+                cwd: root,
+                config: ThreadConfig {
+                    mode: PermissionMode::AskFirst,
+                    model: None,
+                    effort: None,
+                },
+                native: Some(NativeSessionId("lost-native".into())),
+                import: false,
+                root: true,
+            },
+            std::process::id(),
+            Some(config.clone()),
+        );
+        codec.initialize();
+        let mut first = codec
+            .value(serde_json::json!({"id":1,"result":{"userAgent":"fixture"}}))
+            .unwrap();
+        let first =
+            String::from_utf8(first.take_outbound().pop().unwrap().into_bytes().unwrap()).unwrap();
+        let mut next = codec.value(serde_json::json!({"id":2,"error":{"code":-32600,"message":"no rollout found for thread id lost-native"}})).unwrap();
+        let next =
+            String::from_utf8(next.take_outbound().pop().unwrap().into_bytes().unwrap()).unwrap();
+        let mcp = RootMcp::Codex(config);
+        for wire in [first, next] {
+            let redacted = mcp.redact(&wire, "[redacted]");
+            assert!(
+                redacted.contains("\"VEYRA_MCP_TOKEN\":\"[redacted]\""),
+                "attempt credential reached diagnostics"
+            );
+            let diagnostic = with_stderr(&format!("Provider failed: {redacted}"), &[redacted]);
+            assert!(diagnostic.contains("[redacted]"));
+        }
+    }
+    #[tokio::test]
     async fn session_recorder_replaces_token_before_writing() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../target/mcp-rec-{}",
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "veyra-mcp-rec-{}",
             &ThreadId::new().to_string()[28..]
         ));
         platform::private_dir(&root).unwrap();
@@ -2627,13 +2666,21 @@ mod mcp_record_tests {
                     .unwrap(),
             ),
         );
-        let mut wire = serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":format!("prefix {} suffix",token.expose())}]}});
-        process
-            .io
-            .record_inbound(&mut wire, &mut process.codec)
-            .unwrap();
+        let wire = serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":format!("prefix {} suffix",token.expose())}]}});
+        let decoded = process.io.record_inbound(wire, &mut process.codec).unwrap();
+        let texts: Vec<_> = decoded
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Turn {
+                    event: TurnEvent::TextDelta { text, .. },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(
-            !wire.to_string().contains(token.expose()),
+            texts == ["prefix [redacted] suffix"],
             "credential reached provider decoding"
         );
         let recorded = std::fs::read_to_string(&capture).unwrap();
@@ -2717,15 +2764,15 @@ mod recorder_tests {
             .codec
             .value(serde_json::json!({"id":1,"result":{"userAgent":"fixture"}}))
             .unwrap();
-        let mut known = serde_json::json!({"id":2,"result":{"thread":{"id":"known-native","cliVersion":"known-version"}}});
+        let known = serde_json::json!({"id":2,"result":{"thread":{"id":"known-native","cliVersion":"known-version"}}});
         process
             .io
-            .record_inbound(&mut known, &mut process.codec)
+            .record_inbound(known, &mut process.codec)
             .unwrap();
-        let mut unrelated = serde_json::json!({"id":999,"result":{"thread":{"id":"unrelated-native","cliVersion":"unrelated-version"}}});
+        let unrelated = serde_json::json!({"id":999,"result":{"thread":{"id":"unrelated-native","cliVersion":"unrelated-version"}}});
         process
             .io
-            .record_inbound(&mut unrelated, &mut process.codec)
+            .record_inbound(unrelated, &mut process.codec)
             .unwrap();
         process.io.child.stop().await.unwrap();
         drop(process.io.recorder);
@@ -2741,5 +2788,86 @@ mod recorder_tests {
             "unrelated-native"
         );
         assert!(env.groups.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+    #[tokio::test]
+    async fn spawning_uses_provider_availability() {
+        for provider in ProviderKind::ALL {
+            let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../target/availability-{}", ThreadId::new()));
+            std::fs::create_dir_all(&root).unwrap();
+            let _scratch = crate::tests::Scratch(root.clone());
+            let binary = root.join("owned-provider-stand-in");
+            let marker = root.join("spawned");
+            std::fs::write(
+                &binary,
+                "#!/bin/sh\nprintf launched > spawned\nwhile read ignored; do :; done\n",
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&binary)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let env = ChildEnv::isolated().with_binary(provider, binary);
+            let (out, mut events) = mpsc::channel(16);
+            let result = spawn_provider(
+                provider,
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: root,
+                    config: ThreadConfig {
+                        mode: PermissionMode::AskFirst,
+                        model: None,
+                        effort: None,
+                    },
+                    native: None,
+                    import: false,
+                    root: false,
+                },
+                env.clone(),
+                out,
+                1,
+            );
+            if !provider.is_built() {
+                assert!(matches!(result, Err(ProviderError::NotBuilt)));
+                assert!(!marker.exists());
+                continue;
+            }
+            let handle = result.unwrap();
+            let end = tokio::time::Instant::now() + Duration::from_secs(3);
+            while !marker.exists() {
+                assert!(
+                    tokio::time::Instant::now() < end,
+                    "built provider never spawned"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            handle.control.send(SessionControl::Shutdown).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = events.recv().await {
+                    if matches!(
+                        event,
+                        EngineMsg::Provider {
+                            event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                            ..
+                        }
+                    ) {
+                        return;
+                    }
+                }
+                panic!("session closed without an exit event")
+            })
+            .await
+            .unwrap();
+            assert!(env.groups.lock().unwrap().is_empty());
+        }
     }
 }

@@ -445,15 +445,10 @@ impl StopLadder {
         }
     }
 }
-pub(crate) trait OutboundFrame: Send {
-    #[cfg(any(debug_assertions, test))]
-    fn value(&self) -> serde_json::Value;
-    fn into_bytes(self: Box<Self>) -> serde_json::Result<Vec<u8>>;
-}
 pub(crate) enum Outbound {
     Prompt(serde_json::Value),
     Message(serde_json::Value),
-    Provider(Box<dyn OutboundFrame>),
+    Provider(Box<codex::ThreadFrame>),
     Interrupt {
         turn: TurnId,
         line: serde_json::Value,
@@ -469,7 +464,7 @@ impl Outbound {
     }
     pub fn into_bytes(self) -> serde_json::Result<Vec<u8>> {
         match self {
-            Self::Provider(frame) => frame.into_bytes(),
+            Self::Provider(frame) => (*frame).into_bytes(),
             Self::Prompt(line) | Self::Message(line) | Self::Interrupt { line, .. } => {
                 serde_json::to_vec(&line)
             }

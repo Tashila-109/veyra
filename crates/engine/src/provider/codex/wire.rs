@@ -450,11 +450,42 @@ pub(super) struct RateLimitsNotification {
 pub(super) struct RateLimits {
     pub primary: Option<RateWindow>,
     pub secondary: Option<RateWindow>,
-    pub rate_limit_reached_type: Option<Value>,
-    pub spend_control_reached: Option<Value>,
+    pub rate_limit_reached_type: Option<RateLimitReachedType>,
+    pub spend_control_reached: Option<bool>,
+    pub individual_limit: Option<SpendLimit>,
+}
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RateLimitReachedType {
+    RateLimitReached,
+    WorkspaceOwnerCreditsDepleted,
+    WorkspaceMemberCreditsDepleted,
+    WorkspaceOwnerUsageLimitReached,
+    WorkspaceMemberUsageLimitReached,
+    #[serde(other)]
+    Unknown,
+}
+impl RateLimitReachedType {
+    pub fn description(self) -> Option<&'static str> {
+        match self {
+            Self::RateLimitReached => Some("its usage limit"),
+            Self::WorkspaceOwnerCreditsDepleted => Some("the workspace owner's credit limit"),
+            Self::WorkspaceMemberCreditsDepleted => Some("the workspace member's credit limit"),
+            Self::WorkspaceOwnerUsageLimitReached => Some("the workspace owner's usage limit"),
+            Self::WorkspaceMemberUsageLimitReached => Some("the workspace member's usage limit"),
+            Self::Unknown => None,
+        }
+    }
+}
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct SpendLimit {
+    pub resets_at: Option<i64>,
 }
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct RateWindow {
     pub used_percent: f64,
+    pub window_duration_mins: Option<i64>,
+    pub resets_at: Option<i64>,
 }

@@ -32,9 +32,7 @@ impl Drop for Run {
     }
 }
 fn root() -> Run {
-    let test = std::env::current_exe().expect("test executable");
-    let target = test.parent().unwrap().parent().unwrap().parent().unwrap();
-    let root = target.join(format!("mcp-{}", &ThreadId::new().to_string()[28..]));
+    let root = PathBuf::from("/tmp").join(format!("veyra-mcp-{}", ThreadId::new()));
     platform::private_dir(&root).unwrap();
     Run {
         root: root.canonicalize().unwrap(),

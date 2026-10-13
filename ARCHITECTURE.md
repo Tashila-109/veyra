@@ -480,9 +480,12 @@ The matching turn/completed ends that turn even before turn/started, and a compl
 Another native turn on this conversation can open a separately announced Provider turn; another thread id is filtered before turn routing.
 Thread status, token usage, hooks, startup status and unknown notifications do not mark work or add notices.
 Retrying errors add Veyra notice text without displaying raw provider details.
-Codex usage-limit frames add a notice only when rateLimitReachedType or spendControlReached is set, or primary or secondary usedPercent reaches 90.
+Codex usage-limit frames add a notice only for a known rateLimitReachedType, spendControlReached true, or primary or secondary usedPercent reaching 90.
+Null, false and unknown reached kinds do not count as a reached limit.
 The 90 percent threshold is Veyra's implementation choice for a near-limit warning; 100 percent or a reached flag is the reached level.
 A session reports each level at most once and never reports a lower level after a higher one, even after a usage reset.
+Near notices name the highest-usage primary or secondary window, its duration and used percentage when supplied; reached notices name the reported usage, credit or spend limit.
+The notice includes the selected window's reset timestamp, or the individual spend limit's timestamp for a spend warning, when supplied, formatted in UTC through the platform module with an explicit Unix-time fallback if conversion fails.
 
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.

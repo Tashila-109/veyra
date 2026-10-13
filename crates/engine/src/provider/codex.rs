@@ -91,7 +91,7 @@ impl Drop for McpConfig {
         self.revoke();
     }
 }
-struct ThreadFrame {
+pub(crate) struct ThreadFrame {
     line: Value,
     command: std::path::PathBuf,
     socket: std::path::PathBuf,
@@ -103,15 +103,13 @@ impl ThreadFrame {
             "mcp_servers.veyra.args":["mcp"],
             "mcp_servers.veyra.env":{"VEYRA_SOCKET":self.socket,"VEYRA_MCP_TOKEN":token}})
     }
-}
-impl super::OutboundFrame for ThreadFrame {
     #[cfg(any(debug_assertions, test))]
-    fn value(&self) -> Value {
+    pub(crate) fn value(&self) -> Value {
         let mut line = self.line.clone();
         line["params"]["config"] = self.config("<id:token>");
         line
     }
-    fn into_bytes(mut self: Box<Self>) -> serde_json::Result<Vec<u8>> {
+    pub(crate) fn into_bytes(mut self) -> serde_json::Result<Vec<u8>> {
         self.line["params"]["config"] = self.config(self.token.expose());
         serde_json::to_vec(&self.line)
     }
@@ -170,6 +168,51 @@ enum LimitLevel {
     Reached,
 }
 const NEAR_USAGE_PERCENT: f64 = 90.0;
+fn limit_notice(
+    level: LimitLevel,
+    window: Option<(&str, &wire::RateWindow)>,
+    reached: Option<&str>,
+    spend_reached: bool,
+    spend: Option<&wire::SpendLimit>,
+) -> String {
+    let mut reset = window.and_then(|(_, w)| w.resets_at);
+    let mut text = if spend_reached {
+        reset = spend.and_then(|s| s.resets_at);
+        "Codex reached its spend limit".to_owned()
+    } else {
+        let mut text = match level {
+            LimitLevel::Near => "Codex is near its usage limit".to_owned(),
+            LimitLevel::Reached => {
+                format!("Codex reached {}", reached.unwrap_or("its usage limit"))
+            }
+        };
+        if let Some((name, window)) = window {
+            text.push_str(&format!(": {name} window"));
+            if let Some(minutes) = window.window_duration_mins.filter(|m| *m > 0) {
+                let (count, unit) = if minutes % 1440 == 0 {
+                    (minutes / 1440, "day")
+                } else if minutes % 60 == 0 {
+                    (minutes / 60, "hour")
+                } else {
+                    (minutes, "minute")
+                };
+                text.push_str(&format!(
+                    " ({count} {unit}{})",
+                    if count == 1 { "" } else { "s" }
+                ));
+            }
+            text.push_str(&format!(", {}% used", window.used_percent));
+        }
+        text
+    };
+    text.push('.');
+    if let Some(reset) = reset {
+        let reset =
+            crate::platform::utc_timestamp(reset).unwrap_or_else(|| format!("{reset} (Unix time)"));
+        text.push_str(&format!(" Resets at {reset}."));
+    }
+    text
+}
 enum RequestReply {
     Decision,
     Permissions(Value),
@@ -567,16 +610,19 @@ impl Codec {
         match &notification {
             N::RateLimits { params: details } => {
                 let limits = &details.rate_limits;
-                let usage = limits
+                let window = limits
                     .primary
-                    .iter()
-                    .chain(limits.secondary.iter())
-                    .map(|w| w.used_percent)
-                    .fold(0.0, f64::max);
-                let level = if limits.rate_limit_reached_type.is_some()
-                    || limits.spend_control_reached.is_some()
-                    || usage >= 100.0
-                {
+                    .as_ref()
+                    .map(|w| ("primary", w))
+                    .into_iter()
+                    .chain(limits.secondary.as_ref().map(|w| ("secondary", w)))
+                    .max_by(|a, b| a.1.used_percent.total_cmp(&b.1.used_percent));
+                let usage = window.map_or(0.0, |(_, w)| w.used_percent);
+                let reached = limits
+                    .rate_limit_reached_type
+                    .and_then(|kind| kind.description());
+                let spend_reached = limits.spend_control_reached == Some(true);
+                let level = if reached.is_some() || spend_reached || usage >= 100.0 {
                     Some(LimitLevel::Reached)
                 } else if usage >= NEAR_USAGE_PERCENT {
                     Some(LimitLevel::Near)
@@ -587,7 +633,13 @@ impl Codec {
                     && self.limit_level.is_none_or(|reported| level > reported)
                 {
                     self.limit_level = Some(level);
-                    decoded.events.push(Self::notice("Codex updated its usage limits. Check the CLI for the remaining allowance."));
+                    decoded.events.push(Self::notice(&limit_notice(
+                        level,
+                        window,
+                        reached,
+                        spend_reached,
+                        limits.individual_limit.as_ref(),
+                    )));
                 }
                 return Ok(());
             }
@@ -1593,6 +1645,92 @@ mod tests {
 #[cfg(test)]
 mod limit_tests {
     use super::*;
+    fn texts(codec: &mut Codec, frame: Value) -> Vec<String> {
+        codec
+            .value(frame)
+            .unwrap()
+            .events
+            .into_iter()
+            .map(|event| {
+                let ProviderEvent::Session(SessionEvent::Notice { text }) = event else {
+                    panic!("expected a usage notice")
+                };
+                text
+            })
+            .collect()
+    }
+    fn lane_zero(spend: Value, usage: u32) -> Value {
+        json!({"method":"account/rateLimits/updated","params":{"rateLimits":{
+            "limitId":"codex","limitName":null,"normalModelSlug":null,
+            "primary":{"usedPercent":usage,"windowDurationMins":10080,"resetsAt":1792472736},
+            "secondary":null,"credits":{"hasCredits":true,"unlimited":false,"balance":"<redacted>"},
+            "individualLimit":null,"spendControlReached":spend,"planType":"<redacted>","rateLimitReachedType":null
+        }},"emittedAtMs":1791892563143_i64})
+    }
+    #[test]
+    fn false_spend_control_adds_no_notice() {
+        assert!(texts(&mut codec(), lane_zero(json!(false), 1)).is_empty());
+    }
+    #[test]
+    fn false_spend_control_does_not_hide_later_near_notice() {
+        let mut codec = codec();
+        let _ = texts(&mut codec, lane_zero(json!(false), 1));
+        assert_eq!(
+            texts(&mut codec, lane_zero(json!(false), 95)),
+            [
+                "Codex is near its usage limit: primary window (7 days), 95% used. Resets at 2026-10-20 05:05:36 UTC."
+            ]
+        );
+    }
+    #[test]
+    fn lane_zero_null_limits_add_no_notice() {
+        assert!(texts(&mut codec(), lane_zero(Value::Null, 1)).is_empty());
+    }
+    #[test]
+    fn null_and_unknown_reached_types_are_not_reached_flags() {
+        for kind in [Value::Null, json!("future_limit"), json!("")] {
+            assert_eq!(
+                texts(
+                    &mut codec(),
+                    json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"rateLimitReachedType":kind,"primary":{"usedPercent":1}}}})
+                ),
+                Vec::<String>::new()
+            );
+        }
+    }
+    #[test]
+    fn limit_notice_names_window_and_reset() {
+        for (limits, expected) in [
+            (
+                json!({"secondary":{"usedPercent":95,"windowDurationMins":300,"resetsAt":1792472736}}),
+                "Codex is near its usage limit: secondary window (5 hours), 95% used. Resets at 2026-10-20 05:05:36 UTC.",
+            ),
+            (
+                json!({"primary":{"usedPercent":100,"windowDurationMins":30,"resetsAt":1792472736}}),
+                "Codex reached its usage limit: primary window (30 minutes), 100% used. Resets at 2026-10-20 05:05:36 UTC.",
+            ),
+            (
+                json!({"secondary":{"usedPercent":90}}),
+                "Codex is near its usage limit: secondary window, 90% used.",
+            ),
+            (
+                json!({"spendControlReached":true,"individualLimit":{"limit":"100","used":"100","remainingPercent":0,"resetsAt":1792472736}}),
+                "Codex reached its spend limit. Resets at 2026-10-20 05:05:36 UTC.",
+            ),
+            (
+                json!({"rateLimitReachedType":"workspace_member_credits_depleted"}),
+                "Codex reached the workspace member's credit limit.",
+            ),
+        ] {
+            assert_eq!(
+                texts(
+                    &mut codec(),
+                    json!({"method":"account/rateLimits/updated","params":{"rateLimits":limits}})
+                ),
+                [expected]
+            );
+        }
+    }
     fn codec() -> Codec {
         Codec::new(
             SessionSpec {
@@ -1635,12 +1773,12 @@ mod limit_tests {
         assert_eq!(notice(&mut codec, json!({"primary":{"usedPercent":95}})), 0);
         assert_eq!(notice(&mut codec, json!({"primary":{"usedPercent":1}})), 0);
         assert_eq!(notice(&mut codec, json!({"primary":{"usedPercent":99}})), 0);
+        assert_eq!(notice(&mut codec, json!({"spendControlReached":true})), 1);
         assert_eq!(
-            notice(&mut codec, json!({"spendControlReached":"reached"})),
-            1
-        );
-        assert_eq!(
-            notice(&mut codec, json!({"rateLimitReachedType":"limit"})),
+            notice(
+                &mut codec,
+                json!({"rateLimitReachedType":"rate_limit_reached"})
+            ),
             0
         );
         assert_eq!(
@@ -1651,8 +1789,8 @@ mod limit_tests {
     #[test]
     fn reached_flags_and_full_windows_report_without_a_near_repeat() {
         for reached in [
-            json!({"rateLimitReachedType":"limit"}),
-            json!({"spendControlReached":"reached"}),
+            json!({"rateLimitReachedType":"rate_limit_reached"}),
+            json!({"spendControlReached":true}),
             json!({"primary":{"usedPercent":100}}),
         ] {
             let mut codec = codec();
