@@ -26,6 +26,7 @@ pub enum Record {
         repeat: usize,
     },
     McpStart,
+    McpStop,
     RecordRelayPid {
         path: String,
     },

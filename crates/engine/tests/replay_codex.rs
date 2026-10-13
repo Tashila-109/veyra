@@ -32,7 +32,42 @@ fn environment(name: &str) -> (Scratch, ChildEnv) {
     env.record = None;
     (Scratch(root), env)
 }
-fn replay(name: &str, mode: PermissionMode, root: bool, resume: bool) -> Vec<ProviderEvent> {
+#[derive(Default)]
+struct Inputs {
+    stop_when_accepted: bool,
+    requests: std::collections::VecDeque<Input>,
+}
+enum Input {
+    Answer(Decision),
+    Stop,
+}
+impl Inputs {
+    fn answers(answers: impl IntoIterator<Item = Decision>) -> Self {
+        Self {
+            requests: answers.into_iter().map(Input::Answer).collect(),
+            ..Default::default()
+        }
+    }
+    fn stop_request() -> Self {
+        Self {
+            requests: [Input::Stop].into(),
+            ..Default::default()
+        }
+    }
+    fn stop_accepted() -> Self {
+        Self {
+            stop_when_accepted: true,
+            ..Default::default()
+        }
+    }
+}
+fn replay(
+    name: &str,
+    mode: PermissionMode,
+    root: bool,
+    resume: bool,
+    mut inputs: Inputs,
+) -> Vec<ProviderEvent> {
     let (scratch, mut env) = environment(name);
     Runtime::new().unwrap().block_on(async {
         let thread = ThreadId::new();
@@ -86,7 +121,8 @@ fn replay(name: &str, mode: PermissionMode, root: bool, resume: bool) -> Vec<Pro
                     ProviderEvent::Turn {
                         event: TurnEvent::Accepted,
                         ..
-                    } if name == "interrupt-before-started" => {
+                    } if inputs.stop_when_accepted => {
+                        inputs.stop_when_accepted = false;
                         handle
                             .control
                             .send(SessionControl::Interrupt {
@@ -96,37 +132,24 @@ fn replay(name: &str, mode: PermissionMode, root: bool, resume: bool) -> Vec<Pro
                             .unwrap();
                     }
                     ProviderEvent::Turn {
-                        event: TurnEvent::RequestOpened { native, kind },
+                        event: TurnEvent::RequestOpened { native, .. },
                         ..
                     } => {
-                        if name == "stop-pending-approval" {
-                            handle
-                                .control
-                                .send(SessionControl::Interrupt {
-                                    turn,
-                                    reason: StopReason::User,
-                                })
-                                .unwrap();
-                        } else {
-                            let reply = match kind {
-                                RequestKind::Question { .. } => Decision::Answers(vec![Answer {
-                                    text: "Violet".into(),
-                                }]),
-                                _ if matches!(name, "approval-command" | "output-null")
-                                    || (name == "mcp-tool-approval" && native.0 == "0") =>
-                                {
-                                    Decision::AllowOnce
-                                }
-                                _ => Decision::Deny,
-                            };
-                            handle
-                                .control
-                                .send(SessionControl::Answer {
-                                    native: native.clone(),
-                                    reply,
-                                })
-                                .unwrap();
-                        }
+                        let input = inputs
+                            .requests
+                            .pop_front()
+                            .expect("test must supply an input for every request");
+                        let message = match input {
+                            Input::Stop => SessionControl::Interrupt {
+                                turn,
+                                reason: StopReason::User,
+                            },
+                            Input::Answer(reply) => SessionControl::Answer {
+                                native: native.clone(),
+                                reply,
+                            },
+                        };
+                        handle.control.send(message).unwrap();
                     }
                     _ => {}
                 }
@@ -136,6 +159,7 @@ fn replay(name: &str, mode: PermissionMode, root: bool, resume: bool) -> Vec<Pro
                     break;
                 }
             }
+            assert!(inputs.requests.is_empty(), "test inputs were not consumed");
             assert!(sent, "Codex never reached Ready: {events:?}");
             assert!(
                 events.iter().any(|e| matches!(
@@ -150,8 +174,8 @@ fn replay(name: &str, mode: PermissionMode, root: bool, resume: bool) -> Vec<Pro
         .unwrap()
     })
 }
-fn standard(name: &str) -> Vec<ProviderEvent> {
-    replay(name, PermissionMode::AskFirst, false, false)
+fn standard(name: &str, inputs: Inputs) -> Vec<ProviderEvent> {
+    replay(name, PermissionMode::AskFirst, false, false, inputs)
 }
 fn text(events: &[ProviderEvent]) -> String {
     events
@@ -191,7 +215,7 @@ fn requests(events: &[ProviderEvent]) -> Vec<&RequestKind> {
 }
 #[test]
 fn codex_ok_reply() {
-    let e = standard("ok-reply");
+    let e = standard("ok-reply", Inputs::default());
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
     assert!(e.iter().any(|e| matches!(
@@ -204,7 +228,13 @@ fn codex_ok_reply() {
 }
 #[test]
 fn codex_shell_echo() {
-    let e = replay("shell-echo", PermissionMode::AcceptEdits, false, false);
+    let e = replay(
+        "shell-echo",
+        PermissionMode::AcceptEdits,
+        false,
+        false,
+        Inputs::default(),
+    );
     assert_eq!(
         text(&e),
         "I’ll run the command and report its output.veyra-probe"
@@ -213,7 +243,7 @@ fn codex_shell_echo() {
 }
 #[test]
 fn codex_command_approval() {
-    let e = standard("approval-command");
+    let e = standard("approval-command", Inputs::answers([Decision::AllowOnce]));
     assert!(
         matches!(requests(&e).as_slice(),[RequestKind::Approval {action:ProposedAction{target:ApprovalTarget::Command{command,..},..},..}] if command=="touch veyra-check.txt")
     );
@@ -221,7 +251,7 @@ fn codex_command_approval() {
 }
 #[test]
 fn codex_file_change_approval() {
-    let e = standard("approval-file-change");
+    let e = standard("approval-file-change", Inputs::answers([Decision::Deny]));
     assert!(
         matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,..},grant_key:None}] if tool=="File change")
     );
@@ -229,7 +259,7 @@ fn codex_file_change_approval() {
 }
 #[test]
 fn codex_permissions_deny_grants_nothing() {
-    let e = standard("permissions");
+    let e = standard("permissions", Inputs::answers([Decision::Deny]));
     assert!(
         matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,..},grant_key:None}] if tool=="Permissions")
     );
@@ -237,14 +267,19 @@ fn codex_permissions_deny_grants_nothing() {
 }
 #[test]
 fn codex_elicitation_declined() {
-    let e = standard("elicitation");
+    let e = standard("elicitation", Inputs::default());
     assert_eq!(requests(&e).len(), 0);
     assert!(e.iter().any(|e|matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="Codex requested an MCP form that Veyra cannot display; it was declined.")));
     assert_eq!(text(&e), "ok");
 }
 #[test]
 fn codex_question_answered() {
-    let e = standard("question");
+    let e = standard(
+        "question",
+        Inputs::answers([Decision::Answers(vec![Answer {
+            text: "Violet".into(),
+        }])]),
+    );
     assert_eq!(
         requests(&e),
         [&RequestKind::Question {
@@ -258,19 +293,25 @@ fn codex_question_answered() {
 }
 #[test]
 fn codex_unknown_request_gets_32601() {
-    let e = standard("unknown-request");
+    let e = standard("unknown-request", Inputs::default());
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
 #[test]
 fn codex_resume_not_found_falls_back() {
-    let e = replay("resume-not-found", PermissionMode::AskFirst, false, true);
+    let e = replay(
+        "resume-not-found",
+        PermissionMode::AskFirst,
+        false,
+        true,
+        Inputs::default(),
+    );
     assert!(e.iter().any(|e|matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="The earlier conversation could not be resumed; this is a new session")));
     assert_eq!(text(&e), "ok");
 }
 #[test]
 fn codex_other_turn_id_is_cli_work() {
-    let e = standard("other-turn");
+    let e = standard("other-turn", Inputs::default());
     assert_eq!(text(&e), "okCLI work");
     assert_eq!(
         outcomes(&e),
@@ -284,7 +325,7 @@ fn codex_other_turn_id_is_cli_work() {
 }
 #[test]
 fn codex_stop_cancels_pending_request() {
-    let e = standard("stop-pending-approval");
+    let e = standard("stop-pending-approval", Inputs::stop_request());
     assert_eq!(requests(&e).len(), 1);
     assert_eq!(
         outcomes(&e),
@@ -295,7 +336,7 @@ fn codex_stop_cancels_pending_request() {
 }
 #[test]
 fn codex_interrupt_retries_after_started() {
-    let e = standard("interrupt-before-started");
+    let e = standard("interrupt-before-started", Inputs::stop_accepted());
     assert_eq!(
         outcomes(&e),
         [TurnOutcome::Interrupted {
@@ -305,7 +346,7 @@ fn codex_interrupt_retries_after_started() {
 }
 #[test]
 fn codex_completed_before_started_ends_turn() {
-    let e = standard("completed-before-started");
+    let e = standard("completed-before-started", Inputs::default());
     assert_eq!(
         outcomes(&e),
         [TurnOutcome::Interrupted {
@@ -332,13 +373,20 @@ fn codex_resume_retries_active_writer() {
         PermissionMode::AskFirst,
         false,
         true,
+        Inputs::default(),
     );
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
 #[test]
 fn codex_resume_sends_exclude_turns() {
-    let e = replay("resume-to-ask-first", PermissionMode::AskFirst, false, true);
+    let e = replay(
+        "resume-to-ask-first",
+        PermissionMode::AskFirst,
+        false,
+        true,
+        Inputs::default(),
+    );
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
@@ -357,14 +405,17 @@ fn codex_every_turn_has_network_access() {
             false,
         ),
     ] {
-        let e = replay(name, mode, root, false);
+        let e = replay(name, mode, root, false, Inputs::default());
         assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
         assert_eq!(text(&e), "ok");
     }
 }
 #[test]
 fn codex_mcp_tool_approval_docks() {
-    let e = standard("mcp-tool-approval");
+    let e = standard(
+        "mcp-tool-approval",
+        Inputs::answers([Decision::AllowOnce, Decision::Deny]),
+    );
     assert_eq!(requests(&e).len(), 2);
     for r in requests(&e) {
         assert!(
@@ -379,7 +430,7 @@ fn codex_mcp_tool_approval_docks() {
 }
 #[test]
 fn codex_other_thread_frames_are_filtered() {
-    let e = standard("subagent-other-thread");
+    let e = standard("subagent-other-thread", Inputs::default());
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
     assert_eq!(
@@ -402,7 +453,7 @@ fn codex_other_thread_frames_are_filtered() {
 }
 #[test]
 fn codex_retry_and_limit_notices() {
-    let e = standard("retry-and-limits");
+    let e = standard("retry-and-limits", Inputs::default());
     let n: Vec<_> = e
         .iter()
         .filter_map(|e| match e {
@@ -421,7 +472,7 @@ fn codex_retry_and_limit_notices() {
 }
 #[test]
 fn codex_command_output_falls_back_to_deltas() {
-    let e = standard("output-null");
+    let e = standard("output-null", Inputs::answers([Decision::AllowOnce]));
     assert!(e.iter().any(|e|matches!(e,ProviderEvent::Turn{event:TurnEvent::ToolFinished{ok:true,output_tail:Some(output),..},..} if output=="veyra-probe\n")));
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
@@ -677,14 +728,14 @@ fn codex_other_thread_never_marks_working() {
 
 #[test]
 fn codex_request_before_reply_is_docked() {
-    let e = standard("request-before-reply");
+    let e = standard("request-before-reply", Inputs::answers([Decision::Deny]));
     assert_eq!(requests(&e).len(), 1);
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
 #[test]
 fn codex_completion_before_reply_ends_once() {
-    let e = standard("completed-before-reply");
+    let e = standard("completed-before-reply", Inputs::default());
     assert_eq!(
         outcomes(&e),
         [TurnOutcome::Interrupted {
@@ -698,7 +749,7 @@ fn codex_completion_before_reply_ends_once() {
 }
 #[test]
 fn codex_bad_lines_keep_the_session() {
-    let e = standard("bad-lines");
+    let e = standard("bad-lines", Inputs::default());
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
@@ -710,6 +761,7 @@ fn codex_request_can_answer_before_the_start_reply() {
         PermissionMode::AskFirst,
         false,
         false,
+        Inputs::answers([Decision::Deny]),
     );
     assert!(events.iter().any(|event| matches!(
         event,
@@ -824,4 +876,27 @@ fn codex_session_cancels_early_request_before_interrupt() {
         serde_json::json!({"decision":"cancel"})
     );
     assert_eq!(frames[1]["method"], "turn/interrupt");
+}
+
+#[test]
+fn codex_low_usage_adds_no_notice() {
+    let e = standard("rate-limit-low", Inputs::default());
+    assert_eq!(
+        e.iter()
+            .filter(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice { .. })))
+            .count(),
+        0
+    );
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_repeated_near_limit_adds_one_notice() {
+    let e = standard("rate-limit-repeated", Inputs::default());
+    assert_eq!(
+        e.iter()
+            .filter(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice { .. })))
+            .count(),
+        1
+    );
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }

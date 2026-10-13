@@ -1,0 +1,16 @@
+{"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.161.0", "scenario": "rate-limit-repeated", "source": "Veyra hand-written stable-schema scenario"}
+{"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}}}}
+{"type": "emit_inbound", "line": {"id": "<id:initialize>", "result": {"userAgent": "veyra/0.161.0"}}}
+{"type": "expect_outbound", "line": {"method": "initialized"}}
+{"type": "expect_outbound", "line": {"id": "<id:thread_request>", "method": "thread/start", "params": {"cwd": "<cwd>", "model": "<any>", "approvalPolicy": "untrusted", "sandbox": "read-only", "approvalsReviewer": "user"}}}
+{"type": "emit_inbound", "line": {"id": "<id:thread_request>", "result": {"thread": {"id": "native-thread", "cliVersion": "0.161.0"}}}}
+{"type": "expect_outbound", "line": {"id": "<id:turn_request>", "method": "turn/start", "params": {"threadId": "<id:session>", "input": [{"type": "text", "text": "<any>", "text_elements": []}], "model": "<any>", "effort": "<any>", "summary": "auto", "approvalPolicy": "untrusted", "approvalsReviewer": "user", "sandboxPolicy": {"type": "readOnly", "networkAccess": true}}}}
+{"type": "emit_inbound", "line": {"id": "<id:turn_request>", "result": {"turn": {"id": "native-turn", "status": "inProgress", "items": [], "error": null}}}}
+{"type": "emit_inbound", "line": {"method": "turn/started", "params": {"threadId": "<id:session>", "turn": {"id": "native-turn", "status": "inProgress", "items": [], "error": null}}}}
+{"type": "emit_inbound", "line": {"method": "account/rateLimits/updated", "params": {"rateLimits": {"primary": {"usedPercent": 95}}}}}
+{"type": "emit_inbound", "line": {"method": "account/rateLimits/updated", "params": {"rateLimits": {"primary": {"usedPercent": 95}}}}}
+{"type": "emit_inbound", "line": {"method": "account/rateLimits/updated", "params": {"rateLimits": {"primary": {"usedPercent": 95}}}}}
+{"type": "emit_inbound", "line": {"method": "item/agentMessage/delta", "params": {"threadId": "<id:session>", "turnId": "native-turn", "itemId": "reply", "delta": "ok"}}}
+{"type": "emit_inbound", "line": {"method": "item/completed", "params": {"threadId": "<id:session>", "turnId": "native-turn", "item": {"type": "agentMessage", "id": "reply", "text": "ok"}}}}
+{"type": "emit_inbound", "line": {"method": "turn/completed", "params": {"threadId": "<id:session>", "turn": {"id": "native-turn", "status": "completed", "items": [], "error": null}}}}
+{"type": "exit", "code": 0}

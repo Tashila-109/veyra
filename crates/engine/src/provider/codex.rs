@@ -32,20 +32,88 @@ pub fn mode(mode: PermissionMode) -> (&'static str, &'static str, Value) {
     }
 }
 pub(crate) struct McpConfig {
-    pub command: std::path::PathBuf,
-    pub socket: std::path::PathBuf,
-    pub token: crate::mcp::McpToken,
+    server: std::sync::Arc<crate::mcp::Server>,
+    thread: ThreadId,
+    epoch: u32,
+    pid: u32,
+    hashes: std::sync::Mutex<Vec<crate::mcp::TokenHash>>,
 }
 impl McpConfig {
-    pub fn value(&self, token: &str) -> Value {
-        json!({
-            "mcp_servers.veyra.command":self.command,
+    pub(crate) fn new(
+        server: std::sync::Arc<crate::mcp::Server>,
+        thread: ThreadId,
+        epoch: u32,
+        pid: u32,
+    ) -> Self {
+        Self {
+            server,
+            thread,
+            epoch,
+            pid,
+            hashes: Default::default(),
+        }
+    }
+    fn frame(&self, line: Value) -> Result<Outbound, ProviderError> {
+        let token = self.server.for_spawn(self.thread, self.epoch, |token| {
+            Ok((token.clone(), self.pid))
+        })?;
+        self.hashes
+            .lock()
+            .unwrap()
+            .push(crate::mcp::TokenHash(token.hash()));
+        Ok(Outbound::Provider(Box::new(ThreadFrame {
+            line,
+            command: self.server.command.clone(),
+            socket: self.server.socket.clone(),
+            token,
+        })))
+    }
+    pub(crate) fn sanitize(&self, value: &mut Value, replacement: &str) {
+        for hash in self.hashes.lock().unwrap().iter() {
+            hash.sanitize(value, replacement);
+        }
+    }
+    pub(crate) fn redact(&self, text: &str, replacement: &str) -> String {
+        self.hashes
+            .lock()
+            .unwrap()
+            .iter()
+            .fold(text.to_owned(), |text, hash| {
+                hash.redact(&text, replacement)
+            })
+    }
+    fn revoke(&self) {
+        self.server.revoke(self.thread, self.epoch);
+    }
+}
+impl Drop for McpConfig {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+struct ThreadFrame {
+    line: Value,
+    command: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    token: crate::mcp::McpToken,
+}
+impl ThreadFrame {
+    fn config(&self, token: &str) -> Value {
+        json!({"mcp_servers.veyra.command":self.command,
             "mcp_servers.veyra.args":["mcp"],
-            "mcp_servers.veyra.env":{
-                "VEYRA_SOCKET":self.socket,
-                "VEYRA_MCP_TOKEN":token
-            }
-        })
+            "mcp_servers.veyra.env":{"VEYRA_SOCKET":self.socket,"VEYRA_MCP_TOKEN":token}})
+    }
+}
+impl super::OutboundFrame for ThreadFrame {
+    #[cfg(any(debug_assertions, test))]
+    fn value(&self) -> Value {
+        let mut line = self.line.clone();
+        line["params"]["config"] = self.config("<id:token>");
+        line
+    }
+    fn into_bytes(mut self: Box<Self>) -> serde_json::Result<Vec<u8>> {
+        self.line["params"]["config"] = self.config(self.token.expose());
+        serde_json::to_vec(&self.line)
     }
 }
 pub fn thread_params(spec: &SessionSpec) -> Value {
@@ -88,8 +156,20 @@ enum Call {
 }
 struct Turn {
     owner: ActiveTurn,
-    started: bool,
+    phase: TurnPhase,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnPhase {
+    Pending,
+    Started,
+    Ended,
+}
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LimitLevel {
+    Near,
+    Reached,
+}
+const NEAR_USAGE_PERCENT: f64 = 90.0;
 enum RequestReply {
     Decision,
     Permissions(Value),
@@ -140,31 +220,31 @@ impl Conversation {
         }
     }
 }
-enum TurnState {
+enum TurnBinding {
     Idle,
-    Starting {
+    WaitingReply {
         owner: TurnId,
         native: Option<String>,
         early: Vec<wire::Notification>,
     },
-    Running {
+    Bound {
         owner: ActiveTurn,
         native: String,
     },
 }
-impl TurnState {
+impl TurnBinding {
     fn active(&self) -> Option<ActiveTurn> {
         match self {
             Self::Idle => None,
-            Self::Starting { owner, .. } => Some(ActiveTurn::Veyra(*owner)),
-            Self::Running { owner, .. } => Some(*owner),
+            Self::WaitingReply { owner, .. } => Some(ActiveTurn::Veyra(*owner)),
+            Self::Bound { owner, .. } => Some(*owner),
         }
     }
     fn native(&self) -> Option<&str> {
         match self {
             Self::Idle => None,
-            Self::Starting { native, .. } => native.as_deref(),
-            Self::Running { native, .. } => Some(native),
+            Self::WaitingReply { native, .. } => native.as_deref(),
+            Self::Bound { native, .. } => Some(native),
         }
     }
 }
@@ -174,9 +254,9 @@ pub(crate) struct Codec {
     mcp: Option<std::sync::Arc<McpConfig>>,
     pid: u32,
     conversation: Conversation,
-    turn: TurnState,
+    turn: TurnBinding,
     turns: BTreeMap<String, Turn>,
-    ended: BTreeSet<String>,
+    limit_level: Option<LimitLevel>,
     items: BTreeMap<String, Item>,
     requests: BTreeMap<String, Request>,
     seen_requests: BTreeSet<String>,
@@ -197,9 +277,9 @@ impl Codec {
             pid,
             mcp,
             peer: Peer::new(false),
-            turn: TurnState::Idle,
+            turn: TurnBinding::Idle,
             turns: BTreeMap::new(),
-            ended: BTreeSet::new(),
+            limit_level: None,
             items: BTreeMap::new(),
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
@@ -215,7 +295,7 @@ impl Codec {
     pub(crate) fn active(&self) -> Option<ActiveTurn> {
         self.turn.active()
     }
-    fn open_thread(&mut self) -> Outbound {
+    fn open_thread(&mut self) -> Result<Outbound, ProviderError> {
         let mut spec = self.spec.clone();
         spec.native = self.conversation.native().cloned();
         let line = self.peer.send(
@@ -228,25 +308,23 @@ impl Codec {
             thread_params(&spec),
         );
         match &self.mcp {
-            Some(mcp) => Outbound::CodexThread {
-                line,
-                mcp: mcp.clone(),
-            },
-            None => Outbound::Message(line),
+            Some(mcp) => mcp.frame(line),
+            None => Ok(Outbound::Message(line)),
         }
     }
-    fn queue_thread(&mut self, decoded: &mut Decoded) {
-        match self.open_thread() {
+    fn queue_thread(&mut self, decoded: &mut Decoded) -> Result<(), ProviderError> {
+        match self.open_thread()? {
             Outbound::Message(line) => decoded.replies.push(line),
             frame => decoded.controls.push(frame),
         }
+        Ok(())
     }
     pub(crate) fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
         if self.active().is_some() {
             return None;
         }
         let native = self.native()?.0.clone();
-        self.turn = TurnState::Starting {
+        self.turn = TurnBinding::WaitingReply {
             owner: turn,
             native: None,
             early: vec![],
@@ -270,7 +348,7 @@ impl Codec {
                 decoded
                     .replies
                     .push(self.peer.notification("initialized", Value::Null));
-                self.queue_thread(&mut decoded);
+                self.queue_thread(&mut decoded)?;
             }
             Frame::Reply {
                 tag: Call::Thread,
@@ -278,6 +356,13 @@ impl Codec {
             } => match result {
                 Ok(result) => {
                     let reply: wire::ThreadReply = decode(result, "thread reply")?;
+                    #[cfg(debug_assertions)]
+                    {
+                        decoded.recording = Some(crate::record::Metadata {
+                            native: reply.thread.id.clone(),
+                            version: reply.thread.cli_version.clone(),
+                        });
+                    }
                     let native = reply.thread.id.filter(|id| !id.is_empty()).ok_or_else(|| {
                         ProviderError::Protocol("Codex thread reply has no thread id".into())
                     })?;
@@ -294,6 +379,9 @@ impl Codec {
                         }));
                 }
                 Err(error) if self.native().is_some() && not_found(&error.message) => {
+                    if let Some(mcp) = &self.mcp {
+                        mcp.revoke();
+                    }
                     self.conversation = Conversation::Opening {
                         native: None,
                         retry: None,
@@ -301,12 +389,15 @@ impl Codec {
                     decoded.events.push(Self::notice(
                         "The earlier conversation could not be resumed; this is a new session",
                     ));
-                    self.queue_thread(&mut decoded);
+                    self.queue_thread(&mut decoded)?;
                 }
                 Err(error)
                     if self.native().is_some()
                         && error.message.contains("already has an active writer") =>
                 {
+                    if let Some(mcp) = &self.mcp {
+                        mcp.revoke();
+                    }
                     let Conversation::Opening { retry, .. } = &mut self.conversation else {
                         return Err(jsonrpc::failure(error));
                     };
@@ -333,13 +424,13 @@ impl Codec {
                 })?;
                 let prior = std::mem::replace(
                     &mut self.turn,
-                    TurnState::Running {
+                    TurnBinding::Bound {
                         owner: ActiveTurn::Veyra(turn),
                         native: id.clone(),
                     },
                 );
                 let early = match prior {
-                    TurnState::Starting { native, early, .. } => {
+                    TurnBinding::WaitingReply { native, early, .. } => {
                         if native.as_ref().is_some_and(|native| native != &id) {
                             return Err(ProviderError::Protocol(
                                 "Codex turn reply changed the pending turn id".into(),
@@ -351,7 +442,7 @@ impl Codec {
                 };
                 self.turns.entry(id).or_insert(Turn {
                     owner: ActiveTurn::Veyra(turn),
-                    started: false,
+                    phase: TurnPhase::Pending,
                 });
                 decoded.events.push(ProviderEvent::Turn {
                     turn: Some(turn),
@@ -376,7 +467,7 @@ impl Codec {
                         .turn
                         .native()
                         .and_then(|id| self.turns.get(id))
-                        .is_some_and(|turn| !turn.started);
+                        .is_some_and(|turn| turn.phase == TurnPhase::Pending);
                     if error.code == -32600
                         && error
                             .message
@@ -430,23 +521,27 @@ impl Codec {
             .is_some_and(|id| self.native().is_some_and(|native| native.0 == id))
     }
     fn route(&mut self, id: &str, decoded: &mut Decoded) -> Option<ActiveTurn> {
-        if self.ended.contains(id) {
+        if self
+            .turns
+            .get(id)
+            .is_some_and(|turn| turn.phase == TurnPhase::Ended)
+        {
             return None;
         }
         if let Some(turn) = self.turns.get(id) {
             return Some(turn.owner);
         }
         let owner = match &mut self.turn {
-            TurnState::Idle => {
+            TurnBinding::Idle => {
                 let owner = ActiveTurn::Provider(TurnId::new());
                 decoded.provider_turn = Some(owner.target());
-                self.turn = TurnState::Running {
+                self.turn = TurnBinding::Bound {
                     owner,
                     native: id.into(),
                 };
                 owner
             }
-            TurnState::Starting { owner, native, .. }
+            TurnBinding::WaitingReply { owner, native, .. }
                 if native.as_ref().is_none_or(|native| native == id) =>
             {
                 *native = Some(id.into());
@@ -458,7 +553,7 @@ impl Codec {
             id.into(),
             Turn {
                 owner,
-                started: false,
+                phase: TurnPhase::Pending,
             },
         );
         Some(owner)
@@ -471,10 +566,29 @@ impl Codec {
         use wire::Notification as N;
         match &notification {
             N::RateLimits { params: details } => {
-                let _ = details;
-                decoded.events.push(Self::notice(
-                    "Codex updated its usage limits. Check the CLI for the remaining allowance.",
-                ));
+                let limits = &details.rate_limits;
+                let usage = limits
+                    .primary
+                    .iter()
+                    .chain(limits.secondary.iter())
+                    .map(|w| w.used_percent)
+                    .fold(0.0, f64::max);
+                let level = if limits.rate_limit_reached_type.is_some()
+                    || limits.spend_control_reached.is_some()
+                    || usage >= 100.0
+                {
+                    Some(LimitLevel::Reached)
+                } else if usage >= NEAR_USAGE_PERCENT {
+                    Some(LimitLevel::Near)
+                } else {
+                    None
+                };
+                if let Some(level) = level
+                    && self.limit_level.is_none_or(|reported| level > reported)
+                {
+                    self.limit_level = Some(level);
+                    decoded.events.push(Self::notice("Codex updated its usage limits. Check the CLI for the remaining allowance."));
+                }
                 return Ok(());
             }
             N::Error { params: error } => {
@@ -503,7 +617,7 @@ impl Codec {
         else {
             return Ok(());
         };
-        if let TurnState::Starting { early, .. } = &mut self.turn {
+        if let TurnBinding::WaitingReply { early, .. } = &mut self.turn {
             early.push(notification);
             return Ok(());
         }
@@ -518,7 +632,11 @@ impl Codec {
         let Some(owner) = owner else {
             return Ok(());
         };
-        if self.ended.contains(&id) {
+        if self
+            .turns
+            .get(&id)
+            .is_some_and(|turn| turn.phase == TurnPhase::Ended)
+        {
             return Ok(());
         }
         let mut events = Vec::new();
@@ -526,9 +644,9 @@ impl Codec {
         match notification {
             N::TurnStarted { params: _ } => {
                 if let Some(turn) = self.turns.get_mut(&id)
-                    && !turn.started
+                    && turn.phase == TurnPhase::Pending
                 {
-                    turn.started = true;
+                    turn.phase = TurnPhase::Started;
                     events.push(TurnEvent::Started);
                 }
                 let retry = self.interrupted.as_mut().is_some_and(|i| {
@@ -563,14 +681,16 @@ impl Codec {
                     _ => TurnOutcome::Completed,
                 };
                 let outcome = self.end_outcome(outcome);
-                self.ended.insert(id.clone());
+                if let Some(turn) = self.turns.get_mut(&id) {
+                    turn.phase = TurnPhase::Ended;
+                }
                 self.requests
                     .retain(|_, request| request.owner.target() != owner.target());
                 if self
                     .active()
                     .is_some_and(|active| active.target() == owner.target())
                 {
-                    self.turn = TurnState::Idle;
+                    self.turn = TurnBinding::Idle;
                     self.interrupted = None;
                 }
                 events.push(TurnEvent::TurnEnded {
@@ -773,9 +893,13 @@ impl Codec {
             .or(self.turn.native())
             .map(str::to_owned);
         if !self.own_thread(scope)
-            || native_turn
-                .as_ref()
-                .is_some_and(|turn| turn.is_empty() || self.ended.contains(turn))
+            || native_turn.as_ref().is_some_and(|turn| {
+                turn.is_empty()
+                    || self
+                        .turns
+                        .get(turn)
+                        .is_some_and(|turn| turn.phase == TurnPhase::Ended)
+            })
         {
             decoded.replies.push(self.peer.error(
                 id,
@@ -1009,16 +1133,16 @@ impl Codec {
         };
         ladder.into_iter().chain(retry).min()
     }
-    pub(crate) fn timer_lines(&mut self) -> Vec<Outbound> {
+    pub(crate) fn timer_lines(&mut self) -> Result<Vec<Outbound>, ProviderError> {
         if let Conversation::Opening {
             retry: Some(retry), ..
         } = &mut self.conversation
             && retry.next.is_some_and(|at| Instant::now() >= at)
         {
             retry.next = None;
-            return vec![self.open_thread()];
+            return Ok(vec![self.open_thread()?]);
         }
-        vec![]
+        Ok(vec![])
     }
     pub(crate) fn escalate_interrupt(&mut self) -> Option<Signal> {
         self.interrupted.as_mut()?.ladder.escalate()
@@ -1029,7 +1153,7 @@ impl Codec {
             .map_or(fallback, |i| i.ladder.outcome())
     }
     pub(crate) fn eof(&mut self) {
-        self.peer.eof("Codex JSON-RPC stdout closed");
+        self.peer.eof();
     }
     fn notice(text: &str) -> ProviderEvent {
         ProviderEvent::Session(SessionEvent::Notice { text: text.into() })
@@ -1207,7 +1331,7 @@ pub(super) async fn probe_exchange(
             Frame::Notification { .. } | Frame::Unknown => {}
         }
     }
-    peer.eof("Codex probe stdout closed");
+    peer.eof();
     Err(ProviderError::Protocol(
         "Codex probe ended without a reply".into(),
     ))
@@ -1272,7 +1396,7 @@ mod tests {
                 break;
             }
             tokio::time::advance(Duration::from_millis(250)).await;
-            let frames = codec.timer_lines();
+            let frames = codec.timer_lines().unwrap();
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].value()["method"], "thread/resume");
             id += 1;
@@ -1429,15 +1553,12 @@ mod tests {
     #[test]
     fn codex_thread_credential_stays_typed_until_serialization() {
         let token = crate::mcp::McpToken::new();
-        let config = std::sync::Arc::new(McpConfig {
+        let outbound = Outbound::Provider(Box::new(ThreadFrame {
+            line: json!({"id":1,"method":"thread/start","params":{}}),
             command: "/owned/veyra".into(),
             socket: "/owned/veyra.sock".into(),
             token: token.clone(),
-        });
-        let outbound = Outbound::CodexThread {
-            line: json!({"id":1,"method":"thread/start","params":{}}),
-            mcp: config,
-        };
+        }));
         let recorded = outbound.value();
         assert_eq!(
             recorded["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"],
@@ -1466,5 +1587,77 @@ mod tests {
                 .unwrap(),
             json!({"id":0,"result":{"action":"accept"}})
         );
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    fn codec() -> Codec {
+        Codec::new(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: "/project".into(),
+                config: ThreadConfig {
+                    mode: PermissionMode::AskFirst,
+                    model: None,
+                    effort: None,
+                },
+                native: None,
+                import: false,
+                root: false,
+            },
+            1,
+            None,
+        )
+    }
+    fn notice(codec: &mut Codec, limits: Value) -> usize {
+        codec
+            .value(json!({"method":"account/rateLimits/updated","params":{"rateLimits":limits}}))
+            .unwrap()
+            .events
+            .len()
+    }
+    #[test]
+    fn limits_report_only_new_levels_for_the_session() {
+        let mut codec = codec();
+        assert_eq!(
+            notice(
+                &mut codec,
+                json!({"primary":{"usedPercent":1},"secondary":{"usedPercent":89}})
+            ),
+            0
+        );
+        assert_eq!(
+            notice(&mut codec, json!({"secondary":{"usedPercent":90}})),
+            1
+        );
+        assert_eq!(notice(&mut codec, json!({"primary":{"usedPercent":95}})), 0);
+        assert_eq!(notice(&mut codec, json!({"primary":{"usedPercent":1}})), 0);
+        assert_eq!(notice(&mut codec, json!({"primary":{"usedPercent":99}})), 0);
+        assert_eq!(
+            notice(&mut codec, json!({"spendControlReached":"reached"})),
+            1
+        );
+        assert_eq!(
+            notice(&mut codec, json!({"rateLimitReachedType":"limit"})),
+            0
+        );
+        assert_eq!(
+            notice(&mut codec, json!({"primary":{"usedPercent":100}})),
+            0
+        );
+    }
+    #[test]
+    fn reached_flags_and_full_windows_report_without_a_near_repeat() {
+        for reached in [
+            json!({"rateLimitReachedType":"limit"}),
+            json!({"spendControlReached":"reached"}),
+            json!({"primary":{"usedPercent":100}}),
+        ] {
+            let mut codec = codec();
+            assert_eq!(notice(&mut codec, reached), 1);
+            assert_eq!(notice(&mut codec, json!({"primary":{"usedPercent":95}})), 0);
+        }
     }
 }

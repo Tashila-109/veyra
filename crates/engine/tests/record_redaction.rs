@@ -28,8 +28,15 @@ fn capture_never_contains_token() {
     let scratch = Scratch::new();
     let path = scratch.0.join("t1-s1.jsonl");
     let token = "veyra-test-credential-abcdefgh";
-    let mut recorder =
-        Recorder::create(&path, "claude", "test", &scratch.0, None, Some(token)).unwrap();
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Claude,
+        "test",
+        &scratch.0,
+        None,
+        Some(token),
+    )
+    .unwrap();
     recorder.bind("native-session".into(), "<id:session>".into());
     recorder.line(true, json!({
         "type":"user", "uuid":"prompt-id", "session_id":"native-session", "cwd":scratch.0,
@@ -57,9 +64,17 @@ fn capture_binds_token_and_updates_cli_version() {
     let scratch = Scratch::new();
     let path = scratch.0.join("capture.jsonl");
     let token = "session-credential-value";
-    let mut recorder =
-        Recorder::create(&path, "claude", "unknown", &scratch.0, None, Some(token)).unwrap();
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Claude,
+        "unknown",
+        &scratch.0,
+        None,
+        Some(token),
+    )
+    .unwrap();
     recorder.line(true, json!({"access_token":token})).unwrap();
+    recorder.version(Some("2.1.295")).unwrap();
     recorder
         .line(
             false,
@@ -89,7 +104,15 @@ fn capture_binds_token_and_updates_cli_version() {
 fn capture_files_are_0600() {
     let scratch = Scratch::new();
     let path = scratch.0.join("capture.jsonl");
-    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None, None).unwrap();
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Claude,
+        "test",
+        &scratch.0,
+        None,
+        None,
+    )
+    .unwrap();
     recorder
         .line(true, json!({"type":"user","message":"ok"}))
         .unwrap();
@@ -135,7 +158,15 @@ fn fixtures_hold_no_secret_shapes() {
 fn capture_hides_hook_output_and_preserves_account_keys() {
     let scratch = Scratch::new();
     let path = scratch.0.join("capture.jsonl");
-    let mut recorder = Recorder::create(&path, "claude", "test", &scratch.0, None, None).unwrap();
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Claude,
+        "test",
+        &scratch.0,
+        None,
+        None,
+    )
+    .unwrap();
     recorder
         .line(
             false,
@@ -250,7 +281,7 @@ fn capture_binds_home_folder_in_nested_paths_and_text() {
     let home = "/fixture-home";
     let mut recorder = Recorder::create(
         &path,
-        "claude",
+        veyra_engine::provider::ProviderKind::Claude,
         "test",
         &scratch.0,
         Some(Path::new(home)),

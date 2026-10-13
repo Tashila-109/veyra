@@ -59,9 +59,16 @@ pub fn redact(text: &str, token: Option<&str>) -> String {
 }
 
 #[cfg(debug_assertions)]
+pub(crate) struct Metadata {
+    pub native: Option<String>,
+    pub version: Option<String>,
+}
+
+#[cfg(debug_assertions)]
 mod capture {
     use super::redact;
     use crate::{fixture::Record, platform};
+    use serde::Deserialize;
     use serde_json::Value;
     use std::{
         collections::BTreeMap,
@@ -70,6 +77,30 @@ mod capture {
         path::Path,
     };
 
+    #[derive(Default, Deserialize)]
+    enum EnvelopeKind {
+        #[serde(rename = "system")]
+        System,
+        #[default]
+        #[serde(other)]
+        Other,
+    }
+    #[derive(Deserialize)]
+    #[serde(default)]
+    struct Envelope<'a> {
+        #[serde(rename = "type")]
+        kind: EnvelopeKind,
+        #[serde(borrow)]
+        subtype: &'a str,
+    }
+    impl Default for Envelope<'_> {
+        fn default() -> Self {
+            Self {
+                kind: EnvelopeKind::Other,
+                subtype: "",
+            }
+        }
+    }
     fn mask_account(value: Value) -> Value {
         match value {
             Value::Object(object) => Value::Object(
@@ -104,7 +135,7 @@ mod capture {
     impl Recorder {
         pub fn create(
             path: &Path,
-            provider: &str,
+            provider: crate::provider::ProviderKind,
             version: &str,
             cwd: &Path,
             home: Option<&Path>,
@@ -129,11 +160,12 @@ mod capture {
                 recorder.bind(token.into(), "<id:token>".into());
             }
             recorder.write(&Record::TranscriptStart {
-                provider: provider.into(),
-                protocol: if provider == "claude" {
-                    "stream-json"
-                } else {
-                    "json-rpc"
+                provider: provider.binary().into(),
+                protocol: match provider {
+                    crate::provider::ProviderKind::Claude => "stream-json",
+                    crate::provider::ProviderKind::Codex | crate::provider::ProviderKind::Grok => {
+                        "json-rpc"
+                    }
                 }
                 .into(),
                 cli_version: version.into(),
@@ -156,12 +188,13 @@ mod capture {
             }
             self.bindings.insert(value, replacement);
         }
-        pub fn line(&mut self, outbound: bool, mut value: Value) -> io::Result<()> {
-            let version = if value["type"] == "system" && value["subtype"] == "init" {
-                value["claude_code_version"].as_str()
-            } else {
-                value["result"]["thread"]["cliVersion"].as_str()
-            };
+        pub(crate) fn metadata(&mut self, metadata: &super::Metadata) -> io::Result<()> {
+            if let Some(native) = &metadata.native {
+                self.bind(native.clone(), "<id:session>".into());
+            }
+            self.version(metadata.version.as_deref())
+        }
+        pub fn version(&mut self, version: Option<&str>) -> io::Result<()> {
             if let Some(version) = version.filter(|version| !version.is_empty()) {
                 self.file.seek(SeekFrom::Start(0))?;
                 let mut existing = String::new();
@@ -169,19 +202,23 @@ mod capture {
                 let (header, rest) = existing
                     .split_once('\n')
                     .ok_or_else(|| io::Error::other("capture header is missing"))?;
-                let mut header: Value = serde_json::from_str(header)?;
-                header["cli_version"] = version.into();
+                let mut header: Record = serde_json::from_str(header)?;
+                if let Record::TranscriptStart { cli_version, .. } = &mut header {
+                    *cli_version = version.into();
+                }
                 self.file.set_len(0)?;
                 self.file.seek(SeekFrom::Start(0))?;
                 serde_json::to_writer(&mut self.file, &header)?;
                 self.file.write_all(b"\n")?;
                 self.file.write_all(rest.as_bytes())?;
             }
-            if value["type"] == "system"
-                && value["subtype"]
-                    .as_str()
-                    .is_some_and(|subtype| subtype.starts_with("hook_"))
-            {
+            Ok(())
+        }
+        pub fn line(&mut self, outbound: bool, mut value: Value) -> io::Result<()> {
+            if Envelope::deserialize(&value).is_ok_and(|envelope| {
+                matches!(envelope.kind, EnvelopeKind::System)
+                    && envelope.subtype.starts_with("hook_")
+            }) {
                 mask_hook_output(&mut value);
             }
             let line = self.sanitize(value, None);

@@ -280,39 +280,30 @@ impl ProviderKind {
         cwd: &std::path::Path,
         cancelled: tokio::sync::oneshot::Receiver<()>,
     ) -> Probe {
-        if self.is_built() {
-            let result = match self {
-                Self::Claude => session::probe(env, cwd, cancelled).await,
-                Self::Codex => session::probe_codex(env, cwd, cancelled).await,
-                Self::Grok => Err(ProviderError::NotBuilt),
-            };
-            match result {
-                Ok(probe) => probe,
-                Err(error) => {
-                    tracing::warn!(error = %crate::record::redact(&error.to_string(),None), "provider probe failed");
-                    Probe {
-                        provider: self,
-                        path: env.resolve(self).ok(),
-                        version: None,
-                        readiness: if matches!(error, ProviderError::NotInstalled(_)) {
-                            Readiness::NotInstalled
-                        } else {
-                            Readiness::Ready
-                        },
-                        models: vec![],
-                        account: None,
-                    }
-                }
-            }
-        } else {
-            Probe {
-                provider: self,
-                path: env.resolve(self).ok(),
-                version: None,
-                readiness: Readiness::Ready,
-                models: vec![],
-                account: None,
-            }
+        let result = match self {
+            Self::Claude => Some(session::probe(env, cwd, cancelled).await),
+            Self::Codex => Some(session::probe_codex(env, cwd, cancelled).await),
+            Self::Grok => None,
+        };
+        let error = match result {
+            Some(Ok(probe)) => return probe,
+            Some(Err(error)) => Some(error),
+            None => None,
+        };
+        if let Some(error) = &error {
+            tracing::warn!(error = %crate::record::redact(&error.to_string(),None), "provider probe failed");
+        }
+        Probe {
+            provider: self,
+            path: env.resolve(self).ok(),
+            version: None,
+            readiness: if matches!(error, Some(ProviderError::NotInstalled(_))) {
+                Readiness::NotInstalled
+            } else {
+                Readiness::Ready
+            },
+            models: vec![],
+            account: None,
         }
     }
 }
@@ -331,10 +322,9 @@ impl Spawner {
         epoch: u32,
     ) -> Result<SessionHandle, ProviderError> {
         match self {
-            Self::Cli(env) if provider.is_built() => {
+            Self::Cli(env) => {
                 session::spawn_provider(provider, spec, env.as_ref().clone(), out, epoch)
             }
-            Self::Cli(_) => Err(ProviderError::NotBuilt),
             #[cfg(test)]
             Self::Scripted(script) => Ok(script.spawn(spec, out, epoch)),
         }
@@ -455,13 +445,15 @@ impl StopLadder {
         }
     }
 }
+pub(crate) trait OutboundFrame: Send {
+    #[cfg(any(debug_assertions, test))]
+    fn value(&self) -> serde_json::Value;
+    fn into_bytes(self: Box<Self>) -> serde_json::Result<Vec<u8>>;
+}
 pub(crate) enum Outbound {
     Prompt(serde_json::Value),
     Message(serde_json::Value),
-    CodexThread {
-        line: serde_json::Value,
-        mcp: std::sync::Arc<codex::McpConfig>,
-    },
+    Provider(Box<dyn OutboundFrame>),
     Interrupt {
         turn: TurnId,
         line: serde_json::Value,
@@ -471,23 +463,17 @@ impl Outbound {
     #[cfg(any(debug_assertions, test))]
     pub fn value(&self) -> serde_json::Value {
         match self {
-            Self::CodexThread { line, mcp } => {
-                let mut line = line.clone();
-                line["params"]["config"] = mcp.value("<id:token>");
-                line
-            }
+            Self::Provider(frame) => frame.value(),
             Self::Prompt(line) | Self::Message(line) | Self::Interrupt { line, .. } => line.clone(),
         }
     }
     pub fn into_bytes(self) -> serde_json::Result<Vec<u8>> {
-        let line = match self {
-            Self::CodexThread { mut line, mcp } => {
-                line["params"]["config"] = mcp.value(mcp.token.expose());
-                line
+        match self {
+            Self::Provider(frame) => frame.into_bytes(),
+            Self::Prompt(line) | Self::Message(line) | Self::Interrupt { line, .. } => {
+                serde_json::to_vec(&line)
             }
-            Self::Prompt(line) | Self::Message(line) | Self::Interrupt { line, .. } => line,
-        };
-        serde_json::to_vec(&line)
+        }
     }
 }
 #[derive(Default)]
@@ -496,6 +482,8 @@ pub(crate) struct Decoded {
     pub replies: Vec<serde_json::Value>,
     pub controls: Vec<Outbound>,
     pub provider_turn: Option<TurnId>,
+    #[cfg(debug_assertions)]
+    pub recording: Option<crate::record::Metadata>,
 }
 
 impl Decoded {

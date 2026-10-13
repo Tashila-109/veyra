@@ -45,6 +45,12 @@ pub(crate) struct SpawnPause {
 }
 
 #[derive(Clone, Debug)]
+enum Resolution {
+    Ambient,
+    Explicit(std::collections::BTreeMap<ProviderKind, PathBuf>),
+}
+
+#[derive(Clone, Debug)]
 pub struct ChildEnv {
     pub(crate) groups: Groups,
     pub mcp: Option<Arc<crate::mcp::Server>>,
@@ -56,7 +62,7 @@ pub struct ChildEnv {
     pub(crate) before_spawn: Arc<Mutex<Option<SpawnPause>>>,
     #[cfg(test)]
     pub(crate) close_before_user_write: Arc<AtomicBool>,
-    binaries: Option<std::collections::BTreeMap<ProviderKind, PathBuf>>,
+    resolution: Resolution,
     pub path: OsString,
     pub home: Option<PathBuf>,
     #[cfg(debug_assertions)]
@@ -83,7 +89,7 @@ impl ChildEnv {
                 tracing::warn!(%error, "login shell PATH unavailable; using inherited PATH");
             }
             let mut env = Self::isolated();
-            env.binaries = None;
+            env.resolution = Resolution::Ambient;
             env.reaper_pids = None;
             env.path = LOGIN_PATH.path.clone();
             env.home = std::env::var_os("HOME").map(PathBuf::from);
@@ -112,7 +118,7 @@ impl ChildEnv {
             before_spawn: Default::default(),
             #[cfg(test)]
             close_before_user_write: Default::default(),
-            binaries: Some(Default::default()),
+            resolution: Resolution::Explicit(Default::default()),
             path: std::env::var_os("PATH").unwrap_or_default(),
             home: None,
             #[cfg(debug_assertions)]
@@ -129,16 +135,19 @@ impl ChildEnv {
         }
     }
     pub(crate) fn for_probe(&self) -> Self {
-        if self.binaries.is_some() {
+        if matches!(self.resolution, Resolution::Explicit(_)) {
             self.clone()
         } else {
             Self::load()
         }
     }
     pub fn with_binary(mut self, provider: ProviderKind, binary: PathBuf) -> Self {
-        self.binaries
-            .get_or_insert_with(Default::default)
-            .insert(provider, binary);
+        if matches!(self.resolution, Resolution::Ambient) {
+            self.resolution = Resolution::Explicit(Default::default());
+        }
+        if let Resolution::Explicit(binaries) = &mut self.resolution {
+            binaries.insert(provider, binary);
+        }
         self
     }
     pub fn resolve(&self, provider: ProviderKind) -> Result<PathBuf, ProviderError> {
@@ -151,7 +160,7 @@ impl ChildEnv {
             return executable(path)
                 .ok_or_else(|| ProviderError::NotInstalled(path.display().to_string()));
         }
-        if let Some(binaries) = &self.binaries {
+        if let Resolution::Explicit(binaries) = &self.resolution {
             return binaries
                 .get(&provider)
                 .and_then(|path| executable(path))
@@ -616,4 +625,18 @@ fn isolated_resolution_uses_only_explicit_binaries_in_every_build() {
         env = env.with_binary(provider, binary.clone());
         assert_eq!(env.resolve(provider).unwrap(), binary);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn selecting_an_explicit_binary_disables_ambient_resolution() {
+    let mut env = ChildEnv::isolated();
+    env.resolution = Resolution::Ambient;
+    let binary = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let env = env.with_binary(ProviderKind::Codex, binary.clone());
+    assert_eq!(env.resolve(ProviderKind::Codex).unwrap(), binary);
+    assert!(matches!(
+        env.resolve(ProviderKind::Claude),
+        Err(ProviderError::NotInstalled(_))
+    ));
 }

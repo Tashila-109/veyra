@@ -103,7 +103,10 @@ The debug-only VEYRA_REAP_PIDS override restricts verification startup to saved 
 It sends SIGTERM to validated orphans and revalidates them before SIGKILL one second later.
 Live parents, missing or invalid markers, reused non-agent pids and unrelated processes are left alone.
 Each successful orphan-group signal writes an INFO line with pid, group and reason, without arguments or environment values.
-Process arguments and environment values are never logged; the macOS environment read uses `KERN_PROCARGS2`.
+Process arguments and environment values are never logged; process-list lookup uses proc_listallpids and getpgid, and the macOS argument and environment reader uses `KERN_PROCARGS2`.
+The PID snapshot reserves 64 spare entries between its size and fill calls, an implementation choice for a short creation burst costing 256 extra bytes.
+ProcessBlock separates argv from the environment bytes, preserving argument boundaries; enumeration decodes only argv and discards the environment portion.
+Environment lookup examines that portion only for a named key after the reaper's recognition checks.
 
 `main` keeps a multi-thread tokio runtime alive across the gpui loop.
 The actor enters that runtime on its own thread; the UI never enters it.
@@ -386,13 +389,16 @@ A targeted Interrupt whose named turn belongs to another thread or is no longer 
 Shutdown and startup recovery use StopReason::AppClosing for their shared turn-end reason.
 The codec ignores an interrupt whose target is no longer active, including when a later Provider turn has opened.
 Only a matching targeted interrupt cancels that turn's open requests and arms its ladder; active-turn interruptions resolve the target directly from the codec.
-The codec returns outbound Prompt, Message, CodexThread or Interrupt values, with each Interrupt carrying its target turn and supplying its own protocol JSON.
+The codec returns outbound Prompt, Message, Provider or Interrupt values, with each Interrupt carrying its target turn and supplying its own protocol JSON.
 The stdin queue preserves that type, the writer applies its quit commitment check only to Prompt, and it checks an Interrupt's target against the codec's shared active id at each poll until its first byte is written.
 An unsent interrupt for an ended target is discarded; its preceding cancel replies remain ordered before any matching interrupt.
 Once writing begins, the writer finishes that frame before another frame.
 A turn end clears its ladder; an admitted new prompt starts with no active turn or old ladder.
 Human interrupts use "Stopped by you"; storage and shutdown carry their own reasons.
 A session without a turn never arms that ladder.
+SessionControls drains pending controls and closes its receiver on Shutdown or the shared LaunchGate closing state, retaining cancellation through process cleanup.
+One drain_and_check_launch gates both initial launch and resume fallback, refusing closing, pending or consumed Shutdown, a closed control channel or a gone event consumer.
+Before admitting StartTurn, SessionControls reads the gate's closing state and drains queued controls, so a pending Shutdown or channel closure prevents the prompt without changing cancel-reply or cleanup order.
 Shutdown gives queued replies up to one second to drain, then aborts an unfinished writer before group cleanup.
 Blocked or failed stdin can prevent delivery; cleanup and leader reaping precede Exited.
 Dropping a live group guard immediately kills its owned group and schedules cleanup.
@@ -432,29 +438,27 @@ Unknown or finished child parents are ignored, and snapshots retain a running to
 Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
-SessionControls drains pending controls and closes its receiver on Shutdown or the shared LaunchGate closing state, retaining cancellation through process cleanup.
-One drain_and_check_launch gates both initial launch and resume fallback, refusing closing, pending or consumed Shutdown, a closed control channel or a gone event consumer.
-Before admitting StartTurn, SessionControls reads the gate's closing state and drains queued controls, so a pending Shutdown or channel closure prevents the prompt without changing cancel-reply or cleanup order.
 
 ## JSON-RPC peer and Codex codec
 
 `jsonrpc::Peer<T>` owns the numeric request counter and pending caller tags, with a flag controlling the jsonrpc version field.
-Replies return those tags directly; it has no unused reply-channel receivers.
-Replies resolve by id, server requests retain string or numeric ids including zero, and notifications go to the provider codec.
-Peer::eof drains every pending tag into a failed reply, and dropping the peer ends its remaining call tracking.
+Replies return those tags directly.
+Replies resolve by id, server requests retain string or numeric ids including zero, and Peer::receive returns replies, requests and notifications to its caller as Frame values.
+Peer::eof clears its pending tags; ordinary field destruction releases them when the peer is dropped.
 The session independently finalizes active work when stdout closes.
 The shared writer in session.rs applies the launch-closing check to prompts and the active-turn check to interrupt frames before their first byte.
 Codex uses a reader task over the same cancellation-safe provider::lines::ByteLines reader as Claude.
-The peer and session share that sibling reader module without importing each other.
-The RPC reader queues four frames, an implementation choice that buffers a short reply burst while applying backpressure instead of retaining thirty-two capped frames.
+session.rs reads Codex stdout through jsonrpc::Reader and Claude stdout through ByteLines directly; jsonrpc.rs imports only lines.rs and ProviderError, never the session.
+The RPC reader queues four frames, an implementation choice that buffers a short reply burst while applying backpressure.
 Four slots hold at most 16 MiB of capped wire bytes or 48 MiB of worst-case lossy UTF-8 text; the reader may additionally retain one decoded frame and its bounded byte buffer.
 Reader::next returns text or an error, so an oversize line cannot leak into a caller's impossible branch.
 A Codex line over 4 MiB fails the session with the cap in its crash text; invalid UTF-8 decodes lossily and non-JSON lines are skipped.
 ACP framing is supported by the peer flag, while no Grok session is implemented.
 
-`codex::Codec` owns app-server wire state, native thread and turn correlation, pending approvals and questions, item output, and protocol retry deadlines.
+`codex::Codec` owns its Peer<Call>, app-server wire state, native thread and turn correlation, pending approvals and questions, item output, and protocol retry deadlines.
 Conversation distinguishes opening with an optional resume retry from Ready with a native id.
-TurnState distinguishes Idle, Starting with an owner and optional provisional native id, and Running with its owner and native id.
+TurnBinding distinguishes Idle, WaitingReply with an owner and optional provisional native id, and Bound with its owner and native id.
+Each native turn maps to its owner and one Pending, Started or Ended phase; binding describes admission and correlation, not another native lifecycle phase.
 InterruptRequest models an unsent interrupt, its first send, the wait for turn/started and the one retry.
 next_deadline combines the shared ladder deadline with a resume retry without claiming every timer is an interrupt.
 A session runs one codex app-server process, initializes with Veyra clientInfo without experimental opt-in, then sends initialized and thread/start or thread/resume.
@@ -475,7 +479,10 @@ Another thread's requests are refused without docking, and a start reply that ch
 The matching turn/completed ends that turn even before turn/started, and a completed native id cannot reopen work.
 Another native turn on this conversation can open a separately announced Provider turn; another thread id is filtered before turn routing.
 Thread status, token usage, hooks, startup status and unknown notifications do not mark work or add notices.
-Retrying errors and account/rateLimits/updated add Veyra notice text without displaying raw provider details.
+Retrying errors add Veyra notice text without displaying raw provider details.
+Codex usage-limit frames add a notice only when rateLimitReachedType or spendControlReached is set, or primary or secondary usedPercent reaches 90.
+The 90 percent threshold is Veyra's implementation choice for a near-limit warning; 100 percent or a reached flag is the reached level.
+A session reports each level at most once and never reports a lower level after a higher one, even after a usage reset.
 
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
@@ -488,9 +495,14 @@ Other MCP forms are declined with a notice, and unsupported server requests get 
 A command row uses completed aggregatedOutput when non-null, otherwise the bounded outputDelta tail.
 A no-active-turn interrupt refusal before turn/started waits for that start and sends one retry within the shared three-second protocol step.
 Codex and Claude share process-group cleanup, the stop ladder, shutdown commitment checks and actor recovery paths.
-launch shares fixture selection, recorder setup, credential registration and OS spawn, then constructs the codec variant for its provider.
+launch chooses its provider setup once, and launch_with shares fixture selection, recorder setup and the ChildEnv spawn boundary.
+The run loop chooses one SessionProfile from its codec for stdout reading, malformed-line diagnostics and resume-failure classification.
+RootMcp holds either Claude's private Configuration and session credential or Codex's attempt-credential factory.
 SessionIo owns the process and recording/credential lifetime, while Process owns the Claude or Codex codec variant.
-Codex inline credentials remain in McpConfig as McpToken; recorded thread requests contain only the token marker, and the writer exposes the token into a temporary serialization value immediately before writing bytes.
+Each Codex thread/start or thread/resume attempt registers a fresh one-use credential for the existing app-server pid, revoking the previous attempt before sending the next.
+Resume refusals revoke immediately, including not-found fallback and every active-writer retry.
+McpConfig retains the attempt hashes for inbound, stderr and recording redaction until the root session ends.
+Codex's ThreadFrame keeps its credential as McpToken; its provider-owned serialization inserts config immediately before the shared writer writes bytes, and its recording value contains only the token marker.
 
 ## MCP relay, authentication and actor tools
 
@@ -500,18 +512,18 @@ Each write direction has an 8 MiB pending-byte cap, an implementation choice tha
 It reads VEYRA_SOCKET for the connection path and writes no token-bearing file.
 When stdin ends, the relay shuts down both socket directions and returns even when a socket write or stdout write is blocked.
 This also ends a Codex relay in its separate process group when the app-server closes or dies.
-A live codex-cli 0.162.1 run with a stand-in stdio server measured the direct-child, own-group shape and exit on stdin closure.
+A live native-binary codex-cli 0.162.1 run with a stand-in stdio server measured the direct-child, own-group shape and exit on stdin closure.
 No live run has yet started the production Veyra relay from Codex.
 Authentication still requires that direct-parent shape; an intermediate process is refused.
 The relay starts no window, takes no instance lock and emits no protocol diagnostics to stdout.
 McpToken contains 32 platform-random bytes encoded for the environment, and Debug prints McpToken(***).
-Server::for_spawn registers a pending credential before spawning, releases the registry lock before configuration and the launch gate, then publishes the actual CLI pid through a watch channel.
+Server::for_spawn registers a pending credential before its spawn or existing-pid registration callback, releases the registry lock before configuration and the launch gate, then publishes the actual CLI pid through a watch channel.
 Authentication waits up to three seconds for that registration and checks the still-current credential under its lock.
 Revocation can remove a pending credential while launch runs; no credential lock is held across the launch gate.
 Only the hash remains in the credential registry, and a credential permits one connection.
 The plaintext token remains readable in the relay environment for the session, so the executable, direct-parent and single-use checks all remain necessary.
-A later spawn of the same thread revokes its earlier credential; a revoked open connection closes on its next input line.
-Session Drop removes its credential by hash, and Actor::exited also revokes the thread and epoch before committing exit.
+A later spawn or Codex thread-open attempt for the same thread revokes its earlier credential; a revoked open connection closes on its next input line.
+Claude Session Drop removes its credential by hash and Codex McpConfig Drop revokes its thread and epoch, and Actor::exited also revokes the thread and epoch before committing exit.
 Server::bind requires a private 0700 data folder and uses platform::bind_async_socket to unlink a stale veyra.sock and bind it at 0600.
 The server gets the peer pid with LOCAL_PEERPID, its direct parent with proc_pidinfo and its executable path with proc_pidpath.
 Authentication compares the peer executable with the supplied relay command and its direct parent with the registered CLI pid before consuming the token hash.
@@ -621,7 +633,7 @@ Grok stays a Ready placeholder whose spawn returns NotBuilt, fails the oldest qu
 The Shell holds raw probe account metadata in memory.
 Dump exposes only account presence as known or unknown, never its value.
 
-`fixture.rs` defines Veyra's transcript_start, expect_outbound, emit_inbound, emit_raw, touch, spin, exit, mcp_start, mcp_send, mcp_expect, record_relay_pid and record_argv records.
+`fixture.rs` defines Veyra's transcript_start, expect_outbound, emit_inbound, emit_raw, touch, spin, exit, mcp_start, mcp_stop, mcp_send, mcp_expect, record_relay_pid and record_argv records.
 Touch creates a file under the fake CLI's cwd and rejects absolute paths and parent components.
 Spin burns CPU for its supplied milliseconds.
 Headers name provider, protocol, CLI version, scenario and source.
@@ -633,6 +645,7 @@ The fake CLI ignores SIGTERM when its header sets ignore_sigterm.
 With --mcp-config, the fake CLI binds the config command, arguments and environment in memory, refuses a root environment carrying VEYRA_MCP_TOKEN, and mcp_start launches the relay as its direct child.
 record_argv stores only the fake CLI argv under the same path restrictions as touch.
 A Codex thread/start or thread/resume binds the dotted config keys for the same MCP records, and its fake relay has a separate process group.
+The mcp_stop fixture record closes and reaps that owned relay before a later attempt starts another.
 record_relay_pid stores only that owned relay pid under the same path restrictions, allowing process-exit assertions.
 Capture-derived fixtures come from Veyra's own CLI recordings; other cases are Veyra's scripted wires.
 
@@ -646,8 +659,9 @@ The standalone fake executable reads that singular variable.
 
 The debug Recorder creates private 0600 captures through platform::private_file.
 It binds the supplied cwd, optional home folder and known ids.
-Process sanitizes inbound and outbound recording values with its token hash before calling Recorder::line, replacing any exact token with <id:token>.
-The same hash sanitizes provider inbound values and stderr before UI, storage or crash text receives them.
+SessionIo sanitizes inbound and outbound recording values with its token hashes before calling Recorder::line, replacing any exact token with <id:token>.
+The same hashes sanitize provider inbound values and stderr before UI, storage or crash text receives them.
+The codecs hand the recorder typed native-id and version metadata decoded from their thread reply or system/init; recording protocol labels come from ProviderKind.
 ChildEnv reads HOME once and supplies it to the recorder; `<home>` is a capture placeholder, not a matcher binding.
 It replaces credential fields, redacts secret-shaped text, replaces hook output with a placeholder and keeps account keys with masked values.
 Claude probes are recorded as probe.jsonl; a later probe replaces that capture only after the earlier probe has ended.
@@ -886,6 +900,7 @@ shutdown_request_* tests check backlogged commands, Ready and every retiring-ses
 cancelling_probe_during_version_cleanup_starts_no_initialize cancels a probe during version cleanup, then checks that no owned group survives and only the version spawn succeeded.
 Tests also check the shared engine/environment gate and registry, the ChildEnv spawn boundary, recheck_after_confirm_quit_launches_no_provider and escape_after_confirm_quit_keeps_sheet.
 shutdown_between_actor_check_and_decide_commits_then_holds_turn pauses after the admission read and checks both orders of closing, persisted pre-quit commitment, no prompt and the recovery hold.
+Socket-bearing test data folders use an explicit short path under /tmp, independent of macOS's default TMPDIR length.
 The two database-lock quit tests hold BEGIN IMMEDIATE while an admitted settings write waits, then check shutdown within 10 ms, native quit within 150 ms, persistence and post-quit refusal.
 launch_past_final_check_at_quit_is_registered_and_signalled pauses inside the launch gate after its final closing check and races native quit, then checks registration in the signal pass, SIGTERM exit and subsequent launch refusal.
 A launch already past that check completes before closing; launches that reach the check after closing are refused.
@@ -922,8 +937,8 @@ App-launch's release check proves that release has no driver, using string scans
 Its macOS sandbox allows only the release Veyra executable and denies every child executable, including installed-provider probes; an unavailable sandbox, invalid profile or missing exec-denial receipt fails the check.
 Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.
 The multi-agent page covers family controls, stored task guidance, delivery, single-child archive holds, archive choices, quiet titles and the visible/open timing probes.
+The Codex sections of new-thread, chat-send-stream, approvals-questions and multi-agent cover CLI model/effort readiness, streamed text, approval and question docks, notices, foreign-thread filtering, the root relay and the Claude-root Codex child card.
 Permission-matrix records separately authorized live permission checks.
-Their Status lines record the lead's acceptance, independently of the recipes.
 The ignored live tests require fresh human consent; ordinary workspace tests use only explicit stand-ins or missing provider paths in debug and release.
 live_claude_approval_round_trip uses the public engine in Ask first to check an exact Bash request, Deny without a file, and AllowOnce on a repeat with the file created.
 Actor tests check account-error retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.
@@ -934,7 +949,7 @@ Composer Stop sends Interrupt and sidebar StopThread sends StopThread; real-prov
 Codex replay tests cover approvals, questions, elicitation, request cancellation order, resume errors and retries, all mode triples, early completion, foreign-thread filtering, notices and both command-output sources.
 The mode-change replay sends Configure through the engine and completes one child conversation across four spawns.
 The root proof uses the production veyra mcp relay, socket and peer checks, and the cross-provider proof settles a Codex child report into a Claude parent wake.
-Peer tests cover omitted and included version fields, out-of-order replies, EOF failure and the fatal line cap.
+Peer tests cover omitted and included version fields, out-of-order replies, EOF tracking cleanup and the fatal line cap.
 Relay tests hold the socket open while stdin or the parent ends and independently block socket and stdout writes before closing stdin.
 The MCP half-close and queue-overflow tests hold an actor reply pending and require credential revocation and connection closure.
 Codex live tests are ignored by default.

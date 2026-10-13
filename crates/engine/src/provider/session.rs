@@ -213,9 +213,27 @@ struct Process {
 }
 struct SessionIo {
     child: ProcessGroup,
-    mcp: Option<crate::mcp::Session>,
+    mcp: Option<RootMcp>,
     #[cfg(debug_assertions)]
     recorder: Option<record::Recorder>,
+}
+enum RootMcp {
+    Claude(crate::mcp::Session),
+    Codex(Arc<codex::McpConfig>),
+}
+impl RootMcp {
+    fn sanitize(&self, value: &mut serde_json::Value, replacement: &str) {
+        match self {
+            Self::Claude(session) => session.hash.sanitize(value, replacement),
+            Self::Codex(config) => config.sanitize(value, replacement),
+        }
+    }
+    fn redact(&self, text: &str, replacement: &str) -> String {
+        match self {
+            Self::Claude(session) => session.hash.redact(text, replacement),
+            Self::Codex(config) => config.redact(text, replacement),
+        }
+    }
 }
 impl SessionIo {
     fn send(
@@ -227,7 +245,7 @@ impl SessionIo {
         if let Some(recorder) = &mut self.recorder {
             let mut value = line.value();
             if let Some(mcp) = &self.mcp {
-                mcp.hash.sanitize(&mut value, "<id:token>");
+                mcp.sanitize(&mut value, "<id:token>");
             }
             recorder.line(true, value)?;
         }
@@ -235,32 +253,39 @@ impl SessionIo {
             .send(line)
             .map_err(|_| ProviderError::Protocol("Provider stdin writer closed".into()))
     }
-    fn record_inbound(&mut self, line: &mut serde_json::Value) -> Result<(), ProviderError> {
-        if let Some(mcp) = &self.mcp
-            && let Some(config) = &mcp.config
-        {
-            config.system_init(line)?;
+    fn record_inbound(
+        &mut self,
+        line: &mut serde_json::Value,
+        codec: &mut Codec,
+    ) -> Result<Decoded, ProviderError> {
+        if let Some(RootMcp::Claude(session)) = &self.mcp {
+            session.config.system_init(line)?;
         }
+        let mut decoded_line = line.clone();
+        if let Some(mcp) = &self.mcp {
+            mcp.sanitize(&mut decoded_line, "[redacted]");
+        }
+        let decoded = codec.value(decoded_line);
         #[cfg(debug_assertions)]
         if let Some(recorder) = &mut self.recorder {
-            if let Some(native) = line["result"]["thread"]["id"]
-                .as_str()
-                .filter(|id| !id.is_empty())
+            if let Ok(decoded) = &decoded
+                && let Some(metadata) = &decoded.recording
             {
-                recorder.bind(native.into(), "<id:session>".into());
+                recorder.metadata(metadata)?;
             }
             let mut recorded = line.clone();
             if let Some(mcp) = &self.mcp {
-                mcp.hash.sanitize(&mut recorded, "<id:token>");
+                mcp.sanitize(&mut recorded, "<id:token>");
             }
             recorder.line(false, recorded)?;
         }
         if let Some(mcp) = &self.mcp {
-            mcp.hash.sanitize(line, "[redacted]");
+            mcp.sanitize(line, "[redacted]");
         }
-        Ok(())
+        decoded
     }
 }
+
 fn launch(
     provider: ProviderKind,
     spec: &SessionSpec,
@@ -268,8 +293,8 @@ fn launch(
     fresh: Option<NativeSessionId>,
     session_epoch: u32,
 ) -> Result<Process, ProviderError> {
-    let binary = env.resolve(provider)?;
-    let (mut args, native) = match provider {
+    let server = if spec.root { env.mcp.as_ref() } else { None };
+    match provider {
         ProviderKind::Claude => {
             let native = fresh
                 .or_else(|| spec.native.clone())
@@ -280,11 +305,87 @@ fn launch(
             {
                 args[index + 1] = native.0.clone();
             }
-            (args, Some(native))
+            launch_with(
+                provider,
+                spec,
+                env,
+                args,
+                "unknown until system/init",
+                |args, spawn| {
+                    let (child, mcp) = if let Some(server) = server {
+                        let (child, config, hash) =
+                            server.for_spawn(spec.thread, session_epoch, |token| {
+                                let config = crate::mcp::Configuration::create(
+                                    server.socket.parent().unwrap(),
+                                    spec.thread,
+                                    &server.command,
+                                    &server.socket,
+                                    token,
+                                )?;
+                                args.extend([
+                                    "--mcp-config".into(),
+                                    config.path.to_string_lossy().into_owned(),
+                                ]);
+                                let child = spawn(args)?;
+                                let pid = child.pid();
+                                Ok(((child, config, crate::mcp::TokenHash(token.hash())), pid))
+                            })?;
+                        (
+                            child,
+                            Some(RootMcp::Claude(crate::mcp::Session {
+                                config,
+                                hash,
+                                server: server.clone(),
+                            })),
+                        )
+                    } else {
+                        (spawn(args)?, None)
+                    };
+                    let codec =
+                        Codec::Claude(Box::new(claude::Codec::new(native, child.pid(), &spec.cwd)));
+                    Ok((child, mcp, codec))
+                },
+            )
         }
-        ProviderKind::Codex => (vec!["app-server".into()], None),
-        ProviderKind::Grok => return Err(ProviderError::NotBuilt),
-    };
+        ProviderKind::Codex => launch_with(
+            provider,
+            spec,
+            env,
+            vec!["app-server".into()],
+            "unknown until thread reply",
+            |args, spawn| {
+                let child = spawn(args)?;
+                let config = server.map(|server| {
+                    Arc::new(codex::McpConfig::new(
+                        server.clone(),
+                        spec.thread,
+                        session_epoch,
+                        child.pid(),
+                    ))
+                });
+                let codec = Codec::Codex(Box::new(codex::Codec::new(
+                    spec.clone(),
+                    child.pid(),
+                    config.clone(),
+                )));
+                Ok((child, config.map(RootMcp::Codex), codec))
+            },
+        ),
+        ProviderKind::Grok => Err(ProviderError::NotBuilt),
+    }
+}
+fn launch_with(
+    provider: ProviderKind,
+    spec: &SessionSpec,
+    env: &ChildEnv,
+    mut args: Vec<String>,
+    initial_version: &str,
+    build: impl FnOnce(
+        &mut Vec<String>,
+        &mut dyn FnMut(&[String]) -> Result<ProcessGroup, ProviderError>,
+    ) -> Result<(ProcessGroup, Option<RootMcp>, Codec), ProviderError>,
+) -> Result<Process, ProviderError> {
+    let binary = env.resolve(provider)?;
     #[cfg(debug_assertions)]
     let (n, epoch) = env.next_lane(spec.thread);
     #[cfg(debug_assertions)]
@@ -301,92 +402,19 @@ fn launch(
         .map(|root| {
             record::Recorder::create(
                 &root.join(format!("t{n}-s{epoch}.jsonl")),
-                provider.binary(),
-                match provider {
-                    ProviderKind::Claude => "unknown until system/init",
-                    ProviderKind::Codex => "unknown until thread reply",
-                    ProviderKind::Grok => "unknown",
-                },
+                provider,
+                initial_version,
                 &spec.cwd,
                 env.home.as_deref(),
                 None,
             )
         })
         .transpose()?;
-    let (child, mcp, codex_config) = if spec.root
-        && let Some(server) = &env.mcp
-    {
-        let (child, config, codex_config, hash) =
-            server.for_spawn(spec.thread, session_epoch, |token| {
-                let (config, codex_config) = match provider {
-                    ProviderKind::Claude => {
-                        let config = crate::mcp::Configuration::create(
-                            server.socket.parent().unwrap(),
-                            spec.thread,
-                            &server.command,
-                            &server.socket,
-                            token,
-                        )?;
-                        args.extend([
-                            "--mcp-config".into(),
-                            config.path.to_string_lossy().into_owned(),
-                        ]);
-                        (Some(config), None)
-                    }
-                    ProviderKind::Codex => (
-                        None,
-                        Some(Arc::new(codex::McpConfig {
-                            command: server.command.clone(),
-                            socket: server.socket.clone(),
-                            token: token.clone(),
-                        })),
-                    ),
-                    ProviderKind::Grok => return Err(ProviderError::NotBuilt),
-                };
-                let child = env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?;
-                let pid = child.pid();
-                Ok((
-                    (
-                        child,
-                        config,
-                        codex_config,
-                        crate::mcp::TokenHash(token.hash()),
-                    ),
-                    pid,
-                ))
-            })?;
-        (
-            child,
-            Some(crate::mcp::Session {
-                config,
-                hash,
-                server: server.clone(),
-            }),
-            codex_config,
-        )
-    } else {
-        (
-            env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?,
-            None,
-            None,
-        )
-    };
-    let codec = match (provider, native) {
-        (ProviderKind::Claude, Some(native)) => {
-            Codec::Claude(Box::new(claude::Codec::new(native, child.pid(), &spec.cwd)))
-        }
-        (ProviderKind::Codex, _) => Codec::Codex(Box::new(codex::Codec::new(
-            spec.clone(),
-            child.pid(),
-            codex_config,
-        ))),
-        (ProviderKind::Claude, None) => {
-            return Err(ProviderError::Protocol(
-                "Claude session has no native id".into(),
-            ));
-        }
-        (ProviderKind::Grok, _) => return Err(ProviderError::NotBuilt),
-    };
+    #[cfg(not(debug_assertions))]
+    let _ = initial_version;
+    let (child, mcp, codec) = build(&mut args, &mut |args| {
+        env.spawn(&binary, args, &spec.cwd, fixture.as_deref())
+    })?;
     Ok(Process {
         io: SessionIo {
             child,
@@ -413,7 +441,7 @@ impl Process {
         Self {
             io: SessionIo {
                 child,
-                mcp,
+                mcp: mcp.map(RootMcp::Claude),
                 #[cfg(debug_assertions)]
                 recorder,
             },
@@ -436,10 +464,12 @@ pub fn spawn_provider(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    if !provider.is_built() {
-        return Err(ProviderError::NotBuilt);
+    match provider {
+        ProviderKind::Claude | ProviderKind::Codex => {
+            env.resolve(provider)?;
+        }
+        ProviderKind::Grok => return Err(ProviderError::NotBuilt),
     }
-    env.resolve(provider)?;
     Ok(start_provider_task(provider, None, spec, env, out, epoch))
 }
 
@@ -495,7 +525,6 @@ fn start_provider_task(
                 thread,
                 epoch,
                 spec.native.is_some(),
-                &spec.cwd,
             )
             .await
             {
@@ -668,20 +697,16 @@ async fn run_one(
     thread: ThreadId,
     epoch: u32,
     resume: bool,
-    _cwd: &std::path::Path,
 ) -> Completion {
     let Process {
         io: mut process,
         mut codec,
     } = process;
     let pid = process.child.pid();
-    let provider = codec.provider();
+    let profile = codec.profile();
+    let provider = profile.provider;
     let stdout = process.child.stdout().expect("piped stdout");
-    let mut lines = if provider == ProviderKind::Codex {
-        SessionLines::Rpc(jsonrpc::Reader::start(stdout))
-    } else {
-        SessionLines::Direct(ByteLines::new(stdout))
-    };
+    let mut lines = (profile.lines)(stdout);
     let mut errors = ByteLines::new(process.child.stderr().expect("piped stderr"));
     let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
     let stderr_tail = tail.clone();
@@ -800,7 +825,8 @@ async fn run_one(
                     None => std::future::pending().await,
                 }
             } => {
-                for line in codec.timer_lines() {
+                let timer_lines = match codec.timer_lines() { Ok(lines) => lines, Err(error) => { failure = Some(error.to_string()); break; } };
+                for line in timer_lines {
                     if let Err(error) = process.send(&writer, line) { failure = Some(error.to_string()); break; }
                 }
                 if failure.is_some() { break; }
@@ -822,16 +848,12 @@ async fn run_one(
                         Ok(wire) => wire,
                         Err(error) => {
                             tracing::info!(length = line.len(), "skipped non-JSON provider line");
-                            if provider == ProviderKind::Claude { rejected = Some(format!("{} protocol: {error}", provider.name())); }
+                            if profile.reject_non_json { rejected = Some(format!("{} protocol: {error}", provider.name())); }
                             continue;
                         }
                     };
                     rejected = None;
-                    if let Err(error) = process.record_inbound(&mut wire) {
-                        failure = Some(error.to_string());
-                        break;
-                    }
-                    match codec.value(wire) {
+                    match process.record_inbound(&mut wire, &mut codec) {
                         Ok(mut decoded) => {
                             *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
                             for line in decoded.take_outbound() {
@@ -884,19 +906,19 @@ async fn run_one(
             process
                 .mcp
                 .as_ref()
-                .map_or_else(|| line.clone(), |mcp| mcp.hash.redact(line, "[redacted]"))
+                .map_or_else(|| line.clone(), |mcp| mcp.redact(line, "[redacted]"))
         })
         .collect::<Vec<_>>();
     let failure = failure.map(|text| {
         process
             .mcp
             .as_ref()
-            .map_or_else(|| text.clone(), |mcp| mcp.hash.redact(&text, "[redacted]"))
+            .map_or_else(|| text.clone(), |mcp| mcp.redact(&text, "[redacted]"))
     });
     let failure = failure
         .or(rejected)
         .map(|text| with_stderr(&text, &lines, None));
-    let missing = provider == ProviderKind::Claude
+    let missing = profile.resume_from_stderr
         && resume
         && lines
             .iter()
@@ -977,14 +999,6 @@ async fn run_one(
     Completion::Exited(crash)
 }
 
-pub fn crash_text(code: Option<i32>, lines: &[String], token: Option<&str>) -> String {
-    let text = format!(
-        "claude exited unexpectedly (exit code {})",
-        code.map(|code| code.to_string())
-            .unwrap_or_else(|| "unknown".into())
-    );
-    with_stderr(&text, lines, token)
-}
 fn with_stderr(text: &str, lines: &[String], token: Option<&str>) -> String {
     let mut text = record::redact(text, token);
     for line in lines.iter().skip(lines.len().saturating_sub(8)) {
@@ -1098,7 +1112,14 @@ pub async fn probe(
             if path.exists() {
                 std::fs::remove_file(&path)?;
             }
-            record::Recorder::create(&path, "claude", &version, cwd, env.home.as_deref(), None)
+            record::Recorder::create(
+                &path,
+                ProviderKind::Claude,
+                &version,
+                cwd,
+                env.home.as_deref(),
+                None,
+            )
         })
         .transpose()?;
     check_cancelled(&mut cancelled)?;
@@ -1178,6 +1199,12 @@ fn provider_crash_text(provider: ProviderKind, code: Option<i32>, lines: &[Strin
     )
 }
 
+struct SessionProfile {
+    provider: ProviderKind,
+    lines: fn(tokio::process::ChildStdout) -> SessionLines,
+    reject_non_json: bool,
+    resume_from_stderr: bool,
+}
 enum SessionLines {
     Direct(ByteLines<tokio::process::ChildStdout>),
     Rpc(jsonrpc::Reader),
@@ -1195,10 +1222,20 @@ enum Codec {
     Codex(Box<codex::Codec>),
 }
 impl Codec {
-    fn provider(&self) -> ProviderKind {
+    fn profile(&self) -> SessionProfile {
         match self {
-            Self::Claude(_) => ProviderKind::Claude,
-            Self::Codex(_) => ProviderKind::Codex,
+            Self::Claude(_) => SessionProfile {
+                provider: ProviderKind::Claude,
+                lines: |stdout| SessionLines::Direct(ByteLines::new(stdout)),
+                reject_non_json: true,
+                resume_from_stderr: true,
+            },
+            Self::Codex(_) => SessionProfile {
+                provider: ProviderKind::Codex,
+                lines: |stdout| SessionLines::Rpc(jsonrpc::Reader::start(stdout)),
+                reject_non_json: false,
+                resume_from_stderr: false,
+            },
         }
     }
     #[cfg(debug_assertions)]
@@ -1272,9 +1309,9 @@ impl Codec {
             Self::Codex(c) => c.end_outcome(outcome),
         }
     }
-    fn timer_lines(&mut self) -> Vec<Outbound> {
+    fn timer_lines(&mut self) -> Result<Vec<Outbound>, ProviderError> {
         match self {
-            Self::Claude(_) => vec![],
+            Self::Claude(_) => Ok(vec![]),
             Self::Codex(c) => c.timer_lines(),
         }
     }
@@ -1405,16 +1442,7 @@ mod tests {
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
         let task = tokio::spawn(async move {
-            run_one(
-                process,
-                &mut control,
-                &out,
-                ThreadId::new(),
-                1,
-                false,
-                std::path::Path::new("/tmp"),
-            )
-            .await
+            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await
         });
         let end = std::time::Instant::now() + Duration::from_secs(5);
         let ended = loop {
@@ -1494,16 +1522,7 @@ mod tests {
                 })
                 .unwrap();
             let (out, mut events) = mpsc::channel(256);
-            run_one(
-                process,
-                &mut control,
-                &out,
-                ThreadId::new(),
-                1,
-                false,
-                std::path::Path::new("/tmp"),
-            )
-            .await;
+            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
             assert!(!platform::group_exists(pid).unwrap());
             let EngineMsg::Provider {
                 event:
@@ -1563,16 +1582,7 @@ mod tests {
             })
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
-        run_one(
-            process,
-            &mut control,
-            &out,
-            ThreadId::new(),
-            1,
-            false,
-            std::path::Path::new("/tmp"),
-        )
-        .await;
+        run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
         assert!(!platform::group_exists(pid).unwrap());
         let EngineMsg::Provider {
             event:
@@ -1627,16 +1637,7 @@ mod tests {
         let (out, mut events) = mpsc::channel(256);
         let start = tokio::time::Instant::now();
         let task = tokio::spawn(async move {
-            run_one(
-                process,
-                &mut control,
-                &out,
-                ThreadId::new(),
-                1,
-                false,
-                std::path::Path::new("/tmp"),
-            )
-            .await
+            run_one(process, &mut control, &out, ThreadId::new(), 1, false).await
         });
         let ended = tokio::time::timeout(Duration::from_secs(9), events.recv())
             .await
@@ -1844,16 +1845,7 @@ mod tests {
             })
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
-        let completion = run_one(
-            process,
-            &mut control,
-            &out,
-            ThreadId::new(),
-            1,
-            false,
-            std::path::Path::new("/tmp"),
-        )
-        .await;
+        let completion = run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
         let expected = concat!(
             "Claude protocol: expected ident at line 1 column 2\n",
             "line 1\nline 2\nline 3\nline 4\nline 5\n",
@@ -1907,9 +1899,9 @@ mod tests {
         assert!(!alive, "cleanup left an owned descendant alive");
     }
     #[test]
-    fn crash_text_bounds_and_redacts() {
+    fn provider_crash_text_bounds_and_redacts() {
         assert_eq!(
-            crash_text(None, &[], None),
+            provider_crash_text(ProviderKind::Claude, None, &[]),
             "claude exited unexpectedly (exit code unknown)"
         );
         let token = "test-session-credential";
@@ -1923,7 +1915,11 @@ mod tests {
             "https://user:abc123@example.invalid".into(),
         ];
         lines.extend(["é".repeat(501), "end".into(), "last".into()]);
-        let text = crash_text(Some(7), &lines, Some(token));
+        let lines: Vec<_> = lines
+            .iter()
+            .map(|line| record::redact(line, Some(token)))
+            .collect();
+        let text = provider_crash_text(ProviderKind::Claude, Some(7), &lines);
         assert_eq!(text.lines().count(), 9);
         assert_eq!(
             text.lines().next().unwrap(),
@@ -2621,15 +2617,21 @@ mod mcp_record_tests {
             child,
             NativeSessionId("record-only".into()),
             Some(crate::mcp::Session {
-                config: Some(config),
+                config,
                 hash: crate::mcp::TokenHash(token.hash()),
                 server,
             }),
             #[cfg(debug_assertions)]
-            Some(record::Recorder::create(&capture, "claude", "fake", &root, None, None).unwrap()),
+            Some(
+                record::Recorder::create(&capture, ProviderKind::Claude, "fake", &root, None, None)
+                    .unwrap(),
+            ),
         );
         let mut wire = serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":format!("prefix {} suffix",token.expose())}]}});
-        process.io.record_inbound(&mut wire).unwrap();
+        process
+            .io
+            .record_inbound(&mut wire, &mut process.codec)
+            .unwrap();
         assert!(
             !wire.to_string().contains(token.expose()),
             "credential reached provider decoding"
@@ -2653,5 +2655,91 @@ mod mcp_record_tests {
         drop(recorder);
         drop(mcp);
         assert!(!config_path.exists());
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod recorder_tests {
+    use super::*;
+    #[tokio::test]
+    async fn unrecognized_reply_cannot_replace_recorded_thread_metadata() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/provider-metadata-{}",
+            ThreadId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let env = ChildEnv::isolated();
+        let child = env
+            .spawn(
+                std::path::Path::new("/bin/sleep"),
+                &["5".into()],
+                &root,
+                None,
+            )
+            .unwrap();
+        let path = root.join("capture.jsonl");
+        let mut process = Process {
+            codec: Codec::Codex(Box::new(codex::Codec::new(
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: root.clone(),
+                    config: ThreadConfig {
+                        mode: PermissionMode::AskFirst,
+                        model: None,
+                        effort: None,
+                    },
+                    native: None,
+                    import: false,
+                    root: false,
+                },
+                child.pid(),
+                None,
+            ))),
+            io: SessionIo {
+                child,
+                mcp: None,
+                recorder: Some(
+                    record::Recorder::create(
+                        &path,
+                        ProviderKind::Codex,
+                        "unknown",
+                        &root,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            },
+        };
+        process.codec.initialize();
+        process
+            .codec
+            .value(serde_json::json!({"id":1,"result":{"userAgent":"fixture"}}))
+            .unwrap();
+        let mut known = serde_json::json!({"id":2,"result":{"thread":{"id":"known-native","cliVersion":"known-version"}}});
+        process
+            .io
+            .record_inbound(&mut known, &mut process.codec)
+            .unwrap();
+        let mut unrelated = serde_json::json!({"id":999,"result":{"thread":{"id":"unrelated-native","cliVersion":"unrelated-version"}}});
+        process
+            .io
+            .record_inbound(&mut unrelated, &mut process.codec)
+            .unwrap();
+        process.io.child.stop().await.unwrap();
+        drop(process.io.recorder);
+        let capture: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(capture[0]["cli_version"], "known-version");
+        assert_eq!(capture[1]["line"]["result"]["thread"]["id"], "<id:session>");
+        assert_eq!(
+            capture[2]["line"]["result"]["thread"]["id"],
+            "unrelated-native"
+        );
+        assert!(env.groups.lock().unwrap().is_empty());
     }
 }

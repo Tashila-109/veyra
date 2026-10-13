@@ -150,24 +150,42 @@ pub fn is_alive(pid: u32) -> io::Result<bool> {
     }
 }
 pub fn list_processes() -> io::Result<Vec<ProcessInfo>> {
-    let output = Command::new("ps")
-        .args(["-axww", "-o", "pid=,pgid=,command="])
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other("process list failed"));
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Err(io::Error::last_os_error());
     }
+    let mut pids = vec![0i32; count as usize + 64];
+    let count = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(pids.as_slice()) as i32,
+        )
+    };
+    if count <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    pids.truncate(count as usize);
     let mut processes = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut words = line.split_whitespace();
-        let pid = words.next().and_then(|word| word.parse().ok());
-        let pgid = words.next().and_then(|word| word.parse().ok());
-        if let (Some(pid), Some(pgid)) = (pid, pgid) {
-            processes.push(ProcessInfo {
-                pid,
-                pgid,
-                argv: words.map(str::to_owned).collect(),
-            });
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid < 0 {
+            continue;
         }
+        let Ok(bytes) = process_block(pid as u32) else {
+            continue;
+        };
+        let Ok(block) = ProcessBlock::read(&bytes) else {
+            continue;
+        };
+        processes.push(ProcessInfo {
+            pid: pid as u32,
+            pgid: pgid as u32,
+            argv: block
+                .argv
+                .iter()
+                .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                .collect(),
+        });
     }
     Ok(processes)
 }
@@ -184,7 +202,7 @@ pub fn process_executable(pid: u32) -> io::Result<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     PathBuf::from(std::ffi::OsString::from_vec(bytes[..end].to_vec())).canonicalize()
 }
-pub fn process_env(pid: u32, name: &str) -> io::Result<Option<String>> {
+fn process_block(pid: u32) -> io::Result<Vec<u8>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
     let mut size = 0;
     if unsafe {
@@ -215,33 +233,55 @@ pub fn process_env(pid: u32, name: &str) -> io::Result<Option<String>> {
         return Err(io::Error::last_os_error());
     }
     bytes.truncate(size);
-    let count = bytes
-        .get(..4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(i32::from_ne_bytes)
-        .filter(|count| *count >= 0)
-        .ok_or_else(|| io::Error::other("invalid process argument block"))?;
-    let mut offset = 4;
-    let end = |offset: usize| {
-        bytes
-            .get(offset..)
-            .and_then(|rest| rest.iter().position(|b| *b == 0))
-            .map(|index| offset + index + 1)
-            .ok_or_else(|| io::Error::other("invalid process argument block"))
-    };
-    offset = end(offset)?;
-    while bytes.get(offset) == Some(&0) {
-        offset += 1;
+    Ok(bytes)
+}
+struct ProcessBlock<'a> {
+    argv: Vec<&'a [u8]>,
+    environment: &'a [u8],
+}
+impl<'a> ProcessBlock<'a> {
+    fn read(bytes: &'a [u8]) -> io::Result<Self> {
+        let count = bytes
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i32::from_ne_bytes)
+            .filter(|count| *count >= 0)
+            .ok_or_else(|| io::Error::other("invalid process argument block"))?;
+        let end = |offset: usize| {
+            bytes
+                .get(offset..)
+                .and_then(|rest| rest.iter().position(|byte| *byte == 0))
+                .map(|index| offset + index + 1)
+                .ok_or_else(|| io::Error::other("invalid process argument block"))
+        };
+        let mut offset = end(4)?;
+        while bytes.get(offset) == Some(&0) {
+            offset += 1;
+        }
+        let mut argv = Vec::new();
+        for _ in 0..count {
+            let next = end(offset)?;
+            argv.push(&bytes[offset..next - 1]);
+            offset = next;
+        }
+        Ok(Self {
+            argv,
+            environment: &bytes[offset..],
+        })
     }
-    for _ in 0..count {
-        offset = end(offset)?;
-    }
+}
+pub fn process_env(pid: u32, name: &str) -> io::Result<Option<String>> {
+    let bytes = process_block(pid)?;
+    let block = ProcessBlock::read(&bytes)?;
     let prefix = format!("{name}=");
-    Ok(bytes[offset..].split(|byte| *byte == 0).find_map(|entry| {
-        entry
-            .strip_prefix(prefix.as_bytes())
-            .map(|value| String::from_utf8_lossy(value).into_owned())
-    }))
+    Ok(block
+        .environment
+        .split(|byte| *byte == 0)
+        .find_map(|entry| {
+            entry
+                .strip_prefix(prefix.as_bytes())
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+        }))
 }
 pub fn lower_priority(group: u32) -> io::Result<()> {
     if unsafe { libc::setpriority(libc::PRIO_PGRP, group, 10) } == 0 {
@@ -460,6 +500,7 @@ mod tests {
             .args([
                 "--exact",
                 "platform::macos::tests::platform_inspection_reads_owned_process",
+                "owned argument with spaces",
             ])
             .env("VEYRA_TEST_INSPECTION_CHILD", "1")
             .env("VEYRA_PARENT_PID", &parent)
@@ -479,11 +520,14 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(marker.unwrap(), Some(parent));
         assert_eq!(shorter.unwrap(), None);
-        assert!(
-            rows.unwrap()
-                .iter()
-                .any(|row| row.pid == pid && row.pgid == pid)
-        );
+        assert!(rows.unwrap().iter().any(|row| {
+            row.pid == pid
+                && row.pgid == pid
+                && row
+                    .argv
+                    .iter()
+                    .any(|argument| argument == "owned argument with spaces")
+        }));
         assert!(rss.unwrap() > 0);
         assert!(alive.unwrap());
         assert!(!is_alive(pid).unwrap());
@@ -506,28 +550,20 @@ mod tests {
     }
     #[test]
     fn login_shell_bounds_inherited_pipe() {
-        let root = std::env::temp_dir().join(format!(
-            "veyra-shell-pipe-{}",
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/veyra-shell-pipe-{}",
             crate::domain::ThreadId::new()
         ));
         let _scratch = crate::tests::Scratch(root.clone());
         fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let shell = root.join("shell");
         let marker = root.join("escaped-pid");
-        let source = root.join("stand-in.c");
-        fs::write(&source, format!(
-            "#include <unistd.h>\n#include <stdio.h>\nint main(void) {{ if (fork() == 0) {{ setsid(); FILE *f = fopen(\"{}\", \"w\"); fprintf(f, \"%d\", getpid()); fclose(f); sleep(4); _exit(0); }} sleep(60); }}\n",
-            marker.display()
-        )).unwrap();
-        assert!(
-            Command::new("/usr/bin/cc")
-                .arg(source)
-                .arg("-o")
-                .arg(&shell)
-                .status()
-                .unwrap()
-                .success()
-        );
+        let binary = env::current_exe().unwrap();
+        let quoted_binary = binary.to_string_lossy().replace('\'', "'\"'\"'");
+        let quoted_root = root.to_string_lossy().replace('\'', "'\"'\"'");
+        fs::write(&shell, format!("#!/bin/sh\nexport VEYRA_TEST_SHELL_PIPE_ROOT='{quoted_root}'\nexec '{quoted_binary}' --exact platform::macos::tests::shell_pipe_child --ignored --nocapture\n")).unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
         let start = std::time::Instant::now();
         let result = bounded_shell_path(shell.as_os_str(), std::time::Duration::from_secs(2));
         let elapsed = start.elapsed();
@@ -542,12 +578,41 @@ mod tests {
         );
     }
     #[test]
+    #[ignore = "owned inherited-pipe fixture entrypoint"]
+    fn shell_pipe_child() {
+        use std::os::unix::process::CommandExt;
+        let root = PathBuf::from(
+            env::var_os("VEYRA_TEST_SHELL_PIPE_ROOT").expect("owned fixture requires its root"),
+        );
+        if env::var_os("VEYRA_TEST_SHELL_PIPE_CHILD").is_some() {
+            fs::write(root.join("escaped-pid"), std::process::id().to_string()).unwrap();
+        } else {
+            let mut child = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::macos::tests::shell_pipe_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("VEYRA_TEST_SHELL_PIPE_CHILD", "1")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            child.wait().unwrap();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+    #[test]
     fn login_shell_bounded_at_2s() {
         if env::var_os("VEYRA_SHELL_TIMEOUT_CHILD").is_some() {
             assert!(login_shell_path().is_err());
             return;
         }
-        let root = env::temp_dir().join(format!("veyra-shell-{}", crate::domain::ThreadId::new()));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/veyra-shell-{}",
+            crate::domain::ThreadId::new()
+        ));
         let _scratch = crate::tests::Scratch(root.clone());
         fs::create_dir(&root).unwrap();
         let shell = root.join("shell");

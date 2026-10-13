@@ -203,68 +203,108 @@ mod tests {
     }
     #[test]
     fn relay_eof_exits_with_blocked_socket_and_stdout_writes() {
+        use std::io::Write;
+        use tokio::io::AsyncWriteExt;
         let root = PathBuf::from("/tmp").join(format!(
             "veyra-relay-blocked-{}",
             veyra_engine::domain::ThreadId::new()
         ));
         platform::private_dir(&root).unwrap();
         let _scratch = Scratch(root.clone());
-        let script = r#"
-import json,os,pathlib,secrets,socket,subprocess,sys,time
-root=pathlib.Path(sys.argv[1]); results=[]
-for case in ['positive','socket_write_blocked','stdout_write_blocked']:
-    path=root/'relay.sock'
-    server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-    server.bind(str(path));server.listen();server.settimeout(3)
-    env=os.environ.copy();env['VEYRA_SOCKET']=str(path);env['VEYRA_MCP_TOKEN']=secrets.token_hex(32);env['VEYRA_RELAY_CHILD']='1'
-    child=subprocess.Popen([sys.argv[2],'--exact','relay::tests::relay_child','--ignored','--nocapture'],stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE if case=='stdout_write_blocked' else subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=env)
-    del env['VEYRA_MCP_TOKEN'];conn=None
-    try:
-        conn,_=server.accept();conn.settimeout(3)
-        while conn.recv(1)!=b'\n': pass
-        sent=0;deadline=time.monotonic()+0.5
-        if case=='socket_write_blocked':
-            os.set_blocking(child.stdin.fileno(),False)
-            while time.monotonic()<deadline and sent<262144:
-                try:sent+=os.write(child.stdin.fileno(),b'x'*65536)
-                except BlockingIOError:time.sleep(0.005)
-        elif case=='stdout_write_blocked':
-            conn.setblocking(False)
-            while time.monotonic()<deadline and sent<262144:
-                try:sent+=conn.send(b'x'*65536)
-                except BlockingIOError:time.sleep(0.005)
-        child.stdin.close()
-        try:child.wait(timeout=1);alive=False
-        except subprocess.TimeoutExpired:alive=True
-        results.append({'case':case,'payload_bytes':sent,'alive_after_eof':alive})
-    finally:
-        if child.poll() is None:child.kill()
-        child.wait(timeout=3)
-        if child.stdout:child.stdout.close()
-        if conn:conn.close()
-        server.close();path.unlink(missing_ok=True)
-print(json.dumps(results))
-"#;
-        let output = Command::new("python3")
-            .arg("-c")
-            .arg(script)
-            .arg(&root)
-            .arg(std::env::current_exe().unwrap())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let cases: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(cases.len(), 3);
-        for case in &cases {
-            if case["case"] != "positive" {
-                assert!(case["payload_bytes"].as_u64().unwrap() > 0);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for case in ["positive", "socket_write_blocked", "stdout_write_blocked"] {
+            let socket = root.join("relay.sock");
+            let server = platform::bind_socket(&socket).unwrap();
+            server.set_nonblocking(true).unwrap();
+            let token = veyra_engine::mcp::McpToken::new();
+            let mut child = Child(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "relay::tests::relay_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("VEYRA_RELAY_CHILD", "1")
+                    .env("VEYRA_SOCKET", &socket)
+                    .env("VEYRA_MCP_TOKEN", token.expose())
+                    .stdin(Stdio::piped())
+                    .stdout(if case == "stdout_write_blocked" {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut connection = loop {
+                match server.accept() {
+                    Ok((connection, _)) => break connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            connection
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut authentication = String::new();
+            io::BufReader::new(connection.try_clone().unwrap())
+                .read_line(&mut authentication)
+                .unwrap();
+            assert!(authentication.ends_with('\n'));
+            drop(authentication);
+            let input = child.0.stdin.take().unwrap();
+            let mut sent = 0;
+            if case == "socket_write_blocked" {
+                runtime.block_on(async {
+                    let mut input = tokio::process::ChildStdin::from_std(input).unwrap();
+                    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                        while sent < 262144 {
+                            sent += input.write(&[b'x'; 65536]).await.unwrap();
+                        }
+                    })
+                    .await;
+                });
+            } else {
+                if case == "stdout_write_blocked" {
+                    connection.set_nonblocking(true).unwrap();
+                    let deadline = Instant::now() + Duration::from_millis(500);
+                    while sent < 262144 && Instant::now() < deadline {
+                        match connection.write(&[b'x'; 65536]) {
+                            Ok(count) => sent += count,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5))
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                }
+                drop(input);
             }
-            assert_eq!(case["alive_after_eof"], false, "{cases:?}");
+            if case != "positive" {
+                assert!(sent > 0);
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "relay failed in {case}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "relay survived stdin EOF in {case} after {sent} bytes"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            println!("relay EOF case={case} payload_bytes={sent} exited=true");
+            drop(connection);
+            drop(server);
+            platform::remove_optional_file(&socket).unwrap();
         }
     }
 }

@@ -478,7 +478,7 @@ impl Drop for Configuration {
 }
 
 pub(crate) struct Session {
-    pub config: Option<Configuration>,
+    pub config: Configuration,
     pub hash: TokenHash,
     pub server: Arc<Server>,
 }
@@ -754,5 +754,92 @@ async fn full_frame_queue_closes_and_revokes_pending_call() {
         drop(socket);
         drop(server);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::*;
+    use crate::provider::{SessionSpec, codex};
+
+    fn hash(frame: crate::provider::Outbound) -> (TokenHash, Value) {
+        let bytes = frame.into_bytes().unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let hash = TokenHash::of(
+            value["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"]
+                .as_str()
+                .unwrap(),
+        );
+        (hash, value)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_attempt_replaces_and_redacts_previous_credential() {
+        for message in [
+            "no rollout found for thread id old-thread",
+            "already has an active writer",
+        ] {
+            let thread = ThreadId::new();
+            let server = Arc::new(Server {
+                socket: "/owned/veyra.sock".into(),
+                command: "/owned/veyra".into(),
+                credentials: Default::default(),
+            });
+            let config = Arc::new(codex::McpConfig::new(
+                server.clone(),
+                thread,
+                1,
+                std::process::id(),
+            ));
+            let mut codec = codex::Codec::new(
+                SessionSpec {
+                    thread,
+                    cwd: "/owned".into(),
+                    config: ThreadConfig {
+                        mode: PermissionMode::AskFirst,
+                        model: None,
+                        effort: None,
+                    },
+                    native: Some(NativeSessionId("old-thread".into())),
+                    import: false,
+                    root: true,
+                },
+                std::process::id(),
+                Some(config.clone()),
+            );
+            codec.initialize();
+            let mut opened = codec
+                .value(json!({"id":1,"result":{"userAgent":"veyra-test"}}))
+                .unwrap();
+            let (first, mut first_wire) = hash(opened.controls.pop().unwrap());
+            assert!(server.active(&first.0));
+            let mut refused = codec
+                .value(json!({"id":2,"error":{"code":-32600,"message":message}}))
+                .unwrap();
+            assert!(
+                !server.active(&first.0),
+                "refused attempt credential remains registered"
+            );
+            let next = if let Some(frame) = refused.controls.pop() {
+                frame
+            } else {
+                tokio::time::advance(Duration::from_millis(250)).await;
+                codec.timer_lines().unwrap().pop().unwrap()
+            };
+            let (second, mut second_wire) = hash(next);
+            assert!(first != second, "thread attempts reused a credential");
+            assert!(server.active(&second.0));
+            config.sanitize(&mut first_wire, "<id:token>");
+            config.sanitize(&mut second_wire, "<id:token>");
+            for wire in [first_wire, second_wire] {
+                assert!(
+                    wire["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"]
+                        == "<id:token>"
+                );
+            }
+            drop(codec);
+            drop(config);
+            assert!(!server.active(&second.0));
+        }
     }
 }

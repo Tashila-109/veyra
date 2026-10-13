@@ -64,7 +64,7 @@ pub(super) enum Notification {
     #[serde(rename = "account/rateLimits/updated")]
     RateLimits {
         #[serde(default)]
-        params: Value,
+        params: RateLimitsNotification,
     },
     #[serde(other)]
     Unknown,
@@ -438,4 +438,23 @@ fn optional_bool<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bo
         Value::deserialize(deserializer)?,
         Value::Bool(true)
     ))
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct RateLimitsNotification {
+    pub rate_limits: RateLimits,
+}
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct RateLimits {
+    pub primary: Option<RateWindow>,
+    pub secondary: Option<RateWindow>,
+    pub rate_limit_reached_type: Option<Value>,
+    pub spend_control_reached: Option<Value>,
+}
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct RateWindow {
+    pub used_percent: f64,
 }

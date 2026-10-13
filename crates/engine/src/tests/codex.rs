@@ -121,7 +121,12 @@ fn codex_params_per_mode() {
 }
 
 #[cfg(debug_assertions)]
-fn fake_family(provider: ProviderKind, mode: PermissionMode, files: &[(&str, &str)]) -> Projection {
+fn fake_family(
+    provider: ProviderKind,
+    mode: PermissionMode,
+    files: &[(&str, &str)],
+    native: Option<NativeSessionId>,
+) -> Projection {
     use std::{fs, path::PathBuf, time::Duration};
     static LOGS: std::sync::OnceLock<CapturedLogs> = std::sync::OnceLock::new();
     let logs = LOGS.get_or_init(|| {
@@ -187,7 +192,7 @@ fn fake_family(provider: ProviderKind, mode: PermissionMode, files: &[(&str, &st
             mode,
         },
         cwd: root.clone(),
-        native: None,
+        native,
         native_cursor: None,
         cli_version: None,
         hold: None,
@@ -238,6 +243,22 @@ fn fake_family(provider: ProviderKind, mode: PermissionMode, files: &[(&str, &st
     if let Err(error) = result {
         std::panic::resume_unwind(error);
     }
+    let projection = store::load(&actor.db).unwrap();
+    assert!(
+        projection.turns.values().all(|t| matches!(
+            t.state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "root session did not complete: {:?}",
+        projection
+            .turns
+            .values()
+            .map(|t| &t.state)
+            .collect::<Vec<_>>()
+    );
     if provider == ProviderKind::Codex {
         let relay_pid: u32 = fs::read_to_string(root.join("relay.pid"))
             .unwrap()
@@ -288,6 +309,7 @@ fn codex_root_reaches_real_relay() {
         ProviderKind::Codex,
         PermissionMode::AskFirst,
         &[("root-tool-call", "t1-s1.jsonl")],
+        None,
     );
     assert_eq!(p.turns.len(), 1);
     assert!(p.turns.values().all(|t| matches!(
@@ -312,6 +334,7 @@ fn claude_root_codex_child_runs_on_fake_cli() {
             ("claude-parent-codex-child", "t1-s1.jsonl"),
             ("child-policy-full-access", "t2-s1.jsonl"),
         ],
+        None,
     );
     assert_eq!(p.threads.len(), 2);
     assert_eq!(p.turns.len(), 3);
@@ -338,8 +361,15 @@ fn inline_credential_recording_preserves_redacted_binding() {
     std::fs::create_dir_all(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let path = root.join("capture.jsonl");
-    let mut recorder =
-        crate::record::Recorder::create(&path, "codex", "fake", &root, None, None).unwrap();
+    let mut recorder = crate::record::Recorder::create(
+        &path,
+        crate::provider::ProviderKind::Codex,
+        "fake",
+        &root,
+        None,
+        None,
+    )
+    .unwrap();
     recorder
         .line(
             true,
@@ -371,8 +401,15 @@ fn recording_distinguishes_changed_native_thread_and_version() {
     std::fs::create_dir_all(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let path = root.join("capture.jsonl");
-    let mut recorder =
-        crate::record::Recorder::create(&path, "codex", "unknown", &root, None, None).unwrap();
+    let mut recorder = crate::record::Recorder::create(
+        &path,
+        crate::provider::ProviderKind::Codex,
+        "unknown",
+        &root,
+        None,
+        None,
+    )
+    .unwrap();
     recorder.bind("old-native".into(), "<id:session>".into());
     recorder
         .line(
@@ -380,7 +417,12 @@ fn recording_distinguishes_changed_native_thread_and_version() {
             json!({"method":"thread/resume","params":{"threadId":"old-native"}}),
         )
         .unwrap();
-    recorder.bind("new-native".into(), "<id:session>".into());
+    recorder
+        .metadata(&crate::record::Metadata {
+            native: Some("new-native".into()),
+            version: Some("0.162.1".into()),
+        })
+        .unwrap();
     recorder
         .line(
             false,
@@ -396,4 +438,39 @@ fn recording_distinguishes_changed_native_thread_and_version() {
     assert_eq!(lines[1]["line"]["params"]["threadId"], "<id:session>");
     assert_eq!(lines[2]["line"]["result"]["thread"]["id"], "<id:session:1>");
     assert_eq!(lines[0]["cli_version"], "0.162.1");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn codex_refused_resume_relay_does_not_spend_fallback_credential() {
+    let p = fake_family(
+        ProviderKind::Codex,
+        PermissionMode::AskFirst,
+        &[("resume-relay-fallback", "t1-s1.jsonl")],
+        Some(NativeSessionId("missing-native".into())),
+    );
+    assert!(p.turns.values().all(|t| matches!(
+        t.state,
+        TurnState::Ended {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    )));
+}
+#[cfg(debug_assertions)]
+#[test]
+fn codex_refused_resume_relays_do_not_spend_retry_credentials() {
+    let p = fake_family(
+        ProviderKind::Codex,
+        PermissionMode::AskFirst,
+        &[("resume-relay-retry", "t1-s1.jsonl")],
+        Some(NativeSessionId("missing-native".into())),
+    );
+    assert!(p.turns.values().all(|t| matches!(
+        t.state,
+        TurnState::Ended {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    )));
 }

@@ -102,6 +102,7 @@ fn run() -> io::Result<i32> {
                 }
                 output.flush()?;
             }
+            Record::McpStop => drop(relay.take()),
             Record::McpStart => {
                 let command = matcher.expand(serde_json::json!("<id:mcp_command>"));
                 let args = matcher.expand(serde_json::json!("<id:mcp_args>"));

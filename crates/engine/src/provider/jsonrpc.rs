@@ -111,19 +111,8 @@ impl<T> Peer<T> {
         }
         Frame::Unknown
     }
-    pub fn eof(&mut self, message: &str) -> Vec<Frame<T>> {
-        std::mem::take(&mut self.pending)
-            .into_values()
-            .map(|tag| Frame::Reply {
-                tag,
-                result: Err(Error::closed(message)),
-            })
-            .collect()
-    }
-}
-impl<T> Drop for Peer<T> {
-    fn drop(&mut self) {
-        self.eof("JSON-RPC connection closed");
+    pub fn eof(&mut self) {
+        self.pending.clear();
     }
 }
 pub(crate) struct Reader {
@@ -169,23 +158,18 @@ pub(crate) fn failure(error: Error) -> ProviderError {
 mod tests {
     use super::*;
     #[test]
-    fn jsonrpc_eof_fails_pending() {
+    fn jsonrpc_eof_clears_pending() {
         let mut peer = Peer::new(false);
         peer.send("one", "one", json!({}));
         peer.send("two", "two", json!({}));
-        let replies = peer.eof("JSON-RPC stdout closed");
-        assert_eq!(replies.len(), 2);
-        for (reply, expected) in replies.into_iter().zip(["one", "two"]) {
-            let Frame::Reply { tag, result } = reply else {
-                panic!("pending call was not failed")
-            };
-            assert_eq!(tag, expected);
-            assert_eq!(result.unwrap_err().message, "JSON-RPC stdout closed");
+        peer.eof();
+        assert!(peer.pending.is_empty());
+        for id in [1, 2] {
+            assert!(matches!(
+                peer.receive(json!({"id":id,"result":{}})),
+                Frame::Unknown
+            ));
         }
-        assert!(matches!(
-            peer.receive(json!({"id":1,"result":{}})),
-            Frame::Unknown
-        ));
     }
     #[test]
     fn jsonrpc_flag_omits_field() {

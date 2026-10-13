@@ -552,6 +552,8 @@ impl Codec {
                     controls: Vec::new(),
                     replies: vec![Self::unsupported_request(id)],
                     provider_turn: None,
+                    #[cfg(debug_assertions)]
+                    recording: None,
                 });
             }
             Err(_) if control_response => {
@@ -964,6 +966,14 @@ impl Codec {
     fn system(&mut self, system: System, decoded: &mut Decoded) {
         match system.subtype.as_str() {
             "init" => {
+                #[cfg(debug_assertions)]
+                {
+                    decoded.recording = Some(crate::record::Metadata {
+                        native: (!system.session_id.is_empty()).then(|| system.session_id.clone()),
+                        version: (!system.claude_code_version.is_empty())
+                            .then(|| system.claude_code_version.clone()),
+                    });
+                }
                 if !system.session_id.is_empty() && system.session_id != self.native.0 {
                     decoded
                         .events

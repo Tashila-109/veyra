@@ -8,7 +8,7 @@
 {"type": "emit_inbound", "line": {"id": "<id:turn_request>", "result": {"turn": {"id": "native-turn", "status": "inProgress", "items": [], "error": null}}}}
 {"type": "emit_inbound", "line": {"method": "turn/started", "params": {"threadId": "<id:session>", "turn": {"id": "native-turn", "status": "inProgress", "items": [], "error": null}}}}
 {"type": "emit_inbound", "line": {"method": "error", "params": {"threadId": "<id:session>", "turnId": "native-turn", "willRetry": true, "error": {"message": "Retry this turn"}}}}
-{"type": "emit_inbound", "line": {"method": "account/rateLimits/updated", "params": {"rateLimits": {"primary": {"usedPercent": 25}}}}}
+{"type": "emit_inbound", "line": {"method": "account/rateLimits/updated", "params": {"rateLimits": {"primary": {"usedPercent": 95}}}}}
 {"type": "emit_inbound", "line": {"method": "item/agentMessage/delta", "params": {"threadId": "<id:session>", "turnId": "native-turn", "itemId": "reply", "delta": "ok"}}}
 {"type": "emit_inbound", "line": {"method": "item/completed", "params": {"threadId": "<id:session>", "turnId": "native-turn", "item": {"type": "agentMessage", "id": "reply", "text": "ok"}}}}
 {"type": "emit_inbound", "line": {"method": "turn/completed", "params": {"threadId": "<id:session>", "turn": {"id": "native-turn", "status": "completed", "items": [], "error": null}}}}

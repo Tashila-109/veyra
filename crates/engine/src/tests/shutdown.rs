@@ -5,7 +5,8 @@ use super::*;
 fn quit_during_database_write(native: bool, locked: bool) -> std::time::Duration {
     use std::time::{Duration, Instant};
     let runtime = Runtime::new().unwrap();
-    let scratch = Scratch(std::env::temp_dir().join(format!("veyra-quit-{}", ThreadId::new())));
+    let scratch =
+        Scratch(std::path::Path::new("/tmp").join(format!("veyra-quit-{}", ThreadId::new())));
     let engine = crate::Engine::start_with_processes(
         runtime.handle(),
         crate::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
