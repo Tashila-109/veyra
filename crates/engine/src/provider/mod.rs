@@ -51,6 +51,7 @@ pub enum SessionControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     User,
+    QuestionChoice,
     Parent,
     StorageBlocked,
     AppClosing,
@@ -59,6 +60,7 @@ impl StopReason {
     pub fn text(self) -> &'static str {
         match self {
             Self::User => "Stopped by you",
+            Self::QuestionChoice => "Stopped to send your answer",
             Self::Parent => "Stopped by its parent",
             Self::StorageBlocked => "Stopped because the database is blocked",
             Self::AppClosing => "Veyra closed while this turn ran",
@@ -108,6 +110,11 @@ pub enum TurnEvent {
         text: String,
         streamed: bool,
     },
+    AsyncQuestions {
+        key: NativeItemKey,
+        text: String,
+        questions: Vec<AsyncQuestion>,
+    },
     ReasoningDelta {
         key: NativeItemKey,
         text: String,
@@ -143,6 +150,7 @@ impl TurnEvent {
         match self {
             Self::Started
             | Self::TextDelta { .. }
+            | Self::AsyncQuestions { .. }
             | Self::ReasoningDelta { .. }
             | Self::ToolStarted { .. }
             | Self::Plan(_)

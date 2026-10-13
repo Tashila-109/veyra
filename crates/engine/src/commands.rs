@@ -24,6 +24,11 @@ pub enum Command {
         thread: ThreadId,
         text: String,
     },
+    ChooseAsyncOption {
+        item: ItemId,
+        question: usize,
+        option: usize,
+    },
     Interrupt {
         thread: ThreadId,
         turn: TurnId,
@@ -97,8 +102,13 @@ pub fn decide(
             text,
         } => create_thread(p, l, &mut c, project, provider, config, text)?,
         Command::Send { thread, text } => send(p, l, &mut c, thread, text)?,
+        Command::ChooseAsyncOption {
+            item,
+            question,
+            option,
+        } => choose_async_option(p, l, &mut c, item, question, option, now)?,
         Command::Interrupt { thread, turn } => {
-            interrupt(p, l, &mut c, thread, turn, now)?;
+            interrupt(p, l, &mut c, thread, turn, StopReason::User, now)?;
             Ack::Applied
         }
         Command::Respond { request, decision } => {
@@ -276,12 +286,81 @@ fn send(
     };
     Ok(Ack::Turn(turn))
 }
+fn choose_async_option(
+    p: &Projection,
+    l: &BTreeMap<ThreadId, LiveThread>,
+    c: &mut ChangeSet,
+    item: ItemId,
+    question: usize,
+    option: usize,
+    now: Millis,
+) -> Result<Ack, CommandError> {
+    let mut item = p
+        .items
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::NotFound("question card".into()))?;
+    let thread = item.thread;
+    if get_thread(p, thread)?.archived {
+        return Err(CommandError::Busy(WaitReason::Archived));
+    }
+    let ItemBody::AsyncQuestions { questions, .. } = &mut item.body else {
+        return Err(CommandError::Invalid(
+            "This item is not a question card".into(),
+        ));
+    };
+    let question = questions
+        .get_mut(question)
+        .ok_or_else(|| CommandError::Invalid("This question does not exist".into()))?;
+    if question.selected.is_some() {
+        return Err(CommandError::Invalid(
+            "This question has already been answered".into(),
+        ));
+    }
+    let text = question
+        .options
+        .get(option)
+        .cloned()
+        .ok_or_else(|| CommandError::Invalid("This option does not exist".into()))?;
+    question.selected = Some(option);
+    c.events.push(Ev::ItemAdded(item.clone()));
+    c.items.insert(item.id, item);
+    let target = c
+        .view(p, l, thread)
+        .unwrap()
+        .running
+        .map(|turn| turn.id)
+        .or_else(|| l[&thread].pending_turn());
+    if let Some(turn) = target {
+        interrupt(p, l, c, thread, turn, StopReason::QuestionChoice, now)?;
+    }
+    set_hold(p, c, thread, None);
+    let mut queued: Vec<_> = c
+        .turns(p, thread)
+        .filter(|turn| turn.state == TurnState::Queued)
+        .cloned()
+        .collect();
+    queued.sort_by_key(|turn| turn.ordinal);
+    let next = queued.first().map(|turn| turn.ordinal);
+    for mut turn in queued {
+        turn.ordinal += 1;
+        c.events.push(Ev::TurnQueued(turn.clone()));
+        c.turns.insert(turn.id, turn);
+    }
+    let answer = queue_user(p, c, thread, text);
+    if let Some(ordinal) = next {
+        let turn = c.turns.get_mut(&answer).unwrap();
+        turn.ordinal = ordinal;
+    }
+    Ok(Ack::Turn(answer))
+}
 fn interrupt(
     p: &Projection,
     l: &BTreeMap<ThreadId, LiveThread>,
     c: &mut ChangeSet,
     thread: ThreadId,
     turn: TurnId,
+    reason: StopReason,
     now: Millis,
 ) -> Result<(), CommandError> {
     get_thread(p, thread)?;
@@ -300,24 +379,19 @@ fn interrupt(
         *draining = Some(turn);
     }
     c.live.insert(thread, live);
-    control(
-        c,
-        thread,
-        SessionControl::Interrupt {
-            turn,
-            reason: StopReason::User,
-        },
-    );
+    control(c, thread, SessionControl::Interrupt { turn, reason });
     end_turn(
         p,
         c,
         target.clone(),
         TurnOutcome::Interrupted {
-            reason: StopReason::User.text().into(),
+            reason: reason.text().into(),
         },
         now,
     );
-    set_hold(p, c, thread, Some(HoldReason::Interrupted));
+    if reason != StopReason::QuestionChoice {
+        set_hold(p, c, thread, Some(HoldReason::Interrupted));
+    }
     Ok(())
 }
 fn respond(

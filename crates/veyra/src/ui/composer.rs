@@ -18,6 +18,7 @@ pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String,
         ApprovalTarget::Command {
             command,
             cwd,
+            reason,
             preview,
         } => {
             let location = match cwd {
@@ -25,11 +26,19 @@ pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String,
                 CommandCwd::Directory(path) => format!("in {}", path.display()),
                 CommandCwd::NotVerified => "at a location that is not verified".into(),
             };
-            (
-                command.clone(),
-                format!("{provider} will run this command {location}."),
-                preview,
-            )
+            let mut consequence = if provider == "Codex" && matches!(cwd, CommandCwd::ProjectFolder)
+            {
+                "Codex will use the project folder as its working folder.".to_owned()
+            } else {
+                format!("{provider} will run this command {location}.")
+            };
+            if let Some(reason) = reason {
+                consequence.push_str(&format!("\n{provider}'s reason: {}", reason.text));
+                if reason.truncated {
+                    consequence.push_str(" [truncated]");
+                }
+            }
+            (command.clone(), consequence, preview)
         }
         ApprovalTarget::File {
             operation,
@@ -699,6 +708,22 @@ mod tests {
         assert_eq!(
             consequence,
             "Codex will run this command in /tmp/elsewhere."
+        );
+    }
+}
+
+#[cfg(test)]
+mod command_reason_tests {
+    use super::approval_text;
+    use veyra_engine::domain::ProposedAction;
+    #[test]
+    fn codex_command_names_working_folder_and_reason() {
+        let action:ProposedAction=serde_json::from_value(serde_json::json!({"tool":"Command","target":{"kind":"command","command":"printf outside","cwd":"project_folder","reason":{"text":"Approve writing /tmp/outside.txt with the requested content?","truncated":false},"preview":{"text":"","truncated":false}}})).unwrap();
+        let (command, consequence, _) = approval_text(&action, "Codex");
+        assert_eq!(command, "printf outside");
+        assert_eq!(
+            consequence,
+            "Codex will use the project folder as its working folder.\nCodex's reason: Approve writing /tmp/outside.txt with the requested content?"
         );
     }
 }

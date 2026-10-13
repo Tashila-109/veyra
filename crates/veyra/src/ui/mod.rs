@@ -949,6 +949,56 @@ impl Shell {
         self.notice = Some(message);
         cx.notify();
     }
+    fn choose_async_option(
+        &mut self,
+        action: &ChooseAsyncOption,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.view.chat() else {
+            return;
+        };
+        let Some(items) = self.state.items.get(&thread) else {
+            return;
+        };
+        let item = match action.item {
+            Some(id) => items.get(&id),
+            None => items
+                .values()
+                .filter(|item| {
+                    matches!(&item.body, ItemBody::AsyncQuestions { questions, .. } if questions.iter().any(|q| q.selected.is_none()))
+                })
+                .max_by_key(|item| item.seq),
+        };
+        let Some(item) = item else {
+            return;
+        };
+        let ItemBody::AsyncQuestions { questions, .. } = &item.body else {
+            return;
+        };
+        let Some(question) = action
+            .question
+            .or_else(|| questions.iter().position(|q| q.selected.is_none()))
+        else {
+            return;
+        };
+        let option = action.option.unwrap_or(0);
+        if questions
+            .get(question)
+            .is_none_or(|q| q.selected.is_some() || option >= q.options.len())
+        {
+            return;
+        }
+        self.send_command(
+            Command::ChooseAsyncOption {
+                item: item.id,
+                question,
+                option,
+            },
+            window,
+            cx,
+        );
+    }
     fn send_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(test)]
         if let Command::ArchiveThread {
@@ -1808,6 +1858,11 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
             .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
+            .on_action(
+                cx.listener(|shell, action: &ChooseAsyncOption, window, cx| {
+                    shell.choose_async_option(action, window, cx)
+                }),
+            )
             .on_action(cx.listener(|shell, action: &Stop, window, cx| {
                 shell.stop(action.target.or(shell.rendered_stop), window, cx)
             }))
@@ -3323,6 +3378,7 @@ mod tests {
                         target: ApprovalTarget::Command {
                             command: command.clone(),
                             cwd: Default::default(),
+                            reason: None,
                             preview: ApprovalPreview::new("argument preview\n".repeat(200)),
                         },
                     },
@@ -3422,6 +3478,7 @@ mod tests {
                         target: ApprovalTarget::Command {
                             command: command.into(),
                             cwd: Default::default(),
+                            reason: None,
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -3448,6 +3505,7 @@ mod tests {
                         target: ApprovalTarget::Command {
                             command: "echo ok".into(),
                             cwd: Default::default(),
+                            reason: None,
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -3489,6 +3547,7 @@ mod tests {
                             target: ApprovalTarget::Command {
                                 command: "echo ok".into(),
                                 cwd: Default::default(),
+                                reason: None,
                                 preview: ApprovalPreview::new(String::new()),
                             },
                         },
@@ -3551,6 +3610,7 @@ mod tests {
                         target: ApprovalTarget::Command {
                             command: "touch veyra-check.txt".into(),
                             cwd: Default::default(),
+                            reason: None,
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -4412,6 +4472,7 @@ mod tests {
                         target: ApprovalTarget::Command {
                             command: "touch request-a".into(),
                             cwd: Default::default(),
+                            reason: None,
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -4457,6 +4518,7 @@ mod tests {
                         target: ApprovalTarget::Command {
                             command: "touch request-b".into(),
                             cwd: Default::default(),
+                            reason: None,
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -4488,6 +4550,7 @@ mod tests {
                             target: ApprovalTarget::Command {
                                 command: "echo exact".into(),
                                 cwd: Default::default(),
+                                reason: None,
                                 preview: ApprovalPreview::new(String::new()),
                             },
                         },

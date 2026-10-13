@@ -15,6 +15,7 @@ pub(super) fn approval(f: &mut Fixture, tool: &str, command: &str) -> RequestId 
                     target: ApprovalTarget::Command {
                         command: command.into(),
                         cwd: Default::default(),
+                        reason: None,
                         preview: ApprovalPreview::new(String::new()),
                     },
                 },

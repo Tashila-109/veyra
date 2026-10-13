@@ -10,7 +10,8 @@ The engine never depends on gpui.
 
 Claude and Codex sessions, readiness probes, replay fixtures and debug recording are implemented.
 Grok has placeholder readiness and no codec.
-Claude and Codex approvals and questions reach the same window dock, whose actions send typed decisions through the engine.
+Claude and Codex server approvals and questions reach the same window dock, whose actions send typed decisions through the engine.
+Codex async agent-message questions instead become persistent transcript cards whose option actions send ordinary user messages.
 Exact thread grants and deny/cancel replies are persisted before their provider controls run, except on storage-blocked and blocked-shutdown paths where cancellation precedes stored expiry.
 Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
 The window owns render and event-batch counters.
@@ -470,6 +471,12 @@ Other resume failures keep that id and fail without starting a replacement conve
 Every turn/start sends the current model, effort, summary auto, reviewer user, approvalPolicy and sandboxPolicy.
 Ask first sends untrusted, read-only and readOnly with networkAccess true; Accept edits sends on-request, workspace-write and workspaceWrite with networkAccess true.
 Full access sends never, danger-full-access and dangerFullAccess without a networkAccess field.
+For Accept edits, the session resolves git through its prepared login PATH and runs `git rev-parse --git-dir --git-common-dir` once per app-server spawn, in the project folder.
+The child uses the shared launch gate, owned process group and cleanup supervisor; another launch check after discovery prevents a queued Shutdown from starting the provider.
+The implementation bounds discovery to one second and 8 KiB of stdout, which admits two ordinary paths while bounding latency and memory.
+It canonicalizes and validates both directories, deduplicates a plain repository's identical paths, and retains the resulting roots only for that spawn.
+Every workspaceWrite turn policy adds these roots while keeping networkAccess true; Ask first and Full access neither discover nor add roots.
+A missing git, a folder outside git, malformed output or any discovery failure adds no roots and logs one reason without paths or stdout.
 The codec reads thread reply metadata without interpreting the echoed sandbox as a string.
 The turn/start reply is Accepted; notifications received before it are buffered and then correlated to the returned native turn id.
 A valid own-thread request before that reply attaches to the Veyra turn being started and docks immediately, so a server waiting for consent can progress.
@@ -479,6 +486,10 @@ Another thread's requests are refused without docking, and a start reply that ch
 The matching turn/completed ends that turn even before turn/started, and a completed native id cannot reopen work.
 Another native turn on this conversation can open a separately announced Provider turn; another thread id is filtered before turn routing.
 Thread status, token usage, hooks, startup status and unknown notifications do not mark work or add notices.
+Own-thread turn completion reconciles its typed item summary by native item key, supplying a final reply absent from individual frames without duplicating already completed or streamed items.
+Foreign-thread items and turn summaries are filtered before reconciliation.
+Parent collabAgentToolCall rows use a typed action to label wait, spawn, send, resume or stop in Veyra's words.
+subAgentActivity is ignored: it duplicates native subagent lifecycle bookkeeping and supplies neither a Veyra family task nor parent tool output.
 Retrying errors add Veyra notice text without displaying raw provider details.
 Codex usage-limit frames add a notice only for a known rateLimitReachedType, spendControlReached true, or primary or secondary usedPercent reaching 90.
 Null, false and unknown reached kinds do not count as a reached limit.
@@ -489,9 +500,19 @@ The notice includes the selected window's reset timestamp, or the individual spe
 
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
+The project-cwd consequence names the working folder, and a supplied reason becomes a bounded ApprovalPreview displayed beside the consequence; the existing outside-cwd text remains.
 Only the exact project cwd may use the existing command grant; every other cwd requires a human decision.
 Permissions approvals grant the requested profile for the turn, while Deny and Stop send an empty permissions object.
 Questions retain provider question ids and send answers by those ids; cancellation sends an empty answers object.
+AgentMessage delivery and question fields are typed separately from server requests.
+A valid async questions list becomes ItemBody::AsyncQuestions with the original message text and each title, option list and optional selected index; SQLite's existing item JSON stores that additive shape without a migration.
+The transcript displays a card for each question, labels each option with its text, and explains that choosing sends a message and first stops active work.
+ChooseAsyncOption is a gpui action, bound to Command-1 through Command-9 and reachable through the debug driver; the engine validates its item, question and option identity and refuses a repeated choice.
+One transaction persists the selected index and ordinary User turn.
+If work is active, the choice uses the normal targeted Stop cancellation/interrupt path with a QuestionChoice reason, clears any hold and puts the answer ahead of already queued messages while preserving their order.
+Turn ordinal updates are applied descending before that insertion to retain SQLite's per-thread uniqueness constraint.
+The active session drains before the new prompt is sent; this choice never requires Continue.
+The question stays in the transcript with Sent text and disabled option controls after its selection.
 An MCP elicitation is classified by codex_approval_kind first, then by a message naming serverName and a quoted or unquoted tool with an optional question mark.
 It docks with the server and tool, offers no thread grant, and answers only action accept, decline or cancel without persisting provider grant metadata.
 Other MCP forms are declined with a notice, and unsupported server requests get -32601.
@@ -516,7 +537,8 @@ It reads VEYRA_SOCKET for the connection path and writes no token-bearing file.
 When stdin ends, the relay shuts down both socket directions and returns even when a socket write or stdout write is blocked.
 This also ends a Codex relay in its separate process group when the app-server closes or dies.
 A live native-binary codex-cli 0.162.1 run with a stand-in stdio server measured the direct-child, own-group shape and exit on stdin closure.
-No live run has yet started the production Veyra relay from Codex.
+A live Codex 0.162.1 run at daf400c has since reached the production Veyra relay in Ask first and Full access, with accepted connections and list_providers results.
+Its measured relay parent was the registered app-server pid, and each relay had its own group.
 Authentication still requires that direct-parent shape; an intermediate process is refused.
 The relay starts no window, takes no instance lock and emits no protocol diagnostics to stdout.
 McpToken contains 32 platform-random bytes encoded for the environment, and Debug prints McpToken(***).
@@ -549,7 +571,9 @@ A live Claude 2.1.296 run measured the relay starting directly, supporting the e
 That run observed system/init list veyra as connected with source dynamic after the first user message.
 The same run observed initialize instructions from the start and tool descriptions deferred until ToolSearch loaded their schemas.
 A CLI version that starts the relay through an intermediate process fails the direct-parent check; refusals are logged and the server stays unavailable.
-Instructions therefore contain the complete first-call rules, and each tool description also teaches its own common rule.
+Instructions retain the complete first-call rules byte for byte.
+Every tool description repeats that complete instruction text, keeping the existing descriptions-covered-by-instructions contract while exposing all rules before a Codex call: ownership, depth one, four open children, sixteen total family threads, the permission ceiling, prompt and report caps, idempotent request ids and report wakes after the current turn ends without polling.
+A live Codex 0.162.1 run did not expose server instructions to the model, so descriptions supply those rules before its first call.
 Configuration uses platform::private_dir and platform::private_file to write the sole token-bearing file, 0600 DATA/run/THREAD/mcp.json under a 0700 folder.
 Its mcpServers.veyra entry names the relay command, mcp argument and env bindings VEYRA_SOCKET and VEYRA_MCP_TOKEN.
 Its system_init handler removes the file when veyra is listed with any status, logs a non-connected report with its thread id, and Drop removes it if the session ends first.

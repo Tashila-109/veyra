@@ -98,6 +98,18 @@ pub struct AnswerQuestion {
     pub question: Option<usize>,
     pub option: Option<usize>,
 }
+#[derive(
+    Clone, Default, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action,
+)]
+#[serde(default)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct ChooseAsyncOption {
+    #[schemars(with = "Option<String>")]
+    pub item: Option<ItemId>,
+    pub question: Option<usize>,
+    pub option: Option<usize>,
+}
 choice_action!(SelectProject, project, ProjectId);
 choice_action!(ToggleItem, item, ItemId);
 #[cfg(debug_assertions)]
@@ -204,6 +216,15 @@ pub fn bindings() -> Vec<Binding> {
         binding!(AnswerQuestion, "7", Some("VeyraDock"), option: 6),
         binding!(AnswerQuestion, "8", Some("VeyraDock"), option: 7),
         binding!(AnswerQuestion, "9", Some("VeyraDock"), option: 8),
+        binding!(ChooseAsyncOption, "secondary-1", Some("Veyra"), option: 0),
+        binding!(ChooseAsyncOption, "secondary-2", Some("Veyra"), option: 1),
+        binding!(ChooseAsyncOption, "secondary-3", Some("Veyra"), option: 2),
+        binding!(ChooseAsyncOption, "secondary-4", Some("Veyra"), option: 3),
+        binding!(ChooseAsyncOption, "secondary-5", Some("Veyra"), option: 4),
+        binding!(ChooseAsyncOption, "secondary-6", Some("Veyra"), option: 5),
+        binding!(ChooseAsyncOption, "secondary-7", Some("Veyra"), option: 6),
+        binding!(ChooseAsyncOption, "secondary-8", Some("Veyra"), option: 7),
+        binding!(ChooseAsyncOption, "secondary-9", Some("Veyra"), option: 8),
     ]
 }
 pub fn shortcut<A: Action + Default>() -> Option<String> {

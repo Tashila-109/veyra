@@ -1180,6 +1180,33 @@ impl Actor {
                     c.items.insert(item.id, item);
                 }
             }
+            TurnEvent::AsyncQuestions {
+                key,
+                text,
+                questions,
+            } => {
+                let index = (thread, epoch, turn.id, key);
+                if let Some(id) = self.item_keys.get(&index) {
+                    if let Some(mut item) = self.projection.items.get(id).cloned()
+                        && matches!(item.body, ItemBody::AssistantText { .. })
+                    {
+                        self.buffers.remove(id);
+                        item.body = ItemBody::AsyncQuestions { text, questions };
+                        c.events.push(Ev::ItemAdded(item.clone()));
+                        c.items.insert(item.id, item);
+                    }
+                } else {
+                    let item = Item {
+                        id: ItemId::new(),
+                        thread,
+                        turn: turn.id,
+                        seq: 0,
+                        body: ItemBody::AsyncQuestions { text, questions },
+                    };
+                    self.item_keys.insert(index, item.id);
+                    commands::add_item(&self.projection, c, item);
+                }
+            }
             TurnEvent::ToolStarted { key, call } => {
                 let item = Item {
                     id: ItemId::new(),
@@ -1649,6 +1676,7 @@ impl Actor {
             let kind = match &item.body {
                 ItemBody::UserText(_) => "user text",
                 ItemBody::AssistantText { .. } => "assistant text",
+                ItemBody::AsyncQuestions { .. } => "question card",
                 ItemBody::Reasoning { .. } => "reasoning",
                 ItemBody::Tool(_) => "tool result",
                 ItemBody::Notice(_) => "provider notice",

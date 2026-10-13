@@ -167,13 +167,29 @@ pub struct Item {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemBody {
     UserText(String),
-    AssistantText { text: String, done: bool },
-    Reasoning { text: String, done: bool },
+    AssistantText {
+        text: String,
+        done: bool,
+    },
+    AsyncQuestions {
+        text: String,
+        questions: Vec<AsyncQuestion>,
+    },
+    Reasoning {
+        text: String,
+        done: bool,
+    },
     Tool(ToolItem),
     Plan(Vec<PlanStep>),
     Notice(Notice),
     TaskCard(TaskId),
     TerminalSpan(TerminalSpan),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncQuestion {
+    pub title: String,
+    pub options: Vec<String>,
+    pub selected: Option<usize>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -271,6 +287,8 @@ pub enum ApprovalTarget {
         command: String,
         #[serde(default)]
         cwd: CommandCwd,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<ApprovalPreview>,
         preview: ApprovalPreview,
     },
     File {
@@ -360,6 +378,7 @@ impl<'de> Deserialize<'de> for ProposedAction {
                     ApprovalTarget::Command {
                         command,
                         cwd: Default::default(),
+                        reason: None,
                         preview: ApprovalPreview::new(String::new()),
                     }
                 };

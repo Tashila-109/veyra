@@ -231,6 +231,7 @@ struct Item {
     streamed: bool,
     started: bool,
     output: String,
+    question_card: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InterruptRequest {
@@ -294,6 +295,7 @@ impl TurnBinding {
 pub(crate) struct Codec {
     peer: Peer<Call>,
     spec: SessionSpec,
+    writable_roots: Vec<std::path::PathBuf>,
     mcp: Option<std::sync::Arc<McpConfig>>,
     pid: u32,
     conversation: Conversation,
@@ -317,6 +319,7 @@ impl Codec {
                 retry: None,
             },
             spec,
+            writable_roots: Vec::new(),
             pid,
             mcp,
             peer: Peer::new(false),
@@ -331,6 +334,10 @@ impl Codec {
     }
     pub(crate) fn initialize(&mut self) -> Value {
         self.peer.send(Call::Initialize, "initialize", initialize())
+    }
+    pub(crate) fn with_workspace_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
+        self.writable_roots = roots;
+        self
     }
     pub(crate) fn native(&self) -> Option<&NativeSessionId> {
         self.conversation.native()
@@ -373,10 +380,14 @@ impl Codec {
             early: vec![],
         };
         self.interrupted = None;
+        let mut params = turn_params(&native, &self.spec.config, text);
+        if self.spec.config.mode == PermissionMode::AcceptEdits && !self.writable_roots.is_empty() {
+            params["sandboxPolicy"]["writableRoots"] = json!(self.writable_roots);
+        }
         Some(Outbound::Prompt(self.peer.send(
             Call::Start(turn),
             "turn/start",
-            turn_params(&native, &self.spec.config, text),
+            params,
         )))
     }
     pub(crate) fn value(&mut self, value: Value) -> Result<Decoded, ProviderError> {
@@ -715,6 +726,9 @@ impl Codec {
                 }
             }
             N::TurnCompleted { params } => {
+                for item in params.turn.items.as_ref().into_iter().flatten() {
+                    self.item(&id, item, true, &mut events);
+                }
                 let outcome = match params.turn.status {
                     wire::TurnStatus::Interrupted => TurnOutcome::Interrupted {
                         reason: "Stopped by Codex".into(),
@@ -755,7 +769,11 @@ impl Codec {
             | N::ReasoningDelta { params } => {
                 if let Some(item) = params.item_id.filter(|id| !id.is_empty()) {
                     let key = Self::key(&id, &item);
-                    self.items.entry(key.0.clone()).or_default().streamed = true;
+                    let state = self.items.entry(key.0.clone()).or_default();
+                    if state.question_card {
+                        return Ok(());
+                    }
+                    state.streamed = true;
                     let text = params.delta.unwrap_or_default();
                     events.push(if agent {
                         TurnEvent::TextDelta {
@@ -830,15 +848,50 @@ impl Codec {
         }
         state.finished = completed;
         match wire {
-            wire::Item::AgentMessage(message) if completed => {
-                if !state.streamed {
+            wire::Item::AgentMessage(message) => {
+                if matches!(message.delivery, Some(wire::AgentDelivery::Async))
+                    && !state.question_card
+                {
+                    let questions: Vec<_> = message
+                        .questions
+                        .as_ref()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|question| {
+                            let title = question
+                                .title
+                                .as_ref()
+                                .filter(|title| !title.trim().is_empty())?;
+                            let options = question.options.as_ref().filter(|options| {
+                                !options.is_empty()
+                                    && options.iter().all(|option| !option.trim().is_empty())
+                            })?;
+                            Some(AsyncQuestion {
+                                title: title.clone(),
+                                options: options.clone(),
+                                selected: None,
+                            })
+                        })
+                        .collect();
+                    if !questions.is_empty() {
+                        state.question_card = true;
+                        events.push(TurnEvent::AsyncQuestions {
+                            key: key.clone(),
+                            text: message.text.clone().unwrap_or_default(),
+                            questions,
+                        });
+                    }
+                }
+                if completed && !state.streamed && !state.question_card {
                     events.push(TurnEvent::TextDelta {
                         key: key.clone(),
                         text: message.text.clone().unwrap_or_default(),
                         streamed: false,
                     });
                 }
-                events.push(TurnEvent::ItemEnded { key });
+                if completed {
+                    events.push(TurnEvent::ItemEnded { key });
+                }
             }
             wire::Item::Reasoning(reasoning) if completed => {
                 if !state.streamed {
@@ -874,8 +927,22 @@ impl Codec {
                             call.arguments.clone().unwrap_or(Value::Null),
                             None,
                         ),
-                        wire::Item::CollabAgentToolCall(_) => (
-                            "collabAgentToolCall".into(),
+                        wire::Item::CollabAgentToolCall(call) => (
+                            match call.action {
+                                Some(wire::CollabAction::SpawnAgent) => "Start subagent",
+                                Some(wire::CollabAction::SendInput) => "Send to subagent",
+                                Some(wire::CollabAction::ResumeAgent) => "Resume subagent",
+                                Some(wire::CollabAction::Wait) => "Wait for subagent",
+                                Some(wire::CollabAction::CloseAgent) => "Close subagent",
+                                Some(wire::CollabAction::SendMessage) => {
+                                    "Send a message to subagent"
+                                }
+                                Some(wire::CollabAction::FollowupTask) => "Follow up with subagent",
+                                Some(wire::CollabAction::InterruptAgent) => "Stop subagent",
+                                Some(wire::CollabAction::ListAgents) => "List subagents",
+                                Some(wire::CollabAction::Unknown) | None => "Subagent work",
+                            }
+                            .into(),
                             serde_json::to_value(item).unwrap(),
                             None,
                         ),
@@ -994,6 +1061,7 @@ impl Codec {
                             target: ApprovalTarget::Command {
                                 command: text.into(),
                                 cwd: location,
+                                reason: command.reason.clone().map(ApprovalPreview::new),
                                 preview: preview(),
                             },
                         },
@@ -1796,6 +1864,53 @@ mod limit_tests {
             let mut codec = codec();
             assert_eq!(notice(&mut codec, reached), 1);
             assert_eq!(notice(&mut codec, json!({"primary":{"usedPercent":95}})), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod collaboration_tests {
+    use super::*;
+    #[test]
+    fn codex_collaboration_labels_name_the_action() {
+        for (action, expected) in [
+            ("wait", "Wait for subagent"),
+            ("spawnAgent", "Start subagent"),
+        ] {
+            let mut codec = Codec::new(
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: "/project".into(),
+                    config: ThreadConfig {
+                        mode: PermissionMode::FullAccess,
+                        model: None,
+                        effort: None,
+                    },
+                    native: None,
+                    import: false,
+                    root: false,
+                },
+                1,
+                None,
+            );
+            codec.initialize();
+            codec.value(json!({"id":1,"result":{}})).unwrap();
+            codec
+                .value(json!({"id":2,"result":{"thread":{"id":"native-thread"}}}))
+                .unwrap();
+            codec.start(TurnId::new(), "subagent".into()).unwrap();
+            codec
+                .value(json!({"id":3,"result":{"turn":{"id":"native-turn"}}}))
+                .unwrap();
+            let decoded=codec.value(json!({"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"collabAgentToolCall","id":"agent-call","tool":action,"status":"inProgress"}}})).unwrap();
+            let name = decoded.events.iter().find_map(|event| match event {
+                ProviderEvent::Turn {
+                    event: TurnEvent::ToolStarted { call, .. },
+                    ..
+                } => Some(call.name.as_str()),
+                _ => None,
+            });
+            assert_eq!(name, Some(expected));
         }
     }
 }

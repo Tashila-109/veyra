@@ -108,7 +108,6 @@ impl ProcessGroup {
     fn stdin(&mut self) -> Option<tokio::process::ChildStdin> {
         self.child.as_mut()?.stdin.take()
     }
-    #[cfg(test)]
     pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.as_mut().unwrap().wait().await
     }
@@ -283,14 +282,106 @@ impl SessionIo {
     }
 }
 
-fn launch(
+async fn codex_git_roots(
+    env: &ChildEnv,
+    cwd: &std::path::Path,
+    cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>,
+) -> Vec<std::path::PathBuf> {
+    use tokio::io::AsyncReadExt;
+    let result = async {
+        let binary = env.resolve_git().ok_or("git is not available")?;
+        let mut child = env
+            .spawn(
+                &binary,
+                &[
+                    "rev-parse".into(),
+                    "--git-dir".into(),
+                    "--git-common-dir".into(),
+                ],
+                cwd,
+                None,
+            )
+            .map_err(|_| "git could not start")?;
+        child.watch(cleanup);
+        drop(child.stdin());
+        let stdout = child.stdout().ok_or("git stdout is unavailable")?;
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut bytes = Vec::new();
+            stdout
+                .take(8193)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| "git output could not be read")?;
+            let status = child
+                .wait()
+                .await
+                .map_err(|_| "git could not be waited for")?;
+            if !status.success() {
+                return Err("git did not find repository metadata");
+            }
+            if bytes.len() > 8192 {
+                return Err("git output exceeded 8 KiB");
+            }
+            let text = std::str::from_utf8(&bytes).map_err(|_| "git output is not UTF-8")?;
+            if text.lines().any(str::is_empty) {
+                return Err("git returned an empty metadata path");
+            }
+            let paths = text
+                .lines()
+                .map(|path| {
+                    cwd.join(path)
+                        .canonicalize()
+                        .map_err(|_| "git metadata path is unavailable")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if paths.len() != 2 || paths.iter().any(|p| !p.is_dir()) {
+                return Err("git did not return two metadata folders");
+            }
+            let mut roots = Vec::new();
+            for path in paths {
+                if !roots.contains(&path) {
+                    roots.push(path);
+                }
+            }
+            Ok(roots)
+        })
+        .await;
+        if result.is_err() {
+            let _ = platform::signal_group(child.pid(), Signal::Kill);
+        }
+        child.stop().await.map_err(|_| "git cleanup failed")?;
+        result.map_err(|_| "git metadata check exceeded one second")?
+    }
+    .await;
+    match result {
+        Ok(roots) => roots,
+        Err(reason) => {
+            tracing::info!(
+                reason,
+                "Codex Git metadata is unavailable; no writable roots added"
+            );
+            Vec::new()
+        }
+    }
+}
+
+async fn launch(
     provider: ProviderKind,
     spec: &SessionSpec,
     env: &ChildEnv,
     fresh: Option<NativeSessionId>,
     session_epoch: u32,
+    before_spawn: impl FnOnce() -> Result<(), ProviderError>,
+    cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>,
 ) -> Result<Process, ProviderError> {
+    let roots =
+        if provider == ProviderKind::Codex && spec.config.mode == PermissionMode::AcceptEdits {
+            codex_git_roots(env, &spec.cwd, cleanup).await
+        } else {
+            Vec::new()
+        };
     let server = if spec.root { env.mcp.as_ref() } else { None };
+    before_spawn()?;
     match provider {
         ProviderKind::Claude => {
             let native = fresh
@@ -360,11 +451,10 @@ fn launch(
                         child.pid(),
                     ))
                 });
-                let codec = Codec::Codex(Box::new(codex::Codec::new(
-                    spec.clone(),
-                    child.pid(),
-                    config.clone(),
-                )));
+                let codec = Codec::Codex(Box::new(
+                    codex::Codec::new(spec.clone(), child.pid(), config.clone())
+                        .with_workspace_roots(roots),
+                ));
                 Ok((child, config.map(RootMcp::Codex), codec))
             },
         ),
@@ -500,9 +590,20 @@ fn start_provider_task(
         let mut process = match process {
             Some(process) => process,
             None => {
-                match receiver
-                    .drain_and_check_launch(&out)
-                    .and_then(|()| launch(provider, &spec, &env, None, epoch))
+                match async {
+                    receiver.drain_and_check_launch(&out)?;
+                    launch(
+                        provider,
+                        &spec,
+                        &env,
+                        None,
+                        epoch,
+                        || receiver.drain_and_check_launch(&out),
+                        &cleanup,
+                    )
+                    .await
+                }
+                .await
                 {
                     Ok(process) => process,
                     Err(error) => {
@@ -526,9 +627,20 @@ fn start_provider_task(
                 Completion::MissingSession => {
                     spec.native = None;
                     let native = NativeSessionId(ThreadId::new().to_string());
-                    match receiver
-                        .drain_and_check_launch(&out)
-                        .and_then(|()| launch(provider, &spec, &env, Some(native), epoch))
+                    match async {
+                        receiver.drain_and_check_launch(&out)?;
+                        launch(
+                            provider,
+                            &spec,
+                            &env,
+                            Some(native),
+                            epoch,
+                            || receiver.drain_and_check_launch(&out),
+                            &cleanup,
+                        )
+                        .await
+                    }
+                    .await
                     {
                         Ok(mut next) => {
                             next.io.child.watch(&cleanup);
@@ -2867,6 +2979,58 @@ mod availability_tests {
             })
             .await
             .unwrap();
+            assert!(env.groups.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod git_metadata_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn metadata_roots_are_bounded_validated_and_deduplicated() {
+        let root = std::path::PathBuf::from("/tmp")
+            .join(format!("veyra-m5r2-metadata-{}", ThreadId::new()));
+        std::fs::create_dir(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let binaries = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/git-metadata-{}", ThreadId::new()));
+        std::fs::create_dir_all(&binaries).unwrap();
+        let _binaries = crate::tests::Scratch(binaries.clone());
+        let git = binaries.join("git");
+        let (cleanup, mut pending) = mpsc::unbounded_channel();
+        let mut env = ChildEnv::isolated();
+        env.path = binaries.into_os_string();
+        assert!(codex_git_roots(&env, &root, &cleanup).await.is_empty());
+        std::fs::create_dir(root.join("metadata")).unwrap();
+        for (body, expected) in [
+            ("printf 'metadata\\nmetadata\\n'", 1),
+            ("printf 'metadata\\n'", 0),
+            ("printf 'missing\\nmissing\\n'", 0),
+            ("exit 1", 0),
+            ("/bin/sleep 10", 0),
+            ("/usr/bin/head -c 8193 /dev/zero", 0),
+        ] {
+            std::fs::write(&git, format!("#!/bin/sh\n{body}\n")).unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&git)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let start = std::time::Instant::now();
+            let roots = codex_git_roots(&env, &root, &cleanup).await;
+            assert_eq!(roots.len(), expected, "{body}");
+            assert!(start.elapsed() < Duration::from_secs(3));
+            if let Some(path) = roots.first() {
+                assert_eq!(*path, root.join("metadata").canonicalize().unwrap());
+            }
+            while let Ok(done) = pending.try_recv() {
+                let _ = done.await;
+            }
             assert!(env.groups.lock().unwrap().is_empty());
         }
     }

@@ -345,3 +345,6 @@ Approvals, questions and Stop are covered by their feature pages.
 A streamed row may complete before the turn ends; the header remains Working until the result.
 Open Terminal and native mouse/keyboard entry points remain manual checks.
 Update Status from candidate acceptance.
+
+A Codex command that runs as a later call in the same turn can arrive with no `item/*` frames.
+Such a command has no tool row; Veyra renders the frames Codex supplies.

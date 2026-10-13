@@ -210,6 +210,9 @@ impl ChildEnv {
         platform::own_group(&mut cmd);
         cmd
     }
+    pub(crate) fn resolve_git(&self) -> Option<PathBuf> {
+        resolve_from_dirs("git", std::env::split_paths(&self.path))
+    }
     pub(crate) fn spawn(
         &self,
         binary: &Path,

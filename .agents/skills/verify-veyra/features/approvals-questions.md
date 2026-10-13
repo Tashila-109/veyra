@@ -210,7 +210,8 @@ thread = create_codex('codex-command',scenario='approval-command')
 dump = poll('codex-command',lambda d:d['composer']['dock'] is not None)
 dock = dump['composer']['dock']
 assert dock['action_text']=='touch veyra-check.txt' and dump['selected_thread']['status']=='NeedsYou'
-assert dock['consequence']=='Codex will run this command in the project folder.'
+assert dock['consequence']=='Codex will use the project folder as its working folder.\nCodex\'s reason: Create the requested file'
+assert dock['request']['kind']['Approval']['action']['target']['reason']=={'text':'Create the requested file','truncated':False}
 capture('codex-command')
 action('codex-command-once','AllowOnce',{'request':dock['request']['id']})
 ctl('codex-command-done','wait',thread,'Done')
@@ -232,7 +233,7 @@ capture('codex-grant-in-project')
 action('codex-grant-project','AllowInThread',{'request':first['request']['id']})
 other = poll('codex-command-other-cwd',lambda d:d['composer']['dock'] is not None and d['composer']['dock']['request']['id']!=first['request']['id'])['composer']['dock']
 assert other['action_text']=='touch veyra-check.txt'
-assert other['consequence']=='Codex will run this command in '+str(DATA/'outside')+'.'
+assert other['consequence']=='Codex will run this command in '+str(DATA/'outside')+'.\nCodex\'s reason: Create the requested file'
 assert other['request']['kind']['Approval']['grant_key'] is None
 assert other['request']['kind']['Approval']['action']['target']['cwd']=={'directory':str(DATA/'outside')}
 capture('codex-command-other-cwd')
@@ -272,6 +273,35 @@ ctl('codex-mcp-done','wait',thread,'Done')
 assert sql("select count(*) from requests where thread_id='"+thread+"' and state='answered'")=='2'
 assert sql("select count(*) from grants where thread_id='"+thread+"'")=='0'
 assert [json.loads(value) for value in sql("select decision_json from requests where thread_id='"+thread+"' order by rowid").splitlines()]==['AllowOnce','Deny']
+poll('codex-before-card-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+stage_records(codex_records('async-question'))
+action('codex-card-new','NewThread')
+action('codex-card-provider','PickProvider',{'provider':'codex'})
+action('codex-card-mode','PickPermission',{'mode':'full_access'})
+ctl('codex-card-prompt','text','Which colour should Veyra use?')
+ctl('codex-card-send','keys','secondary-enter')
+card = poll('codex-card-ready',lambda d:d['selected_thread'] is not None
+    and any(item['kind']=='async_questions' for item in d['transcript']['items'])
+    and d['composer']['dock'] is not None)
+thread = card['selected_thread']['id']
+question = next(item for item in card['transcript']['items'] if item['kind']=='async_questions')
+assert question['body']['AsyncQuestions']['questions'][0] == {'title':'Should Veyra use Violet or Blue?','options':['Violet','Blue'],'selected':None}
+capture('codex-async-question')
+action('codex-card-choice','ChooseAsyncOption',{'item':question['id'],'question':0,'option':0})
+chosen = ctl('codex-card-done','wait',thread,'Done')
+assert chosen['composer']['dock'] is None
+assert sql("select coalesce(hold_reason,'none') from threads where id='"+thread+"'")=='none'
+assert sql("select count(*) from turns where thread_id='"+thread+"'")=='2'
+assert all('User' in json.loads(row) for row in sql("select origin_json from turns where thread_id='"+thread+"'").splitlines())
+assert sql("select count(*) from requests where thread_id='"+thread+"' and state='expired'")=='1'
+assert any(item['kind']=='user' and item['text']=='Violet' for item in chosen['transcript']['items'])
+answered = next(item for item in chosen['transcript']['items'] if item['id']==question['id'])
+assert answered['body']['AsyncQuestions']['questions'][0]['selected']==0
+assert answered['text']==question['text']
+capture('codex-async-question-chosen')
+action('codex-card-repeat','ChooseAsyncOption',{'item':question['id'],'question':0,'option':1})
+ctl('codex-card-repeat-key','keys','secondary-2')
+assert sql("select count(*) from turns where thread_id='"+thread+"'")=='2'
 poll('codex-approvals-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
 action('codex-approvals-return-new','NewThread')
 action('codex-approvals-return-claude','PickProvider',{'provider':'claude'})
@@ -286,6 +316,9 @@ The Codex section checks `composer.dock.action_text`, `consequence`, `request.ki
 A grant in the project permits the identical command there; the same command in another directory docks, names that directory and is denied.
 SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
 File and permission denials, the Violet answer and both MCP decisions are persisted.
+The async-question PNG shows the title, Violet and Blue controls and the choice consequence.
+The chosen PNG retains the question, shows Sent Violet and disables both controls.
+The strict fixture requires its pending request cancellation before interrupt and Violet as ordinary user input; SQLite records two User turns, the expired request and no hold.
 Both MCP PNGs name `veyra / list_providers` and show Deny and Allow once without a thread grant.
 
 The unfocused approval PNGs show the exact command, consequence and FocusDock chord.

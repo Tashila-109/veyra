@@ -221,6 +221,47 @@ fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) ->
                 .plugin(ReplyLineBreaks),
             );
         }
+        ItemBody::AsyncQuestions { questions, .. } => {
+            for (question_index, question) in questions.iter().enumerate() {
+                let mut card = div().v_flex().w_full().gap(t.space.0[3])
+                    .rounded(t.radius.large).bg(t.colors.card).p(t.space.0[4])
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(question.title.clone()))
+                    .child(div().text_size(t.text.label.size).text_color(t.colors.text_muted)
+                        .child("Choosing sends this option as a message. Veyra stops current work first if needed."));
+                for (option_index, option) in question.options.iter().enumerate() {
+                    let action = ChooseAsyncOption {
+                        item: Some(item.id),
+                        question: Some(question_index),
+                        option: Some(option_index),
+                    };
+                    card = card.child(
+                        labelled_button(
+                            SharedString::from(format!(
+                                "async-{}-{question_index}-{option_index}",
+                                item.id
+                            )),
+                            option.clone(),
+                            cx,
+                        )
+                        .disabled(question.selected.is_some())
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(action.clone()), cx)
+                        }),
+                    );
+                }
+                if let Some(selected) = question
+                    .selected
+                    .and_then(|index| question.options.get(index))
+                {
+                    card = card.child(
+                        div()
+                            .text_color(t.colors.text_muted)
+                            .child(format!("Sent: {selected}")),
+                    );
+                }
+                row = row.child(card);
+            }
+        }
         ItemBody::Reasoning { .. } => {
             let id = item.id;
             row = row
@@ -710,6 +751,7 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
     let (kind, text, done) = match &item.body {
         ItemBody::UserText(text) => ("user", text.clone(), true),
         ItemBody::AssistantText { text, done } => ("assistant", text.clone(), *done),
+        ItemBody::AsyncQuestions { text, .. } => ("async_questions", text.clone(), true),
         ItemBody::Reasoning { text, done } => ("reasoning", text.clone(), *done),
         ItemBody::Tool(tool) => (
             "tool",

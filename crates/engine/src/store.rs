@@ -146,7 +146,9 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
             ],
         )?;
     }
-    for t in c.turns.values() {
+    let mut turns: Vec<_> = c.turns.values().collect();
+    turns.sort_by_key(|turn| std::cmp::Reverse(turn.ordinal));
+    for t in turns {
         let (state, start, end, outcome) = match &t.state {
             TurnState::Queued => ("queued", None, None, None),
             TurnState::Running { since } => ("running", Some(*since), None, None),
@@ -159,7 +161,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         tx.execute(
             "INSERT INTO turns(id,thread_id,ordinal,origin_json,state,outcome_json,queued_at,
              started_at,ended_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(id) DO UPDATE SET origin_json=excluded.origin_json,state=excluded.state,
+             ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal,origin_json=excluded.origin_json,state=excluded.state,
              outcome_json=excluded.outcome_json,started_at=CASE WHEN excluded.state='queued' THEN turns.started_at ELSE excluded.started_at END,
              ended_at=excluded.ended_at",
             params![
@@ -179,6 +181,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         let (kind, done) = match &i.body {
             ItemBody::UserText(_) => ("user_text", true),
             ItemBody::AssistantText { done, .. } => ("assistant_text", *done),
+            ItemBody::AsyncQuestions { .. } => ("async_questions", true),
             ItemBody::Reasoning { done, .. } => ("reasoning", *done),
             ItemBody::Tool(t) => ("tool", t.result.is_some()),
             ItemBody::Plan(_) => ("plan", true),
@@ -189,7 +192,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         tx.execute(
             "INSERT INTO items(id,thread_id,turn_id,seq,kind,body_json,done)
              VALUES(?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(id) DO UPDATE SET body_json=excluded.body_json,done=excluded.done",
+             ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,body_json=excluded.body_json,done=excluded.done",
             params![
                 i.id.to_string(),
                 i.thread.to_string(),

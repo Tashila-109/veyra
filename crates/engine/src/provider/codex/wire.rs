@@ -148,6 +148,7 @@ pub(super) struct Turn {
     pub id: Option<String>,
     pub status: TurnStatus,
     pub error: Option<Failure>,
+    pub items: Option<Vec<Item>>,
 }
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -194,7 +195,7 @@ pub(super) enum Item {
     CommandExecution(CommandExecution),
     FileChange(FileChange),
     McpToolCall(McpToolCall),
-    CollabAgentToolCall(Tool),
+    CollabAgentToolCall(CollabAgentCall),
     WebSearch(Tool),
     ImageView(Tool),
     #[default]
@@ -206,6 +207,44 @@ pub(super) enum Item {
 pub(super) struct AgentMessage {
     pub id: Option<String>,
     pub text: Option<String>,
+    pub delivery: Option<AgentDelivery>,
+    pub questions: Option<Vec<AsyncQuestion>>,
+}
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AgentDelivery {
+    Async,
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(super) struct AsyncQuestion {
+    pub title: Option<String>,
+    pub options: Option<Vec<String>>,
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(super) struct CollabAgentCall {
+    #[serde(flatten)]
+    pub tool_data: Tool,
+    #[serde(rename = "tool")]
+    pub action: Option<CollabAction>,
+}
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum CollabAction {
+    SpawnAgent,
+    SendInput,
+    ResumeAgent,
+    Wait,
+    CloseAgent,
+    SendMessage,
+    FollowupTask,
+    InterruptAgent,
+    ListAgents,
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -268,9 +307,8 @@ impl Item {
             Self::CommandExecution(p) => p.tool.id.as_deref(),
             Self::FileChange(p) => p.tool.id.as_deref(),
             Self::McpToolCall(p) => p.tool.id.as_deref(),
-            Self::CollabAgentToolCall(p) | Self::WebSearch(p) | Self::ImageView(p) => {
-                p.id.as_deref()
-            }
+            Self::CollabAgentToolCall(p) => p.tool_data.id.as_deref(),
+            Self::WebSearch(p) | Self::ImageView(p) => p.id.as_deref(),
             Self::Unknown => None,
         }
     }
@@ -279,7 +317,8 @@ impl Item {
             Self::CommandExecution(p) => Some(&p.tool),
             Self::FileChange(p) => Some(&p.tool),
             Self::McpToolCall(p) => Some(&p.tool),
-            Self::CollabAgentToolCall(p) | Self::WebSearch(p) | Self::ImageView(p) => Some(p),
+            Self::CollabAgentToolCall(p) => Some(&p.tool_data),
+            Self::WebSearch(p) | Self::ImageView(p) => Some(p),
             _ => None,
         }
     }
@@ -334,6 +373,7 @@ pub(super) struct CommandApproval {
     pub scope: Scope,
     pub command: Option<String>,
     pub cwd: Option<String>,
+    pub reason: Option<String>,
 }
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]

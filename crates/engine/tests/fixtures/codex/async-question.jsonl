@@ -1,0 +1,23 @@
+{"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.162.1", "scenario": "async-question", "source": "Veyra live recordings converted with masked values; stable-schema cancel and answer continuation"}
+{"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}}}}
+{"type": "emit_inbound", "line": {"id": "<id:initialize>", "result": {"userAgent": "veyra/0.161.0"}}}
+{"type": "expect_outbound", "line": {"method": "initialized"}}
+{"type": "expect_outbound", "line": {"id": "<id:thread_request>", "method": "thread/start", "params": {"cwd": "<cwd>", "model": "<any>", "approvalPolicy": "never", "sandbox": "danger-full-access", "approvalsReviewer": "user"}}}
+{"type": "emit_inbound", "line": {"id": "<id:thread_request>", "result": {"thread": {"id": "native-thread", "cliVersion": "0.162.1"}}}}
+{"type": "expect_outbound", "line": {"id": "<id:turn_request>", "method": "turn/start", "params": {"threadId": "<id:session>", "input": [{"type": "text", "text": "<any>", "text_elements": []}], "model": "<any>", "effort": "<any>", "summary": "auto", "approvalPolicy": "never", "approvalsReviewer": "user", "sandboxPolicy": {"type": "dangerFullAccess"}}}}
+{"type": "emit_inbound", "line": {"id": "<id:turn_request>", "result": {"turn": {"id": "native-turn", "status": "inProgress", "items": [], "error": null}}}}
+{"type": "emit_inbound", "line": {"method": "turn/started", "params": {"threadId": "<id:session>", "turn": {"id": "native-turn", "items": [], "itemsView": "notLoaded", "status": "inProgress", "error": null, "startedAt": 1791442959, "completedAt": null, "durationMs": null}}}}
+{"type": "emit_inbound", "line": {"method": "item/started", "params": {"item": {"type": "agentMessage", "id": "async-color-question", "text": "Should Veyra use Violet or Blue?\n- Violet\n- Blue", "phase": "final_answer", "memoryCitation": null, "delivery": "async", "questions": [{"title": "Should Veyra use Violet or Blue?", "options": ["Violet", "Blue"]}]}, "threadId": "native-thread", "turnId": "native-turn", "startedAtMs": 1791930094510}, "emittedAtMs": 1791930094511}}
+{"type": "emit_inbound", "line": {"method": "item/completed", "params": {"item": {"type": "agentMessage", "id": "async-color-question", "text": "Should Veyra use Violet or Blue?\n- Violet\n- Blue", "phase": "final_answer", "memoryCitation": null, "delivery": "async", "questions": [{"title": "Should Veyra use Violet or Blue?", "options": ["Violet", "Blue"]}]}, "threadId": "native-thread", "turnId": "native-turn", "completedAtMs": 1791930094510}, "emittedAtMs": 1791930094512}}
+{"type": "emit_inbound", "line": {"method": "item/started", "params": {"item": {"type": "sleep", "id": "waiting-for-choice", "durationMs": 60000}, "threadId": "native-thread", "turnId": "native-turn", "startedAtMs": 1791928919320}, "emittedAtMs": 1791928919320}}
+{"type": "emit_inbound", "line": {"id": 0, "method": "item/commandExecution/requestApproval", "params": {"threadId": "native-thread", "turnId": "native-turn", "command": "echo card", "cwd": "<cwd>"}}}
+{"type": "expect_outbound", "line": {"id": 0, "result": {"decision": "cancel"}}}
+{"type": "expect_outbound", "line": {"id": "<id:interrupt>", "method": "turn/interrupt", "params": {"threadId": "native-thread", "turnId": "native-turn"}}}
+{"type": "emit_inbound", "line": {"id": "<id:interrupt>", "result": {}}}
+{"type": "emit_inbound", "line": {"method": "turn/completed", "params": {"threadId": "native-thread", "turn": {"id": "native-turn", "status": "interrupted"}}}}
+{"type": "expect_outbound", "line": {"id": "<id:choice>", "method": "turn/start", "params": {"threadId": "<id:session>", "input": [{"type": "text", "text": "Violet", "text_elements": []}], "model": "<any>", "effort": "<any>", "summary": "auto", "approvalPolicy": "never", "approvalsReviewer": "user", "sandboxPolicy": {"type": "dangerFullAccess"}}}}
+{"type": "emit_inbound", "line": {"id": "<id:choice>", "result": {"turn": {"id": "answer-turn", "status": "inProgress"}}}}
+{"type": "emit_inbound", "line": {"method": "turn/started", "params": {"threadId": "native-thread", "turn": {"id": "answer-turn", "status": "inProgress"}}}}
+{"type": "emit_inbound", "line": {"method": "item/completed", "params": {"threadId": "native-thread", "turnId": "answer-turn", "item": {"type": "agentMessage", "id": "answer-message", "text": "Violet", "delivery": null, "questions": null}}}}
+{"type": "emit_inbound", "line": {"method": "turn/completed", "params": {"threadId": "native-thread", "turn": {"id": "answer-turn", "status": "completed"}}}}
+{"type": "exit", "code": 0}

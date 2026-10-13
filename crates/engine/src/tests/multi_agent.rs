@@ -871,6 +871,7 @@ fn get_task_status_matches_window() {
                             target: ApprovalTarget::Command {
                                 command: "echo status".into(),
                                 cwd: Default::default(),
+                                reason: None,
                                 preview: ApprovalPreview::new(String::new()),
                             },
                         },

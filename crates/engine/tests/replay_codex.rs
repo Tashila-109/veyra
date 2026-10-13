@@ -89,7 +89,7 @@ fn replay(
                 ProviderKind::Codex,
                 SessionSpec {
                     thread,
-                    cwd: std::env::current_dir().unwrap(),
+                    cwd: scratch.0.canonicalize().unwrap(),
                     config: ThreadConfig {
                         model: Some("veyra-model".into()),
                         effort: Some("medium".into()),
@@ -899,4 +899,293 @@ fn codex_repeated_near_limit_adds_one_notice() {
         1
     );
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+
+#[test]
+fn codex_accept_edits_adds_linked_worktree_git_roots() {
+    use serde_json::{Value, json};
+    let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir", "--git-common-dir"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let mut roots: Vec<_> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|p| project.join(p).canonicalize().unwrap())
+        .collect();
+    assert_eq!(roots.len(), 2);
+    if roots[0] == roots[1] {
+        roots.pop();
+    }
+    let root = Path::new("/tmp").join(format!("veyra-m5r2-policy-{}", ThreadId::new()));
+    fs::create_dir(&root).unwrap();
+    let _scratch = Scratch(root.clone());
+    let mut records: Vec<Value> = fs::read_to_string(fixture("ok-reply"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for record in &mut records {
+        if record["type"] == "expect_outbound"
+            && matches!(
+                record["line"]["method"].as_str(),
+                Some("thread/start" | "turn/start")
+            )
+        {
+            record["line"]["params"]["approvalPolicy"] = json!("on-request");
+            if record["line"]["method"] == "thread/start" {
+                record["line"]["params"]["sandbox"] = json!("workspace-write");
+            } else {
+                record["line"]["params"]["sandboxPolicy"] =
+                    json!({"type":"workspaceWrite","networkAccess":true,"writableRoots":roots});
+            }
+        }
+    }
+    fs::write(
+        root.join("t1-s1.jsonl"),
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let mut env = ChildEnv::isolated().with_binary(
+        ProviderKind::Codex,
+        env!("CARGO_BIN_EXE_veyra-fake-cli").into(),
+    );
+    env.fixtures = Some(root);
+    Runtime::new().unwrap().block_on(async {
+        let (out, mut events) = mpsc::channel(256);
+        let turn = TurnId::new();
+        let handle = Spawner::Cli(Box::new(env))
+            .spawn(
+                ProviderKind::Codex,
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: project,
+                    config: ThreadConfig {
+                        mode: PermissionMode::AcceptEdits,
+                        model: None,
+                        effort: None,
+                    },
+                    native: None,
+                    root: false,
+                    import: false,
+                },
+                out,
+                1,
+            )
+            .unwrap();
+        let mut ended = None;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
+                match event {
+                    ProviderEvent::Session(SessionEvent::Ready { .. }) => handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn,
+                            text: "ok".into(),
+                        })
+                        .unwrap(),
+                    ProviderEvent::Turn {
+                        event: TurnEvent::TurnEnded { outcome, .. },
+                        ..
+                    } => ended = Some(outcome),
+                    ProviderEvent::Session(SessionEvent::Exited { .. }) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            ended,
+            Some(TurnOutcome::Completed),
+            "workspaceWrite omitted the linked worktree roots"
+        );
+    });
+}
+
+#[test]
+fn codex_async_question_card() {
+    engine_replay(
+        "codex_async_question_card",
+        &["async-question"],
+        |engine, root, thread, runtime| {
+            use veyra_engine::{
+                commands::{Ack, Command},
+                events::{ChangeEvent, UiEvent},
+            };
+            runtime.block_on(async {
+                let mut events = engine.subscribe();
+                engine
+                    .send(Command::Send {
+                        thread,
+                        text: "Choose a color".into(),
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut card = None;
+                let mut pending_request = false;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while card.is_none() || !pending_request {
+                        if let UiEvent::Change { event, .. } = events.recv().await.unwrap() {
+                            match event {
+                                ChangeEvent::ItemAdded(item)
+                                    if item.thread == thread
+                                        && serde_json::to_value(&item.body)
+                                            .unwrap()
+                                            .get("AsyncQuestions")
+                                            .is_some() =>
+                                {
+                                    card = Some(item.id)
+                                }
+                                ChangeEvent::RequestOpened(request) if request.thread == thread => {
+                                    pending_request = true
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("async agent message never became a persisted question card");
+                let card = card.unwrap();
+                assert!(
+                    engine
+                        .snapshot(thread)
+                        .await
+                        .unwrap()
+                        .items
+                        .iter()
+                        .any(|item| item.id == card)
+                );
+                let Ack::Turn(answer) = engine
+                    .send(Command::ChooseAsyncOption {
+                        item: card,
+                        question: 0,
+                        option: 0,
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap()
+                else {
+                    panic!("missing answer turn")
+                };
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    loop {
+                        if let UiEvent::Change {
+                            event: ChangeEvent::TurnEnded(turn),
+                            ..
+                        } = events.recv().await.unwrap()
+                            && turn.id == answer
+                        {
+                            assert!(matches!(
+                                turn.state,
+                                TurnState::Ended {
+                                    outcome: TurnOutcome::Completed,
+                                    ..
+                                }
+                            ));
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("card answer waited for Continue or was not sent after interrupt");
+                let db = rusqlite::Connection::open_with_flags(
+                    root.join("data/veyra.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let projection = veyra_engine::store::load(&db).unwrap();
+                assert!(projection.threads[&thread].hold.is_none());
+                assert_eq!(projection.turns_for(thread).count(), 2);
+                assert!(
+                    projection
+                        .turns_for(thread)
+                        .all(|turn| matches!(turn.origin, TurnOrigin::User { .. }))
+                );
+                assert!(projection.items_for(thread).any(
+                    |item| matches!(&item.body, ItemBody::UserText(text) if text == "Violet")
+                ));
+                let ItemBody::AsyncQuestions { text, questions } = &projection.items[&card].body
+                else {
+                    panic!("card disappeared")
+                };
+                assert!(text.contains("Should Veyra use Violet or Blue?"));
+                assert_eq!(questions[0].selected, Some(0));
+                assert!(
+                    projection
+                        .requests
+                        .values()
+                        .filter(|request| request.thread == thread)
+                        .all(|request| matches!(request.state, RequestState::Expired { .. }))
+                );
+                assert!(
+                    engine
+                        .send(Command::ChooseAsyncOption {
+                            item: card,
+                            question: 0,
+                            option: 1
+                        })
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+                assert_eq!(
+                    veyra_engine::store::load(&db)
+                        .unwrap()
+                        .turns_for(thread)
+                        .count(),
+                    2
+                );
+            });
+        },
+    );
+}
+
+#[test]
+fn codex_subagent_live_is_one_turn_without_child_text() {
+    let events = standard("subagent-live", Inputs::default());
+    assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })
+    )));
+    let labels: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Turn {
+                event: TurnEvent::ToolStarted { call, .. },
+                ..
+            } => Some(call.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(labels.contains(&"Wait for subagent"));
+    let text: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { text, .. },
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text.iter().filter(|s| **s == "ok").count(),
+        1,
+        "child text leaked alongside the parent's ok"
+    );
 }

@@ -221,6 +221,7 @@ impl Fixture {
                     target: ApprovalTarget::Command {
                         command: "echo own-test".into(),
                         cwd: Default::default(),
+                        reason: None,
                         preview: ApprovalPreview::new(String::new()),
                     },
                 },

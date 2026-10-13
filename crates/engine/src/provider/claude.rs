@@ -834,6 +834,7 @@ impl Codec {
             ApprovalTarget::Command {
                 command: command.into(),
                 cwd: Default::default(),
+                reason: None,
                 preview: Self::preview(arguments),
             }
         } else if let Some((field, operation, path)) = file_target {

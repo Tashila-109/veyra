@@ -240,7 +240,22 @@ PYTHONPATH="$PROOF" python3 - <<'PYCODEX'
 from driver import *
 identity()
 assert LANE == 'fake'
-thread = create_codex('codex-relay',scenario='root-tool-call')
+records = codex_records('root-tool-call')
+first_item = next(record for record in records if record.get('line',{}).get('method')=='item/started')
+first_item['after_ms']=5000
+thread = create_codex('codex-relay',records=records)
+relay_marker = DATA/'project'/'relay.pid'
+poll('codex-relay-running',lambda d:relay_marker.exists()
+    and sql("select coalesce(live_pid,'') from threads where id='"+thread+"'")!='')
+cli = int(sql("select live_pid from threads where id='"+thread+"'"))
+relay = int(relay_marker.read_text().strip())
+veyra_pids = subprocess.check_output(['pgrep','-x','veyra'],text=True).split()
+assert str(relay) in veyra_pids
+processes = subprocess.check_output(['ps','-o','pid=,ppid=,pgid=,comm=','-p',','.join(veyra_pids)],text=True)
+(PROOF/'codex-relay-processes.txt').write_text(processes)
+row = next(line.split(None,3) for line in processes.splitlines() if int(line.split()[0])==relay)
+assert int(row[1])==cli and int(row[2])==relay
+save('codex-relay-parent',{'cli_pid':cli,'relay_pid':relay,'relay_parent':int(row[1]),'relay_pgid':int(row[2])})
 done = ctl('codex-relay-wait','wait',thread,'Done')
 save('codex-relay-done',done)
 assert any(item['kind']=='tool' and 'codex' in item['text'] and 'remaining_fan_out' in item['text'] for item in done['transcript']['items'])
@@ -295,6 +310,7 @@ PYCODEX
 
 ## Observable success
 
+The held Codex fixture saves pid, ppid, pgid and comm for named Veyra processes and asserts the relay is the fake root CLI's direct child in its own group.
 The Codex root section saves the production relay result in `transcript.items`, SQLite tool rows and `codex-relay-log.txt`.
 That log contains the root thread's accepted connection and `list_providers` call.
 The Claude-root/Codex-child section checks `composer.provider`, the child's `selected_thread.config.mode`, `breadcrumb`, TaskCard and family row.

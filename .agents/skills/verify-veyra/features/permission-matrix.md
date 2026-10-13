@@ -5,12 +5,12 @@ Status: not run, 2026-10-12, 950317c, Codex and Grok live cells
 ## Sub-features
 
 One live prompt checks reading, a command, a project write and an outside write in every permission mode.
-Claude's row comes from preserved authorized live evidence; Codex and Grok remain not run.
+Claude and Codex rows come from preserved authorized live evidence; Grok remains not run.
 
 | Provider | Ask first | Accept edits | Full access |
 | --- | --- | --- | --- |
 | Claude | passed: Read and `echo` ran without approval; both writes docked as `Write` with their absolute targets, inside and outside the project, Allow once, both files written | passed: Read, `echo` and the project write ran without approval; the outside write docked as `Write`, outside the project, Allow once, written | passed: all four steps ran with no approval; both files written |
-| Codex | not run | not run | not run |
+| Codex | passed: `cat` and `echo` each docked as Command and ran after Allow once; the project write docked as `/bin/zsh -lc "printf '%s\\n' 'veyra permission probe' > permission-project.txt"`, Allow once, written; the outside write docked with its `/tmp` target in the command, Deny (the lane allows no approval outside the scratch project), not written | passed: Read, `echo`, the project write and the `/tmp` outside write all ran without approval; Codex's workspace-write sandbox lets `/tmp` writes through; both files written | passed: all four steps ran with no approval; both files written |
 | Grok | not run | not run | not run |
 
 ## How to get to it (user POV)
@@ -41,7 +41,7 @@ Select each mode with PickPermission, send through Send, and preserve every dock
 Use AllowOnce or Deny as the operator directs; do not silently grant the whole thread.
 Read the project and outside files to prove the effects, then remove only this run's outside file.
 Record cell status, provider version, requested approvals, decisions, files and the run proof path.
-Codex's cells await the separately authorized permission run; Grok's adapter is not built.
+Codex's cells preserve the authorized run below; Grok's adapter is not built.
 
 ## Observable success
 
@@ -93,4 +93,11 @@ Observed results below describe the preserved mode checks.
 - Accept edits records Claude's directory boundary: a write outside the project folder still asks.
 - In every mode Claude's own closing text said no step needed approval, including Ask first, where two writes docked. That is the model's narration, not Veyra state.
 - The `Write` docks show the tool input as raw JSON under the copy "Claude Code will run this command in the project folder.", also for the `/tmp` write (the recording predates the tool-target dock repair).
-- Codex and Grok cells stay not run here.
+- Grok cells stay not run here.
+
+### Codex preserved live evidence
+
+Live run RUN `38bd20ba`, Codex 0.162.1, model the CLI default, 2026-10-14, checkout `daf400c`.
+The row is retained exactly from the authorized live permission run in `m5-lane-3.md`; the fake worker does not rerun it.
+Codex's Accept edits workspace sandbox permits `/tmp` writes without asking, including targets outside the project folder.
+This is Codex's directory boundary; Claude's Accept edits outside write still docks.

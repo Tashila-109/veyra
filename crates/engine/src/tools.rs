@@ -61,7 +61,7 @@ impl Tool {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
     }
-    fn description(self) -> &'static str {
+    fn base_description(self) -> &'static str {
         match self {
             Self::ListProviders => {
                 "Read available providers, models, your permission ceiling and remaining child slots before delegating. A refusal explains the fix."
@@ -79,6 +79,9 @@ impl Tool {
                 "Stop your own child when its work is no longer needed. Its report arrives after your current turn ends. A refusal explains the fix."
             }
         }
+    }
+    fn description(self) -> String {
+        instructions()
     }
     fn schema(self) -> Value {
         let (properties, required) = match self {
@@ -103,20 +106,27 @@ impl Tool {
         json!({"name":self.name(),"description":self.description(),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
     }
 }
-pub fn instructions() -> String {
+fn first_call_rules() -> String {
     format!(
-        "{}\nOnly a running root may delegate, and you may read or control only your own tasks and children. Depth is 1. At most {} children may have open tasks and a family may have {} threads in total, including archived threads. Children default to your mode and may never use a broader mode: ask_first < accept_edits < full_access. Prompts and follow-ups may contain at most {} characters. Use a client_request_id for start_thread and message_thread; retry the same key only with the same provider, target and text. Child reports carry up to {} characters and arrive as a wake after your turn ends, so do not poll. Every refusal names the rule, its limit when applicable, and the next tool and ids needed to fix it.",
-        Tool::ALL
-            .into_iter()
-            .map(|tool| format!("{}: {}", tool.name(), tool.description()))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        "Only a running root may delegate, and you may read or control only your own tasks and children. Depth is 1. At most {} children may have open tasks and a family may have {} threads in total, including archived threads. Children default to your mode and may never use a broader mode: ask_first < accept_edits < full_access. Prompts and follow-ups may contain at most {} characters. Use a client_request_id for start_thread and message_thread; retry the same key only with the same provider, target and text. Child reports carry up to {} characters and arrive as a wake after your turn ends, so do not poll. Every refusal names the rule, its limit when applicable, and the next tool and ids needed to fix it.",
         OPEN_CHILD_LIMIT,
         FAMILY_LIMIT,
         grouped(PROMPT_CHARS),
         grouped(REPORT_CHARS)
     )
 }
+pub fn instructions() -> String {
+    format!(
+        "{}\n{}",
+        Tool::ALL
+            .into_iter()
+            .map(|tool| format!("{}: {}", tool.name(), tool.base_description()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        first_call_rules()
+    )
+}
+
 pub fn list() -> Value {
     Value::Array(Tool::ALL.into_iter().map(Tool::schema).collect())
 }
@@ -453,4 +463,31 @@ pub fn decide(
     };
     commands::start_changed(p, l, &mut c, now);
     Ok((c, result))
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+    #[test]
+    fn every_tool_description_teaches_the_first_call_rules() {
+        let tools = list();
+        for tool in tools.as_array().unwrap() {
+            let text = tool["description"].as_str().unwrap();
+            for rule in [
+                "Only a running root",
+                "Depth is 1",
+                "4 children",
+                "16 threads",
+                "ask_first < accept_edits < full_access",
+                "100,000 characters",
+                "4,000 characters",
+                "wake after your turn ends",
+                "do not poll",
+                "client_request_id",
+                "own tasks and children",
+            ] {
+                assert!(text.contains(rule), "{} omits {rule}", tool["name"]);
+            }
+        }
+    }
 }

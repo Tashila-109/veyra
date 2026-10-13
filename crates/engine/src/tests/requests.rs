@@ -269,6 +269,7 @@ fn legacy_approval_rows_load_as_typed_display() {
             ApprovalTarget::Command {
                 command: "echo old".into(),
                 cwd: Default::default(),
+                reason: None,
                 preview: ApprovalPreview::new(String::new()),
             },
         ),
@@ -310,4 +311,77 @@ fn legacy_approval_rows_load_as_typed_display() {
         assert!(stored.get("input").is_none());
         assert!(stored.get("command").is_none());
     }
+}
+
+#[test]
+fn async_choice_precedes_queued_messages_and_persists_once() {
+    let mut f = Fixture::new(LiveState::Running);
+    f.event(turn_event(
+        f.running(),
+        TurnEvent::AsyncQuestions {
+            key: NativeItemKey("async-question".into()),
+            text: "Which colour should Veyra use?".into(),
+            questions: vec![AsyncQuestion {
+                title: "Colour".into(),
+                options: vec!["Violet".into(), "Blue".into()],
+                selected: None,
+            }],
+        },
+    ));
+    let item = f
+        .loaded()
+        .items_for(f.thread)
+        .find(|i| matches!(i.body, ItemBody::AsyncQuestions { .. }))
+        .unwrap()
+        .id;
+    f.command(Command::Send {
+        thread: f.thread,
+        text: "already queued".into(),
+    })
+    .unwrap();
+    let Ack::Turn(answer) = f
+        .command(Command::ChooseAsyncOption {
+            item,
+            question: 0,
+            option: 0,
+        })
+        .unwrap()
+    else {
+        panic!("choice did not queue a user turn")
+    };
+    let p = f.loaded();
+    assert_eq!(p.threads[&f.thread].hold, None);
+    let mut queued: Vec<_> = p
+        .turns_for(f.thread)
+        .filter(|t| t.state == TurnState::Queued)
+        .collect();
+    queued.sort_by_key(|t| t.ordinal);
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[0].id, answer);
+    assert!(matches!(queued[0].origin, TurnOrigin::User { .. }));
+    assert!(
+        p.items_for(f.thread)
+            .any(|i| i.turn == answer && i.body == ItemBody::UserText("Violet".into()))
+    );
+    assert!(
+        matches!(&p.items[&item].body, ItemBody::AsyncQuestions { text, questions } if text == "Which colour should Veyra use?" && questions[0].selected == Some(0))
+    );
+    assert!(
+        std::iter::from_fn(|| f.controls.try_recv().ok()).any(|control| matches!(
+            control,
+            SessionControl::Interrupt {
+                reason: StopReason::QuestionChoice,
+                ..
+            }
+        ))
+    );
+    assert!(
+        f.command(Command::ChooseAsyncOption {
+            item,
+            question: 0,
+            option: 1
+        })
+        .is_err()
+    );
+    assert_eq!(f.loaded().turns_for(f.thread).count(), 3);
 }
