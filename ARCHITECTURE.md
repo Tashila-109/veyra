@@ -615,7 +615,7 @@ A task without a recorded source shows no delivery badge, including older stored
 The row renderer and dump use the same report_delivered predicate over the task's stored link.
 Turn::recency orders the transcript, ThreadView.last, failure cause and Retry by actual start, or end time for a turn that ended without starting, with ordinal for ties and queued turns after started ones; stored queue ordinals retain their admission role.
 The actor attaches a session notice to a running turn when one exists, otherwise the latest started turn; queued and never-started turns cannot take a notice.
-Startup storage-loss notices use the same rule on the reconciled rows, so an attempted-start turn recovered as Interrupted can take its notice with its retained start time.
+Startup storage-loss notices use the same rule on the reconciled rows, so an attempted-start turn recovered as Interrupted can take its notice because it keeps its attempted start time.
 When no eligible turn exists, the shared notice selector logs the thread id and notice kind without the notice text.
 ReplyLineBreaks applies to assistant reply rows and uses the kit's Markdown AST hook to turn prose soft breaks into rendered line breaks, preserving lists, emphasis, tables and code, with the original Markdown retained for source copying.
 AppState caches each thread's ordered item ids and row positions, rebuilding them on item insertion, turn metadata and snapshots.

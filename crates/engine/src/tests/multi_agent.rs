@@ -1325,7 +1325,7 @@ fn check_storage_loss_notice(queued: bool) {
     if queued {
         f.user("Queued after the completed prompt");
     }
-    let (actor, _scratch) = reload_with_storage_loss(&f, "recent text");
+    let (scratch, actor) = reload_with_storage_loss(&f, "recent text");
     let loaded = store::load(&actor.db).unwrap();
     let notice = loaded
         .items_for(f.thread)
@@ -1335,6 +1335,7 @@ fn check_storage_loss_notice(queued: bool) {
         })
         .unwrap();
     assert_eq!(notice.turn, prompt);
+    assert!(!scratch.0.join("run/storage-blocked.json").exists());
 }
 
 #[test]
@@ -1591,17 +1592,13 @@ fn empty_report_keeps_no_source_after_later_child_work() {
     );
     let loaded = f.loaded();
     assert!(matches!(&loaded.tasks[&task].state, TaskState::Settled {
-        summary, delivery: Delivery::Delivered { wake: delivered }, ..
+        summary, source: None, delivery: Delivery::Delivered { wake: delivered }, ..
     } if summary.is_empty() && *delivered == wake));
     assert!(loaded.items_for(child).any(|item| matches!(&item.body,
         ItemBody::AssistantText { text, .. } if text == "Later work reply")));
-    assert!(matches!(
-        f.loaded().tasks[&task].state,
-        TaskState::Settled { source: None, .. }
-    ));
 }
 
-fn reload_with_storage_loss(f: &Fixture, text: &str) -> (Actor, Scratch) {
+fn reload_with_storage_loss(f: &Fixture, text: &str) -> (Scratch, Actor) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!("../../target/notice-recovery-{}", ThreadId::new()));
     let scratch = Scratch(root.clone());
@@ -1627,14 +1624,14 @@ fn reload_with_storage_loss(f: &Fixture, text: &str) -> (Actor, Scratch) {
         Spawner::Scripted(Scripted::default()),
     )
     .unwrap();
-    (actor, scratch)
+    (scratch, actor)
 }
 
 #[test]
 fn storage_loss_notice_follows_reconciled_attempted_start() {
-    for older in [false, true] {
+    for older_completed in [false, true] {
         let mut f = Fixture::new(LiveState::Idle);
-        if older {
+        if older_completed {
             f.turn(
                 TurnOrigin::Provider,
                 TurnState::Ended {
@@ -1644,20 +1641,26 @@ fn storage_loss_notice_follows_reconciled_attempted_start() {
                 },
             );
         }
-        let attempted = f.user("Admitted then requeued");
-        f.actor
-            .db
-            .execute(
-                "UPDATE turns SET started_at=300 WHERE id=?1",
-                [attempted.to_string()],
-            )
-            .unwrap();
-        let (actor, _scratch) = reload_with_storage_loss(&f, "attempted prompt text");
+        let Ack::Turn(attempted) = f
+            .command(Command::Send {
+                thread: f.thread,
+                text: "Admitted then requeued".into(),
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        let provider_turn = f.turn(TurnOrigin::Provider, TurnState::Running { since: 100 });
+        f.event(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+            provider_turn,
+        }));
+        assert_eq!(f.loaded().turns[&attempted].state, TurnState::Queued);
+        let (scratch, actor) = reload_with_storage_loss(&f, "attempted prompt text");
         let loaded = store::load(&actor.db).unwrap();
         assert!(matches!(
             loaded.turns[&attempted].state,
             TurnState::Ended {
-                started: Some(300),
+                started: Some(_),
                 outcome: TurnOutcome::Interrupted { .. },
                 ..
             }
@@ -1670,7 +1673,7 @@ fn storage_loss_notice_follows_reconciled_attempted_start() {
             })
             .unwrap();
         assert_eq!(notice.turn, attempted);
-        assert!(!_scratch.0.join("run/storage-blocked.json").exists());
+        assert!(!scratch.0.join("run/storage-blocked.json").exists());
     }
 }
 
@@ -1753,7 +1756,7 @@ fn storage_loss_notice_without_started_turn_logs_identity_only() {
         }
         let logs = CapturedLogs::default();
         let text = "Private storage notice body";
-        let (actor, scratch) =
+        let (scratch, actor) =
             tracing::subscriber::with_default(logs.clone(), || reload_with_storage_loss(&f, text));
         assert!(
             !store::load(&actor.db)
@@ -1770,15 +1773,16 @@ fn storage_loss_notice_without_started_turn_logs_identity_only() {
                 outcome: TurnOutcome::Completed,
             },
         );
-        let (attached, _attached_scratch) =
+        let (scratch, actor) =
             tracing::subscriber::with_default(logs.clone(), || reload_with_storage_loss(&f, text));
         assert!(
-            store::load(&attached.db)
+            store::load(&actor.db)
                 .unwrap()
                 .items_for(f.thread)
                 .any(|item| matches!(&item.body,
             ItemBody::Notice(notice) if notice.text.contains(text)))
         );
+        assert!(!scratch.0.join("run/storage-blocked.json").exists());
         unattached_notice_log(&logs, f.thread, "storage_loss", text);
     }
 }
