@@ -4795,7 +4795,7 @@ mod tests {
             super::transcript::turn_label(&state, &report),
             Some("Reports from 1 child thread".into())
         );
-        let later_reply = Item {
+        let report_row = Item {
             id: report_item,
             thread: child,
             turn: task_turn,
@@ -4807,9 +4807,9 @@ mod tests {
         };
         state.apply(UiEvent::Change {
             counter: None,
-            event: ChangeEvent::ItemAdded(later_reply.clone()),
+            event: ChangeEvent::ItemAdded(report_row.clone()),
         });
-        assert!(!super::transcript::report_delivered(&state, &later_reply));
+        assert!(!super::transcript::report_delivered(&state, &report_row));
         task.state = TaskState::Settled {
             outcome: TurnOutcome::Completed,
             summary: "report".into(),
@@ -4820,7 +4820,7 @@ mod tests {
             counter: None,
             event: ChangeEvent::TaskDelivered(task),
         });
-        assert!(super::transcript::report_delivered(&state, &later_reply));
+        assert!(super::transcript::report_delivered(&state, &report_row));
         let mut followup = state.tasks.values().next().unwrap().clone();
         followup.id = TaskId::new();
         followup.turn = TurnId::new();
@@ -4848,7 +4848,7 @@ mod tests {
             counter: None,
             event: ChangeEvent::TaskSettled(followup.clone()),
         });
-        assert!(super::transcript::report_delivered(&state, &later_reply));
+        assert!(super::transcript::report_delivered(&state, &report_row));
         report.origin = TurnOrigin::Wake {
             tasks: state.tasks.keys().copied().collect(),
         };
@@ -4866,7 +4866,7 @@ mod tests {
             counter: None,
             event: ChangeEvent::TaskDelivered(followup),
         });
-        assert!(super::transcript::report_delivered(&state, &later_reply));
+        assert!(super::transcript::report_delivered(&state, &report_row));
         state.apply(UiEvent::Change {
             counter: None,
             event: ChangeEvent::ThreadArchived { thread: root },

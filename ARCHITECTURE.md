@@ -142,8 +142,8 @@ After the shutdown commit attempt, a three-second deadline ends the actor's sess
 If that write fails, pending row changes remain blocked while sessions still receive Shutdown, and sessionless Starting threads still park in runtime state.
 A blocked write logs affected thread ids and changed item, turn, request, task and metadata identifiers without recording their text.
 A private DATA/run/storage-blocked.json receipt carries that same metadata for the next launch and is removed after a successful write.
-Startup consumes a valid receipt into notice items on affected threads with a started turn before clearing it.
-A receipt entry without a started turn cannot attach a transcript notice.
+Startup chooses storage-loss notice targets from the reconciled turn rows, including attempted starts recovered as Interrupted, and stores those notices in the startup transaction before clearing the valid receipt.
+A receipt entry without a started turn after reconciliation cannot attach a transcript notice.
 An unreadable or malformed receipt is renamed aside privately when possible, logged without its contents and reported through a window recovery notice; it does not refuse startup.
 The notice identifies what may have been lost and asks the user to inspect the provider conversation before sending more work.
 Receipt creation failures are logged; unavailable storage can prevent the next-launch notice from being saved.
@@ -494,7 +494,7 @@ The ordinary start rule waits for the parent to be idle and unheld, so a wake ne
 Accepted changes task delivery to Delivered, and the actor logs thread, turn and acceptance time for each admitted acceptance.
 Any wake ending before Accepted moves pending reports into a new queued wake; for an unarchived root delivery is at least once until acceptance, can repeat, and is final once Delivered.
 Parent Stop preserves a held wake, and a user stop or archive of one child holds the parent as ChildReport without replacing an earlier hold.
-A kept child settles into its archived root's queued wake, which never starts because the start rule refuses an archived thread with WaitReason::Archived, and the window offers it no Continue.
+A kept child settles into its archived root's queued wake, which never starts: the archive's Stopped hold, or an earlier preserved hold, refuses it first; WaitReason::Archived still refuses it if that hold clears, and the window offers it no Continue.
 
 ## Platform and keep-awake
 
@@ -614,7 +614,9 @@ A Delivered task labels only its named source assistant row Report delivered, in
 A task without a recorded source shows no delivery badge, including older stored tasks and a child stopped before producing an assistant item.
 The row renderer and dump use the same report_delivered predicate over the task's stored link.
 Turn::recency orders the transcript, ThreadView.last, failure cause and Retry by actual start, or end time for a turn that ended without starting, with ordinal for ties and queued turns after started ones; stored queue ordinals retain their admission role.
-The actor attaches session and storage-loss notices to a running turn when one exists, otherwise the latest turn with a stored start time; queued and never-started turns cannot take a notice.
+The actor attaches a session notice to a running turn when one exists, otherwise the latest started turn; queued and never-started turns cannot take a notice.
+Startup storage-loss notices use the same rule on the reconciled rows, so an attempted-start turn recovered as Interrupted can take its notice with its retained start time.
+When no eligible turn exists, the shared notice selector logs the thread id and notice kind without the notice text.
 ReplyLineBreaks applies to assistant reply rows and uses the kit's Markdown AST hook to turn prose soft breaks into rendered line breaks, preserving lists, emphasis, tables and code, with the original Markdown retained for source copying.
 AppState caches each thread's ordered item ids and row positions, rebuilding them on item insertion, turn metadata and snapshots.
 It fills shared markdown source strings for assistant and reasoning rows before they enter the cached order, refreshing only the changed item and removing archived rows.

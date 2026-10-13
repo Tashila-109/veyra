@@ -1325,31 +1325,7 @@ fn check_storage_loss_notice(queued: bool) {
     if queued {
         f.user("Queued after the completed prompt");
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../../target/notice-recovery-{}", ThreadId::new()));
-    let _scratch = Scratch(root.clone());
-    crate::platform::private_dir(&root.join("run")).unwrap();
-    let path = root.join("veyra.db");
-    f.actor
-        .db
-        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
-        .unwrap();
-    crate::platform::private_text(
-        &root.join("run/storage-blocked.json"),
-        &serde_json::to_string(&std::collections::BTreeMap::from([(
-            f.thread,
-            "recent text".to_string(),
-        )]))
-        .unwrap(),
-    )
-    .unwrap();
-    let (out, _) = mpsc::channel(16);
-    let actor = Actor::new(
-        Connection::open(&path).unwrap(),
-        out,
-        Spawner::Scripted(Scripted::default()),
-    )
-    .unwrap();
+    let (actor, _scratch) = reload_with_storage_loss(&f, "recent text");
     let loaded = store::load(&actor.db).unwrap();
     let notice = loaded
         .items_for(f.thread)
@@ -1459,7 +1435,7 @@ fn archive_one_child_holds_parent_and_preserves_earlier_hold() {
 }
 
 #[test]
-fn existing_assistant_json_remains_unchanged_without_reports() {
+fn assistant_text_stored_shape_round_trips() {
     let legacy = serde_json::json!({"AssistantText":{"text":"existing reply","done":true}});
     let item: ItemBody = serde_json::from_value(legacy.clone()).unwrap();
     assert_eq!(serde_json::to_value(item).unwrap(), legacy);
@@ -1527,35 +1503,14 @@ fn migration_leaves_older_tasks_without_inferred_report_sources() {
     let (child, task) = start(&mut f, "old report");
     ready_child(&mut f, child);
     end_child(&mut f, child, task);
-    let has_source: bool = f
-        .actor
+    f.actor
         .db
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='source_item_id')",
-            [],
-            |row| row.get(0),
-        )
+        .execute_batch("ALTER TABLE tasks DROP COLUMN source_item_id")
         .unwrap();
-    if has_source {
-        f.actor
-            .db
-            .execute_batch("ALTER TABLE tasks DROP COLUMN source_item_id")
-            .unwrap();
-    }
     f.actor.db.pragma_update(None, "user_version", 2).unwrap();
     store::initialize(&mut f.actor.db).unwrap();
-    let source: Option<String> = f
-        .actor
-        .db
-        .query_row(
-            "SELECT source_item_id FROM tasks WHERE id=?1",
-            [task.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(source, None);
     assert!(matches!(&f.loaded().tasks[&task].state,
-        TaskState::Settled { summary, .. } if summary == "Child report"));
+        TaskState::Settled { source: None, summary, .. } if summary == "Child report"));
     store::initialize(&mut f.actor.db).unwrap();
     assert_eq!(
         f.actor
@@ -1640,14 +1595,190 @@ fn empty_report_keeps_no_source_after_later_child_work() {
     } if summary.is_empty() && *delivered == wake));
     assert!(loaded.items_for(child).any(|item| matches!(&item.body,
         ItemBody::AssistantText { text, .. } if text == "Later work reply")));
-    let source: Option<String> = f
-        .actor
+    assert!(matches!(
+        f.loaded().tasks[&task].state,
+        TaskState::Settled { source: None, .. }
+    ));
+}
+
+fn reload_with_storage_loss(f: &Fixture, text: &str) -> (Actor, Scratch) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../target/notice-recovery-{}", ThreadId::new()));
+    let scratch = Scratch(root.clone());
+    crate::platform::private_dir(&root.join("run")).unwrap();
+    let path = root.join("veyra.db");
+    f.actor
         .db
-        .query_row(
-            "SELECT source_item_id FROM tasks WHERE id=?1",
-            [task.to_string()],
-            |row| row.get(0),
-        )
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
         .unwrap();
-    assert_eq!(source, None);
+    crate::platform::private_text(
+        &root.join("run/storage-blocked.json"),
+        &serde_json::to_string(&std::collections::BTreeMap::from([(
+            f.thread,
+            text.to_string(),
+        )]))
+        .unwrap(),
+    )
+    .unwrap();
+    let (out, _) = mpsc::channel(16);
+    let actor = Actor::new(
+        Connection::open(&path).unwrap(),
+        out,
+        Spawner::Scripted(Scripted::default()),
+    )
+    .unwrap();
+    (actor, scratch)
+}
+
+#[test]
+fn storage_loss_notice_follows_reconciled_attempted_start() {
+    for older in [false, true] {
+        let mut f = Fixture::new(LiveState::Idle);
+        if older {
+            f.turn(
+                TurnOrigin::Provider,
+                TurnState::Ended {
+                    started: Some(100),
+                    at: 200,
+                    outcome: TurnOutcome::Completed,
+                },
+            );
+        }
+        let attempted = f.user("Admitted then requeued");
+        f.actor
+            .db
+            .execute(
+                "UPDATE turns SET started_at=300 WHERE id=?1",
+                [attempted.to_string()],
+            )
+            .unwrap();
+        let (actor, _scratch) = reload_with_storage_loss(&f, "attempted prompt text");
+        let loaded = store::load(&actor.db).unwrap();
+        assert!(matches!(
+            loaded.turns[&attempted].state,
+            TurnState::Ended {
+                started: Some(300),
+                outcome: TurnOutcome::Interrupted { .. },
+                ..
+            }
+        ));
+        let notice = loaded
+            .items_for(f.thread)
+            .find(|item| {
+                matches!(&item.body,
+            ItemBody::Notice(notice) if notice.text.contains("attempted prompt text"))
+            })
+            .unwrap();
+        assert_eq!(notice.turn, attempted);
+        assert!(!_scratch.0.join("run/storage-blocked.json").exists());
+    }
+}
+
+fn unattached_notice_log(logs: &CapturedLogs, thread: ThreadId, kind: &str, text: &str) {
+    let events = logs.0.lock().unwrap();
+    let notices: Vec<_> = events
+        .iter()
+        .filter(|event| event.contains_key("notice_kind"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "missing or repeated unattached-notice log"
+    );
+    assert_eq!(
+        *notices[0],
+        BTreeMap::from([
+            ("message".into(), "notice has no started turn".into()),
+            ("thread".into(), thread.to_string()),
+            ("notice_kind".into(), kind.into()),
+        ])
+    );
+    assert!(
+        events
+            .iter()
+            .flat_map(|event| event.values())
+            .all(|value| !value.contains(text)),
+        "notice text entered a log event"
+    );
+}
+
+#[test]
+fn session_notice_without_started_turn_logs_identity_only() {
+    for queued in [false, true] {
+        let mut f = Fixture::new(LiveState::Idle);
+        if queued {
+            f.user("Queued prompt");
+        }
+        let logs = CapturedLogs::default();
+        let text = "Private session notice body";
+        tracing::subscriber::with_default(logs.clone(), || {
+            f.event(ProviderEvent::Session(SessionEvent::Notice {
+                text: text.into(),
+            }));
+        });
+        assert!(
+            !f.loaded()
+                .items_for(f.thread)
+                .any(|item| matches!(item.body, ItemBody::Notice(_)))
+        );
+        f.turn(
+            TurnOrigin::Provider,
+            TurnState::Ended {
+                started: Some(100),
+                at: 200,
+                outcome: TurnOutcome::Completed,
+            },
+        );
+        tracing::subscriber::with_default(logs.clone(), || {
+            f.event(ProviderEvent::Session(SessionEvent::Notice {
+                text: text.into(),
+            }));
+        });
+        assert!(
+            f.loaded()
+                .items_for(f.thread)
+                .any(|item| matches!(&item.body,
+            ItemBody::Notice(notice) if notice.text == text))
+        );
+        unattached_notice_log(&logs, f.thread, "session", text);
+    }
+}
+
+#[test]
+fn storage_loss_notice_without_started_turn_logs_identity_only() {
+    for queued in [false, true] {
+        let mut f = Fixture::new(LiveState::Idle);
+        if queued {
+            f.user("Queued prompt");
+        }
+        let logs = CapturedLogs::default();
+        let text = "Private storage notice body";
+        let (actor, scratch) =
+            tracing::subscriber::with_default(logs.clone(), || reload_with_storage_loss(&f, text));
+        assert!(
+            !store::load(&actor.db)
+                .unwrap()
+                .items_for(f.thread)
+                .any(|item| matches!(item.body, ItemBody::Notice(_)))
+        );
+        assert!(!scratch.0.join("run/storage-blocked.json").exists());
+        f.turn(
+            TurnOrigin::Provider,
+            TurnState::Ended {
+                started: Some(100),
+                at: 200,
+                outcome: TurnOutcome::Completed,
+            },
+        );
+        let (attached, _attached_scratch) =
+            tracing::subscriber::with_default(logs.clone(), || reload_with_storage_loss(&f, text));
+        assert!(
+            store::load(&attached.db)
+                .unwrap()
+                .items_for(f.thread)
+                .any(|item| matches!(&item.body,
+            ItemBody::Notice(notice) if notice.text.contains(text)))
+        );
+        unattached_notice_log(&logs, f.thread, "storage_loss", text);
+    }
 }

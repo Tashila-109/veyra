@@ -125,9 +125,14 @@ fn clear_drain(live: &mut LiveThread, turn: TurnId) {
         *draining = None;
     }
 }
-fn notice_turn(projection: &Projection, thread: ThreadId) -> Option<TurnId> {
-    projection
-        .turns_for(thread)
+fn notice_turn(
+    projection: &Projection,
+    changes: &ChangeSet,
+    thread: ThreadId,
+    kind: &'static str,
+) -> Option<TurnId> {
+    let turn = changes
+        .turns(projection, thread)
         .filter(|turn| turn.state.started().is_some())
         .max_by_key(|turn| {
             (
@@ -135,7 +140,11 @@ fn notice_turn(projection: &Projection, thread: ThreadId) -> Option<TurnId> {
                 turn.recency(),
             )
         })
-        .map(|turn| turn.id)
+        .map(|turn| turn.id);
+    if turn.is_none() {
+        tracing::warn!(thread=%thread, notice_kind=kind, "notice has no started turn");
+    }
+    turn
 }
 impl Actor {
     #[cfg(test)]
@@ -224,7 +233,7 @@ impl Actor {
         let mut c = c;
         if let Some(rows) = lost {
             for (thread, what) in rows {
-                if let Some(turn) = notice_turn(&actor.projection, thread) {
+                if let Some(turn) = notice_turn(&actor.projection, &c, thread, "storage_loss") {
                     commands::add_item(
                         &actor.projection,
                         &mut c,
@@ -987,7 +996,7 @@ impl Actor {
                 });
             }
             ProviderEvent::Session(SessionEvent::Notice { text }) => {
-                if let Some(turn) = notice_turn(&self.projection, thread) {
+                if let Some(turn) = notice_turn(&self.projection, &c, thread, "session") {
                     commands::add_item(
                         &self.projection,
                         &mut c,
@@ -1460,7 +1469,7 @@ impl Actor {
             .map(|task| {
                 (
                     task.id,
-                    commands::task_summary(&self.projection, c, task.child),
+                    commands::task_report(&self.projection, c, task.child),
                 )
             })
             .collect();

@@ -823,7 +823,7 @@ pub fn turn_text(p: &Projection, c: &ChangeSet, turn: &Turn) -> String {
     }
 }
 
-pub fn task_summary(p: &Projection, c: &ChangeSet, child: ThreadId) -> (String, Option<ItemId>) {
+pub fn task_report(p: &Projection, c: &ChangeSet, child: ThreadId) -> (String, Option<ItemId>) {
     c.items(p, child)
         .filter_map(|item| match &item.body {
             ItemBody::AssistantText { text, .. } => Some((item, text)),
@@ -934,7 +934,7 @@ pub(crate) fn settle_tasks(
         });
         let Some(outcome) = outcome else { continue };
         let wake = queue_wake(p, c, t.parent, [t.id]);
-        let (summary, source) = task_summary(p, c, child);
+        let (summary, source) = task_report(p, c, child);
         t.state = TaskState::Settled {
             outcome,
             summary,
