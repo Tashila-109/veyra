@@ -132,7 +132,7 @@ fn later_archived_write_keeps_first_archive_time() {
 fn spawn_failure_survives_full_actor_mailbox() {
     let mut f = Fixture::new(LiveState::Parked);
     let mut row = f.actor.projection.threads[&f.thread].clone();
-    row.provider = ProviderKind::Grok;
+    row.provider = ProviderKind::Claude;
     let mut change = ChangeSet::default();
     change.threads.insert(row.id, row);
     f.save(change);
@@ -142,7 +142,10 @@ fn spawn_failure_survives_full_actor_mailbox() {
     f.actor = Actor::new(
         db,
         out,
-        Spawner::Cli(crate::provider::env::ChildEnv::load()),
+        Spawner::Cli(Box::new(
+            crate::provider::env::ChildEnv::isolated()
+                .with_binary(ProviderKind::Claude, "/nonexistent/claude".into()),
+        )),
     )
     .unwrap();
     let (event_tx, mut events) = mpsc::unbounded_channel();
@@ -150,7 +153,7 @@ fn spawn_failure_survives_full_actor_mailbox() {
     let Ack::Turn(turn) = f
         .command(Command::Send {
             thread: f.thread,
-            text: "a spawn that is not built".into(),
+            text: "a spawn with an explicitly missing binary".into(),
         })
         .unwrap()
     else {
@@ -170,7 +173,7 @@ fn spawn_failure_survives_full_actor_mailbox() {
     assert!(matches!(
         &f.loaded().turns[&turn].state,
         TurnState::Ended { outcome: TurnOutcome::Failed { message }, .. }
-            if message.contains("not built")
+            if message.contains("not installed")
     ));
     assert_eq!(
         f.loaded().threads[&f.thread].hold,
@@ -200,6 +203,7 @@ fn full_actor_queue_refuses_read_requests() {
             state: Default::default(),
             runtime: runtime.handle().clone(),
             groups: Default::default(),
+            environment: env::ChildEnv::isolated(),
         }),
     };
     assert!(matches!(
@@ -223,6 +227,7 @@ fn closed_actor_queue_reports_closed_instead_of_full() {
             state: Default::default(),
             runtime: runtime.handle().clone(),
             groups: Default::default(),
+            environment: env::ChildEnv::isolated(),
         }),
     };
     assert!(matches!(
@@ -326,7 +331,7 @@ fn set_default_mode_persists_and_publishes() {
             },
             UiEvent::Change {
                 counter: Some(1),
-                event: Ev::ThreadCreated(f.actor.projection.threads[&f.thread].clone())
+                event: Ev::ThreadCreated(Box::new(f.actor.projection.threads[&f.thread].clone()))
             },
             UiEvent::Change {
                 counter: Some(2),
@@ -683,6 +688,7 @@ fn send_waits_when_mailbox_full() {
             state: Default::default(),
             runtime: runtime.handle().clone(),
             groups: Default::default(),
+            environment: env::ChildEnv::isolated(),
         }),
     };
     #[cfg(debug_assertions)]
@@ -726,6 +732,7 @@ fn waiting_commands_reach_actor_in_send_order() {
             state: Default::default(),
             runtime: runtime.handle().clone(),
             groups: Default::default(),
+            environment: env::ChildEnv::isolated(),
         }),
     };
     let mut first = std::pin::pin!(engine.send(Command::SetDefaultMode {

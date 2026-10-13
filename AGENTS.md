@@ -21,8 +21,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Release builds ignore the provider overrides such as `VEYRA_CLAUDE_BIN`, so a release test that starts a provider starts the installed CLI.
-In release, build the tests with `--no-run`, or run only a named test that starts no provider, such as `perf_snapshot_large`.
+Ordinary tests use isolated provider environments in debug and release; only ignored `live_*` tests resolve installed providers.
 
 For a UI or CLI change, follow [.agents/skills/verify-veyra/SKILL.md](.agents/skills/verify-veyra/SKILL.md).
 Prove the real window and CLI path, not only compilation or unit tests.

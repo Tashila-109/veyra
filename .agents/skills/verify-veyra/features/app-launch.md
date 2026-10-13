@@ -174,8 +174,9 @@ PY
 
 Do not run it while another verification run is in restart-recovery's crash step.
 
-Use a disposable HOME and a PATH with no Claude to prevent an unauthorized live probe.
-Require the known system-wide install paths to contain no Claude before launch.
+Use a disposable HOME and a restricted PATH, then launch through macOS sandbox-exec with only the release Veyra executable allowed.
+The profile denies every child executable, so release probes cannot start an installed provider even when its known install path exists.
+The profile and provider-path metadata stay in release proof.
 Release still reads VEYRA_DATA_DIR, but excludes the driver, recording and provider overrides at compile time.
 The debug strings are the positive control.
 Before launch, the shared in-memory KERN_PROCARGS2 reader refuses any same-user marked process whose VEYRA_PARENT_PID names a dead pid.
@@ -194,13 +195,14 @@ REL_DATA=/tmp/veyra-rel-$RUN
 REL_PROOF=$PROOF/release
 test ! -e "$REL_DATA"
 mkdir -p "$REL_PROOF"
+test -x /usr/bin/sandbox-exec
 cargo build --release -p veyra
 if target/release/veyra ctl dump >"$REL_PROOF/ctl.txt" 2>&1; then rc=0; else rc=$?; fi
 printf 'exit=%s\n' "$rc" >>"$REL_PROOF/ctl.txt"
 test "$rc" = 2
 grep -qx 'usage: veyra \[mcp\]' "$REL_PROOF/ctl.txt"
 : >"$REL_PROOF/strings.txt"
-for name in control.sock VEYRA_CLAUDE_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD VEYRA_REAP_PIDS DebugNotificationResponse; do
+for name in control.sock VEYRA_CLAUDE_BIN VEYRA_CODEX_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD VEYRA_REAP_PIDS DebugNotificationResponse; do
     release=$(/usr/bin/strings -a target/release/veyra | grep -c "$name" || true)
     debug=$(/usr/bin/strings -a target/debug/veyra | grep -c "$name" || true)
     printf 'release %s count=%s\ndebug %s count=%s\n' "$name" "$release" "$name" "$debug" \
@@ -208,7 +210,20 @@ for name in control.sock VEYRA_CLAUDE_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD VEYRA
     test "$release" = 0
     test "$debug" -gt 0
 done
-for path in /opt/homebrew/bin/claude /usr/local/bin/claude /usr/bin/claude; do test ! -x "$path"; done
+python3 - <<'PYPROFILE'
+import json,os,pathlib
+proof=pathlib.Path(os.environ['RUN'])
+proof=pathlib.Path('target/verify-veyra')/proof/'release'
+executable=str(pathlib.Path('target/release/veyra').resolve())
+profile='(version 1)\n(allow default)\n(deny process-exec)\n(allow process-exec (literal '+json.dumps(executable)+'))\n'
+(proof/'no-child-exec.sb').write_text(profile)
+metadata={str(pathlib.Path(directory)/name):os.access(pathlib.Path(directory)/name,os.X_OK) for directory in ['/opt/homebrew/bin','/usr/local/bin','/usr/bin'] for name in ['claude','codex','grok']}
+(proof/'provider-paths.json').write_text(json.dumps(metadata,indent=2)+'\n')
+PYPROFILE
+if /usr/bin/sandbox-exec -f "$REL_PROOF/no-child-exec.sb" target/release/veyra ctl dump >"$REL_PROOF/profile-load.txt" 2>&1; then rc=0; else rc=$?; fi
+printf 'exit=%s\n' "$rc" >>"$REL_PROOF/profile-load.txt"
+test "$rc" = 2
+grep -qx 'usage: veyra \[mcp\]' "$REL_PROOF/profile-load.txt"
 PYTHONPATH="$PROOF" python3 - <<'PY'
 from driver import *
 stop('before-release')
@@ -228,14 +243,15 @@ PY
 mkdir -p "$REL_DATA/home"
 set -m
 HOME="$REL_DATA/home" SHELL=/usr/bin/false PATH=/usr/bin:/bin:/usr/sbin:/sbin VEYRA_DATA_DIR="$REL_DATA" \
-    target/release/veyra >"$REL_PROOF/stdout.log" 2>"$REL_PROOF/stderr.log" &
+    /usr/bin/sandbox-exec -f "$REL_PROOF/no-child-exec.sb" target/release/veyra >"$REL_PROOF/stdout.log" 2>"$REL_PROOF/stderr.log" &
 REL_PID=$!
-REL_PGID=$(ps -o pgid= -p "$REL_PID" | tr -d ' ')
+REL_PGID=$REL_PID
 printf '%s\n' "$REL_PID" >"$REL_PROOF/pid"
 printf '%s\n' "$REL_PGID" >"$REL_PROOF/pgid"
 stop_release() {
     if kill -0 "$REL_PID" 2>/dev/null; then
-        test "$REL_PID" = "$REL_PGID" || return 1
+        actual=$(ps -o pgid= -p "$REL_PID" | tr -d ' ')
+        test "$REL_PID" = "$REL_PGID" && test "$actual" = "$REL_PGID" || return 1
         kill -TERM -- "-$REL_PGID"
     fi
     for attempt in $(seq 1 50); do kill -0 "$REL_PID" 2>/dev/null || break; sleep .1; done
@@ -248,7 +264,7 @@ stop_release() {
     printf 'PASS release cleanup PID=%s DATA=%s\n' "$REL_PID" "$REL_DATA"
 }
 trap stop_release EXIT
-test "$REL_PID" = "$REL_PGID"
+test "$(ps -o pgid= -p "$REL_PID" | tr -d ' ')" = "$REL_PGID"
 for attempt in $(seq 1 100); do
     grep -q "^veyra ready pid=$REL_PID data_dir=$REL_DATA$" "$REL_PROOF/stderr.log" && break
     kill -0 "$REL_PID" 2>/dev/null || break
@@ -260,6 +276,10 @@ test ! -e "$REL_DATA/control.sock"
 test -S "$REL_DATA/veyra.sock"
 test "$(stat -f %Lp "$REL_DATA/veyra.sock")" = 600
 printf 'PASS release usage exit=2; driver and override strings absent; no driver socket\n'
+for attempt in $(seq 1 100); do
+    grep -q 'provider probe failed.*Operation not permitted\|provider probe failed.*Permission denied' "$REL_DATA/logs/veyra.log" && break
+    sleep .1
+done
 stop_release
 trap - EXIT
 test -s "$REL_PROOF/veyra.log"
@@ -269,6 +289,18 @@ if grep -q 'reaper signalled orphan group' "$REL_PROOF/veyra.log"; then
 fi
 PYTHONPATH="$PROOF" python3 - <<'PY'
 from driver import *
+import re
+release = PROOF/'release'
+metadata = json.loads((release/'provider-paths.json').read_text())
+log = (release/'veyra.log').read_text()
+probes = [line for line in log.splitlines() if 'provider probe failed' in line]
+assert probes, 'release probe diagnostics absent'
+denied = [line for line in probes if 'Operation not permitted' in line or 'Permission denied' in line]
+assert not any(re.search(r'\b\d+\.\d+\.\d+\b',line) for line in probes), 'release probe returned a version'
+assert all('not installed' in line or line in denied for line in probes), probes
+if any(metadata.values()): assert denied, 'installed provider exec was not denied'
+(release/'provider-probes.txt').write_text('\n'.join(probes)+'\n')
+print('PASS release sandbox loaded; installed-provider exec denied; no provider version received')
 start('after-release')
 print('PASS debug relaunched after release window ended')
 PY
@@ -284,7 +316,8 @@ PY
 - Migration: `migration-task-loaded.json` retains the delivered summary with a null source; `migration-unlinked-report.png` shows the legacy reply without a delivery badge after the schema-2 to schema-3 launch.
 - Recovery: `persisted-project.txt` matches the SQLite row after both relaunches; migration, WAL, tables, mode and inode are asserted every time.
 - Release: `release/strings.txt` has zero release counts and positive debug controls for every driver and override name, `ctl.txt` exits 2 and `data-listing.txt` has no driver socket.
-- Release: `release/veyra.log` contains no `reaper signalled orphan group` line.
+- Release: `release/provider-paths.json` records each known provider path, including `/opt/homebrew/bin/codex`; `profile-load.txt` proves the sandbox loaded.
+- Release: `release/veyra.log` contains no `reaper signalled orphan group` line; `provider-probes.txt` shows failed execs and no provider version.
 - Cleanup: `marker-check.txt` passes and DATA is absent while proof remains.
 
 ## Gotchas
@@ -293,4 +326,5 @@ The composer is now real; a text error is not expected while it is focused.
 Adding a project and checking readiness run no turn.
 This page leaves the fixture binary missing for new-thread's installation proof.
 The native folder picker, pointer resizing and theme switching remain manual entry points.
-Do not launch a release check that can find the user's Claude without consent.
+The release sandbox must deny every child executable; do not fall back to an unsandboxed launch.
+An unavailable sandbox-exec, an invalid profile or a missing exec-denial receipt fails the release check.

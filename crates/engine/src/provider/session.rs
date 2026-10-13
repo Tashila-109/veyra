@@ -19,10 +19,14 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncWrite, AsyncWriteExt},
     process::Child,
     sync::{mpsc, oneshot},
 };
+
+pub(crate) use super::lines::{ByteLines, Line};
+#[cfg(test)]
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub(crate) struct ProcessGroup {
     child: Option<Child>,
@@ -172,15 +176,48 @@ pub(crate) async fn write_interrupt(
     }
     Ok(())
 }
+pub(crate) async fn write(
+    mut stdin: impl AsyncWrite + Unpin,
+    mut input: mpsc::UnboundedReceiver<Outbound>,
+    active: Arc<Mutex<Option<crate::domain::TurnId>>>,
+    closing: Arc<crate::LaunchGate>,
+    #[cfg(test)] close_before_prompt: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    while let Some(outbound) = input.recv().await {
+        let prompt = matches!(&outbound, Outbound::Prompt(_));
+        let interrupt = match &outbound {
+            Outbound::Interrupt { turn, .. } => Some(*turn),
+            _ => None,
+        };
+        #[cfg(test)]
+        if prompt && close_before_prompt.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            closing.close();
+        }
+        if prompt && closing.is_closing() {
+            continue;
+        }
+        let mut bytes = outbound.into_bytes()?;
+        bytes.push(b'\n');
+        if let Some(turn) = interrupt {
+            write_interrupt(&mut stdin, &bytes, turn, &active).await?;
+        } else {
+            stdin.write_all(&bytes).await?;
+        }
+        stdin.flush().await?;
+    }
+    Ok(())
+}
 struct Process {
+    io: SessionIo,
+    codec: Codec,
+}
+struct SessionIo {
     child: ProcessGroup,
-    native: NativeSessionId,
-    codex: Option<codex::Codec>,
     mcp: Option<crate::mcp::Session>,
     #[cfg(debug_assertions)]
     recorder: Option<record::Recorder>,
 }
-impl Process {
+impl SessionIo {
     fn send(
         &mut self,
         writer: &mpsc::UnboundedSender<Outbound>,
@@ -196,7 +233,7 @@ impl Process {
         }
         writer
             .send(line)
-            .map_err(|_| ProviderError::Protocol("Claude stdin writer closed".into()))
+            .map_err(|_| ProviderError::Protocol("Provider stdin writer closed".into()))
     }
     fn record_inbound(&mut self, line: &mut serde_json::Value) -> Result<(), ProviderError> {
         if let Some(mcp) = &self.mcp
@@ -231,23 +268,25 @@ fn launch(
     fresh: Option<NativeSessionId>,
     session_epoch: u32,
 ) -> Result<Process, ProviderError> {
-    if provider == ProviderKind::Codex {
-        return launch_codex(spec, env, session_epoch);
-    }
-    let binary = env.resolve(ProviderKind::Claude)?;
+    let binary = env.resolve(provider)?;
+    let (mut args, native) = match provider {
+        ProviderKind::Claude => {
+            let native = fresh
+                .or_else(|| spec.native.clone())
+                .unwrap_or_else(|| NativeSessionId(spec.thread.to_string()));
+            let mut args = claude::args(Some(spec));
+            if spec.native.is_none()
+                && let Some(index) = args.iter().position(|arg| arg == "--session-id")
+            {
+                args[index + 1] = native.0.clone();
+            }
+            (args, Some(native))
+        }
+        ProviderKind::Codex => (vec!["app-server".into()], None),
+        ProviderKind::Grok => return Err(ProviderError::NotBuilt),
+    };
     #[cfg(debug_assertions)]
     let (n, epoch) = env.next_lane(spec.thread);
-    let mut args = claude::args(Some(spec));
-    let native = fresh.unwrap_or_else(|| {
-        spec.native
-            .clone()
-            .unwrap_or_else(|| NativeSessionId(spec.thread.to_string()))
-    });
-    if spec.native.is_none()
-        && let Some(index) = args.iter().position(|arg| arg == "--session-id")
-    {
-        args[index + 1] = native.0.clone();
-    }
     #[cfg(debug_assertions)]
     let fixture = env
         .fixtures
@@ -262,55 +301,125 @@ fn launch(
         .map(|root| {
             record::Recorder::create(
                 &root.join(format!("t{n}-s{epoch}.jsonl")),
-                "claude",
-                "unknown until system/init",
+                provider.binary(),
+                match provider {
+                    ProviderKind::Claude => "unknown until system/init",
+                    ProviderKind::Codex => "unknown until thread reply",
+                    ProviderKind::Grok => "unknown",
+                },
                 &spec.cwd,
                 env.home.as_deref(),
                 None,
             )
         })
         .transpose()?;
-    let (child, mcp) = if spec.root
+    let (child, mcp, codex_config) = if spec.root
         && let Some(server) = &env.mcp
     {
-        let (child, config, hash) = server.for_spawn(spec.thread, session_epoch, |token| {
-            let config = crate::mcp::Configuration::create(
-                server.socket.parent().unwrap(),
-                spec.thread,
-                &server.command,
-                &server.socket,
-                token,
-            )?;
-            args.extend([
-                "--mcp-config".into(),
-                config.path.to_string_lossy().into_owned(),
-            ]);
-            let child = env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?;
-            let pid = child.pid();
-            Ok(((child, config, crate::mcp::TokenHash(token.hash())), pid))
-        })?;
+        let (child, config, codex_config, hash) =
+            server.for_spawn(spec.thread, session_epoch, |token| {
+                let (config, codex_config) = match provider {
+                    ProviderKind::Claude => {
+                        let config = crate::mcp::Configuration::create(
+                            server.socket.parent().unwrap(),
+                            spec.thread,
+                            &server.command,
+                            &server.socket,
+                            token,
+                        )?;
+                        args.extend([
+                            "--mcp-config".into(),
+                            config.path.to_string_lossy().into_owned(),
+                        ]);
+                        (Some(config), None)
+                    }
+                    ProviderKind::Codex => (
+                        None,
+                        Some(Arc::new(codex::McpConfig {
+                            command: server.command.clone(),
+                            socket: server.socket.clone(),
+                            token: token.clone(),
+                        })),
+                    ),
+                    ProviderKind::Grok => return Err(ProviderError::NotBuilt),
+                };
+                let child = env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?;
+                let pid = child.pid();
+                Ok((
+                    (
+                        child,
+                        config,
+                        codex_config,
+                        crate::mcp::TokenHash(token.hash()),
+                    ),
+                    pid,
+                ))
+            })?;
         (
             child,
             Some(crate::mcp::Session {
-                config: Some(config),
+                config,
                 hash,
                 server: server.clone(),
             }),
+            codex_config,
         )
     } else {
         (
             env.spawn(&binary, &args, &spec.cwd, fixture.as_deref())?,
             None,
+            None,
         )
     };
+    let codec = match (provider, native) {
+        (ProviderKind::Claude, Some(native)) => {
+            Codec::Claude(Box::new(claude::Codec::new(native, child.pid(), &spec.cwd)))
+        }
+        (ProviderKind::Codex, _) => Codec::Codex(Box::new(codex::Codec::new(
+            spec.clone(),
+            child.pid(),
+            codex_config,
+        ))),
+        (ProviderKind::Claude, None) => {
+            return Err(ProviderError::Protocol(
+                "Claude session has no native id".into(),
+            ));
+        }
+        (ProviderKind::Grok, _) => return Err(ProviderError::NotBuilt),
+    };
     Ok(Process {
-        child,
-        native,
-        codex: None,
-        mcp,
-        #[cfg(debug_assertions)]
-        recorder,
+        io: SessionIo {
+            child,
+            mcp,
+            #[cfg(debug_assertions)]
+            recorder,
+        },
+        codec,
     })
+}
+#[cfg(test)]
+impl Process {
+    fn test(
+        child: ProcessGroup,
+        native: NativeSessionId,
+        mcp: Option<crate::mcp::Session>,
+        #[cfg(debug_assertions)] recorder: Option<record::Recorder>,
+    ) -> Self {
+        let codec = Codec::Claude(Box::new(claude::Codec::new(
+            native,
+            child.pid(),
+            std::path::Path::new("/tmp"),
+        )));
+        Self {
+            io: SessionIo {
+                child,
+                mcp,
+                #[cfg(debug_assertions)]
+                recorder,
+            },
+            codec,
+        }
+    }
 }
 pub fn spawn(
     spec: SessionSpec,
@@ -377,7 +486,7 @@ fn start_provider_task(
                 }
             }
         };
-        process.child.watch(&cleanup);
+        process.io.child.watch(&cleanup);
         loop {
             match run_one(
                 process,
@@ -398,7 +507,7 @@ fn start_provider_task(
                         .and_then(|()| launch(provider, &spec, &env, Some(native), epoch))
                     {
                         Ok(mut next) => {
-                            next.child.watch(&cleanup);
+                            next.io.child.watch(&cleanup);
                             let notice = ProviderEvent::Session(SessionEvent::Notice {
                                 text: "The earlier conversation could not be resumed; this is a new session".into(),
                             });
@@ -464,14 +573,7 @@ async fn supervise(
             epoch,
             ProviderEvent::Session(SessionEvent::Exited {
                 crash: Some(record::redact(
-                    &format!(
-                        "{} session task failed: {error}",
-                        if provider == ProviderKind::Claude {
-                            "Claude"
-                        } else {
-                            provider.label()
-                        }
-                    ),
+                    &format!("{} session task failed: {error}", provider.name()),
                     None,
                 )),
             }),
@@ -492,51 +594,6 @@ async fn emit(
     })
     .await
     .is_ok()
-}
-const LINE_CAP: usize = 4 * 1024 * 1024;
-pub(crate) enum Line {
-    Text(String),
-    Oversize(usize),
-}
-pub(crate) struct ByteLines<R> {
-    reader: BufReader<R>,
-    bytes: Vec<u8>,
-    length: usize,
-}
-impl<R: AsyncRead + Unpin> ByteLines<R> {
-    pub(crate) fn new(reader: R) -> Self {
-        Self {
-            reader: BufReader::new(reader),
-            bytes: Vec::new(),
-            length: 0,
-        }
-    }
-    pub(crate) async fn next(&mut self) -> std::io::Result<Option<Line>> {
-        loop {
-            let available = self.reader.fill_buf().await?;
-            let end = available.iter().position(|byte| *byte == b'\n');
-            let count = end.unwrap_or(available.len());
-            let eof = available.is_empty();
-            self.length = self.length.saturating_add(count);
-            if self.length <= LINE_CAP {
-                self.bytes.extend_from_slice(&available[..count]);
-            } else {
-                self.bytes.clear();
-            }
-            self.reader.consume(count + usize::from(end.is_some()));
-            if end.is_some() || eof {
-                let length = std::mem::take(&mut self.length);
-                let bytes = std::mem::take(&mut self.bytes);
-                return Ok(if eof && length == 0 {
-                    None
-                } else if length > LINE_CAP {
-                    Some(Line::Oversize(length))
-                } else {
-                    Some(Line::Text(String::from_utf8_lossy(&bytes).into_owned()))
-                });
-            }
-        }
-    }
 }
 struct SessionControls {
     receiver: mpsc::UnboundedReceiver<SessionControl>,
@@ -605,20 +662,20 @@ enum Completion {
 }
 
 async fn run_one(
-    mut process: Process,
+    process: Process,
     control: &mut SessionControls,
     out: &mpsc::Sender<EngineMsg>,
     thread: ThreadId,
     epoch: u32,
     resume: bool,
-    cwd: &std::path::Path,
+    _cwd: &std::path::Path,
 ) -> Completion {
+    let Process {
+        io: mut process,
+        mut codec,
+    } = process;
     let pid = process.child.pid();
-    let provider = if process.codex.is_some() {
-        ProviderKind::Codex
-    } else {
-        ProviderKind::Claude
-    };
+    let provider = codec.provider();
     let stdout = process.child.stdout().expect("piped stdout");
     let mut lines = if provider == ProviderKind::Codex {
         SessionLines::Rpc(jsonrpc::Reader::start(stdout))
@@ -632,7 +689,7 @@ async fn run_one(
         while let Ok(Some(line)) = errors.next().await {
             let line = match line {
                 Line::Text(line) => line,
-                Line::Oversize(length) => format!("Claude stderr line skipped ({length} bytes)"),
+                Line::Oversize(length) => format!("Provider stderr line skipped ({length} bytes)"),
             };
             let mut tail = stderr_tail.lock().unwrap();
             tail.push_back(line);
@@ -644,7 +701,7 @@ async fn run_one(
     let stdin = process.child.stdin().expect("piped stdin");
     let (writer, input) = mpsc::unbounded_channel::<Outbound>();
     let active_turn = Arc::new(Mutex::new(None));
-    let mut write_task = tokio::spawn(jsonrpc::write(
+    let mut write_task = tokio::spawn(write(
         stdin,
         input,
         active_turn.clone(),
@@ -652,21 +709,13 @@ async fn run_one(
         #[cfg(test)]
         control.close_before_user_write.clone(),
     ));
-    let mut codec = match process.codex.take() {
-        Some(codec) => Codec::Codex(Box::new(codec)),
-        None => Codec::Claude(Box::new(claude::Codec::new(
-            process.native.clone(),
-            pid,
-            cwd,
-        ))),
-    };
     let mut ready = false;
     let mut rejected = None;
     #[cfg(debug_assertions)]
     if let Some(recorder) = &mut process.recorder
-        && !process.native.0.is_empty()
+        && let Some(native) = codec.native()
     {
-        recorder.bind(process.native.0.clone(), "<id:session>".into());
+        recorder.bind(native.0.clone(), "<id:session>".into());
     }
     let mut failure = process
         .send(&writer, Outbound::Message(codec.initialize()))
@@ -739,14 +788,14 @@ async fn run_one(
             result = &mut write_task => {
                 writer_done = true;
                 failure = Some(match result {
-                    Ok(Err(error)) => format!("{} stdin writer failed: {error}", if provider == ProviderKind::Claude { "Claude" } else { provider.label() }),
-                    Err(error) => format!("{} stdin writer task failed: {error}", if provider == ProviderKind::Claude { "Claude" } else { provider.label() }),
-                    Ok(Ok(())) => format!("{} stdin writer closed", if provider == ProviderKind::Claude { "Claude" } else { provider.label() }),
+                    Ok(Err(error)) => format!("{} stdin writer failed: {error}", provider.name()),
+                    Err(error) => format!("{} stdin writer task failed: {error}", provider.name()),
+                    Ok(Ok(())) => format!("{} stdin writer closed", provider.name()),
                 });
                 break;
             }
             _ = async {
-                match codec.interrupt_deadline() {
+                match codec.next_deadline() {
                     Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
@@ -763,9 +812,9 @@ async fn run_one(
             }
             line = lines.next() => match line {
                 Ok(Some(Line::Oversize(length))) => {
-                    tracing::info!(length, "skipped oversized Claude line");
+                    tracing::info!(length, provider = provider.name(), "skipped oversized provider line");
                     if !emit(out, thread, epoch, ProviderEvent::Session(SessionEvent::Notice {
-                        text: "Claude sent a line larger than 4 MiB; Veyra skipped it.".into()
+                        text: format!("{} sent a line larger than 4 MiB; Veyra skipped it.", provider.name())
                     })).await { consumer_gone = true; break; }
                 }
                 Ok(Some(Line::Text(line))) => {
@@ -773,7 +822,7 @@ async fn run_one(
                         Ok(wire) => wire,
                         Err(error) => {
                             tracing::info!(length = line.len(), "skipped non-JSON provider line");
-                            if provider == ProviderKind::Claude { rejected = Some(ProviderError::Json(error).to_string()); }
+                            if provider == ProviderKind::Claude { rejected = Some(format!("{} protocol: {error}", provider.name())); }
                             continue;
                         }
                     };
@@ -783,16 +832,10 @@ async fn run_one(
                         break;
                     }
                     match codec.value(wire) {
-                        Ok(decoded) => {
+                        Ok(mut decoded) => {
                             *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
-                            for line in decoded.controls {
+                            for line in decoded.take_outbound() {
                                 if let Err(error) = process.send(&writer, line) { failure = Some(error.to_string()); break; }
-                            }
-                            for reply in decoded.replies {
-                                if let Err(error) = process.send(&writer, Outbound::Message(reply)) {
-                                    failure = Some(error.to_string());
-                                    break;
-                                }
                             }
                             if failure.is_some() { break; }
                             if let Some(provider_turn) = decoded.provider_turn
@@ -977,7 +1020,7 @@ async fn drain_stderr(
                 match status {
                     Ok(status) => observed = Some(status),
                     Err(error) => {
-                        tracing::warn!(%error, "could not wait for Claude exit");
+                        tracing::warn!(%error, "could not wait for provider exit");
                         wait_failed = true;
                     }
                 }
@@ -1123,21 +1166,18 @@ fn start_task(
     start_provider_task(ProviderKind::Claude, process, spec, env, out, epoch)
 }
 fn provider_crash_text(provider: ProviderKind, code: Option<i32>, lines: &[String]) -> String {
-    if provider == ProviderKind::Claude {
-        crash_text(code, lines, None)
-    } else {
-        with_stderr(
-            &format!(
-                "{} exited unexpectedly (exit code {})",
-                provider.binary(),
-                code.map(|c| c.to_string())
-                    .unwrap_or_else(|| "unknown".into())
-            ),
-            lines,
-            None,
-        )
-    }
+    with_stderr(
+        &format!(
+            "{} exited unexpectedly (exit code {})",
+            provider.binary(),
+            code.map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ),
+        lines,
+        None,
+    )
 }
+
 enum SessionLines {
     Direct(ByteLines<tokio::process::ChildStdout>),
     Rpc(jsonrpc::Reader),
@@ -1146,7 +1186,7 @@ impl SessionLines {
     async fn next(&mut self) -> std::io::Result<Option<Line>> {
         match self {
             Self::Direct(lines) => lines.next().await,
-            Self::Rpc(lines) => lines.next().await,
+            Self::Rpc(lines) => Ok(lines.next().await?.map(Line::Text)),
         }
     }
 }
@@ -1155,6 +1195,19 @@ enum Codec {
     Codex(Box<codex::Codec>),
 }
 impl Codec {
+    fn provider(&self) -> ProviderKind {
+        match self {
+            Self::Claude(_) => ProviderKind::Claude,
+            Self::Codex(_) => ProviderKind::Codex,
+        }
+    }
+    #[cfg(debug_assertions)]
+    fn native(&self) -> Option<&NativeSessionId> {
+        match self {
+            Self::Claude(c) => Some(c.native()),
+            Self::Codex(c) => c.native(),
+        }
+    }
     fn initialize(&mut self) -> serde_json::Value {
         match self {
             Self::Claude(_) => claude::initialize(),
@@ -1164,7 +1217,7 @@ impl Codec {
     fn active(&self) -> Option<ActiveTurn> {
         match self {
             Self::Claude(c) => c.active,
-            Self::Codex(c) => c.active,
+            Self::Codex(c) => c.active(),
         }
     }
     fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
@@ -1201,10 +1254,10 @@ impl Codec {
             Self::Codex(c) => c.interrupt_lines(turn, reason),
         }
     }
-    fn interrupt_deadline(&self) -> Option<tokio::time::Instant> {
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
         match self {
-            Self::Claude(c) => c.interrupt_deadline(),
-            Self::Codex(c) => c.interrupt_deadline(),
+            Self::Claude(c) => c.next_deadline(),
+            Self::Codex(c) => c.next_deadline(),
         }
     }
     fn escalate_interrupt(&mut self) -> Option<Signal> {
@@ -1231,82 +1284,11 @@ impl Codec {
         }
     }
 }
-fn launch_codex(spec: &SessionSpec, env: &ChildEnv, epoch: u32) -> Result<Process, ProviderError> {
-    let binary = env.resolve(ProviderKind::Codex)?;
-    #[cfg(debug_assertions)]
-    let (n, lane) = env.next_lane(spec.thread);
-    #[cfg(debug_assertions)]
-    let fixture = env
-        .fixtures
-        .as_ref()
-        .map(|root| root.join(format!("t{n}-s{lane}.jsonl")));
-    #[cfg(not(debug_assertions))]
-    let fixture: Option<std::path::PathBuf> = None;
-    #[cfg(debug_assertions)]
-    let recorder = env
-        .record
-        .as_ref()
-        .map(|root| {
-            record::Recorder::create(
-                &root.join(format!("t{n}-s{lane}.jsonl")),
-                "codex",
-                "unknown until thread reply",
-                &spec.cwd,
-                env.home.as_deref(),
-                None,
-            )
-        })
-        .transpose()?;
-    let (child, mcp, config) = if spec.root
-        && let Some(server) = &env.mcp
-    {
-        let (child,config,hash)=server.for_spawn(spec.thread,epoch,|token| {
-            let config=serde_json::json!({"command":server.command,"args":["mcp"],"env":{"VEYRA_SOCKET":server.socket,"VEYRA_MCP_TOKEN":token.expose()}});
-            let child=env.spawn(&binary,&["app-server".into()],&spec.cwd,fixture.as_deref())?;
-            let pid=child.pid();
-            Ok(((child,config,crate::mcp::TokenHash(token.hash())),pid))
-        })?;
-        (
-            child,
-            Some(crate::mcp::Session {
-                config: None,
-                hash,
-                server: server.clone(),
-            }),
-            Some(config),
-        )
-    } else {
-        (
-            env.spawn(
-                &binary,
-                &["app-server".into()],
-                &spec.cwd,
-                fixture.as_deref(),
-            )?,
-            None,
-            None,
-        )
-    };
-    let codec = codex::Codec::new(spec.clone(), child.pid(), config);
-    Ok(Process {
-        child,
-        native: spec
-            .native
-            .clone()
-            .unwrap_or_else(|| NativeSessionId(String::new())),
-        codex: Some(codec),
-        mcp,
-        #[cfg(debug_assertions)]
-        recorder,
-    })
-}
-
 pub async fn probe_codex(
     env: &ChildEnv,
     cwd: &std::path::Path,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<super::Probe, ProviderError> {
-    use serde_json::{Value, json};
     let binary = env.resolve(ProviderKind::Codex)?;
     #[cfg(debug_assertions)]
     let fixture = env
@@ -1320,7 +1302,7 @@ pub async fn probe_codex(
     let mut reader = jsonrpc::Reader::start(child.stdout().expect("piped stdout"));
     let stderr = discard_stderr(&mut child);
     let (writer, input) = mpsc::unbounded_channel();
-    let write_task = tokio::spawn(jsonrpc::write(
+    let write_task = tokio::spawn(write(
         child.stdin().expect("piped stdin"),
         input,
         Default::default(),
@@ -1329,53 +1311,10 @@ pub async fn probe_codex(
         Default::default(),
     ));
     let result = tokio::select! {
-        _=&mut cancelled=>Err(ProviderError::Cancelled),
-        result=tokio::time::timeout(Duration::from_secs(5),async {
-            let mut peer=jsonrpc::Peer::new(false);
-            writer.send(Outbound::Message(peer.send("initialize","initialize",codex::initialize()))).map_err(|_|ProviderError::Protocol("Codex probe writer closed".into()))?;
-            let mut version=None;
-            let mut account=None;
-            let mut readiness=super::Readiness::Ready;
-            let mut models=vec![];
-            let mut waiting=2;
-            while let Some(line)=reader.next().await? {
-                let Line::Text(line)=line else {unreachable!()};
-                let Ok(wire)=serde_json::from_str::<Value>(&line) else {continue};
-                match peer.receive(wire) {
-                    jsonrpc::Frame::Reply {tag,result}=>{
-                        let result=result.map_err(jsonrpc::failure)?;
-                        match tag {
-                            "initialize"=>{
-                                version=result["userAgent"].as_str().and_then(|s|s.split_whitespace().next()).and_then(|s|s.rsplit_once('/')).map(|(_,v)|v.to_owned());
-                                writer.send(Outbound::Message(peer.notification("initialized",Value::Null))).map_err(|_|ProviderError::Protocol("Codex probe writer closed".into()))?;
-                                for (method,params) in [("account/read",json!({"refreshToken":false})),("model/list",json!({}))] {
-                                    writer.send(Outbound::Message(peer.send(method,method,params))).map_err(|_|ProviderError::Protocol("Codex probe writer closed".into()))?;
-                                }
-                            }
-                            "account/read"=>{
-                                account=result.get("account").filter(|a|!a.is_null()).cloned();
-                                if result.get("account")==Some(&Value::Null) && result["requiresOpenaiAuth"]==true {readiness=super::Readiness::SignedOut;}
-                                waiting-=1;
-                            }
-                            "model/list"=>{
-                                if let Some(data)=result["data"].as_array() {
-                                    models.extend(data.iter().filter_map(|m|Some(super::Model {value:m["model"].as_str().or_else(||m["id"].as_str())?.into(),display_name:m["displayName"].as_str().unwrap_or_default().into(),effort_levels:m["supportedReasoningEfforts"].as_array().map(|a|a.iter().filter_map(|e|e["reasoningEffort"].as_str().map(str::to_owned)).collect()).unwrap_or_default()})));
-                                }
-                                if let Some(cursor)=result["nextCursor"].as_str() {
-                                    writer.send(Outbound::Message(peer.send("model/list","model/list",json!({"cursor":cursor})))).map_err(|_|ProviderError::Protocol("Codex probe writer closed".into()))?;
-                                } else {waiting-=1;}
-                            }
-                            _=>{}
-                        }
-                        if waiting==0 {return Ok(super::Probe {provider:ProviderKind::Codex,path:Some(binary.clone()),version,readiness,models,account});}
-                    }
-                    jsonrpc::Frame::Request {id,..}=>{let _=writer.send(Outbound::Message(peer.error(id,-32601,"Unsupported server request")));}
-                    _=>{}
-                }
-            }
-            peer.eof("Codex probe stdout closed");
-            Err(ProviderError::Protocol("Codex probe ended without a reply".into()))
-        })=>result.unwrap_or_else(|_|Err(ProviderError::Protocol("Codex probe timed out".into()))),
+        _ = &mut cancelled => Err(ProviderError::Cancelled),
+        result = tokio::time::timeout(Duration::from_secs(5), codex::probe_exchange(&mut reader, &writer, binary)) => {
+            result.unwrap_or_else(|_|Err(ProviderError::Protocol("Codex probe timed out".into())))
+        }
     };
     drop(writer);
     write_task.abort();
@@ -1449,14 +1388,13 @@ mod tests {
             )
             .unwrap();
         let pid = child.pid();
-        let process = Process {
+        let process = Process::test(
             child,
-            native: NativeSessionId("fixture-session".into()),
-            codex: None,
-            mcp: None,
+            NativeSessionId("fixture-session".into()),
+            None,
             #[cfg(debug_assertions)]
-            recorder: None,
-        };
+            None,
+        );
         let (sender, control) = mpsc::unbounded_channel();
         let mut control = SessionControls::new(control, Default::default());
         sender
@@ -1540,14 +1478,13 @@ mod tests {
                 )
                 .unwrap();
             let pid = child.pid();
-            let process = Process {
+            let process = Process::test(
                 child,
-                native: NativeSessionId("fixture-session".into()),
-                codex: None,
-                mcp: None,
+                NativeSessionId("fixture-session".into()),
+                None,
                 #[cfg(debug_assertions)]
-                recorder: None,
-            };
+                None,
+            );
             let (sender, control) = mpsc::unbounded_channel();
             let mut control = SessionControls::new(control, Default::default());
             sender
@@ -1610,14 +1547,13 @@ mod tests {
             )
             .unwrap();
         let pid = child.pid();
-        let process = Process {
+        let process = Process::test(
             child,
-            native: NativeSessionId("fixture-session".into()),
-            codex: None,
-            mcp: None,
+            NativeSessionId("fixture-session".into()),
+            None,
             #[cfg(debug_assertions)]
-            recorder: None,
-        };
+            None,
+        );
         let (sender, control) = mpsc::unbounded_channel();
         let mut control = SessionControls::new(control, Default::default());
         sender
@@ -1673,14 +1609,13 @@ mod tests {
             )
             .unwrap();
         let pid = child.pid();
-        let process = Process {
+        let process = Process::test(
             child,
-            native: NativeSessionId("fixture-session".into()),
-            codex: None,
-            mcp: None,
+            NativeSessionId("fixture-session".into()),
+            None,
             #[cfg(debug_assertions)]
-            recorder: None,
-        };
+            None,
+        );
         let (sender, control) = mpsc::unbounded_channel();
         let mut control = SessionControls::new(control, Default::default());
         sender
@@ -1751,14 +1686,13 @@ mod tests {
         let mut group = child;
         let pid = group.pid();
         group.check = |_, _| Ok(true);
-        let process = Process {
-            child: group,
-            native: NativeSessionId("fixture-session".into()),
-            codex: None,
-            mcp: None,
+        let process = Process::test(
+            group,
+            NativeSessionId("fixture-session".into()),
+            None,
             #[cfg(debug_assertions)]
-            recorder: None,
-        };
+            None,
+        );
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let (out, mut events) = mpsc::channel(256);
@@ -1893,14 +1827,13 @@ mod tests {
             )
             .unwrap();
         let pid = child.pid();
-        let process = Process {
+        let process = Process::test(
             child,
-            native: NativeSessionId("fixture-session".into()),
-            codex: None,
-            mcp: None,
+            NativeSessionId("fixture-session".into()),
+            None,
             #[cfg(debug_assertions)]
-            recorder: None,
-        };
+            None,
+        );
         let (sender, control) = mpsc::unbounded_channel();
         let mut control = SessionControls::new(control, Default::default());
         let turn = TurnId::new();
@@ -2027,14 +1960,13 @@ mod tests {
         let mut group = child;
         let pid = group.pid();
         group.check = |_, _| Ok(true);
-        let process = Process {
-            child: group,
-            native: NativeSessionId("fixture-session".into()),
-            codex: None,
-            mcp: None,
+        let process = Process::test(
+            group,
+            NativeSessionId("fixture-session".into()),
+            None,
             #[cfg(debug_assertions)]
-            recorder: None,
-        };
+            None,
+        );
         let thread = ThreadId::new();
         let turn = TurnId::new();
         let (out, mut events) = mpsc::channel(256);
@@ -2210,13 +2142,13 @@ mod tests {
                     )
                     .unwrap();
                 let pid = child.pid();
-                let process = Process {
+                let process = Process::test(
                     child,
-                    native: NativeSessionId("missing-native".into()),
-                    codex: None,
-                    mcp: None,
-                    recorder: None,
-                };
+                    NativeSessionId("missing-native".into()),
+                    None,
+                    #[cfg(debug_assertions)]
+                    None,
+                );
                 let thread = ThreadId::new();
                 let (out, mut events) = mpsc::channel(256);
                 let handle = start_session(
@@ -2685,21 +2617,19 @@ mod mcp_record_tests {
                 None,
             )
             .unwrap();
-        let mut process = Process {
+        let mut process = Process::test(
             child,
-            native: NativeSessionId("record-only".into()),
-            codex: None,
-            mcp: Some(crate::mcp::Session {
+            NativeSessionId("record-only".into()),
+            Some(crate::mcp::Session {
                 config: Some(config),
                 hash: crate::mcp::TokenHash(token.hash()),
                 server,
             }),
-            recorder: Some(
-                record::Recorder::create(&capture, "claude", "fake", &root, None, None).unwrap(),
-            ),
-        };
+            #[cfg(debug_assertions)]
+            Some(record::Recorder::create(&capture, "claude", "fake", &root, None, None).unwrap()),
+        );
         let mut wire = serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":format!("prefix {} suffix",token.expose())}]}});
-        process.record_inbound(&mut wire).unwrap();
+        process.io.record_inbound(&mut wire).unwrap();
         assert!(
             !wire.to_string().contains(token.expose()),
             "credential reached provider decoding"
@@ -2711,9 +2641,12 @@ mod mcp_record_tests {
         );
         assert!(recorded.contains("<id:token>"));
         let Process {
-            child,
-            mcp,
-            recorder,
+            io:
+                SessionIo {
+                    child,
+                    mcp,
+                    recorder,
+                },
             ..
         } = process;
         child.stop().await.unwrap();

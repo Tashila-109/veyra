@@ -2,6 +2,7 @@ pub mod claude;
 pub mod codex;
 pub mod env;
 pub mod jsonrpc;
+pub(crate) mod lines;
 #[cfg(test)]
 pub mod scripted;
 pub mod session;
@@ -178,7 +179,7 @@ pub enum ProviderError {
     FixtureMissing(PathBuf),
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    #[error("Claude protocol: {0}")]
+    #[error("Provider protocol: {0}")]
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Protocol(String),
@@ -259,6 +260,13 @@ impl ProviderKind {
             Self::Grok => "grok login",
         }
     }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::Grok => "Grok",
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
@@ -276,7 +284,7 @@ impl ProviderKind {
             let result = match self {
                 Self::Claude => session::probe(env, cwd, cancelled).await,
                 Self::Codex => session::probe_codex(env, cwd, cancelled).await,
-                Self::Grok => unreachable!(),
+                Self::Grok => Err(ProviderError::NotBuilt),
             };
             match result {
                 Ok(probe) => probe,
@@ -310,7 +318,7 @@ impl ProviderKind {
 }
 #[derive(Clone)]
 pub enum Spawner {
-    Cli(env::ChildEnv),
+    Cli(Box<env::ChildEnv>),
     #[cfg(test)]
     Scripted(scripted::Scripted),
 }
@@ -324,7 +332,7 @@ impl Spawner {
     ) -> Result<SessionHandle, ProviderError> {
         match self {
             Self::Cli(env) if provider.is_built() => {
-                session::spawn_provider(provider, spec, env.clone(), out, epoch)
+                session::spawn_provider(provider, spec, env.as_ref().clone(), out, epoch)
             }
             Self::Cli(_) => Err(ProviderError::NotBuilt),
             #[cfg(test)]
@@ -405,26 +413,81 @@ impl ActiveTurn {
         }
     }
 }
+enum StopPhase {
+    Protocol(tokio::time::Instant),
+    Terminate(tokio::time::Instant),
+}
+pub(crate) struct StopLadder {
+    phase: StopPhase,
+    pub reason: String,
+}
+impl StopLadder {
+    pub fn new(reason: StopReason) -> Self {
+        Self {
+            phase: StopPhase::Protocol(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+            ),
+            reason: reason.text().into(),
+        }
+    }
+    pub fn deadline(&self) -> tokio::time::Instant {
+        match self.phase {
+            StopPhase::Protocol(at) | StopPhase::Terminate(at) => at,
+        }
+    }
+    pub fn escalate(&mut self) -> Option<crate::platform::Signal> {
+        if tokio::time::Instant::now() < self.deadline() {
+            return None;
+        }
+        Some(match self.phase {
+            StopPhase::Protocol(_) => {
+                self.phase = StopPhase::Terminate(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                );
+                crate::platform::Signal::Terminate
+            }
+            StopPhase::Terminate(_) => crate::platform::Signal::Kill,
+        })
+    }
+    pub fn outcome(&self) -> TurnOutcome {
+        TurnOutcome::Interrupted {
+            reason: self.reason.clone(),
+        }
+    }
+}
 pub(crate) enum Outbound {
     Prompt(serde_json::Value),
     Message(serde_json::Value),
-    Interrupt(TurnId),
-    RpcInterrupt {
+    CodexThread {
+        line: serde_json::Value,
+        mcp: std::sync::Arc<codex::McpConfig>,
+    },
+    Interrupt {
         turn: TurnId,
         line: serde_json::Value,
     },
 }
 impl Outbound {
+    #[cfg(any(debug_assertions, test))]
     pub fn value(&self) -> serde_json::Value {
         match self {
-            Self::Prompt(line) | Self::Message(line) | Self::RpcInterrupt { line, .. } => {
-                line.clone()
+            Self::CodexThread { line, mcp } => {
+                let mut line = line.clone();
+                line["params"]["config"] = mcp.value("<id:token>");
+                line
             }
-            Self::Interrupt(_) => serde_json::json!({
-                "type":"control_request", "request_id":"veyra-interrupt",
-                "request":{"subtype":"interrupt"}
-            }),
+            Self::Prompt(line) | Self::Message(line) | Self::Interrupt { line, .. } => line.clone(),
         }
+    }
+    pub fn into_bytes(self) -> serde_json::Result<Vec<u8>> {
+        let line = match self {
+            Self::CodexThread { mut line, mcp } => {
+                line["params"]["config"] = mcp.value(mcp.token.expose());
+                line
+            }
+            Self::Prompt(line) | Self::Message(line) | Self::Interrupt { line, .. } => line,
+        };
+        serde_json::to_vec(&line)
     }
 }
 #[derive(Default)]
@@ -433,6 +496,25 @@ pub(crate) struct Decoded {
     pub replies: Vec<serde_json::Value>,
     pub controls: Vec<Outbound>,
     pub provider_turn: Option<TurnId>,
+}
+
+impl Decoded {
+    pub fn take_outbound(&mut self) -> Vec<Outbound> {
+        let mut frames: Vec<_> = std::mem::take(&mut self.replies)
+            .into_iter()
+            .map(Outbound::Message)
+            .collect();
+        let mut interrupts = Vec::new();
+        for frame in std::mem::take(&mut self.controls) {
+            if matches!(frame, Outbound::Interrupt { .. }) {
+                interrupts.push(frame);
+            } else {
+                frames.push(frame);
+            }
+        }
+        frames.extend(interrupts);
+        frames
+    }
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -504,4 +586,52 @@ read initialize
             "cancelled probe launched initialize after version cleanup"
         );
     }
+}
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn shared_stop_ladder_enforces_deadlines_and_reason() {
+    let mut ladder = StopLadder::new(StopReason::User);
+    assert!(ladder.escalate().is_none());
+    tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    assert!(matches!(
+        ladder.escalate(),
+        Some(crate::platform::Signal::Terminate)
+    ));
+    assert!(ladder.escalate().is_none());
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert!(matches!(
+        ladder.escalate(),
+        Some(crate::platform::Signal::Kill)
+    ));
+    assert_eq!(
+        ladder.outcome(),
+        TurnOutcome::Interrupted {
+            reason: "Stopped by you".into()
+        }
+    );
+}
+#[cfg(test)]
+#[test]
+fn decoded_batch_always_places_replies_before_interrupts() {
+    let turn = TurnId::new();
+    let mut decoded = Decoded {
+        controls: vec![Outbound::Interrupt {
+            turn,
+            line: serde_json::json!({"interrupt":true}),
+        }],
+        replies: vec![serde_json::json!({"decision":"cancel"})],
+        ..Default::default()
+    };
+    assert_eq!(
+        decoded
+            .take_outbound()
+            .iter()
+            .map(Outbound::value)
+            .collect::<Vec<_>>(),
+        vec![
+            serde_json::json!({"decision":"cancel"}),
+            serde_json::json!({"interrupt":true})
+        ]
+    );
 }

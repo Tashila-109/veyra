@@ -18,7 +18,9 @@ Choose the provider, model, effort and permission chips.
 The provider menu marks Claude Code, Codex and Grok Ready, Not installed or Signed out.
 A missing Claude names `npm install -g @anthropic-ai/claude-code`; a signed-out Claude names `claude auth login`.
 Check again reaches `veyra::RecheckProviders`.
-Codex and Grok stay Ready until their codecs supply a recorded readiness signal.
+Codex reads readiness, models and efforts from its app-server probe.
+The Codex sign-in mark awaits the separately authorized signal check.
+Grok stays a placeholder until its adapter exists.
 Type in the textarea, then Send, Enter or ⌘↵ to create a thread.
 Shift+Enter inserts a newline.
 This page stops before Send so its readiness proofs must leave zero threads.
@@ -127,7 +129,57 @@ print('PASS new-thread missing → ready → no-account Ready; choices live; thr
 PY
 ```
 
+### Codex
+
+Run this fake-only section after the existing drive and before Evidence.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH="$PROOF" python3 - <<'PYCODEX'
+from driver import *
+identity()
+assert LANE == 'fake'
+assert sql('select count(*) from threads')=='0'
+(DATA/'fake-cli').unlink()
+action('codex-new-thread-open','NewThread')
+action('codex-new-thread-provider','PickProvider',{'provider':'codex'})
+action('codex-new-thread-check-missing','RecheckProviders')
+missing = poll('codex-new-thread-missing',lambda d:d['providers'][1]['readiness']=='not_installed')
+assert missing['composer']['provider']=='codex' and not missing['composer']['send_enabled']
+assert 'Install the Codex CLI' in missing['composer']['disabled_reason']
+capture('codex-new-thread-missing')
+(DATA/'fake-cli').symlink_to(pathlib.Path('target/debug/veyra-fake-cli').resolve())
+action('codex-new-thread-recheck','RecheckProviders')
+ready = poll('codex-new-thread-ready',lambda d:d['providers'][1]['readiness']=='ready' and bool(d['providers'][1]['models']))
+assert ready['composer']['send_enabled']
+assert ready['providers'][1]['version']=='0.161.0'
+assert ready['providers'][1]['models'][0]['value']=='veyra-model'
+assert ready['providers'][1]['models'][0]['supportedEffortLevels']==['medium']
+action('codex-provider-menu','OpenProviderPicker')
+menu = poll('codex-provider-menu-ready',lambda d:d['composer']['provider_picker_open'])
+assert menu['composer']['provider_picker_labels'][1]=='Codex · Ready'
+capture('codex-provider-menu-ready')
+action('codex-provider-menu-close','PickProvider',{'provider':'codex'})
+action('codex-new-thread-model','PickModel',{'model':'veyra-model'})
+action('codex-new-thread-effort','PickEffort',{'effort':'medium'})
+choice = ctl('codex-new-thread-choices','dump')
+assert choice['composer']['model']=='veyra-model' and choice['composer']['effort']=='medium'
+assert sql('select count(*) from threads')=='0'
+capture('codex-new-thread')
+action('codex-new-thread-return-claude','PickProvider',{'provider':'claude'})
+action('codex-new-thread-reset','NewThread')
+page_done('new-thread-codex')
+print('PASS Codex missing to Ready; CLI model and effort; no thread created')
+PYCODEX
+```
+
 ## Observable success
+
+The Codex section preserves missing and Ready `providers[1].readiness`, `version` and `models`, the picker label, `composer.model` and `composer.effort`.
+Its SQLite thread count remains zero, and its PNGs show the disabled reason and selected CLI choices.
 
 - `new-thread-missing.json`: Claude `not_installed`, Send disabled, installation command visible; inspect its PNG.
 - `new-thread-ready.json`: Claude `ready`, models present, Send enabled after RecheckProviders.

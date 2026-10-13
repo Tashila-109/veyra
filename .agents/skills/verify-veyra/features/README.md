@@ -1,14 +1,14 @@
 # Veyra verification map
 
 [app-launch](app-launch.md) covers the native window, debug CLI, instance lock, migrated database, log, release exclusion, and cleanup.
-[new-thread](new-thread.md) covers project selection, startup readiness, Check again, the no-account probe and the live composer choices without creating a thread.
-[chat-send-stream](chat-send-stream.md) covers fake-CLI streaming, Working → Done, failure cause and stderr, Retry and ctl wait.
+[new-thread](new-thread.md) covers project selection, startup readiness, Check again, the no-account probe and the live composer choices without creating a thread, including Codex's CLI models and efforts.
+[chat-send-stream](chat-send-stream.md) covers fake-CLI streaming, Working → Done, failure cause and stderr, Retry and ctl wait, plus Codex's foreign-thread filtering and retry/limit notices.
 [settings](settings.md) covers OpenSettings, all defaults, existing-versus-new thread modes and default persistence after relaunch.
 
-[approvals-questions](approvals-questions.md) covers approval decisions, exact grants, question keys and NextNeedsYou.
+[approvals-questions](approvals-questions.md) covers approval decisions, exact grants, question keys and NextNeedsYou, plus Codex directory-aware command grants and MCP approvals without grants.
 [stop-interrupt](stop-interrupt.md) covers Stop, held queues, awake and banners.
 [restart-recovery](restart-recovery.md) covers the quit sheet, ConfirmQuit, ctl quit and recovery.
-[multi-agent](multi-agent.md) covers child rows, task and family cards, archive choices, held wakes, report delivery and quiet time.
+[multi-agent](multi-agent.md) covers child rows, task and family cards, archive choices, held wakes, report delivery and quiet time, plus a Codex root relay and a Claude root's Codex child.
 [permission-matrix](permission-matrix.md) records the live provider permission grid.
 
 ## Preconditions

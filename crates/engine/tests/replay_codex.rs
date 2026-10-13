@@ -22,11 +22,11 @@ fn fixture(name: &str) -> PathBuf {
         .join(format!("{name}.jsonl"))
 }
 fn environment(name: &str) -> (Scratch, ChildEnv) {
-    let root = Path::new("/tmp").join(format!("veyra-m5s1-{}", ThreadId::new()));
+    let root = Path::new("/tmp").join(format!("veyra-codex-replay-{}", ThreadId::new()));
     fs::create_dir(&root).unwrap();
     fs::copy(fixture(name), root.join("t1-s1.jsonl")).unwrap();
     fs::copy(fixture("probe-ready"), root.join("probe-codex.jsonl")).unwrap();
-    let mut env = ChildEnv::load();
+    let mut env = ChildEnv::isolated();
     env.codex_bin = Some(env!("CARGO_BIN_EXE_veyra-fake-cli").into());
     env.fixtures = Some(root.clone());
     env.record = None;
@@ -49,7 +49,7 @@ fn replay(name: &str, mode: PermissionMode, root: bool, resume: bool) -> Vec<Pro
                 .unwrap(),
             ));
         }
-        let handle = Spawner::Cli(env)
+        let handle = Spawner::Cli(Box::new(env))
             .spawn(
                 ProviderKind::Codex,
                 SessionSpec {
@@ -451,8 +451,8 @@ fn engine_replay(
     scenarios: &[&str],
     check: impl FnOnce(&veyra_engine::Engine, &Path, ThreadId, &Runtime),
 ) {
-    if std::env::var("VEYRA_M5_ENGINE_REPLAY").ok().as_deref() != Some(test) {
-        let root = Path::new("/tmp").join(format!("veyra-m5s1-{}", ThreadId::new()));
+    if std::env::var("VEYRA_TEST_ENGINE_REPLAY").ok().as_deref() != Some(test) {
+        let root = Path::new("/tmp").join(format!("veyra-codex-replay-{}", ThreadId::new()));
         fs::create_dir(&root).unwrap();
         let _scratch = Scratch(root.clone());
         let fixtures = root.join("fixtures");
@@ -462,8 +462,8 @@ fn engine_replay(
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
-            .env("VEYRA_M5_ENGINE_REPLAY", test)
-            .env("VEYRA_M5_ENGINE_ROOT", &root)
+            .env("VEYRA_TEST_ENGINE_REPLAY", test)
+            .env("VEYRA_TEST_ENGINE_ROOT", &root)
             .env("VEYRA_FAKE_FIXTURES", &fixtures)
             .env("VEYRA_CODEX_BIN", env!("CARGO_BIN_EXE_veyra-fake-cli"))
             .env("VEYRA_CLAUDE_BIN", "/nonexistent/claude")
@@ -473,7 +473,7 @@ fn engine_replay(
         assert!(status.success());
         return;
     }
-    let root = PathBuf::from(std::env::var_os("VEYRA_M5_ENGINE_ROOT").unwrap())
+    let root = PathBuf::from(std::env::var_os("VEYRA_TEST_ENGINE_ROOT").unwrap())
         .canonicalize()
         .unwrap();
     let data = veyra_engine::data_dir::DataDir::at(root.join("data")).unwrap();
@@ -533,8 +533,12 @@ fn engine_replay(
     tx.commit().unwrap();
     drop(db);
     let runtime = Runtime::new().unwrap();
-    let engine =
-        veyra_engine::Engine::start_with_processes(runtime.handle(), data, vec![]).unwrap();
+    let mut environment = ChildEnv::isolated().with_binary(
+        ProviderKind::Codex,
+        env!("CARGO_BIN_EXE_veyra-fake-cli").into(),
+    );
+    environment.fixtures = Some(root.join("fixtures"));
+    let engine = veyra_engine::Engine::start_with_env(runtime.handle(), data, environment).unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         check(&engine, &root, child.id, &runtime)
     }));
@@ -697,4 +701,127 @@ fn codex_bad_lines_keep_the_session() {
     let e = standard("bad-lines");
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+
+#[test]
+fn codex_request_can_answer_before_the_start_reply() {
+    let events = replay(
+        "early-request-waits-for-answer",
+        PermissionMode::AskFirst,
+        false,
+        false,
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::Turn {
+            event: TurnEvent::RequestOpened {
+                kind: RequestKind::Approval { .. },
+                ..
+            },
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::Turn {
+            event: TurnEvent::TurnEnded {
+                outcome: TurnOutcome::Completed,
+                ..
+            },
+            ..
+        }
+    )));
+}
+#[test]
+fn codex_session_cancels_early_request_before_interrupt() {
+    let (scratch, mut env) = environment("stop-before-start-reply");
+    env.record = Some(scratch.0.join("rec"));
+    let mut owned = vec![];
+    Runtime::new().unwrap().block_on(async {
+        let (out, mut messages) = mpsc::channel(256);
+        let turn = TurnId::new();
+        let session = Spawner::Cli(Box::new(env))
+            .spawn(
+                ProviderKind::Codex,
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: std::env::current_dir().unwrap(),
+                    config: ThreadConfig {
+                        mode: PermissionMode::AskFirst,
+                        model: Some("veyra-model".into()),
+                        effort: Some("medium".into()),
+                    },
+                    native: None,
+                    import: false,
+                    root: false,
+                },
+                out,
+                1,
+            )
+            .unwrap();
+        let mut ended = None;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while let Some(EngineMsg::Provider { event, .. }) = messages.recv().await {
+                match event {
+                    ProviderEvent::Session(SessionEvent::Ready { pid, .. }) => {
+                        owned.push(pid);
+                        session
+                            .control
+                            .send(SessionControl::StartTurn {
+                                turn,
+                                text: "work".into(),
+                            })
+                            .unwrap();
+                        session
+                            .control
+                            .send(SessionControl::Interrupt {
+                                turn,
+                                reason: StopReason::User,
+                            })
+                            .unwrap();
+                    }
+                    ProviderEvent::Turn {
+                        event: TurnEvent::TurnEnded { outcome, .. },
+                        ..
+                    } => ended = Some(outcome),
+                    ProviderEvent::Session(SessionEvent::Exited { .. }) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            ended,
+            Some(TurnOutcome::Interrupted {
+                reason: "Stopped by you".into()
+            })
+        );
+    });
+    assert!(
+        owned
+            .into_iter()
+            .all(|pid| !veyra_engine::platform::group_exists(pid).unwrap())
+    );
+    let frames: Vec<serde_json::Value> = fs::read_to_string(scratch.0.join("rec/t1-s1.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["type"] == "expect_outbound")
+        .map(|record| record["line"].clone())
+        .filter(|line| {
+            line["method"] == "turn/interrupt"
+                || line["result"] == serde_json::json!({"decision":"cancel"})
+        })
+        .collect();
+    assert_eq!(
+        frames.len(),
+        2,
+        "actual session writer did not send cancellation and interrupt"
+    );
+    assert_eq!(
+        frames[0]["result"],
+        serde_json::json!({"decision":"cancel"})
+    );
+    assert_eq!(frames[1]["method"], "turn/interrupt");
 }

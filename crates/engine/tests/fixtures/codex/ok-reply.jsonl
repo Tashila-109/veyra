@@ -1,4 +1,4 @@
-{"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.161.0", "scenario": "ok-reply", "source": "P3-live codex-structured.ndjson; Veyra converter pattern from M2"}
+{"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.161.0", "scenario": "ok-reply", "source": "Veyra live recording converted with masked values"}
 {"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}}}}
 {"type": "emit_inbound", "line": {"id": "<id:initialize>", "result": {"userAgent": "veyra/0.161.0"}}}
 {"type": "expect_outbound", "line": {"method": "initialized"}}

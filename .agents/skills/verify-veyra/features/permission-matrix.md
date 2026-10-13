@@ -19,7 +19,10 @@ In a disposable project, select the provider and permission mode, then send the 
 Ask first asks before edits and commands the CLI does not treat as safe; commands can use the network.
 Accept edits permits edits and asks before commands the CLI does not treat as safe; commands can use the network.
 Full access permits commands and writes without asking; a request the CLI still sends always docks.
-Reading and the safe echo command should run without an approval in all three modes.
+Claude's read and safe echo should run without approval in all three modes.
+Codex Ask first uses `untrusted` and asks before every command, including echo.
+Codex Accept edits uses `on-request` with a workspace sandbox; its CLI decides which commands need approval.
+Codex Full access uses `never` with no sandbox; any request that arrives still docks.
 Ask first should dock both file writes; Accept edits should allow the project write, while the outside write records the provider's actual directory boundary.
 Full access should complete all four steps without an approval.
 The live provider's actual behavior is the result, including any approval beyond that expectation.
@@ -38,7 +41,7 @@ Select each mode with PickPermission, send through Send, and preserve every dock
 Use AllowOnce or Deny as the operator directs; do not silently grant the whole thread.
 Read the project and outside files to prove the effects, then remove only this run's outside file.
 Record cell status, provider version, requested approvals, decisions, files and the run proof path.
-Codex and Grok remain not run until their adapters exist.
+Codex's cells await the separately authorized permission run; Grok's adapter is not built.
 
 ## Observable success
 

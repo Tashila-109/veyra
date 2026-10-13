@@ -195,6 +195,7 @@ fn shutdown_wait_is_bounded_when_actor_is_stalled() {
             state: Default::default(),
             runtime: runtime.handle().clone(),
             groups: Default::default(),
+            environment: env::ChildEnv::isolated(),
         }),
     };
     runtime.block_on(async {
@@ -390,7 +391,7 @@ read initialize
             .unwrap()
             .success()
     );
-    let mut env = env::ChildEnv::load();
+    let mut env = env::ChildEnv::isolated();
     env.groups = Default::default();
     env.claude_bin = Some(binary);
     env.fixtures = None;
@@ -403,7 +404,7 @@ read initialize
     c.threads.insert(thread.id, thread);
     f.save(c);
     let (out, mut messages) = mpsc::channel(256);
-    f.actor = Actor::new(f.actor.db, out, Spawner::Cli(env.clone())).unwrap();
+    f.actor = Actor::new(f.actor.db, out, Spawner::Cli(Box::new(env.clone()))).unwrap();
     let Ack::Turn(queued) = f
         .command(Command::Send {
             thread: f.thread,
@@ -474,6 +475,7 @@ fn shutdown_request_prevents_ready_start_before_mailbox_shutdown() {
             state: f.actor.state.clone(),
             runtime: f.runtime.handle().clone(),
             groups: Default::default(),
+            environment: env::ChildEnv::isolated(),
         }),
     };
     engine
@@ -520,6 +522,7 @@ fn shutdown_request_rejects_backlogged_start_commands() {
                 state: f.actor.state.clone(),
                 runtime: f.runtime.handle().clone(),
                 groups: Default::default(),
+                environment: env::ChildEnv::isolated(),
             }),
         };
         let mut reply = std::pin::pin!(engine.send(Command::Send {
@@ -564,6 +567,7 @@ fn shutdown_request_prevents_retiring_session_restart_before_mailbox_shutdown() 
                     state: f.actor.state.clone(),
                     runtime: f.runtime.handle().clone(),
                     groups: Default::default(),
+                    environment: env::ChildEnv::isolated(),
                 }),
             };
             engine
@@ -598,9 +602,14 @@ fn engine_and_provider_environment_share_closing_state() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut db = rusqlite::Connection::open_in_memory().unwrap();
     store::initialize(&mut db).unwrap();
-    let env = env::ChildEnv::load();
-    let engine =
-        crate::Engine::launch(runtime.handle(), db, Spawner::Cli(env.clone()), None).unwrap();
+    let env = env::ChildEnv::isolated();
+    let engine = crate::Engine::launch(
+        runtime.handle(),
+        db,
+        Spawner::Cli(Box::new(env.clone())),
+        None,
+    )
+    .unwrap();
     let probe_env = engine.child_env();
     assert!(std::sync::Arc::ptr_eq(
         &env.closing,
@@ -629,6 +638,7 @@ fn shutdown_between_actor_check_and_decide_commits_then_holds_turn() {
                 state: f.actor.state.clone(),
                 runtime: f.runtime.handle().clone(),
                 groups: Default::default(),
+                environment: env::ChildEnv::isolated(),
             }),
         };
         if closed_before_read {

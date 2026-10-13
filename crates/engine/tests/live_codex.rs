@@ -33,7 +33,7 @@ fn live(
     let env = ChildEnv::load();
     runtime.block_on(async {
         let (out, mut rx) = mpsc::channel(256);
-        let handle = Spawner::Cli(env)
+        let handle = Spawner::Cli(Box::new(env))
             .spawn(
                 ProviderKind::Codex,
                 SessionSpec {
@@ -235,7 +235,7 @@ fn live_codex_question() {
         })
         .count();
     eprintln!(
-        "codex_native_user_question_requests={count}; criterion 8 needs Lane 6's record when this is zero"
+        "codex_native_user_question_requests={count}; this question path needs a live record of the supported mode when this is zero"
     );
     assert!(events.iter().any(|e| matches!(
         e,

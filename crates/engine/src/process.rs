@@ -233,7 +233,10 @@ mod tests {
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let env = ChildEnv::load();
+            let env = ChildEnv::isolated().with_binary(
+                crate::provider::ProviderKind::Claude,
+                Path::new(&root).join("claude"),
+            );
             let binary = env.resolve(crate::provider::ProviderKind::Claude).unwrap();
             assert_eq!(binary.file_name().unwrap(), "2.1.296");
             let mut parent = env

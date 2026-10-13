@@ -695,7 +695,7 @@ mod cli {
 
         let (scratch, binary) = stand_in(script);
         let root = &scratch.0;
-        let mut env = env::ChildEnv::load();
+        let mut env = env::ChildEnv::isolated();
         env.claude_bin = Some(binary);
         env.fixtures = None;
         env.record = None;
@@ -706,7 +706,7 @@ mod cli {
         c.threads.insert(thread.id, thread);
         f.save(c);
         let (out, mut messages) = mpsc::channel(256);
-        f.actor = Actor::new(f.actor.db, out, Spawner::Cli(env)).unwrap();
+        f.actor = Actor::new(f.actor.db, out, Spawner::Cli(Box::new(env))).unwrap();
         let first = match f
             .command(Command::Send {
                 thread: f.thread,
@@ -872,7 +872,7 @@ mod cli {
             for (fixture, target) in [(name, "t1-s1.jsonl"), ("ok-reply", "t1-s2.jsonl")] {
                 std::fs::copy(source.join(format!("{fixture}.jsonl")), root.join(target)).unwrap();
             }
-            let mut env = env::ChildEnv::load();
+            let mut env = env::ChildEnv::isolated();
             env.claude_bin = Some(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../target/debug/veyra-fake-cli")
@@ -888,7 +888,7 @@ mod cli {
             c.threads.insert(thread.id, thread);
             f.save(c);
             let (out, messages) = mpsc::channel(256);
-            f.actor = Actor::new(f.actor.db, out, Spawner::Cli(env)).unwrap();
+            f.actor = Actor::new(f.actor.db, out, Spawner::Cli(Box::new(env))).unwrap();
             Self {
                 f,
                 messages,
@@ -1369,7 +1369,7 @@ fn provider_interrupt_targets_provider_turn_and_preserves_cancel_order() {
     };
     assert_eq!(turn, first_provider_turn);
     assert!(codec.interrupt_lines(turn, reason).is_empty());
-    assert!(codec.interrupt_deadline().is_none());
+    assert!(codec.next_deadline().is_none());
     for event in old_end.events.into_iter().chain(events) {
         f.event(event);
     }
@@ -1407,7 +1407,7 @@ fn provider_interrupt_targets_provider_turn_and_preserves_cancel_order() {
             json!({"type":"control_request", "request_id":"veyra-interrupt", "request":{"subtype":"interrupt"}}),
         ]
     );
-    assert!(codec.interrupt_deadline().is_some());
+    assert!(codec.next_deadline().is_some());
     assert!(matches!(&f.loaded().turns[&next].state, TurnState::Ended {
         outcome: TurnOutcome::Interrupted { reason }, ..
     } if reason == "Stopped by you"));

@@ -30,7 +30,7 @@ fn environment(name: &str, resumed: bool) -> (Scratch, ChildEnv) {
         fs::copy(fixture("ok-reply"), root.join("t1-s2.jsonl")).unwrap();
     }
     fs::copy(fixture("probe-initialize"), root.join("probe.jsonl")).unwrap();
-    let mut env = ChildEnv::load();
+    let mut env = ChildEnv::isolated();
     env.claude_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra-fake-cli")));
     env.fixtures = Some(root.clone());
     env.record = None;
@@ -1388,7 +1388,7 @@ for line in sys.stdin:
         print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False}), flush=True)
 "#,
     );
-    let mut env = ChildEnv::load();
+    let mut env = ChildEnv::isolated();
     env.claude_bin = Some(binary);
     env.fixtures = None;
     env.record = None;
@@ -1556,7 +1556,7 @@ for line in sys.stdin:
         if followup { "True" } else { "False" }
     );
     let binary = stand_in(&scratch, "owned-followup-stand-in", &script);
-    let mut env = ChildEnv::load();
+    let mut env = ChildEnv::isolated();
     env.claude_bin = Some(binary);
     env.fixtures = None;
     env.record = None;
@@ -1745,7 +1745,7 @@ else:
 while read_line(5) is not None: pass
 "#,
     );
-    let mut env = ChildEnv::load();
+    let mut env = ChildEnv::isolated();
     env.claude_bin = Some(binary);
     env.fixtures = None;
     env.record = None;

@@ -586,3 +586,159 @@ mod tests {
         assert!(!alive);
     }
 }
+
+struct RelayFd {
+    fd: libc::c_int,
+    flags: libc::c_int,
+}
+impl RelayFd {
+    fn nonblocking(fd: libc::c_int) -> io::Result<Self> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd, flags })
+    }
+}
+impl Drop for RelayFd {
+    fn drop(&mut self) {
+        unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.flags) };
+    }
+}
+#[derive(Default)]
+struct RelayBuffer {
+    bytes: Vec<u8>,
+    written: usize,
+}
+impl RelayBuffer {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    fn pending(&self) -> bool {
+        self.written < self.bytes.len()
+    }
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.written > 0 {
+            self.bytes.drain(..self.written);
+            self.written = 0;
+        }
+        if self.bytes.len() + bytes.len() > Self::LIMIT {
+            return Err(io::Error::other(
+                "MCP relay exceeded its 8 MiB write buffer",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn write(&mut self, fd: libc::c_int) -> io::Result<()> {
+        if !self.pending() {
+            return Ok(());
+        }
+        let bytes = &self.bytes[self.written..];
+        let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if count > 0 {
+            self.written += count as usize;
+            return Ok(());
+        }
+        if count == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+fn relay_read(fd: libc::c_int, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+    let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if count >= 0 {
+        return Ok(Some(count as usize));
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    ) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+pub fn relay_stdio(connection: UnixStream, authentication: &[u8]) -> io::Result<()> {
+    let input = RelayFd::nonblocking(libc::STDIN_FILENO)?;
+    let output = RelayFd::nonblocking(libc::STDOUT_FILENO)?;
+    let socket = RelayFd::nonblocking(connection.as_raw_fd())?;
+    let mut to_socket = RelayBuffer::default();
+    to_socket.append(authentication)?;
+    to_socket.append(b"\n")?;
+    let mut to_stdout = RelayBuffer::default();
+    let mut socket_eof = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        if socket_eof && !to_stdout.pending() {
+            return Ok(());
+        }
+        let mut poll = [
+            libc::pollfd {
+                fd: input.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: socket.fd,
+                events: if socket_eof { 0 } else { libc::POLLIN }
+                    | if to_socket.pending() {
+                        libc::POLLOUT
+                    } else {
+                        0
+                    },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: output.fd,
+                events: if to_stdout.pending() {
+                    libc::POLLOUT
+                } else {
+                    0
+                },
+                revents: 0,
+            },
+        ];
+        if unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if poll[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            match relay_read(input.fd, &mut buffer)? {
+                Some(0) => {
+                    let _ = connection.shutdown(std::net::Shutdown::Both);
+                    return Ok(());
+                }
+                Some(count) => to_socket.append(&buffer[..count])?,
+                None => {}
+            }
+        }
+        if !socket_eof && poll[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            match relay_read(socket.fd, &mut buffer)? {
+                Some(0) => socket_eof = true,
+                Some(count) => to_stdout.append(&buffer[..count])?,
+                None => {}
+            }
+        }
+        if poll[1].revents & libc::POLLOUT != 0 {
+            to_socket.write(socket.fd)?;
+        }
+        if poll[2].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0 {
+            to_stdout.write(output.fd)?;
+        }
+        if poll.iter().any(|fd| fd.revents & libc::POLLNVAL != 0) {
+            return Err(io::Error::other("MCP relay descriptor closed"));
+        }
+    }
+}

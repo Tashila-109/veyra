@@ -45,7 +45,7 @@ pub fn decide(p: &Projection, now: Millis) -> ChangeSet {
             req.state = RequestState::Expired {
                 reason: "Veyra closed while this request waited".into(),
             };
-            c.events.push(Ev::RequestClosed(req.clone()));
+            c.events.push(Ev::RequestClosed(Box::new(req.clone())));
             c.requests.insert(req.id, req);
         }
         set_hold(p, &mut c, req.thread, Some(HoldReason::Restarted));

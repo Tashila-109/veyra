@@ -192,7 +192,7 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-VEYRA_CLAUDE_BIN=/nonexistent/claude TMPDIR=/tmp cargo test -p veyra-engine --lib perf_snapshot_large -- --ignored --nocapture >"$PROOF/large-seed.txt" 2>&1
+VEYRA_CLAUDE_BIN=/nonexistent/claude VEYRA_CODEX_BIN=/nonexistent/codex TMPDIR=/tmp cargo test -p veyra-engine --lib perf_snapshot_large -- --ignored --nocapture >"$PROOF/large-seed.txt" 2>&1
 PYTHONPATH="$PROOF" python3 - <<'PYPROBE'
 from driver import *
 identity()
@@ -227,7 +227,78 @@ The named reading JSON files record the two window measurements, and large-seed.
 The 5,000-item dump exercises the client's 4 MiB reply limit; the command limit remains 64 KiB.
 The original family drive's dumps, screenshots and SQL receipts remain in PROOF after the disposable database is replaced.
 
+### Codex
+
+Run this fake-only section after the existing drive and before Evidence.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH="$PROOF" python3 - <<'PYCODEX'
+from driver import *
+identity()
+assert LANE == 'fake'
+thread = create_codex('codex-relay',scenario='root-tool-call')
+done = ctl('codex-relay-wait','wait',thread,'Done')
+save('codex-relay-done',done)
+assert any(item['kind']=='tool' and 'codex' in item['text'] and 'remaining_fan_out' in item['text'] for item in done['transcript']['items'])
+assert 'remaining_fan_out' in sql("select body_json from items where thread_id='"+thread+"' and kind='tool'")
+log = (DATA/'logs/veyra.log').read_text()
+lines = [line for line in log.splitlines() if thread in line and ('MCP connection accepted' in line or 'list_providers' in line)]
+assert any('MCP connection accepted' in line for line in lines)
+assert any('list_providers' in line for line in lines)
+(PROOF/'codex-relay-log.txt').write_text('\n'.join(lines)+'\n')
+capture('codex-relay')
+poll('codex-relay-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+restart('codex-family-fresh-lanes')
+poll('codex-family-providers-ready',lambda d:all(d['providers'][i]['readiness']=='ready' for i in [0,1]))
+parent = [json.loads(line) for line in (CODEX_SOURCE/'claude-parent-codex-child.jsonl').read_text().splitlines()]
+child = codex_records('child-policy-full-access',root=False)
+for record in child:
+    method = record.get('line',{}).get('method')
+    if method=='item/agentMessage/delta': record['after_ms']=2000
+    if method=='turn/completed': record['after_ms']=1000
+for lane,records in [(1,parent),(2,child)]:
+    (FIXTURES/('t'+str(lane)+'-s1.jsonl')).write_text('\n'.join(json.dumps(r) for r in records)+'\n')
+action('codex-family-default','SetDefaultMode',{'mode':'full_access'})
+action('codex-family-new','NewThread')
+action('codex-family-parent-provider','PickProvider',{'provider':'claude'})
+ctl('codex-family-prompt','text','Start a Codex child')
+ctl('codex-family-send','keys','secondary-enter')
+root = poll('codex-family-root',lambda d:d['selected_thread'] is not None and d['selected_thread']['title']=='Start a Codex child')['selected_thread']['id']
+poll('codex-family-task',lambda d:any(task['parent']==root for task in d['tasks']))
+child,task = sql("select child_thread_id||'|'||id from tasks where parent_thread_id='"+root+"'").split('|')
+working = poll('codex-family-working',lambda d:d['transcript']['family_card'] is not None and d['transcript']['family_card']['rows'][0]['status']=='Working')
+assert working['transcript']['family_card']['title']=='Started 1 agent'
+opened = select('codex-child-task',child)
+assert opened['composer']['provider']=='codex' and opened['selected_thread']['config']['mode']=='full_access'
+assert any(item['kind']=='task_card' and item['text']=='Task from Claude Code' for item in opened['transcript']['items'])
+assert opened['selected_thread']['breadcrumb']=={'thread':root,'title':'Start a Codex child','linked':True}
+assert sql("select provider from threads where id='"+child+"'")=='codex'
+capture('codex-child-task')
+family_delivered('codex-family-delivered',root,task)
+select('codex-family-done',root)
+done = poll('codex-family-done',lambda d:d['transcript']['family_card']['rows'][0]['status']=='Done')
+assert any(item['turn_label']=='Reports from 1 child thread' for item in done['transcript']['items'])
+assert sql("select summary||'|'||delivery from tasks where id='"+task+"'")=='ok|delivered'
+capture('codex-family-done')
+poll('codex-family-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+action('codex-family-restore-default','SetDefaultMode',{'mode':'ask_first'})
+action('codex-family-return-new','NewThread')
+action('codex-family-return-claude','PickProvider',{'provider':'claude'})
+page_done('multi-agent-codex')
+print('PASS Codex root production relay list_providers and Claude root/Codex child card and delivered wake')
+PYCODEX
+```
+
 ## Observable success
+
+The Codex root section saves the production relay result in `transcript.items`, SQLite tool rows and `codex-relay-log.txt`.
+That log contains the root thread's accepted connection and `list_providers` call.
+The Claude-root/Codex-child section checks `composer.provider`, the child's `selected_thread.config.mode`, `breadcrumb`, TaskCard and family row.
+SQLite records provider `codex`, summary `ok` and delivered task state; the PNGs show the child card and the completed family.
 
 The top-level `tasks` dump key adds task state and Pending or Delivered, while `sidebar`, `selected_thread` and `transcript` contain the lineage and rendered controls.
 The production relay's saved pid and parent match the root's live_pid; SQLite and the log show a real start_thread call.

@@ -4,6 +4,8 @@ use crate::domain::ThreadId;
 use crate::platform;
 #[cfg(debug_assertions)]
 use std::collections::BTreeMap;
+#[cfg(not(test))]
+use std::sync::LazyLock;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 #[cfg(all(test, debug_assertions))]
@@ -12,16 +14,18 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
 };
 use tokio::process::Command;
 
 pub(crate) type Groups = Arc<Mutex<std::collections::BTreeSet<u32>>>;
 
+#[cfg(not(test))]
 struct LoginPath {
     path: OsString,
     failure: Option<std::io::Error>,
 }
+#[cfg(not(test))]
 static LOGIN_PATH: LazyLock<LoginPath> = LazyLock::new(|| match platform::login_shell_path() {
     Ok(path) => LoginPath {
         path,
@@ -52,6 +56,7 @@ pub struct ChildEnv {
     pub(crate) before_spawn: Arc<Mutex<Option<SpawnPause>>>,
     #[cfg(test)]
     pub(crate) close_before_user_write: Arc<AtomicBool>,
+    binaries: Option<std::collections::BTreeMap<ProviderKind, PathBuf>>,
     pub path: OsString,
     pub home: Option<PathBuf>,
     #[cfg(debug_assertions)]
@@ -68,9 +73,34 @@ pub struct ChildEnv {
 }
 impl ChildEnv {
     pub fn load() -> Self {
-        if let Some(error) = &LOGIN_PATH.failure {
-            tracing::warn!(%error, "login shell PATH unavailable; using inherited PATH");
+        #[cfg(test)]
+        {
+            Self::isolated()
         }
+        #[cfg(not(test))]
+        {
+            if let Some(error) = &LOGIN_PATH.failure {
+                tracing::warn!(%error, "login shell PATH unavailable; using inherited PATH");
+            }
+            let mut env = Self::isolated();
+            env.binaries = None;
+            env.reaper_pids = None;
+            env.path = LOGIN_PATH.path.clone();
+            env.home = std::env::var_os("HOME").map(PathBuf::from);
+            #[cfg(debug_assertions)]
+            {
+                env.claude_bin = std::env::var_os("VEYRA_CLAUDE_BIN").map(PathBuf::from);
+                env.codex_bin = std::env::var_os("VEYRA_CODEX_BIN").map(PathBuf::from);
+                env.fixtures = std::env::var_os("VEYRA_FAKE_FIXTURES").map(PathBuf::from);
+                env.record = std::env::var_os("VEYRA_RECORD").map(PathBuf::from);
+                env.reaper_pids = std::env::var("VEYRA_REAP_PIDS")
+                    .ok()
+                    .map(|text| text.split(',').filter_map(|pid| pid.parse().ok()).collect());
+            }
+            env
+        }
+    }
+    pub fn isolated() -> Self {
         Self {
             groups: Default::default(),
             mcp: None,
@@ -82,25 +112,34 @@ impl ChildEnv {
             before_spawn: Default::default(),
             #[cfg(test)]
             close_before_user_write: Default::default(),
-            path: LOGIN_PATH.path.clone(),
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            binaries: Some(Default::default()),
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            home: None,
             #[cfg(debug_assertions)]
             lanes: Arc::default(),
             #[cfg(debug_assertions)]
-            claude_bin: std::env::var_os("VEYRA_CLAUDE_BIN").map(PathBuf::from),
+            claude_bin: None,
             #[cfg(debug_assertions)]
-            codex_bin: std::env::var_os("VEYRA_CODEX_BIN").map(PathBuf::from),
+            codex_bin: None,
             #[cfg(debug_assertions)]
-            fixtures: std::env::var_os("VEYRA_FAKE_FIXTURES").map(PathBuf::from),
+            fixtures: None,
             #[cfg(debug_assertions)]
-            record: std::env::var_os("VEYRA_RECORD").map(PathBuf::from),
-            #[cfg(debug_assertions)]
-            reaper_pids: std::env::var("VEYRA_REAP_PIDS")
-                .ok()
-                .map(|text| text.split(',').filter_map(|pid| pid.parse().ok()).collect()),
-            #[cfg(not(debug_assertions))]
-            reaper_pids: None,
+            record: None,
+            reaper_pids: Some(Default::default()),
         }
+    }
+    pub(crate) fn for_probe(&self) -> Self {
+        if self.binaries.is_some() {
+            self.clone()
+        } else {
+            Self::load()
+        }
+    }
+    pub fn with_binary(mut self, provider: ProviderKind, binary: PathBuf) -> Self {
+        self.binaries
+            .get_or_insert_with(Default::default)
+            .insert(provider, binary);
+        self
     }
     pub fn resolve(&self, provider: ProviderKind) -> Result<PathBuf, ProviderError> {
         #[cfg(debug_assertions)]
@@ -112,6 +151,12 @@ impl ChildEnv {
             return executable(path)
                 .ok_or_else(|| ProviderError::NotInstalled(path.display().to_string()));
         }
+        if let Some(binaries) = &self.binaries {
+            return binaries
+                .get(&provider)
+                .and_then(|path| executable(path))
+                .ok_or_else(|| ProviderError::NotInstalled(provider.binary().into()));
+        }
         let name = provider.binary();
         let gui = std::env::var_os("PATH").unwrap_or_default();
         let known = platform::KNOWN_BIN_DIRS.iter().map(|dir| {
@@ -121,12 +166,13 @@ impl ChildEnv {
                 PathBuf::from(dir)
             }
         });
-        std::env::split_paths(&gui)
-            .chain(std::env::split_paths(&self.path))
-            .chain(known)
-            .filter(|dir| dir.is_absolute())
-            .find_map(|dir| executable(&dir.join(name)))
-            .ok_or_else(|| ProviderError::NotInstalled(name.into()))
+        resolve_from_dirs(
+            name,
+            std::env::split_paths(&gui)
+                .chain(std::env::split_paths(&self.path))
+                .chain(known),
+        )
+        .ok_or_else(|| ProviderError::NotInstalled(name.into()))
     }
     pub fn command(&self, binary: &Path, args: &[String], cwd: &Path) -> Command {
         let mut cmd = Command::new(binary);
@@ -198,6 +244,11 @@ impl ChildEnv {
         Ok(child)
     }
 }
+fn resolve_from_dirs(name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    dirs.into_iter()
+        .filter(|dir| dir.is_absolute())
+        .find_map(|dir| executable(&dir.join(name)))
+}
 fn executable(path: &Path) -> Option<PathBuf> {
     platform::is_executable(path)
         .then(|| std::fs::canonicalize(path).ok())
@@ -232,36 +283,15 @@ mod tests {
     #[test]
     fn resolution_skips_relative_and_empty_path_entries() {
         if let Some(root) = std::env::var_os("VEYRA_TEST_RESOLUTION") {
-            let env = super::ChildEnv {
-                mcp: None,
-                groups: Default::default(),
-                catalog: Default::default(),
-                closing: Default::default(),
-                launches: Default::default(),
-                #[cfg(test)]
-                before_spawn: Default::default(),
-                #[cfg(test)]
-                close_before_user_write: Default::default(),
-                path: "bin::.".into(),
-                home: None,
-                lanes: Default::default(),
-                claude_bin: None,
-                codex_bin: None,
-                fixtures: None,
-                record: None,
-                #[cfg(debug_assertions)]
-                reaper_pids: None,
-            };
-            let selected = env.resolve(super::ProviderKind::Claude).ok();
+            let selected = super::resolve_from_dirs(
+                "claude",
+                std::env::split_paths(std::ffi::OsStr::new("bin::.")),
+            );
             let planted =
                 std::fs::canonicalize(std::path::PathBuf::from(root).join("bin/claude")).unwrap();
             assert_ne!(selected, Some(planted.clone()));
-            let absolute = super::ChildEnv {
-                path: planted.parent().unwrap().as_os_str().into(),
-                ..env
-            };
             assert_eq!(
-                absolute.resolve(super::ProviderKind::Claude).unwrap(),
+                super::resolve_from_dirs("claude", [planted.parent().unwrap().to_owned()]).unwrap(),
                 planted
             );
             return;
@@ -367,7 +397,7 @@ mod tests {
         let engine = crate::Engine::launch(
             runtime.handle(),
             db,
-            super::super::Spawner::Cli(env.clone()),
+            super::super::Spawner::Cli(Box::new(env.clone())),
             None,
         )
         .unwrap();
@@ -491,7 +521,7 @@ mod tests {
         let engine = crate::Engine::launch(
             &tokio::runtime::Handle::current(),
             db,
-            super::super::Spawner::Cli(env.clone()),
+            super::super::Spawner::Cli(Box::new(env.clone())),
             None,
         )
         .unwrap();
@@ -523,5 +553,67 @@ mod tests {
             Err(super::ProviderError::Cancelled)
         ));
         engine.shutdown_wait().await;
+    }
+}
+
+#[cfg(test)]
+mod hermetic_tests {
+    use super::*;
+    #[test]
+    fn test_environment_never_resolves_ambient_providers() {
+        if std::env::var_os("VEYRA_TEST_HERMETIC_CHILD").is_some() {
+            let env = ChildEnv::load();
+            for provider in ProviderKind::ALL {
+                assert!(
+                    matches!(env.resolve(provider), Err(ProviderError::NotInstalled(_))),
+                    "test environment resolved ambient {}",
+                    provider.binary()
+                );
+            }
+            return;
+        }
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/provider-ambient-{}",
+            crate::domain::ThreadId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        for name in ["claude", "codex", "grok"] {
+            std::fs::copy(std::env::current_exe().unwrap(), root.join(name)).unwrap();
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "provider::env::hermetic_tests::test_environment_never_resolves_ambient_providers",
+                "--nocapture",
+            ])
+            .env("VEYRA_TEST_HERMETIC_CHILD", "1")
+            .env("PATH", &root)
+            .env_remove("VEYRA_CLAUDE_BIN")
+            .env_remove("VEYRA_CODEX_BIN")
+            .env_remove("VEYRA_GROK_BIN")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn isolated_resolution_uses_only_explicit_binaries_in_every_build() {
+    let binary = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let mut env = ChildEnv::isolated();
+    for provider in ProviderKind::ALL {
+        assert!(matches!(
+            env.resolve(provider),
+            Err(ProviderError::NotInstalled(_))
+        ));
+        env = env.with_binary(provider, binary.clone());
+        assert_eq!(env.resolve(provider).unwrap(), binary);
     }
 }

@@ -1,7 +1,4 @@
-use std::{
-    io::{self, Write},
-    path::PathBuf,
-};
+use std::{io, path::PathBuf};
 use veyra_engine::platform;
 
 pub fn run() -> anyhow::Result<()> {
@@ -11,17 +8,8 @@ pub fn run() -> anyhow::Result<()> {
     );
     let token = std::env::var("VEYRA_MCP_TOKEN")
         .map_err(|_| io::Error::other("VEYRA_MCP_TOKEN is missing"))?;
-    let mut connection = platform::connect_socket(&socket)?;
-    connection.write_all(token.as_bytes())?;
-    connection.write_all(b"\n")?;
-    connection.flush()?;
-    drop(token);
-    let mut input_connection = connection.try_clone()?;
-    std::thread::spawn(move || {
-        let _ = io::copy(&mut io::stdin().lock(), &mut input_connection);
-        let _ = input_connection.shutdown(std::net::Shutdown::Both);
-    });
-    io::copy(&mut connection, &mut io::stdout().lock())?;
+    let connection = platform::connect_socket(&socket)?;
+    platform::relay_stdio(connection, token.as_bytes())?;
     Ok(())
 }
 
@@ -53,12 +41,12 @@ mod tests {
             std::env::var_os("VEYRA_RELAY_CHILD").is_some(),
             "fixture entrypoint requires its run marker"
         );
-        run().unwrap();
+        std::process::exit(if run().is_ok() { 0 } else { 1 });
     }
     #[test]
     fn relay_stdin_eof_exits_with_socket_held_open() {
         let root = PathBuf::from("/tmp").join(format!(
-            "veyra-m5s1-{}",
+            "veyra-codex-replay-{}",
             veyra_engine::domain::ThreadId::new()
         ));
         platform::private_dir(&root).unwrap();
@@ -145,7 +133,7 @@ mod tests {
     #[test]
     fn codex_process_end_leaves_no_relay() {
         let root = PathBuf::from("/tmp").join(format!(
-            "veyra-m5s1-{}",
+            "veyra-codex-replay-{}",
             veyra_engine::domain::ThreadId::new()
         ));
         platform::private_dir(&root).unwrap();
@@ -212,5 +200,71 @@ mod tests {
             ended,
             "the Codex stdio process ended but its separate relay group survived"
         );
+    }
+    #[test]
+    fn relay_eof_exits_with_blocked_socket_and_stdout_writes() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "veyra-relay-blocked-{}",
+            veyra_engine::domain::ThreadId::new()
+        ));
+        platform::private_dir(&root).unwrap();
+        let _scratch = Scratch(root.clone());
+        let script = r#"
+import json,os,pathlib,secrets,socket,subprocess,sys,time
+root=pathlib.Path(sys.argv[1]); results=[]
+for case in ['positive','socket_write_blocked','stdout_write_blocked']:
+    path=root/'relay.sock'
+    server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    server.bind(str(path));server.listen();server.settimeout(3)
+    env=os.environ.copy();env['VEYRA_SOCKET']=str(path);env['VEYRA_MCP_TOKEN']=secrets.token_hex(32);env['VEYRA_RELAY_CHILD']='1'
+    child=subprocess.Popen([sys.argv[2],'--exact','relay::tests::relay_child','--ignored','--nocapture'],stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE if case=='stdout_write_blocked' else subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=env)
+    del env['VEYRA_MCP_TOKEN'];conn=None
+    try:
+        conn,_=server.accept();conn.settimeout(3)
+        while conn.recv(1)!=b'\n': pass
+        sent=0;deadline=time.monotonic()+0.5
+        if case=='socket_write_blocked':
+            os.set_blocking(child.stdin.fileno(),False)
+            while time.monotonic()<deadline and sent<262144:
+                try:sent+=os.write(child.stdin.fileno(),b'x'*65536)
+                except BlockingIOError:time.sleep(0.005)
+        elif case=='stdout_write_blocked':
+            conn.setblocking(False)
+            while time.monotonic()<deadline and sent<262144:
+                try:sent+=conn.send(b'x'*65536)
+                except BlockingIOError:time.sleep(0.005)
+        child.stdin.close()
+        try:child.wait(timeout=1);alive=False
+        except subprocess.TimeoutExpired:alive=True
+        results.append({'case':case,'payload_bytes':sent,'alive_after_eof':alive})
+    finally:
+        if child.poll() is None:child.kill()
+        child.wait(timeout=3)
+        if child.stdout:child.stdout.close()
+        if conn:conn.close()
+        server.close();path.unlink(missing_ok=True)
+print(json.dumps(results))
+"#;
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(&root)
+            .arg(std::env::current_exe().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cases: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(cases.len(), 3);
+        for case in &cases {
+            if case["case"] != "positive" {
+                assert!(case["payload_bytes"].as_u64().unwrap() > 0);
+            }
+            assert_eq!(case["alive_after_eof"], false, "{cases:?}");
+        }
     }
 }

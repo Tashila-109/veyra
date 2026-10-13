@@ -268,6 +268,7 @@ fn legacy_approval_rows_load_as_typed_display() {
             json!({"tool":"Bash","command":"echo old"}),
             ApprovalTarget::Command {
                 command: "echo old".into(),
+                cwd: Default::default(),
                 preview: ApprovalPreview::new(String::new()),
             },
         ),

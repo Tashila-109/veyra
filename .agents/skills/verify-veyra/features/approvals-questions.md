@@ -193,7 +193,100 @@ print('PASS exact approval, deny/allow/grant/compound, questions, digit focus, 1
 PY
 ```
 
+### Codex
+
+Run this fake-only section after the existing drive and before Evidence.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH="$PROOF" python3 - <<'PYCODEX'
+from driver import *
+identity()
+assert LANE == 'fake'
+thread = create_codex('codex-command',scenario='approval-command')
+dump = poll('codex-command',lambda d:d['composer']['dock'] is not None)
+dock = dump['composer']['dock']
+assert dock['action_text']=='touch veyra-check.txt' and dump['selected_thread']['status']=='NeedsYou'
+assert dock['consequence']=='Codex will run this command in the project folder.'
+capture('codex-command')
+action('codex-command-once','AllowOnce',{'request':dock['request']['id']})
+ctl('codex-command-done','wait',thread,'Done')
+assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))=='AllowOnce'
+
+records = codex_records('approval-command')
+index = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/commandExecution/requestApproval')
+other = json.loads(json.dumps(records[index]))
+other['line']['id']='other-directory'
+other['line']['params']['cwd']=str(DATA/'outside')
+(DATA/'outside').mkdir(exist_ok=True)
+same = json.loads(json.dumps(records[index]))
+same['line']['id']='same-directory'
+records[index+2:index+2] = [other,{'type':'expect_outbound','line':{'id':'other-directory','result':{'decision':'decline'}}},same,{'type':'expect_outbound','line':{'id':'same-directory','result':{'decision':'accept'}}}]
+thread = create_codex('codex-command-grants',records=records,prompt='Allow this command only in the project folder')
+first = poll('codex-grant-in-project',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert first['request']['kind']['Approval']['grant_key']['command']=='touch veyra-check.txt'
+capture('codex-grant-in-project')
+action('codex-grant-project','AllowInThread',{'request':first['request']['id']})
+other = poll('codex-command-other-cwd',lambda d:d['composer']['dock'] is not None and d['composer']['dock']['request']['id']!=first['request']['id'])['composer']['dock']
+assert other['action_text']=='touch veyra-check.txt'
+assert other['consequence']=='Codex will run this command in '+str(DATA/'outside')+'.'
+assert other['request']['kind']['Approval']['grant_key'] is None
+assert other['request']['kind']['Approval']['action']['target']['cwd']=={'directory':str(DATA/'outside')}
+capture('codex-command-other-cwd')
+action('codex-command-other-deny','Deny',{'request':other['request']['id']})
+ctl('codex-command-grants-done','wait',thread,'Done')
+assert sql("select count(*) from grants where thread_id='"+thread+"'")=='1'
+assert sql("select count(*) from requests where thread_id='"+thread+"' and state='answered'")=='3'
+assert [json.loads(value) for value in sql("select decision_json from requests where thread_id='"+thread+"' order by rowid").splitlines()]==['AllowInThread','Deny','AllowOnce']
+
+for label,scenario,tool in [('file','approval-file-change','File change'),('permissions','permissions','Permissions')]:
+    thread = create_codex('codex-'+label,scenario=scenario)
+    dock = poll('codex-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
+    assert dock['action_text']==tool and dock['request']['kind']['Approval']['grant_key'] is None
+    capture('codex-'+label)
+    action('codex-'+label+'-deny','Deny',{'request':dock['request']['id']})
+    ctl('codex-'+label+'-done','wait',thread,'Done')
+    assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))=='Deny'
+thread = create_codex('codex-question',scenario='question')
+dock = poll('codex-question',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert dock['request']['kind']['Question']['questions']==[{'text':'Which color should Veyra use?','options':['Violet','Blue']}]
+capture('codex-question')
+action('codex-question-focus','FocusDock')
+ctl('codex-question-choice','keys','1')
+done = ctl('codex-question-done','wait',thread,'Done')
+assert done['composer']['dock'] is None
+assert any(item['kind']=='user' and 'Violet' in item['text'] for item in done['transcript']['items'])
+assert 'Violet' in sql("select decision_json from requests where thread_id='"+thread+"'")
+thread = create_codex('codex-mcp',scenario='mcp-tool-approval')
+for label,decision in [('first','AllowOnce'),('second','Deny')]:
+    dock = poll('codex-mcp-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
+    assert dock['action_text']=='veyra / list_providers'
+    assert dock['request']['kind']['Approval']['grant_key'] is None
+    capture('codex-mcp-'+label)
+    action('codex-mcp-'+label+'-answer',decision,{'request':dock['request']['id']})
+    poll('codex-mcp-'+label+'-closed',lambda d:any(r['id']==dock['request']['id'] and r['state']=={'Answered':decision} for r in d['requests']))
+ctl('codex-mcp-done','wait',thread,'Done')
+assert sql("select count(*) from requests where thread_id='"+thread+"' and state='answered'")=='2'
+assert sql("select count(*) from grants where thread_id='"+thread+"'")=='0'
+assert [json.loads(value) for value in sql("select decision_json from requests where thread_id='"+thread+"' order by rowid").splitlines()]==['AllowOnce','Deny']
+poll('codex-approvals-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+action('codex-approvals-return-new','NewThread')
+action('codex-approvals-return-claude','PickProvider',{'provider':'claude'})
+page_done('approvals-questions-codex')
+print('PASS Codex commands, cwd-scoped grant, file/permissions Deny, question and both MCP approvals without grants')
+PYCODEX
+```
+
 ## Observable success
+
+The Codex section checks `composer.dock.action_text`, `consequence`, `request.kind`, the typed command `target.cwd` and `grant_key`.
+A grant in the project permits the identical command there; the same command in another directory docks, names that directory and is denied.
+SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
+File and permission denials, the Violet answer and both MCP decisions are persisted.
+Both MCP PNGs name `veyra / list_providers` and show Deny and Allow once without a thread grant.
 
 The unfocused approval PNGs show the exact command, consequence and FocusDock chord.
 The focused approval PNGs show Allow once, Deny and their answer chords, matching the keys driven in those states.

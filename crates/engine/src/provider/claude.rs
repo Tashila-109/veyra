@@ -335,21 +335,6 @@ impl TextFilter {
         }
     }
 }
-enum InterruptPhase {
-    Protocol(tokio::time::Instant),
-    Terminate(tokio::time::Instant),
-}
-impl InterruptPhase {
-    pub fn deadline(&self) -> tokio::time::Instant {
-        match self {
-            Self::Protocol(at) | Self::Terminate(at) => *at,
-        }
-    }
-}
-pub(crate) struct Interruption {
-    phase: InterruptPhase,
-    pub reason: String,
-}
 fn log_ignored(kind: &str, value: &Value) {
     tracing::info!(
         kind,
@@ -485,12 +470,16 @@ pub(crate) struct Codec {
     stream: MessageStream,
     tools: BTreeMap<String, Tool>,
     error: Option<AssistantError>,
-    interrupted: Option<Interruption>,
+    interrupted: Option<super::StopLadder>,
     requests: BTreeMap<String, PendingRequest>,
     seen_requests: BTreeSet<String>,
     seen_commands: BTreeSet<String>,
 }
 impl Codec {
+    #[cfg(debug_assertions)]
+    pub fn native(&self) -> &NativeSessionId {
+        &self.native
+    }
     pub fn new(native: NativeSessionId, pid: u32, cwd: &std::path::Path) -> Self {
         Self {
             active: None,
@@ -739,30 +728,17 @@ impl Codec {
         if self.active.map(ActiveTurn::target) != Some(turn) {
             return false;
         }
-        self.interrupted.get_or_insert_with(|| Interruption {
-            phase: InterruptPhase::Protocol(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
-            ),
-            reason: reason.text().into(),
-        });
+        self.interrupted
+            .get_or_insert_with(|| super::StopLadder::new(reason));
         true
     }
-    pub fn interrupt_deadline(&self) -> Option<tokio::time::Instant> {
+    pub fn next_deadline(&self) -> Option<tokio::time::Instant> {
         self.interrupted
             .as_ref()
-            .map(|interrupt| interrupt.phase.deadline())
+            .map(|interrupt| interrupt.deadline())
     }
     pub fn escalate_interrupt(&mut self) -> Option<crate::platform::Signal> {
-        let interrupt = self.interrupted.as_mut()?;
-        Some(match interrupt.phase {
-            InterruptPhase::Protocol(_) => {
-                interrupt.phase = InterruptPhase::Terminate(
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                );
-                crate::platform::Signal::Terminate
-            }
-            InterruptPhase::Terminate(_) => crate::platform::Signal::Kill,
-        })
+        self.interrupted.as_mut()?.escalate()
     }
     fn request(&self, request: &ControlRequest) -> Option<RequestKind> {
         let tool = &request.request;
@@ -855,6 +831,7 @@ impl Codec {
             arguments.remove("command");
             ApprovalTarget::Command {
                 command: command.into(),
+                cwd: Default::default(),
                 preview: Self::preview(arguments),
             }
         } else if let Some((field, operation, path)) = file_target {
@@ -938,7 +915,13 @@ impl Codec {
             .into_iter()
             .map(Outbound::Message)
             .collect();
-        lines.push(Outbound::Interrupt(turn));
+        lines.push(Outbound::Interrupt {
+            turn,
+            line: json!({
+                "type":"control_request", "request_id":"veyra-interrupt",
+                "request":{"subtype":"interrupt"}
+            }),
+        });
         lines
     }
     pub fn cancel_requests(&mut self, reason: &str) -> Vec<Value> {
@@ -961,9 +944,7 @@ impl Codec {
     }
     pub fn end_outcome(&self, fallback: TurnOutcome) -> TurnOutcome {
         if let Some(interrupt) = &self.interrupted {
-            TurnOutcome::Interrupted {
-                reason: interrupt.reason.clone(),
-            }
+            interrupt.outcome()
         } else if let Some(error) = &self.error {
             TurnOutcome::Failed {
                 message: error.message.clone(),
@@ -1845,7 +1826,7 @@ mod tests {
         let old = json!({"tool":"Bash", "command":"echo old"});
         let action: ProposedAction = serde_json::from_value(old.clone()).unwrap();
         assert!(
-            matches!(&action.target, ApprovalTarget::Command { command, preview }
+            matches!(&action.target, ApprovalTarget::Command { command, preview, .. }
             if command == "echo old" && preview.text.is_empty() && !preview.truncated)
         );
         let stored = serde_json::to_value(&action).unwrap();

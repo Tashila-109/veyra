@@ -579,7 +579,7 @@ impl Actor {
                         .threads
                         .values()
                         .cloned()
-                        .map(Ev::ThreadCreated),
+                        .map(|row| Ev::ThreadCreated(Box::new(row))),
                 );
                 initial.extend(self.projection.turns.values().cloned().map(
                     |turn| match turn.state {
@@ -1260,7 +1260,7 @@ impl Actor {
                     },
                 };
                 if granted {
-                    c.events.push(Ev::RequestClosed(r.clone()));
+                    c.events.push(Ev::RequestClosed(Box::new(r.clone())));
                     c.effects.push(Effect::Control {
                         thread,
                         control: SessionControl::Answer {
@@ -1269,7 +1269,7 @@ impl Actor {
                         },
                     });
                 } else {
-                    c.events.push(Ev::RequestOpened(r.clone()));
+                    c.events.push(Ev::RequestOpened(Box::new(r.clone())));
                 }
                 c.requests.insert(r.id, r);
             }

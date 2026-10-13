@@ -266,7 +266,59 @@ DebugScrollTranscript scrolls the same public gpui list state used by keys and t
 ScrollTranscriptUp, ScrollTranscriptDown and ScrollTranscriptEnd use Page Up, Page Down and Command+End.
 The debug transcript also reports gap, top_item, top_offset and item_tops for scroll and expansion assertions.
 
+### Codex
+
+Run this fake-only section after the existing drive and before Evidence.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH="$PROOF" python3 - <<'PYCODEX'
+from driver import *
+identity()
+assert LANE == 'fake'
+thread = create_codex('codex-chat',slow=True)
+stream = poll('codex-chat-working',lambda d:any(item['kind']=='assistant' and item['text']=='o' and not item['done'] for item in d['transcript']['items']))
+assert stream['selected_thread']['status']=='Working'
+assert stream['composer_text']=='' and stream['selected_thread']['native_id']
+capture('codex-chat-working')
+done = ctl('codex-chat-wait','wait',thread,'Done')
+save('codex-chat-done',done)
+assert [(item['text'],item['done']) for item in done['transcript']['items'] if item['kind']=='assistant']==[('ok',True)]
+assert next(item for item in done['transcript']['items'] if item['kind']=='assistant')['delta_count']==2
+assert sql("select json_extract(body_json,'$.AssistantText.text')||'|'||done from items where thread_id='"+thread+"' and kind='assistant_text'")=='ok|1'
+assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"'"))=='Completed'
+capture('codex-chat-done')
+thread = create_codex('codex-other-thread',scenario='subagent-other-thread')
+done = ctl('codex-other-thread-wait','wait',thread,'Done')
+save('codex-other-thread-done',done)
+assert sql("select count(*) from turns where thread_id='"+thread+"'")=='1'
+assert 'User' in json.loads(sql("select origin_json from turns where thread_id='"+thread+"'"))
+assert [item['text'] for item in done['transcript']['items'] if item['kind']=='assistant']==['ok']
+assert sql("select json_extract(body_json,'$.AssistantText.text') from items where thread_id='"+thread+"' and kind='assistant_text'")=='ok'
+capture('codex-other-thread')
+thread = create_codex('codex-notices',scenario='retry-and-limits')
+done = ctl('codex-notices-wait','wait',thread,'Done')
+save('codex-notices-done',done)
+expected = ['Codex is retrying after a provider error.','Codex updated its usage limits. Check the CLI for the remaining allowance.']
+assert [item['text'] for item in done['transcript']['items'] if item['kind']=='notice']==expected
+stored = sql("select json_extract(body_json,'$.Notice.text') from items where thread_id='"+thread+"' and kind='notice' order by seq").splitlines()
+assert stored==expected
+capture('codex-notices')
+action('codex-chat-return-new','NewThread')
+action('codex-chat-return-claude','PickProvider',{'provider':'claude'})
+page_done('chat-send-stream-codex')
+print('PASS Codex streams ok; foreign thread creates no turn/text; two stored notices')
+PYCODEX
+```
+
 ## Observable success
+
+The Codex section saves streamed `o`, completed `ok` with two `delta_count` events, its stored item and Completed turn.
+The foreign-thread fixture leaves one User turn and only `ok`; the retry/limit fixture stores exactly two Notice items.
+The Codex PNGs show Working, Done and both notices.
 
 - `chat-working.json` has Working, assistant `o` with `done: false`, a native id and cleared composer; inspect its PNG for the caret and Working header.
 - `chat-done.json` has one user prompt and exactly one completed assistant `ok`, Done in the selected thread and sidebar, and an increased applied-batch counter.

@@ -220,6 +220,7 @@ impl Fixture {
                     tool: "shell".into(),
                     target: ApprovalTarget::Command {
                         command: "echo own-test".into(),
+                        cwd: Default::default(),
                         preview: ApprovalPreview::new(String::new()),
                     },
                 },

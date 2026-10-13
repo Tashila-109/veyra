@@ -376,7 +376,7 @@ async fn session_config_lifecycle(root_thread: bool, reported: Option<&str>) {
     .unwrap();
     let (out, mut events) = mpsc::channel(256);
     let server = Server::bind(&run.root, relay(), out.clone()).unwrap();
-    let mut env = ChildEnv::load();
+    let mut env = ChildEnv::isolated();
     env.mcp = Some(std::sync::Arc::new(server));
     env.claude_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra-fake-cli")));
     env.fixtures = Some(run.root.join("fixtures"));

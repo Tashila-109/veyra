@@ -35,6 +35,7 @@ fn remove_stale_configs(data: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct McpToken(String);
 impl McpToken {
     pub fn new() -> Self {
@@ -273,14 +274,14 @@ impl Server {
         let Some(credential) = credential else { return };
         tracing::info!(thread=%credential.thread,"MCP connection accepted");
         let pid = (*credential.pid.borrow()).expect("registered CLI pid");
-        let (input, mut frames) = mpsc::channel(16);
+        let (input, mut frames) = mpsc::channel(4);
         let (closed, mut ended) = oneshot::channel();
         let credentials = self.credentials.clone();
         let reader = tokio::spawn(async move {
             loop {
                 let next = lines.next().await;
                 let terminal = !matches!(next, Ok(Some(Line::Text(_))));
-                if input.send(next).await.is_err() || terminal {
+                if input.try_send(next).is_err() || terminal {
                     break;
                 }
             }
@@ -297,7 +298,15 @@ impl Server {
                 Ok(Some(Line::Text(line))) => match serde_json::from_str(&line) {
                     Ok(value) => value,
                     Err(_) => {
-                        let _=write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}\n").await;
+                        let written = tokio::select! {
+                            biased;
+                            _ = &mut ended => break,
+                            _ = out.closed() => break,
+                            result = write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}\n") => result,
+                        };
+                        if written.is_err() {
+                            break;
+                        }
                         continue;
                     }
                 },
@@ -320,7 +329,13 @@ impl Server {
                     break;
                 };
                 bytes.push(b'\n');
-                if write.write_all(&bytes).await.is_err() {
+                let written = tokio::select! {
+                    biased;
+                    _ = &mut ended => break,
+                    _ = out.closed() => break,
+                    result = write.write_all(&bytes) => result,
+                };
+                if written.is_err() {
                     break;
                 }
             }
@@ -611,7 +626,7 @@ mod eof_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[tokio::test]
     async fn half_closed_peer_ends_pending_call() {
-        let root = PathBuf::from("/tmp").join(format!("veyra-m5s1-{}", ThreadId::new()));
+        let root = PathBuf::from("/tmp").join(format!("veyra-codex-replay-{}", ThreadId::new()));
         platform::private_dir(&root).unwrap();
         let _scratch = crate::tests::Scratch(root.clone());
         let (out, mut messages) = mpsc::channel(16);
@@ -672,5 +687,72 @@ mod eof_tests {
                 token
             }
         ));
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn full_frame_queue_closes_and_revokes_pending_call() {
+    use tokio::io::AsyncReadExt;
+    for pipelined in [0, 33] {
+        let root = PathBuf::from("/tmp").join(format!("veyra-mcp-queue-{}", ThreadId::new()));
+        platform::private_dir(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let (out, mut messages) = mpsc::channel(16);
+        let server = Server::bind(&root, std::env::current_exe().unwrap(), out).unwrap();
+        let thread = ThreadId::new();
+        let mut authentication = server
+            .for_spawn(thread, 1, |token| {
+                Ok((
+                    token.expose().to_owned(),
+                    platform::parent_pid(std::process::id())?,
+                ))
+            })
+            .unwrap();
+        let token = TokenHash::of(&authentication);
+        let mut socket = platform::connect_async_socket(&server.socket)
+            .await
+            .unwrap();
+        socket.write_all(authentication.as_bytes()).await.unwrap();
+        socket.write_all(b"\n").await.unwrap();
+        authentication.clear();
+        drop(authentication);
+        socket.write_all(b"{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"list_providers\",\"arguments\":{}}}\n").await.unwrap();
+        let held = tokio::time::timeout(Duration::from_secs(2), messages.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&held, EngineMsg::Tool { .. }));
+        for id in 2..pipelined + 2 {
+            if socket
+                .write_all(format!("{{\"id\":{id},\"method\":\"ping\"}}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        let _ = socket.shutdown().await;
+        let mut bytes = vec![];
+        let closed =
+            tokio::time::timeout(Duration::from_millis(750), socket.read_to_end(&mut bytes)).await;
+        drop(held);
+        drop(messages);
+        assert!(
+            closed.is_ok(),
+            "{pipelined} pipelined frames hid EOF behind a held actor call"
+        );
+        assert!(!server.allows(
+            thread,
+            Caller {
+                epoch: 1,
+                pid: platform::parent_pid(std::process::id()).unwrap(),
+                token
+            }
+        ));
+        assert_eq!(bytes, b"");
+        drop(socket);
+        drop(server);
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

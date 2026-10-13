@@ -398,7 +398,7 @@ pub fn decide(
                 archived: false,
             };
             let child_id = child.id;
-            c.events.push(Ev::ThreadCreated(child.clone()));
+            c.events.push(Ev::ThreadCreated(Box::new(child.clone())));
             c.threads.insert(child_id, child);
             c.live.insert(child_id, LiveThread::default());
             let task = queue_task(

@@ -189,7 +189,7 @@ impl AppState {
                     self.projects.insert(project.id, project.clone());
                 }
                 ChangeEvent::ThreadCreated(thread) => {
-                    self.threads.insert(thread.id, thread.clone());
+                    self.threads.insert(thread.id, thread.as_ref().clone());
                 }
                 ChangeEvent::ThreadArchived { thread } => {
                     if let Some(row) = self.threads.get_mut(thread) {
@@ -243,9 +243,9 @@ impl AppState {
                 ChangeEvent::SettingsChanged(settings) => self.settings = *settings,
                 ChangeEvent::RequestOpened(request) | ChangeEvent::RequestClosed(request) => {
                     if let Some(row) = self.requests.iter_mut().find(|row| row.id == request.id) {
-                        *row = request.clone();
+                        *row = request.as_ref().clone();
                     } else {
-                        self.requests.push(request.clone());
+                        self.requests.push(request.as_ref().clone());
                     }
                 }
                 ChangeEvent::TaskStarted(task)
@@ -2331,10 +2331,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let engine = veyra_engine::Engine::start_with_processes(
+        let engine = veyra_engine::Engine::start_with_env(
             runtime.handle(),
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
-            vec![],
+            veyra_engine::provider::env::ChildEnv::isolated(),
         )
         .unwrap();
         runtime.block_on(engine.shutdown_wait());
@@ -3322,6 +3322,7 @@ mod tests {
                         tool: "command tool".into(),
                         target: ApprovalTarget::Command {
                             command: command.clone(),
+                            cwd: Default::default(),
                             preview: ApprovalPreview::new("argument preview\n".repeat(200)),
                         },
                     },
@@ -3420,6 +3421,7 @@ mod tests {
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: command.into(),
+                            cwd: Default::default(),
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -3445,6 +3447,7 @@ mod tests {
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: "echo ok".into(),
+                            cwd: Default::default(),
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -3485,6 +3488,7 @@ mod tests {
                             tool: "Bash".into(),
                             target: ApprovalTarget::Command {
                                 command: "echo ok".into(),
+                                cwd: Default::default(),
                                 preview: ApprovalPreview::new(String::new()),
                             },
                         },
@@ -3513,7 +3517,7 @@ mod tests {
             sender
                 .send(UiEvent::Change {
                     counter: Some(1),
-                    event: ChangeEvent::RequestClosed(answered),
+                    event: ChangeEvent::RequestClosed(Box::new(answered)),
                 })
                 .unwrap();
             draw(cx);
@@ -3546,6 +3550,7 @@ mod tests {
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: "touch veyra-check.txt".into(),
+                            cwd: Default::default(),
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -3618,7 +3623,7 @@ mod tests {
             sender
                 .send(UiEvent::Change {
                     counter: Some(1),
-                    event: ChangeEvent::RequestClosed(answered),
+                    event: ChangeEvent::RequestClosed(Box::new(answered)),
                 })
                 .unwrap();
             cx.run_until_parked();
@@ -3643,10 +3648,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let engine = veyra_engine::Engine::start_with_processes(
+        let engine = veyra_engine::Engine::start_with_env(
             runtime.handle(),
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
-            vec![],
+            veyra_engine::provider::env::ChildEnv::isolated(),
         )
         .unwrap();
         let (_, events) = tokio::sync::mpsc::unbounded_channel();
@@ -3700,10 +3705,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let engine = veyra_engine::Engine::start_with_processes(
+        let engine = veyra_engine::Engine::start_with_env(
             runtime.handle(),
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
-            vec![],
+            veyra_engine::provider::env::ChildEnv::isolated(),
         )
         .unwrap();
         runtime.block_on(engine.shutdown_wait());
@@ -3730,7 +3735,7 @@ mod tests {
         sender
             .send(UiEvent::Change {
                 counter: Some(1),
-                event: ChangeEvent::ThreadCreated(Thread {
+                event: ChangeEvent::ThreadCreated(Box::new(Thread {
                     id: thread,
                     project: ProjectId::new(),
                     title: "chat".into(),
@@ -3749,7 +3754,7 @@ mod tests {
                     view: View::Chat,
                     import_pending: false,
                     archived: false,
-                }),
+                })),
             })
             .unwrap();
         let end = std::time::Instant::now() + Duration::from_secs(30);
@@ -3853,7 +3858,7 @@ mod tests {
         let mut state = AppState::default();
         state.apply(UiEvent::Change {
             counter: Some(1),
-            event: ChangeEvent::ThreadCreated(row.clone()),
+            event: ChangeEvent::ThreadCreated(Box::new(row.clone())),
         });
         state.apply(UiEvent::Change {
             counter: Some(2),
@@ -3961,7 +3966,7 @@ mod tests {
         let mut state = AppState::default();
         state.apply(UiEvent::Change {
             counter: Some(1),
-            event: ChangeEvent::ThreadCreated(Thread {
+            event: ChangeEvent::ThreadCreated(Box::new(Thread {
                 id: thread,
                 project: ProjectId::new(),
                 title: "chat".into(),
@@ -3980,7 +3985,7 @@ mod tests {
                 view: View::Chat,
                 import_pending: false,
                 archived: false,
-            }),
+            })),
         });
         let request = state.begin_snapshot(thread);
         state.apply(UiEvent::Change {
@@ -4141,10 +4146,10 @@ mod tests {
                 .build()
                 .unwrap();
             let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
-            let engine = veyra_engine::Engine::start_with_processes(
+            let engine = veyra_engine::Engine::start_with_env(
                 runtime.handle(),
                 veyra_engine::data_dir::DataDir::at(data).unwrap(),
-                vec![],
+                veyra_engine::provider::env::ChildEnv::isolated(),
             )
             .unwrap();
             shell.update_in(cx, |shell, _, _| {
@@ -4232,10 +4237,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let engine = veyra_engine::Engine::start_with_processes(
+        let engine = veyra_engine::Engine::start_with_env(
             runtime.handle(),
             veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
-            vec![],
+            veyra_engine::provider::env::ChildEnv::isolated(),
         )
         .unwrap();
         let (_sender, events) = tokio::sync::mpsc::unbounded_channel();
@@ -4258,7 +4263,10 @@ mod tests {
         let control = probes.check(
             runtime.handle(),
             ProviderKind::Claude,
-            veyra_engine::provider::env::ChildEnv::load(),
+            veyra_engine::provider::env::ChildEnv::isolated().with_binary(
+                ProviderKind::Claude,
+                std::env::var_os("VEYRA_CLAUDE_BIN").unwrap().into(),
+            ),
             scratch.0.clone(),
         );
         let positive = runtime.block_on(control).unwrap();
@@ -4403,6 +4411,7 @@ mod tests {
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: "touch request-a".into(),
+                            cwd: Default::default(),
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -4447,6 +4456,7 @@ mod tests {
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: "touch request-b".into(),
+                            cwd: Default::default(),
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -4477,6 +4487,7 @@ mod tests {
                             tool: "Bash".into(),
                             target: ApprovalTarget::Command {
                                 command: "echo exact".into(),
+                                cwd: Default::default(),
                                 preview: ApprovalPreview::new(String::new()),
                             },
                         },
@@ -4697,7 +4708,7 @@ mod tests {
         };
         state.apply(UiEvent::Change {
             counter: None,
-            event: ChangeEvent::ThreadCreated(parent.clone()),
+            event: ChangeEvent::ThreadCreated(Box::new(parent.clone())),
         });
         let turn = TurnId::new();
         let item = ItemId::new();
@@ -4735,7 +4746,7 @@ mod tests {
         };
         state.apply(UiEvent::Change {
             counter: None,
-            event: ChangeEvent::ThreadCreated(worker),
+            event: ChangeEvent::ThreadCreated(Box::new(worker)),
         });
         state.apply(UiEvent::Change {
             counter: None,

@@ -83,6 +83,7 @@ else { fail("owned window is covered by another application") }
 SWIFT
 swiftc -O "$PROOF/capture-window.swift" -o "$PROOF/capture-window"
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
+cp crates/engine/tests/fixtures/codex/probe-ready.jsonl "$PROOF/fixtures/probe-codex.jsonl"
 printf 'RUN=%s\n' "$RUN"
 cat >"$PROOF/driver.py" <<'PY'
 import ctypes, errno, hashlib, json, os, pathlib, re, shutil, signal, sqlite3, struct, subprocess, sys, time
@@ -92,6 +93,7 @@ DATA = pathlib.Path('/tmp/veyra-verify-' + RUN)
 DB = DATA / 'veyra.db'
 FIXTURES = PROOF / 'fixtures'
 SOURCE = pathlib.Path('crates/engine/tests/fixtures/claude')
+CODEX_SOURCE = pathlib.Path('crates/engine/tests/fixtures/codex')
 TABLES = 'grants items projects requests settings tasks threads turns'.split()
 LANE = (PROOF/'lane').read_text().strip()
 assert LANE in ['fake','live'], LANE
@@ -100,10 +102,11 @@ ENV = {key:value for key,value in os.environ.items() if not (
     or key in ['CLAUDE_PID','CLAUDE_EFFORT','CLAUDECODE','CLAUDE_AGENT_SDK_VERSION'])}
 ENV['VEYRA_DATA_DIR'] = str(DATA)
 ENV['VEYRA_REAP_PIDS'] = ''
-for name in ['VEYRA_CLAUDE_BIN','VEYRA_FAKE_FIXTURES','VEYRA_FAKE_FIXTURE','VEYRA_RECORD']:
+for name in ['VEYRA_CLAUDE_BIN','VEYRA_CODEX_BIN','VEYRA_GROK_BIN','VEYRA_FAKE_FIXTURES','VEYRA_FAKE_FIXTURE','VEYRA_RECORD']:
     ENV.pop(name,None)
 if LANE == 'fake':
-    ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()))
+    ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_CODEX_BIN=str(DATA/'fake-cli'),
+        VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()))
 else:
     ENV['VEYRA_RECORD'] = str(PROOF.resolve()/'rec')
 lib = ctypes.CDLL(None,use_errno=True)
@@ -353,6 +356,39 @@ def stage(scenario, slow=False, turns=1):
             records.extend(json.loads(text))
         records.append(ending)
     stage_records(records)
+def codex_records(scenario, slow=False, root=True):
+    records = [json.loads(line) for line in (CODEX_SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
+    expanded = []
+    for record in records:
+        wire = record.get('line',{})
+        method = wire.get('method','')
+        if root and record['type']=='expect_outbound' and method in ['thread/start','thread/resume']:
+            wire['params'].setdefault('config',{
+                'mcp_servers.veyra.command':'<any>', 'mcp_servers.veyra.args':['mcp'],
+                'mcp_servers.veyra.env':{'VEYRA_SOCKET':'<any>','VEYRA_MCP_TOKEN':'<any>'}})
+        if slow and method=='item/agentMessage/delta' and wire['params']['delta']=='ok':
+            for text in ['o','k']:
+                part = json.loads(json.dumps(record))
+                part['line']['params']['delta'] = text
+                part['after_ms'] = 500
+                expanded.append(part)
+        else:
+            if slow and method=='turn/completed': record['after_ms'] = 1000
+            expanded.append(record)
+    return expanded
+def create_codex(name, scenario='ok-reply', slow=False, records=None, prompt='reply with the word ok'):
+    assert LANE == 'fake'
+    stage_records(codex_records(scenario,slow) if records is None else records)
+    action(name+'-new','NewThread')
+    action(name+'-provider','PickProvider',{'provider':'codex'})
+    action(name+'-mode','PickPermission',{'mode':'ask_first'})
+    ctl(name+'-text','text',prompt)
+    before = int(sql('select count(*) from threads'))
+    ctl(name+'-send','keys','secondary-enter')
+    dump = poll(name+'-selected',lambda d: d['selected_thread'] is not None
+        and int(sql('select count(*) from threads'))==before+1)
+    assert dump['composer']['provider']=='codex'
+    return dump['selected_thread']['id']
 def create(name, prompt, slow=False, scenario='ok-reply'):
     if LANE == 'fake' and scenario is not None: stage(scenario,slow)
     action(name+'-new','NewThread')
@@ -487,6 +523,7 @@ PY
 
 Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.md), [chat-send-stream](features/chat-send-stream.md) and [settings](features/settings.md).
 Also run [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
+Run each page's Codex section in the fake lane after its existing drive.
 Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
 The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
@@ -607,6 +644,14 @@ required = {
         'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
         'settings-existing.json','settings-new.json'],
+    'new-thread-codex':['codex-new-thread-missing.json','codex-new-thread-missing.png',
+        'codex-new-thread-ready.json','codex-provider-menu-ready.png','codex-new-thread-choices.json','codex-new-thread.png'],
+    'chat-send-stream-codex':['codex-chat-working.json','codex-chat-working.png','codex-chat-done.json',
+        'codex-chat-done.png','codex-other-thread-done.json','codex-other-thread.png','codex-notices-done.json','codex-notices.png'],
+    'approvals-questions-codex':['codex-command.json','codex-command.png','codex-command-other-cwd.png',
+        'codex-file.png','codex-permissions.png','codex-question.png','codex-mcp-first.png','codex-mcp-second.png'],
+    'multi-agent-codex':['codex-relay-done.json','codex-relay.png','codex-relay-log.txt',
+        'codex-child-task.json','codex-child-task.png','codex-family-done.json','codex-family-done.png'],
     'new-thread-live':['new-thread-live.json','new-thread-live.png'],
     'chat-send-stream-live':['chat-working.json','chat-working.png','chat-done.json','chat-done.png','rec/probe.jsonl'],
 }
@@ -623,6 +668,8 @@ pairs = {
     'chat-send-stream':[('chat-working','chat-done'),('chat-tool-collapsed','chat-tool-expanded')],
     'settings':[('settings-full-access','settings')],
     'chat-send-stream-live':[('chat-working','chat-done')],
+    'chat-send-stream-codex':[('codex-chat-working','codex-chat-done')],
+    'new-thread-codex':[('codex-new-thread-missing','codex-new-thread')],
 }
 for page in pages:
     for first,second in pairs.get(page,[]):

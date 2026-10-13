@@ -9,16 +9,28 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::{
-    ApprovalTarget, FileOperation, ProposedAction, RequestKind, TargetLocation, WaitReason,
+    ApprovalTarget, CommandCwd, FileOperation, ProposedAction, RequestKind, TargetLocation,
+    WaitReason,
 };
 
 pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String, String, String) {
     let (label, consequence, preview) = match &action.target {
-        ApprovalTarget::Command { command, preview } => (
-            command.clone(),
-            format!("{provider} will run this command in the project folder."),
+        ApprovalTarget::Command {
+            command,
+            cwd,
             preview,
-        ),
+        } => {
+            let location = match cwd {
+                CommandCwd::ProjectFolder => "in the project folder".into(),
+                CommandCwd::Directory(path) => format!("in {}", path.display()),
+                CommandCwd::NotVerified => "at a location that is not verified".into(),
+            };
+            (
+                command.clone(),
+                format!("{provider} will run this command {location}."),
+                preview,
+            )
+        }
         ApprovalTarget::File {
             operation,
             path,
@@ -674,5 +686,19 @@ mod tests {
             }
         }
         assert!(code.contains(".child(preview)"));
+    }
+    #[test]
+    fn codex_command_dock_shows_other_working_directory() {
+        let action: ProposedAction = serde_json::from_value(serde_json::json!({
+            "tool":"Command", "target":{"kind":"command","command":"rm -rf build",
+            "cwd":{"directory":"/tmp/elsewhere"},"preview":{"text":"","truncated":false}}
+        }))
+        .unwrap();
+        let (command, consequence, _) = approval_text(&action, "Codex");
+        assert_eq!(command, "rm -rf build");
+        assert_eq!(
+            consequence,
+            "Codex will run this command in /tmp/elsewhere."
+        );
     }
 }

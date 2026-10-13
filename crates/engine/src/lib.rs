@@ -53,6 +53,7 @@ struct EngineInner {
     state: Arc<RuntimeState>,
     runtime: Handle,
     groups: provider::env::Groups,
+    environment: provider::env::ChildEnv,
 }
 #[derive(Default)]
 pub(crate) struct RuntimeState {
@@ -156,22 +157,21 @@ pub struct Engine {
 }
 impl Engine {
     pub fn start(runtime: &Handle, data: DataDir) -> Result<Self, StartError> {
-        Self::start_with(runtime, data, |env| env)
+        Self::start_with_env(runtime, data, provider::env::ChildEnv::load())
     }
     pub fn start_with_processes(
         runtime: &Handle,
         data: DataDir,
         pids: Vec<u32>,
     ) -> Result<Self, StartError> {
-        Self::start_with(runtime, data, |mut env| {
-            env.reaper_pids = Some(pids.into_iter().collect());
-            env
-        })
+        let mut env = provider::env::ChildEnv::load();
+        env.reaper_pids = Some(pids.into_iter().collect());
+        Self::start_with_env(runtime, data, env)
     }
-    fn start_with(
+    pub fn start_with_env(
         runtime: &Handle,
         data: DataDir,
-        prepare: impl FnOnce(provider::env::ChildEnv) -> provider::env::ChildEnv,
+        env: provider::env::ChildEnv,
     ) -> Result<Self, StartError> {
         let lock = data.lock()?;
         platform::private_file(
@@ -183,9 +183,8 @@ impl Engine {
                 .truncate(false),
         )?;
         let db = store::open(&data.path().join("veyra.db"))?;
-        let env = prepare(provider::env::ChildEnv::load());
         process::start(store::live_processes(&db)?, &env);
-        Self::launch(runtime, db, Spawner::Cli(env), Some(lock))
+        Self::launch(runtime, db, Spawner::Cli(Box::new(env)), Some(lock))
     }
     fn launch(
         runtime: &Handle,
@@ -212,6 +211,12 @@ impl Engine {
             )?));
         }
         let state = actor.state.clone();
+        let mut environment = match &actor.spawner {
+            Spawner::Cli(env) => env.as_ref().clone(),
+            #[cfg(test)]
+            Spawner::Scripted(_) => provider::env::ChildEnv::isolated(),
+        };
+        environment.mcp = None;
         let groups = match &actor.spawner {
             Spawner::Cli(env) => env.groups.clone(),
             #[cfg(test)]
@@ -243,6 +248,7 @@ impl Engine {
                 state,
                 runtime: runtime.clone(),
                 groups,
+                environment,
             }),
         })
     }
@@ -283,7 +289,7 @@ impl Engine {
             .await;
     }
     pub fn child_env(&self) -> provider::env::ChildEnv {
-        let mut env = provider::env::ChildEnv::load();
+        let mut env = self.inner.environment.for_probe();
         env.closing = self.inner.state.closing.clone();
         env.groups = self.inner.groups.clone();
         env.catalog = self.inner.state.catalog.clone();

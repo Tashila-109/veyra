@@ -269,6 +269,8 @@ pub struct ProposedAction {
 pub enum ApprovalTarget {
     Command {
         command: String,
+        #[serde(default)]
+        cwd: CommandCwd,
         preview: ApprovalPreview,
     },
     File {
@@ -280,6 +282,14 @@ pub enum ApprovalTarget {
     Tool {
         preview: ApprovalPreview,
     },
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandCwd {
+    #[default]
+    ProjectFolder,
+    Directory(PathBuf),
+    NotVerified,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -349,6 +359,7 @@ impl<'de> Deserialize<'de> for ProposedAction {
                 } else {
                     ApprovalTarget::Command {
                         command,
+                        cwd: Default::default(),
                         preview: ApprovalPreview::new(String::new()),
                     }
                 };

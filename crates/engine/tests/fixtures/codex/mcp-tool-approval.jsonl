@@ -1,4 +1,4 @@
-{"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.162.1", "scenario": "mcp-tool-approval", "source": "Veyra lane 0 elicitation shape with Veyra list_providers tool"}
+{"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.162.1", "scenario": "mcp-tool-approval", "source": "Veyra hand-written stable-schema scenario"}
 {"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}}}}
 {"type": "emit_inbound", "line": {"id": "<id:initialize>", "result": {"userAgent": "veyra/0.161.0"}}}
 {"type": "expect_outbound", "line": {"method": "initialized"}}

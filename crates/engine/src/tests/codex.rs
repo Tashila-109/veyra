@@ -50,8 +50,11 @@ fn codex_ready_provider_can_be_delegated() {
 #[cfg(debug_assertions)]
 #[test]
 fn codex_debug_binary_override_is_resolved() {
-    if std::env::var_os("VEYRA_M5_OVERRIDE_TEST").is_some() {
-        let env = env::ChildEnv::load();
+    if std::env::var_os("VEYRA_TEST_BINARY_OVERRIDE").is_some() {
+        let env = env::ChildEnv::isolated().with_binary(
+            ProviderKind::Codex,
+            std::env::var_os("VEYRA_CODEX_BIN").unwrap().into(),
+        );
         assert_eq!(
             env.resolve(ProviderKind::Codex).unwrap(),
             std::env::current_exe().unwrap().canonicalize().unwrap()
@@ -63,7 +66,7 @@ fn codex_debug_binary_override_is_resolved() {
             "--exact",
             "tests::codex::codex_debug_binary_override_is_resolved",
         ])
-        .env("VEYRA_M5_OVERRIDE_TEST", "1")
+        .env("VEYRA_TEST_BINARY_OVERRIDE", "1")
         .env("VEYRA_CODEX_BIN", std::env::current_exe().unwrap())
         .status()
         .unwrap();
@@ -107,7 +110,7 @@ fn codex_params_per_mode() {
             root: false,
         };
         assert_eq!(
-            codex::thread_params(&spec, None),
+            codex::thread_params(&spec),
             json!({"cwd":"/project","model":"a-current-model","approvalPolicy":approval,"sandbox":sandbox,"approvalsReviewer":"user","threadId":"native","excludeTurns":true})
         );
         assert_eq!(
@@ -128,7 +131,7 @@ fn fake_family(provider: ProviderKind, mode: PermissionMode, files: &[(&str, &st
     });
     let runtime = Runtime::new().unwrap();
     let _entered = runtime.enter();
-    let root = PathBuf::from("/tmp").join(format!("veyra-m5s1-{}", ThreadId::new()));
+    let root = PathBuf::from("/tmp").join(format!("veyra-codex-replay-{}", ThreadId::new()));
     fs::create_dir(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let root = root.canonicalize().unwrap();
@@ -144,7 +147,7 @@ fn fake_family(provider: ProviderKind, mode: PermissionMode, files: &[(&str, &st
         fs::copy(fixtures.join(format!("{name}.jsonl")), root.join(lane)).unwrap();
     }
     let (out, mut rx) = mpsc::channel(256);
-    let mut env = env::ChildEnv::load();
+    let mut env = env::ChildEnv::isolated();
     env.codex_bin = Some(binary.join("veyra-fake-cli"));
     env.claude_bin = Some(binary.join("veyra-fake-cli"));
     env.fixtures = Some(root.clone());
@@ -199,7 +202,7 @@ fn fake_family(provider: ProviderKind, mode: PermissionMode, files: &[(&str, &st
     let tx = db.transaction().unwrap();
     store::apply(&tx, &changes, 1).unwrap();
     tx.commit().unwrap();
-    let mut actor = Actor::new(db, out, Spawner::Cli(env)).unwrap();
+    let mut actor = Actor::new(db, out, Spawner::Cli(Box::new(env))).unwrap();
     let (reply, result) = oneshot::channel();
     actor.handle(EngineMsg::Command {
         command: Command::Send {
@@ -331,7 +334,7 @@ fn claude_root_codex_child_runs_on_fake_cli() {
 #[test]
 fn inline_credential_recording_preserves_redacted_binding() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../../target/m5-record-{}", ThreadId::new()));
+        .join(format!("../../target/provider-record-{}", ThreadId::new()));
     std::fs::create_dir_all(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let path = root.join("capture.jsonl");
@@ -361,8 +364,10 @@ fn inline_credential_recording_preserves_redacted_binding() {
 #[cfg(debug_assertions)]
 #[test]
 fn recording_distinguishes_changed_native_thread_and_version() {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../../target/m5-native-record-{}", ThreadId::new()));
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../target/provider-native-record-{}",
+        ThreadId::new()
+    ));
     std::fs::create_dir_all(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let path = root.join("capture.jsonl");
@@ -388,9 +393,7 @@ fn recording_distinguishes_changed_native_thread_and_version() {
         .lines()
         .map(|s| serde_json::from_str(s).unwrap())
         .collect();
-    assert_ne!(
-        lines[1]["line"]["params"]["threadId"],
-        lines[2]["line"]["result"]["thread"]["id"]
-    );
+    assert_eq!(lines[1]["line"]["params"]["threadId"], "<id:session>");
+    assert_eq!(lines[2]["line"]["result"]["thread"]["id"], "<id:session:1>");
     assert_eq!(lines[0]["cli_version"], "0.162.1");
 }

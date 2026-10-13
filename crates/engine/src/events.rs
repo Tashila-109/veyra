@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChangeEvent {
     ProjectAdded(Project),
-    ThreadCreated(Thread),
+    ThreadCreated(Box<Thread>),
     ThreadArchived {
         thread: ThreadId,
     },
@@ -30,8 +30,8 @@ pub enum ChangeEvent {
     TurnEnded(Turn),
     ItemAdded(Item),
     ItemCompleted(Item),
-    RequestOpened(Request),
-    RequestClosed(Request),
+    RequestOpened(Box<Request>),
+    RequestClosed(Box<Request>),
     TaskStarted(Task),
     TaskSettled(Task),
     TaskDelivered(Task),
@@ -178,7 +178,7 @@ impl ChangeSet {
                     ChangeEvent::ProjectAdded(self.projects[&row.id].clone())
                 }
                 ChangeEvent::ThreadCreated(row) => {
-                    ChangeEvent::ThreadCreated(self.threads[&row.id].clone())
+                    ChangeEvent::ThreadCreated(Box::new(self.threads[&row.id].clone()))
                 }
                 ChangeEvent::TurnQueued(row) => {
                     ChangeEvent::TurnQueued(self.turns[&row.id].clone())
@@ -192,10 +192,10 @@ impl ChangeSet {
                     ChangeEvent::ItemCompleted(self.items[&row.id].clone())
                 }
                 ChangeEvent::RequestOpened(row) => {
-                    ChangeEvent::RequestOpened(self.requests[&row.id].clone())
+                    ChangeEvent::RequestOpened(Box::new(self.requests[&row.id].clone()))
                 }
                 ChangeEvent::RequestClosed(row) => {
-                    ChangeEvent::RequestClosed(self.requests[&row.id].clone())
+                    ChangeEvent::RequestClosed(Box::new(self.requests[&row.id].clone()))
                 }
                 ChangeEvent::TaskStarted(row) => {
                     ChangeEvent::TaskStarted(self.tasks[&row.id].clone())

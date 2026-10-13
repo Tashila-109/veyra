@@ -14,6 +14,7 @@ pub(super) fn approval(f: &mut Fixture, tool: &str, command: &str) -> RequestId 
                     tool: tool.into(),
                     target: ApprovalTarget::Command {
                         command: command.into(),
+                        cwd: Default::default(),
                         preview: ApprovalPreview::new(String::new()),
                     },
                 },
@@ -121,7 +122,7 @@ fn grant_replay_automatically_answers_only_the_exact_command() {
         root.join("t1-s1.jsonl"),
     )
     .unwrap();
-    let mut env = env::ChildEnv::load();
+    let mut env = env::ChildEnv::isolated();
     env.claude_bin = Some(
         source
             .join("../../target/debug/veyra-fake-cli")
@@ -137,7 +138,7 @@ fn grant_replay_automatically_answers_only_the_exact_command() {
         let engine = crate::Engine::launch(
             &tokio::runtime::Handle::current(),
             db,
-            Spawner::Cli(env),
+            Spawner::Cli(Box::new(env)),
             None,
         )
         .unwrap();
@@ -293,4 +294,103 @@ fn grant_does_not_answer_commands_with_extra_fields() {
             .count(),
         2
     );
+}
+
+fn codex_grant_codec(f: &Fixture) -> crate::provider::codex::Codec {
+    let mut codec = crate::provider::codex::Codec::new(
+        SessionSpec {
+            thread: f.thread,
+            cwd: "/tmp".into(),
+            config: config(),
+            native: Some(NativeSessionId("codex-thread".into())),
+            import: false,
+            root: false,
+        },
+        1,
+        None,
+    );
+    codec.initialize();
+    codec.value(json!({"id":1,"result":{}})).unwrap();
+    codec
+        .value(json!({"id":2,"result":{"thread":{"id":"codex-thread"}}}))
+        .unwrap();
+    codec
+        .start(f.running().unwrap(), "test grants".into())
+        .unwrap();
+    codec
+        .value(json!({"id":3,"result":{"turn":{"id":"native-turn","status":"inProgress"}}}))
+        .unwrap();
+    codec
+}
+fn codex_approval(
+    f: &mut Fixture,
+    codec: &mut crate::provider::codex::Codec,
+    id: &str,
+    cwd: &str,
+) -> RequestId {
+    let decoded = codec.value(json!({"id":id,"method":"item/commandExecution/requestApproval",
+        "params":{"threadId":"codex-thread","turnId":"native-turn","itemId":id,"command":"rm -rf build","cwd":cwd}})).unwrap();
+    for event in decoded.events {
+        f.event(event);
+    }
+    f.actor
+        .projection
+        .requests
+        .values()
+        .find(|r| r.native == NativeRequestRef(format!("\"{id}\"")))
+        .unwrap()
+        .id
+}
+#[test]
+fn codex_grant_other_cwd_always_docks() {
+    let mut f = Fixture::new(LiveState::Running);
+    let runtime = f.runtime.handle().clone();
+    let _entered = runtime.enter();
+    let mut codec = codex_grant_codec(&f);
+    let first = codex_approval(&mut f, &mut codec, "first", "/tmp");
+    f.command(Command::Respond {
+        request: first,
+        decision: Decision::AllowInThread,
+    })
+    .unwrap();
+    assert_eq!(
+        f.loaded().requests[&first].state,
+        RequestState::Answered(Decision::AllowInThread)
+    );
+    f.controls.try_recv().unwrap();
+    f.drain();
+    let other = codex_approval(&mut f, &mut codec, "other", "/tmp/elsewhere");
+    assert_eq!(f.loaded().requests[&other].state, RequestState::Pending);
+    assert!(
+        f.controls.try_recv().is_err(),
+        "another cwd was automatically allowed"
+    );
+    assert!(f.drain().iter().any(|e| matches!(e, UiEvent::Change { event: crate::events::ChangeEvent::RequestOpened(r), .. } if r.id == other)));
+}
+#[test]
+fn codex_grant_same_command_and_cwd_is_automatic() {
+    let mut f = Fixture::new(LiveState::Running);
+    let runtime = f.runtime.handle().clone();
+    let _entered = runtime.enter();
+    let mut codec = codex_grant_codec(&f);
+    let first = codex_approval(&mut f, &mut codec, "first", "/tmp");
+    f.command(Command::Respond {
+        request: first,
+        decision: Decision::AllowInThread,
+    })
+    .unwrap();
+    f.controls.try_recv().unwrap();
+    f.drain();
+    let same = codex_approval(&mut f, &mut codec, "same", "/tmp");
+    assert_eq!(
+        f.loaded().requests[&same].state,
+        RequestState::Answered(Decision::AllowOnce)
+    );
+    assert!(matches!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::Answer {
+            reply: Decision::AllowOnce,
+            ..
+        }
+    ));
 }

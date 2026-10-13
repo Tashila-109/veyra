@@ -203,7 +203,7 @@ fn create_thread(
         import_pending: false,
         archived: false,
     };
-    c.events.push(Ev::ThreadCreated(t.clone()));
+    c.events.push(Ev::ThreadCreated(Box::new(t.clone())));
     c.live.insert(t.id, LiveThread::default());
     c.threads.insert(t.id, t.clone());
     queue_user(p, c, t.id, text);
@@ -376,7 +376,7 @@ fn respond(
             }
             let mut r = r.clone();
             r.state = RequestState::Answered(decision.clone());
-            c.events.push(Ev::RequestClosed(r.clone()));
+            c.events.push(Ev::RequestClosed(Box::new(r.clone())));
             c.requests.insert(request, r.clone());
             control(
                 c,
@@ -675,7 +675,7 @@ pub fn expire_requests(p: &Projection, c: &mut ChangeSet, turn: TurnId, reason: 
         r.state = RequestState::Expired {
             reason: reason.into(),
         };
-        c.events.push(Ev::RequestClosed(r.clone()));
+        c.events.push(Ev::RequestClosed(Box::new(r.clone())));
         c.requests.insert(r.id, r);
     }
 }

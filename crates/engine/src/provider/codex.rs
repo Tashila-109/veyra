@@ -5,6 +5,7 @@ use super::{
 };
 use crate::{domain::*, platform::Signal};
 use serde_json::{Value, json};
+mod wire;
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Duration,
@@ -30,21 +31,50 @@ pub fn mode(mode: PermissionMode) -> (&'static str, &'static str, Value) {
         ),
     }
 }
-pub fn thread_params(spec: &SessionSpec, mcp: Option<&Value>) -> Value {
+pub(crate) struct McpConfig {
+    pub command: std::path::PathBuf,
+    pub socket: std::path::PathBuf,
+    pub token: crate::mcp::McpToken,
+}
+impl McpConfig {
+    pub fn value(&self, token: &str) -> Value {
+        json!({
+            "mcp_servers.veyra.command":self.command,
+            "mcp_servers.veyra.args":["mcp"],
+            "mcp_servers.veyra.env":{
+                "VEYRA_SOCKET":self.socket,
+                "VEYRA_MCP_TOKEN":token
+            }
+        })
+    }
+}
+pub fn thread_params(spec: &SessionSpec) -> Value {
     let (approval, sandbox, _) = mode(spec.config.mode);
-    let mut params = json!({"cwd":spec.cwd,"model":spec.config.model,"approvalPolicy":approval,"sandbox":sandbox,"approvalsReviewer":"user"});
+    let mut params = json!({
+        "cwd":spec.cwd,
+        "model":spec.config.model,
+        "approvalPolicy":approval,
+        "sandbox":sandbox,
+        "approvalsReviewer":"user"
+    });
     if let Some(native) = &spec.native {
         params["threadId"] = json!(native.0);
         params["excludeTurns"] = json!(true);
-    }
-    if let Some(mcp) = mcp {
-        params["config"] = json!({"mcp_servers.veyra.command":mcp["command"],"mcp_servers.veyra.args":mcp["args"],"mcp_servers.veyra.env":mcp["env"]});
     }
     params
 }
 pub fn turn_params(native: &str, config: &ThreadConfig, text: String) -> Value {
     let (approval, _, sandbox) = mode(config.mode);
-    json!({"threadId":native,"input":[{"type":"text","text":text,"text_elements":[]}],"model":config.model,"effort":config.effort,"summary":"auto","approvalPolicy":approval,"approvalsReviewer":"user","sandboxPolicy":sandbox})
+    json!({
+        "threadId":native,
+        "input":[{"type":"text","text":text,"text_elements":[]}],
+        "model":config.model,
+        "effort":config.effort,
+        "summary":"auto",
+        "approvalPolicy":approval,
+        "approvalsReviewer":"user",
+        "sandboxPolicy":sandbox
+    })
 }
 pub fn initialize() -> Value {
     json!({"clientInfo":{"name":"veyra","title":"Veyra","version":env!("CARGO_PKG_VERSION")}})
@@ -70,7 +100,7 @@ struct Request {
     id: Value,
     kind: RequestKind,
     reply: RequestReply,
-    turn: String,
+    owner: ActiveTurn,
 }
 #[derive(Default)]
 struct Item {
@@ -79,161 +109,216 @@ struct Item {
     started: bool,
     output: String,
 }
-enum InterruptPhase {
-    Protocol(Instant),
-    Terminate(Instant),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InterruptRequest {
+    Pending,
+    Sent,
+    RetryWhenStarted,
+    Retried,
 }
 struct Interruption {
     target: TurnId,
-    reason: String,
-    phase: InterruptPhase,
-    retry_after_started: bool,
-    retried: bool,
-    sent: bool,
+    ladder: super::StopLadder,
+    request: InterruptRequest,
 }
-enum Early {
-    Notification {
-        method: String,
-        params: Value,
+enum Conversation {
+    Opening {
+        native: Option<NativeSessionId>,
+        retry: Option<ResumeRetry>,
     },
-    Request {
-        id: Value,
-        method: String,
-        params: Value,
+    Ready(NativeSessionId),
+}
+struct ResumeRetry {
+    next: Option<Instant>,
+    until: Instant,
+}
+impl Conversation {
+    fn native(&self) -> Option<&NativeSessionId> {
+        match self {
+            Self::Opening { native, .. } => native.as_ref(),
+            Self::Ready(native) => Some(native),
+        }
+    }
+}
+enum TurnState {
+    Idle,
+    Starting {
+        owner: TurnId,
+        native: Option<String>,
+        early: Vec<wire::Notification>,
     },
+    Running {
+        owner: ActiveTurn,
+        native: String,
+    },
+}
+impl TurnState {
+    fn active(&self) -> Option<ActiveTurn> {
+        match self {
+            Self::Idle => None,
+            Self::Starting { owner, .. } => Some(ActiveTurn::Veyra(*owner)),
+            Self::Running { owner, .. } => Some(*owner),
+        }
+    }
+    fn native(&self) -> Option<&str> {
+        match self {
+            Self::Idle => None,
+            Self::Starting { native, .. } => native.as_deref(),
+            Self::Running { native, .. } => Some(native),
+        }
+    }
 }
 pub(crate) struct Codec {
     peer: Peer<Call>,
     spec: SessionSpec,
-    mcp: Option<Value>,
+    mcp: Option<std::sync::Arc<McpConfig>>,
     pid: u32,
-    native: Option<String>,
-    pub active: Option<ActiveTurn>,
-    starting: Option<TurnId>,
-    native_turn: Option<String>,
-    early: Vec<Early>,
+    conversation: Conversation,
+    turn: TurnState,
     turns: BTreeMap<String, Turn>,
     ended: BTreeSet<String>,
     items: BTreeMap<String, Item>,
     requests: BTreeMap<String, Request>,
     seen_requests: BTreeSet<String>,
     interrupted: Option<Interruption>,
-    resume_retry: Option<Instant>,
-    resume_until: Option<Instant>,
 }
 impl Codec {
-    pub(crate) fn new(spec: SessionSpec, pid: u32, mcp: Option<Value>) -> Self {
+    pub(crate) fn new(
+        mut spec: SessionSpec,
+        pid: u32,
+        mcp: Option<std::sync::Arc<McpConfig>>,
+    ) -> Self {
         Self {
-            native: spec.native.as_ref().map(|n| n.0.clone()),
+            conversation: Conversation::Opening {
+                native: spec.native.take(),
+                retry: None,
+            },
             spec,
             pid,
             mcp,
             peer: Peer::new(false),
-            active: None,
-            starting: None,
-            native_turn: None,
-            early: vec![],
+            turn: TurnState::Idle,
             turns: BTreeMap::new(),
             ended: BTreeSet::new(),
             items: BTreeMap::new(),
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
             interrupted: None,
-            resume_retry: None,
-            resume_until: None,
         }
     }
     pub(crate) fn initialize(&mut self) -> Value {
         self.peer.send(Call::Initialize, "initialize", initialize())
     }
-    fn open_thread(&mut self) -> Value {
-        self.peer.send(
+    pub(crate) fn native(&self) -> Option<&NativeSessionId> {
+        self.conversation.native()
+    }
+    pub(crate) fn active(&self) -> Option<ActiveTurn> {
+        self.turn.active()
+    }
+    fn open_thread(&mut self) -> Outbound {
+        let mut spec = self.spec.clone();
+        spec.native = self.conversation.native().cloned();
+        let line = self.peer.send(
             Call::Thread,
-            if self.spec.native.is_some() {
+            if spec.native.is_some() {
                 "thread/resume"
             } else {
                 "thread/start"
             },
-            thread_params(&self.spec, self.mcp.as_ref()),
-        )
+            thread_params(&spec),
+        );
+        match &self.mcp {
+            Some(mcp) => Outbound::CodexThread {
+                line,
+                mcp: mcp.clone(),
+            },
+            None => Outbound::Message(line),
+        }
+    }
+    fn queue_thread(&mut self, decoded: &mut Decoded) {
+        match self.open_thread() {
+            Outbound::Message(line) => decoded.replies.push(line),
+            frame => decoded.controls.push(frame),
+        }
     }
     pub(crate) fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
-        if self.active.is_some() {
+        if self.active().is_some() {
             return None;
         }
-        let native = self.native.as_deref()?;
-        self.active = Some(ActiveTurn::Veyra(turn));
-        self.starting = Some(turn);
-        self.native_turn = None;
+        let native = self.native()?.0.clone();
+        self.turn = TurnState::Starting {
+            owner: turn,
+            native: None,
+            early: vec![],
+        };
         self.interrupted = None;
         Some(Outbound::Prompt(self.peer.send(
             Call::Start(turn),
             "turn/start",
-            turn_params(native, &self.spec.config, text),
+            turn_params(&native, &self.spec.config, text),
         )))
     }
-    pub(crate) fn value(&mut self, wire: Value) -> Result<Decoded, ProviderError> {
+    pub(crate) fn value(&mut self, value: Value) -> Result<Decoded, ProviderError> {
         let mut decoded = Decoded::default();
-        match self.peer.receive(wire) {
+        match self.peer.receive(value) {
             Frame::Reply {
                 tag: Call::Initialize,
                 result,
             } => {
-                result.map_err(jsonrpc::failure)?;
+                let _: wire::InitializeReply =
+                    decode(result.map_err(jsonrpc::failure)?, "initialize reply")?;
                 decoded
                     .replies
                     .push(self.peer.notification("initialized", Value::Null));
-                decoded.replies.push(self.open_thread());
+                self.queue_thread(&mut decoded);
             }
             Frame::Reply {
                 tag: Call::Thread,
                 result,
             } => match result {
                 Ok(result) => {
-                    let native = result["thread"]["id"]
-                        .as_str()
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| {
-                            ProviderError::Protocol("Codex thread reply has no thread id".into())
-                        })?
-                        .to_owned();
-                    self.native = Some(native.clone());
+                    let reply: wire::ThreadReply = decode(result, "thread reply")?;
+                    let native = reply.thread.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                        ProviderError::Protocol("Codex thread reply has no thread id".into())
+                    })?;
+                    self.conversation = Conversation::Ready(NativeSessionId(native.clone()));
                     self.mcp = None;
-                    self.resume_retry = None;
-                    self.resume_until = None;
                     decoded
                         .events
                         .push(ProviderEvent::Session(SessionEvent::Ready {
                             native: NativeSessionId(native),
-                            cli_version: result["thread"]["cliVersion"]
-                                .as_str()
-                                .filter(|v| !v.is_empty())
-                                .map(str::to_owned),
+                            cli_version: reply.thread.cli_version.filter(|v| !v.is_empty()),
                             pid: self.pid,
                             pgid: self.pid,
                             capabilities: vec![],
                         }));
                 }
-                Err(error) if self.spec.native.is_some() && not_found(&error.message) => {
-                    self.spec.native = None;
-                    self.native = None;
+                Err(error) if self.native().is_some() && not_found(&error.message) => {
+                    self.conversation = Conversation::Opening {
+                        native: None,
+                        retry: None,
+                    };
                     decoded.events.push(Self::notice(
                         "The earlier conversation could not be resumed; this is a new session",
                     ));
-                    decoded.replies.push(self.open_thread());
+                    self.queue_thread(&mut decoded);
                 }
                 Err(error)
-                    if self.spec.native.is_some()
+                    if self.native().is_some()
                         && error.message.contains("already has an active writer") =>
                 {
-                    let until = *self
-                        .resume_until
-                        .get_or_insert_with(|| Instant::now() + Duration::from_secs(3));
-                    if Instant::now() >= until {
+                    let Conversation::Opening { retry, .. } = &mut self.conversation else {
+                        return Err(jsonrpc::failure(error));
+                    };
+                    let retry = retry.get_or_insert_with(|| ResumeRetry {
+                        next: None,
+                        until: Instant::now() + Duration::from_secs(3),
+                    });
+                    if Instant::now() >= retry.until {
                         return Err(jsonrpc::failure(error));
                     }
-                    self.resume_retry =
-                        Some((Instant::now() + Duration::from_millis(250)).min(until));
+                    retry.next =
+                        Some((Instant::now() + Duration::from_millis(250)).min(retry.until));
                 }
                 Err(error) => return Err(jsonrpc::failure(error)),
             },
@@ -241,38 +326,43 @@ impl Codec {
                 tag: Call::Start(turn),
                 result,
             } => {
-                let result = result.map_err(jsonrpc::failure)?;
-                let id = result["turn"]["id"]
-                    .as_str()
-                    .filter(|id| !id.is_empty())
-                    .ok_or_else(|| {
-                        ProviderError::Protocol("Codex turn reply has no turn id".into())
-                    })?
-                    .to_owned();
-                self.starting = None;
-                self.native_turn = Some(id.clone());
-                self.turns.insert(
-                    id.clone(),
-                    Turn {
+                let reply: wire::TurnReply =
+                    decode(result.map_err(jsonrpc::failure)?, "turn reply")?;
+                let id = reply.turn.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                    ProviderError::Protocol("Codex turn reply has no turn id".into())
+                })?;
+                let prior = std::mem::replace(
+                    &mut self.turn,
+                    TurnState::Running {
                         owner: ActiveTurn::Veyra(turn),
-                        started: false,
+                        native: id.clone(),
                     },
                 );
+                let early = match prior {
+                    TurnState::Starting { native, early, .. } => {
+                        if native.as_ref().is_some_and(|native| native != &id) {
+                            return Err(ProviderError::Protocol(
+                                "Codex turn reply changed the pending turn id".into(),
+                            ));
+                        }
+                        early
+                    }
+                    _ => vec![],
+                };
+                self.turns.entry(id).or_insert(Turn {
+                    owner: ActiveTurn::Veyra(turn),
+                    started: false,
+                });
                 decoded.events.push(ProviderEvent::Turn {
                     turn: Some(turn),
                     event: TurnEvent::Accepted,
                 });
-                for frame in std::mem::take(&mut self.early) {
-                    match frame {
-                        Early::Notification { method, params } => {
-                            self.notification(&method, params, &mut decoded)?
-                        }
-                        Early::Request { id, method, params } => {
-                            self.request(id, &method, params, &mut decoded)
-                        }
-                    }
+                for notification in early {
+                    self.notification(notification, &mut decoded)?;
                 }
-                if self.active.is_some() && self.interrupted.is_some() && !self.peer_has_interrupt()
+                if self.active().is_some()
+                    && self.interrupted.is_some()
+                    && !self.peer_has_interrupt()
                 {
                     decoded.controls.push(self.interrupt_frame(turn));
                 }
@@ -283,8 +373,8 @@ impl Codec {
             } => {
                 if let Err(error) = result {
                     let before_started = self
-                        .native_turn
-                        .as_ref()
+                        .turn
+                        .native()
                         .and_then(|id| self.turns.get(id))
                         .is_some_and(|turn| !turn.started);
                     if error.code == -32600
@@ -296,37 +386,48 @@ impl Codec {
                     {
                         if let Some(interrupt) = &mut self.interrupted
                             && interrupt.target == target
-                            && !interrupt.retried
+                            && interrupt.request != InterruptRequest::Retried
                         {
-                            interrupt.retry_after_started = true;
+                            interrupt.request = InterruptRequest::RetryWhenStarted;
                         }
-                    } else if self.active.is_some_and(|active| active.target() == target) {
+                    } else if self
+                        .active()
+                        .is_some_and(|active| active.target() == target)
+                    {
                         return Err(jsonrpc::failure(error));
                     }
                 }
             }
             Frame::Request { id, method, params } => {
-                if self.starting.is_some() && self.own_thread(&params) && supported_request(&method)
-                {
-                    self.early.push(Early::Request { id, method, params });
-                } else {
-                    self.request(id, &method, params, &mut decoded);
+                let request = serde_json::from_value(json!({"method":method,"params":params}));
+                match request {
+                    Ok(request) => self.request(id, request, params, &mut decoded),
+                    Err(_) => decoded.replies.push(self.peer.error(
+                        id,
+                        -32602,
+                        "Malformed server request",
+                    )),
                 }
             }
             Frame::Notification { method, params } => {
-                self.notification(&method, params, &mut decoded)?
+                let notification =
+                    decode(json!({"method":method,"params":params}), "notification")?;
+                self.notification(notification, &mut decoded)?;
             }
             Frame::Unknown => tracing::info!("ignored unrecognized Codex frame"),
         }
         Ok(decoded)
     }
     fn peer_has_interrupt(&self) -> bool {
-        self.interrupted.as_ref().is_some_and(|i| i.sent)
+        self.interrupted
+            .as_ref()
+            .is_some_and(|i| i.request != InterruptRequest::Pending)
     }
-    fn own_thread(&self, params: &Value) -> bool {
-        params["threadId"]
-            .as_str()
-            .is_some_and(|id| Some(id) == self.native.as_deref())
+    fn own_thread(&self, scope: &wire::Scope) -> bool {
+        scope
+            .thread_id
+            .as_deref()
+            .is_some_and(|id| self.native().is_some_and(|native| native.0 == id))
     }
     fn route(&mut self, id: &str, decoded: &mut Decoded) -> Option<ActiveTurn> {
         if self.ended.contains(id) {
@@ -335,12 +436,24 @@ impl Codec {
         if let Some(turn) = self.turns.get(id) {
             return Some(turn.owner);
         }
-        if self.active.is_some() {
-            return None;
-        }
-        let owner = ActiveTurn::Provider(TurnId::new());
-        self.active = Some(owner);
-        self.native_turn = Some(id.into());
+        let owner = match &mut self.turn {
+            TurnState::Idle => {
+                let owner = ActiveTurn::Provider(TurnId::new());
+                decoded.provider_turn = Some(owner.target());
+                self.turn = TurnState::Running {
+                    owner,
+                    native: id.into(),
+                };
+                owner
+            }
+            TurnState::Starting { owner, native, .. }
+                if native.as_ref().is_none_or(|native| native == id) =>
+            {
+                *native = Some(id.into());
+                ActiveTurn::Veyra(*owner)
+            }
+            _ => return None,
+        };
         self.turns.insert(
             id.into(),
             Turn {
@@ -348,65 +461,55 @@ impl Codec {
                 started: false,
             },
         );
-        decoded.provider_turn = Some(owner.target());
         Some(owner)
     }
     fn notification(
         &mut self,
-        method: &str,
-        params: Value,
+        notification: wire::Notification,
         decoded: &mut Decoded,
     ) -> Result<(), ProviderError> {
-        if method == "account/rateLimits/updated" {
-            decoded.events.push(Self::notice(
-                "Codex updated its usage limits. Check the CLI for the remaining allowance.",
-            ));
-            return Ok(());
-        }
-        if method == "error" && params["willRetry"] == true {
-            if params.get("threadId").is_none() || self.own_thread(&params) {
-                decoded
-                    .events
-                    .push(Self::notice("Codex is retrying after a provider error."));
+        use wire::Notification as N;
+        match &notification {
+            N::RateLimits { params: details } => {
+                let _ = details;
+                decoded.events.push(Self::notice(
+                    "Codex updated its usage limits. Check the CLI for the remaining allowance.",
+                ));
+                return Ok(());
             }
+            N::Error { params: error } => {
+                if error.will_retry
+                    && (error.scope.thread_id.is_none() || self.own_thread(&error.scope))
+                {
+                    decoded
+                        .events
+                        .push(Self::notice("Codex is retrying after a provider error."));
+                }
+                return Ok(());
+            }
+            N::Unknown => return Ok(()),
+            _ => {}
+        }
+        if notification
+            .scope()
+            .is_none_or(|scope| !self.own_thread(scope))
+        {
             return Ok(());
         }
-        if !matches!(
-            method,
-            "turn/started"
-                | "turn/completed"
-                | "item/agentMessage/delta"
-                | "item/reasoning/summaryTextDelta"
-                | "item/reasoning/textDelta"
-                | "item/commandExecution/outputDelta"
-                | "item/started"
-                | "item/completed"
-                | "turn/plan/updated"
-        ) {
-            tracing::info!(method, "ignored Codex notification");
+        let Some(id) = notification
+            .turn_id()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        else {
             return Ok(());
-        }
-        if !self.own_thread(&params) {
-            return Ok(());
-        }
-        let id = params["turnId"]
-            .as_str()
-            .or_else(|| params["turn"]["id"].as_str())
-            .unwrap_or_default()
-            .to_owned();
-        if id.is_empty() {
-            return Ok(());
-        }
-        if self.starting.is_some() {
-            self.early.push(Early::Notification {
-                method: method.into(),
-                params,
-            });
+        };
+        if let TurnState::Starting { early, .. } = &mut self.turn {
+            early.push(notification);
             return Ok(());
         }
         let owner = if matches!(
-            method,
-            "turn/completed" | "item/commandExecution/outputDelta"
+            &notification,
+            N::TurnCompleted { params: _ } | N::CommandOutput { params: _ }
         ) {
             self.turns.get(&id).map(|turn| turn.owner)
         } else {
@@ -419,8 +522,9 @@ impl Codec {
             return Ok(());
         }
         let mut events = Vec::new();
-        match method {
-            "turn/started" => {
+        let agent = matches!(&notification, N::AgentDelta { params: _ });
+        match notification {
+            N::TurnStarted { params: _ } => {
                 if let Some(turn) = self.turns.get_mut(&id)
                     && !turn.started
                 {
@@ -428,8 +532,9 @@ impl Codec {
                     events.push(TurnEvent::Started);
                 }
                 let retry = self.interrupted.as_mut().is_some_and(|i| {
-                    if i.target == owner.target() && i.retry_after_started && !i.retried {
-                        i.retried = true;
+                    if i.target == owner.target() && i.request == InterruptRequest::RetryWhenStarted
+                    {
+                        i.request = InterruptRequest::Retried;
                         true
                     } else {
                         false
@@ -439,15 +544,18 @@ impl Codec {
                     decoded.controls.push(self.interrupt_frame(owner.target()));
                 }
             }
-            "turn/completed" => {
-                let outcome = match params["turn"]["status"].as_str().unwrap_or("completed") {
-                    "interrupted" => TurnOutcome::Interrupted {
+            N::TurnCompleted { params } => {
+                let outcome = match params.turn.status {
+                    wire::TurnStatus::Interrupted => TurnOutcome::Interrupted {
                         reason: "Stopped by Codex".into(),
                     },
-                    "failed" => TurnOutcome::Failed {
+                    wire::TurnStatus::Failed => TurnOutcome::Failed {
                         message: crate::record::redact(
-                            params["turn"]["error"]["message"]
-                                .as_str()
+                            params
+                                .turn
+                                .error
+                                .as_ref()
+                                .and_then(|error| error.message.as_deref())
                                 .unwrap_or("Codex could not finish this turn"),
                             None,
                         ),
@@ -456,13 +564,13 @@ impl Codec {
                 };
                 let outcome = self.end_outcome(outcome);
                 self.ended.insert(id.clone());
-                self.requests.retain(|_, request| request.turn != id);
+                self.requests
+                    .retain(|_, request| request.owner.target() != owner.target());
                 if self
-                    .active
+                    .active()
                     .is_some_and(|active| active.target() == owner.target())
                 {
-                    self.active = None;
-                    self.native_turn = None;
+                    self.turn = TurnState::Idle;
                     self.interrupted = None;
                 }
                 events.push(TurnEvent::TurnEnded {
@@ -470,16 +578,14 @@ impl Codec {
                     park: false,
                 });
             }
-            "item/agentMessage/delta"
-            | "item/reasoning/summaryTextDelta"
-            | "item/reasoning/textDelta" => {
-                let item = params["itemId"].as_str().unwrap_or_default();
-                if !item.is_empty() {
-                    let key = Self::key(&id, item);
-                    let state = self.items.entry(key.0.clone()).or_default();
-                    state.streamed = true;
-                    let text = params["delta"].as_str().unwrap_or_default().to_owned();
-                    events.push(if method == "item/agentMessage/delta" {
+            N::AgentDelta { params }
+            | N::ReasoningSummaryDelta { params }
+            | N::ReasoningDelta { params } => {
+                if let Some(item) = params.item_id.filter(|id| !id.is_empty()) {
+                    let key = Self::key(&id, &item);
+                    self.items.entry(key.0.clone()).or_default().streamed = true;
+                    let text = params.delta.unwrap_or_default();
+                    events.push(if agent {
                         TurnEvent::TextDelta {
                             key,
                             text,
@@ -490,11 +596,10 @@ impl Codec {
                     });
                 }
             }
-            "item/commandExecution/outputDelta" => {
-                let item = params["itemId"].as_str().unwrap_or_default();
-                if !item.is_empty() {
-                    let key = Self::key(&id, item);
-                    let text = params["delta"].as_str().unwrap_or_default().to_owned();
+            N::CommandOutput { params } => {
+                if let Some(item) = params.item_id.filter(|id| !id.is_empty()) {
+                    let key = Self::key(&id, &item);
+                    let text = params.delta.unwrap_or_default();
                     let state = self.items.entry(key.0.clone()).or_default();
                     state.output.push_str(&text);
                     let chars = state.output.chars().count();
@@ -508,30 +613,22 @@ impl Codec {
                     events.push(TurnEvent::ToolOutput { key, text });
                 }
             }
-            "item/started" | "item/completed" => self.item(
-                &id,
-                &params["item"],
-                method == "item/completed",
-                &mut events,
-            ),
-            "turn/plan/updated" => {
-                let plan = params["plan"]
-                    .as_array()
-                    .map(|steps| {
-                        steps
-                            .iter()
-                            .filter_map(|step| {
-                                Some(PlanStep {
-                                    text: step["step"].as_str()?.into(),
-                                    done: step["status"] == "completed",
-                                })
-                            })
-                            .collect()
+            N::ItemStarted { params } => self.item(&id, &params.item, false, &mut events),
+            N::ItemCompleted { params } => self.item(&id, &params.item, true, &mut events),
+            N::PlanUpdated { params } => {
+                let plan = params
+                    .plan
+                    .into_iter()
+                    .filter_map(|step| {
+                        Some(PlanStep {
+                            text: step.step?,
+                            done: matches!(step.status, wire::PlanStatus::Completed),
+                        })
                     })
-                    .unwrap_or_default();
+                    .collect();
                 events.push(TurnEvent::Plan(plan));
             }
-            _ => tracing::info!(method, "ignored Codex notification"),
+            N::RateLimits { params: _ } | N::Error { params: _ } | N::Unknown => {}
         }
         decoded
             .events
@@ -544,8 +641,14 @@ impl Codec {
     fn key(turn: &str, item: &str) -> NativeItemKey {
         NativeItemKey(format!("{turn}:{item}"))
     }
-    fn item(&mut self, turn: &str, wire: &Value, completed: bool, events: &mut Vec<TurnEvent>) {
-        let Some(id) = wire["id"].as_str().filter(|id| !id.is_empty()) else {
+    fn item(
+        &mut self,
+        turn: &str,
+        wire: &wire::Item,
+        completed: bool,
+        events: &mut Vec<TurnEvent>,
+    ) {
+        let Some(id) = wire.id().filter(|id| !id.is_empty()) else {
             return;
         };
         let key = Self::key(turn, id);
@@ -554,28 +657,20 @@ impl Codec {
             return;
         }
         state.finished = completed;
-        match wire["type"].as_str().unwrap_or_default() {
-            "agentMessage" if completed => {
+        match wire {
+            wire::Item::AgentMessage(message) if completed => {
                 if !state.streamed {
                     events.push(TurnEvent::TextDelta {
                         key: key.clone(),
-                        text: wire["text"].as_str().unwrap_or_default().into(),
+                        text: message.text.clone().unwrap_or_default(),
                         streamed: false,
                     });
                 }
                 events.push(TurnEvent::ItemEnded { key });
             }
-            "reasoning" if completed => {
+            wire::Item::Reasoning(reasoning) if completed => {
                 if !state.streamed {
-                    let text = wire["summary"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_default();
+                    let text = reasoning.summary.join("\n");
                     if !text.is_empty() {
                         events.push(TurnEvent::ReasoningDelta {
                             key: key.clone(),
@@ -585,35 +680,44 @@ impl Codec {
                 }
                 events.push(TurnEvent::ItemEnded { key });
             }
-            kind @ ("commandExecution"
-            | "fileChange"
-            | "mcpToolCall"
-            | "collabAgentToolCall"
-            | "webSearch"
-            | "imageView") => {
+            item if item.tool().is_some() => {
+                let tool = item.tool().unwrap();
                 if !state.started {
                     state.started = true;
-                    let (name, arguments, summary) = match kind {
-                        "commandExecution" => (
+                    let (name, arguments, summary) = match item {
+                        wire::Item::CommandExecution(command) => (
                             "Command".into(),
-                            json!({"command":wire["command"],"cwd":wire["cwd"]}),
-                            wire["command"].as_str().map(str::to_owned),
+                            json!({"command":command.command,"cwd":command.cwd}),
+                            command.command.clone(),
                         ),
-                        "fileChange" => (
-                            "File change".into(),
-                            json!({"changes":wire["changes"]}),
-                            None,
-                        ),
-                        "mcpToolCall" => (
+                        wire::Item::FileChange(file) => {
+                            ("File change".into(), json!({"changes":file.changes}), None)
+                        }
+                        wire::Item::McpToolCall(call) => (
                             format!(
                                 "{} / {}",
-                                wire["server"].as_str().unwrap_or("MCP"),
-                                wire["tool"].as_str().unwrap_or("tool")
+                                call.server.as_deref().unwrap_or("MCP"),
+                                call.tool_name.as_deref().unwrap_or("tool")
                             ),
-                            wire["arguments"].clone(),
+                            call.arguments.clone().unwrap_or(Value::Null),
                             None,
                         ),
-                        _ => (kind.into(), wire.clone(), None),
+                        wire::Item::CollabAgentToolCall(_) => (
+                            "collabAgentToolCall".into(),
+                            serde_json::to_value(item).unwrap(),
+                            None,
+                        ),
+                        wire::Item::WebSearch(_) => (
+                            "webSearch".into(),
+                            serde_json::to_value(item).unwrap(),
+                            None,
+                        ),
+                        wire::Item::ImageView(_) => (
+                            "imageView".into(),
+                            serde_json::to_value(item).unwrap(),
+                            None,
+                        ),
+                        _ => return,
                     };
                     events.push(TurnEvent::ToolStarted {
                         key: key.clone(),
@@ -625,18 +729,20 @@ impl Codec {
                     });
                 }
                 if completed {
-                    let output = wire["aggregatedOutput"]
-                        .as_str()
-                        .map(str::to_owned)
+                    let output = tool
+                        .aggregated_output
+                        .clone()
                         .or_else(|| (!state.output.is_empty()).then(|| state.output.clone()))
                         .or_else(|| {
-                            wire.get("result")
-                                .filter(|v| !v.is_null())
+                            tool.result
+                                .as_ref()
+                                .filter(|value| !value.is_null())
                                 .map(Value::to_string)
                         });
-                    let ok = wire["status"] != "failed"
-                        && wire["status"] != "declined"
-                        && wire["exitCode"].as_i64().is_none_or(|c| c == 0);
+                    let ok = !matches!(
+                        tool.status,
+                        wire::ToolStatus::Failed | wire::ToolStatus::Declined
+                    ) && tool.exit_code.is_none_or(|code| code == 0);
                     events.push(TurnEvent::ToolFinished {
                         key,
                         ok,
@@ -647,7 +753,7 @@ impl Codec {
             _ => {}
         }
     }
-    fn request(&mut self, id: Value, method: &str, params: Value, decoded: &mut Decoded) {
+    fn request(&mut self, id: Value, request: wire::Request, params: Value, decoded: &mut Decoded) {
         let key = id.to_string();
         if !self.seen_requests.insert(key.clone()) {
             decoded
@@ -655,19 +761,22 @@ impl Codec {
                 .push(self.peer.error(id, -32600, "Request id was already used"));
             return;
         }
-        let supported = supported_request(method);
-        if !supported {
+        let Some(scope) = request.scope() else {
             decoded
                 .replies
                 .push(self.peer.error(id, -32601, "Unsupported server request"));
             return;
-        }
-        let native_turn = params["turnId"]
-            .as_str()
-            .or(self.native_turn.as_deref())
-            .unwrap_or_default();
-        let owner = self.turns.get(native_turn).map(|t| t.owner);
-        if !self.own_thread(&params) || owner.is_none() || self.ended.contains(native_turn) {
+        };
+        let native_turn = scope
+            .turn_id
+            .as_deref()
+            .or(self.turn.native())
+            .map(str::to_owned);
+        if !self.own_thread(scope)
+            || native_turn
+                .as_ref()
+                .is_some_and(|turn| turn.is_empty() || self.ended.contains(turn))
+        {
             decoded.replies.push(self.peer.error(
                 id,
                 -32600,
@@ -675,16 +784,15 @@ impl Codec {
             ));
             return;
         }
-        let turn = native_turn.to_owned();
         let preview =
             || ApprovalPreview::new(serde_json::to_string_pretty(&params).unwrap_or_default());
         let approval = |tool: String, target| RequestKind::Approval {
             action: ProposedAction { tool, target },
             grant_key: None,
         };
-        let (kind, reply) = match method {
-            "item/commandExecution/requestApproval" => {
-                let Some(command) = params["command"].as_str().filter(|s| !s.is_empty()) else {
+        let (kind, reply) = match request {
+            wire::Request::Command { params: command } => {
+                let Some(text) = command.command.as_deref().filter(|text| !text.is_empty()) else {
                     decoded.replies.push(self.peer.error(
                         id,
                         -32602,
@@ -692,39 +800,75 @@ impl Codec {
                     ));
                     return;
                 };
+                let in_project = command
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| Some(cwd) == self.spec.cwd.to_str());
+                let location = if in_project {
+                    CommandCwd::ProjectFolder
+                } else if let Some(path) = command.cwd.as_deref().filter(|path| !path.is_empty()) {
+                    CommandCwd::Directory(path.into())
+                } else {
+                    CommandCwd::NotVerified
+                };
                 (
                     RequestKind::Approval {
                         action: ProposedAction {
                             tool: "Command".into(),
                             target: ApprovalTarget::Command {
-                                command: command.into(),
+                                command: text.into(),
+                                cwd: location,
                                 preview: preview(),
                             },
                         },
-                        grant_key: Some(GrantKey {
+                        grant_key: in_project.then(|| GrantKey {
                             tool: "Command".into(),
-                            command: command.into(),
+                            command: text.into(),
                         }),
                     },
                     RequestReply::Decision,
                 )
             }
-            "item/fileChange/requestApproval" => (
+            wire::Request::File { params: _ } => (
                 approval(
                     "File change".into(),
                     ApprovalTarget::Tool { preview: preview() },
                 ),
                 RequestReply::Decision,
             ),
-            "item/permissions/requestApproval" if params["permissions"].is_object() => (
-                approval(
-                    "Permissions".into(),
-                    ApprovalTarget::Tool { preview: preview() },
-                ),
-                RequestReply::Permissions(params["permissions"].clone()),
-            ),
-            "mcpServer/elicitation/request" => {
-                let Some(tool) = elicitation_tool(&params) else {
+            wire::Request::Permissions { params: profile } => {
+                let Some(profile) = profile.permissions else {
+                    decoded.replies.push(self.peer.error(
+                        id,
+                        -32602,
+                        "Permissions approval has no profile",
+                    ));
+                    return;
+                };
+                (
+                    approval(
+                        "Permissions".into(),
+                        ApprovalTarget::Tool { preview: preview() },
+                    ),
+                    RequestReply::Permissions(serde_json::to_value(profile).unwrap()),
+                )
+            }
+            wire::Request::UserInput { params: input } => {
+                let Some((questions, ids)) = questions(&input) else {
+                    decoded
+                        .replies
+                        .push(self.peer.error(id, -32602, "Invalid questions"));
+                    return;
+                };
+                (
+                    RequestKind::Question { questions },
+                    RequestReply::Question(ids),
+                )
+            }
+            wire::Request::Elicitation {
+                params: elicitation,
+            } => {
+                let Some(tool) = elicitation_tool(&elicitation) else {
                     decoded
                         .replies
                         .push(self.peer.response(id, json!({"action":"decline"})));
@@ -737,40 +881,36 @@ impl Codec {
                     approval(
                         format!(
                             "{} / {tool}",
-                            params["serverName"].as_str().unwrap_or("MCP")
+                            elicitation.server_name.as_deref().unwrap_or("MCP")
                         ),
-                        ApprovalTarget::Tool {
-                            preview: ApprovalPreview::new(
-                                params["message"].as_str().unwrap_or_default().into(),
-                            ),
-                        },
+                        ApprovalTarget::Tool { preview: preview() },
                     ),
                     RequestReply::Elicitation,
                 )
             }
-            "item/tool/requestUserInput" => {
-                let Some((questions, ids)) = questions(&params) else {
-                    decoded.replies.push(self.peer.error(
-                        id,
-                        -32602,
-                        "Question request has no valid questions",
-                    ));
-                    return;
-                };
-                (
-                    RequestKind::Question { questions },
-                    RequestReply::Question(ids),
-                )
-            }
-            _ => {
-                decoded
-                    .replies
-                    .push(self.peer.error(id, -32602, "Invalid approval parameters"));
-                return;
-            }
+            wire::Request::Unknown => return,
         };
-        if self.interrupted.is_some() {
+        let owner = match native_turn {
+            Some(native) => self.route(&native, decoded),
+            None => self.active(),
+        };
+        let Some(owner) = owner else {
+            decoded.replies.push(self.peer.error(
+                id,
+                -32600,
+                "Request is not for this thread's active turn",
+            ));
+            return;
+        };
+        if self
+            .interrupted
+            .as_ref()
+            .is_some_and(|i| i.target == owner.target())
+        {
             decoded.replies.push(self.peer.response(id, cancel(&reply)));
+            if self.turn.native().is_some() && !self.peer_has_interrupt() {
+                decoded.controls.push(self.interrupt_frame(owner.target()));
+            }
             return;
         }
         self.requests.insert(
@@ -779,11 +919,11 @@ impl Codec {
                 id,
                 kind: kind.clone(),
                 reply,
-                turn,
+                owner,
             },
         );
         decoded.events.push(ProviderEvent::Turn {
-            turn: owner.unwrap().id(),
+            turn: owner.id(),
             event: TurnEvent::RequestOpened {
                 native: NativeRequestRef(key),
                 kind,
@@ -807,7 +947,12 @@ impl Codec {
             }
             (RequestReply::Elicitation, AcceptedDecision::Deny) => json!({"action":"decline"}),
             (RequestReply::Question(ids), AcceptedDecision::Answers { answers, .. }) => {
-                json!({"answers":ids.iter().zip(answers).map(|(id,a)|(id.clone(),json!({"answers":[a.text]}))).collect::<serde_json::Map<_,_>>()})
+                let answers: serde_json::Map<_, _> = ids
+                    .iter()
+                    .zip(answers)
+                    .map(|(id, answer)| (id.clone(), json!({"answers":[answer.text]})))
+                    .collect();
+                json!({"answers":answers})
             }
             _ => return None,
         };
@@ -815,77 +960,73 @@ impl Codec {
         Some(self.peer.response(request.id, response))
     }
     fn interrupt_frame(&mut self, target: TurnId) -> Outbound {
-        if let Some(interrupt) = &mut self.interrupted {
-            interrupt.sent = true;
+        if let Some(interrupt) = &mut self.interrupted
+            && interrupt.request != InterruptRequest::Retried
+        {
+            interrupt.request = InterruptRequest::Sent;
         }
-        Outbound::RpcInterrupt {
+        Outbound::Interrupt {
             turn: target,
             line: self.peer.send(
                 Call::Interrupt(target),
                 "turn/interrupt",
-                json!({"threadId":self.native,"turnId":self.native_turn}),
+                json!({"threadId":self.native().map(|n|&n.0),"turnId":self.turn.native()}),
             ),
         }
     }
     pub(crate) fn interrupt_lines(&mut self, target: TurnId, reason: StopReason) -> Vec<Outbound> {
-        if !self.active.is_some_and(|active| active.target() == target)
+        if !self
+            .active()
+            .is_some_and(|active| active.target() == target)
             || self.interrupted.is_some()
         {
             return vec![];
         }
         self.interrupted = Some(Interruption {
             target,
-            reason: reason.text().into(),
-            phase: InterruptPhase::Protocol(Instant::now() + Duration::from_secs(3)),
-            retry_after_started: false,
-            retried: false,
-            sent: false,
+            ladder: super::StopLadder::new(reason),
+            request: InterruptRequest::Pending,
         });
         let mut lines: Vec<_> = std::mem::take(&mut self.requests)
             .into_values()
             .map(|r| Outbound::Message(self.peer.response(r.id, cancel(&r.reply))))
             .collect();
-        if self.native_turn.is_some() {
+        if self.turn.native().is_some() {
             lines.push(self.interrupt_frame(target));
         }
         lines
     }
     pub(crate) fn interrupt_active(&mut self, reason: StopReason) -> Vec<Outbound> {
-        self.active
+        self.active()
             .map(|turn| self.interrupt_lines(turn.target(), reason))
             .unwrap_or_default()
     }
-    pub(crate) fn interrupt_deadline(&self) -> Option<Instant> {
-        let ladder = self.interrupted.as_ref().map(|i| match i.phase {
-            InterruptPhase::Protocol(at) | InterruptPhase::Terminate(at) => at,
-        });
-        ladder.into_iter().chain(self.resume_retry).min()
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        let ladder = self.interrupted.as_ref().map(|i| i.ladder.deadline());
+        let retry = match &self.conversation {
+            Conversation::Opening { retry, .. } => retry.as_ref().and_then(|retry| retry.next),
+            Conversation::Ready(_) => None,
+        };
+        ladder.into_iter().chain(retry).min()
     }
     pub(crate) fn timer_lines(&mut self) -> Vec<Outbound> {
-        if self.resume_retry.is_some_and(|at| Instant::now() >= at) {
-            self.resume_retry = None;
-            return vec![Outbound::Message(self.open_thread())];
+        if let Conversation::Opening {
+            retry: Some(retry), ..
+        } = &mut self.conversation
+            && retry.next.is_some_and(|at| Instant::now() >= at)
+        {
+            retry.next = None;
+            return vec![self.open_thread()];
         }
         vec![]
     }
     pub(crate) fn escalate_interrupt(&mut self) -> Option<Signal> {
-        let interrupt = self.interrupted.as_mut()?;
-        match interrupt.phase {
-            InterruptPhase::Protocol(at) if Instant::now() >= at => {
-                interrupt.phase =
-                    InterruptPhase::Terminate(Instant::now() + Duration::from_secs(1));
-                Some(Signal::Terminate)
-            }
-            InterruptPhase::Terminate(at) if Instant::now() >= at => Some(Signal::Kill),
-            _ => None,
-        }
+        self.interrupted.as_mut()?.ladder.escalate()
     }
     pub(crate) fn end_outcome(&self, fallback: TurnOutcome) -> TurnOutcome {
         self.interrupted
             .as_ref()
-            .map_or(fallback, |i| TurnOutcome::Interrupted {
-                reason: i.reason.clone(),
-            })
+            .map_or(fallback, |i| i.ladder.outcome())
     }
     pub(crate) fn eof(&mut self) {
         self.peer.eof("Codex JSON-RPC stdout closed");
@@ -907,10 +1048,19 @@ fn not_found(message: &str) -> bool {
         .to_lowercase()
         .contains("no rollout found for thread id")
 }
-fn elicitation_tool(params: &Value) -> Option<String> {
-    let server = params["serverName"].as_str().filter(|s| !s.is_empty())?;
-    let keyed = params["_meta"]["codex_approval_kind"] == "mcp_tool_call";
-    let parsed = params["message"].as_str().and_then(|message| {
+fn decode<T: serde::de::DeserializeOwned>(value: Value, kind: &str) -> Result<T, ProviderError> {
+    serde_json::from_value(value)
+        .map_err(|_| ProviderError::Protocol(format!("Codex {kind} is malformed")))
+}
+fn elicitation_tool(params: &wire::Elicitation) -> Option<String> {
+    let server = params.server_name.as_deref().filter(|s| !s.is_empty())?;
+    let keyed = params.meta.as_ref().is_some_and(|meta| {
+        matches!(
+            meta.codex_approval_kind,
+            Some(wire::ApprovalKind::McpToolCall)
+        )
+    });
+    let parsed = params.message.as_deref().and_then(|message| {
         let prefix = format!("Allow the {server} MCP server to run tool ");
         let rest = message.strip_prefix(&prefix)?;
         let tool = rest
@@ -925,47 +1075,142 @@ fn elicitation_tool(params: &Value) -> Option<String> {
         parsed
     }
 }
-fn questions(params: &Value) -> Option<(Vec<Question>, Vec<String>)> {
+fn questions(params: &wire::UserInput) -> Option<(Vec<Question>, Vec<String>)> {
     let mut ids = BTreeSet::new();
     let mut texts = BTreeSet::new();
-    let mut questions = Vec::new();
+    let mut result = Vec::new();
     let mut ordered_ids = Vec::new();
-    for question in params["questions"].as_array()? {
-        let id = question["id"].as_str().filter(|s| !s.is_empty())?;
-        let text = question["question"].as_str().filter(|s| !s.is_empty())?;
+    for question in params.questions.as_ref()? {
+        let id = question.id.as_deref().filter(|id| !id.is_empty())?;
+        let text = question
+            .question
+            .as_deref()
+            .filter(|text| !text.is_empty())?;
         if !ids.insert(id) || !texts.insert(text) {
             return None;
         }
-        let options = match question["options"].as_array() {
-            Some(options) => options
-                .iter()
-                .map(|o| {
-                    o["label"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                })
-                .collect::<Option<Vec<_>>>()?,
-            None => vec![],
-        };
-        questions.push(Question {
+        let options = question
+            .options
+            .as_ref()
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|o| o.label.as_ref().filter(|text| !text.is_empty()).cloned())
+                    .collect::<Option<Vec<_>>>()
+            })
+            .unwrap_or_else(|| Some(vec![]))?;
+        result.push(Question {
             text: text.into(),
             options,
         });
         ordered_ids.push(id.into());
     }
-    (!questions.is_empty()).then_some((questions, ordered_ids))
+    (!result.is_empty()).then_some((result, ordered_ids))
 }
 
-fn supported_request(method: &str) -> bool {
-    matches!(
-        method,
-        "item/commandExecution/requestApproval"
-            | "item/fileChange/requestApproval"
-            | "item/permissions/requestApproval"
-            | "item/tool/requestUserInput"
-            | "mcpServer/elicitation/request"
-    )
+#[derive(Clone, Copy)]
+enum ProbeCall {
+    Initialize,
+    Account,
+    Models,
+}
+pub(super) async fn probe_exchange(
+    reader: &mut jsonrpc::Reader,
+    writer: &tokio::sync::mpsc::UnboundedSender<Outbound>,
+    binary: std::path::PathBuf,
+) -> Result<super::Probe, ProviderError> {
+    let send = |frame| {
+        writer
+            .send(Outbound::Message(frame))
+            .map_err(|_| ProviderError::Protocol("Codex probe writer closed".into()))
+    };
+    let mut peer = Peer::new(false);
+    send(peer.send(ProbeCall::Initialize, "initialize", initialize()))?;
+    let mut version = None;
+    let mut account = None;
+    let mut readiness = super::Readiness::Ready;
+    let mut models = vec![];
+    let mut waiting = 2;
+    while let Some(line) = reader.next().await? {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match peer.receive(value) {
+            Frame::Reply { tag, result } => {
+                let value = result.map_err(jsonrpc::failure)?;
+                match tag {
+                    ProbeCall::Initialize => {
+                        let reply: wire::InitializeReply = decode(value, "probe initialize reply")?;
+                        version = reply
+                            .user_agent
+                            .as_deref()
+                            .and_then(|s| s.split_whitespace().next())
+                            .and_then(|s| s.rsplit_once('/'))
+                            .map(|(_, version)| version.to_owned());
+                        send(peer.notification("initialized", Value::Null))?;
+                        send(peer.send(
+                            ProbeCall::Account,
+                            "account/read",
+                            json!({"refreshToken":false}),
+                        ))?;
+                        send(peer.send(ProbeCall::Models, "model/list", json!({})))?;
+                    }
+                    ProbeCall::Account => {
+                        let reply: wire::AccountReply = decode(value, "account reply")?;
+                        match reply.account {
+                            wire::Account::Null if reply.requires_openai_auth => {
+                                readiness = super::Readiness::SignedOut
+                            }
+                            wire::Account::Known(value) => account = Some(value),
+                            _ => {}
+                        }
+                        waiting -= 1;
+                    }
+                    ProbeCall::Models => {
+                        let reply: wire::ModelsReply = decode(value, "model list reply")?;
+                        models.extend(reply.data.into_iter().filter_map(|model| {
+                            Some(super::Model {
+                                value: model.model.or(model.id)?,
+                                display_name: model.display_name.unwrap_or_default(),
+                                effort_levels: model
+                                    .supported_reasoning_efforts
+                                    .into_iter()
+                                    .filter_map(|e| e.reasoning_effort)
+                                    .collect(),
+                            })
+                        }));
+                        if let Some(cursor) = reply.next_cursor {
+                            send(peer.send(
+                                ProbeCall::Models,
+                                "model/list",
+                                json!({"cursor":cursor}),
+                            ))?;
+                        } else {
+                            waiting -= 1;
+                        }
+                    }
+                }
+                if waiting == 0 {
+                    return Ok(super::Probe {
+                        provider: super::ProviderKind::Codex,
+                        path: Some(binary),
+                        version,
+                        readiness,
+                        models,
+                        account,
+                    });
+                }
+            }
+            Frame::Request { id, .. } => {
+                send(peer.error(id, -32601, "Unsupported server request"))?
+            }
+            Frame::Notification { .. } | Frame::Unknown => {}
+        }
+    }
+    peer.eof("Codex probe stdout closed");
+    Err(ProviderError::Protocol(
+        "Codex probe ended without a reply".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -1004,13 +1249,13 @@ mod tests {
             "invalid session id"
         );
         assert_eq!(
-            codec.spec.native,
+            codec.native().cloned(),
             Some(NativeSessionId("old-thread".into()))
         );
         let mut codec = resumed();
         let d=codec.value(json!({"id":2,"error":{"code":-32600,"message":"no rollout found for thread id old-thread"}})).unwrap();
         assert_eq!(d.replies[0]["method"], "thread/start");
-        assert_eq!(codec.spec.native, None);
+        assert_eq!(codec.native().cloned(), None);
     }
     #[tokio::test(start_paused = true)]
     async fn codex_active_writer_retry_is_bounded() {
@@ -1035,7 +1280,7 @@ mod tests {
         assert_eq!(Instant::now() - start, Duration::from_secs(3));
         assert_eq!(id, 14);
         assert_eq!(
-            codec.spec.native,
+            codec.native().cloned(),
             Some(NativeSessionId("old-thread".into()))
         );
     }
@@ -1083,7 +1328,7 @@ mod tests {
             ] {
                 assert_eq!(
                     elicitation_tool(
-                        &json!({"serverName":"veyra","message":message,"mode":"form","_meta":meta})
+                        &serde_json::from_value(json!({"serverName":"veyra","message":message,"mode":"form","_meta":meta})).unwrap()
                     ),
                     Some("list_providers".into())
                 );
@@ -1091,9 +1336,135 @@ mod tests {
         }
         assert_eq!(
             elicitation_tool(
-                &json!({"serverName":"veyra","message":"Select a color","mode":"form"})
+                &serde_json::from_value(
+                    json!({"serverName":"veyra","message":"Select a color","mode":"form"})
+                )
+                .unwrap()
             ),
             None
+        );
+    }
+    fn early_request_codec() -> Codec {
+        let mut codec = resumed();
+        codec
+            .value(json!({"id":2,"result":{"thread":{"id":"old-thread"}}}))
+            .unwrap();
+        codec
+    }
+    fn early_approval(turn: &str) -> Value {
+        json!({"id":0,"method":"item/commandExecution/requestApproval",
+            "params":{"threadId":"old-thread","turnId":turn,"itemId":"command","command":"touch test-file","cwd":"/project"}})
+    }
+    fn request_count(decoded: &Decoded) -> usize {
+        decoded
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ProviderEvent::Turn {
+                        event: TurnEvent::RequestOpened { .. },
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+    #[test]
+    fn codex_request_waiting_for_start_reply_can_be_answered() {
+        let mut codec = early_request_codec();
+        let turn = TurnId::new();
+        codec.start(turn, "work".into()).unwrap();
+        let opened = codec.value(early_approval("native-turn")).unwrap();
+        assert_eq!(
+            request_count(&opened),
+            1,
+            "a provider waiting for consent before its start reply must progress"
+        );
+        assert!(opened.events.iter().any(|e| matches!(e,ProviderEvent::Turn {turn:Some(id),event:TurnEvent::RequestOpened{..}} if *id==turn)));
+        assert_eq!(
+            codec
+                .answer(NativeRequestRef("0".into()), Decision::Deny)
+                .unwrap(),
+            json!({"id":0,"result":{"decision":"decline"}})
+        );
+    }
+    #[test]
+    fn codex_cli_request_without_started_opens_provider() {
+        let mut codec = early_request_codec();
+        let opened = codec.value(early_approval("cli-turn")).unwrap();
+        assert_eq!(request_count(&opened), 1);
+        assert!(opened.provider_turn.is_some());
+        assert_eq!(
+            codec
+                .answer(NativeRequestRef("0".into()), Decision::AllowOnce)
+                .unwrap(),
+            json!({"id":0,"result":{"decision":"accept"}})
+        );
+        let mut foreign = early_approval("foreign-turn");
+        foreign["id"] = json!(1);
+        foreign["params"]["threadId"] = json!("another-thread");
+        assert_eq!(request_count(&codec.value(foreign).unwrap()), 0);
+    }
+    #[tokio::test]
+    async fn codex_stop_orders_cancel_before_interrupt() {
+        let mut codec = early_request_codec();
+        let turn = TurnId::new();
+        codec.start(turn, "work".into()).unwrap();
+        codec.value(early_approval("native-turn")).unwrap();
+        let mut frames: Vec<Value> = codec
+            .interrupt_lines(turn, StopReason::User)
+            .iter()
+            .map(Outbound::value)
+            .collect();
+        let decoded = codec
+            .value(json!({"id":3,"result":{"turn":{"id":"native-turn"}}}))
+            .unwrap();
+        frames.extend(decoded.controls.iter().map(Outbound::value));
+        frames.extend(decoded.replies);
+        assert_eq!(frames[0], json!({"id":0,"result":{"decision":"cancel"}}));
+        assert_eq!(frames[1]["method"], "turn/interrupt");
+        assert_eq!(frames.len(), 2);
+    }
+    #[test]
+    fn codex_thread_credential_stays_typed_until_serialization() {
+        let token = crate::mcp::McpToken::new();
+        let config = std::sync::Arc::new(McpConfig {
+            command: "/owned/veyra".into(),
+            socket: "/owned/veyra.sock".into(),
+            token: token.clone(),
+        });
+        let outbound = Outbound::CodexThread {
+            line: json!({"id":1,"method":"thread/start","params":{}}),
+            mcp: config,
+        };
+        let recorded = outbound.value();
+        assert_eq!(
+            recorded["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"],
+            "<id:token>"
+        );
+        assert!(!recorded.to_string().contains(token.expose()));
+        let bytes = outbound.into_bytes().unwrap();
+        let written: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            written["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"].as_str()
+                == Some(token.expose())
+        );
+    }
+    #[test]
+    fn codex_early_mcp_without_turn_id_can_be_answered() {
+        let mut codec = early_request_codec();
+        let turn = TurnId::new();
+        codec.start(turn, "work".into()).unwrap();
+        let opened=codec.value(json!({"id":0,"method":"mcpServer/elicitation/request",
+            "params":{"threadId":"old-thread","serverName":"veyra","message":"Allow the veyra MCP server to run tool list_providers"}})).unwrap();
+        assert_eq!(request_count(&opened), 1);
+        assert!(opened.events.iter().any(|e|matches!(e,ProviderEvent::Turn {turn:Some(id),event:TurnEvent::RequestOpened{..}} if *id==turn)));
+        assert_eq!(
+            codec
+                .answer(NativeRequestRef("0".into()), Decision::AllowOnce)
+                .unwrap(),
+            json!({"id":0,"result":{"action":"accept"}})
         );
     }
 }

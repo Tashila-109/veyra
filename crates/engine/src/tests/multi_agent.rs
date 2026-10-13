@@ -870,6 +870,7 @@ fn get_task_status_matches_window() {
                             tool: "Bash".into(),
                             target: ApprovalTarget::Command {
                                 command: "echo status".into(),
+                                cwd: Default::default(),
                                 preview: ApprovalPreview::new(String::new()),
                             },
                         },
@@ -1016,7 +1017,7 @@ fn queued_tool_request_keeps_its_originating_session() {
 #[test]
 fn tool_request_without_session_is_refused_by_cli_actor() {
     let mut f = Fixture::new(LiveState::Running);
-    f.actor.spawner = Spawner::Cli(crate::provider::env::ChildEnv::load());
+    f.actor.spawner = Spawner::Cli(Box::new(crate::provider::env::ChildEnv::isolated()));
     let caller = f.thread;
     refusal(
         call(&mut f, caller, "list_providers", json!({})),

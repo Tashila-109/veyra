@@ -1,16 +1,10 @@
 use super::{
-    Outbound, ProviderError,
-    session::{ByteLines, Line},
+    ProviderError,
+    lines::{ByteLines, Line},
 };
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, oneshot},
-};
+use std::collections::BTreeMap;
+use tokio::{io::AsyncRead, sync::mpsc};
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
@@ -26,14 +20,10 @@ impl Error {
         }
     }
 }
-struct Pending<T> {
-    tag: T,
-    reply: oneshot::Sender<Result<Value, Error>>,
-}
 pub struct Peer<T> {
     version_field: bool,
     next_id: u64,
-    pending: BTreeMap<u64, Pending<T>>,
+    pending: BTreeMap<u64, T>,
 }
 pub enum Frame<T> {
     Reply {
@@ -65,23 +55,11 @@ impl<T> Peer<T> {
         }
         value
     }
-    pub fn request(
-        &mut self,
-        tag: T,
-        method: &str,
-        params: Value,
-    ) -> (Value, oneshot::Receiver<Result<Value, Error>>) {
+    pub fn send(&mut self, tag: T, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
-        let (reply, receiver) = oneshot::channel();
-        self.pending.insert(id, Pending { tag, reply });
-        (
-            self.envelope(json!({"id":id,"method":method,"params":params})),
-            receiver,
-        )
-    }
-    pub fn send(&mut self, tag: T, method: &str, params: Value) -> Value {
-        self.request(tag, method, params).0
+        self.pending.insert(id, tag);
+        self.envelope(json!({"id":id,"method":method,"params":params}))
     }
     pub fn notification(&self, method: &str, params: Value) -> Value {
         self.envelope(if params.is_null() {
@@ -126,18 +104,21 @@ impl<T> Peer<T> {
             } else {
                 Err(Error::closed("Provider reply has no result or error"))
             };
-            let _ = pending.reply.send(result.clone());
             return Frame::Reply {
-                tag: pending.tag,
+                tag: pending,
                 result,
             };
         }
         Frame::Unknown
     }
-    pub fn eof(&mut self, message: &str) {
-        for (_, pending) in std::mem::take(&mut self.pending) {
-            let _ = pending.reply.send(Err(Error::closed(message)));
-        }
+    pub fn eof(&mut self, message: &str) -> Vec<Frame<T>> {
+        std::mem::take(&mut self.pending)
+            .into_values()
+            .map(|tag| Frame::Reply {
+                tag,
+                result: Err(Error::closed(message)),
+            })
+            .collect()
     }
 }
 impl<T> Drop for Peer<T> {
@@ -151,7 +132,7 @@ pub(crate) struct Reader {
 }
 impl Reader {
     pub(crate) fn start(stdout: impl AsyncRead + Unpin + Send + 'static) -> Self {
-        let (sender, receiver) = mpsc::channel(32);
+        let (sender, receiver) = mpsc::channel(4);
         let task = tokio::spawn(async move {
             let mut lines = ByteLines::new(stdout);
             loop {
@@ -164,13 +145,14 @@ impl Reader {
         });
         Self { receiver, task }
     }
-    pub(crate) async fn next(&mut self) -> std::io::Result<Option<Line>> {
+    pub(crate) async fn next(&mut self) -> std::io::Result<Option<String>> {
         match self.receiver.recv().await {
             Some(Ok(Some(Line::Oversize(_)))) => Err(std::io::Error::other(
                 "JSON-RPC line exceeded the 4 MiB cap",
             )),
-            Some(value) => value,
-            None => Ok(None),
+            Some(Ok(Some(Line::Text(text)))) => Ok(Some(text)),
+            Some(Ok(None)) | None => Ok(None),
+            Some(Err(error)) => Err(error),
         }
     }
 }
@@ -179,35 +161,6 @@ impl Drop for Reader {
         self.task.abort();
     }
 }
-pub(crate) async fn write(
-    mut stdin: impl AsyncWrite + Unpin,
-    mut input: mpsc::UnboundedReceiver<Outbound>,
-    active: Arc<Mutex<Option<crate::domain::TurnId>>>,
-    closing: Arc<crate::LaunchGate>,
-    #[cfg(test)] close_before_prompt: Arc<std::sync::atomic::AtomicBool>,
-) -> std::io::Result<()> {
-    while let Some(outbound) = input.recv().await {
-        let mut bytes = serde_json::to_vec(&outbound.value())?;
-        bytes.push(b'\n');
-        #[cfg(test)]
-        if matches!(outbound, Outbound::Prompt(_))
-            && close_before_prompt.swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            closing.close();
-        }
-        if matches!(outbound, Outbound::Prompt(_)) && closing.is_closing() {
-            continue;
-        }
-        match outbound {
-            Outbound::Interrupt(turn) | Outbound::RpcInterrupt { turn, .. } => {
-                super::session::write_interrupt(&mut stdin, &bytes, turn, &active).await?
-            }
-            Outbound::Prompt(_) | Outbound::Message(_) => stdin.write_all(&bytes).await?,
-        }
-        stdin.flush().await?;
-    }
-    Ok(())
-}
 pub(crate) fn failure(error: Error) -> ProviderError {
     ProviderError::Protocol(error.message)
 }
@@ -215,18 +168,24 @@ pub(crate) fn failure(error: Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn jsonrpc_eof_fails_pending() {
+    #[test]
+    fn jsonrpc_eof_fails_pending() {
         let mut peer = Peer::new(false);
-        let (_, a) = peer.request((), "one", json!({}));
-        let (_, b) = peer.request((), "two", json!({}));
-        peer.eof("JSON-RPC stdout closed");
-        for reply in [a, b] {
-            assert_eq!(
-                reply.await.unwrap().unwrap_err().message,
-                "JSON-RPC stdout closed"
-            );
+        peer.send("one", "one", json!({}));
+        peer.send("two", "two", json!({}));
+        let replies = peer.eof("JSON-RPC stdout closed");
+        assert_eq!(replies.len(), 2);
+        for (reply, expected) in replies.into_iter().zip(["one", "two"]) {
+            let Frame::Reply { tag, result } = reply else {
+                panic!("pending call was not failed")
+            };
+            assert_eq!(tag, expected);
+            assert_eq!(result.unwrap_err().message, "JSON-RPC stdout closed");
         }
+        assert!(matches!(
+            peer.receive(json!({"id":1,"result":{}})),
+            Frame::Unknown
+        ));
     }
     #[test]
     fn jsonrpc_flag_omits_field() {
@@ -250,20 +209,23 @@ mod tests {
             "JSON-RPC line exceeded the 4 MiB cap"
         );
     }
-    #[tokio::test]
-    async fn jsonrpc_replies_route_by_id() {
+    #[test]
+    fn jsonrpc_replies_route_by_id() {
         let mut peer = Peer::new(false);
-        let (_, a) = peer.request("first", "one", json!({}));
-        let (_, b) = peer.request("second", "two", json!({}));
-        assert!(matches!(
-            peer.receive(json!({"id":2,"result":{"ok":true}})),
-            Frame::Reply { tag: "second", .. }
-        ));
-        assert!(matches!(
-            peer.receive(json!({"id":1,"error":{"code":-32601,"message":"unknown"}})),
-            Frame::Reply { tag: "first", .. }
-        ));
-        assert_eq!(b.await.unwrap().unwrap(), json!({"ok":true}));
-        assert_eq!(a.await.unwrap().unwrap_err().code, -32601);
+        peer.send("first", "one", json!({}));
+        peer.send("second", "two", json!({}));
+        let Frame::Reply { tag, result } = peer.receive(json!({"id":2,"result":{"ok":true}}))
+        else {
+            panic!("missing reply")
+        };
+        assert_eq!(tag, "second");
+        assert_eq!(result.unwrap(), json!({"ok":true}));
+        let Frame::Reply { tag, result } =
+            peer.receive(json!({"id":1,"error":{"code":-32601,"message":"unknown"}}))
+        else {
+            panic!("missing reply")
+        };
+        assert_eq!(tag, "first");
+        assert_eq!(result.unwrap_err().code, -32601);
     }
 }
