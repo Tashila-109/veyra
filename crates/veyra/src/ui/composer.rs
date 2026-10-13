@@ -530,6 +530,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
 mod tests {
     use super::approval_text;
     use veyra_engine::domain::{ApprovalPreview, ApprovalTarget, ProposedAction};
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn grant_caption_keeps_command_whitespace(cx: &mut gpui::TestAppContext) {
         use gpui_kit::{prelude::*, *};

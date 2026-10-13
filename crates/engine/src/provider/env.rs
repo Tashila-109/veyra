@@ -5,7 +5,9 @@ use crate::platform;
 #[cfg(debug_assertions)]
 use std::collections::BTreeMap;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(all(test, debug_assertions))]
+use std::sync::atomic::Ordering;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},

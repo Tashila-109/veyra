@@ -1799,6 +1799,7 @@ mod tests {
             "Stop drain exceeded five seconds: {elapsed:?}"
         );
     }
+    #[cfg(debug_assertions)]
     async fn assert_stand_in_starts(
         env: &ChildEnv,
         cwd: &std::path::Path,
@@ -1821,6 +1822,7 @@ mod tests {
         std::fs::remove_file(marker).unwrap();
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn shutdown_during_missing_resume_never_launches_replacement() {
         for during_cleanup in [false, true] {
@@ -1952,6 +1954,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn shutdown_before_session_launch_starts_no_provider() {
         for shutdown in [true, false] {
@@ -2045,6 +2048,7 @@ mod tests {
             ));
         }
     }
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pending_shutdown_preempts_queued_turn_on_ready_session() {
         for cancellation in ["shutdown", "closed", "engine", "none"] {
@@ -2175,6 +2179,7 @@ done
             );
         }
     }
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn shutdown_after_admission_before_stdin_write_sends_no_prompt() {
         for cancellation in ["none", "writer"] {

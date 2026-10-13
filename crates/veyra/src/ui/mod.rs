@@ -2465,6 +2465,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn shown_stop_follows_rendered_target_and_empty_draft(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, dispatched, _| {
@@ -2492,6 +2493,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     fn text_batch(thread: ThreadId) -> Vec<UiEvent> {
         vec![UiEvent::TextAppended {
             thread,
@@ -2571,6 +2573,7 @@ mod tests {
         (root, child, turn)
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn sidebar_titles_stay_left_and_quiet_controls_stay_on_one_line(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| super::theme::register_fonts(cx).unwrap());
@@ -2620,6 +2623,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn queued_task_report_badge_uses_its_report_source(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -2707,6 +2711,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn empty_child_report_never_badges_later_work(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -2782,6 +2787,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn quiet_row_retains_title_and_untruncated_hint(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| super::theme::register_fonts(cx).unwrap());
@@ -2832,6 +2838,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn family_card_stop_tracks_the_shared_turn_target(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -2873,6 +2880,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn family_card_uses_singular_and_plural_agent_labels(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -2887,6 +2895,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn failed_admitted_prompt_keeps_its_cause_and_retry(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -3004,6 +3013,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn delivered_report_stays_on_its_task_after_later_user_work(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -3076,6 +3086,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn visible_perf_counts_only_selected_text_and_resets(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -3113,6 +3124,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn visible_perf_sees_a_pause_despite_hidden_text(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -3145,6 +3157,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn transcript_open_perf_stamps_first_installed_render_and_replaces(
         cx: &mut gpui::TestAppContext,
@@ -3212,6 +3225,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn empty_send_stops_while_provider_is_checking(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, dispatched, _| {
@@ -3263,6 +3277,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn empty_send_without_a_turn_is_refused(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, dispatched, _| {
@@ -3292,6 +3307,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn long_approval_keeps_decision_buttons_visible(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -3356,6 +3372,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn file_approval_dock_names_target_and_consequence(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -3445,6 +3462,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn question_focus_prompt_matches_approval(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -3456,6 +3474,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn allow_in_thread_chip_follows_keyboard_focus(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, dispatched, sender| {
@@ -3516,6 +3535,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn approval_chips_follow_keyboard_focus(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, dispatched, _| {
@@ -3659,6 +3679,7 @@ mod tests {
         ));
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn chat_branch_loads_when_the_thread_row_follows_selection(cx: &mut gpui::TestAppContext) {
         use std::{path::PathBuf, process::Command, time::Duration};
@@ -4155,6 +4176,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn recheck_after_confirm_quit_launches_no_provider(cx: &mut gpui::TestAppContext) {
         use std::time::Duration;
@@ -4274,6 +4296,7 @@ mod tests {
             "a provider launched after quit began: {launched}"
         );
     }
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn stop_mouse_release_does_not_retarget_after_repaint(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -4368,6 +4391,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn old_rendered_allow_button_does_not_approve_new_request(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {

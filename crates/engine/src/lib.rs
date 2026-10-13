@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 use std::time::Instant;
 pub mod actor;
 pub mod commands;

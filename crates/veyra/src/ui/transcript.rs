@@ -733,6 +733,7 @@ mod tests {
     use super::tool_input;
     use gpui_kit::AppContext;
     use veyra_engine::domain::*;
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn reply_preserves_single_newlines(cx: &mut gpui::TestAppContext) {
         use gpui_kit::{prelude::*, *};
@@ -848,6 +849,7 @@ mod tests {
             Some("Failed · No account".into())
         );
     }
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn failed_tool_preview_stays_one_line_at_narrow_width(cx: &mut gpui::TestAppContext) {
         use gpui_kit::{prelude::*, *};

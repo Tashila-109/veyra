@@ -352,6 +352,7 @@ fn quit_while_stopping_cancels_session_and_terminal_restarts() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn actor_shutdown_during_missing_resume_spawns_no_replacement() {
     use std::{fs, path::PathBuf, time::Duration};

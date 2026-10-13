@@ -263,7 +263,9 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivateWindow, AllowOnce, Deny, Stop, bindings, shortcut};
+    #[cfg(debug_assertions)]
+    use super::ActivateWindow;
+    use super::{AllowOnce, Deny, Stop, bindings, shortcut};
     use gpui_kit::Keystroke;
     #[test]
     fn shortcut_chips_match_bindings() {
@@ -284,6 +286,7 @@ mod tests {
         assert_eq!(shortcut::<AllowOnce>(), Some("⌘↵".into()));
         assert_eq!(shortcut::<Deny>(), Some("⌘.".into()));
         assert_eq!(shortcut::<Stop>(), Some("⌃c".into()));
+        #[cfg(debug_assertions)]
         assert_eq!(shortcut::<ActivateWindow>(), None);
     }
 }

@@ -334,6 +334,7 @@ fn mcp_config_is_unlinked_when_session_ends_before_init() {
     assert!(!path.exists());
 }
 
+#[cfg(debug_assertions)]
 async fn session_config_lifecycle(root_thread: bool, reported: Option<&str>) {
     use veyra_engine::{
         domain::*,
@@ -480,12 +481,14 @@ async fn session_config_lifecycle(root_thread: bool, reported: Option<&str>) {
         }
     }
 }
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn root_session_owns_private_config_until_init_or_exit() {
     for status in [Some("connected"), Some("failed"), None] {
         session_config_lifecycle(true, status).await;
     }
 }
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn child_spawn_has_no_tool_server() {
     session_config_lifecycle(false, Some("connected")).await;

@@ -169,14 +169,14 @@ mod tests {
     fn private_folders_and_stale_socket() {
         let path = scratch();
         let _scratch = crate::tests::Scratch(path.clone());
-        let dir = DataDir::at(path.clone()).unwrap();
+        let _dir = DataDir::at(path.clone()).unwrap();
         for folder in [&path, &path.join("logs"), &path.join("run")] {
             assert!(platform::is_private(folder).unwrap());
         }
         #[cfg(debug_assertions)]
         {
             fs::write(path.join("control.sock"), "stale").unwrap();
-            let lock = dir.lock().unwrap();
+            let lock = _dir.lock().unwrap();
             assert!(platform::is_private(&path.join("veyra.lock")).unwrap());
             assert!(!path.join("control.sock").exists());
             drop(lock);

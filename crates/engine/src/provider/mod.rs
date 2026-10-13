@@ -378,7 +378,7 @@ impl Drop for Probes {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 mod shutdown_probe_tests {
     use super::*;
     #[tokio::test]
