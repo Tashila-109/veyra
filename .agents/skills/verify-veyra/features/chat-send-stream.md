@@ -221,7 +221,7 @@ failed_row = next(item for item in tool_dump['transcript']['items'] if item['kin
 assert failed_row['failed_last_line']=='last tool error' and not failed_row['expanded']
 capture('chat-failed-tool')
 index = next(i for i,item in enumerate(tool_dump['transcript']['items']) if item['id']==failed_row['id'])
-old_top = tool_dump['transcript']['item_tops'][index]
+old_top = poll('chat-failed-tool-measured',lambda d: d['transcript']['item_tops'][index] is not None)['transcript']['item_tops'][index]
 action('chat-failed-tool-expand','ToggleItem',{'item':failed_row['id']})
 expanded = poll('chat-failed-tool-expanded',lambda d: next(item for item in d['transcript']['items'] if item['id']==failed_row['id'])['expanded'])
 assert abs(expanded['transcript']['item_tops'][index]-old_top)<1
