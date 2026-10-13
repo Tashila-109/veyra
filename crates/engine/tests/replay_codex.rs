@@ -1,0 +1,700 @@
+#![cfg(debug_assertions)]
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::{runtime::Runtime, sync::mpsc};
+use veyra_engine::{
+    actor::EngineMsg,
+    domain::*,
+    provider::{env::ChildEnv, *},
+};
+struct Scratch(PathBuf);
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex")
+        .join(format!("{name}.jsonl"))
+}
+fn environment(name: &str) -> (Scratch, ChildEnv) {
+    let root = Path::new("/tmp").join(format!("veyra-m5s1-{}", ThreadId::new()));
+    fs::create_dir(&root).unwrap();
+    fs::copy(fixture(name), root.join("t1-s1.jsonl")).unwrap();
+    fs::copy(fixture("probe-ready"), root.join("probe-codex.jsonl")).unwrap();
+    let mut env = ChildEnv::load();
+    env.codex_bin = Some(env!("CARGO_BIN_EXE_veyra-fake-cli").into());
+    env.fixtures = Some(root.clone());
+    env.record = None;
+    (Scratch(root), env)
+}
+fn replay(name: &str, mode: PermissionMode, root: bool, resume: bool) -> Vec<ProviderEvent> {
+    let (scratch, mut env) = environment(name);
+    Runtime::new().unwrap().block_on(async {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let (out, mut rx) = mpsc::channel(256);
+        if root {
+            veyra_engine::platform::private_dir(&scratch.0.join("data")).unwrap();
+            env.mcp = Some(std::sync::Arc::new(
+                veyra_engine::mcp::Server::bind(
+                    &scratch.0.join("data"),
+                    std::env::current_exe().unwrap(),
+                    out.clone(),
+                )
+                .unwrap(),
+            ));
+        }
+        let handle = Spawner::Cli(env)
+            .spawn(
+                ProviderKind::Codex,
+                SessionSpec {
+                    thread,
+                    cwd: std::env::current_dir().unwrap(),
+                    config: ThreadConfig {
+                        model: Some("veyra-model".into()),
+                        effort: Some("medium".into()),
+                        mode,
+                    },
+                    native: resume.then(|| NativeSessionId("missing-native".into())),
+                    import: false,
+                    root,
+                },
+                out,
+                1,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut events = Vec::new();
+            let mut sent = false;
+            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                match &event {
+                    ProviderEvent::Session(SessionEvent::Ready { .. }) if !sent => {
+                        handle
+                            .control
+                            .send(SessionControl::StartTurn {
+                                turn,
+                                text: "reply with the word ok".into(),
+                            })
+                            .unwrap();
+                        sent = true;
+                    }
+                    ProviderEvent::Turn {
+                        event: TurnEvent::Accepted,
+                        ..
+                    } if name == "interrupt-before-started" => {
+                        handle
+                            .control
+                            .send(SessionControl::Interrupt {
+                                turn,
+                                reason: StopReason::User,
+                            })
+                            .unwrap();
+                    }
+                    ProviderEvent::Turn {
+                        event: TurnEvent::RequestOpened { native, kind },
+                        ..
+                    } => {
+                        if name == "stop-pending-approval" {
+                            handle
+                                .control
+                                .send(SessionControl::Interrupt {
+                                    turn,
+                                    reason: StopReason::User,
+                                })
+                                .unwrap();
+                        } else {
+                            let reply = match kind {
+                                RequestKind::Question { .. } => Decision::Answers(vec![Answer {
+                                    text: "Violet".into(),
+                                }]),
+                                _ if matches!(name, "approval-command" | "output-null")
+                                    || (name == "mcp-tool-approval" && native.0 == "0") =>
+                                {
+                                    Decision::AllowOnce
+                                }
+                                _ => Decision::Deny,
+                            };
+                            handle
+                                .control
+                                .send(SessionControl::Answer {
+                                    native: native.clone(),
+                                    reply,
+                                })
+                                .unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+                let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+            assert!(sent, "Codex never reached Ready: {events:?}");
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    ProviderEvent::Session(SessionEvent::Exited { crash: None })
+                )),
+                "Codex crashed: {events:?}"
+            );
+            events
+        })
+        .await
+        .unwrap()
+    })
+}
+fn standard(name: &str) -> Vec<ProviderEvent> {
+    replay(name, PermissionMode::AskFirst, false, false)
+}
+fn text(events: &[ProviderEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { text, .. },
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+fn outcomes(events: &[ProviderEvent]) -> Vec<TurnOutcome> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Turn {
+                event: TurnEvent::TurnEnded { outcome, .. },
+                ..
+            } => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect()
+}
+fn requests(events: &[ProviderEvent]) -> Vec<&RequestKind> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Turn {
+                event: TurnEvent::RequestOpened { kind, .. },
+                ..
+            } => Some(kind),
+            _ => None,
+        })
+        .collect()
+}
+#[test]
+fn codex_ok_reply() {
+    let e = standard("ok-reply");
+    assert_eq!(text(&e), "ok");
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+    assert!(e.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Turn {
+            event: TurnEvent::Accepted,
+            ..
+        }
+    )));
+}
+#[test]
+fn codex_shell_echo() {
+    let e = replay("shell-echo", PermissionMode::AcceptEdits, false, false);
+    assert_eq!(
+        text(&e),
+        "I’ll run the command and report its output.veyra-probe"
+    );
+    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Turn{event:TurnEvent::ToolFinished{ok:true,output_tail:Some(output),..},..} if output=="veyra-probe\n")));
+}
+#[test]
+fn codex_command_approval() {
+    let e = standard("approval-command");
+    assert!(
+        matches!(requests(&e).as_slice(),[RequestKind::Approval {action:ProposedAction{target:ApprovalTarget::Command{command,..},..},..}] if command=="touch veyra-check.txt")
+    );
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_file_change_approval() {
+    let e = standard("approval-file-change");
+    assert!(
+        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,..},grant_key:None}] if tool=="File change")
+    );
+    assert_eq!(text(&e), "ok");
+}
+#[test]
+fn codex_permissions_deny_grants_nothing() {
+    let e = standard("permissions");
+    assert!(
+        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,..},grant_key:None}] if tool=="Permissions")
+    );
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_elicitation_declined() {
+    let e = standard("elicitation");
+    assert_eq!(requests(&e).len(), 0);
+    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="Codex requested an MCP form that Veyra cannot display; it was declined.")));
+    assert_eq!(text(&e), "ok");
+}
+#[test]
+fn codex_question_answered() {
+    let e = standard("question");
+    assert_eq!(
+        requests(&e),
+        [&RequestKind::Question {
+            questions: vec![Question {
+                text: "Which color should Veyra use?".into(),
+                options: vec!["Violet".into(), "Blue".into()]
+            }]
+        }]
+    );
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_unknown_request_gets_32601() {
+    let e = standard("unknown-request");
+    assert_eq!(text(&e), "ok");
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_resume_not_found_falls_back() {
+    let e = replay("resume-not-found", PermissionMode::AskFirst, false, true);
+    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="The earlier conversation could not be resumed; this is a new session")));
+    assert_eq!(text(&e), "ok");
+}
+#[test]
+fn codex_other_turn_id_is_cli_work() {
+    let e = standard("other-turn");
+    assert_eq!(text(&e), "okCLI work");
+    assert_eq!(
+        outcomes(&e),
+        [TurnOutcome::Completed, TurnOutcome::Completed]
+    );
+    assert!(e.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })
+    )));
+    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Turn{turn:None,event:TurnEvent::TextDelta{text,..}} if text=="CLI work")));
+}
+#[test]
+fn codex_stop_cancels_pending_request() {
+    let e = standard("stop-pending-approval");
+    assert_eq!(requests(&e).len(), 1);
+    assert_eq!(
+        outcomes(&e),
+        [TurnOutcome::Interrupted {
+            reason: "Stopped by you".into()
+        }]
+    );
+}
+#[test]
+fn codex_interrupt_retries_after_started() {
+    let e = standard("interrupt-before-started");
+    assert_eq!(
+        outcomes(&e),
+        [TurnOutcome::Interrupted {
+            reason: "Stopped by you".into()
+        }]
+    );
+}
+#[test]
+fn codex_completed_before_started_ends_turn() {
+    let e = standard("completed-before-started");
+    assert_eq!(
+        outcomes(&e),
+        [TurnOutcome::Interrupted {
+            reason: "Stopped by Codex".into()
+        }]
+    );
+    assert_eq!(
+        e.iter()
+            .filter(|e| matches!(
+                e,
+                ProviderEvent::Turn {
+                    event: TurnEvent::Started,
+                    ..
+                }
+            ))
+            .count(),
+        0
+    );
+}
+#[test]
+fn codex_resume_retries_active_writer() {
+    let e = replay(
+        "resume-active-writer",
+        PermissionMode::AskFirst,
+        false,
+        true,
+    );
+    assert_eq!(text(&e), "ok");
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_resume_sends_exclude_turns() {
+    let e = replay("resume-to-ask-first", PermissionMode::AskFirst, false, true);
+    assert_eq!(text(&e), "ok");
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_every_turn_has_network_access() {
+    for (name, mode, root) in [
+        ("root-policy", PermissionMode::AskFirst, true),
+        (
+            "child-policy-accept-edits",
+            PermissionMode::AcceptEdits,
+            false,
+        ),
+        (
+            "child-policy-full-access",
+            PermissionMode::FullAccess,
+            false,
+        ),
+    ] {
+        let e = replay(name, mode, root, false);
+        assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+        assert_eq!(text(&e), "ok");
+    }
+}
+#[test]
+fn codex_mcp_tool_approval_docks() {
+    let e = standard("mcp-tool-approval");
+    assert_eq!(requests(&e).len(), 2);
+    for r in requests(&e) {
+        assert!(
+            matches!(r,RequestKind::Approval{action:ProposedAction{tool,..},grant_key:None} if tool=="veyra / list_providers")
+        );
+    }
+    assert!(
+        !e.iter()
+            .any(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice { .. })))
+    );
+    assert_eq!(text(&e), "ok");
+}
+#[test]
+fn codex_other_thread_frames_are_filtered() {
+    let e = standard("subagent-other-thread");
+    assert_eq!(text(&e), "ok");
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+    assert_eq!(
+        e.iter()
+            .filter(|e| matches!(
+                e,
+                ProviderEvent::Turn {
+                    event: TurnEvent::Started,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(!e.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })
+            | ProviderEvent::Session(SessionEvent::BackgroundWork { pending: true })
+    )));
+}
+#[test]
+fn codex_retry_and_limit_notices() {
+    let e = standard("retry-and-limits");
+    let n: Vec<_> = e
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Session(SessionEvent::Notice { text }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        n,
+        [
+            "Codex is retrying after a provider error.",
+            "Codex updated its usage limits. Check the CLI for the remaining allowance."
+        ]
+    );
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_command_output_falls_back_to_deltas() {
+    let e = standard("output-null");
+    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Turn{event:TurnEvent::ToolFinished{ok:true,output_tail:Some(output),..},..} if output=="veyra-probe\n")));
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_probe_reads_catalog_without_a_turn() {
+    let (scratch, env) = environment("ok-reply");
+    Runtime::new().unwrap().block_on(async {
+        let mut probes = Probes::default();
+        let p = probes
+            .check(
+                &tokio::runtime::Handle::current(),
+                ProviderKind::Codex,
+                env,
+                scratch.0.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.readiness, Readiness::Ready);
+        assert_eq!(p.version.as_deref(), Some("0.161.0"));
+        assert_eq!(p.models[0].value, "veyra-model");
+        assert_eq!(p.models[0].effort_levels, ["medium"]);
+    });
+}
+
+fn engine_replay(
+    test: &str,
+    scenarios: &[&str],
+    check: impl FnOnce(&veyra_engine::Engine, &Path, ThreadId, &Runtime),
+) {
+    if std::env::var("VEYRA_M5_ENGINE_REPLAY").ok().as_deref() != Some(test) {
+        let root = Path::new("/tmp").join(format!("veyra-m5s1-{}", ThreadId::new()));
+        fs::create_dir(&root).unwrap();
+        let _scratch = Scratch(root.clone());
+        let fixtures = root.join("fixtures");
+        fs::create_dir(&fixtures).unwrap();
+        for (i, name) in scenarios.iter().enumerate() {
+            fs::copy(fixture(name), fixtures.join(format!("t1-s{}.jsonl", i + 1))).unwrap();
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("VEYRA_M5_ENGINE_REPLAY", test)
+            .env("VEYRA_M5_ENGINE_ROOT", &root)
+            .env("VEYRA_FAKE_FIXTURES", &fixtures)
+            .env("VEYRA_CODEX_BIN", env!("CARGO_BIN_EXE_veyra-fake-cli"))
+            .env("VEYRA_CLAUDE_BIN", "/nonexistent/claude")
+            .env_remove("VEYRA_RECORD")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os("VEYRA_M5_ENGINE_ROOT").unwrap())
+        .canonicalize()
+        .unwrap();
+    let data = veyra_engine::data_dir::DataDir::at(root.join("data")).unwrap();
+    veyra_engine::platform::private_dir(data.path()).unwrap();
+    let mut db = veyra_engine::store::open(&data.path().join("veyra.db")).unwrap();
+    let project = Project {
+        id: ProjectId::new(),
+        path: root.clone(),
+        name: "Codex replay".into(),
+    };
+    let parent = Thread {
+        id: ThreadId::new(),
+        project: project.id,
+        title: "Claude parent".into(),
+        lineage: Lineage::Root,
+        provider: ProviderKind::Claude,
+        config: ThreadConfig {
+            mode: PermissionMode::FullAccess,
+            model: None,
+            effort: None,
+        },
+        cwd: root.clone(),
+        native: None,
+        native_cursor: None,
+        cli_version: None,
+        hold: None,
+        view: View::Chat,
+        import_pending: false,
+        archived: false,
+    };
+    let child = Thread {
+        id: ThreadId::new(),
+        title: "Codex child".into(),
+        lineage: Lineage::Child {
+            parent: parent.id,
+            root: parent.id,
+            relationship: Relationship::Subagent,
+        },
+        provider: ProviderKind::Codex,
+        config: ThreadConfig {
+            mode: if scenarios[0] == "subagent-other-thread" {
+                PermissionMode::AskFirst
+            } else {
+                PermissionMode::FullAccess
+            },
+            model: Some("veyra-model".into()),
+            effort: Some("medium".into()),
+        },
+        ..parent.clone()
+    };
+    let mut changes = veyra_engine::events::ChangeSet::default();
+    changes.projects.insert(project.id, project);
+    changes.threads.insert(parent.id, parent);
+    changes.threads.insert(child.id, child.clone());
+    let tx = db.transaction().unwrap();
+    veyra_engine::store::apply(&tx, &changes, 1).unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    let runtime = Runtime::new().unwrap();
+    let engine =
+        veyra_engine::Engine::start_with_processes(runtime.handle(), data, vec![]).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check(&engine, &root, child.id, &runtime)
+    }));
+    runtime.block_on(engine.shutdown_wait());
+    drop(engine);
+    drop(runtime);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+async fn run_engine_turn(engine: &veyra_engine::Engine, child: ThreadId) -> TurnId {
+    use veyra_engine::{
+        commands::{Ack, Command},
+        events::{ChangeEvent, UiEvent},
+    };
+    let mut events = engine.subscribe();
+    let Ack::Turn(turn) = engine
+        .send(Command::Send {
+            thread: child,
+            text: "reply with the word ok".into(),
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("missing turn")
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(event) = events.recv().await {
+            if let UiEvent::Change {
+                event: ChangeEvent::TurnEnded(row),
+                ..
+            } = event
+                && row.id == turn
+            {
+                assert!(
+                    matches!(
+                        row.state,
+                        TurnState::Ended {
+                            outcome: TurnOutcome::Completed,
+                            ..
+                        }
+                    ),
+                    "{:?}",
+                    row.state
+                );
+                return;
+            }
+        }
+        panic!("event stream ended");
+    })
+    .await
+    .unwrap();
+    turn
+}
+#[test]
+fn codex_resume_reapplies_mode() {
+    engine_replay(
+        "codex_resume_reapplies_mode",
+        &[
+            "child-policy-full-access",
+            "resume-to-ask-first",
+            "resume-to-full-access",
+            "resume-to-accept-edits",
+        ],
+        |engine, root, child, runtime| {
+            runtime.block_on(async {
+                run_engine_turn(engine, child).await;
+                for mode in [
+                    PermissionMode::AskFirst,
+                    PermissionMode::FullAccess,
+                    PermissionMode::AcceptEdits,
+                ] {
+                    engine
+                        .send(veyra_engine::commands::Command::Configure {
+                            thread: child,
+                            config: ThreadConfig {
+                                mode,
+                                model: Some("veyra-model".into()),
+                                effort: Some("medium".into()),
+                            },
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    run_engine_turn(engine, child).await;
+                }
+            });
+            let db = veyra_engine::store::open(&root.join("data/veyra.db")).unwrap();
+            let p = veyra_engine::store::load(&db).unwrap();
+            assert_eq!(p.turns.len(), 4);
+            assert!(p.turns.values().all(|t| matches!(
+                t.state,
+                TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                }
+            )));
+            assert_eq!(p.threads[&child].config.mode, PermissionMode::AcceptEdits);
+            assert_eq!(
+                p.threads[&child].native.as_ref().unwrap().0,
+                "native-thread"
+            );
+        },
+    );
+}
+
+#[test]
+fn codex_other_thread_never_marks_working() {
+    engine_replay(
+        "codex_other_thread_never_marks_working",
+        &["subagent-other-thread"],
+        |engine, root, child, runtime| {
+            runtime.block_on(run_engine_turn(engine, child));
+            let db = veyra_engine::store::open(&root.join("data/veyra.db")).unwrap();
+            let p = veyra_engine::store::load(&db).unwrap();
+            assert_eq!(p.turns.len(), 1);
+            assert!(
+                p.turns
+                    .values()
+                    .all(|t| matches!(t.origin, TurnOrigin::User { .. }))
+            );
+            assert_eq!(
+                p.items
+                    .values()
+                    .filter_map(|i| match &i.body {
+                        ItemBody::AssistantText { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                "ok"
+            );
+        },
+    );
+}
+
+#[test]
+fn codex_request_before_reply_is_docked() {
+    let e = standard("request-before-reply");
+    assert_eq!(requests(&e).len(), 1);
+    assert_eq!(text(&e), "ok");
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_completion_before_reply_ends_once() {
+    let e = standard("completed-before-reply");
+    assert_eq!(
+        outcomes(&e),
+        [TurnOutcome::Interrupted {
+            reason: "Stopped by Codex".into()
+        }]
+    );
+    assert!(!e.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })
+    )));
+}
+#[test]
+fn codex_bad_lines_keep_the_session() {
+    let e = standard("bad-lines");
+    assert_eq!(text(&e), "ok");
+    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+}

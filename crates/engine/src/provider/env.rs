@@ -59,6 +59,8 @@ pub struct ChildEnv {
     #[cfg(debug_assertions)]
     pub claude_bin: Option<PathBuf>,
     #[cfg(debug_assertions)]
+    pub codex_bin: Option<PathBuf>,
+    #[cfg(debug_assertions)]
     pub fixtures: Option<PathBuf>,
     #[cfg(debug_assertions)]
     pub record: Option<PathBuf>,
@@ -87,6 +89,8 @@ impl ChildEnv {
             #[cfg(debug_assertions)]
             claude_bin: std::env::var_os("VEYRA_CLAUDE_BIN").map(PathBuf::from),
             #[cfg(debug_assertions)]
+            codex_bin: std::env::var_os("VEYRA_CODEX_BIN").map(PathBuf::from),
+            #[cfg(debug_assertions)]
             fixtures: std::env::var_os("VEYRA_FAKE_FIXTURES").map(PathBuf::from),
             #[cfg(debug_assertions)]
             record: std::env::var_os("VEYRA_RECORD").map(PathBuf::from),
@@ -100,9 +104,11 @@ impl ChildEnv {
     }
     pub fn resolve(&self, provider: ProviderKind) -> Result<PathBuf, ProviderError> {
         #[cfg(debug_assertions)]
-        if provider == ProviderKind::Claude
-            && let Some(path) = &self.claude_bin
-        {
+        if let Some(path) = match provider {
+            ProviderKind::Claude => self.claude_bin.as_ref(),
+            ProviderKind::Codex => self.codex_bin.as_ref(),
+            ProviderKind::Grok => None,
+        } {
             return executable(path)
                 .ok_or_else(|| ProviderError::NotInstalled(path.display().to_string()));
         }
@@ -240,6 +246,7 @@ mod tests {
                 home: None,
                 lanes: Default::default(),
                 claude_bin: None,
+                codex_bin: None,
                 fixtures: None,
                 record: None,
                 #[cfg(debug_assertions)]

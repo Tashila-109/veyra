@@ -298,7 +298,7 @@ fn start_thread_schema_offers_only_built_providers() {
         .unwrap();
     assert_eq!(
         start["inputSchema"]["properties"]["provider"]["enum"],
-        json!(["claude"])
+        json!(["claude", "codex"])
     );
 }
 
@@ -1125,18 +1125,17 @@ fn tool_catalog_refuses_unbuilt_providers() {
         .iter()
         .map(|provider| provider["provider"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["claude"]);
-    for provider in ["codex", "grok"] {
-        refusal(
-            call(
-                &mut f,
-                caller,
-                "start_thread",
-                json!({"provider":provider,"title":"Worker","prompt":"x","client_request_id":provider}),
-            ),
-            &["not built", "list_providers", "{}"],
-        );
-    }
+    assert_eq!(names, ["claude", "codex"]);
+    let provider = "grok";
+    refusal(
+        call(
+            &mut f,
+            caller,
+            "start_thread",
+            json!({"provider":provider,"title":"Worker","prompt":"x","client_request_id":provider}),
+        ),
+        &["not built", "list_providers", "{}"],
+    );
 }
 #[test]
 fn parent_stop_keeps_the_discarded_queue_reason() {

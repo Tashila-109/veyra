@@ -130,21 +130,39 @@ mod capture {
             }
             recorder.write(&Record::TranscriptStart {
                 provider: provider.into(),
-                protocol: "stream-json".into(),
+                protocol: if provider == "claude" {
+                    "stream-json"
+                } else {
+                    "json-rpc"
+                }
+                .into(),
                 cli_version: version.into(),
                 scenario: "recorded".into(),
                 source: "Veyra recording".into(),
             })?;
             Ok(recorder)
         }
-        pub fn bind(&mut self, value: String, replacement: String) {
+        pub fn bind(&mut self, value: String, mut replacement: String) {
+            if self.bindings.contains_key(&value) {
+                return;
+            }
+            if replacement.starts_with("<id:") && replacement.ends_with('>') {
+                let base = replacement.trim_end_matches('>').to_owned();
+                let mut suffix = 1;
+                while self.bindings.values().any(|known| known == &replacement) {
+                    replacement = format!("{base}:{suffix}>");
+                    suffix += 1;
+                }
+            }
             self.bindings.insert(value, replacement);
         }
         pub fn line(&mut self, outbound: bool, mut value: Value) -> io::Result<()> {
-            if value["type"] == "system"
-                && value["subtype"] == "init"
-                && let Some(version) = value["claude_code_version"].as_str()
-            {
+            let version = if value["type"] == "system" && value["subtype"] == "init" {
+                value["claude_code_version"].as_str()
+            } else {
+                value["result"]["thread"]["cliVersion"].as_str()
+            };
+            if let Some(version) = version.filter(|version| !version.is_empty()) {
                 self.file.seek(SeekFrom::Start(0))?;
                 let mut existing = String::new();
                 self.file.read_to_string(&mut existing)?;
@@ -184,10 +202,11 @@ mod capture {
         }
         fn sanitize(&mut self, value: Value, key: Option<&str>) -> Value {
             if let Value::String(text) = &value
-                && self
-                    .bindings
-                    .get(text)
-                    .is_some_and(|binding| binding == "<id:token>")
+                && (text == "<id:token>"
+                    || self
+                        .bindings
+                        .get(text)
+                        .is_some_and(|binding| binding == "<id:token>"))
             {
                 return "<id:token>".into();
             }

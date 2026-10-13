@@ -1,8 +1,7 @@
 use super::{
-    ProviderError, ProviderEvent, ProviderKind, SessionControl, SessionEvent, SessionHandle,
-    SessionSpec, StopReason, TurnEvent,
-    claude::{self, Codec, Outbound},
-    env::ChildEnv,
+    ActiveTurn, Decoded, Outbound, ProviderError, ProviderEvent, ProviderKind, SessionControl,
+    SessionEvent, SessionHandle, SessionSpec, StopReason, TurnEvent, claude, codex, env::ChildEnv,
+    jsonrpc,
 };
 use crate::{
     actor::EngineMsg,
@@ -11,7 +10,9 @@ use crate::{
     record,
 };
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(all(test, debug_assertions))]
+use std::sync::atomic::Ordering;
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -147,7 +148,7 @@ impl Drop for ProcessGroup {
         self.end();
     }
 }
-async fn write_interrupt(
+pub(crate) async fn write_interrupt(
     stdin: &mut (impl AsyncWrite + Unpin),
     bytes: &[u8],
     turn: TurnId,
@@ -174,6 +175,7 @@ async fn write_interrupt(
 struct Process {
     child: ProcessGroup,
     native: NativeSessionId,
+    codex: Option<codex::Codec>,
     mcp: Option<crate::mcp::Session>,
     #[cfg(debug_assertions)]
     recorder: Option<record::Recorder>,
@@ -197,11 +199,19 @@ impl Process {
             .map_err(|_| ProviderError::Protocol("Claude stdin writer closed".into()))
     }
     fn record_inbound(&mut self, line: &mut serde_json::Value) -> Result<(), ProviderError> {
-        if let Some(mcp) = &self.mcp {
-            mcp.config.system_init(line)?;
+        if let Some(mcp) = &self.mcp
+            && let Some(config) = &mcp.config
+        {
+            config.system_init(line)?;
         }
         #[cfg(debug_assertions)]
         if let Some(recorder) = &mut self.recorder {
+            if let Some(native) = line["result"]["thread"]["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+            {
+                recorder.bind(native.into(), "<id:session>".into());
+            }
             let mut recorded = line.clone();
             if let Some(mcp) = &self.mcp {
                 mcp.hash.sanitize(&mut recorded, "<id:token>");
@@ -215,11 +225,15 @@ impl Process {
     }
 }
 fn launch(
+    provider: ProviderKind,
     spec: &SessionSpec,
     env: &ChildEnv,
     fresh: Option<NativeSessionId>,
     session_epoch: u32,
 ) -> Result<Process, ProviderError> {
+    if provider == ProviderKind::Codex {
+        return launch_codex(spec, env, session_epoch);
+    }
     let binary = env.resolve(ProviderKind::Claude)?;
     #[cfg(debug_assertions)]
     let (n, epoch) = env.next_lane(spec.thread);
@@ -278,7 +292,7 @@ fn launch(
         (
             child,
             Some(crate::mcp::Session {
-                config,
+                config: Some(config),
                 hash,
                 server: server.clone(),
             }),
@@ -292,6 +306,7 @@ fn launch(
     Ok(Process {
         child,
         native,
+        codex: None,
         mcp,
         #[cfg(debug_assertions)]
         recorder,
@@ -303,9 +318,22 @@ pub fn spawn(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    env.resolve(ProviderKind::Claude)?;
-    Ok(start_task(None, spec, env, out, epoch))
+    spawn_provider(ProviderKind::Claude, spec, env, out, epoch)
 }
+pub fn spawn_provider(
+    provider: ProviderKind,
+    spec: SessionSpec,
+    env: ChildEnv,
+    out: mpsc::Sender<EngineMsg>,
+    epoch: u32,
+) -> Result<SessionHandle, ProviderError> {
+    if !provider.is_built() {
+        return Err(ProviderError::NotBuilt);
+    }
+    env.resolve(provider)?;
+    Ok(start_provider_task(provider, None, spec, env, out, epoch))
+}
+
 #[cfg(test)]
 fn start_session(
     process: Process,
@@ -316,7 +344,8 @@ fn start_session(
 ) -> SessionHandle {
     start_task(Some(process), spec, env, out, epoch)
 }
-fn start_task(
+fn start_provider_task(
+    provider: ProviderKind,
     process: Option<Process>,
     spec: SessionSpec,
     env: ChildEnv,
@@ -339,7 +368,7 @@ fn start_task(
             None => {
                 match receiver
                     .drain_and_check_launch(&out)
-                    .and_then(|()| launch(&spec, &env, None, epoch))
+                    .and_then(|()| launch(provider, &spec, &env, None, epoch))
                 {
                     Ok(process) => process,
                     Err(error) => {
@@ -366,7 +395,7 @@ fn start_task(
                     let native = NativeSessionId(ThreadId::new().to_string());
                     match receiver
                         .drain_and_check_launch(&out)
-                        .and_then(|()| launch(&spec, &env, Some(native), epoch))
+                        .and_then(|()| launch(provider, &spec, &env, Some(native), epoch))
                     {
                         Ok(mut next) => {
                             next.child.watch(&cleanup);
@@ -396,7 +425,14 @@ fn start_task(
             }
         }
     });
-    tokio::spawn(supervise(task, reaped, supervisor_out, thread, epoch));
+    tokio::spawn(supervise(
+        task,
+        reaped,
+        supervisor_out,
+        thread,
+        epoch,
+        provider,
+    ));
     SessionHandle { control }
 }
 fn launch_failed(error: ProviderError) -> ProviderEvent {
@@ -415,6 +451,7 @@ async fn supervise(
     out: mpsc::Sender<EngineMsg>,
     thread: ThreadId,
     epoch: u32,
+    provider: ProviderKind,
 ) {
     let result = task.await;
     while let Some(done) = reaped.recv().await {
@@ -427,7 +464,14 @@ async fn supervise(
             epoch,
             ProviderEvent::Session(SessionEvent::Exited {
                 crash: Some(record::redact(
-                    &format!("Claude session task failed: {error}"),
+                    &format!(
+                        "{} session task failed: {error}",
+                        if provider == ProviderKind::Claude {
+                            "Claude"
+                        } else {
+                            provider.label()
+                        }
+                    ),
                     None,
                 )),
             }),
@@ -570,7 +614,17 @@ async fn run_one(
     cwd: &std::path::Path,
 ) -> Completion {
     let pid = process.child.pid();
-    let mut lines = ByteLines::new(process.child.stdout().expect("piped stdout"));
+    let provider = if process.codex.is_some() {
+        ProviderKind::Codex
+    } else {
+        ProviderKind::Claude
+    };
+    let stdout = process.child.stdout().expect("piped stdout");
+    let mut lines = if provider == ProviderKind::Codex {
+        SessionLines::Rpc(jsonrpc::Reader::start(stdout))
+    } else {
+        SessionLines::Direct(ByteLines::new(stdout))
+    };
     let mut errors = ByteLines::new(process.child.stderr().expect("piped stderr"));
     let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
     let stderr_tail = tail.clone();
@@ -587,45 +641,35 @@ async fn run_one(
             }
         }
     });
-    let mut stdin = process.child.stdin().expect("piped stdin");
-    let (writer, mut input) = mpsc::unbounded_channel::<Outbound>();
+    let stdin = process.child.stdin().expect("piped stdin");
+    let (writer, input) = mpsc::unbounded_channel::<Outbound>();
     let active_turn = Arc::new(Mutex::new(None));
-    let writer_turn = active_turn.clone();
-    let writer_closing = control.closing.clone();
-    #[cfg(test)]
-    let close_before_user_write = control.close_before_user_write.clone();
-    let mut write_task = tokio::spawn(async move {
-        while let Some(outbound) = input.recv().await {
-            let line = outbound.value();
-            let mut bytes = serde_json::to_vec(&line)?;
-            bytes.push(b'\n');
-            #[cfg(test)]
-            if matches!(&outbound, Outbound::Prompt(_))
-                && close_before_user_write.swap(false, Ordering::AcqRel)
-            {
-                writer_closing.close();
-            }
-            if matches!(&outbound, Outbound::Prompt(_)) && writer_closing.is_closing() {
-                continue;
-            }
-            if let Outbound::Interrupt(turn) = outbound {
-                write_interrupt(&mut stdin, &bytes, turn, &writer_turn).await?;
-            } else {
-                stdin.write_all(&bytes).await?;
-            }
-            stdin.flush().await?;
-        }
-        Ok::<_, std::io::Error>(())
-    });
-    let mut codec = Codec::new(process.native.clone(), pid, cwd);
+    let mut write_task = tokio::spawn(jsonrpc::write(
+        stdin,
+        input,
+        active_turn.clone(),
+        control.closing.clone(),
+        #[cfg(test)]
+        control.close_before_user_write.clone(),
+    ));
+    let mut codec = match process.codex.take() {
+        Some(codec) => Codec::Codex(Box::new(codec)),
+        None => Codec::Claude(Box::new(claude::Codec::new(
+            process.native.clone(),
+            pid,
+            cwd,
+        ))),
+    };
     let mut ready = false;
     let mut rejected = None;
     #[cfg(debug_assertions)]
-    if let Some(recorder) = &mut process.recorder {
+    if let Some(recorder) = &mut process.recorder
+        && !process.native.0.is_empty()
+    {
         recorder.bind(process.native.0.clone(), "<id:session>".into());
     }
     let mut failure = process
-        .send(&writer, Outbound::Message(claude::initialize()))
+        .send(&writer, Outbound::Message(codec.initialize()))
         .err()
         .map(|error| error.to_string());
     let mut consumer_gone = false;
@@ -647,7 +691,7 @@ async fn run_one(
                     if let Some(recorder) = &mut process.recorder {
                         recorder.bind(turn.to_string(), format!("<id:turn:{turn}>"));
                     }
-                    *active_turn.lock().unwrap() = codec.active.map(claude::ActiveTurn::target);
+                    *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
                     if let Err(error) = process.send(&writer, prompt) {
                         failure = Some(error.to_string());
                         break;
@@ -695,9 +739,9 @@ async fn run_one(
             result = &mut write_task => {
                 writer_done = true;
                 failure = Some(match result {
-                    Ok(Err(error)) => format!("Claude stdin writer failed: {error}"),
-                    Err(error) => format!("Claude stdin writer task failed: {error}"),
-                    Ok(Ok(())) => "Claude stdin writer closed".into(),
+                    Ok(Err(error)) => format!("{} stdin writer failed: {error}", if provider == ProviderKind::Claude { "Claude" } else { provider.label() }),
+                    Err(error) => format!("{} stdin writer task failed: {error}", if provider == ProviderKind::Claude { "Claude" } else { provider.label() }),
+                    Ok(Ok(())) => format!("{} stdin writer closed", if provider == ProviderKind::Claude { "Claude" } else { provider.label() }),
                 });
                 break;
             }
@@ -707,6 +751,10 @@ async fn run_one(
                     None => std::future::pending().await,
                 }
             } => {
+                for line in codec.timer_lines() {
+                    if let Err(error) = process.send(&writer, line) { failure = Some(error.to_string()); break; }
+                }
+                if failure.is_some() { break; }
                 if let Some(signal) = codec.escalate_interrupt() {
                     let kill = matches!(signal, Signal::Kill);
                     let _ = platform::signal_group(pid, signal);
@@ -724,8 +772,8 @@ async fn run_one(
                     let mut wire = match serde_json::from_str::<serde_json::Value>(&line) {
                         Ok(wire) => wire,
                         Err(error) => {
-                            tracing::info!(length = line.len(), "skipped non-JSON Claude line");
-                            rejected = Some(ProviderError::Json(error).to_string());
+                            tracing::info!(length = line.len(), "skipped non-JSON provider line");
+                            if provider == ProviderKind::Claude { rejected = Some(ProviderError::Json(error).to_string()); }
                             continue;
                         }
                     };
@@ -736,7 +784,10 @@ async fn run_one(
                     }
                     match codec.value(wire) {
                         Ok(decoded) => {
-                            *active_turn.lock().unwrap() = codec.active.map(claude::ActiveTurn::target);
+                            *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
+                            for line in decoded.controls {
+                                if let Err(error) = process.send(&writer, line) { failure = Some(error.to_string()); break; }
+                            }
                             for reply in decoded.replies {
                                 if let Err(error) = process.send(&writer, Outbound::Message(reply)) {
                                     failure = Some(error.to_string());
@@ -765,6 +816,7 @@ async fn run_one(
             }
         }
     }
+    codec.eof();
     if !writer_done {
         write_task.abort();
         let _ = write_task.await;
@@ -801,13 +853,14 @@ async fn run_one(
     let failure = failure
         .or(rejected)
         .map(|text| with_stderr(&text, &lines, None));
-    let missing = resume
+    let missing = provider == ProviderKind::Claude
+        && resume
         && lines
             .iter()
             .any(|line| line.contains("No conversation found with session ID"));
     let crash = if consumer_gone || missing {
         None
-    } else if let Some(active) = codec.active {
+    } else if let Some(active) = codec.active() {
         let outside = observed
             .as_ref()
             .and_then(|status| match platform::exit_signal(status) {
@@ -824,7 +877,7 @@ async fn run_one(
         } else {
             TurnOutcome::Failed {
                 message: failure.unwrap_or_else(|| {
-                    crash_text(observed.and_then(|status| status.code()), &lines, None)
+                    provider_crash_text(provider, observed.and_then(|status| status.code()), &lines)
                 }),
             }
         };
@@ -867,13 +920,13 @@ async fn run_one(
         return Completion::MissingSession;
     }
     let crash = if crash.is_none()
-        && codec.active.is_none()
+        && codec.active().is_none()
         && (!ready || status.is_some_and(|status| !status.success()))
     {
-        Some(crash_text(
+        Some(provider_crash_text(
+            provider,
             status.and_then(|status| status.code()),
             &lines,
-            None,
         ))
     } else {
         crash
@@ -1060,6 +1113,280 @@ pub async fn probe(
 }
 
 #[cfg(test)]
+fn start_task(
+    process: Option<Process>,
+    spec: SessionSpec,
+    env: ChildEnv,
+    out: mpsc::Sender<EngineMsg>,
+    epoch: u32,
+) -> SessionHandle {
+    start_provider_task(ProviderKind::Claude, process, spec, env, out, epoch)
+}
+fn provider_crash_text(provider: ProviderKind, code: Option<i32>, lines: &[String]) -> String {
+    if provider == ProviderKind::Claude {
+        crash_text(code, lines, None)
+    } else {
+        with_stderr(
+            &format!(
+                "{} exited unexpectedly (exit code {})",
+                provider.binary(),
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ),
+            lines,
+            None,
+        )
+    }
+}
+enum SessionLines {
+    Direct(ByteLines<tokio::process::ChildStdout>),
+    Rpc(jsonrpc::Reader),
+}
+impl SessionLines {
+    async fn next(&mut self) -> std::io::Result<Option<Line>> {
+        match self {
+            Self::Direct(lines) => lines.next().await,
+            Self::Rpc(lines) => lines.next().await,
+        }
+    }
+}
+enum Codec {
+    Claude(Box<claude::Codec>),
+    Codex(Box<codex::Codec>),
+}
+impl Codec {
+    fn initialize(&mut self) -> serde_json::Value {
+        match self {
+            Self::Claude(_) => claude::initialize(),
+            Self::Codex(c) => c.initialize(),
+        }
+    }
+    fn active(&self) -> Option<ActiveTurn> {
+        match self {
+            Self::Claude(c) => c.active,
+            Self::Codex(c) => c.active,
+        }
+    }
+    fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
+        match self {
+            Self::Claude(c) => c.start(turn, text),
+            Self::Codex(c) => c.start(turn, text),
+        }
+    }
+    fn value(&mut self, wire: serde_json::Value) -> Result<Decoded, ProviderError> {
+        match self {
+            Self::Claude(c) => c.value(wire),
+            Self::Codex(c) => c.value(wire),
+        }
+    }
+    fn answer(
+        &mut self,
+        native: NativeRequestRef,
+        reply: super::Reply,
+    ) -> Option<serde_json::Value> {
+        match self {
+            Self::Claude(c) => c.answer(native, reply),
+            Self::Codex(c) => c.answer(native, reply),
+        }
+    }
+    fn interrupt_active(&mut self, reason: StopReason) -> Vec<Outbound> {
+        match self {
+            Self::Claude(c) => c.interrupt_active(reason),
+            Self::Codex(c) => c.interrupt_active(reason),
+        }
+    }
+    fn interrupt_lines(&mut self, turn: TurnId, reason: StopReason) -> Vec<Outbound> {
+        match self {
+            Self::Claude(c) => c.interrupt_lines(turn, reason),
+            Self::Codex(c) => c.interrupt_lines(turn, reason),
+        }
+    }
+    fn interrupt_deadline(&self) -> Option<tokio::time::Instant> {
+        match self {
+            Self::Claude(c) => c.interrupt_deadline(),
+            Self::Codex(c) => c.interrupt_deadline(),
+        }
+    }
+    fn escalate_interrupt(&mut self) -> Option<Signal> {
+        match self {
+            Self::Claude(c) => c.escalate_interrupt(),
+            Self::Codex(c) => c.escalate_interrupt(),
+        }
+    }
+    fn end_outcome(&self, outcome: TurnOutcome) -> TurnOutcome {
+        match self {
+            Self::Claude(c) => c.end_outcome(outcome),
+            Self::Codex(c) => c.end_outcome(outcome),
+        }
+    }
+    fn timer_lines(&mut self) -> Vec<Outbound> {
+        match self {
+            Self::Claude(_) => vec![],
+            Self::Codex(c) => c.timer_lines(),
+        }
+    }
+    fn eof(&mut self) {
+        if let Self::Codex(c) = self {
+            c.eof()
+        }
+    }
+}
+fn launch_codex(spec: &SessionSpec, env: &ChildEnv, epoch: u32) -> Result<Process, ProviderError> {
+    let binary = env.resolve(ProviderKind::Codex)?;
+    #[cfg(debug_assertions)]
+    let (n, lane) = env.next_lane(spec.thread);
+    #[cfg(debug_assertions)]
+    let fixture = env
+        .fixtures
+        .as_ref()
+        .map(|root| root.join(format!("t{n}-s{lane}.jsonl")));
+    #[cfg(not(debug_assertions))]
+    let fixture: Option<std::path::PathBuf> = None;
+    #[cfg(debug_assertions)]
+    let recorder = env
+        .record
+        .as_ref()
+        .map(|root| {
+            record::Recorder::create(
+                &root.join(format!("t{n}-s{lane}.jsonl")),
+                "codex",
+                "unknown until thread reply",
+                &spec.cwd,
+                env.home.as_deref(),
+                None,
+            )
+        })
+        .transpose()?;
+    let (child, mcp, config) = if spec.root
+        && let Some(server) = &env.mcp
+    {
+        let (child,config,hash)=server.for_spawn(spec.thread,epoch,|token| {
+            let config=serde_json::json!({"command":server.command,"args":["mcp"],"env":{"VEYRA_SOCKET":server.socket,"VEYRA_MCP_TOKEN":token.expose()}});
+            let child=env.spawn(&binary,&["app-server".into()],&spec.cwd,fixture.as_deref())?;
+            let pid=child.pid();
+            Ok(((child,config,crate::mcp::TokenHash(token.hash())),pid))
+        })?;
+        (
+            child,
+            Some(crate::mcp::Session {
+                config: None,
+                hash,
+                server: server.clone(),
+            }),
+            Some(config),
+        )
+    } else {
+        (
+            env.spawn(
+                &binary,
+                &["app-server".into()],
+                &spec.cwd,
+                fixture.as_deref(),
+            )?,
+            None,
+            None,
+        )
+    };
+    let codec = codex::Codec::new(spec.clone(), child.pid(), config);
+    Ok(Process {
+        child,
+        native: spec
+            .native
+            .clone()
+            .unwrap_or_else(|| NativeSessionId(String::new())),
+        codex: Some(codec),
+        mcp,
+        #[cfg(debug_assertions)]
+        recorder,
+    })
+}
+
+pub async fn probe_codex(
+    env: &ChildEnv,
+    cwd: &std::path::Path,
+    mut cancelled: oneshot::Receiver<()>,
+) -> Result<super::Probe, ProviderError> {
+    use serde_json::{Value, json};
+    let binary = env.resolve(ProviderKind::Codex)?;
+    #[cfg(debug_assertions)]
+    let fixture = env
+        .fixtures
+        .as_ref()
+        .map(|root| root.join("probe-codex.jsonl"));
+    #[cfg(not(debug_assertions))]
+    let fixture: Option<std::path::PathBuf> = None;
+    check_cancelled(&mut cancelled)?;
+    let mut child = env.spawn(&binary, &["app-server".into()], cwd, fixture.as_deref())?;
+    let mut reader = jsonrpc::Reader::start(child.stdout().expect("piped stdout"));
+    let stderr = discard_stderr(&mut child);
+    let (writer, input) = mpsc::unbounded_channel();
+    let write_task = tokio::spawn(jsonrpc::write(
+        child.stdin().expect("piped stdin"),
+        input,
+        Default::default(),
+        env.closing.clone(),
+        #[cfg(test)]
+        Default::default(),
+    ));
+    let result = tokio::select! {
+        _=&mut cancelled=>Err(ProviderError::Cancelled),
+        result=tokio::time::timeout(Duration::from_secs(5),async {
+            let mut peer=jsonrpc::Peer::new(false);
+            writer.send(Outbound::Message(peer.send("initialize","initialize",codex::initialize()))).map_err(|_|ProviderError::Protocol("Codex probe writer closed".into()))?;
+            let mut version=None;
+            let mut account=None;
+            let mut readiness=super::Readiness::Ready;
+            let mut models=vec![];
+            let mut waiting=2;
+            while let Some(line)=reader.next().await? {
+                let Line::Text(line)=line else {unreachable!()};
+                let Ok(wire)=serde_json::from_str::<Value>(&line) else {continue};
+                match peer.receive(wire) {
+                    jsonrpc::Frame::Reply {tag,result}=>{
+                        let result=result.map_err(jsonrpc::failure)?;
+                        match tag {
+                            "initialize"=>{
+                                version=result["userAgent"].as_str().and_then(|s|s.split_whitespace().next()).and_then(|s|s.rsplit_once('/')).map(|(_,v)|v.to_owned());
+                                writer.send(Outbound::Message(peer.notification("initialized",Value::Null))).map_err(|_|ProviderError::Protocol("Codex probe writer closed".into()))?;
+                                for (method,params) in [("account/read",json!({"refreshToken":false})),("model/list",json!({}))] {
+                                    writer.send(Outbound::Message(peer.send(method,method,params))).map_err(|_|ProviderError::Protocol("Codex probe writer closed".into()))?;
+                                }
+                            }
+                            "account/read"=>{
+                                account=result.get("account").filter(|a|!a.is_null()).cloned();
+                                if result.get("account")==Some(&Value::Null) && result["requiresOpenaiAuth"]==true {readiness=super::Readiness::SignedOut;}
+                                waiting-=1;
+                            }
+                            "model/list"=>{
+                                if let Some(data)=result["data"].as_array() {
+                                    models.extend(data.iter().filter_map(|m|Some(super::Model {value:m["model"].as_str().or_else(||m["id"].as_str())?.into(),display_name:m["displayName"].as_str().unwrap_or_default().into(),effort_levels:m["supportedReasoningEfforts"].as_array().map(|a|a.iter().filter_map(|e|e["reasoningEffort"].as_str().map(str::to_owned)).collect()).unwrap_or_default()})));
+                                }
+                                if let Some(cursor)=result["nextCursor"].as_str() {
+                                    writer.send(Outbound::Message(peer.send("model/list","model/list",json!({"cursor":cursor})))).map_err(|_|ProviderError::Protocol("Codex probe writer closed".into()))?;
+                                } else {waiting-=1;}
+                            }
+                            _=>{}
+                        }
+                        if waiting==0 {return Ok(super::Probe {provider:ProviderKind::Codex,path:Some(binary.clone()),version,readiness,models,account});}
+                    }
+                    jsonrpc::Frame::Request {id,..}=>{let _=writer.send(Outbound::Message(peer.error(id,-32601,"Unsupported server request")));}
+                    _=>{}
+                }
+            }
+            peer.eof("Codex probe stdout closed");
+            Err(ProviderError::Protocol("Codex probe ended without a reply".into()))
+        })=>result.unwrap_or_else(|_|Err(ProviderError::Protocol("Codex probe timed out".into()))),
+    };
+    drop(writer);
+    write_task.abort();
+    let _ = write_task.await;
+    child.stop().await?;
+    stderr.abort();
+    let _ = stderr.await;
+    result
+}
+
+#[cfg(test)]
 mod tests {
     #[tokio::test]
     async fn blocked_interrupt_is_checked_at_its_first_byte() {
@@ -1125,6 +1452,7 @@ mod tests {
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
+            codex: None,
             mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1215,6 +1543,7 @@ mod tests {
             let process = Process {
                 child,
                 native: NativeSessionId("fixture-session".into()),
+                codex: None,
                 mcp: None,
                 #[cfg(debug_assertions)]
                 recorder: None,
@@ -1284,6 +1613,7 @@ mod tests {
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
+            codex: None,
             mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1346,6 +1676,7 @@ mod tests {
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
+            codex: None,
             mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1423,6 +1754,7 @@ mod tests {
         let process = Process {
             child: group,
             native: NativeSessionId("fixture-session".into()),
+            codex: None,
             mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1526,7 +1858,7 @@ mod tests {
             panic!("fixture panic");
         });
         let (out, mut events) = mpsc::channel(256);
-        supervise(task, reaped, out, ThreadId::new(), 1).await;
+        supervise(task, reaped, out, ThreadId::new(), 1, ProviderKind::Claude).await;
         let alive = platform::group_exists(pid).unwrap();
         if alive {
             let _ = platform::signal_group(pid, Signal::Kill);
@@ -1564,6 +1896,7 @@ mod tests {
         let process = Process {
             child,
             native: NativeSessionId("fixture-session".into()),
+            codex: None,
             mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1697,6 +2030,7 @@ mod tests {
         let process = Process {
             child: group,
             native: NativeSessionId("fixture-session".into()),
+            codex: None,
             mcp: None,
             #[cfg(debug_assertions)]
             recorder: None,
@@ -1879,6 +2213,7 @@ mod tests {
                 let process = Process {
                     child,
                     native: NativeSessionId("missing-native".into()),
+                    codex: None,
                     mcp: None,
                     recorder: None,
                 };
@@ -2353,8 +2688,9 @@ mod mcp_record_tests {
         let mut process = Process {
             child,
             native: NativeSessionId("record-only".into()),
+            codex: None,
             mcp: Some(crate::mcp::Session {
-                config,
+                config: Some(config),
                 hash: crate::mcp::TokenHash(token.hash()),
                 server,
             }),

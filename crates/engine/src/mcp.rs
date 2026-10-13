@@ -273,8 +273,23 @@ impl Server {
         let Some(credential) = credential else { return };
         tracing::info!(thread=%credential.thread,"MCP connection accepted");
         let pid = (*credential.pid.borrow()).expect("registered CLI pid");
+        let (input, mut frames) = mpsc::channel(16);
+        let (closed, mut ended) = oneshot::channel();
+        let credentials = self.credentials.clone();
+        let reader = tokio::spawn(async move {
+            loop {
+                let next = lines.next().await;
+                let terminal = !matches!(next, Ok(Some(Line::Text(_))));
+                if input.send(next).await.is_err() || terminal {
+                    break;
+                }
+            }
+            credentials.lock().unwrap().remove(&hash);
+            let _ = closed.send(());
+        });
+        let _reader = ConnectionRead(reader.abort_handle());
         loop {
-            let line = tokio::select! {result=lines.next()=>result,_=out.closed()=>break};
+            let line = tokio::select! {result=frames.recv()=>match result {Some(line)=>line,None=>break},_=out.closed()=>break};
             if !self.active(&hash) {
                 break;
             }
@@ -289,18 +304,18 @@ impl Server {
                 _ => break,
             };
             TokenHash(hash).sanitize(&mut value, "[redacted]");
-            if let Some(reply) = response_for(
-                credential.thread,
-                Some(Caller {
-                    epoch: credential.epoch,
-                    pid,
-                    token: TokenHash(hash),
-                }),
-                value,
-                &out,
-            )
-            .await
-            {
+            let reply = tokio::select! {
+                biased;
+                _ = &mut ended => break,
+                _ = out.closed() => break,
+                reply = response_for(
+                    credential.thread,
+                    Some(Caller {epoch: credential.epoch, pid, token: TokenHash(hash)}),
+                    value,
+                    &out,
+                ) => reply,
+            };
+            if let Some(reply) = reply {
                 let Ok(mut bytes) = serde_json::to_vec(&reply) else {
                     break;
                 };
@@ -312,6 +327,13 @@ impl Server {
         }
     }
 }
+struct ConnectionRead(tokio::task::AbortHandle);
+impl Drop for ConnectionRead {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub async fn response(
     caller: ThreadId,
     value: Value,
@@ -441,7 +463,7 @@ impl Drop for Configuration {
 }
 
 pub(crate) struct Session {
-    pub config: Configuration,
+    pub config: Option<Configuration>,
     pub hash: TokenHash,
     pub server: Arc<Server>,
 }
@@ -580,5 +602,75 @@ mod launch_lock_tests {
         launch.join().unwrap().unwrap();
         revoke.join().unwrap();
         assert!(prompt, "revocation waited for the launch gate owner");
+    }
+}
+
+#[cfg(test)]
+mod eof_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn half_closed_peer_ends_pending_call() {
+        let root = PathBuf::from("/tmp").join(format!("veyra-m5s1-{}", ThreadId::new()));
+        platform::private_dir(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let (out, mut messages) = mpsc::channel(16);
+        let server = Server::bind(&root, std::env::current_exe().unwrap(), out).unwrap();
+        let thread = ThreadId::new();
+        let mut client = server
+            .for_spawn(thread, 1, |token| {
+                Ok((
+                    (token.expose().to_owned(), server.socket.clone()),
+                    platform::parent_pid(std::process::id())?,
+                ))
+            })
+            .unwrap();
+        let token = TokenHash::of(&client.0);
+        let mut socket = platform::connect_async_socket(&client.1).await.unwrap();
+        socket.write_all(client.0.as_bytes()).await.unwrap();
+        socket.write_all(b"\n").await.unwrap();
+        client.0.clear();
+        drop(client);
+        socket
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        let mut response = ByteLines::new(&mut socket);
+        let Some(Line::Text(reply)) = response.next().await.unwrap() else {
+            panic!("no positive-control reply")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap(),
+            json!({"jsonrpc":"2.0","id":1,"result":{}})
+        );
+        drop(response);
+        socket.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_providers\",\"arguments\":{}}}\n").await.unwrap();
+        let EngineMsg::Tool { reply, .. } =
+            tokio::time::timeout(Duration::from_secs(2), messages.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("tool did not reach actor")
+        };
+        socket.shutdown().await.unwrap();
+        let mut bytes = vec![];
+        let closed =
+            tokio::time::timeout(Duration::from_millis(500), socket.read_to_end(&mut bytes)).await;
+        drop(reply);
+        drop(messages);
+        assert!(
+            closed.is_ok(),
+            "a half-closed peer remained connected while an actor reply was pending"
+        );
+        assert_eq!(closed.unwrap().unwrap(), 0);
+        assert!(!server.allows(
+            thread,
+            Caller {
+                epoch: 1,
+                pid: platform::parent_pid(std::process::id()).unwrap(),
+                token
+            }
+        ));
     }
 }

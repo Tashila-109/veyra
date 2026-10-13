@@ -1,0 +1,9 @@
+{"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.161.0", "scenario": "probe-ready", "source": "Veyra hand-written stable-schema scenario"}
+{"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}}}}
+{"type": "emit_inbound", "line": {"id": "<id:initialize>", "result": {"userAgent": "veyra/0.161.0"}}}
+{"type": "expect_outbound", "line": {"method": "initialized"}}
+{"type": "expect_outbound", "line": {"id": "<id:account>", "method": "account/read", "params": {"refreshToken": "<any>"}}}
+{"type": "expect_outbound", "line": {"id": "<id:models>", "method": "model/list", "params": {}}}
+{"type": "emit_inbound", "line": {"id": "<id:account>", "result": {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": "<any>"}}}
+{"type": "emit_inbound", "line": {"id": "<id:models>", "result": {"data": [{"id": "veyra-model", "model": "veyra-model", "displayName": "Veyra model", "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]}], "nextCursor": null}}}
+{"type": "exit", "code": 0}

@@ -132,7 +132,7 @@ fn later_archived_write_keeps_first_archive_time() {
 fn spawn_failure_survives_full_actor_mailbox() {
     let mut f = Fixture::new(LiveState::Parked);
     let mut row = f.actor.projection.threads[&f.thread].clone();
-    row.provider = ProviderKind::Codex;
+    row.provider = ProviderKind::Grok;
     let mut change = ChangeSet::default();
     change.threads.insert(row.id, row);
     f.save(change);

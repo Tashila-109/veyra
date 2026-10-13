@@ -65,7 +65,22 @@ fn run() -> io::Result<i32> {
                     .next()
                     .transpose()?
                     .ok_or_else(|| io::Error::other("expected outbound frame, actual EOF"))?;
-                let value = serde_json::from_str(&actual)?;
+                let value: serde_json::Value = serde_json::from_str(&actual)?;
+                if value["method"] == "thread/start" || value["method"] == "thread/resume" {
+                    let config = &value["params"]["config"];
+                    if config.get("mcp_servers.veyra.command").is_some() {
+                        for (name, key) in [
+                            ("mcp_command", "command"),
+                            ("mcp_args", "args"),
+                            ("mcp_env", "env"),
+                        ] {
+                            matcher.bind(
+                                &format!("<id:{name}>"),
+                                config[format!("mcp_servers.veyra.{key}")].clone(),
+                            );
+                        }
+                    }
+                }
                 if !matcher.matches(&line, &value) {
                     return Err(io::Error::other("outbound frame did not match the fixture"));
                 }
@@ -133,11 +148,15 @@ fn run() -> io::Result<i32> {
                 if relay.is_some() {
                     return Err(io::Error::other("MCP relay is already running"));
                 }
-                let mut child = child
+                child
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()?;
+                    .stderr(std::process::Stdio::null());
+                let mut command = tokio::process::Command::from(child);
+                if header["provider"] == "codex" {
+                    veyra_engine::platform::own_group(&mut command);
+                }
+                let mut child = command.as_std_mut().spawn()?;
                 let input = child.stdin.take().unwrap();
                 let output = io::BufReader::new(child.stdout.take().unwrap());
                 relay = Some(Relay {
@@ -145,6 +164,22 @@ fn run() -> io::Result<i32> {
                     input: Some(input),
                     output,
                 });
+            }
+            Record::RecordRelayPid { path } => {
+                let path = std::path::Path::new(&path);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir)
+                {
+                    return Err(io::Error::other(
+                        "relay pid path must stay within the project folder",
+                    ));
+                }
+                let relay = relay
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("MCP relay has not started"))?;
+                std::fs::write(path, relay.child.id().to_string())?;
             }
             Record::McpSend { line } => {
                 let relay = relay

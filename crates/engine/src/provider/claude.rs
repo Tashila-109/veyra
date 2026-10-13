@@ -1,3 +1,4 @@
+use super::{ActiveTurn, Decoded, Outbound};
 use super::{Model, ProviderEvent, SessionEvent, SessionSpec, StopReason, TurnEvent};
 use crate::domain::*;
 use serde::Deserialize;
@@ -395,24 +396,6 @@ impl ResultFrame {
         }
     }
 }
-#[derive(Clone, Copy)]
-pub(crate) enum ActiveTurn {
-    Veyra(TurnId),
-    Provider(TurnId),
-}
-impl ActiveTurn {
-    pub fn target(self) -> TurnId {
-        match self {
-            Self::Veyra(turn) | Self::Provider(turn) => turn,
-        }
-    }
-    pub fn id(self) -> Option<TurnId> {
-        match self {
-            Self::Veyra(turn) => Some(turn),
-            Self::Provider(_) => None,
-        }
-    }
-}
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RateLimit {
@@ -493,22 +476,6 @@ struct Tool {
     key: NativeItemKey,
     subagent: Option<Box<Codec>>,
 }
-pub(crate) enum Outbound {
-    Prompt(Value),
-    Message(Value),
-    Interrupt(TurnId),
-}
-impl Outbound {
-    pub fn value(&self) -> Value {
-        match self {
-            Self::Prompt(line) | Self::Message(line) => line.clone(),
-            Self::Interrupt(_) => json!({
-                "type":"control_request", "request_id":"veyra-interrupt",
-                "request":{"subtype":"interrupt"}
-            }),
-        }
-    }
-}
 pub(crate) struct Codec {
     pub active: Option<ActiveTurn>,
     echo: EchoMode,
@@ -522,12 +489,6 @@ pub(crate) struct Codec {
     requests: BTreeMap<String, PendingRequest>,
     seen_requests: BTreeSet<String>,
     seen_commands: BTreeSet<String>,
-}
-#[derive(Default)]
-pub(crate) struct Decoded {
-    pub events: Vec<ProviderEvent>,
-    pub replies: Vec<Value>,
-    pub provider_turn: Option<TurnId>,
 }
 impl Codec {
     pub fn new(native: NativeSessionId, pid: u32, cwd: &std::path::Path) -> Self {
@@ -599,6 +560,7 @@ impl Codec {
                 self.seen_requests.insert(id.clone());
                 return Ok(Decoded {
                     events: Vec::new(),
+                    controls: Vec::new(),
                     replies: vec![Self::unsupported_request(id)],
                     provider_turn: None,
                 });

@@ -1,5 +1,7 @@
 pub mod claude;
+pub mod codex;
 pub mod env;
+pub mod jsonrpc;
 #[cfg(test)]
 pub mod scripted;
 pub mod session;
@@ -233,7 +235,7 @@ impl Probe {
 }
 impl ProviderKind {
     pub fn is_built(self) -> bool {
-        self == Self::Claude
+        matches!(self, Self::Claude | Self::Codex)
     }
     pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
     pub fn binary(self) -> &'static str {
@@ -270,8 +272,13 @@ impl ProviderKind {
         cwd: &std::path::Path,
         cancelled: tokio::sync::oneshot::Receiver<()>,
     ) -> Probe {
-        if self == Self::Claude {
-            match session::probe(env, cwd, cancelled).await {
+        if self.is_built() {
+            let result = match self {
+                Self::Claude => session::probe(env, cwd, cancelled).await,
+                Self::Codex => session::probe_codex(env, cwd, cancelled).await,
+                Self::Grok => unreachable!(),
+            };
+            match result {
                 Ok(probe) => probe,
                 Err(error) => {
                     tracing::warn!(error = %crate::record::redact(&error.to_string(),None), "provider probe failed");
@@ -316,7 +323,9 @@ impl Spawner {
         epoch: u32,
     ) -> Result<SessionHandle, ProviderError> {
         match self {
-            Self::Cli(env) if provider.is_built() => session::spawn(spec, env.clone(), out, epoch),
+            Self::Cli(env) if provider.is_built() => {
+                session::spawn_provider(provider, spec, env.clone(), out, epoch)
+            }
             Self::Cli(_) => Err(ProviderError::NotBuilt),
             #[cfg(test)]
             Self::Scripted(script) => Ok(script.spawn(spec, out, epoch)),
@@ -376,6 +385,54 @@ impl Drop for Probes {
             let _ = task.cancel.send(());
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ActiveTurn {
+    Veyra(TurnId),
+    Provider(TurnId),
+}
+impl ActiveTurn {
+    pub fn target(self) -> TurnId {
+        match self {
+            Self::Veyra(turn) | Self::Provider(turn) => turn,
+        }
+    }
+    pub fn id(self) -> Option<TurnId> {
+        match self {
+            Self::Veyra(turn) => Some(turn),
+            Self::Provider(_) => None,
+        }
+    }
+}
+pub(crate) enum Outbound {
+    Prompt(serde_json::Value),
+    Message(serde_json::Value),
+    Interrupt(TurnId),
+    RpcInterrupt {
+        turn: TurnId,
+        line: serde_json::Value,
+    },
+}
+impl Outbound {
+    pub fn value(&self) -> serde_json::Value {
+        match self {
+            Self::Prompt(line) | Self::Message(line) | Self::RpcInterrupt { line, .. } => {
+                line.clone()
+            }
+            Self::Interrupt(_) => serde_json::json!({
+                "type":"control_request", "request_id":"veyra-interrupt",
+                "request":{"subtype":"interrupt"}
+            }),
+        }
+    }
+}
+#[derive(Default)]
+pub(crate) struct Decoded {
+    pub events: Vec<ProviderEvent>,
+    pub replies: Vec<serde_json::Value>,
+    pub controls: Vec<Outbound>,
+    pub provider_turn: Option<TurnId>,
 }
 
 #[cfg(all(test, debug_assertions))]
