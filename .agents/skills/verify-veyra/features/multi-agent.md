@@ -1,6 +1,6 @@
 # Child threads
 
-Status: not run, 2026-10-12, 833bbce, child controls, quiet time and timing probes
+Status: passed, 2026-10-13, d2ff581, none
 
 ## Sub-features
 

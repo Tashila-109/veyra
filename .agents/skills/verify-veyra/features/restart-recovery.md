@@ -1,6 +1,6 @@
 # Restart and recovery
 
-Status: not run, 2026-10-12, 833bbce, child crash and recovery
+Status: passed, 2026-10-13, d2ff581, none
 
 ## Sub-features
 
