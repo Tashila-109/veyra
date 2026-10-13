@@ -145,6 +145,17 @@ pub enum TurnOutcome {
     Interrupted { reason: String },
     Failed { message: String },
 }
+impl TurnOutcome {
+    pub fn words(&self) -> String {
+        match self {
+            Self::Completed => "Done".into(),
+            Self::Interrupted { reason } => reason.clone(),
+            Self::Failed { message } => {
+                format!("Failed · {}", message.lines().next().unwrap_or_default())
+            }
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub id: ItemId,

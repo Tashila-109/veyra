@@ -10,7 +10,7 @@ use crate::{
 };
 use rusqlite::Connection;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -94,6 +94,7 @@ pub struct Actor {
     subscribers: Vec<mpsc::UnboundedSender<UiEvent>>,
     pending_snapshots: Vec<(ThreadId, oneshot::Sender<ThreadSnapshot>)>,
     counters: BTreeMap<ThreadId, u64>,
+    pub(crate) accepted_turns: BTreeSet<TurnId>,
     buffers: BTreeMap<ItemId, TextBuffer>,
     #[cfg(debug_assertions)]
     delta_counts: BTreeMap<ItemId, u64>,
@@ -212,6 +213,7 @@ impl Actor {
             subscribers: vec![],
             pending_snapshots: vec![],
             counters: BTreeMap::new(),
+            accepted_turns: BTreeSet::new(),
             buffers: BTreeMap::new(),
             #[cfg(debug_assertions)]
             delta_counts: BTreeMap::new(),
@@ -708,13 +710,13 @@ impl Actor {
                 _ => None,
             })
             .collect();
-        let ended: std::collections::BTreeSet<_> = c
+        let ended: BTreeSet<_> = c
             .turns
             .values()
             .filter(|turn| matches!(turn.state, TurnState::Ended { .. }))
             .map(|turn| turn.id)
             .collect();
-        let completed: std::collections::BTreeSet<_> = c
+        let completed: BTreeSet<_> = c
             .items
             .values()
             .filter(|item| {
@@ -776,6 +778,7 @@ impl Actor {
             let counter = event.thread().map(|id| self.next_counter(id));
             self.publish(UiEvent::Change { counter, event });
         }
+        self.accepted_turns.retain(|turn| !ended.contains(turn));
         self.item_keys
             .retain(|(_, _, turn, _), id| !ended.contains(turn) && !completed.contains(id));
         self.buffers.retain(|id, _| {
@@ -1122,6 +1125,9 @@ impl Actor {
         match event {
             TurnEvent::Started => {}
             TurnEvent::Accepted => {
+                if !self.accepted_turns.insert(turn.id) {
+                    return;
+                }
                 tracing::info!(
                     "turn accepted thread={} turn={} at_ms={}",
                     thread,

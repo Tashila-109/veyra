@@ -343,10 +343,10 @@ pub fn decide(
             }
             let mode = args.mode.unwrap_or(parent.config.mode);
             if mode > parent.config.mode {
+                let ceiling = serde_json::to_value(parent.config.mode).unwrap();
                 return Err(invalid(format!(
-                    "mode exceeds your {:?} ceiling ({}); call start_thread with a mode at or below that ceiling",
-                    parent.config.mode,
-                    serde_json::to_value(parent.config.mode).unwrap()
+                    "mode exceeds your {} ceiling; call start_thread with a mode at or below that ceiling",
+                    ceiling.as_str().unwrap()
                 )));
             }
             if !args.provider.is_built() {

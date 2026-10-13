@@ -25,6 +25,7 @@ After ConfirmQuit begins, Escape keeps the quit sheet visible until the app exit
 
 Run Launch, Doctor and new-thread first, with fake CLI only.
 The final section adds a child task through the production relay, then crashes and relaunches the owned app.
+Its post-relaunch marker check uses Cleanup's exiting-process retry and chooses a separate thirty-second window to let session-end hooks drain; remaining unreadable or marked pids fail the check without signalling unrecorded groups.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -151,7 +152,14 @@ wait_gone(pid)
 shutil.copy2(SOURCE/'parent-wake.jsonl',FIXTURES/'t1-s1.jsonl')
 start('restart-child-crash')
 owned_groups_gone(groups)
-assert not marked_processes({pid})
+started = time.monotonic()
+while True:
+    markers = marked_processes({pid}, retry_exiting=True)
+    if not markers or time.monotonic()-started >= 30: break
+    time.sleep(.05)
+save('restart-child-marker-drain', {'remaining':len(markers),
+    'elapsed_seconds':time.monotonic()-started})
+assert not markers, f'{len(markers)} marked processes remain after the thirty-second restart drain: {markers}'
 assert not list((DATA/'run').glob('*/mcp.json'))
 select('restart-child-interrupted',child)
 interrupted = poll('restart-child-interrupted',lambda d:d['selected_thread']['status']=='Interrupted')

@@ -329,17 +329,11 @@ pub fn turn_outcome_line(turn: &Turn) -> Option<String> {
         return None;
     };
     let seconds = started.map(|started| at.saturating_sub(started) / 1000);
-    Some(match outcome {
-        TurnOutcome::Completed => {
-            seconds.map_or_else(|| "Done".into(), |seconds| format!("Done in {seconds}s"))
-        }
-        TurnOutcome::Interrupted { reason } => seconds.map_or_else(
-            || reason.clone(),
-            |seconds| format!("{reason} after {seconds}s"),
-        ),
-        TurnOutcome::Failed { message } => {
-            format!("Failed · {}", message.lines().next().unwrap_or_default())
-        }
+    let words = outcome.words();
+    Some(match (outcome, seconds) {
+        (TurnOutcome::Completed, Some(seconds)) => format!("{words} in {seconds}s"),
+        (TurnOutcome::Interrupted { .. }, Some(seconds)) => format!("{words} after {seconds}s"),
+        _ => words,
     })
 }
 fn tool_output(tool: &ToolItem) -> Option<&str> {

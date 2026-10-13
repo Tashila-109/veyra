@@ -112,7 +112,7 @@ lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_
 def no_environment(pid):
     status = subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
     return not status or status.startswith('Z')
-def marked_processes(parents=None):
+def marked_processes(parents=None, retry_exiting=False):
     remaining = []
     rows = subprocess.check_output(['ps','-axo','pid=,uid=,stat='],text=True).splitlines()
     for row in rows:
@@ -124,7 +124,7 @@ def marked_processes(parents=None):
         if lib.sysctl(mib,3,None,ctypes.byref(size),None,0) != 0:
             error = ctypes.get_errno()
             if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
-            if error == errno.EINVAL:
+            if error == errno.EINVAL or (retry_exiting and error == errno.EIO):
                 remaining.append(pid)
                 continue
             raise OSError(error,f'marker size read failed for pid {pid}')
@@ -133,7 +133,7 @@ def marked_processes(parents=None):
         if lib.sysctl(mib,3,buffer,ctypes.byref(size),None,0) != 0:
             error = ctypes.get_errno()
             if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
-            if error == errno.EINVAL:
+            if error == errno.EINVAL or (retry_exiting and error == errno.EIO):
                 remaining.append(pid)
                 continue
             raise OSError(error,f'marker read failed for pid {pid}')
@@ -644,13 +644,15 @@ Read `live_pgid` before quitting or removing anything.
 Quit the app, then send SIGTERM to saved provider groups and SIGKILL one second later.
 Signal only groups saved in this run's database and the app group this run started.
 The leftover checks retry for five seconds and fail only for saved run-owned pids or groups.
-Other processes carrying the parent marker are allowed up to ten seconds to drain; any remaining marker then fails Cleanup, regardless of its group, with counts and pids only.
+Other processes carrying the parent marker are allowed up to thirty seconds to drain; any remaining marker then fails Cleanup, regardless of its group, with counts and pids only.
 The marker check uses Darwin's `KERN_PROCARGS2` through `sysctl` in memory, never printing arguments or environment values.
 It reads same-user parent markers in memory, then counts only saved app/provider pids and members of saved provider groups as owned leftovers.
 macOS refuses argument reads for privileged processes whose real uid is the user but effective uid is root; a fake CLI lane cannot create such a process.
 Zombies have no argument/environment block on Darwin and are excluded before the read; owned app pids must still be absent.
 ESRCH or an empty argument block after either sysctl read means the process is gone.
 EINVAL or an incomplete block from a still-listed process keeps it in the leftover count and retries within the same five-second window.
+During Cleanup, EIO also keeps a still-listed process in the count for another read within the five-second owned-leftover window or the thirty-second other-marker drain; an unreadable process remaining at that window's deadline fails with its pid.
+The startup marker check still refuses EIO immediately.
 A failed database read, group check or marker check leaves DATA for diagnosis.
 
 ```sh
@@ -703,7 +705,7 @@ pids = parents | {int(pid) for pid in (proof/'provider-pids.txt').read_text().sp
 end = time.monotonic()+5
 while True:
     remaining_groups = groups_gone()
-    marked = marked_processes(parents)
+    marked = marked_processes(parents, retry_exiting=True)
     remaining_markers = saved_marked_processes(marked, pids, groups)
     with (proof/'leftover-checks.jsonl').open('a') as out:
         out.write(json.dumps({'groups':len(remaining_groups),'markers':len(remaining_markers),
@@ -713,12 +715,12 @@ while True:
     time.sleep(.05)
 started = time.monotonic()
 while True:
-    other_markers = marked_processes(parents)
-    if not other_markers or time.monotonic()-started >= 10: break
+    other_markers = marked_processes(parents, retry_exiting=True)
+    if not other_markers or time.monotonic()-started >= 30: break
     time.sleep(.05)
 (proof/'hook-drain.json').write_text(json.dumps({'remaining':len(other_markers),
     'elapsed_seconds':time.monotonic()-started})+'\n')
-assert not other_markers, f'{len(other_markers)} marked processes remain after the ten-second drain: {other_markers}'
+assert not other_markers, f'{len(other_markers)} marked processes remain after the thirty-second drain: {other_markers}'
 (proof/'marker-check.txt').write_text(f'PASS no saved owned pids or provider groups for app pids {sorted(parents)}\n')
 print('PASS saved owned pids, provider groups and marker check; other marker drain seconds='+str(round(time.monotonic()-started,3)))
 PY
@@ -735,9 +737,9 @@ Never kill by name.
 
 ### Gotchas
 
-A live provider's session-end hook chains have been observed carrying the parent marker for up to nine seconds after quit or reap.
-Cleanup signals only saved run-owned pids and groups, while other marked processes get a separate ten-second drain wait and fail Cleanup if they remain afterward.
-The drain wait adds one second of margin to that observed chain lifetime, records counts and elapsed time, and never prints arguments or environments.
+Five live session-end hook processes still carried the parent marker after 10.08 seconds of Cleanup and were gone when checked a few seconds later.
+Cleanup signals only saved run-owned pids and groups, while other marked processes get a separate thirty-second drain wait and fail Cleanup if they remain afterward.
+The verification recipe chooses thirty seconds to allow that observed tail while bounding retries, including EIO from an exiting process; the wait ends immediately when no marker remains, records counts and elapsed time, and never prints arguments or environments.
 It does not signal an unrecorded group.
 
 ## Helpers

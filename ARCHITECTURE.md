@@ -167,7 +167,7 @@ The writer takes no gate and an already committed write can finish after closing
 
 ## Actor decisions, storage and recovery
 
-`Actor` owns the SQLite connection, projection rows, live-thread map, item-key map, text buffers and per-thread event counters.
+`Actor` owns the SQLite connection, projection rows, live-thread map, item-key map, accepted-turn id set, text buffers and per-thread event counters.
 It receives typed messages through a 256-slot tokio channel.
 Engine::send returns a future that awaits mailbox space and then the command acknowledgement.
 The window awaits that future in its gpui task; tokio's FIFO permit queue preserves the order of waiting sends.
@@ -217,6 +217,7 @@ Text coalesces per item, normally flushing to the UI at most once per 16 ms.
 Requests, item completion and turn completion flush pending UI text immediately.
 Unpersisted text writes every two seconds and at item/turn completion.
 Completed items and ended turns free their item keys and text buffers.
+Ended turns also remove their accepted-turn set entries in the same installation pass.
 A command write failure returns an error without publishing the decision.
 A provider, Tick or text write failure retains changes, interrupts active turns with the database-blocked reason, refuses commands and tool calls, and publishes StorageBlocked.
 Every blocked write preserves the metadata receipt described in Quit and shutdown.
@@ -490,8 +491,11 @@ After completing buffered text, the actor writes each newly settled task's summa
 TaskState::Settled owns the source link beside summary and delivery, and tasks.source_item_id stores it; no assistant item means no source.
 A settlement while a wake runs creates a successor wake.
 Wake text frames each child's final assistant message as a report and caps its summary at 4,000 characters.
+For a task that did not complete, the wake adds an Outcome line using TurnOutcome::words shared with the window, capped at 200 Unicode characters including its prefix and a trailing ellipsis when cut; the window's outcome words are unchanged.
+Veyra chooses that outcome limit to keep provider-supplied failure text from dominating or repeating the carried report.
+For every task outcome, the wake says when the child left no report text; completed reports with text keep their existing content.
 The ordinary start rule waits for the parent to be idle and unheld, so a wake never interrupts or steers.
-Accepted changes task delivery to Delivered, and the actor logs thread, turn and acceptance time for each admitted acceptance.
+The first Accepted for a turn changes task delivery to Delivered and logs its thread, turn and acceptance time; the actor ignores later Accepted events using a runtime turn-id set, whose entry is removed when the ended turn is installed.
 Any wake ending before Accepted moves pending reports into a new queued wake; for an unarchived root delivery is at least once until acceptance, can repeat, and is final once Delivered.
 Parent Stop preserves a held wake, and a user stop or archive of one child holds the parent as ChildReport without replacing an earlier hold.
 A kept child settles into its archived root's queued wake, which never starts: the archive's Stopped hold, or an earlier preserved hold, refuses it first; WaitReason::Archived still refuses it if that hold clears, and the window offers it no Continue.
