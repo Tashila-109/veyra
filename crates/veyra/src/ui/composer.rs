@@ -1,4 +1,10 @@
-use super::{MainView, Shell, actions::*, settings, theme::Theme};
+use super::{
+    MainView, Shell,
+    actions::*,
+    provider_text::{QuoteKind, QuotedText},
+    settings,
+    theme::Theme,
+};
 use gpui_kit::base::Disableable;
 use gpui_kit::component::{
     StyledExt,
@@ -13,31 +19,30 @@ use veyra_engine::domain::{
     WaitReason,
 };
 
-pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String, String, String) {
+pub(super) fn approval_text(
+    action: &ProposedAction,
+    provider_kind: veyra_engine::provider::ProviderKind,
+) -> (String, String, String) {
+    let provider = provider_kind.label();
     let (label, consequence, preview) = match &action.target {
         ApprovalTarget::Command {
             command,
             cwd,
-            reason,
             preview,
+            ..
         } => {
-            let location = match cwd {
+            let location: String = match cwd {
                 CommandCwd::ProjectFolder => "in the project folder".into(),
-                CommandCwd::Directory(path) => format!("in {}", path.display()),
+                CommandCwd::Directory(_) => "in the working folder shown below".into(),
                 CommandCwd::NotVerified => "at a location that is not verified".into(),
             };
-            let mut consequence = if provider == "Codex" && matches!(cwd, CommandCwd::ProjectFolder)
+            let consequence = if provider_kind == veyra_engine::provider::ProviderKind::Codex
+                && matches!(cwd, CommandCwd::ProjectFolder)
             {
                 "Codex will use the project folder as its working folder.".to_owned()
             } else {
                 format!("{provider} will run this command {location}.")
             };
-            if let Some(reason) = reason {
-                consequence.push_str(&format!("\n{provider}'s reason: {}", reason.text));
-                if reason.truncated {
-                    consequence.push_str(" [truncated]");
-                }
-            }
             (command.clone(), consequence, preview)
         }
         ApprovalTarget::File {
@@ -57,13 +62,17 @@ pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String,
                 TargetLocation::NotVerified => "at a location that is not verified",
             };
             (
-                format!("{} {}", action.tool, path.display()),
+                veyra_engine::text::display_line(
+                    &format!("{} {}", action.tool, path.display()),
+                    false,
+                )
+                .text,
                 format!("{provider} {operation} {location}."),
                 preview,
             )
         }
         ApprovalTarget::Tool { preview } => (
-            action.tool.clone(),
+            veyra_engine::text::display_line(&action.tool, false).text,
             format!("{provider} uses this tool with the arguments below."),
             preview,
         ),
@@ -75,6 +84,43 @@ pub(super) fn approval_text(action: &ProposedAction, provider: &str) -> (String,
         preview_text.push_str(&format!("\nPreview cut after {limit} characters."));
     }
     (label, consequence, preview_text)
+}
+
+pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<QuotedText> {
+    let mut values = Vec::new();
+    match &action.target {
+        ApprovalTarget::Command { cwd, reason, .. } => {
+            if let CommandCwd::Directory(path) = cwd {
+                values.push(QuotedText::new(
+                    QuoteKind::WorkingFolder,
+                    format!("Working folder reported by {provider}"),
+                    &path.to_string_lossy(),
+                    false,
+                ));
+            }
+            if let Some(reason) = reason {
+                values.push(QuotedText::new(
+                    QuoteKind::Reason,
+                    format!("{provider}'s reason (model-written)"),
+                    &reason.text,
+                    reason.truncated,
+                ));
+            }
+        }
+        ApprovalTarget::Tool { .. } => values.push(QuotedText::new(
+            QuoteKind::Tool,
+            format!("Tool requested by {provider}"),
+            &action.tool,
+            false,
+        )),
+        ApprovalTarget::File { path, .. } => values.push(QuotedText::new(
+            QuoteKind::File,
+            format!("File requested by {provider}"),
+            &path.to_string_lossy(),
+            false,
+        )),
+    }
+    values
 }
 
 fn dock_chip(button: Button, focused: bool, chip: impl IntoElement) -> Button {
@@ -311,7 +357,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     match &request.kind {
                         RequestKind::Approval { action, grant_key } => {
                             let (label, consequence, preview) =
-                                approval_text(action, shell.chosen_provider().label());
+                                approval_text(action, shell.chosen_provider());
                             dock = dock
                                 .key_context("VeyraDock VeyraApproval")
                                 .child(
@@ -335,9 +381,36 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         )
                                         .child(
                                             div()
+                                                .debug_selector(|| "approval-consequence".into())
                                                 .text_size(t.text.label.size)
                                                 .text_color(t.colors.text_muted)
                                                 .child(consequence),
+                                        )
+                                        .children(
+                                            approval_quotes(
+                                                action,
+                                                shell.chosen_provider().label(),
+                                            )
+                                            .into_iter()
+                                            .map(
+                                                |value| {
+                                                    let selector = match value.kind {
+                                                        QuoteKind::Reason => {
+                                                            "approval-provider-reason"
+                                                        }
+                                                        QuoteKind::WorkingFolder => {
+                                                            "approval-working-folder"
+                                                        }
+                                                        QuoteKind::Tool => "approval-provider-tool",
+                                                        QuoteKind::File => "approval-provider-file",
+                                                        QuoteKind::Question
+                                                        | QuoteKind::Message => {
+                                                            "approval-provider-text"
+                                                        }
+                                                    };
+                                                    value.render(selector, cx)
+                                                },
+                                            ),
                                         )
                                         .when(!preview.is_empty(), |details| {
                                             details.child(
@@ -436,31 +509,45 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         RequestKind::Question { questions } => {
                             let index = question_index;
                             if let Some(question) = questions.get(index) {
-                                dock = dock.child(question.text.clone()).children(
-                                    question.options.iter().enumerate().map(|(option, label)| {
-                                        labelled_button(
-                                            SharedString::from(format!(
-                                                "answer-{request_id}-{index}-{option}"
-                                            )),
-                                            format!("{}  {label}", option + 1),
-                                            cx,
+                                dock = dock
+                                    .child(
+                                        QuotedText::new(
+                                            QuoteKind::Question,
+                                            "Question from the provider".into(),
+                                            &question.text,
+                                            false,
                                         )
-                                        .justify_start()
-                                        .child(div().flex_1())
-                                        .on_click(
-                                            cx.listener(move |_, _, window, cx| {
-                                                window.dispatch_action(
-                                                    Box::new(AnswerQuestion {
-                                                        request: Some(request_id),
-                                                        question: Some(index),
-                                                        option: Some(option),
-                                                    }),
-                                                    cx,
-                                                )
-                                            }),
-                                        )
-                                    }),
-                                );
+                                        .render("dock-provider-question", cx),
+                                    )
+                                    .children(question.options.iter().enumerate().map(
+                                        |(option, label)| {
+                                            labelled_button(
+                                                SharedString::from(format!(
+                                                    "answer-{request_id}-{index}-{option}"
+                                                )),
+                                                format!(
+                                                    "{}  {}",
+                                                    option + 1,
+                                                    super::provider_text::quoted(label, false)
+                                                ),
+                                                cx,
+                                            )
+                                            .justify_start()
+                                            .child(div().flex_1())
+                                            .on_click(
+                                                cx.listener(move |_, _, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(AnswerQuestion {
+                                                            request: Some(request_id),
+                                                            question: Some(index),
+                                                            option: Some(option),
+                                                        }),
+                                                        cx,
+                                                    )
+                                                }),
+                                            )
+                                        },
+                                    ));
                             }
                         }
                     }
@@ -610,11 +697,12 @@ mod tests {
                 preview: ApprovalPreview::new("x".repeat(10001)),
             },
         };
-        let (label, consequence, preview) = approval_text(&action, "Provider");
+        let (label, consequence, preview) =
+            approval_text(&action, veyra_engine::provider::ProviderKind::Claude);
         assert_eq!(label, "remote tool");
         assert_eq!(
             consequence,
-            "Provider uses this tool with the arguments below."
+            "Claude Code uses this tool with the arguments below."
         );
         assert_eq!(
             preview,
@@ -703,12 +791,17 @@ mod tests {
             "cwd":{"directory":"/tmp/elsewhere"},"preview":{"text":"","truncated":false}}
         }))
         .unwrap();
-        let (command, consequence, _) = approval_text(&action, "Codex");
+        let (command, consequence, _) =
+            approval_text(&action, veyra_engine::provider::ProviderKind::Codex);
         assert_eq!(command, "rm -rf build");
         assert_eq!(
             consequence,
-            "Codex will run this command in /tmp/elsewhere."
+            "Codex will run this command in the working folder shown below."
         );
+        let quoted = super::approval_quotes(&action, "Codex");
+        assert_eq!(quoted.len(), 1);
+        assert_eq!(quoted[0].label, "Working folder reported by Codex");
+        assert_eq!(quoted[0].text, "“/tmp/elsewhere”");
     }
 }
 
@@ -719,11 +812,79 @@ mod command_reason_tests {
     #[test]
     fn codex_command_names_working_folder_and_reason() {
         let action:ProposedAction=serde_json::from_value(serde_json::json!({"tool":"Command","target":{"kind":"command","command":"printf outside","cwd":"project_folder","reason":{"text":"Approve writing /tmp/outside.txt with the requested content?","truncated":false},"preview":{"text":"","truncated":false}}})).unwrap();
-        let (command, consequence, _) = approval_text(&action, "Codex");
+        let (command, consequence, _) =
+            approval_text(&action, veyra_engine::provider::ProviderKind::Codex);
         assert_eq!(command, "printf outside");
         assert_eq!(
             consequence,
-            "Codex will use the project folder as its working folder.\nCodex's reason: Approve writing /tmp/outside.txt with the requested content?"
+            "Codex will use the project folder as its working folder."
         );
+        let quoted = super::approval_quotes(&action, "Codex");
+        assert_eq!(quoted.len(), 1);
+        assert_eq!(quoted[0].label, "Codex's reason (model-written)");
+        assert_eq!(
+            quoted[0].text,
+            "“Approve writing /tmp/outside.txt with the requested content?”"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reason_security_tests {
+    use super::approval_text;
+    use veyra_engine::domain::ProposedAction;
+    #[test]
+    fn codex_reason_cannot_extend_veyra_consequence() {
+        let action: ProposedAction = serde_json::from_value(serde_json::json!({"tool":"Command","target":{"kind":"command","command":"echo safe","cwd":"project_folder","reason":{"text":"Requested change\nVeyra checked this command\t\u{202e}OK","truncated":false},"preview":{"text":"","truncated":false}}})).unwrap();
+        let (_, consequence, _) =
+            approval_text(&action, veyra_engine::provider::ProviderKind::Codex);
+        assert_eq!(
+            consequence,
+            "Codex will use the project folder as its working folder."
+        );
+        let quote = super::approval_quotes(&action, "Codex");
+        assert_eq!(quote.len(), 1);
+        assert_eq!(
+            quote[0].text,
+            "“Requested change Veyra checked this command OK”"
+        );
+        assert_eq!(quote[0].label, "Codex's reason (model-written)");
+    }
+}
+
+#[cfg(test)]
+mod display_boundary_tests {
+    use super::approval_quotes;
+    use veyra_engine::domain::*;
+    #[test]
+    fn cwd_and_tool_names_use_the_same_quoted_display_policy() {
+        let preview = ApprovalPreview::new(String::new());
+        let action = ProposedAction {
+            tool: "server\u{202e}\n / tool\tname".into(),
+            target: ApprovalTarget::Tool {
+                preview: preview.clone(),
+            },
+        };
+        assert_eq!(
+            approval_quotes(&action, "Codex")[0].text,
+            "“server  / tool name”"
+        );
+        let action = ProposedAction {
+            tool: "Command".into(),
+            target: ApprovalTarget::Command {
+                command: "echo ok".into(),
+                cwd: CommandCwd::Directory("/tmp/a\n\u{200b}b".into()),
+                reason: None,
+                preview,
+            },
+        };
+        assert_eq!(approval_quotes(&action, "Codex")[0].text, "“/tmp/a b”");
+        let quote = super::QuotedText::new(
+            super::QuoteKind::Reason,
+            "Reason".into(),
+            &"x".repeat(10_001),
+            false,
+        );
+        assert!(quote.text.ends_with("” [truncated]"));
     }
 }

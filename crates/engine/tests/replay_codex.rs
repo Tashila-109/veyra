@@ -904,28 +904,63 @@ fn codex_repeated_near_limit_adds_one_notice() {
 #[test]
 fn codex_accept_edits_adds_linked_worktree_git_roots() {
     use serde_json::{Value, json};
-    let project = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
+    let root = Path::new("/tmp").join(format!("veyra-codex-policy-{}", ThreadId::new()));
+    fs::create_dir(&root).unwrap();
+    let _scratch = Scratch(root.clone());
+    let common = root.join("repository/.git");
+    let git_dir = common.join("worktrees/linked");
+    let worktree = root.join("worktree");
+    let project = worktree.join("nested");
+    for directory in [
+        &git_dir,
+        &project,
+        &common.join("objects"),
+        &common.join("refs"),
+        &common.join("logs"),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let common = common.canonicalize().unwrap();
+    let git_dir = git_dir.canonicalize().unwrap();
+    let worktree = worktree.canonicalize().unwrap();
+    let project = project.canonicalize().unwrap();
+    fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        common.join("config"),
+        "[core]\nrepositoryformatversion = 0\nbare = false\n",
+    )
+    .unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+    fs::write(
+        git_dir.join("gitdir"),
+        format!("{}\n", worktree.join(".git").display()),
+    )
+    .unwrap();
+    fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--git-dir", "--git-common-dir"])
         .current_dir(&project)
         .output()
         .unwrap();
     assert!(output.status.success());
-    let mut roots: Vec<_> = std::str::from_utf8(&output.stdout)
+    let printed: Vec<_> = std::str::from_utf8(&output.stdout)
         .unwrap()
         .lines()
         .map(|p| project.join(p).canonicalize().unwrap())
         .collect();
-    assert_eq!(roots.len(), 2);
-    if roots[0] == roots[1] {
-        roots.pop();
-    }
-    let root = Path::new("/tmp").join(format!("veyra-m5r2-policy-{}", ThreadId::new()));
-    fs::create_dir(&root).unwrap();
-    let _scratch = Scratch(root.clone());
+    assert_eq!(printed, [git_dir.clone(), common.clone()]);
+    assert_ne!(printed[0], printed[1]);
+    let roots = [
+        git_dir,
+        common.join("objects"),
+        common.join("refs"),
+        common.join("logs"),
+    ];
     let mut records: Vec<Value> = fs::read_to_string(fixture("ok-reply"))
         .unwrap()
         .lines()
@@ -1188,4 +1223,26 @@ fn codex_subagent_live_is_one_turn_without_child_text() {
         1,
         "child text leaked alongside the parent's ok"
     );
+}
+
+#[test]
+fn codex_subagent_live_shows_one_started_and_finished_activity() {
+    let events = standard("subagent-live", Inputs::default());
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Turn {
+                event: TurnEvent::ToolStarted { key, call },
+                ..
+            } if call.name == "Subagent" => Some(key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "the live capture's subagent start disappeared"
+    );
+    assert_eq!(events.iter().filter(|event| matches!(event, ProviderEvent::Turn { event: TurnEvent::ToolFinished { key, ok: true, .. }, .. } if key == &starts[0])).count(), 1);
+    assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
 }

@@ -316,6 +316,11 @@ fn legacy_approval_rows_load_as_typed_display() {
 #[test]
 fn async_choice_precedes_queued_messages_and_persists_once() {
     let mut f = Fixture::new(LiveState::Running);
+    f.command(Command::Send {
+        thread: f.thread,
+        text: "already queued".into(),
+    })
+    .unwrap();
     f.event(turn_event(
         f.running(),
         TurnEvent::AsyncQuestions {
@@ -334,11 +339,6 @@ fn async_choice_precedes_queued_messages_and_persists_once() {
         .find(|i| matches!(i.body, ItemBody::AsyncQuestions { .. }))
         .unwrap()
         .id;
-    f.command(Command::Send {
-        thread: f.thread,
-        text: "already queued".into(),
-    })
-    .unwrap();
     let Ack::Turn(answer) = f
         .command(Command::ChooseAsyncOption {
             item,
@@ -384,4 +384,85 @@ fn async_choice_precedes_queued_messages_and_persists_once() {
         .is_err()
     );
     assert_eq!(f.loaded().turns_for(f.thread).count(), 3);
+}
+
+#[test]
+fn later_typed_user_message_closes_async_card_choices() {
+    let mut f = Fixture::new(LiveState::Running);
+    f.event(turn_event(
+        f.running(),
+        TurnEvent::AsyncQuestions {
+            key: NativeItemKey("typed-question".into()),
+            text: "Choose a colour".into(),
+            questions: vec![AsyncQuestion {
+                title: "Colour".into(),
+                options: vec!["Violet".into(), "Blue".into()],
+                selected: None,
+            }],
+        },
+    ));
+    let item = f
+        .loaded()
+        .items_for(f.thread)
+        .find(|i| matches!(i.body, ItemBody::AsyncQuestions { .. }))
+        .unwrap()
+        .id;
+    f.command(Command::Send {
+        thread: f.thread,
+        text: "Blue, please".into(),
+    })
+    .unwrap();
+    assert!(
+        f.command(Command::ChooseAsyncOption {
+            item,
+            question: 0,
+            option: 0
+        })
+        .is_err(),
+        "a typed answer left stale controls active"
+    );
+    assert_eq!(f.loaded().turns_for(f.thread).count(), 2);
+    assert!(
+        !std::iter::from_fn(|| f.controls.try_recv().ok())
+            .any(|control| matches!(control, SessionControl::Interrupt { .. }))
+    );
+}
+
+#[test]
+fn sanitized_option_display_does_not_change_the_user_message() {
+    let mut f = Fixture::new(LiveState::Running);
+    let exact = "Vi\u{202e}olet\nnext";
+    f.event(turn_event(
+        f.running(),
+        TurnEvent::AsyncQuestions {
+            key: NativeItemKey("exact-option".into()),
+            text: "Colour".into(),
+            questions: vec![AsyncQuestion {
+                title: "Colour".into(),
+                options: vec![exact.into()],
+                selected: None,
+            }],
+        },
+    ));
+    let item = f
+        .loaded()
+        .items_for(f.thread)
+        .find(|item| matches!(item.body, ItemBody::AsyncQuestions { .. }))
+        .unwrap()
+        .id;
+    let Ack::Turn(answer) = f
+        .command(Command::ChooseAsyncOption {
+            item,
+            question: 0,
+            option: 0,
+        })
+        .unwrap()
+    else {
+        panic!("choice did not queue user text")
+    };
+    assert!(
+        f.loaded()
+            .items_for(f.thread)
+            .any(|item| item.turn == answer && item.body == ItemBody::UserText(exact.into()))
+    );
 }

@@ -81,7 +81,13 @@ impl Tool {
         }
     }
     fn description(self) -> String {
-        instructions()
+        match self {
+            Self::StartThread => format!("{} {}", self.base_description(), first_call_rules()),
+            _ => format!(
+                "{} Family rules are in start_thread's description.",
+                self.base_description()
+            ),
+        }
     }
     fn schema(self) -> Value {
         let (properties, required) = match self {
@@ -469,10 +475,14 @@ pub fn decide(
 mod description_tests {
     use super::*;
     #[test]
-    fn every_tool_description_teaches_the_first_call_rules() {
+    fn start_thread_description_teaches_the_first_call_rules() {
         let tools = list();
         for tool in tools.as_array().unwrap() {
             let text = tool["description"].as_str().unwrap();
+            if tool["name"] != "start_thread" {
+                assert!(text.contains("Family rules are in start_thread's description."));
+                continue;
+            }
             for rule in [
                 "Only a running root",
                 "Depth is 1",
@@ -488,6 +498,37 @@ mod description_tests {
             ] {
                 assert!(text.contains(rule), "{} omits {rule}", tool["name"]);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod description_size_tests {
+    use super::*;
+    #[test]
+    fn family_rules_have_one_description_carrier() {
+        let listed = list();
+        let tools = listed.as_array().unwrap();
+        let carriers: Vec<_> = tools
+            .iter()
+            .filter(|tool| tool["description"].as_str().unwrap().contains("Depth is 1"))
+            .collect();
+        assert_eq!(carriers.len(), 1);
+        assert_eq!(carriers[0]["name"], "start_thread");
+        assert!(
+            tools
+                .iter()
+                .map(|tool| tool["description"].as_str().unwrap().chars().count())
+                .sum::<usize>()
+                < 3_000
+        );
+        for tool in tools.iter().filter(|tool| tool["name"] != "start_thread") {
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("start_thread")
+            );
         }
     }
 }

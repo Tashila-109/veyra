@@ -41,19 +41,11 @@ fn root() -> Run {
     }
 }
 fn relay() -> PathBuf {
-    let test = std::env::current_exe().expect("test executable");
-    let directory = test.parent().unwrap().parent().unwrap();
-    let relay = directory.join("veyra");
-    let metadata=std::fs::metadata(&relay).unwrap_or_else(|_|panic!("build the production relay first: cargo build --workspace using the same CARGO_TARGET_DIR and profile; missing {}",relay.display()));
-    for source in ["../veyra/src/relay.rs", "../veyra/src/main.rs"] {
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(source);
-        assert!(
-            metadata.modified().unwrap() >= std::fs::metadata(source).unwrap().modified().unwrap(),
-            "production relay is stale; run cargo build --workspace using the same CARGO_TARGET_DIR and profile"
-        );
-    }
-    relay.canonicalize().unwrap()
+    PathBuf::from(env!("CARGO_BIN_EXE_veyra"))
+        .canonicalize()
+        .unwrap()
 }
+
 fn fixture(run: &Run) -> PathBuf {
     let path = run.root.join("fixture.jsonl");
     let records = [
@@ -98,7 +90,7 @@ async fn started_fixture(
         .for_spawn(thread, 1, |token| {
             copy = Some(token.expose().to_owned());
             let config = Configuration::create(&run.root, thread, &relay(), &server.socket, token)?;
-            let child = Command::new(env!("CARGO_BIN_EXE_veyra-fake-cli"))
+            let child = Command::new(env!("CARGO_BIN_EXE_veyra-test-cli"))
                 .args(["--mcp-config", config.path.to_str().unwrap()])
                 .env("VEYRA_FAKE_FIXTURE", &fixture)
                 .current_dir(&run.root)
@@ -268,7 +260,19 @@ async fn tools_list_describes_every_tool() {
     for tool in tools {
         let description = tool["description"].as_str().unwrap();
         assert!(!description.is_empty());
-        assert!(instructions.contains(description));
+        let base = description
+            .split(" Family rules are in start_thread's description.")
+            .next()
+            .unwrap()
+            .split(" Only a running root")
+            .next()
+            .unwrap();
+        assert!(instructions.contains(base));
+        if tool["name"] == "start_thread" {
+            assert!(description.contains("Depth is 1"));
+        } else {
+            assert!(description.contains("start_thread's description"));
+        }
         assert!(description.contains("refusal"));
     }
     for rule in [
@@ -344,8 +348,8 @@ async fn session_config_lifecycle(root_thread: bool, reported: Option<&str>) {
     let run = root();
     platform::private_dir(&run.root.join("fixtures")).unwrap();
     platform::private_dir(&run.root.join("rec")).unwrap();
-    let source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude/mcp-connected.jsonl");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../engine/tests/fixtures/claude/mcp-connected.jsonl");
     let mut records: Vec<Value> = std::fs::read_to_string(source)
         .unwrap()
         .lines()
@@ -376,7 +380,7 @@ async fn session_config_lifecycle(root_thread: bool, reported: Option<&str>) {
     let server = Server::bind(&run.root, relay(), out.clone()).unwrap();
     let mut env = ChildEnv::isolated();
     env.mcp = Some(std::sync::Arc::new(server));
-    env.claude_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra-fake-cli")));
+    env.claude_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra-test-cli")));
     env.fixtures = Some(run.root.join("fixtures"));
     env.record = Some(run.root.join("rec"));
     let thread = ThreadId::new();

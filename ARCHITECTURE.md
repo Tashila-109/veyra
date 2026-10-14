@@ -471,10 +471,17 @@ Other resume failures keep that id and fail without starting a replacement conve
 Every turn/start sends the current model, effort, summary auto, reviewer user, approvalPolicy and sandboxPolicy.
 Ask first sends untrusted, read-only and readOnly with networkAccess true; Accept edits sends on-request, workspace-write and workspaceWrite with networkAccess true.
 Full access sends never, danger-full-access and dangerFullAccess without a networkAccess field.
-For Accept edits, the session resolves git through its prepared login PATH and runs `git rev-parse --git-dir --git-common-dir` once per app-server spawn, in the project folder.
+For Accept edits, Codex preparation resolves git through its prepared login PATH and runs `git rev-parse --git-dir --git-common-dir` once per app-server spawn, in the project folder.
 The child uses the shared launch gate, owned process group and cleanup supervisor; another launch check after discovery prevents a queued Shutdown from starting the provider.
-The implementation bounds discovery to one second and 8 KiB of stdout, which admits two ordinary paths while bounding latency and memory.
-It canonicalizes and validates both directories, deduplicates a plain repository's identical paths, and retains the resulting roots only for that spawn.
+The Git subprocess is bounded to one second and 8 KiB of stdout, admitting two ordinary paths while capping the process wait and captured output.
+codex/git.rs canonicalizes both directories and accepts only a linked worktree whose git dir is a direct child of the common .git/worktrees folder.
+The git dir's regular gitdir file must name the project's or an ancestor's .git file, that file must point back to the same git dir, and commondir must agree with the common directory.
+Each back-link read is capped at 8 KiB; malformed, redirected or unrelated metadata fails closed with one refusal log.
+It grants the worktree git dir and only existing ordinary common objects, refs and logs directories, retaining the roots for that spawn.
+The common root, hooks and config are never granted; plain repositories add no roots because their .git folder includes hooks and config and remains protected.
+The prescribed whole-worktree git-dir grant includes optional config.worktree: if Git worktree configuration is enabled, that file can redirect hooks for this worktree.
+The guarantee covers the common hooks and config paths, rather than preventing every worktree-local metadata change.
+This policy proves the writable-root frame, not whether Codex permits a plain-repository commit without extra roots.
 Every workspaceWrite turn policy adds these roots while keeping networkAccess true; Ask first and Full access neither discover nor add roots.
 A missing git, a folder outside git, malformed output or any discovery failure adds no roots and logs one reason without paths or stdout.
 The codec reads thread reply metadata without interpreting the echoed sandbox as a string.
@@ -489,7 +496,9 @@ Thread status, token usage, hooks, startup status and unknown notifications do n
 Own-thread turn completion reconciles its typed item summary by native item key, supplying a final reply absent from individual frames without duplicating already completed or streamed items.
 Foreign-thread items and turn summaries are filtered before reconciliation.
 Parent collabAgentToolCall rows use a typed action to label wait, spawn, send, resume or stop in Veyra's words.
-subAgentActivity is ignored: it duplicates native subagent lifecycle bookkeeping and supplies neither a Veyra family task nor parent tool output.
+Typed subAgentActivity started/completed events share one parent tool row keyed by the child native thread id; item completion of a started marker does not complete the subagent.
+The row identifies the subagent path in its arguments, ends when a completed marker arrives and creates no Veyra child or Provider turn.
+Unknown activity kinds are ignored without reopening completed rows.
 Retrying errors add Veyra notice text without displaying raw provider details.
 Codex usage-limit frames add a notice only for a known rateLimitReachedType, spendControlReached true, or primary or secondary usedPercent reaching 90.
 Null, false and unknown reached kinds do not count as a reached limit.
@@ -500,18 +509,25 @@ The notice includes the selected window's reset timestamp, or the individual spe
 
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
-The project-cwd consequence names the working folder, and a supplied reason becomes a bounded ApprovalPreview displayed beside the consequence; the existing outside-cwd text remains.
+The project-cwd consequence names the working folder.
+An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text.
+Tool-row names use the same bounded, quoted display projection; exact commands and argument/code previews retain their verbatim presentation for consent and diagnosis.
+The UI takes ProviderKind for provider-specific behavior; display labels do not select behavior.
 Only the exact project cwd may use the existing command grant; every other cwd requires a human decision.
 Permissions approvals grant the requested profile for the turn, while Deny and Stop send an empty permissions object.
 Questions retain provider question ids and send answers by those ids; cancellation sends an empty answers object.
 AgentMessage delivery and question fields are typed separately from server requests.
 A valid async questions list becomes ItemBody::AsyncQuestions with the original message text and each title, option list and optional selected index; SQLite's existing item JSON stores that additive shape without a migration.
-The transcript displays a card for each question, labels each option with its text, and explains that choosing sends a message and first stops active work.
+The transcript displays a card for each question and additional agent message content when it differs from the question titles.
+It labels provider content as quoted text and explains that choosing sends a message, first stops active work and continues queued messages.
 ChooseAsyncOption is a gpui action, bound to Command-1 through Command-9 and reachable through the debug driver; the engine validates its item, question and option identity and refuses a repeated choice.
 One transaction persists the selected index and ordinary User turn.
 If work is active, the choice uses the normal targeted Stop cancellation/interrupt path with a QuestionChoice reason, clears any hold and puts the answer ahead of already queued messages while preserving their order.
 Turn ordinal updates are applied descending before that insertion to retain SQLite's per-thread uniqueness constraint.
-The active session drains before the new prompt is sent; this choice never requires Continue.
+The active session drains before the new prompt is sent; a choice deliberately clears any existing hold, including held queued work, and never requires Continue.
+Card eligibility is a projection of item order: any later UserText item in the same thread closes every remaining choice, including after a typed answer.
+The engine rejects choices on such cards, and the window disables their controls; no new stored closed flag or migration is needed.
+An unnamed Command-1 through Command-9 action additionally requires a card in the thread's latest turn; explicit item actions retain their item/question/option identity.
 The question stays in the transcript with Sent text and disabled option controls after its selection.
 An MCP elicitation is classified by codex_approval_kind first, then by a message naming serverName and a quoted or unquoted tool with an optional question mark.
 It docks with the server and tool, offers no thread grant, and answers only action accept, decline or cancel without persisting provider grant metadata.
@@ -552,7 +568,8 @@ Claude Session Drop removes its credential by hash and Codex McpConfig Drop revo
 Server::bind requires a private 0700 data folder and uses platform::bind_async_socket to unlink a stale veyra.sock and bind it at 0600.
 The server gets the peer pid with LOCAL_PEERPID, its direct parent with proc_pidinfo and its executable path with proc_pidpath.
 Authentication compares the peer executable with the supplied relay command and its direct parent with the registered CLI pid before consuming the token hash.
-Engine::launch supplies std::env::current_exe to Server::bind before starting its file-backed actor.
+Engine::launch supplies the prepared ChildEnv relay_command, or std::env::current_exe by default, to Server::bind before starting its file-backed actor.
+relay_command is a trusted host input, never loaded from environment variables or provider frames; the public prepared-environment seam lets application integration tests use Cargo's exact production binary.
 In-memory test engines have no data folder and do not bind a socket.
 Tests supply the built Veyra executable and reach it from the fake CLI's direct-child relay.
 Accepted and refused connections log the thread id when the token identifies one, and tools/call logs the thread and supported tool name without arguments.
@@ -572,7 +589,8 @@ That run observed system/init list veyra as connected with source dynamic after 
 The same run observed initialize instructions from the start and tool descriptions deferred until ToolSearch loaded their schemas.
 A CLI version that starts the relay through an intermediate process fails the direct-parent check; refusals are logged and the server stays unavailable.
 Instructions retain the complete first-call rules byte for byte.
-Every tool description repeats that complete instruction text, keeping the existing descriptions-covered-by-instructions contract while exposing all rules before a Codex call: ownership, depth one, four open children, sixteen total family threads, the permission ceiling, prompt and report caps, idempotent request ids and report wakes after the current turn ends without polling.
+The start_thread description carries the full family rules once; each other tool keeps its own base description and one short pointer to that carrier.
+The unchanged instructions retain the same base descriptions and family rules: ownership, depth one, four open children, sixteen total family threads, the permission ceiling, prompt and report caps, idempotent request ids and report wakes after the current turn ends without polling.
 A live Codex 0.162.1 run did not expose server instructions to the model, so descriptions supply those rules before its first call.
 Configuration uses platform::private_dir and platform::private_file to write the sole token-bearing file, 0600 DATA/run/THREAD/mcp.json under a 0700 folder.
 Its mcpServers.veyra entry names the relay command, mcp argument and env bindings VEYRA_SOCKET and VEYRA_MCP_TOKEN.
@@ -835,6 +853,13 @@ Its root-id tag lets a click activate the window and select the root or the firs
 System permission and native banner clicks require operator verification.
 The debug-only DebugNotificationResponse action passes a banner tag to the same notification_response handler as the native callback, allowing stale-tag routing checks without OS delivery.
 
+Provider display text uses the engine's pure text::display_line projection, which caps input at 10,000 Unicode characters, replaces controls and line separators with spaces and removes Unicode format and default-ignorable characters.
+The dock, async card and family/plan labels use that projection with quotes and the existing truncation mark; reasons have their own labeled, muted element.
+The debug dump exposes provider_text entries in approval docks and display_questions plus choices_active on async items beside the unchanged raw body.
+Those fields use the same display projection as rendering, while raw options remain available for exact protocol assertions.
+Raw option strings remain in the stored card and are selected by validated indices for UserText, so display cleanup cannot change the sent message.
+Commands and argument previews retain their separately styled verbatim code presentation and exact consent identity.
+
 ## Debug protocol and verification trust
 
 The control module, ctl argument, driver socket references and UI dump/input methods exist only under cfg(debug_assertions).
@@ -894,6 +919,10 @@ mcp_socket uses the built relay and a fake CLI that records only its own argv, t
 Removing either the parent or one-use check makes its isolated relay regression fail.
 mcp.rs launch_lock_tests blocks a launch closure and exercises revocation concurrently, with a bounded wait proving revocation does not wait for that closure.
 mcp_socket also exercises production root session config lifetime, non-connected init cleanup, pre-init exit cleanup, child argv isolation and token redaction.
+
+Real-relay socket and Codex family tests live in the application package, which receives CARGO_BIN_EXE_veyra and a fixture binary target from Cargo.
+Both fixture binary entrypoints call the same engine fixture::cli implementation; engine-only fake-session tests resolve their helper beside the current test profile instead of a fixed target/debug path.
+No stale-binary timestamp guard or preparatory workspace build is required; the empty-target workspace test covers that ownership boundary.
 
 Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
 replay_claude uses the real session task with the fake CLI for text and tools, prompt correlation, provider-turn completion, resume, crash and error outcomes, background replacement and readiness.

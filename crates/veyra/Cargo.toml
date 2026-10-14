@@ -1,5 +1,6 @@
 [package]
 name = "veyra"
+default-run = "veyra"
 version.workspace = true
 edition.workspace = true
 
@@ -16,3 +17,9 @@ serde_json.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+
+[[bin]]
+name = "veyra-test-cli"
+path = "../engine/src/bin/veyra-fake-cli.rs"
+test = false
+bench = false

@@ -666,3 +666,12 @@ pub fn wait_reason(v: &ThreadView<'_>) -> Option<WaitReason> {
     }
     None
 }
+
+pub fn async_question_active<'a>(item: &Item, items: impl IntoIterator<Item = &'a Item>) -> bool {
+    matches!(&item.body, ItemBody::AsyncQuestions { questions, .. } if questions.iter().any(|question| question.selected.is_none()))
+        && !items.into_iter().any(|later| {
+            later.thread == item.thread
+                && later.seq > item.seq
+                && matches!(later.body, ItemBody::UserText(_))
+        })
+}

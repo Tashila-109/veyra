@@ -874,8 +874,13 @@ mod cli {
             }
             let mut env = env::ChildEnv::isolated();
             env.claude_bin = Some(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/debug/veyra-fake-cli")
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("veyra-fake-cli")
                     .canonicalize()
                     .unwrap(),
             );

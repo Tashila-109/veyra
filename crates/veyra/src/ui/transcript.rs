@@ -193,7 +193,13 @@ impl MarkdownPlugin for ReplyLineBreaks {
         )
     }
 }
-fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) -> AnyElement {
+fn row(
+    item: &Item,
+    expanded: bool,
+    markdown: Option<SharedString>,
+    choices_active: bool,
+    cx: &App,
+) -> AnyElement {
     let t = cx.global::<Theme>();
     let mut row = div()
         .v_flex()
@@ -221,14 +227,31 @@ fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) ->
                 .plugin(ReplyLineBreaks),
             );
         }
-        ItemBody::AsyncQuestions { questions, .. } => {
+        ItemBody::AsyncQuestions { text, questions } => {
+            let titles = questions
+                .iter()
+                .map(|question| question.title.trim())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.trim().is_empty() && text.trim() != titles {
+                row = row.child(
+                    super::provider_text::QuotedText::new(
+                        super::provider_text::QuoteKind::Message,
+                        "Message from the provider".into(),
+                        text,
+                        false,
+                    )
+                    .render("async-question-message", cx),
+                );
+            }
             for (question_index, question) in questions.iter().enumerate() {
+                let display = super::provider_text::question_display(question);
                 let mut card = div().v_flex().w_full().gap(t.space.0[3])
                     .rounded(t.radius.large).bg(t.colors.card).p(t.space.0[4])
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(question.title.clone()))
+                    .child(super::provider_text::QuotedText { kind: super::provider_text::QuoteKind::Question, label: "Question from the provider".into(), text: display.title }.render("async-question-title", cx))
                     .child(div().text_size(t.text.label.size).text_color(t.colors.text_muted)
-                        .child("Choosing sends this option as a message. Veyra stops current work first if needed."));
-                for (option_index, option) in question.options.iter().enumerate() {
+                        .child("Choosing sends this option as a message, stops current work first and continues queued messages."));
+                for (option_index, _) in question.options.iter().enumerate() {
                     let action = ChooseAsyncOption {
                         item: Some(item.id),
                         question: Some(question_index),
@@ -240,10 +263,10 @@ fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) ->
                                 "async-{}-{question_index}-{option_index}",
                                 item.id
                             )),
-                            option.clone(),
+                            display.options[option_index].clone(),
                             cx,
                         )
-                        .disabled(question.selected.is_some())
+                        .disabled(!choices_active || question.selected.is_some())
                         .on_click(move |_, window, cx| {
                             window.dispatch_action(Box::new(action.clone()), cx)
                         }),
@@ -253,10 +276,16 @@ fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) ->
                     .selected
                     .and_then(|index| question.options.get(index))
                 {
+                    card = card.child(div().text_color(t.colors.text_muted).child(format!(
+                        "Sent: {}",
+                        super::provider_text::quoted(selected, false)
+                    )));
+                }
+                if !choices_active && question.selected.is_none() {
                     card = card.child(
                         div()
                             .text_color(t.colors.text_muted)
-                            .child(format!("Sent: {selected}")),
+                            .child("Conversation continued; choices are closed."),
                     );
                 }
                 row = row.child(card);
@@ -293,7 +322,7 @@ fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) ->
             let label = format!(
                 "{} {} · {}",
                 if expanded { "▾" } else { "▸" },
-                tool.call.name,
+                super::provider_text::quoted(&tool.call.name, false),
                 match &tool.result {
                     None => "Working",
                     Some(result) if result.ok => "Done",
@@ -351,7 +380,7 @@ fn row(item: &Item, expanded: bool, markdown: Option<SharedString>, cx: &App) ->
                 div().child(format!(
                     "{} {}",
                     if step.done { "✓" } else { "·" },
-                    step.text
+                    super::provider_text::quoted(&step.text, false)
                 ))
             }))
         }
@@ -465,7 +494,12 @@ fn family_card(shell: &Shell, parent: ThreadId, cx: &App) -> AnyElement {
                         .text_color(super::sidebar::glyph_color(&status, t))
                         .child(super::sidebar::glyph(&status)),
                 )
-                .child(div().flex_1().min_w_0().child(child.title.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(super::provider_text::quoted(&child.title, false)),
+                )
                 .child(
                     div()
                         .text_size(t.text.meta.size)
@@ -524,7 +558,7 @@ pub(super) fn turn_label(state: &super::AppState, turn: &Turn) -> Option<String>
             .tasks
             .get(task)
             .and_then(|task| state.threads.get(&task.parent))
-            .map(|parent| task_from(&parent.title)),
+            .map(|parent| task_from(&super::provider_text::quoted(&parent.title, false))),
         TurnOrigin::Wake { tasks } => {
             let count = tasks
                 .iter()
@@ -692,6 +726,15 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                                             item,
                                             shell.expanded.contains(&item.id),
                                             shell.state.markdown_text.get(&item.id).cloned(),
+                                            async_question_active(
+                                                item,
+                                                shell
+                                                    .state
+                                                    .items
+                                                    .get(&item.thread)
+                                                    .into_iter()
+                                                    .flat_map(|items| items.values()),
+                                            ),
                                             cx,
                                         )
                                     })
@@ -761,7 +804,16 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
         ItemBody::Notice(notice) => ("notice", notice.text.clone(), true),
         _ => ("other", String::new(), true),
     };
-    serde_json::json!({"id":item.id,"turn":item.turn,"kind":kind,"text":text,"done":done,"body":item.body})
+    let mut value = serde_json::json!({"id":item.id,"turn":item.turn,"kind":kind,"text":text,"done":done,"body":item.body});
+    if let ItemBody::AsyncQuestions { questions, .. } = &item.body {
+        value["display_questions"] = serde_json::json!(
+            questions
+                .iter()
+                .map(super::provider_text::question_display)
+                .collect::<Vec<_>>()
+        );
+    }
+    value
 }
 
 #[cfg(test)]
@@ -785,6 +837,7 @@ mod tests {
                                 &self.0,
                                 false,
                                 super::markdown_text(&self.0),
+                                false,
                                 cx,
                             )),
                     )
@@ -894,7 +947,7 @@ mod tests {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 div()
                     .w(cx.global::<super::Theme>().layout.transcript_min)
-                    .child(super::row(&self.0, false, None, cx))
+                    .child(super::row(&self.0, false, None, false, cx))
             }
         }
         cx.update(gpui_kit::init);
@@ -1034,5 +1087,38 @@ mod tests {
         tool.result.as_mut().unwrap().ok = true;
         assert_eq!(super::failed_tool_last_line(&tool), None);
         assert_eq!(tool_input(&tool.call), "false");
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod question_security_tests {
+    use super::dump_item;
+    use veyra_engine::domain::*;
+    #[test]
+    fn async_option_display_removes_bidi_but_preserves_sent_text() {
+        let option = "Vi\u{202e}olet\nnext";
+        let item = Item {
+            id: ItemId::new(),
+            thread: ThreadId::new(),
+            turn: TurnId::new(),
+            seq: 1,
+            body: ItemBody::AsyncQuestions {
+                text: "question".into(),
+                questions: vec![AsyncQuestion {
+                    title: "Colour\u{200b}".into(),
+                    options: vec![option.into()],
+                    selected: None,
+                }],
+            },
+        };
+        let displayed = dump_item(&item);
+        assert_eq!(
+            displayed["display_questions"][0]["options"][0],
+            "“Violet next”"
+        );
+        assert_eq!(
+            displayed["body"]["AsyncQuestions"]["questions"][0]["options"][0],
+            option
+        );
     }
 }

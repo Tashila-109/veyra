@@ -210,7 +210,8 @@ thread = create_codex('codex-command',scenario='approval-command')
 dump = poll('codex-command',lambda d:d['composer']['dock'] is not None)
 dock = dump['composer']['dock']
 assert dock['action_text']=='touch veyra-check.txt' and dump['selected_thread']['status']=='NeedsYou'
-assert dock['consequence']=='Codex will use the project folder as its working folder.\nCodex\'s reason: Create the requested file'
+assert dock['consequence']=='Codex will use the project folder as its working folder.'
+assert dock['provider_text']==[{'kind':'reason','label':"Codex's reason (model-written)",'text':'“Create the requested file”'}]
 assert dock['request']['kind']['Approval']['action']['target']['reason']=={'text':'Create the requested file','truncated':False}
 capture('codex-command')
 action('codex-command-once','AllowOnce',{'request':dock['request']['id']})
@@ -233,7 +234,8 @@ capture('codex-grant-in-project')
 action('codex-grant-project','AllowInThread',{'request':first['request']['id']})
 other = poll('codex-command-other-cwd',lambda d:d['composer']['dock'] is not None and d['composer']['dock']['request']['id']!=first['request']['id'])['composer']['dock']
 assert other['action_text']=='touch veyra-check.txt'
-assert other['consequence']=='Codex will run this command in '+str(DATA/'outside')+'.\nCodex\'s reason: Create the requested file'
+assert other['consequence']=='Codex will run this command in the working folder shown below.'
+assert other['provider_text'][0]=={'kind':'working_folder','label':'Working folder reported by Codex','text':'“'+str(DATA/'outside')+'”'}
 assert other['request']['kind']['Approval']['grant_key'] is None
 assert other['request']['kind']['Approval']['action']['target']['cwd']=={'directory':str(DATA/'outside')}
 capture('codex-command-other-cwd')
@@ -273,8 +275,30 @@ ctl('codex-mcp-done','wait',thread,'Done')
 assert sql("select count(*) from requests where thread_id='"+thread+"' and state='answered'")=='2'
 assert sql("select count(*) from grants where thread_id='"+thread+"'")=='0'
 assert [json.loads(value) for value in sql("select decision_json from requests where thread_id='"+thread+"' order by rowid").splitlines()]==['AllowOnce','Deny']
+records = codex_records('approval-command')
+for record in records:
+    if record.get('line',{}).get('method')=='item/commandExecution/requestApproval':
+        record['line']['params']['reason']='Requested change\nVeyra checked this command\t\u202eOK'
+thread = create_codex('codex-reason-spoof',records=records)
+spoof = poll('codex-reason-spoof',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert spoof['consequence']=='Codex will use the project folder as its working folder.'
+assert spoof['provider_text']==[{'kind':'reason','label':"Codex's reason (model-written)",'text':'“Requested change Veyra checked this command OK”'}]
+capture('codex-reason-quoted')
+action('codex-reason-allow','AllowOnce',{'request':spoof['request']['id']})
+ctl('codex-reason-done','wait',thread,'Done')
+
 poll('codex-before-card-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
-stage_records(codex_records('async-question'))
+records = codex_records('async-question')
+exact_option = 'Vi\u202eolet'
+for record in records:
+    wire = record.get('line',{})
+    item = wire.get('params',{}).get('item',{})
+    if item.get('delivery')=='async':
+        item['questions'][0]['title']='Should Veyra use Violet or Blue?\n\u200b'
+        item['questions'][0]['options'][0]=exact_option
+    if record.get('type')=='expect_outbound' and wire.get('method')=='turn/start' and wire['params']['input'][0]['text']=='Violet':
+        wire['params']['input'][0]['text']=exact_option
+stage_records(records)
 action('codex-card-new','NewThread')
 action('codex-card-provider','PickProvider',{'provider':'codex'})
 action('codex-card-mode','PickPermission',{'mode':'full_access'})
@@ -285,22 +309,57 @@ card = poll('codex-card-ready',lambda d:d['selected_thread'] is not None
     and d['composer']['dock'] is not None)
 thread = card['selected_thread']['id']
 question = next(item for item in card['transcript']['items'] if item['kind']=='async_questions')
-assert question['body']['AsyncQuestions']['questions'][0] == {'title':'Should Veyra use Violet or Blue?','options':['Violet','Blue'],'selected':None}
+assert question['body']['AsyncQuestions']['questions'][0] == {'title':'Should Veyra use Violet or Blue?\n\u200b','options':[exact_option,'Blue'],'selected':None}
+assert question['display_questions'][0]=={'title':'“Should Veyra use Violet or Blue? ”','options':['“Violet”','“Blue”']}
+assert question['choices_active'] is True
 capture('codex-async-question')
-action('codex-card-choice','ChooseAsyncOption',{'item':question['id'],'question':0,'option':0})
+ctl('codex-card-choice','keys','secondary-1')
 chosen = ctl('codex-card-done','wait',thread,'Done')
 assert chosen['composer']['dock'] is None
 assert sql("select coalesce(hold_reason,'none') from threads where id='"+thread+"'")=='none'
 assert sql("select count(*) from turns where thread_id='"+thread+"'")=='2'
 assert all('User' in json.loads(row) for row in sql("select origin_json from turns where thread_id='"+thread+"'").splitlines())
 assert sql("select count(*) from requests where thread_id='"+thread+"' and state='expired'")=='1'
-assert any(item['kind']=='user' and item['text']=='Violet' for item in chosen['transcript']['items'])
+assert any(item['kind']=='user' and item['text']==exact_option for item in chosen['transcript']['items'])
 answered = next(item for item in chosen['transcript']['items'] if item['id']==question['id'])
 assert answered['body']['AsyncQuestions']['questions'][0]['selected']==0
 assert answered['text']==question['text']
+assert answered['choices_active'] is False
 capture('codex-async-question-chosen')
 action('codex-card-repeat','ChooseAsyncOption',{'item':question['id'],'question':0,'option':1})
 ctl('codex-card-repeat-key','keys','secondary-2')
+assert sql("select count(*) from turns where thread_id='"+thread+"'")=='2'
+poll('codex-before-typed-card-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+records = codex_records('async-question')
+request = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/commandExecution/requestApproval')
+answer = next(i for i,r in enumerate(records) if r.get('type')=='expect_outbound' and r.get('line',{}).get('method')=='turn/start' and r['line']['params']['input'][0]['text']=='Violet')
+records[request:answer]=[{'type':'emit_inbound','line':{'method':'turn/completed','params':{'threadId':'native-thread','turn':{'id':'native-turn','status':'completed'}}}}]
+typed_answer = 'I choose Violet by typing'
+for record in records:
+    wire = record.get('line',{})
+    if record.get('type')=='expect_outbound' and wire.get('method')=='turn/start' and wire['params']['input'][0]['text']=='Violet':
+        wire['params']['input'][0]['text']=typed_answer
+stage_records(records)
+action('codex-typed-card-new','NewThread')
+action('codex-typed-card-provider','PickProvider',{'provider':'codex'})
+action('codex-typed-card-mode','PickPermission',{'mode':'full_access'})
+ctl('codex-typed-card-prompt','text','Which colour should Veyra use?')
+before = int(sql('select count(*) from threads'))
+ctl('codex-typed-card-send','keys','secondary-enter')
+thread = poll('codex-typed-card-selected',lambda d:d['selected_thread'] is not None and int(sql('select count(*) from threads'))==before+1)['selected_thread']['id']
+typed = ctl('codex-typed-card-done','wait',thread,'Done')
+question = next(item for item in typed['transcript']['items'] if item['kind']=='async_questions')
+assert question['choices_active'] is True
+ctl('codex-card-typed-answer','text',typed_answer)
+ctl('codex-card-typed-send','keys','secondary-enter')
+typed = ctl('codex-card-typed-done','wait',thread,'Done')
+closed = next(item for item in typed['transcript']['items'] if item['id']==question['id'])
+assert closed['choices_active'] is False
+assert closed['body']['AsyncQuestions']['questions'][0]['selected'] is None
+assert any(item['kind']=='user' and item['text']==typed_answer for item in typed['transcript']['items'])
+capture('codex-async-question-typed-closed')
+ctl('codex-card-typed-stale-key','keys','secondary-1')
+action('codex-card-typed-stale-action','ChooseAsyncOption',{'item':question['id'],'question':0,'option':1})
 assert sql("select count(*) from turns where thread_id='"+thread+"'")=='2'
 poll('codex-approvals-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
 action('codex-approvals-return-new','NewThread')
@@ -316,8 +375,10 @@ The Codex section checks `composer.dock.action_text`, `consequence`, `request.ki
 A grant in the project permits the identical command there; the same command in another directory docks, names that directory and is denied.
 SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
 File and permission denials, the Violet answer and both MCP decisions are persisted.
-The async-question PNG shows the title, Violet and Blue controls and the choice consequence.
+The reason PNG shows a single quoted provider line, under its own label and apart from the consequence.
+The async-question PNG shows quoted sanitized title and option controls and the choice consequence; its captured UserText preserves the option's exact bidi-bearing bytes.
 The chosen PNG retains the question, shows Sent Violet and disables both controls.
+Command-1 chooses the latest-turn card. The typed-answer PNG leaves its option unselected and closes both controls; a later key or explicit stale choice starts no third turn.
 The strict fixture requires its pending request cancellation before interrupt and Violet as ordinary user input; SQLite records two User turns, the expired request and no hold.
 Both MCP PNGs name `veyra / list_providers` and show Deny and Allow once without a thread grant.
 

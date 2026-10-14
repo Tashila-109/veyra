@@ -196,6 +196,7 @@ pub(super) enum Item {
     FileChange(FileChange),
     McpToolCall(McpToolCall),
     CollabAgentToolCall(CollabAgentCall),
+    SubAgentActivity(SubAgentActivity),
     WebSearch(Tool),
     ImageView(Tool),
     #[default]
@@ -222,6 +223,23 @@ pub(super) enum AgentDelivery {
 pub(super) struct AsyncQuestion {
     pub title: Option<String>,
     pub options: Option<Vec<String>>,
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct SubAgentActivity {
+    pub id: Option<String>,
+    pub kind: SubAgentKind,
+    pub agent_thread_id: Option<String>,
+    pub agent_path: Option<String>,
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum SubAgentKind {
+    Started,
+    Completed,
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -308,6 +326,7 @@ impl Item {
             Self::FileChange(p) => p.tool.id.as_deref(),
             Self::McpToolCall(p) => p.tool.id.as_deref(),
             Self::CollabAgentToolCall(p) => p.tool_data.id.as_deref(),
+            Self::SubAgentActivity(p) => p.id.as_deref(),
             Self::WebSearch(p) | Self::ImageView(p) => p.id.as_deref(),
             Self::Unknown => None,
         }

@@ -17,6 +17,7 @@ pub mod record;
 pub mod store;
 #[cfg(test)]
 mod tests;
+pub mod text;
 pub mod tools;
 
 use actor::{Actor, EngineMsg};
@@ -206,7 +207,10 @@ impl Engine {
             let _entered = runtime.enter();
             env.mcp = Some(std::sync::Arc::new(mcp::Server::bind(
                 data,
-                std::env::current_exe()?,
+                match &env.relay_command {
+                    Some(command) => command.clone(),
+                    None => std::env::current_exe()?,
+                },
                 sender.clone(),
             )?));
         }

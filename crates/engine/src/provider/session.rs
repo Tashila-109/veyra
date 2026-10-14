@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::codex::git::discover as codex_git_roots;
 use super::{
     ActiveTurn, Decoded, Outbound, ProviderError, ProviderEvent, ProviderKind, SessionControl,
     SessionEvent, SessionHandle, SessionSpec, StopReason, TurnEvent, claude, codex, env::ChildEnv,
@@ -99,19 +101,19 @@ impl ProcessGroup {
             check: process_alive,
         }
     }
-    fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+    pub(super) fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
         self.child.as_mut()?.stdout.take()
     }
     fn stderr(&mut self) -> Option<tokio::process::ChildStderr> {
         self.child.as_mut()?.stderr.take()
     }
-    fn stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+    pub(super) fn stdin(&mut self) -> Option<tokio::process::ChildStdin> {
         self.child.as_mut()?.stdin.take()
     }
     pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.as_mut().unwrap().wait().await
     }
-    fn watch(&mut self, cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>) {
+    pub(super) fn watch(&mut self, cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>) {
         let (sender, receiver) = oneshot::channel();
         self.reaped = Some(sender);
         let _ = cleanup.send(receiver);
@@ -282,89 +284,6 @@ impl SessionIo {
     }
 }
 
-async fn codex_git_roots(
-    env: &ChildEnv,
-    cwd: &std::path::Path,
-    cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>,
-) -> Vec<std::path::PathBuf> {
-    use tokio::io::AsyncReadExt;
-    let result = async {
-        let binary = env.resolve_git().ok_or("git is not available")?;
-        let mut child = env
-            .spawn(
-                &binary,
-                &[
-                    "rev-parse".into(),
-                    "--git-dir".into(),
-                    "--git-common-dir".into(),
-                ],
-                cwd,
-                None,
-            )
-            .map_err(|_| "git could not start")?;
-        child.watch(cleanup);
-        drop(child.stdin());
-        let stdout = child.stdout().ok_or("git stdout is unavailable")?;
-        let result = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut bytes = Vec::new();
-            stdout
-                .take(8193)
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|_| "git output could not be read")?;
-            let status = child
-                .wait()
-                .await
-                .map_err(|_| "git could not be waited for")?;
-            if !status.success() {
-                return Err("git did not find repository metadata");
-            }
-            if bytes.len() > 8192 {
-                return Err("git output exceeded 8 KiB");
-            }
-            let text = std::str::from_utf8(&bytes).map_err(|_| "git output is not UTF-8")?;
-            if text.lines().any(str::is_empty) {
-                return Err("git returned an empty metadata path");
-            }
-            let paths = text
-                .lines()
-                .map(|path| {
-                    cwd.join(path)
-                        .canonicalize()
-                        .map_err(|_| "git metadata path is unavailable")
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if paths.len() != 2 || paths.iter().any(|p| !p.is_dir()) {
-                return Err("git did not return two metadata folders");
-            }
-            let mut roots = Vec::new();
-            for path in paths {
-                if !roots.contains(&path) {
-                    roots.push(path);
-                }
-            }
-            Ok(roots)
-        })
-        .await;
-        if result.is_err() {
-            let _ = platform::signal_group(child.pid(), Signal::Kill);
-        }
-        child.stop().await.map_err(|_| "git cleanup failed")?;
-        result.map_err(|_| "git metadata check exceeded one second")?
-    }
-    .await;
-    match result {
-        Ok(roots) => roots,
-        Err(reason) => {
-            tracing::info!(
-                reason,
-                "Codex Git metadata is unavailable; no writable roots added"
-            );
-            Vec::new()
-        }
-    }
-}
-
 async fn launch(
     provider: ProviderKind,
     spec: &SessionSpec,
@@ -374,16 +293,10 @@ async fn launch(
     before_spawn: impl FnOnce() -> Result<(), ProviderError>,
     cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>,
 ) -> Result<Process, ProviderError> {
-    let roots =
-        if provider == ProviderKind::Codex && spec.config.mode == PermissionMode::AcceptEdits {
-            codex_git_roots(env, &spec.cwd, cleanup).await
-        } else {
-            Vec::new()
-        };
     let server = if spec.root { env.mcp.as_ref() } else { None };
-    before_spawn()?;
     match provider {
         ProviderKind::Claude => {
+            before_spawn()?;
             let native = fresh
                 .or_else(|| spec.native.clone())
                 .unwrap_or_else(|| NativeSessionId(spec.thread.to_string()));
@@ -435,29 +348,37 @@ async fn launch(
                 },
             )
         }
-        ProviderKind::Codex => launch_with(
-            provider,
-            spec,
-            env,
-            vec!["app-server".into()],
-            "unknown until thread reply",
-            |args, spawn| {
-                let child = spawn(args)?;
-                let config = server.map(|server| {
-                    Arc::new(codex::McpConfig::new(
-                        server.clone(),
-                        spec.thread,
-                        session_epoch,
-                        child.pid(),
-                    ))
-                });
-                let codec = Codec::Codex(Box::new(
-                    codex::Codec::new(spec.clone(), child.pid(), config.clone())
-                        .with_workspace_roots(roots),
-                ));
-                Ok((child, config.map(RootMcp::Codex), codec))
-            },
-        ),
+        ProviderKind::Codex => {
+            let roots = if spec.config.mode == PermissionMode::AcceptEdits {
+                codex::git::discover(env, &spec.cwd, cleanup).await
+            } else {
+                Vec::new()
+            };
+            before_spawn()?;
+            launch_with(
+                provider,
+                spec,
+                env,
+                vec!["app-server".into()],
+                "unknown until thread reply",
+                |args, spawn| {
+                    let child = spawn(args)?;
+                    let config = server.map(|server| {
+                        Arc::new(codex::McpConfig::new(
+                            server.clone(),
+                            spec.thread,
+                            session_epoch,
+                            child.pid(),
+                        ))
+                    });
+                    let codec = Codec::Codex(Box::new(
+                        codex::Codec::new(spec.clone(), child.pid(), config.clone())
+                            .with_workspace_roots(roots),
+                    ));
+                    Ok((child, config.map(RootMcp::Codex), codec))
+                },
+            )
+        }
         ProviderKind::Grok => Err(ProviderError::NotBuilt),
     }
 }
@@ -2989,9 +2910,9 @@ mod git_metadata_tests {
     use super::*;
 
     #[tokio::test]
-    async fn metadata_roots_are_bounded_validated_and_deduplicated() {
+    async fn metadata_roots_are_bounded_and_fail_closed() {
         let root = std::path::PathBuf::from("/tmp")
-            .join(format!("veyra-m5r2-metadata-{}", ThreadId::new()));
+            .join(format!("veyra-git-metadata-{}", ThreadId::new()));
         std::fs::create_dir(&root).unwrap();
         let _scratch = crate::tests::Scratch(root.clone());
         let binaries = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3004,8 +2925,10 @@ mod git_metadata_tests {
         env.path = binaries.into_os_string();
         assert!(codex_git_roots(&env, &root, &cleanup).await.is_empty());
         std::fs::create_dir(root.join("metadata")).unwrap();
+        std::fs::create_dir(root.join("common")).unwrap();
         for (body, expected) in [
-            ("printf 'metadata\\nmetadata\\n'", 1),
+            ("printf 'metadata\\nmetadata\\n'", 0),
+            ("printf 'metadata\\ncommon\\n'", 0),
             ("printf 'metadata\\n'", 0),
             ("printf 'missing\\nmissing\\n'", 0),
             ("exit 1", 0),
@@ -3033,5 +2956,235 @@ mod git_metadata_tests {
             }
             assert!(env.groups.lock().unwrap().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod git_security_tests {
+    use super::*;
+    use crate::tests::{CapturedLogs, Scratch};
+    use std::path::PathBuf;
+
+    struct GitFixture {
+        _scratch: Scratch,
+        _binaries: Scratch,
+        env: ChildEnv,
+        project: PathBuf,
+        common: PathBuf,
+        dir: PathBuf,
+    }
+    impl GitFixture {
+        fn new(kind: &str) -> Self {
+            let root =
+                PathBuf::from("/tmp").join(format!("veyra-git-security-{}", ThreadId::new()));
+            std::fs::create_dir(&root).unwrap();
+            let scratch = Scratch(root.clone());
+            let root = root.canonicalize().unwrap();
+            let worktree = root.join("worktree");
+            let project = worktree.join("nested");
+            std::fs::create_dir_all(&project).unwrap();
+            let common = root.join("repository/.git");
+            let dir = common.join("worktrees/current");
+            for path in [
+                &dir,
+                &common.join("objects"),
+                &common.join("refs"),
+                &common.join("logs"),
+                &common.join("hooks"),
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            std::fs::write(common.join("config"), "fixture config").unwrap();
+            std::fs::write(dir.join("commondir"), "../..\n").unwrap();
+            std::fs::write(
+                dir.join("gitdir"),
+                format!("{}\n", worktree.join(".git").display()),
+            )
+            .unwrap();
+            std::fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {}\n", dir.display()),
+            )
+            .unwrap();
+            let (reported_dir, reported_common) = match kind {
+                "head_objects_refs" => {
+                    let foreign = root.join("elsewhere/meta");
+                    std::fs::create_dir_all(foreign.join("objects")).unwrap();
+                    std::fs::create_dir_all(foreign.join("refs")).unwrap();
+                    std::fs::write(foreign.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+                    std::fs::write(
+                        worktree.join(".git"),
+                        format!("gitdir: {}\n", foreign.display()),
+                    )
+                    .unwrap();
+                    #[cfg(debug_assertions)]
+                    {
+                        let output = std::process::Command::new("git")
+                            .args(["rev-parse", "--git-dir", "--git-common-dir"])
+                            .current_dir(&project)
+                            .output()
+                            .unwrap();
+                        assert!(output.status.success());
+                        let printed: Vec<_> = std::str::from_utf8(&output.stdout)
+                            .unwrap()
+                            .lines()
+                            .map(|path| project.join(path).canonicalize().unwrap())
+                            .collect();
+                        assert_eq!(printed, [foreign.clone(), foreign.clone()]);
+                    }
+                    let mut names: Vec<_> = std::fs::read_dir(&foreign)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect();
+                    names.sort();
+                    assert_eq!(names, ["HEAD", "objects", "refs"]);
+                    (foreign.clone(), foreign)
+                }
+                "foreign_repository" => {
+                    let foreign = root.join("foreign/.git");
+                    std::fs::create_dir_all(&foreign).unwrap();
+                    std::fs::write(
+                        worktree.join(".git"),
+                        format!("gitdir: {}\n", foreign.display()),
+                    )
+                    .unwrap();
+                    (foreign.clone(), foreign)
+                }
+                "foreign_common" => {
+                    let foreign = root.join("foreign/.git");
+                    std::fs::create_dir_all(&foreign).unwrap();
+                    std::fs::write(dir.join("commondir"), format!("{}\n", foreign.display()))
+                        .unwrap();
+                    (dir.clone(), foreign)
+                }
+                "foreign_backlink" => {
+                    let other = root.join("other-worktree");
+                    std::fs::create_dir(&other).unwrap();
+                    std::fs::write(other.join(".git"), format!("gitdir: {}\n", dir.display()))
+                        .unwrap();
+                    std::fs::write(
+                        dir.join("gitdir"),
+                        format!("{}\n", other.join(".git").display()),
+                    )
+                    .unwrap();
+                    (dir.clone(), common.clone())
+                }
+                "plain" => {
+                    std::fs::remove_file(worktree.join(".git")).unwrap();
+                    std::fs::create_dir(worktree.join(".git")).unwrap();
+                    (worktree.join(".git"), worktree.join(".git"))
+                }
+                "linked" => (dir.clone(), common.clone()),
+                _ => panic!("unknown security fixture"),
+            };
+            let binaries = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../target/git-security-{}", ThreadId::new()));
+            std::fs::create_dir_all(&binaries).unwrap();
+            let binary_scratch = Scratch(binaries.clone());
+            let git = binaries.join("git");
+            std::fs::write(
+                &git,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{}' '{}'\n",
+                    reported_dir.display(),
+                    reported_common.display()
+                ),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&git)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut env = ChildEnv::isolated();
+            env.path = binaries.clone().into_os_string();
+            Self {
+                _scratch: scratch,
+                _binaries: binary_scratch,
+                env,
+                project,
+                common,
+                dir,
+            }
+        }
+        async fn roots(&self) -> (Vec<PathBuf>, usize) {
+            let logs = CapturedLogs::default();
+            let _capture = tracing::subscriber::set_default(logs.clone());
+            let (cleanup, mut pending) = mpsc::unbounded_channel();
+            let roots = codex_git_roots(&self.env, &self.project, &cleanup).await;
+            while let Ok(done) = pending.try_recv() {
+                let _ = done.await;
+            }
+            assert!(self.env.groups.lock().unwrap().is_empty());
+            let lines = logs
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.get("message")
+                        .is_some_and(|text| text.contains("no writable roots added"))
+                })
+                .count();
+            (roots, lines)
+        }
+    }
+    async fn refuses(kind: &str) {
+        let fixture = GitFixture::new(kind);
+        let (roots, lines) = fixture.roots().await;
+        assert!(roots.is_empty(), "{kind} escaped the sandbox: {roots:?}");
+        assert_eq!(lines, 1, "{kind} must log exactly one refusal");
+    }
+    #[tokio::test]
+    async fn codex_git_rejects_exact_review_head_objects_refs_probe() {
+        refuses("head_objects_refs").await;
+    }
+    #[tokio::test]
+    async fn codex_git_rejects_foreign_repository_pointer() {
+        refuses("foreign_repository").await;
+    }
+    #[tokio::test]
+    async fn codex_git_rejects_foreign_common_directory() {
+        refuses("foreign_common").await;
+    }
+    #[tokio::test]
+    async fn codex_git_rejects_foreign_worktree_backlink() {
+        refuses("foreign_backlink").await;
+    }
+    #[tokio::test]
+    async fn codex_git_plain_repository_adds_nothing() {
+        refuses("plain").await;
+    }
+    #[tokio::test]
+    async fn codex_git_rejects_symlinked_common_storage() {
+        let fixture = GitFixture::new("linked");
+        let objects = fixture.common.join("objects");
+        std::fs::remove_dir(&objects).unwrap();
+        platform::test_symlink(&fixture.common.join("hooks"), &objects).unwrap();
+        let (roots, lines) = fixture.roots().await;
+        assert!(roots.is_empty());
+        assert_eq!(lines, 1);
+    }
+    #[tokio::test]
+    async fn codex_git_linked_worktree_uses_only_narrow_metadata_roots() {
+        let fixture = GitFixture::new("linked");
+        let (roots, lines) = fixture.roots().await;
+        assert_eq!(
+            roots,
+            [
+                fixture.dir.clone(),
+                fixture.common.join("objects"),
+                fixture.common.join("refs"),
+                fixture.common.join("logs")
+            ]
+        );
+        assert_eq!(lines, 0);
+        assert!(!roots.iter().any(|root| root == &fixture.common
+            || root == &fixture.common.join("hooks")
+            || root == &fixture.common.join("config")));
+        assert_ne!(fixture.dir, fixture.common);
     }
 }

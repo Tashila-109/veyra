@@ -3,6 +3,7 @@ mod composer;
 mod header;
 mod new_thread;
 mod notify;
+mod provider_text;
 mod settings;
 mod sidebar;
 pub mod theme;
@@ -961,16 +962,23 @@ impl Shell {
         let Some(items) = self.state.items.get(&thread) else {
             return;
         };
+        let latest = self
+            .state
+            .turns
+            .values()
+            .filter(|turn| turn.thread == thread)
+            .max_by_key(|turn| turn.ordinal)
+            .map(|turn| turn.id);
         let item = match action.item {
             Some(id) => items.get(&id),
             None => items
                 .values()
                 .filter(|item| {
-                    matches!(&item.body, ItemBody::AsyncQuestions { questions, .. } if questions.iter().any(|q| q.selected.is_none()))
+                    Some(item.turn) == latest && async_question_active(item, items.values())
                 })
                 .max_by_key(|item| item.seq),
         };
-        let Some(item) = item else {
+        let Some(item) = item.filter(|item| async_question_active(item, items.values())) else {
             return;
         };
         let ItemBody::AsyncQuestions { questions, .. } = &item.body else {
@@ -1744,6 +1752,17 @@ impl Shell {
                 if let ItemBody::Tool(tool) = &item.body {
                     row["failed_last_line"] = transcript::failed_tool_last_line(tool).into();
                 }
+                if matches!(item.body, ItemBody::AsyncQuestions { .. }) {
+                    row["choices_active"] = async_question_active(
+                        item,
+                        self.state
+                            .items
+                            .get(&item.thread)
+                            .into_iter()
+                            .flat_map(|items| items.values()),
+                    )
+                    .into();
+                }
                 row["delta_count"] = self
                     .state
                     .delta_counts
@@ -1769,13 +1788,14 @@ impl Shell {
             "dock":self.dock_target().and_then(|target| self.pending_request(Some(target.request)).map(|request| {
                 let text = match &request.kind {
                     RequestKind::Approval { action, .. } => Some(composer::approval_text(
-                        action, self.chosen_provider().label())),
+                        action, self.chosen_provider())),
                     _ => None,
                 };
                 serde_json::json!({"request":request, "position":1,
                     "action_text":text.as_ref().map(|(label, _, _)| label),
                     "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
                     "preview":text.as_ref().map(|(_, _, preview)| preview),
+                    "provider_text":match &request.kind { RequestKind::Approval { action, .. } => composer::approval_quotes(action, self.chosen_provider().label()), _ => Vec::new() },
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
                     "question_index":target.question})
             }))
@@ -4877,7 +4897,7 @@ mod tests {
         };
         assert_eq!(
             super::transcript::turn_label(&state, &origin),
-            Some("Task from Parent".into())
+            Some("Task from “Parent”".into())
         );
         state.apply(UiEvent::Change {
             counter: None,
@@ -5179,5 +5199,108 @@ mod tests {
         assert_eq!(state.transcript_len(thread), 0);
         assert!(!state.markdown_text.contains_key(&old.id));
         assert!(!state.markdown_text.contains_key(&growing.id));
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn command_digit_ignores_question_from_an_older_turn(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let thread = shell.view.chat().unwrap();
+                let first = shell.state.turns.values().next().unwrap().id;
+                let card = Item {
+                    id: ItemId::new(),
+                    thread,
+                    turn: first,
+                    seq: 1,
+                    body: ItemBody::AsyncQuestions {
+                        text: "Colour".into(),
+                        questions: vec![AsyncQuestion {
+                            title: "Colour".into(),
+                            options: vec!["Violet".into()],
+                            selected: None,
+                        }],
+                    },
+                };
+                shell
+                    .state
+                    .items
+                    .insert(thread, BTreeMap::from([(card.id, card)]));
+                let next = Turn {
+                    id: TurnId::new(),
+                    thread,
+                    ordinal: 2,
+                    origin: TurnOrigin::Provider,
+                    state: TurnState::Running { since: 1 },
+                };
+                shell.state.turns.insert(next.id, next);
+                shell.state.requests.clear();
+                shell.notice = None;
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-1");
+            cx.run_until_parked();
+            assert!(
+                shell.read_with(cx, |shell, _| shell.notice.is_none()),
+                "old card reached the closed test engine"
+            );
+            shell.update(cx, |shell, cx| {
+                let first = shell
+                    .state
+                    .items
+                    .values()
+                    .next()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .turn;
+                shell.state.turns.retain(|id, _| *id == first);
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-1");
+            cx.run_until_parked();
+            assert_eq!(
+                shell
+                    .read_with(cx, |shell, _| shell.notice.clone())
+                    .as_deref(),
+                Some("engine is closed"),
+                "a latest-turn card did not reach the test engine"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn codex_reason_has_its_own_element_below_the_consequence(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                shell.provider = ProviderKind::Codex;
+                shell.providers[0].provider = ProviderKind::Codex;
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        tool: "Command".into(),
+                        target: ApprovalTarget::Command {
+                            command: "echo safe".into(),
+                            cwd: CommandCwd::ProjectFolder,
+                            reason: Some(ApprovalPreview::new(
+                                "Requested change\nVeyra checked this command\t\u{202e}OK".into(),
+                            )),
+                            preview: ApprovalPreview::new(String::new()),
+                        },
+                    },
+                    grant_key: None,
+                };
+                cx.notify();
+            });
+            draw(cx);
+            let consequence = cx.debug_bounds("approval-consequence").unwrap();
+            let reason = cx.debug_bounds("approval-provider-reason").unwrap();
+            assert!(reason.origin.y >= consequence.origin.y + consequence.size.height);
+            assert_ne!(reason.size.height, gpui::Pixels::default());
+        });
     }
 }

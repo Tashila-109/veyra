@@ -5,6 +5,7 @@ use super::{
 };
 use crate::{domain::*, platform::Signal};
 use serde_json::{Value, json};
+pub(crate) mod git;
 mod wire;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -381,7 +382,7 @@ impl Codec {
         };
         self.interrupted = None;
         let mut params = turn_params(&native, &self.spec.config, text);
-        if self.spec.config.mode == PermissionMode::AcceptEdits && !self.writable_roots.is_empty() {
+        if !self.writable_roots.is_empty() {
             params["sandboxPolicy"]["writableRoots"] = json!(self.writable_roots);
         }
         Some(Outbound::Prompt(self.peer.send(
@@ -838,6 +839,41 @@ impl Codec {
         completed: bool,
         events: &mut Vec<TurnEvent>,
     ) {
+        if let wire::Item::SubAgentActivity(activity) = wire {
+            let Some(agent) = activity
+                .agent_thread_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+            else {
+                return;
+            };
+            if matches!(activity.kind, wire::SubAgentKind::Unknown) {
+                return;
+            }
+            let key = Self::key(turn, &format!("subagent:{agent}"));
+            let state = self.items.entry(key.0.clone()).or_default();
+            if state.finished {
+                return;
+            }
+            if !state.started {
+                state.started = true;
+                events.push(TurnEvent::ToolStarted { key: key.clone(), call: ToolCall {
+                    name: "Subagent".into(),
+                    arguments: json!({"agent_path":activity.agent_path,"agent_thread_id":agent}),
+                    input_summary: activity.agent_path.clone(),
+                } });
+            }
+            if matches!(activity.kind, wire::SubAgentKind::Completed) {
+                state.finished = true;
+                events.push(TurnEvent::ToolFinished {
+                    key: key.clone(),
+                    ok: true,
+                    output_tail: None,
+                });
+                events.push(TurnEvent::ItemEnded { key });
+            }
+            return;
+        }
         let Some(id) = wire.id().filter(|id| !id.is_empty()) else {
             return;
         };

@@ -125,8 +125,13 @@ fn grant_replay_automatically_answers_only_the_exact_command() {
     .unwrap();
     let mut env = env::ChildEnv::isolated();
     env.claude_bin = Some(
-        source
-            .join("../../target/debug/veyra-fake-cli")
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("veyra-fake-cli")
             .canonicalize()
             .unwrap(),
     );

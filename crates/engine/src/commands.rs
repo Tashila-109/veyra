@@ -301,6 +301,11 @@ fn choose_async_option(
         .cloned()
         .ok_or_else(|| CommandError::NotFound("question card".into()))?;
     let thread = item.thread;
+    if !async_question_active(&item, p.items_for(thread)) {
+        return Err(CommandError::Invalid(
+            "This question has already been answered or the conversation continued".into(),
+        ));
+    }
     if get_thread(p, thread)?.archived {
         return Err(CommandError::Busy(WaitReason::Archived));
     }

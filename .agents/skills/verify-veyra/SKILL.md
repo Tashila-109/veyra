@@ -650,7 +650,7 @@ required = {
         'codex-chat-done.png','codex-other-thread-done.json','codex-other-thread.png','codex-notices-done.json','codex-notices.png'],
     'approvals-questions-codex':['codex-command.json','codex-command.png','codex-command-other-cwd.png',
         'codex-file.png','codex-permissions.png','codex-question.png','codex-mcp-first.png','codex-mcp-second.png',
-        'codex-async-question.png','codex-async-question-chosen.png','codex-card-done.json'],
+        'codex-async-question.png','codex-async-question-chosen.png','codex-async-question-typed-closed.png','codex-card-done.json','codex-reason-quoted.png'],
     'multi-agent-codex':['codex-relay-done.json','codex-relay.png','codex-relay-log.txt',
         'codex-relay-parent.json','codex-relay-processes.txt',
         'codex-child-task.json','codex-child-task.png','codex-family-done.json','codex-family-done.png'],

@@ -54,6 +54,7 @@ enum Resolution {
 pub struct ChildEnv {
     pub(crate) groups: Groups,
     pub mcp: Option<Arc<crate::mcp::Server>>,
+    pub relay_command: Option<PathBuf>,
     pub(crate) catalog: Arc<Mutex<std::collections::BTreeMap<ProviderKind, super::Probe>>>,
     pub(crate) closing: Arc<crate::LaunchGate>,
     #[cfg(test)]
@@ -110,6 +111,7 @@ impl ChildEnv {
         Self {
             groups: Default::default(),
             mcp: None,
+            relay_command: None,
             catalog: Default::default(),
             closing: Default::default(),
             #[cfg(test)]
