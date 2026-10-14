@@ -2994,7 +2994,20 @@ mod git_security_tests {
             ] {
                 std::fs::create_dir_all(path).unwrap();
             }
-            std::fs::write(common.join("config"), "fixture config").unwrap();
+            std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(
+                common.join("config"),
+                if kind == "config_unset" {
+                    "[core]\nrepositoryformatversion = 0\nbare = false\n".into()
+                } else {
+                    format!(
+                        "[core]\nrepositoryformatversion = 0\nbare = false\n[extensions]\nworktreeConfig = {}\n",
+                        kind == "worktree_config"
+                    )
+                },
+            )
+            .unwrap();
             std::fs::write(dir.join("commondir"), "../..\n").unwrap();
             std::fs::write(
                 dir.join("gitdir"),
@@ -3074,7 +3087,16 @@ mod git_security_tests {
                     std::fs::create_dir(worktree.join(".git")).unwrap();
                     (worktree.join(".git"), worktree.join(".git"))
                 }
-                "linked" => (dir.clone(), common.clone()),
+                "linked"
+                | "worktree_config"
+                | "config_error"
+                | "config_error_output"
+                | "config_unset"
+                | "config_unset_output"
+                | "config_malformed"
+                | "config_timeout"
+                | "config_overflow"
+                | "config_shared_deadline" => (dir.clone(), common.clone()),
                 _ => panic!("unknown security fixture"),
             };
             let binaries = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3082,10 +3104,28 @@ mod git_security_tests {
             std::fs::create_dir_all(&binaries).unwrap();
             let binary_scratch = Scratch(binaries.clone());
             let git = binaries.join("git");
+            let config = match kind {
+                "worktree_config" => "printf 'true\\n'",
+                "config_error" => "exit 3",
+                "config_error_output" => "printf 'false\\n'; exit 3",
+                "config_unset" => "exit 1",
+                "config_unset_output" => "printf 'false\\n'; exit 1",
+                "config_malformed" => "printf 'unknown\\n'",
+                "config_timeout" => "/bin/sleep 10",
+                "config_overflow" => "/usr/bin/head -c 8193 /dev/zero",
+                "config_shared_deadline" => "/bin/sleep .6; printf 'false\\n'",
+                _ => "printf 'false\\n'",
+            };
+            let delay = if kind == "config_shared_deadline" {
+                "/bin/sleep .6; "
+            } else {
+                ""
+            };
             std::fs::write(
                 &git,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' '{}' '{}'\n",
+                    "#!/bin/sh\n[ \"$PWD\" = '{}' ] || exit 2\ncase \"$*\" in\n'rev-parse --git-dir --git-common-dir') {delay}printf '%s\\n' '{}' '{}' ;;\n'config --get --bool extensions.worktreeConfig') {config} ;;\n*) exit 2 ;;\nesac\n",
+                    project.display(),
                     reported_dir.display(),
                     reported_common.display()
                 ),
@@ -3167,6 +3207,67 @@ mod git_security_tests {
         let (roots, lines) = fixture.roots().await;
         assert!(roots.is_empty());
         assert_eq!(lines, 1);
+    }
+    #[tokio::test]
+    async fn codex_git_rejects_enabled_worktree_config() {
+        let fixture = GitFixture::new("worktree_config");
+        #[cfg(debug_assertions)]
+        {
+            let output = std::process::Command::new("git")
+                .args(["config", "--get", "--bool", "extensions.worktreeConfig"])
+                .current_dir(&fixture.project)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"true\n");
+        }
+        let (roots, lines) = fixture.roots().await;
+        assert!(
+            roots.is_empty(),
+            "enabled worktree config granted {roots:?}"
+        );
+        assert_eq!(lines, 1);
+    }
+    #[tokio::test]
+    async fn codex_git_unset_worktree_config_uses_narrow_metadata_roots() {
+        let fixture = GitFixture::new("config_unset");
+        #[cfg(debug_assertions)]
+        {
+            let output = std::process::Command::new("git")
+                .args(["config", "--get", "--bool", "extensions.worktreeConfig"])
+                .current_dir(&fixture.project)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+        }
+        let (roots, lines) = fixture.roots().await;
+        assert_eq!(
+            roots,
+            [
+                fixture.dir,
+                fixture.common.join("objects"),
+                fixture.common.join("refs"),
+                fixture.common.join("logs")
+            ]
+        );
+        assert_eq!(lines, 0);
+    }
+    #[tokio::test]
+    async fn codex_git_rejects_unreadable_worktree_config() {
+        for kind in [
+            "config_error",
+            "config_error_output",
+            "config_unset_output",
+            "config_malformed",
+            "config_timeout",
+            "config_overflow",
+            "config_shared_deadline",
+        ] {
+            let start = std::time::Instant::now();
+            refuses(kind).await;
+            assert!(start.elapsed() < Duration::from_secs(3), "{kind}");
+        }
     }
     #[tokio::test]
     async fn codex_git_linked_worktree_uses_only_narrow_metadata_roots() {

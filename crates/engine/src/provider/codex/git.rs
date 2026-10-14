@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
+    process::ExitStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -130,69 +131,110 @@ pub(super) fn worktree_roots(
     LinkedWorktree::checked(project, git_dir, common_dir)?.roots()
 }
 
+struct GitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+async fn output(
+    env: &ChildEnv,
+    binary: &Path,
+    args: &[String],
+    cwd: &Path,
+    cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>,
+    deadline: tokio::time::Instant,
+) -> Result<GitOutput, &'static str> {
+    use tokio::io::AsyncReadExt;
+    let mut child = env
+        .spawn(binary, args, cwd, None)
+        .map_err(|_| "git could not start")?;
+    child.watch(cleanup);
+    drop(child.stdin());
+    let stdout = child.stdout().ok_or("git stdout is unavailable")?;
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut bytes = Vec::new();
+        stdout
+            .take(8193)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "git output could not be read")?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|_| "git could not be waited for")?;
+        if bytes.len() > 8192 {
+            return Err("git output exceeded 8 KiB");
+        }
+        Ok(GitOutput {
+            status,
+            stdout: bytes,
+        })
+    })
+    .await;
+    if result.is_err() {
+        let _ = platform::signal_group(child.pid(), Signal::Kill);
+    }
+    child.stop().await.map_err(|_| "git cleanup failed")?;
+    result.map_err(|_| "git metadata check exceeded one second")?
+}
 pub(crate) async fn discover(
     env: &ChildEnv,
-    cwd: &std::path::Path,
+    cwd: &Path,
     cleanup: &mpsc::UnboundedSender<oneshot::Receiver<()>>,
-) -> Vec<std::path::PathBuf> {
-    use tokio::io::AsyncReadExt;
+) -> Vec<PathBuf> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let result = async {
         let binary = env.resolve_git().ok_or("git is not available")?;
-        let mut child = env
-            .spawn(
-                &binary,
-                &[
-                    "rev-parse".into(),
-                    "--git-dir".into(),
-                    "--git-common-dir".into(),
-                ],
-                cwd,
-                None,
-            )
-            .map_err(|_| "git could not start")?;
-        child.watch(cleanup);
-        drop(child.stdin());
-        let stdout = child.stdout().ok_or("git stdout is unavailable")?;
-        let result = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut bytes = Vec::new();
-            stdout
-                .take(8193)
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|_| "git output could not be read")?;
-            let status = child
-                .wait()
-                .await
-                .map_err(|_| "git could not be waited for")?;
-            if !status.success() {
-                return Err("git did not find repository metadata");
-            }
-            if bytes.len() > 8192 {
-                return Err("git output exceeded 8 KiB");
-            }
-            let text = std::str::from_utf8(&bytes).map_err(|_| "git output is not UTF-8")?;
-            if text.lines().any(str::is_empty) {
-                return Err("git returned an empty metadata path");
-            }
-            let paths = text
-                .lines()
-                .map(|path| {
-                    cwd.join(path)
-                        .canonicalize()
-                        .map_err(|_| "git metadata path is unavailable")
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if paths.len() != 2 || paths.iter().any(|p| !p.is_dir()) {
-                return Err("git did not return two metadata folders");
-            }
-            worktree_roots(cwd, &paths[0], &paths[1])
-        })
-        .await;
-        if result.is_err() {
-            let _ = platform::signal_group(child.pid(), Signal::Kill);
+        let metadata = output(
+            env,
+            &binary,
+            &[
+                "rev-parse".into(),
+                "--git-dir".into(),
+                "--git-common-dir".into(),
+            ],
+            cwd,
+            cleanup,
+            deadline,
+        )
+        .await?;
+        if !metadata.status.success() {
+            return Err("git command did not succeed");
         }
-        child.stop().await.map_err(|_| "git cleanup failed")?;
-        result.map_err(|_| "git metadata check exceeded one second")?
+        let text = std::str::from_utf8(&metadata.stdout).map_err(|_| "git output is not UTF-8")?;
+        if text.lines().any(str::is_empty) {
+            return Err("git returned an empty metadata path");
+        }
+        let paths = text
+            .lines()
+            .map(|path| {
+                cwd.join(path)
+                    .canonicalize()
+                    .map_err(|_| "git metadata path is unavailable")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if paths.len() != 2 || paths.iter().any(|p| !p.is_dir()) {
+            return Err("git did not return two metadata folders");
+        }
+        let roots = worktree_roots(cwd, &paths[0], &paths[1])?;
+        let config = output(
+            env,
+            &binary,
+            &[
+                "config".into(),
+                "--get".into(),
+                "--bool".into(),
+                "extensions.worktreeConfig".into(),
+            ],
+            cwd,
+            cleanup,
+            deadline,
+        )
+        .await?;
+        match (config.status.code(), config.stdout.as_slice()) {
+            (Some(0), b"false\n") | (Some(1), b"") => Ok(roots),
+            (Some(0), b"true\n") => Err("worktree configuration is enabled"),
+            _ => Err("worktree configuration could not be read"),
+        }
     }
     .await;
     match result {

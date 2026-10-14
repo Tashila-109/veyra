@@ -62,7 +62,7 @@ capture('multi-tree-working')
 opened = select('multi-child-task',child)
 assert opened['selected_thread']['breadcrumb']=={'thread':root,'title':'report family','linked':True}
 assert any(item['kind']=='task_card' and item['text']=='Task from Claude Code' for item in opened['transcript']['items'])
-assert any(item['turn_label']=='Task from report family' for item in opened['transcript']['items'])
+assert any(item['turn_label']=='Task from “report family”' for item in opened['transcript']['items'])
 assert any(item['kind']=='user' and item['text'].startswith('Your last message is your report') and 'You cannot start child threads.' in item['text'] for item in opened['transcript']['items'])
 poll('multi-visible-counted',lambda d:d['perf']['visible']['thread']==child and d['perf']['visible']['applied_batches']>0)
 poll('multi-open-stamped',lambda d:d['perf']['transcript_open_ms'] is not None)

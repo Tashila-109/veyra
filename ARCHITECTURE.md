@@ -472,15 +472,16 @@ Every turn/start sends the current model, effort, summary auto, reviewer user, a
 Ask first sends untrusted, read-only and readOnly with networkAccess true; Accept edits sends on-request, workspace-write and workspaceWrite with networkAccess true.
 Full access sends never, danger-full-access and dangerFullAccess without a networkAccess field.
 For Accept edits, Codex preparation resolves git through its prepared login PATH and runs `git rev-parse --git-dir --git-common-dir` once per app-server spawn, in the project folder.
+After validating the linked worktree, it reads `git config --get --bool extensions.worktreeConfig` in the same folder.
 The child uses the shared launch gate, owned process group and cleanup supervisor; another launch check after discovery prevents a queued Shutdown from starting the provider.
-The Git subprocess is bounded to one second and 8 KiB of stdout, admitting two ordinary paths while capping the process wait and captured output.
+Both Git commands share a one-second deadline, with each command's stdout capped at 8 KiB.
 codex/git.rs canonicalizes both directories and accepts only a linked worktree whose git dir is a direct child of the common .git/worktrees folder.
 The git dir's regular gitdir file must name the project's or an ancestor's .git file, that file must point back to the same git dir, and commondir must agree with the common directory.
 Each back-link read is capped at 8 KiB; malformed, redirected or unrelated metadata fails closed with one refusal log.
 It grants the worktree git dir and only existing ordinary common objects, refs and logs directories, retaining the roots for that spawn.
 The common root, hooks and config are never granted; plain repositories add no roots because their .git folder includes hooks and config and remains protected.
-The prescribed whole-worktree git-dir grant includes optional config.worktree: if Git worktree configuration is enabled, that file can redirect hooks for this worktree.
-The guarantee covers the common hooks and config paths, rather than preventing every worktree-local metadata change.
+Writable roots require a successful config query returning false, or exit 1 with empty stdout for an unset setting, which Git treats as false.
+An enabled setting, any other non-zero exit, exit 1 with output, malformed or oversized output, or the shared deadline adds no roots and logs one refusal, so the git-dir grant cannot expose an active config.worktree that redirects hooks.
 This policy proves the writable-root frame, not whether Codex permits a plain-repository commit without extra roots.
 Every workspaceWrite turn policy adds these roots while keeping networkAccess true; Ask first and Full access neither discover nor add roots.
 A missing git, a folder outside git, malformed output or any discovery failure adds no roots and logs one reason without paths or stdout.
