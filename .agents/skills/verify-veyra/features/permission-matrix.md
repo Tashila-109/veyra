@@ -1,6 +1,6 @@
 # Provider permission matrix
 
-Status: not run, 2026-10-12, 950317c, Codex and Grok live cells
+Status: not run, 2026-10-14, 192cffa, Grok live cells
 
 ## Sub-features
 
