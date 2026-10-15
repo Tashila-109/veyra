@@ -1,7 +1,13 @@
 use super::theme::Theme;
-use gpui_kit::component::StyledExt;
+use gpui_kit::component::{
+    StyledExt,
+    scroll::{Scrollbar, ScrollbarMode},
+};
 use gpui_kit::{prelude::*, *};
-use veyra_engine::{domain::AsyncQuestion, text::display_line};
+use veyra_engine::{
+    domain::{AsyncQuestion, RequestId},
+    text::display_line,
+};
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -11,6 +17,17 @@ pub(super) enum QuoteKind {
     Tool,
     File,
     Question,
+}
+impl QuoteKind {
+    pub fn selector(&self) -> &'static str {
+        match self {
+            Self::Reason => "approval-provider-reason",
+            Self::WorkingFolder => "approval-working-folder",
+            Self::Tool => "approval-provider-tool",
+            Self::File => "approval-provider-file",
+            Self::Question => "approval-provider-text",
+        }
+    }
 }
 #[derive(serde::Serialize)]
 pub(super) struct QuotedText {
@@ -34,7 +51,49 @@ impl QuotedText {
         Self { kind, label, text }
     }
     pub fn render(self, selector: &'static str, cx: &App) -> AnyElement {
+        self.render_with_scroll(selector, None, cx)
+    }
+    pub fn render_folder(self, request: RequestId, handle: &ScrollHandle, cx: &App) -> AnyElement {
+        let selector = self.kind.selector();
+        self.render_with_scroll(selector, Some((request, handle)), cx)
+    }
+    fn render_with_scroll(
+        self,
+        selector: &'static str,
+        folder: Option<(RequestId, &ScrollHandle)>,
+        cx: &App,
+    ) -> AnyElement {
         let t = cx.global::<Theme>();
+        let value = div()
+            .pl(t.space.0[3])
+            .border_l(t.layout.border)
+            .border_color(t.colors.border)
+            .child(self.text);
+        let value = if let Some((request, handle)) = folder {
+            div()
+                .relative()
+                .w_full()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("working-folder-{request}")))
+                        .debug_selector(|| "approval-working-folder-scroll".into())
+                        .max_h(t.text.label.line_height * 3.)
+                        .line_height(t.text.label.line_height)
+                        .track_scroll(handle)
+                        .overflow_y_scroll()
+                        .pr(t.space.0[4])
+                        .child(value.debug_selector(|| "approval-working-folder-text".into())),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(Scrollbar::vertical(handle).mode(ScrollbarMode::Always)),
+                )
+                .into_any_element()
+        } else {
+            value.into_any_element()
+        };
         div()
             .debug_selector(move || selector.into())
             .v_flex()
@@ -42,13 +101,7 @@ impl QuotedText {
             .text_size(t.text.label.size)
             .text_color(t.colors.text_muted)
             .child(div().font_weight(FontWeight::SEMIBOLD).child(self.label))
-            .child(
-                div()
-                    .pl(t.space.0[3])
-                    .border_l(t.layout.border)
-                    .border_color(t.colors.border)
-                    .child(self.text),
-            )
+            .child(value)
             .into_any_element()
     }
 }

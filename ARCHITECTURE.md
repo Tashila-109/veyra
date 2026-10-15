@@ -502,7 +502,7 @@ The notice includes the selected window's reset timestamp, or the individual spe
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
-An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text. The working-folder quote stays beside the consequence above the scrolling details; the reason scrolls with the command and preview.
+An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text. The working-folder quote stays beside the consequence above the scrolling details, with its path in a request-keyed vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
 ToolCall stores a serde-defaulted veyra_label flag: only Codex's fixed labels are unquoted, while provider-named tools and older stored rows stay quoted.
 Both kinds use the bounded display projection; web search and image viewing have Veyra labels.
 Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers. Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them. Multiline command consequences name the line count, including blank lines, above the scrolling details. The shell owns ApprovalScroll, pairing the docked request id with its details scroll handle. A changed request id, including closing the dock, replaces the handle; repainting the same request preserves its offset. An always-visible kit scrollbar exposes actual overflow.
@@ -809,7 +809,7 @@ SetDefaultMode publishes SettingsChanged; Escape or thread/project selection lea
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
 Ctrl+C is literal control in the composer and preserves its draft while interrupting the turn.
 The approval dock (`ui/composer.rs`) renders only the codec's typed ProposedAction and does no disk work to render it.
-The full command or file path, consequence and bounded argument preview share a scrollable area bounded by the composer height token, with Allow and Deny below it.
+The command or file path, model-written reason and bounded argument preview share the details scroll area within the composer height token. The consequence and any outside working folder sit above that area; the folder has its own vertical scroll viewport bounded to three label-text lines. Its kit scrollbar stays visible while the folder overflows and is absent when the path fits. Shell owns its scroll handle alongside the details handle and replaces both when the docked request id changes, so each new request opens at the top, with the full marked path available by scrolling and no elision. Allow and Deny remain below the details.
 The dock shows 1 of N for multiple pending requests.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
 Consent buttons carry their displayed request id, and question choices also carry the displayed question index.
@@ -854,7 +854,7 @@ Literal consent paths and approval tool names instead retain their full marked c
 The debug dump exposes provider_text entries in approval docks and display_questions plus choices_active on async items beside the unchanged raw body.
 Those fields use the same display projection as rendering, while raw options remain available for exact protocol assertions.
 The debug tool_label and dock grant_caption fields share the row and grant-button rendering helpers.
-The debug-only DebugScrollApproval action moves the actual details handle used by wheel scrolling; details_scroll exposes its offset and maximum for window assertions without changing consent state.
+The debug-only DebugScrollApproval action moves the actual details handle used by wheel scrolling; details_scroll exposes its offset and maximum only when the scroll state belongs to the currently docked request, without changing consent state.
 Raw option strings remain in the stored card and are selected by validated indices for UserText, so display cleanup cannot change the sent message.
 Commands and argument previews retain their code styling with visible Unicode markers; their underlying consent identities keep the exact bytes.
 

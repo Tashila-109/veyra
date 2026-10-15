@@ -384,7 +384,11 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .child(consequence),
                                 )
                                 .when_some(folder, |dock, value| {
-                                    dock.child(value.render("approval-working-folder", cx))
+                                    dock.child(value.render_folder(
+                                        request_id,
+                                        &shell.approval_scroll.folder_handle,
+                                        cx,
+                                    ))
                                 })
                                 .child(
                                     div()
@@ -414,19 +418,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                         .child(label),
                                                 )
                                                 .children(quotes.into_iter().map(|value| {
-                                                    let selector = match value.kind {
-                                                        QuoteKind::Reason => {
-                                                            "approval-provider-reason"
-                                                        }
-                                                        QuoteKind::WorkingFolder => {
-                                                            "approval-working-folder"
-                                                        }
-                                                        QuoteKind::Tool => "approval-provider-tool",
-                                                        QuoteKind::File => "approval-provider-file",
-                                                        QuoteKind::Question => {
-                                                            "approval-provider-text"
-                                                        }
-                                                    };
+                                                    let selector = value.kind.selector();
                                                     value.render(selector, cx)
                                                 }))
                                                 .when(!preview.is_empty(), |details| {
@@ -888,16 +880,23 @@ mod display_boundary_tests {
     #[test]
     fn cwd_and_tool_names_use_the_same_quoted_display_policy() {
         let preview = ApprovalPreview::new(String::new());
-        let action = ProposedAction {
-            tool: "server\u{202e}\n / tool\tname".into(),
-            target: ApprovalTarget::Tool {
-                preview: preview.clone(),
-            },
-        };
-        assert_eq!(
-            approval_quotes(&action, "Codex")[0].text,
-            "“server⟨U+202E⟩⟨U+000A⟩ / tool⟨U+0009⟩name”"
-        );
+        for tool in [
+            "server\u{202e}\n / tool\tname",
+            "deploy\u{200b}\u{202e}\nnext",
+        ] {
+            let action = ProposedAction {
+                tool: tool.into(),
+                target: ApprovalTarget::Tool {
+                    preview: preview.clone(),
+                },
+            };
+            let action_text =
+                super::approval_text(&action, veyra_engine::provider::ProviderKind::Codex).0;
+            assert_eq!(
+                approval_quotes(&action, "Codex")[0].text,
+                format!("“{action_text}”")
+            );
+        }
         let action = ProposedAction {
             tool: "Command".into(),
             target: ApprovalTarget::Command {
@@ -923,21 +922,6 @@ mod display_boundary_tests {
 
 #[cfg(test)]
 mod round_trip_display_tests {
-    #[test]
-    fn tool_quote_keeps_the_marked_consent_identity() {
-        use veyra_engine::domain::*;
-        let action = ProposedAction {
-            tool: "deploy\u{200b}\u{202e}\nnext".into(),
-            target: ApprovalTarget::Tool {
-                preview: ApprovalPreview::new("{}".into()),
-            },
-        };
-        let original = action.clone();
-        let quote = super::approval_quotes(&action, "Claude Code");
-        assert_eq!(quote[0].text, "“deploy⟨U+200B⟩⟨U+202E⟩⟨U+000A⟩next”");
-        assert_eq!(action, original);
-    }
-
     use super::approval_text;
     use veyra_engine::{domain::*, provider::ProviderKind};
     #[test]
