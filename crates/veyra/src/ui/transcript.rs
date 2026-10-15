@@ -805,6 +805,9 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
             div()
                 .w_full()
                 .max_w(t.layout.composer_max)
+                .v_flex()
+                .min_h_0()
+                .max_h_full()
                 .py(t.space.0[5])
                 .child(composer::render(shell, cx)),
         )

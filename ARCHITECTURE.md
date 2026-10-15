@@ -502,10 +502,10 @@ The notice includes the selected window's reset timestamp, or the individual spe
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
-An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text. The working-folder quote stays beside the consequence above the scrolling details, with its path in a request-keyed vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
+An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text. The working-folder quote stays beside the consequence above the scrolling details, with its path in a vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
 ToolCall stores a serde-defaulted veyra_label flag: only Codex's fixed labels are unquoted, while provider-named tools and older stored rows stay quoted.
 Both kinds use the bounded display projection; web search and image viewing have Veyra labels.
-Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers. Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them. Multiline command consequences name the line count, including blank lines, above the scrolling details. The shell owns ApprovalScroll, pairing the docked request id with its details scroll handle. A changed request id, including closing the dock, replaces the handle; repainting the same request preserves its offset. An always-visible kit scrollbar exposes actual overflow.
+Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers. Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them. Multiline command consequences name the line count, including blank lines, above the scrolling details. The shell owns ApprovalScroll, pairing the docked request id with its details and folder scroll handles. A changed request id, including closing the dock, replaces both handles; repainting the same request preserves its offset. An always-visible kit scrollbar exposes actual overflow.
 The thread-grant button shows the first line of the marked command, shortened to its available width; execution, native replies and stored grant identities retain the original bytes.
 The UI takes ProviderKind for provider-specific behavior; display labels do not select behavior.
 Only the exact project cwd may use the existing command grant; every other cwd requires a human decision.
@@ -809,7 +809,15 @@ SetDefaultMode publishes SettingsChanged; Escape or thread/project selection lea
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
 Ctrl+C is literal control in the composer and preserves its draft while interrupting the turn.
 The approval dock (`ui/composer.rs`) renders only the codec's typed ProposedAction and does no disk work to render it.
-The command or file path, model-written reason and bounded argument preview share the details scroll area within the composer height token. The consequence and any outside working folder sit above that area; the folder has its own vertical scroll viewport bounded to three label-text lines. Its kit scrollbar stays visible while the folder overflows and is absent when the path fits. Shell owns its scroll handle alongside the details handle and replaces both when the docked request id changes, so each new request opens at the top, with the full marked path available by scrolling and no elision. Allow and Deny remain below the details.
+The chat column bounds the composer by its available height; the transcript gives up space before the dock.
+Flex layout measures the hold row, request count, consequence, wrapped decision buttons, focus hint, input and toolbar before shrinking the details to the remaining height, capped at composer_max_height (240px).
+The command or file path, model-written reason and bounded argument preview share that details scroll area, which keeps at least one code-text line.
+The consequence and any outside working folder sit above it, and Allow and Deny stay below it.
+The folder's viewport keeps at most three label-text lines; a tall message draft can shrink to the composer's minimum height.
+At both theme window sizes, the approval matrix retains the long folder's three lines and at least one code line even with all fixed controls present, so no smaller-folder fallback is needed.
+Folder and details use one bounded-scroll helper with independent kit scrollbars, visible only for actual overflow.
+Shell owns both handles and replaces them when the docked request id changes, so each new request opens at the top with its full marked path available by scrolling and no elision.
+The stable folder element id does not own that reset.
 The dock shows 1 of N for multiple pending requests.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
 Consent buttons carry their displayed request id, and question choices also carry the displayed question index.

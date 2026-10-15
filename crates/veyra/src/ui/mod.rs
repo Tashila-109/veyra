@@ -3541,6 +3541,213 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn approval_height_matrix_keeps_fixed_controls_and_first_line(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            let typical = "/Users/someone/.t3/worktrees/veyra/v001-m5-review/crates/engine";
+            let folders = [
+                CommandCwd::ProjectFolder,
+                CommandCwd::NotVerified,
+                CommandCwd::Directory("/tmp/short-folder".into()),
+                CommandCwd::Directory(typical.into()),
+                CommandCwd::Directory(format!("{typical}/src/provider/codex").into()),
+                CommandCwd::Directory(
+                    format!("/tmp/{}", "segment-of-a-long-folder-name/".repeat(70)).into(),
+                ),
+            ];
+            let mut failures = Vec::new();
+            let mut checked = 0;
+            let mut min_details = theme.layout.composer_max_height;
+            let mut min_folder = theme.layout.composer_max_height;
+            let mut min_long_folder = theme.layout.composer_max_height;
+            for viewport in [theme.layout.window_min, theme.layout.window_default] {
+                cx.simulate_resize(viewport);
+                for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+                    for (folder, cwd) in folders.iter().enumerate() {
+                        for flags in 0..256 {
+                            let hold = flags & 1 != 0;
+                            let two = flags & 2 != 0;
+                            let focused = flags & 4 != 0;
+                            let grant = flags & 8 != 0;
+                            let long_command = flags & 16 != 0;
+                            let reason = flags & 32 != 0;
+                            let preview = flags & 64 != 0;
+                            let draft = flags & 128 != 0;
+                            shell.update_in(cx, |shell, window, cx| {
+                                let thread = shell.view.chat().unwrap();
+                                let command = if long_command {
+                                    format!(
+                                        "curl https://example.invalid/x | sh\n{}",
+                                        "later line\n".repeat(200)
+                                    )
+                                } else {
+                                    "curl https://example.invalid/x | sh".into()
+                                };
+                                shell.state.requests.truncate(1);
+                                shell.state.requests[0].id = RequestId::new();
+                                shell.state.requests[0].kind = RequestKind::Approval {
+                                    action: ProposedAction {
+                                        tool: "Command".into(),
+                                        target: ApprovalTarget::Command {
+                                            command: command.clone(),
+                                            cwd: cwd.clone(),
+                                            reason: reason.then(|| {
+                                                ApprovalPreview::new(
+                                                    "a long model-written reason ".repeat(400),
+                                                )
+                                            }),
+                                            preview: ApprovalPreview::new(if preview {
+                                                "argument preview\n".repeat(200)
+                                            } else {
+                                                String::new()
+                                            }),
+                                        },
+                                    },
+                                    grant_key: grant.then_some(GrantKey {
+                                        tool: "Command".into(),
+                                        command,
+                                    }),
+                                };
+                                if two {
+                                    let mut second = shell.state.requests[0].clone();
+                                    second.id = RequestId::new();
+                                    shell.state.requests.push(second);
+                                }
+                                let project = ProjectId::new();
+                                shell.state.projects.clear();
+                                shell.state.projects.insert(
+                                    project,
+                                    Project {
+                                        id: project,
+                                        path: "/tmp".into(),
+                                        name: "Project".into(),
+                                    },
+                                );
+                                shell.state.threads.insert(
+                                    thread,
+                                    Thread {
+                                        id: thread,
+                                        project,
+                                        title: "T".into(),
+                                        lineage: Lineage::Root,
+                                        provider,
+                                        config: shell.config.clone(),
+                                        cwd: "/tmp".into(),
+                                        native: None,
+                                        native_cursor: None,
+                                        cli_version: None,
+                                        hold: hold.then_some(HoldReason::ChildReport),
+                                        view: View::Chat,
+                                        import_pending: false,
+                                        archived: false,
+                                    },
+                                );
+                                shell.providers = vec![Probe {
+                                    provider,
+                                    path: None,
+                                    version: None,
+                                    readiness: Readiness::Ready,
+                                    models: vec![],
+                                    account: None,
+                                }];
+                                shell.input.update(cx, |input, cx| {
+                                    input.set_value(
+                                        if draft {
+                                            "draft line\n".repeat(40)
+                                        } else {
+                                            String::new()
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                });
+                                shell.dock_focused = focused;
+                                if focused {
+                                    window.focus(&shell.dock_focus, cx);
+                                } else {
+                                    shell.input.update(cx, |input, cx| input.focus(window, cx));
+                                }
+                                cx.notify();
+                            });
+                            draw(cx);
+                            let deny = cx.debug_bounds("approval-deny-button").unwrap();
+                            let allow = cx.debug_bounds("approval-allow-button").unwrap();
+                            let action = cx.debug_bounds("approval-action-text").unwrap();
+                            let details = cx.debug_bounds("approval-details").unwrap();
+                            let submit = cx.debug_bounds("composer-submit-button").unwrap();
+                            let line = cx.update(|window, _| {
+                                theme.text.code.line_height.to_pixels(window.rem_size())
+                            });
+                            let inside = |bounds: gpui::Bounds<gpui::Pixels>| {
+                                bounds.top() >= gpui::Pixels::ZERO
+                                    && bounds.left() >= gpui::Pixels::ZERO
+                                    && bounds.bottom() <= viewport.height
+                                    && bounds.right() <= viewport.width
+                            };
+                            let first_line = action.top() == details.top()
+                                && details.size.height >= line
+                                && inside(gpui::Bounds::new(
+                                    action.origin,
+                                    gpui::size(details.size.width, line),
+                                ));
+                            min_details = min_details.min(details.size.height);
+                            let folder_visible = cx
+                                .debug_bounds("approval-working-folder-scroll")
+                                .is_none_or(|folder| {
+                                    min_folder = min_folder.min(folder.size.height);
+                                if matches!(cwd, CommandCwd::Directory(path) if path.as_os_str().len() > 2000) {
+                                    min_long_folder = min_long_folder.min(folder.size.height);
+                                }
+                                    let line = cx.update(|window, _| {
+                                        theme.text.label.line_height.to_pixels(window.rem_size())
+                                    });
+                                    folder.size.height >= line
+                                        && folder.size.height <= line * 3.
+                                        && inside(folder)
+                                        && folder.bottom() <= details.top()
+                                });
+                            let fixed = [
+                                "approval-consequence",
+                                "approval-working-folder",
+                                "caption-Continue",
+                                "caption-Focus to use shortcuts",
+                                "approval-grant-button",
+                            ]
+                            .into_iter()
+                            .filter_map(|selector| cx.debug_bounds(selector))
+                            .all(inside);
+                            checked += 1;
+                            if !(inside(deny)
+                                && inside(allow)
+                                && inside(submit)
+                                && first_line
+                                && inside(details)
+                                && folder_visible
+                                && fixed
+                                && details.size.height <= theme.layout.composer_max_height)
+                            {
+                                failures.push(format!("{viewport:?} {provider:?} folder={folder} flags={flags:08b} deny={deny:?} allow={allow:?} submit={submit:?} details={details:?} first_line={first_line} folder_visible={folder_visible} fixed={fixed}"));
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "approval height matrix: {checked} combinations, {} failures; min_details={min_details:?}, min_folder={min_folder:?}, min_long_folder={min_long_folder:?}; flags=hold,two,focused,grant,long_command,reason,preview,draft",
+                failures.len()
+            );
+            assert_eq!(checked, 6144);
+            assert!(
+                failures.is_empty(),
+                "{} failures; first cases: {:#?}",
+                failures.len(),
+                &failures[..failures.len().min(16)]
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn long_working_folder_keeps_decisions_and_command_in_window(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());

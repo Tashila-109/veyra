@@ -442,7 +442,12 @@ PYCODEX
 `codex-command-invisibles.png` shows U+202E and U+200B markers in the command and grant button; the stored request keeps the exact bytes and Allow once completes the fixture.
 Previews mark control characters too, and literal file and working-folder paths mark embedded newlines.
 `DebugScrollApproval` changes the same details scroll handle used by the wheel. `composer.dock.details_scroll.offset_y` and `max_offset_y` prove an overflowing approval reached its end and the next request opened at zero. `approval-long-command-end.png` shows the first approval scrolled; `approval-new-long-command.png` shows the next long command starting with its curl-to-shell line.
-`codex-long-working-folder.png` and `codex-long-working-folder-end.png` keep a complete, marked working folder longer than 2,000 characters in its own viewport of at most three text lines above the scrolling details. Allow and Deny and the command's first line remain visible when it opens; the folder can be scrolled without eliding its path. The model-written reason remains inside the details.
+`codex-long-working-folder.png` and `codex-long-working-folder-end.png` show a complete, marked working folder longer than 2,000 characters in its own viewport of at most three text lines above the scrolling details.
+Allow and Deny and the command's first line remain visible when it opens; the model-written reason stays inside the details.
+The GPUI wheel test proves the folder scrolls to its end independently without eliding its path.
+The GPUI height matrix covers both theme sizes, Claude and Codex, every combination of hold, request count, focus, grant, command length, reason, preview and draft height, with project, unverified, short, typical, two-line and long folders.
+The transcript gives up space before the dock; the details use the remaining height, capped at 240px, and retain the command's first line.
+The matrix keeps the long folder's three lines and at least one code line even in its most crowded cases.
 The folder viewport shows an always-visible kit scrollbar when the path overflows, and no scrollbar when it fits.
 The Codex section checks `composer.dock.action_text`, `consequence`, `request.kind`, the typed command `target.cwd` and `grant_key`.
 A grant in the project permits the identical command there; the same command in another directory docks, names that directory and is denied.

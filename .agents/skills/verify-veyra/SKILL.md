@@ -574,7 +574,10 @@ A cut preview ends with a notice.
 Consent command, preview and path displays mark Unicode controls and invisible formats as ⟨U+XXXX⟩; command newlines remain for heredocs.
 The dock's grant_caption uses the same marked command as the thread-grant button; request and grant identities keep the exact raw bytes.
 The dock emits details_scroll, with offset_y and max_offset_y, only after the rendered scroll handle matches its current request id. Poll for its presence after a request change. DebugScrollApproval accepts a finite pixels value and scrolls that same handle, without changing the pending request or its decision. A new docked request resets to the top.
-The command or file path, the model-written reason and the bounded preview share the details scroll area within the composer height limit. The consequence and any outside working folder sit above it. The folder value has its own vertical scroll, bounded to three label-text lines and keyed by the request id; it opens at the top for each request and never elides the marked path.
+The command or file path, the model-written reason and the bounded preview share the details scroll area, capped at 240px and shrinking to the window height left by the fixed controls.
+The transcript gives up space first, and the details keep at least the command's first line.
+The consequence and any outside working folder sit above it.
+The folder value has its own vertical scroll, bounded to three label-text lines; replacing both scroll handles on a changed request id opens each request at the top without eliding the marked path.
 Its kit scrollbar stays visible whenever the folder overflows and is absent when the path fits.
 Allow and Deny stay below that area.
 Questions share the same unfocused FocusDock prompt.

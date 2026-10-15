@@ -1,7 +1,7 @@
 use super::{
     MainView, Shell,
     actions::*,
-    provider_text::{QuoteKind, QuotedText},
+    provider_text::{QuoteKind, QuotedText, bounded_scroll},
     settings,
     theme::Theme,
 };
@@ -12,7 +12,6 @@ use gpui_kit::component::{
     input::Textarea,
     menu::DropdownMenu,
     popover::Popover,
-    scroll::{Scrollbar, ScrollbarMode},
 };
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::{
@@ -279,6 +278,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         .v_flex()
         .w_full()
         .max_w(t.layout.composer_max)
+        .min_h_0()
+        .max_h_full()
         .gap(t.space.0[3])
         .when_some(
             reason.clone().filter(|_| shell.provider_picker.is_some()),
@@ -295,6 +296,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
             div()
                 .v_flex()
                 .w_full()
+                .min_h_0()
                 .rounded(t.radius.large)
                 .bg(t.colors.card)
                 .border(t.layout.border)
@@ -304,6 +306,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     composer.child(
                         div()
                             .v_flex()
+                            .flex_none()
                             .gap(t.space.0[3])
                             .pb(t.space.0[4])
                             .child(
@@ -344,6 +347,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     let mut dock = div()
                         .v_flex()
                         .w_full()
+                        .min_h_0()
                         .gap(t.space.0[3])
                         .p(t.space.0[4])
                         .mb(t.space.0[5])
@@ -359,6 +363,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         .when(pending.len() > 1, |dock| {
                             dock.child(
                                 div()
+                                    .flex_none()
                                     .text_size(t.text.meta.size)
                                     .text_color(t.colors.text_muted)
                                     .child(format!("1 of {}", pending.len())),
@@ -379,77 +384,62 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                 .child(
                                     div()
                                         .debug_selector(|| "approval-consequence".into())
+                                        .flex_none()
                                         .text_size(t.text.label.size)
                                         .text_color(t.colors.text_muted)
                                         .child(consequence),
                                 )
                                 .when_some(folder, |dock, value| {
-                                    dock.child(value.render_folder(
-                                        request_id,
-                                        &shell.approval_scroll.folder_handle,
-                                        cx,
-                                    ))
+                                    dock.child(
+                                        value.render_folder(
+                                            &shell.approval_scroll.folder_handle,
+                                            cx,
+                                        ),
+                                    )
                                 })
                                 .child(
-                                    div()
-                                        .relative()
-                                        .w_full()
-                                        .child(
-                                            div()
-                                                .id("approval-details")
-                                                .w_full()
-                                                .min_w_0()
-                                                .debug_selector(|| "approval-details".into())
-                                                .v_flex()
-                                                .min_h_0()
-                                                .max_h(t.layout.composer_max_height)
-                                                .track_scroll(&shell.approval_scroll.handle)
-                                                .overflow_y_scroll()
-                                                .pr(t.space.0[4])
-                                                .gap(t.space.0[3])
-                                                .child(
+                                    bounded_scroll(
+                                        "approval-details",
+                                        "approval-details",
+                                        &shell.approval_scroll.handle,
+                                        div()
+                                            .v_flex()
+                                            .gap(t.space.0[3])
+                                            .child(
+                                                div()
+                                                    .font_family(t.text.mono_font.clone())
+                                                    .text_size(t.text.code.size)
+                                                    .line_height(t.text.code.line_height)
+                                                    .debug_selector(|| {
+                                                        "approval-action-text".into()
+                                                    })
+                                                    .child(label),
+                                            )
+                                            .children(quotes.into_iter().map(|value| {
+                                                let selector = value.kind.selector();
+                                                value.render(selector, cx)
+                                            }))
+                                            .when(!preview.is_empty(), |details| {
+                                                details.child(
                                                     div()
+                                                        .debug_selector(|| {
+                                                            "approval-preview".into()
+                                                        })
                                                         .font_family(t.text.mono_font.clone())
                                                         .text_size(t.text.code.size)
                                                         .line_height(t.text.code.line_height)
-                                                        .debug_selector(|| {
-                                                            "approval-action-text".into()
-                                                        })
-                                                        .child(label),
+                                                        .child(preview),
                                                 )
-                                                .children(quotes.into_iter().map(|value| {
-                                                    let selector = value.kind.selector();
-                                                    value.render(selector, cx)
-                                                }))
-                                                .when(!preview.is_empty(), |details| {
-                                                    details.child(
-                                                        div()
-                                                            .debug_selector(|| {
-                                                                "approval-preview".into()
-                                                            })
-                                                            .font_family(t.text.mono_font.clone())
-                                                            .text_size(t.text.code.size)
-                                                            .line_height(t.text.code.line_height)
-                                                            .child(preview),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .inset_0()
-                                                .debug_selector(|| "approval-scrollbar".into())
-                                                .child(
-                                                    Scrollbar::vertical(
-                                                        &shell.approval_scroll.handle,
-                                                    )
-                                                    .mode(ScrollbarMode::Always),
-                                                ),
-                                        ),
+                                            }),
+                                        cx,
+                                    )
+                                    .min_h(t.text.code.line_height)
+                                    .max_h(t.layout.composer_max_height),
                                 )
                                 .child(
                                     div()
                                         .h_flex()
+                                        .flex_none()
                                         .flex_wrap()
                                         .gap(t.space.0[3])
                                         .child(
@@ -486,6 +476,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                         grant_caption(&key.command),
                                                         cx,
                                                     )
+                                                    .debug_selector(|| {
+                                                        "approval-grant-button".into()
+                                                    })
                                                     .max_w_full(),
                                                     shell.dock_focused,
                                                     shortcut_chip::<AllowInThread>(cx),
@@ -575,6 +568,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     composer.child(dock.when(!shell.dock_focused, |dock| {
                         dock.child(
                             labelled_button("focus-dock", "Focus to use shortcuts", cx)
+                                .flex_shrink_0()
                                 .child(shortcut_chip::<FocusDock>(cx))
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(Box::new(FocusDock), cx)
@@ -583,21 +577,27 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     }))
                 })
                 .child(
-                    div().w_full().key_context("VeyraComposer").child(
-                        Textarea::new(&shell.input)
-                            .appearance(false)
-                            .bordered(false)
-                            .w_full()
-                            .min_h(t.layout.composer_min_height)
-                            .max_h(t.layout.composer_max_height)
-                            .text_size(t.text.read.size)
-                            .line_height(t.text.read.line_height)
-                            .aria_label("Message"),
-                    ),
+                    div()
+                        .v_flex()
+                        .w_full()
+                        .min_h(t.layout.composer_min_height)
+                        .key_context("VeyraComposer")
+                        .child(
+                            Textarea::new(&shell.input)
+                                .appearance(false)
+                                .bordered(false)
+                                .w_full()
+                                .min_h(t.layout.composer_min_height)
+                                .max_h(t.layout.composer_max_height)
+                                .text_size(t.text.read.size)
+                                .line_height(t.text.read.line_height)
+                                .aria_label("Message"),
+                        ),
                 )
                 .child(
                     div()
                         .h_flex()
+                        .flex_none()
                         .h(t.layout.composer_toolbar)
                         .items_center()
                         .gap(t.space.0[1])
@@ -880,9 +880,15 @@ mod display_boundary_tests {
     #[test]
     fn cwd_and_tool_names_use_the_same_quoted_display_policy() {
         let preview = ApprovalPreview::new(String::new());
-        for tool in [
-            "server\u{202e}\n / tool\tname",
-            "deploy\u{200b}\u{202e}\nnext",
+        for (tool, marked) in [
+            (
+                "server\u{202e}\n / tool\tname",
+                "“server⟨U+202E⟩⟨U+000A⟩ / tool⟨U+0009⟩name”",
+            ),
+            (
+                "deploy\u{200b}\u{202e}\nnext",
+                "“deploy⟨U+200B⟩⟨U+202E⟩⟨U+000A⟩next”",
+            ),
         ] {
             let action = ProposedAction {
                 tool: tool.into(),
@@ -896,6 +902,7 @@ mod display_boundary_tests {
                 approval_quotes(&action, "Codex")[0].text,
                 format!("“{action_text}”")
             );
+            assert_eq!(approval_quotes(&action, "Codex")[0].text, marked);
         }
         let action = ProposedAction {
             tool: "Command".into(),
