@@ -604,6 +604,11 @@ struct DockTarget {
     question: usize,
 }
 
+#[derive(Default)]
+struct ApprovalScroll {
+    request: Option<RequestId>,
+    handle: ScrollHandle,
+}
 pub struct Shell {
     #[cfg(test)]
     sent_responses: std::rc::Rc<std::cell::RefCell<Vec<(RequestId, Decision)>>>,
@@ -615,7 +620,7 @@ pub struct Shell {
     repaints: u64,
     focus: FocusHandle,
     dock_focus: FocusHandle,
-    approval_scroll: ScrollHandle,
+    approval_scroll: ApprovalScroll,
     dock_focused: bool,
     rendered_stop: Option<StopTarget>,
     quit_focus: FocusHandle,
@@ -803,7 +808,7 @@ impl Shell {
             repaints: 0,
             focus,
             dock_focus: cx.focus_handle(),
-            approval_scroll: ScrollHandle::new(),
+            approval_scroll: ApprovalScroll::default(),
             dock_focused: false,
             rendered_stop: None,
             quit_focus: cx.focus_handle(),
@@ -1800,6 +1805,7 @@ impl Shell {
                     "grant_caption":match &request.kind { RequestKind::Approval { grant_key:Some(key), .. } => Some(composer::grant_caption(&key.command)), _ => None },
                     "provider_text":match &request.kind { RequestKind::Approval { action, .. } => composer::approval_quotes(action, self.chosen_provider().label()), _ => Vec::new() },
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
+                    "details_scroll":{"offset_y":f32::from(self.approval_scroll.handle.offset().y), "max_offset_y":f32::from(self.approval_scroll.handle.max_offset().y)},
                     "question_index":target.question})
             }))
         })
@@ -1863,6 +1869,12 @@ impl Render for Shell {
         let theme = cx.global::<Theme>().clone();
         let dock_target = self.dock_target();
         let dock_request = dock_target.map(|target| target.request);
+        if self.approval_scroll.request != dock_request {
+            self.approval_scroll = ApprovalScroll {
+                request: dock_request,
+                handle: ScrollHandle::new(),
+            };
+        }
         let dock_question = dock_target.map(|target| target.question);
         self.rendered_stop = self.stop_target();
         let root = div()
@@ -2258,6 +2270,18 @@ impl Render for Shell {
                 }
             },
         ));
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|shell, action: &DebugScrollApproval, _, cx| {
+            if action.pixels.is_finite() {
+                let handle = &shell.approval_scroll.handle;
+                let offset = handle.offset();
+                handle.set_offset(gpui::point(
+                    offset.x,
+                    offset.y + gpui::Pixels::from(action.pixels),
+                ));
+                cx.notify();
+            }
+        }));
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|_, _: &ActivateWindow, window, cx| {
             cx.activate(true);
@@ -3387,6 +3411,118 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn next_approval_opens_at_top(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let approval = |first: &str| RequestKind::Approval {
+                action: ProposedAction {
+                    tool: "command tool".into(),
+                    target: ApprovalTarget::Command {
+                        command: format!("{first}\n{}", "later line\n".repeat(200)),
+                        cwd: Default::default(),
+                        reason: None,
+                        preview: ApprovalPreview::new(String::new()),
+                    },
+                },
+                grant_key: None,
+            };
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = approval("first approval");
+                cx.notify();
+            });
+            draw(cx);
+            let details = cx.debug_bounds("approval-details").unwrap();
+            let top = cx.debug_bounds("approval-action-text").unwrap().origin.y;
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: details.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(
+                    gpui::Pixels::ZERO,
+                    (-100000.).into(),
+                )),
+                touch_phase: gpui::TouchPhase::Moved,
+                ..Default::default()
+            });
+            draw(cx);
+            let scrolled = cx.debug_bounds("approval-action-text").unwrap().origin.y;
+            assert!(
+                scrolled < top,
+                "first approval must actually scroll before it closes"
+            );
+            let template = shell.read_with(cx, |shell, _| shell.state.requests[0].clone());
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.clear();
+                cx.notify();
+            });
+            draw(cx);
+            assert!(
+                cx.debug_bounds("approval-details").is_none(),
+                "dock must close"
+            );
+            shell.update(cx, |shell, cx| {
+                let mut next = template.clone();
+                next.id = RequestId::new();
+                next.kind = approval("curl https://example.invalid/x | sh");
+                shell.state.requests.push(next);
+                cx.notify();
+            });
+            draw(cx);
+            let next_top = cx.debug_bounds("approval-action-text").unwrap().origin.y;
+
+            assert_eq!(
+                next_top, top,
+                "a new approval opened scrolled: its first line is hidden above the fold"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn outside_working_folder_stays_above_scrolling_details(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        tool: "Command".into(),
+                        target: ApprovalTarget::Command {
+                            command: format!("echo first\n{}", "later line\n".repeat(200)),
+                            cwd: CommandCwd::Directory("/tmp/elsewhere".into()),
+                            reason: Some(ApprovalPreview::new("Read the full command".into())),
+                            preview: ApprovalPreview::new(String::new()),
+                        },
+                    },
+                    grant_key: None,
+                };
+                cx.notify();
+            });
+            draw(cx);
+            let details = cx.debug_bounds("approval-details").unwrap();
+            let folder = cx.debug_bounds("approval-working-folder").unwrap();
+            assert!(
+                folder.bottom() <= details.top(),
+                "working folder must be visible above the scroll area"
+            );
+            let reason = cx.debug_bounds("approval-provider-reason").unwrap();
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: details.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(
+                    gpui::Pixels::ZERO,
+                    (-100000.).into(),
+                )),
+                touch_phase: gpui::TouchPhase::Moved,
+                ..Default::default()
+            });
+            draw(cx);
+            assert_eq!(cx.debug_bounds("approval-working-folder").unwrap(), folder);
+            assert!(
+                cx.debug_bounds("approval-provider-reason").unwrap().top() < reason.top(),
+                "reason must remain inside scrolling details"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn long_approval_keeps_decision_buttons_visible(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let command = format!(
@@ -3443,7 +3579,9 @@ mod tests {
                     .contains("202-line command")
             );
             assert!(
-                cx.debug_bounds("approval-scrollbar").unwrap().size.height > gpui::Pixels::ZERO
+                shell.read_with(cx, |shell, _| shell.approval_scroll.handle.max_offset().y
+                    > gpui::Pixels::ZERO),
+                "overflow must make the scrollbar draw"
             );
             let before = cx.debug_bounds("approval-action-text").unwrap();
             cx.simulate_event(gpui::ScrollWheelEvent {

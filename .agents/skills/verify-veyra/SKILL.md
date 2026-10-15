@@ -573,6 +573,7 @@ Approval dock action_text, consequence and preview report the same typed target,
 A cut preview ends with a notice.
 Consent command, preview and path displays mark Unicode controls and invisible formats as ⟨U+XXXX⟩; command newlines remain for heredocs.
 The dock's grant_caption uses the same marked command as the thread-grant button; request and grant identities keep the exact raw bytes.
+The dock details_scroll reports offset_y and max_offset_y from its request-keyed scroll handle. DebugScrollApproval accepts a finite pixels value and scrolls that same handle, without changing the pending request or its decision. A new docked request resets to the top.
 The full command or file path, consequence and bounded argument preview share a scrollable area within the composer height limit.
 Allow and Deny stay below that area.
 Questions share the same unfocused FocusDock prompt.
@@ -635,7 +636,8 @@ required = {
         'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png',
         'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png',
         'approval-write-inside.png','approval-write-outside.png','approval-web-fetch.png',
-        'approval-notebook-edit.png','approval-mcp.png','approval-long-command.png'],
+        'approval-notebook-edit.png','approval-mcp.png','approval-long-command.png',
+        'approval-long-command-end.png','approval-new-long-command.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json',
@@ -652,7 +654,8 @@ required = {
         'codex-chat-done.png','codex-other-thread-done.json','codex-other-thread.png','codex-notices-done.json','codex-notices.png'],
     'approvals-questions-codex':['codex-command.json','codex-command.png','codex-command-other-cwd.png',
         'codex-file.png','codex-permissions.png','codex-question.png','codex-mcp-first.png','codex-mcp-second.png',
-        'codex-async-question.png','codex-async-question-chosen.png','codex-async-question-typed-closed.png','codex-card-done.json','codex-reason-quoted.png'],
+        'codex-async-question.png','codex-async-question-chosen.png','codex-async-question-typed-closed.png','codex-card-done.json','codex-reason-quoted.png',
+        'codex-long-working-folder.png','codex-long-working-folder-end.png'],
     'multi-agent-codex':['codex-relay-done.json','codex-relay.png','codex-relay-log.txt',
         'codex-relay-parent.json','codex-relay-processes.txt',
         'codex-child-task.json','codex-child-task.png','codex-family-done.json','codex-family-done.png'],

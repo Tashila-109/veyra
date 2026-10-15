@@ -502,10 +502,10 @@ The notice includes the selected window's reset timestamp, or the individual spe
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
-An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text.
+An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text. The working-folder quote stays beside the consequence above the scrolling details; the reason scrolls with the command and preview.
 ToolCall stores a serde-defaulted veyra_label flag: only Codex's fixed labels are unquoted, while provider-named tools and older stored rows stay quoted.
 Both kinds use the bounded display projection; web search and image viewing have Veyra labels.
-Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers. Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them. Multiline command consequences name the line count, including blank lines, above the scrolling details. The shell owns the details scroll handle, and an always-visible kit scrollbar exposes overflow.
+Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers. Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them. Multiline command consequences name the line count, including blank lines, above the scrolling details. The shell owns ApprovalScroll, pairing the docked request id with its details scroll handle. A changed request id, including closing the dock, replaces the handle; repainting the same request preserves its offset. An always-visible kit scrollbar exposes actual overflow.
 The thread-grant button shows the first line of the marked command, shortened to its available width; execution, native replies and stored grant identities retain the original bytes.
 The UI takes ProviderKind for provider-specific behavior; display labels do not select behavior.
 Only the exact project cwd may use the existing command grant; every other cwd requires a human decision.
@@ -513,7 +513,7 @@ Permissions approvals grant the requested profile for the turn, while Deny and S
 Questions retain provider question ids and send answers by those ids; cancellation sends an empty answers object.
 AgentMessage delivery and question fields are typed separately from server requests.
 A valid async questions list becomes ItemBody::AsyncQuestions with the original message text and each title, option list and optional selected index; SQLite's existing item JSON stores that additive shape without a migration.
-The transcript renders additional agent message content above the cards with the same item-id markdown cache and reply renderer as AssistantText, preserving its full text and paragraphs. Empty messages or messages equal to the trimmed question titles are omitted.
+The transcript renders additional agent message content above the cards with the same item-id markdown cache and shared reply_markdown helper as AssistantText, preserving its full text and paragraphs. Empty messages or messages equal to the trimmed question titles are omitted.
 Each card quotes its provider title and option labels and explains that choosing sends a message, first stops active work and continues queued messages.
 ChooseAsyncOption is a gpui action, bound to Command-1 through Command-9 and reachable through the debug driver; the engine validates its item, question and option identity and refuses a repeated choice.
 One transaction persists the selected index and ordinary User turn.
@@ -849,11 +849,12 @@ System permission and native banner clicks require operator verification.
 The debug-only DebugNotificationResponse action passes a banner tag to the same notification_response handler as the native callback, allowing stale-tag routing checks without OS delivery.
 
 Provider display text uses the engine's pure text::display_line projection, with its own 400-character input cap, a trailing ellipsis when cut, collapsed whitespace and removed Unicode format and default-ignorable characters.
-Dock reasons and quoted provider tool names, async card titles and options, and family/plan labels use that projection with quotes and the existing truncation mark; reasons have their own labeled, muted element.
-Literal consent paths instead retain the full marked path, and commands retain their marked text with heredoc newlines.
+Dock reasons, transcript provider tool names, async card titles and options, and family/plan labels use that projection with quotes and the existing truncation mark; reasons have their own labeled, muted element.
+Literal consent paths and approval tool names instead retain their full marked consent projection in both action text and labeled quotes; commands retain their marked text with heredoc newlines.
 The debug dump exposes provider_text entries in approval docks and display_questions plus choices_active on async items beside the unchanged raw body.
 Those fields use the same display projection as rendering, while raw options remain available for exact protocol assertions.
 The debug tool_label and dock grant_caption fields share the row and grant-button rendering helpers.
+The debug-only DebugScrollApproval action moves the actual details handle used by wheel scrolling; details_scroll exposes its offset and maximum for window assertions without changing consent state.
 Raw option strings remain in the stored card and are selected by validated indices for UserText, so display cleanup cannot change the sent message.
 Commands and argument previews retain their code styling with visible Unicode markers; their underlying consent identities keep the exact bytes.
 

@@ -202,6 +202,13 @@ impl MarkdownPlugin for ReplyLineBreaks {
         )
     }
 }
+fn reply_markdown(item: &Item, markdown: SharedString) -> impl IntoElement {
+    TextView::markdown(
+        SharedString::from(format!("assistant-{}", item.id)),
+        markdown,
+    )
+    .plugin(ReplyLineBreaks)
+}
 fn row(
     item: &Item,
     expanded: bool,
@@ -228,26 +235,17 @@ fn row(
             )
         }
         ItemBody::AssistantText { .. } => {
-            row = row.child(
-                TextView::markdown(
-                    SharedString::from(format!("assistant-{}", item.id)),
-                    markdown.expect("markdown rows have cached text"),
-                )
-                .plugin(ReplyLineBreaks),
-            );
+            row = row.child(reply_markdown(
+                item,
+                markdown.expect("markdown rows have cached text"),
+            ));
         }
         ItemBody::AsyncQuestions { questions, .. } => {
             if let Some(markdown) = markdown {
                 row = row.child(
                     div()
                         .debug_selector(|| "async-question-message".into())
-                        .child(
-                            TextView::markdown(
-                                SharedString::from(format!("assistant-{}", item.id)),
-                                markdown,
-                            )
-                            .plugin(ReplyLineBreaks),
-                        ),
+                        .child(reply_markdown(item, markdown)),
                 );
             }
             for (question_index, question) in questions.iter().enumerate() {

@@ -38,19 +38,17 @@ pub(super) fn approval_text(
                 CommandCwd::Directory(_) => "in the working folder shown below".into(),
                 CommandCwd::NotVerified => "at a location that is not verified".into(),
             };
+            let codex_project = provider_kind == veyra_engine::provider::ProviderKind::Codex
+                && matches!(cwd, CommandCwd::ProjectFolder);
             let lines = command.split('\n').count();
             let consequence = if lines > 1 {
-                let location = if provider_kind == veyra_engine::provider::ProviderKind::Codex
-                    && matches!(cwd, CommandCwd::ProjectFolder)
-                {
+                let location = if codex_project {
                     "with the project folder as its working folder"
                 } else {
                     &location
                 };
                 format!("{provider} will run this {lines}-line command {location}.")
-            } else if provider_kind == veyra_engine::provider::ProviderKind::Codex
-                && matches!(cwd, CommandCwd::ProjectFolder)
-            {
+            } else if codex_project {
                 "Codex will use the project folder as its working folder.".to_owned()
             } else {
                 format!("{provider} will run this command {location}.")
@@ -118,11 +116,10 @@ pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<Qu
                 ));
             }
         }
-        ApprovalTarget::Tool { .. } => values.push(QuotedText::new(
+        ApprovalTarget::Tool { .. } => values.push(QuotedText::from_quoted(
             QuoteKind::Tool,
             format!("Tool requested by {provider}"),
-            &action.tool,
-            false,
+            format!("“{}”", consent_line(&action.tool)),
         )),
         ApprovalTarget::File { path, .. } => values.push(QuotedText::from_quoted(
             QuoteKind::File,
@@ -371,6 +368,12 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         RequestKind::Approval { action, grant_key } => {
                             let (label, consequence, preview) =
                                 approval_text(action, shell.chosen_provider());
+                            let mut quotes =
+                                approval_quotes(action, shell.chosen_provider().label());
+                            let folder = quotes
+                                .iter()
+                                .position(|value| matches!(value.kind, QuoteKind::WorkingFolder))
+                                .map(|index| quotes.remove(index));
                             dock = dock
                                 .key_context("VeyraDock VeyraApproval")
                                 .child(
@@ -380,6 +383,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .text_color(t.colors.text_muted)
                                         .child(consequence),
                                 )
+                                .when_some(folder, |dock, value| {
+                                    dock.child(value.render("approval-working-folder", cx))
+                                })
                                 .child(
                                     div()
                                         .relative()
@@ -393,7 +399,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 .v_flex()
                                                 .min_h_0()
                                                 .max_h(t.layout.composer_max_height)
-                                                .track_scroll(&shell.approval_scroll)
+                                                .track_scroll(&shell.approval_scroll.handle)
                                                 .overflow_y_scroll()
                                                 .pr(t.space.0[4])
                                                 .gap(t.space.0[3])
@@ -407,33 +413,22 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                         })
                                                         .child(label),
                                                 )
-                                                .children(
-                                                    approval_quotes(
-                                                        action,
-                                                        shell.chosen_provider().label(),
-                                                    )
-                                                    .into_iter()
-                                                    .map(|value| {
-                                                        let selector = match value.kind {
-                                                            QuoteKind::Reason => {
-                                                                "approval-provider-reason"
-                                                            }
-                                                            QuoteKind::WorkingFolder => {
-                                                                "approval-working-folder"
-                                                            }
-                                                            QuoteKind::Tool => {
-                                                                "approval-provider-tool"
-                                                            }
-                                                            QuoteKind::File => {
-                                                                "approval-provider-file"
-                                                            }
-                                                            QuoteKind::Question => {
-                                                                "approval-provider-text"
-                                                            }
-                                                        };
-                                                        value.render(selector, cx)
-                                                    }),
-                                                )
+                                                .children(quotes.into_iter().map(|value| {
+                                                    let selector = match value.kind {
+                                                        QuoteKind::Reason => {
+                                                            "approval-provider-reason"
+                                                        }
+                                                        QuoteKind::WorkingFolder => {
+                                                            "approval-working-folder"
+                                                        }
+                                                        QuoteKind::Tool => "approval-provider-tool",
+                                                        QuoteKind::File => "approval-provider-file",
+                                                        QuoteKind::Question => {
+                                                            "approval-provider-text"
+                                                        }
+                                                    };
+                                                    value.render(selector, cx)
+                                                }))
                                                 .when(!preview.is_empty(), |details| {
                                                     details.child(
                                                         div()
@@ -453,8 +448,10 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 .inset_0()
                                                 .debug_selector(|| "approval-scrollbar".into())
                                                 .child(
-                                                    Scrollbar::vertical(&shell.approval_scroll)
-                                                        .mode(ScrollbarMode::Always),
+                                                    Scrollbar::vertical(
+                                                        &shell.approval_scroll.handle,
+                                                    )
+                                                    .mode(ScrollbarMode::Always),
                                                 ),
                                         ),
                                 )
@@ -899,7 +896,7 @@ mod display_boundary_tests {
         };
         assert_eq!(
             approval_quotes(&action, "Codex")[0].text,
-            "“server / tool name”"
+            "“server⟨U+202E⟩⟨U+000A⟩ / tool⟨U+0009⟩name”"
         );
         let action = ProposedAction {
             tool: "Command".into(),
@@ -926,6 +923,21 @@ mod display_boundary_tests {
 
 #[cfg(test)]
 mod round_trip_display_tests {
+    #[test]
+    fn tool_quote_keeps_the_marked_consent_identity() {
+        use veyra_engine::domain::*;
+        let action = ProposedAction {
+            tool: "deploy\u{200b}\u{202e}\nnext".into(),
+            target: ApprovalTarget::Tool {
+                preview: ApprovalPreview::new("{}".into()),
+            },
+        };
+        let original = action.clone();
+        let quote = super::approval_quotes(&action, "Claude Code");
+        assert_eq!(quote[0].text, "“deploy⟨U+200B⟩⟨U+202E⟩⟨U+000A⟩next”");
+        assert_eq!(action, original);
+    }
+
     use super::approval_text;
     use veyra_engine::{domain::*, provider::ProviderKind};
     #[test]

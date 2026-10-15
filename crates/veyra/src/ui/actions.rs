@@ -137,6 +137,14 @@ pub struct DebugScrollTranscript {
     pub pixels: f32,
 }
 
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugScrollApproval {
+    pub pixels: f32,
+}
+
 pub struct Binding {
     pub action: &'static str,
     pub chord: &'static str,
