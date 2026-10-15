@@ -134,6 +134,14 @@ pub(super) fn markdown_text(item: &Item) -> Option<SharedString> {
         } else {
             format!("{text} ▏").into()
         }),
+        ItemBody::AsyncQuestions { text, questions } => {
+            let titles = questions
+                .iter()
+                .map(|question| question.title.trim())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty() && text.trim() != titles).then(|| text.clone().into())
+        }
         ItemBody::Reasoning { text, .. } => Some(text.clone().into()),
         _ => None,
     }
@@ -228,21 +236,18 @@ fn row(
                 .plugin(ReplyLineBreaks),
             );
         }
-        ItemBody::AsyncQuestions { text, questions } => {
-            let titles = questions
-                .iter()
-                .map(|question| question.title.trim())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.trim().is_empty() && text.trim() != titles {
+        ItemBody::AsyncQuestions { questions, .. } => {
+            if let Some(markdown) = markdown {
                 row = row.child(
-                    QuotedText::new(
-                        QuoteKind::Message,
-                        "Message from the provider".into(),
-                        text,
-                        false,
-                    )
-                    .render("async-question-message", cx),
+                    div()
+                        .debug_selector(|| "async-question-message".into())
+                        .child(
+                            TextView::markdown(
+                                SharedString::from(format!("assistant-{}", item.id)),
+                                markdown,
+                            )
+                            .plugin(ReplyLineBreaks),
+                        ),
                 );
             }
             for (question_index, question) in questions.iter().enumerate() {
@@ -863,6 +868,136 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(super::tool_label(&stored), "“Command”");
+    }
+    #[test]
+    fn async_question_message_keeps_full_markdown_and_paragraphs() {
+        let text = format!(
+            "{}\n\n**The complete second paragraph ends here.**",
+            "A full reply before the question. ".repeat(24)
+        );
+        let item = super::Item {
+            id: super::ItemId::new(),
+            thread: super::ThreadId::new(),
+            turn: super::TurnId::new(),
+            seq: 0,
+            body: super::ItemBody::AsyncQuestions {
+                text: text.clone(),
+                questions: vec![super::AsyncQuestion {
+                    title: "Which colour?".into(),
+                    options: vec!["Violet".into()],
+                    selected: None,
+                }],
+            },
+        };
+        assert!(text.chars().count() > 400);
+        assert_eq!(super::markdown_text(&item).as_deref(), Some(text.as_str()));
+        let assistant = super::Item {
+            body: super::ItemBody::AssistantText {
+                text: text.clone(),
+                done: true,
+            },
+            ..item.clone()
+        };
+        assert_eq!(
+            super::markdown_text(&item),
+            super::markdown_text(&assistant)
+        );
+        let titles_only = super::Item {
+            body: super::ItemBody::AsyncQuestions {
+                text: "  Which colour?  ".into(),
+                questions: vec![super::AsyncQuestion {
+                    title: "Which colour?".into(),
+                    options: vec!["Violet".into()],
+                    selected: None,
+                }],
+            },
+            ..item
+        };
+        assert_eq!(super::markdown_text(&titles_only), None);
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn async_question_message_uses_reply_markdown_layout(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::{prelude::*, *};
+        struct Reply(super::Item);
+        impl Render for Reply {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(cx.global::<super::Theme>().layout.transcript_min)
+                    .child(
+                        div()
+                            .debug_selector(|| "reply-content".into())
+                            .child(super::row(
+                                &self.0,
+                                false,
+                                super::markdown_text(&self.0),
+                                false,
+                                cx,
+                            )),
+                    )
+            }
+        }
+        cx.update(gpui_kit::init);
+        let text = format!(
+            "{}\n\n**The second paragraph remains complete.**",
+            "The full reply has useful detail. ".repeat(24)
+        );
+        let item = super::Item {
+            id: super::ItemId::new(),
+            thread: super::ThreadId::new(),
+            turn: super::TurnId::new(),
+            seq: 0,
+            body: super::ItemBody::AssistantText {
+                text: text.clone(),
+                done: true,
+            },
+        };
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+            Reply(item)
+        });
+        let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+        let mut heights = Vec::new();
+        for card in [false, true] {
+            if card {
+                view.update(cx, |view, cx| {
+                    view.0.body = super::ItemBody::AsyncQuestions {
+                        text: text.clone(),
+                        questions: vec![super::AsyncQuestion {
+                            title: "Which colour?".into(),
+                            options: vec!["Violet".into()],
+                            selected: None,
+                        }],
+                    };
+                    cx.notify();
+                });
+            }
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.draw(
+                    Point::default(),
+                    size(
+                        AvailableSpace::Definite(theme.layout.transcript_min),
+                        AvailableSpace::Definite(theme.layout.window_default.height),
+                    ),
+                    |_, _| div().child(view.clone()),
+                );
+            }
+            heights.push(
+                cx.debug_bounds(if card {
+                    "async-question-message"
+                } else {
+                    "reply-content"
+                })
+                .expect("reply rendered above card")
+                .size
+                .height,
+            );
+        }
+        assert_eq!(
+            heights[0], heights[1],
+            "async message must use the same complete markdown layout as a reply"
+        );
     }
     use super::tool_input;
     use gpui_kit::AppContext;

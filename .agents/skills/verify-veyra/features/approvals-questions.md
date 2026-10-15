@@ -99,7 +99,7 @@ for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve(
     assert dock['action_text'] == 'Write '+target
     assert dock['consequence'] == 'Claude Code writes a file '+place+' the project folder.'
     assert dock['request']['kind']['Approval']['grant_key'] is None
-    assert json.loads(dock['preview'].replace('⟨U+000A⟩','\n')) == {'content':'veyra check'}
+    assert json.loads(dock['preview']) == {'content':'veyra check'}
     capture('approval-write-'+place)
     action('approval-write-'+place+'-focus','FocusDock')
     ctl('approval-write-'+place+'-allow','keys','secondary-enter')
@@ -119,7 +119,7 @@ for label, tool, arguments in [
     thread = create('approval-'+label,'Approve the tool arguments',scenario=None)
     dump = poll('approval-'+label,lambda d: d['composer']['dock'] is not None)
     dock = dump['composer']['dock']
-    preview = json.loads(dock['preview'].replace('⟨U+000A⟩','\n'))
+    preview = json.loads(dock['preview'])
     if label == 'notebook-edit':
         assert dock['action_text'] == tool+' '+arguments['notebook_path']
         assert dock['consequence'] == 'Claude Code edits a file inside the project folder.'
@@ -129,6 +129,8 @@ for label, tool, arguments in [
         assert dock['consequence'] == 'Claude Code uses this tool with the arguments below.'
     assert preview == arguments
     assert dock['request']['kind']['Approval']['grant_key'] is None
+    if label == 'mcp':
+        assert '\n' in dock['preview'] and '⟨U+000A⟩' not in dock['preview']
     capture('approval-'+label)
     action('approval-'+label+'-allow','AllowOnce',{'request':dock['request']['id']})
     ctl('approval-'+label+'-done','wait',thread,'Done')
@@ -139,6 +141,7 @@ stage_records(records)
 thread = create('approval-long-command','Approve a long heredoc',scenario=None)
 dump = poll('approval-long-command-dock',lambda d: d['composer']['dock'] is not None)
 assert dump['composer']['dock']['action_text'] == command
+assert '202-line command' in dump['composer']['dock']['consequence']
 assert dump['composer']['dock']['request']['kind']['Approval']['grant_key']['command'] == command
 action('approval-long-command-focus','FocusDock')
 poll('approval-long-command-focused',lambda d: d['composer']['dock']['focused'])
@@ -296,6 +299,7 @@ thread = create_codex('codex-command-invisibles',records=records)
 dock = poll('codex-command-invisibles',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 marked = "printf 'a⟨U+202E⟩⟨U+200B⟩b'\nprintf done"
 assert dock['action_text']==marked
+assert dock['consequence']=='Codex will run this 2-line command with the project folder as its working folder.'
 assert dock['grant_caption']=='Allow `'+marked+'` in this thread'
 assert dock['request']['kind']['Approval']['action']['target']['command']==command
 assert dock['request']['kind']['Approval']['grant_key']['command']==command
@@ -307,11 +311,18 @@ assert json.loads(sql("select body_json from requests where thread_id='"+thread+
 
 poll('codex-before-card-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
 records = codex_records('async-question')
+question_message = (
+    "The first paragraph explains the choice before asking for a decision. Veyra can use Violet for the accent while keeping the rest of the interface quiet and readable. This reply is intentionally longer than four hundred characters so its ending remains part of the visible answer."
+    "\n\n"
+    "The second paragraph keeps the recommendation separate from the controls below. Review both alternatives, then choose the colour that should be sent as an ordinary message. The complete reply ends here, above the question card."
+)
+assert len(question_message) > 400
 exact_option = 'Vi\u202eolet'
 for record in records:
     wire = record.get('line',{})
     item = wire.get('params',{}).get('item',{})
     if item.get('delivery')=='async':
+        item['text']=question_message
         item['questions'][0]['title']='Should Veyra use Violet or Blue?\n\u200b'
         item['questions'][0]['options'][0]=exact_option
     if record.get('type')=='expect_outbound' and wire.get('method')=='turn/start' and wire['params']['input'][0]['text']=='Violet':
@@ -330,6 +341,8 @@ question = next(item for item in card['transcript']['items'] if item['kind']=='a
 assert question['body']['AsyncQuestions']['questions'][0] == {'title':'Should Veyra use Violet or Blue?\n\u200b','options':[exact_option,'Blue'],'selected':None}
 assert question['display_questions'][0]=={'title':'“Should Veyra use Violet or Blue?”','options':['“Violet”','“Blue”']}
 assert question['choices_active'] is True
+assert question['text']==question_message
+assert question['body']['AsyncQuestions']['text']==question_message
 capture('codex-async-question')
 ctl('codex-card-choice','keys','secondary-1')
 chosen = ctl('codex-card-done','wait',thread,'Done')
@@ -396,7 +409,7 @@ A grant in the project permits the identical command there; the same command in 
 SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
 File and permission denials, the Violet answer and both MCP decisions are persisted.
 The reason PNG shows a single quoted provider line, under its own label and apart from the consequence.
-The async-question PNG shows quoted sanitized title and option controls and the choice consequence; its captured UserText preserves the option's exact bidi-bearing bytes.
+The async-question PNG shows the complete two-paragraph markdown reply above the quoted sanitized title, option controls and choice consequence; its captured UserText preserves the option's exact bidi-bearing bytes.
 The chosen PNG retains the question, shows Sent Violet and disables both controls.
 Command-1 chooses the latest-turn card. The typed-answer PNG leaves its option unselected and closes both controls; a later key or explicit stale choice starts no third turn.
 The strict fixture requires its pending request cancellation before interrupt and Violet as ordinary user input; SQLite records two User turns, the expired request and no hold.
@@ -407,7 +420,7 @@ The focused approval PNGs show Allow once, Deny and their answer chords, matchin
 The project file stays absent after Deny and exists after Allow once.
 The Write PNGs and action_text/consequence fields show absolute targets inside and outside the project, plus their content preview.
 The WebFetch, NotebookEdit and MCP PNGs show their full arguments in a bounded, scrollable area.
-The long-command PNG shows a heredoc in that area with Allow and Deny visible below it.
+The long-command PNG shows a heredoc in that area with an always-visible scrollbar, a 202-line consequence above it, and Allow and Deny visible below it. The MCP preview retains its pretty JSON line breaks.
 Its action_text keeps heredoc newlines and marks invisible characters; its stored grant key preserves the whole original command.
 Only the provider codec interprets tool fields and resolves file locations; rendering consumes typed data.
 Those fake requests check dock presentation, not outside file effects.

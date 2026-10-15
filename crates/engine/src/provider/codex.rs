@@ -936,15 +936,19 @@ impl Codec {
                 let tool = item.tool().unwrap();
                 if !state.started {
                     state.started = true;
-                    let (name, arguments, summary) = match item {
+                    let (name, arguments, summary, veyra_label) = match item {
                         wire::Item::CommandExecution(command) => (
                             "Command".into(),
                             json!({"command":command.command,"cwd":command.cwd}),
                             command.command.clone(),
+                            true,
                         ),
-                        wire::Item::FileChange(file) => {
-                            ("File change".into(), json!({"changes":file.changes}), None)
-                        }
+                        wire::Item::FileChange(file) => (
+                            "File change".into(),
+                            json!({"changes":file.changes}),
+                            None,
+                            true,
+                        ),
                         wire::Item::McpToolCall(call) => (
                             format!(
                                 "{} / {}",
@@ -953,6 +957,7 @@ impl Codec {
                             ),
                             call.arguments.clone().unwrap_or(Value::Null),
                             None,
+                            false,
                         ),
                         wire::Item::CollabAgentToolCall(call) => (
                             match call.action {
@@ -972,23 +977,26 @@ impl Codec {
                             .into(),
                             serde_json::to_value(item).unwrap(),
                             None,
+                            true,
                         ),
                         wire::Item::WebSearch(_) => (
                             "Web search".into(),
                             serde_json::to_value(item).unwrap(),
                             None,
+                            true,
                         ),
                         wire::Item::ImageView(_) => (
                             "View image".into(),
                             serde_json::to_value(item).unwrap(),
                             None,
+                            true,
                         ),
                         _ => return,
                     };
                     events.push(TurnEvent::ToolStarted {
                         key: key.clone(),
                         call: ToolCall {
-                            veyra_label: !matches!(item, wire::Item::McpToolCall(_)),
+                            veyra_label,
                             name,
                             arguments,
                             input_summary: summary,

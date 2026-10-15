@@ -283,18 +283,16 @@ impl SessionIo {
     }
 }
 
-async fn launch(
+fn launch(
     provider: ProviderKind,
     spec: &SessionSpec,
     env: &ChildEnv,
     fresh: Option<NativeSessionId>,
     session_epoch: u32,
-    before_spawn: impl FnOnce() -> Result<(), ProviderError>,
 ) -> Result<Process, ProviderError> {
     let server = if spec.root { env.mcp.as_ref() } else { None };
     match provider {
         ProviderKind::Claude => {
-            before_spawn()?;
             let native = fresh
                 .or_else(|| spec.native.clone())
                 .unwrap_or_else(|| NativeSessionId(spec.thread.to_string()));
@@ -346,33 +344,30 @@ async fn launch(
                 },
             )
         }
-        ProviderKind::Codex => {
-            before_spawn()?;
-            launch_with(
-                provider,
-                spec,
-                env,
-                vec!["app-server".into()],
-                "unknown until thread reply",
-                |args, spawn| {
-                    let child = spawn(args)?;
-                    let config = server.map(|server| {
-                        Arc::new(codex::McpConfig::new(
-                            server.clone(),
-                            spec.thread,
-                            session_epoch,
-                            child.pid(),
-                        ))
-                    });
-                    let codec = Codec::Codex(Box::new(codex::Codec::new(
-                        spec.clone(),
+        ProviderKind::Codex => launch_with(
+            provider,
+            spec,
+            env,
+            vec!["app-server".into()],
+            "unknown until thread reply",
+            |args, spawn| {
+                let child = spawn(args)?;
+                let config = server.map(|server| {
+                    Arc::new(codex::McpConfig::new(
+                        server.clone(),
+                        spec.thread,
+                        session_epoch,
                         child.pid(),
-                        config.clone(),
-                    )));
-                    Ok((child, config.map(RootMcp::Codex), codec))
-                },
-            )
-        }
+                    ))
+                });
+                let codec = Codec::Codex(Box::new(codex::Codec::new(
+                    spec.clone(),
+                    child.pid(),
+                    config.clone(),
+                )));
+                Ok((child, config.map(RootMcp::Codex), codec))
+            },
+        ),
         ProviderKind::Grok => Err(ProviderError::NotBuilt),
     }
 }
@@ -505,14 +500,9 @@ fn start_provider_task(
         let mut process = match process {
             Some(process) => process,
             None => {
-                match async {
-                    receiver.drain_and_check_launch(&out)?;
-                    launch(provider, &spec, &env, None, epoch, || {
-                        receiver.drain_and_check_launch(&out)
-                    })
-                    .await
-                }
-                .await
+                match receiver
+                    .drain_and_check_launch(&out)
+                    .and_then(|()| launch(provider, &spec, &env, None, epoch))
                 {
                     Ok(process) => process,
                     Err(error) => {
@@ -536,14 +526,9 @@ fn start_provider_task(
                 Completion::MissingSession => {
                     spec.native = None;
                     let native = NativeSessionId(ThreadId::new().to_string());
-                    match async {
-                        receiver.drain_and_check_launch(&out)?;
-                        launch(provider, &spec, &env, Some(native), epoch, || {
-                            receiver.drain_and_check_launch(&out)
-                        })
-                        .await
-                    }
-                    .await
+                    match receiver
+                        .drain_and_check_launch(&out)
+                        .and_then(|()| launch(provider, &spec, &env, Some(native), epoch))
                     {
                         Ok(mut next) => {
                             next.io.child.watch(&cleanup);

@@ -11,7 +11,6 @@ pub(super) enum QuoteKind {
     Tool,
     File,
     Question,
-    Message,
 }
 #[derive(serde::Serialize)]
 pub(super) struct QuotedText {

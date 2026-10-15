@@ -33,10 +33,16 @@ pub fn display_line(text: &str, previously_truncated: bool) -> DisplayLine {
     }
     DisplayLine { text, truncated }
 }
-pub fn consent_text(text: &str, keep_newlines: bool) -> String {
+pub fn consent_multiline(text: &str) -> String {
+    consent_projection(text, |ch| ch == '\n')
+}
+pub fn consent_line(text: &str) -> String {
+    consent_projection(text, |_| false)
+}
+fn consent_projection(text: &str, preserve: impl Fn(char) -> bool) -> String {
     let mut projected = String::new();
     for ch in text.chars() {
-        if keep_newlines && ch == '\n' {
+        if preserve(ch) {
             projected.push(ch);
         } else if ch.is_control()
             || matches!(ch, '\u{2028}' | '\u{2029}')

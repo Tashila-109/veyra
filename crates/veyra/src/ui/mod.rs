@@ -615,6 +615,7 @@ pub struct Shell {
     repaints: u64,
     focus: FocusHandle,
     dock_focus: FocusHandle,
+    approval_scroll: ScrollHandle,
     dock_focused: bool,
     rendered_stop: Option<StopTarget>,
     quit_focus: FocusHandle,
@@ -802,6 +803,7 @@ impl Shell {
             repaints: 0,
             focus,
             dock_focus: cx.focus_handle(),
+            approval_scroll: ScrollHandle::new(),
             dock_focused: false,
             rendered_stop: None,
             quit_focus: cx.focus_handle(),
@@ -3429,6 +3431,20 @@ mod tests {
             }
             let dock = shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"].clone());
             assert_eq!(dock["action_text"], command, "command must remain whole");
+            let consequence = cx.debug_bounds("approval-consequence").unwrap();
+            assert!(
+                consequence.bottom() <= text.top(),
+                "line count must stay above the scrolling command"
+            );
+            assert!(
+                dock["consequence"]
+                    .as_str()
+                    .unwrap()
+                    .contains("202-line command")
+            );
+            assert!(
+                cx.debug_bounds("approval-scrollbar").unwrap().size.height > gpui::Pixels::ZERO
+            );
             let before = cx.debug_bounds("approval-action-text").unwrap();
             cx.simulate_event(gpui::ScrollWheelEvent {
                 position: text.center(),
@@ -3444,6 +3460,10 @@ mod tests {
             assert!(
                 after.origin.y < before.origin.y,
                 "approval command did not scroll"
+            );
+            assert_eq!(
+                cx.debug_bounds("approval-consequence").unwrap(),
+                consequence
             );
             assert_eq!(cx.debug_bounds("approval-deny-button").unwrap(), deny);
             assert_eq!(cx.debug_bounds("approval-allow-button").unwrap(), allow);
