@@ -614,6 +614,7 @@ struct ApprovalScroll {
 struct QuestionScroll {
     target: Option<DockTarget>,
     handle: ScrollHandle,
+    options: ScrollHandle,
 }
 pub struct Shell {
     #[cfg(test)]
@@ -628,6 +629,7 @@ pub struct Shell {
     dock_focus: FocusHandle,
     approval_scroll: ApprovalScroll,
     question_scroll: QuestionScroll,
+    input_docked: bool,
     dock_focused: bool,
     rendered_stop: Option<StopTarget>,
     quit_focus: FocusHandle,
@@ -817,6 +819,7 @@ impl Shell {
             dock_focus: cx.focus_handle(),
             approval_scroll: ApprovalScroll::default(),
             question_scroll: QuestionScroll::default(),
+            input_docked: false,
             dock_focused: false,
             rendered_stop: None,
             quit_focus: cx.focus_handle(),
@@ -1883,12 +1886,14 @@ impl Render for Shell {
             self.question_scroll = QuestionScroll {
                 target: dock_target,
                 handle: ScrollHandle::new(),
+                options: ScrollHandle::new(),
             };
         }
         let dock_request = dock_target.map(|target| target.request);
-        if self.approval_scroll.request.is_some() != dock_request.is_some() {
+        if self.input_docked != dock_target.is_some() {
+            self.input_docked = dock_target.is_some();
             self.input.update(cx, |input, cx| {
-                if dock_request.is_some() {
+                if self.input_docked {
                     input.set_auto_grow(1, 1, cx);
                 } else {
                     input.set_auto_grow(2, 10, cx);
@@ -3562,6 +3567,93 @@ mod tests {
     }
 
     #[cfg(debug_assertions)]
+    const DOCK_OPTIONS: [(&str, &str); 9] = [
+        ("dock-option-0", "dock-option-caption-0"),
+        ("dock-option-1", "dock-option-caption-1"),
+        ("dock-option-2", "dock-option-caption-2"),
+        ("dock-option-3", "dock-option-caption-3"),
+        ("dock-option-4", "dock-option-caption-4"),
+        ("dock-option-5", "dock-option-caption-5"),
+        ("dock-option-6", "dock-option-caption-6"),
+        ("dock-option-7", "dock-option-caption-7"),
+        ("dock-option-8", "dock-option-caption-8"),
+    ];
+
+    #[cfg(debug_assertions)]
+    fn configure_dock_thread(
+        shell: &mut super::Shell,
+        provider: ProviderKind,
+        hold: bool,
+        queued: bool,
+    ) -> (ThreadId, TurnId) {
+        let thread = shell.view.chat().unwrap();
+        shell
+            .state
+            .turns
+            .retain(|_, turn| turn.thread != thread || turn.state != TurnState::Queued);
+        let turn = shell
+            .state
+            .turns
+            .values()
+            .find(|turn| turn.thread == thread && matches!(turn.state, TurnState::Running { .. }))
+            .unwrap()
+            .id;
+        let project = ProjectId::new();
+        shell.state.projects.clear();
+        shell.state.projects.insert(
+            project,
+            Project {
+                id: project,
+                path: "/tmp".into(),
+                name: "Project".into(),
+            },
+        );
+        shell.state.threads.insert(
+            thread,
+            Thread {
+                id: thread,
+                project,
+                title: "T".into(),
+                lineage: Lineage::Root,
+                provider,
+                config: shell.config.clone(),
+                cwd: "/tmp".into(),
+                native: None,
+                native_cursor: None,
+                cli_version: None,
+                hold: hold.then_some(HoldReason::ChildReport),
+                view: View::Chat,
+                import_pending: false,
+                archived: false,
+            },
+        );
+        shell.providers = vec![Probe {
+            provider,
+            path: None,
+            version: None,
+            readiness: Readiness::Ready,
+            models: vec![],
+            account: None,
+        }];
+        if queued {
+            let id = TurnId::new();
+            shell.state.turns.insert(
+                id,
+                Turn {
+                    id,
+                    thread,
+                    ordinal: 2,
+                    origin: TurnOrigin::User {
+                        item: ItemId::new(),
+                    },
+                    state: TurnState::Queued,
+                },
+            );
+        }
+        (thread, turn)
+    }
+
+    #[cfg(debug_assertions)]
     fn dock_layout_issues(
         shell: &Entity<super::Shell>,
         cx: &mut gpui::VisualTestContext,
@@ -3603,20 +3695,9 @@ mod tests {
         .into_iter()
         .filter_map(|name| cx.debug_bounds(name).map(|bounds| (name, bounds)))
         .collect();
-        let option_names = [
-            "dock-option-0",
-            "dock-option-1",
-            "dock-option-2",
-            "dock-option-3",
-            "dock-option-4",
-            "dock-option-5",
-            "dock-option-6",
-            "dock-option-7",
-            "dock-option-8",
-        ];
-        let options: Vec<_> = option_names
-            .into_iter()
-            .filter_map(|name| cx.debug_bounds(name).map(|bounds| (name, bounds)))
+        let options: Vec<_> = DOCK_OPTIONS
+            .iter()
+            .filter_map(|(name, _)| cx.debug_bounds(name).map(|bounds| (*name, bounds)))
             .collect();
         if cx.debug_bounds("dock-options").is_none() {
             regions.extend(options.iter().copied());
@@ -3651,9 +3732,29 @@ mod tests {
         .into_iter()
         .filter_map(|name| cx.debug_bounds(name).map(|bounds| (name, bounds)))
         .collect();
-        controls.extend(options);
-        for (index, (name, bounds)) in controls.iter().enumerate() {
+        let option_viewport = cx.debug_bounds("dock-options");
+        for (name, bounds) in &options {
             if bounds.size.height < button_height || bounds.size.width <= gpui::Pixels::ZERO {
+                issues.push(format!("control {name} collapsed: {bounds:?}"));
+            }
+            if let Some(content) = cx.debug_bounds("dock-options-content")
+                && !contains(content, *bounds)
+            {
+                issues.push(format!(
+                    "option escapes list: {name} {bounds:?} / {content:?}"
+                ));
+            }
+        }
+
+        controls.extend(options.into_iter().filter_map(|(name, bounds)| {
+            let visible = option_viewport.map_or(bounds, |viewport| bounds.intersect(&viewport));
+            (visible.size.height > gpui::Pixels::ZERO && visible.size.width > gpui::Pixels::ZERO)
+                .then_some((name, visible))
+        }));
+        for (index, (name, bounds)) in controls.iter().enumerate() {
+            if !DOCK_OPTIONS.iter().any(|(option, _)| option == name)
+                && (bounds.size.height < button_height || bounds.size.width <= gpui::Pixels::ZERO)
+            {
                 issues.push(format!("control {name} collapsed: {bounds:?}"));
             }
             if !inside(*bounds) {
@@ -3686,6 +3787,157 @@ mod tests {
                 issues.push(format!(
                     "question paint escapes quote: quote={quote:?}, \
                      label={label:?}, value={visible:?}"
+                ));
+            }
+        }
+        let text_pairs = [
+            ("composer-hold", "composer-hold-text"),
+            ("dock-count", "dock-count-text"),
+            ("approval-consequence", "approval-consequence-text"),
+            ("approval-action-text", "approval-action-content"),
+            ("approval-preview", "approval-preview-content"),
+            ("approval-grant-button", "approval-grant-caption"),
+            ("dock-focus-hint", "dock-focus-hint-text"),
+            ("approval-working-folder", "approval-working-folder-label"),
+            (
+                "approval-working-folder-label",
+                "approval-working-folder-label-content",
+            ),
+            (
+                "approval-working-folder-text",
+                "approval-working-folder-content",
+            ),
+            ("approval-working-folder", "approval-working-folder-scroll"),
+            ("approval-provider-reason", "approval-provider-reason-label"),
+            (
+                "approval-provider-reason-label",
+                "approval-provider-reason-label-content",
+            ),
+            (
+                "approval-provider-reason-value",
+                "approval-provider-reason-content",
+            ),
+            ("approval-provider-reason", "approval-provider-reason-value"),
+            ("approval-provider-tool", "approval-provider-tool-label"),
+            (
+                "approval-provider-tool-label",
+                "approval-provider-tool-label-content",
+            ),
+            (
+                "approval-provider-tool-value",
+                "approval-provider-tool-content",
+            ),
+            ("approval-provider-tool", "approval-provider-tool-value"),
+            ("approval-provider-file", "approval-provider-file-label"),
+            (
+                "approval-provider-file-label",
+                "approval-provider-file-label-content",
+            ),
+            (
+                "approval-provider-file-value",
+                "approval-provider-file-content",
+            ),
+            ("approval-provider-file", "approval-provider-file-value"),
+            ("dock-provider-question", "dock-provider-question-label"),
+            (
+                "dock-provider-question-label",
+                "dock-provider-question-label-content",
+            ),
+            (
+                "dock-provider-question-value",
+                "dock-provider-question-content",
+            ),
+            ("dock-provider-question", "dock-question-scroll"),
+        ];
+        for (region, content) in text_pairs {
+            match (cx.debug_bounds(region), cx.debug_bounds(content)) {
+                (Some(bounds), Some(text)) => {
+                    if !contains(bounds, text) {
+                        issues.push(format!(
+                            "text escapes {region}: region={bounds:?}, content={text:?}"
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => issues.push(format!(
+                    "missing text selector: region={region}, content={content}"
+                )),
+            }
+        }
+        let labels = shell.read_with(cx, |shell, _| {
+            shell
+                .dock_target()
+                .and_then(|target| {
+                    shell
+                        .state
+                        .requests
+                        .iter()
+                        .find(|r| r.id == target.request)
+                        .and_then(|r| match &r.kind {
+                            RequestKind::Question { questions } => {
+                                questions.get(target.question).map(|q| q.options.clone())
+                            }
+                            _ => None,
+                        })
+                })
+                .unwrap_or_default()
+        });
+        if labels.len() <= 4
+            && let Some(first) = cx.debug_bounds(DOCK_OPTIONS[0].0)
+        {
+            for (button, _) in &DOCK_OPTIONS[1..labels.len().max(1)] {
+                if let Some(bounds) = cx.debug_bounds(button)
+                    && (bounds.left() != first.left() || bounds.size.width != first.size.width)
+                {
+                    issues.push(format!(
+                        "up to four options require one column: \
+                         first={first:?}, other={bounds:?}"
+                    ));
+                }
+            }
+        }
+        for ((button, caption), (index, label)) in
+            DOCK_OPTIONS.iter().zip(labels.iter().enumerate())
+        {
+            let button = cx.debug_bounds(button).unwrap();
+            let caption = cx.debug_bounds(caption).unwrap();
+            let text: gpui::SharedString = format!(
+                "{}  {}",
+                index + 1,
+                super::provider_text::quoted(label, false)
+            )
+            .into();
+            let required = cx.update(|window, cx| {
+                let t = cx.global::<super::Theme>();
+                let mut font = gpui::font(t.text.ui_font.clone());
+                font.weight = t.text.label.weight;
+                window
+                    .text_system()
+                    .shape_text(
+                        text.clone(),
+                        t.text.label.size.to_pixels(window.rem_size()),
+                        &[gpui::TextRun {
+                            len: text.len(),
+                            font,
+                            ..Default::default()
+                        }],
+                        Some(caption.size.width),
+                        None,
+                    )
+                    .unwrap()
+                    .iter()
+                    .map(|line| {
+                        line.size(t.text.label.line_height.to_pixels(window.rem_size()))
+                            .height
+                    })
+                    .sum::<gpui::Pixels>()
+            });
+            if !contains(button, caption)
+                || caption.size.height + gpui::Pixels::from(0.1) < required
+            {
+                issues.push(format!(
+                    "option {index} hides caption: button={button:?}, \
+                     caption={caption:?}, required_height={required:?}"
                 ));
             }
         }
@@ -3806,7 +4058,7 @@ mod tests {
                     card: Some(card),
                 });
             }
-            for count in [2, 9] {
+            for (count, realistic) in [(2, false), (3, true), (4, true), (9, false), (9, true)] {
                 for question_index in 0..3 {
                     let question = Question {
                         text: if long {
@@ -3818,10 +4070,13 @@ mod tests {
                         } else {
                             "Choose a route".into()
                         },
-                        options: (0..count).map(|i| format!("Option number {i}")).collect(),
+                        options: (0..count).map(|i| if realistic {
+                            if count <= 4 { ["Use PostgreSQL (Recommended)", "Keep SQLite for now", "Add the migration later", "Ask me after the tests pass"][i].into() }
+                            else { format!("Option {}: use PostgreSQL for the service and keep the existing migration history", i + 1) }
+                        } else { format!("Option number {i}") }).collect(),
                     };
                     cases.push(Case {
-                        name: format!("question count={count} long={long} multi={question_index}"),
+                        name: format!("question count={count} realistic={realistic} long={long} multi={question_index}"),
                         kind: Some(RequestKind::Question {
                             questions: vec![question; if question_index == 0 { 1 } else { 2 }],
                         }),
@@ -3840,10 +4095,14 @@ mod tests {
                 cx.simulate_resize(viewport);
                 for provider in [ProviderKind::Claude, ProviderKind::Codex] {
                     for case in &cases {
-                        for flags in 0..16 {
+                        for flags in 0..32 {
                             shell.update_in(cx, |shell, window, cx| {
-                                let thread = shell.view.chat().unwrap();
-                                let turn = *shell.state.turns.keys().next().unwrap();
+                                let (thread, turn) = configure_dock_thread(
+                                    shell,
+                                    provider,
+                                    flags & 1 != 0,
+                                    flags & 16 != 0,
+                                );
                                 shell.state.requests.clear();
                                 shell.question_draft = None;
                                 if let Some(kind) = &case.kind {
@@ -3870,43 +4129,6 @@ mod tests {
                                         shell.state.requests.push(second);
                                     }
                                 }
-                                let project = ProjectId::new();
-                                shell.state.projects.clear();
-                                shell.state.projects.insert(
-                                    project,
-                                    Project {
-                                        id: project,
-                                        path: "/tmp".into(),
-                                        name: "Project".into(),
-                                    },
-                                );
-                                shell.state.threads.insert(
-                                    thread,
-                                    Thread {
-                                        id: thread,
-                                        project,
-                                        title: "T".into(),
-                                        lineage: Lineage::Root,
-                                        provider,
-                                        config: shell.config.clone(),
-                                        cwd: "/tmp".into(),
-                                        native: None,
-                                        native_cursor: None,
-                                        cli_version: None,
-                                        hold: (flags & 1 != 0).then_some(HoldReason::ChildReport),
-                                        view: View::Chat,
-                                        import_pending: false,
-                                        archived: false,
-                                    },
-                                );
-                                shell.providers = vec![Probe {
-                                    provider,
-                                    path: None,
-                                    version: None,
-                                    readiness: Readiness::Ready,
-                                    models: vec![],
-                                    account: None,
-                                }];
                                 shell.state.items.clear();
                                 shell.state.item_order.clear();
                                 shell.state.markdown_text.clear();
@@ -3950,6 +4172,10 @@ mod tests {
                             });
                             draw(cx);
                             let mut issues = dock_layout_issues(&shell, cx);
+                            assert_eq!(
+                                cx.debug_bounds("composer-discard").is_some(),
+                                flags & 1 != 0 && flags & 16 != 0
+                            );
                             if case.card.is_some() && viewport == theme.layout.window_default {
                                 assert!(cx.debug_bounds("async-question-title").is_some());
                             }
@@ -3958,18 +4184,9 @@ mod tests {
                                 case.kind.is_some()
                             );
                             if let Some(RequestKind::Question { questions }) = &case.kind {
-                                let names = [
-                                    "dock-option-0",
-                                    "dock-option-1",
-                                    "dock-option-2",
-                                    "dock-option-3",
-                                    "dock-option-4",
-                                    "dock-option-5",
-                                    "dock-option-6",
-                                    "dock-option-7",
-                                    "dock-option-8",
-                                ];
-                                for name in &names[..questions[case.question_index].options.len()] {
+                                for (name, _) in
+                                    &DOCK_OPTIONS[..questions[case.question_index].options.len()]
+                                {
                                     assert!(cx.debug_bounds(name).is_some(), "missing {name}");
                                 }
                                 if !issues.is_empty() {
@@ -3992,7 +4209,7 @@ mod tests {
                 "all dock matrix: {checked} combinations, {} failures, {question_failures} question failures",
                 failures.len()
             );
-            assert_eq!(checked, cases.len() * 64);
+            assert_eq!(checked, cases.len() * 128);
             assert!(
                 failures.is_empty(),
                 "{} failures; first cases: {:#?}",
@@ -4144,35 +4361,7 @@ mod tests {
             let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
             cx.simulate_resize(theme.layout.window_min);
             shell.update(cx, |shell, cx| {
-                let thread = shell.view.chat().unwrap();
-                let project = ProjectId::new();
-                shell.state.projects.insert(
-                    project,
-                    Project {
-                        id: project,
-                        path: "/tmp".into(),
-                        name: "Project".into(),
-                    },
-                );
-                shell.state.threads.insert(
-                    thread,
-                    Thread {
-                        id: thread,
-                        project,
-                        title: "T".into(),
-                        lineage: Lineage::Root,
-                        provider: ProviderKind::Claude,
-                        config: shell.config.clone(),
-                        cwd: "/tmp".into(),
-                        native: None,
-                        native_cursor: None,
-                        cli_version: None,
-                        hold: Some(HoldReason::ChildReport),
-                        view: View::Chat,
-                        import_pending: false,
-                        archived: false,
-                    },
-                );
+                configure_dock_thread(shell, ProviderKind::Claude, true, false);
                 shell.state.requests[0].kind = RequestKind::Question {
                     questions: (0..2)
                         .map(|i| Question {
@@ -4247,6 +4436,99 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn option_scroll_resets_for_each_question_and_request(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            cx.simulate_resize(theme.layout.window_min);
+            shell.update(cx, |shell, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, true, true);
+                shell.state.requests[0].kind = RequestKind::Question {
+                    questions: (0..2).map(|i| Question {
+                        text: format!("Question {i}: {}", "q".repeat(400)),
+                        options: (0..9).map(|i| format!("Option {i}: use PostgreSQL for the service and keep the existing migration history")).collect(),
+                    }).collect(),
+                };
+                cx.notify();
+            });
+            draw(cx);
+            let scroll = |cx: &mut gpui::VisualTestContext| {
+                let viewport = cx.debug_bounds("dock-options").unwrap();
+                cx.simulate_event(gpui::ScrollWheelEvent {
+                    position: viewport.center(),
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(
+                        gpui::Pixels::ZERO,
+                        (-100000.).into(),
+                    )),
+                    touch_phase: gpui::TouchPhase::Moved,
+                    ..Default::default()
+                });
+                draw(cx);
+                shell.read_with(cx, |shell, _| {
+                    assert!(
+                        shell.question_scroll.options.max_offset().y > gpui::Pixels::ZERO,
+                        "overflow draws the shared always-visible scrollbar"
+                    );
+                    assert!(shell.question_scroll.options.offset().y < gpui::Pixels::ZERO);
+                    assert_eq!(
+                        shell.question_scroll.handle.offset().y,
+                        gpui::Pixels::ZERO,
+                        "option scroll must not scroll the question"
+                    );
+                });
+            };
+            scroll(cx);
+            let offset = shell.read_with(cx, |shell, _| shell.question_scroll.options.offset());
+            shell.update(cx, |_, cx| cx.notify());
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.question_scroll.options.offset()),
+                offset
+            );
+            shell.update(cx, |shell, cx| {
+                shell.question_draft = Some((
+                    shell.state.requests[0].id,
+                    vec![Answer {
+                        text: "first choice".into(),
+                    }],
+                ));
+                cx.notify();
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.question_scroll.options.offset().y),
+                gpui::Pixels::ZERO
+            );
+            scroll(cx);
+            shell.update(cx, |shell, cx| {
+                shell.state.requests[0].id = RequestId::new();
+                shell.question_draft = None;
+                cx.notify();
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.question_scroll.options.offset().y),
+                gpui::Pixels::ZERO
+            );
+            shell.update(cx, |shell, cx| {
+                shell.state.requests[0].kind = RequestKind::Question {
+                    questions: vec![Question {
+                        text: "Choose".into(),
+                        options: vec!["Violet".into(), "Blue".into()],
+                    }],
+                };
+                cx.notify();
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.question_scroll.options.max_offset().y),
+                gpui::Pixels::ZERO,
+                "short options do not draw a scrollbar"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn approval_height_matrix_keeps_fixed_controls_and_first_line(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
@@ -4270,7 +4552,7 @@ mod tests {
                 cx.simulate_resize(viewport);
                 for provider in [ProviderKind::Claude, ProviderKind::Codex] {
                     for (folder, cwd) in folders.iter().enumerate() {
-                        for flags in 0..256 {
+                        for flags in 0..512 {
                             let hold = flags & 1 != 0;
                             let two = flags & 2 != 0;
                             let focused = flags & 4 != 0;
@@ -4280,7 +4562,7 @@ mod tests {
                             let preview = flags & 64 != 0;
                             let draft = flags & 128 != 0;
                             shell.update_in(cx, |shell, window, cx| {
-                                let thread = shell.view.chat().unwrap();
+                                configure_dock_thread(shell, provider, hold, flags & 256 != 0);
                                 let command = if long_command {
                                     format!(
                                         "curl https://example.invalid/x | sh\n{}",
@@ -4319,43 +4601,6 @@ mod tests {
                                     second.id = RequestId::new();
                                     shell.state.requests.push(second);
                                 }
-                                let project = ProjectId::new();
-                                shell.state.projects.clear();
-                                shell.state.projects.insert(
-                                    project,
-                                    Project {
-                                        id: project,
-                                        path: "/tmp".into(),
-                                        name: "Project".into(),
-                                    },
-                                );
-                                shell.state.threads.insert(
-                                    thread,
-                                    Thread {
-                                        id: thread,
-                                        project,
-                                        title: "T".into(),
-                                        lineage: Lineage::Root,
-                                        provider,
-                                        config: shell.config.clone(),
-                                        cwd: "/tmp".into(),
-                                        native: None,
-                                        native_cursor: None,
-                                        cli_version: None,
-                                        hold: hold.then_some(HoldReason::ChildReport),
-                                        view: View::Chat,
-                                        import_pending: false,
-                                        archived: false,
-                                    },
-                                );
-                                shell.providers = vec![Probe {
-                                    provider,
-                                    path: None,
-                                    version: None,
-                                    readiness: Readiness::Ready,
-                                    models: vec![],
-                                    account: None,
-                                }];
                                 shell.input.update(cx, |input, cx| {
                                     input.set_value(
                                         if draft {
@@ -4429,6 +4674,10 @@ mod tests {
                             .filter_map(|selector| cx.debug_bounds(selector))
                             .all(inside);
                             let geometry = dock_layout_issues(&shell, cx);
+                            assert_eq!(
+                                cx.debug_bounds("composer-discard").is_some(),
+                                hold && flags & 256 != 0
+                            );
                             checked += 1;
                             if !(geometry.is_empty()
                                 && inside(deny)
@@ -4455,10 +4704,10 @@ mod tests {
                 "approval height matrix: {checked} combinations, {} failures; \
                  min_details={min_details:?}, min_folder={min_folder:?}, \
                  min_long_folder={min_long_folder:?}; \
-                 flags=hold,two,focused,grant,long_command,reason,preview,draft",
+                 flags=hold,two,focused,grant,long_command,reason,preview,draft,queued",
                 failures.len()
             );
-            assert_eq!(checked, 6144);
+            assert_eq!(checked, 12288);
             assert!(
                 failures.is_empty(),
                 "{} failures; first cases: {:#?}",

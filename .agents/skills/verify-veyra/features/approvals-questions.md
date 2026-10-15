@@ -21,7 +21,7 @@ Composer ⌘↵ sends a nonempty draft and leaves the request pending; an empty 
 Every button's shortcut_chip reads the same bindings table as the keymap.
 Buttons answer their displayed request; an expired request or a question index that already advanced sends no answer.
 A question keeps its labeled text in a bounded scroll area above its options.
-Two options use a column; more than two use three columns so nine choices fit in the minimum window.
+Up to four options use one column; larger lists use three columns. Captions wrap in their buttons, and overflowing lists scroll with the shared visible scrollbar.
 A pending dock keeps the scrollable message input at its 48px minimum; closing the dock restores its normal height limit.
 Click Focus to use shortcuts or press ⌘⇧Y to FocusDock.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
@@ -209,12 +209,29 @@ save('questions-done',result)
 assert result['composer']['dock'] is None
 assert sql("select count(*) from requests where thread_id='"+two+"' and state='answered'") == '2'
 records = [json.loads(line) for line in (SOURCE/'question.jsonl').read_text().splitlines()]
+labels = ['Use PostgreSQL (Recommended)', 'Keep SQLite for now', 'Add the migration later', 'Ask me after the tests pass']
+question_wire = records[4]['line']['request']['input']['questions'][0]
+question_text = question_wire['question'] = 'Which database should the service use?'
+question_wire['options'] = [{'label':label, 'description':'Database route'} for label in labels]
+records[5]['line']['response']['response']['updatedInput'] = {'questions':[question_wire], 'answers':{question_text:labels[3]}}
+stage_records(records)
+four = create('question-four','Choose a database route',scenario=None)
+dock = poll('question-four',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert dock['request']['kind']['Question']['questions'][0]['options']==labels
+capture('question-four')
+action('question-four-focus','FocusDock')
+ctl('question-four-choice','keys','4')
+done = ctl('question-four-done','wait',four,'Done')
+assert done['composer']['dock'] is None
+assert any(item['kind']=='user' and labels[3] in item['text'] for item in done['transcript']['items'])
+records = [json.loads(line) for line in (SOURCE/'question.jsonl').read_text().splitlines()]
 question_text = ('Which route should the agent take? ' * 20)[:400]
 question_wire = records[4]['line']['request']['input']['questions'][0]
 question_wire['question'] = question_text
-question_wire['options'] = [{'label':f'Option number {i}','description':f'Route {i}'} for i in range(9)]
+labels = [f'Route {i + 1}: use PostgreSQL and keep the migration history' for i in range(9)]
+question_wire['options'] = [{'label':label,'description':f'Route {i}'} for i,label in enumerate(labels)]
 records[5]['line']['response']['response']['updatedInput'] = {
-    'questions':[question_wire], 'answers':{question_text:'Option number 8'}}
+    'questions':[question_wire], 'answers':{question_text:labels[8]}}
 stage_records(records)
 nine = create('question-nine','Choose among nine routes',scenario=None)
 dock = poll('question-nine',lambda d:d['composer']['dock'] is not None)['composer']['dock']
@@ -225,7 +242,7 @@ action('question-nine-focus','FocusDock')
 ctl('question-nine-choice','keys','9')
 done = ctl('question-nine-done','wait',nine,'Done')
 assert done['composer']['dock'] is None
-assert any(item['kind']=='user' and 'Option number 8' in item['text'] for item in done['transcript']['items'])
+assert any(item['kind']=='user' and labels[8] in item['text'] for item in done['transcript']['items'])
 save('approvals-done',ctl('approvals-final','dump'))
 poll('approvals-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null')=='0')
 page_done('approvals-questions')
@@ -305,11 +322,28 @@ assert any(item['kind']=='user' and 'Violet' in item['text'] for item in done['t
 assert 'Violet' in sql("select decision_json from requests where thread_id='"+thread+"'")
 records = codex_records('question')
 index = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/tool/requestUserInput')
+labels = ['Use PostgreSQL (Recommended)', 'Keep SQLite for now', 'Add the migration later', 'Ask me after the tests pass']
+question_wire = records[index]['line']['params']['questions'][0]
+question_wire['question'] = 'Which database should the service use?'
+question_wire['options'] = [{'label':label, 'description':'Database route'} for label in labels]
+records[index+1]['line']['result']['answers']['color']['answers'] = [labels[3]]
+thread = create_codex('codex-question-four',records=records,prompt='Choose a database route')
+dock = poll('codex-question-four',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert dock['request']['kind']['Question']['questions'][0]['options']==labels
+capture('codex-question-four')
+action('codex-question-four-focus','FocusDock')
+ctl('codex-question-four-choice','keys','4')
+done = ctl('codex-question-four-done','wait',thread,'Done')
+assert done['composer']['dock'] is None
+assert any(item['kind']=='user' and labels[3] in item['text'] for item in done['transcript']['items'])
+records = codex_records('question')
+index = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/tool/requestUserInput')
 question_text = ('Which route should the agent take? ' * 20)[:400]
 question_wire = records[index]['line']['params']['questions'][0]
 question_wire['question'] = question_text
-question_wire['options'] = [{'label':f'Option number {i}','description':f'Route {i}'} for i in range(9)]
-records[index+1]['line']['result']['answers']['color']['answers'] = ['Option number 8']
+labels = [f'Route {i + 1}: use PostgreSQL and keep the migration history' for i in range(9)]
+question_wire['options'] = [{'label':label,'description':f'Route {i}'} for i,label in enumerate(labels)]
+records[index+1]['line']['result']['answers']['color']['answers'] = [labels[8]]
 thread = create_codex('codex-question-nine',records=records,prompt='Choose among nine routes')
 dock = poll('codex-question-nine',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert len(dock['request']['kind']['Question']['questions'][0]['options'])==9
@@ -319,7 +353,7 @@ action('codex-question-nine-focus','FocusDock')
 ctl('codex-question-nine-choice','keys','9')
 done = ctl('codex-question-nine-done','wait',thread,'Done')
 assert done['composer']['dock'] is None
-assert any(item['kind']=='user' and 'Option number 8' in item['text'] for item in done['transcript']['items'])
+assert any(item['kind']=='user' and labels[8] in item['text'] for item in done['transcript']['items'])
 thread = create_codex('codex-mcp',scenario='mcp-tool-approval')
 for label,decision in [('first','AllowOnce'),('second','Deny')]:
     dock = poll('codex-mcp-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
@@ -478,11 +512,14 @@ PYCODEX
 ## Observable success
 
 `question.png`, `question-focused.png` and `codex-question.png` show two-option docks with text clear of the controls.
-`question-nine.png` and `codex-question-nine.png` show the 400-character question above nine controls in three columns, with a tall draft retained in the bounded message input.
-The digit-9 replies preserve Option number 8 as the answer in both providers' strict fixtures and stored user text.
-The GPUI matrices also check disjoint visible regions, contained quote text, the docked editor inside its input viewport and every dock/composer button inside both theme window sizes for every dock kind.
+`question-four.png` and `codex-question-four.png` show the four realistic database labels in one column.
+`question-nine.png` and `codex-question-nine.png` show every long route label wrapped in three columns below the 400-character question, with a tall draft retained in the fixed 48px message input.
+The digit-9 replies preserve the ninth route label as the answer in both providers' strict fixtures and stored user text.
+The GPUI matrices also check disjoint visible regions, contained text for every region, the docked editor inside its input viewport and every dock/composer button inside both theme window sizes for every dock kind (scrolling choices are clipped to their viewport).
+A queued-turn flag exercises Discard queued alongside Continue in both matrices.
+Caption checks shape each complete option label at its actual font and width, so truncation cannot pass as containment.
 The draft test scrolls to the last of 40 lines and proves the original text and normal input growth survive closing the dock.
-Question text keeps at least one 20px line, caps at 240px, and scrolls independently of its label and options; its handle resets for each request and question index.
+Question text keeps at least one 20px line, caps at 240px, and scrolls independently of its label and options; both its text and option-list handles reset for each request and question index.
 The shared scrollbar uses a 16px logical thumb minimum so even a one-line track has visible thumb travel.
 
 `codex-command-invisibles.png` shows U+202E and U+200B markers in the command and grant button; the stored request keeps the exact bytes and Allow once completes the fixture.
@@ -491,7 +528,7 @@ Previews mark control characters too, and literal file and working-folder paths 
 `codex-long-working-folder.png` and `codex-long-working-folder-end.png` show a complete, marked working folder longer than 2,000 characters in its own viewport of at most three text lines above the scrolling details.
 Allow and Deny and the command's first line remain visible when it opens; the model-written reason stays inside the details.
 The GPUI wheel test proves the folder scrolls to its end independently without eliding its path.
-The GPUI height matrix covers both theme sizes, Claude and Codex, every combination of hold, request count, focus, grant, command length, reason, preview and draft height, with project, unverified, short, typical, two-line and long folders.
+The GPUI height matrix covers both theme sizes, Claude and Codex, every combination of hold, request count, focus, grant, command length, reason, preview, draft height and queued turns, with project, unverified, short, typical, two-line and long folders.
 The transcript gives up space before the dock; the details use the remaining height, capped at 240px, and retain the command's first line.
 The matrix keeps the long folder's three lines and at least one code line even in its most crowded cases.
 The folder viewport shows an always-visible kit scrollbar when the path overflows, and no scrollbar when it fits.

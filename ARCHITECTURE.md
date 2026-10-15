@@ -813,17 +813,19 @@ The chat column bounds the composer by its available height; the transcript give
 Flex layout measures the hold row, request count, consequence, wrapped decision buttons, focus hint, input and toolbar before shrinking the details to the remaining height, capped at composer_max_height (240px).
 The command or file path, model-written reason and bounded argument preview share that details scroll area, which keeps at least one code-text line.
 The consequence and any outside working folder sit above it, and Allow and Deny stay below it.
-The folder's viewport keeps at most three label-text lines; while a request is docked, the message input keeps its 48px minimum height and its draft remains scrollable.
+The folder's viewport keeps at most three label-text lines; while a request is docked, the message input has a fixed 48px height and its draft remains scrollable.
 The dock also switches the editor from two-to-ten auto-growing rows to one row, gives its frame a definite 48px height and clips that viewport, so the editor itself fits above the toolbar while its full draft remains scrollable.
 Closing the dock restores the normal two-to-ten-row growth and 240px input limit.
+Growing the docked input when there is spare room is carried to the polish stage.
 Decision controls put Deny and Allow once before the optional thread grant, so a wide grant wraps after both decisions instead of forcing three rows.
 At both theme window sizes, the approval matrix retains the long folder's three lines and at least one code line even with all fixed controls present, so no smaller-folder fallback is needed.
 Folder, details and question text use one bounded-scroll helper whose caller supplies minimum and maximum heights, with independent kit scrollbars visible only for actual overflow.
 Its 16px logical thumb minimum leaves travel on a 20px one-line track; the kit's 4px end insets leave an 8px painted thumb at that minimum.
 Only the working-folder quote uses the 16px label line height; other quotes retain their inherited 20px UI line height and natural height.
 Question text scrolls from one 20px line up to the 240px composer cap beneath its fixed label; the combined question region keeps a 44px minimum for label, gap and one text line.
-Two options stay in a column, and larger lists use three columns so all nine controls fit at the minimum theme size.
-Shell owns QuestionScroll separately, keyed by the docked RequestId and question index; a changed target replaces its handle, and repainting the same target keeps its offset.
+Up to four options use one column; larger lists use three columns.
+Option captions wrap without visual truncation inside buttons of at least 28px; overflowing lists scroll in a 28–240px bounded viewport with the same overflow-only scrollbar.
+Shell owns QuestionScroll separately, keyed by the docked RequestId and question index; a changed target replaces both its text and option-list handles, and repainting the same target keeps their offsets.
 Shell owns both approval handles and replaces them when the docked request id changes, so each new request opens at the top with its full marked path available by scrolling and no elision.
 The stable folder element id does not own that reset.
 The dock shows 1 of N for multiple pending requests.

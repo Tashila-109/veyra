@@ -180,6 +180,19 @@ pub(super) fn button_text(label: SharedString, cx: &App) -> Div {
         .child(button_caption(label))
 }
 
+fn option_caption(option: usize, label: SharedString, cx: &App) -> Div {
+    let t = cx.global::<Theme>();
+    div()
+        .debug_selector(move || format!("dock-option-caption-{option}"))
+        .text_size(t.text.label.size)
+        .line_height(t.text.label.line_height)
+        .font_weight(t.text.label.weight)
+        .w_full()
+        .min_w_0()
+        .whitespace_normal()
+        .child(label)
+}
+
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let config = shell.composer_config().clone();
@@ -318,7 +331,12 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                 div()
                                     .text_size(t.text.label.size)
                                     .text_color(t.colors.text_muted)
-                                    .child(WaitReason::Held(hold).to_string()),
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .debug_selector(|| "composer-hold-text".into())
+                                            .child(WaitReason::Held(hold).to_string()),
+                                    ),
                             )
                             .child(
                                 div()
@@ -374,7 +392,12 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                     .text_size(t.text.meta.size)
                                     .text_color(t.colors.text_muted)
                                     .debug_selector(|| "dock-count".into())
-                                    .child(format!("1 of {}", pending.len())),
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .debug_selector(|| "dock-count-text".into())
+                                            .child(format!("1 of {}", pending.len())),
+                                    ),
                             )
                         });
                     match &request.kind {
@@ -395,7 +418,14 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         .flex_none()
                                         .text_size(t.text.label.size)
                                         .text_color(t.colors.text_muted)
-                                        .child(consequence),
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .debug_selector(|| {
+                                                    "approval-consequence-text".into()
+                                                })
+                                                .child(consequence),
+                                        ),
                                 )
                                 .when_some(folder, |dock, value| {
                                     dock.child(
@@ -418,7 +448,14 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 .text_size(t.text.code.size)
                                                 .line_height(t.text.code.line_height)
                                                 .debug_selector(|| "approval-action-text".into())
-                                                .child(label),
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .debug_selector(|| {
+                                                            "approval-action-content".into()
+                                                        })
+                                                        .child(label),
+                                                ),
                                         )
                                         .children(quotes.into_iter().map(|value| {
                                             let selector = value.kind.selector();
@@ -431,7 +468,14 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     .font_family(t.text.mono_font.clone())
                                                     .text_size(t.text.code.size)
                                                     .line_height(t.text.code.line_height)
-                                                    .child(preview),
+                                                    .child(
+                                                        div()
+                                                            .flex_none()
+                                                            .debug_selector(|| {
+                                                                "approval-preview-content".into()
+                                                            })
+                                                            .child(preview),
+                                                    ),
                                             )
                                         }),
                                     t.text.code.line_height.into(),
@@ -495,13 +539,18 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                             ),
                                         )
                                         .when_some(grant_key.as_ref(), |row, key| {
+                                            let caption = grant_caption(&key.command);
                                             row.child(
                                                 dock_chip(
-                                                    labelled_button(
+                                                    labelled_button_with(
                                                         SharedString::from(format!(
                                                             "allow-thread-{request_id}"
                                                         )),
-                                                        grant_caption(&key.command),
+                                                        caption.clone(),
+                                                        button_text(caption.into(), cx)
+                                                            .debug_selector(|| {
+                                                                "approval-grant-caption".into()
+                                                            }),
                                                         cx,
                                                     )
                                                     .debug_selector(|| {
@@ -536,33 +585,39 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         )
                                         .render_question(&shell.question_scroll.handle, cx),
                                     )
-                                    .child(
+                                    .child(bounded_scroll(
+                                        "question-options",
+                                        "dock-options",
+                                        &shell.question_scroll.options,
                                         div()
-                                            .debug_selector(|| "dock-options".into())
+                                            .debug_selector(|| "dock-options-content".into())
                                             .grid()
-                                            .grid_cols(if question.options.len() > 2 {
+                                            .grid_cols(if question.options.len() > 4 {
                                                 3
                                             } else {
                                                 1
                                             })
                                             .w_full()
-                                            .flex_none()
                                             .gap(t.space.0[3])
                                             .children(question.options.iter().enumerate().map(
                                                 |(option, label)| {
-                                                    labelled_button(
+                                                    let caption: SharedString = format!(
+                                                        "{}  {}",
+                                                        option + 1,
+                                                        super::provider_text::quoted(label, false)
+                                                    )
+                                                    .into();
+                                                    labelled_button_with(
                                                         SharedString::from(format!(
                                                             "answer-{request_id}-{index}-{option}"
                                                         )),
-                                                        format!(
-                                                            "{}  {}",
-                                                            option + 1,
-                                                            super::provider_text::quoted(
-                                                                label, false
-                                                            )
-                                                        ),
+                                                        caption.clone(),
+                                                        option_caption(option, caption, cx),
                                                         cx,
                                                     )
+                                                    .h_auto()
+                                                    .min_h(t.layout.icon_button)
+                                                    .py(t.space.0[1])
                                                     .justify_start()
                                                     .w_full()
                                                     .min_w_0()
@@ -570,7 +625,6 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     .debug_selector(move || {
                                                         format!("dock-option-{option}")
                                                     })
-                                                    .child(div().flex_1())
                                                     .on_click(cx.listener(
                                                         move |_, _, window, cx| {
                                                             window.dispatch_action(
@@ -585,19 +639,29 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     ))
                                                 },
                                             )),
-                                    );
+                                        t.layout.icon_button.into(),
+                                        t.layout.composer_max_height.into(),
+                                        cx,
+                                    ));
                             }
                         }
                     }
                     composer.child(dock.when(!shell.dock_focused, |dock| {
+                        let hint: SharedString = "Focus to use shortcuts".into();
                         dock.child(
-                            labelled_button("focus-dock", "Focus to use shortcuts", cx)
-                                .flex_shrink_0()
-                                .debug_selector(|| "dock-focus-hint".into())
-                                .child(shortcut_chip::<FocusDock>(cx))
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(FocusDock), cx)
-                                }),
+                            labelled_button_with(
+                                "focus-dock",
+                                hint.clone(),
+                                button_text(hint, cx)
+                                    .debug_selector(|| "dock-focus-hint-text".into()),
+                                cx,
+                            )
+                            .flex_shrink_0()
+                            .debug_selector(|| "dock-focus-hint".into())
+                            .child(shortcut_chip::<FocusDock>(cx))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(FocusDock), cx)
+                            }),
                         )
                     }))
                 })

@@ -73,47 +73,59 @@ impl QuotedText {
         cx: &App,
     ) -> AnyElement {
         let t = cx.global::<Theme>();
-        let value = div()
-            .pl(t.space.0[3])
-            .border_l(t.layout.border)
-            .border_color(t.colors.border)
-            .debug_selector(move || format!("{selector}-value"))
-            .child(self.text);
-        let value = if let Some(scroll) = scroll {
-            let (id, selector, handle, min, max) = match scroll {
-                QuoteScroll::Folder(handle) => (
+        let (text_selector, region_minimum, line_height, viewport) = match scroll {
+            Some(QuoteScroll::Folder(handle)) => (
+                "approval-working-folder-text".to_owned(),
+                Length::Auto,
+                t.text.label.line_height,
+                Some((
                     "working-folder",
                     "approval-working-folder-scroll",
                     handle,
                     t.text.label.line_height.into(),
                     (t.text.label.line_height * 3.).into(),
-                ),
-                QuoteScroll::Question(handle) => (
+                )),
+            ),
+            Some(QuoteScroll::Question(handle)) => (
+                format!("{selector}-value"),
+                t.layout.dock_question_min_height.into(),
+                t.text.ui.line_height,
+                Some((
                     "question-text",
                     "dock-question-scroll",
                     handle,
                     t.text.ui.line_height.into(),
                     t.layout.composer_max_height.into(),
-                ),
-            };
-            let value = if matches!(scroll, QuoteScroll::Folder(_)) {
-                value.debug_selector(|| "approval-working-folder-text".into())
-            } else {
-                value
-            };
-            bounded_scroll(id, selector, handle, value, min, max, cx).into_any_element()
+                )),
+            ),
+            None => (
+                format!("{selector}-value"),
+                Length::Auto,
+                t.text.ui.line_height,
+                None,
+            ),
+        };
+        let value = div()
+            .pl(t.space.0[3])
+            .border_l(t.layout.border)
+            .border_color(t.colors.border)
+            .debug_selector(move || text_selector.clone())
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector(move || format!("{selector}-content"))
+                    .child(self.text),
+            );
+        let value = if let Some((id, viewport, handle, min, max)) = viewport {
+            bounded_scroll(id, viewport, handle, value, min, max, cx).into_any_element()
         } else {
             value.into_any_element()
         };
         div()
             .debug_selector(move || selector.into())
-            .when(matches!(scroll, Some(QuoteScroll::Question(_))), |value| {
-                value.min_h(t.layout.dock_question_min_height)
-            })
+            .min_h(region_minimum)
             .v_flex()
-            .when(matches!(scroll, Some(QuoteScroll::Folder(_))), |value| {
-                value.min_h_auto().line_height(t.text.label.line_height)
-            })
+            .line_height(line_height)
             .gap(t.space.0[1])
             .text_size(t.text.label.size)
             .text_color(t.colors.text_muted)
@@ -122,7 +134,12 @@ impl QuotedText {
                     .flex_none()
                     .debug_selector(move || format!("{selector}-label"))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.label),
+                    .child(
+                        div()
+                            .flex_none()
+                            .debug_selector(move || format!("{selector}-label-content"))
+                            .child(self.label),
+                    ),
             )
             .child(value)
             .into_any_element()
