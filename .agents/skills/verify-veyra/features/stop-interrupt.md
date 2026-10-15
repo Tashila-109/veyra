@@ -116,7 +116,7 @@ poll('notifications-inactive',lambda d: not d['window_active'])
 needs = poll('notifications-needs-you',lambda d: d['selected_thread']['status']=='NeedsYou')
 assert needs['notifications']['posted']==posted+1
 stage('ok-reply')
-action('notifications-answer-away','Deny')
+action('notifications-answer-away','Deny',{'request':needs['composer']['dock']['request']['id']})
 done = ctl('notifications-done-away','wait',thread,'Done')
 assert done['notifications']['posted']==posted+2
 old_banner_tag = thread

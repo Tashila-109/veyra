@@ -1380,10 +1380,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(request) = self.pending_request(request).map(|row| row.id) else {
+        let Some(row) = self.pending_request(request) else {
             self.notice("This request is no longer pending", cx);
             return;
         };
+        if row.kind.accepts(&decision).is_none() {
+            return;
+        }
+        let request = row.id;
         self.send_command(Command::Respond { request, decision }, window, cx);
         if self.view.chat().is_some_and(|thread| {
             self.state
@@ -1804,17 +1808,20 @@ impl Shell {
             "stop_visible":self.shown_stop(cx).is_some(),
             "discard_queued_visible":self.discard_queued_visible(),
             "dock":self.dock_target().and_then(|target| self.pending_request(Some(target.request)).map(|request| {
-                let text = match &request.kind {
-                    RequestKind::Approval { action, .. } => Some(composer::approval_text(
-                        action, self.chosen_provider())),
-                    _ => None,
+                let approval = match &request.kind {
+                    RequestKind::Approval { action } => Some(action),
+                    RequestKind::Question { .. } => None,
                 };
+                let text = approval.map(|action| composer::approval_text(action, self.chosen_provider()));
                 let mut dock = serde_json::json!({"request":request, "position":1,
                     "action_text":text.as_ref().map(|(label, _, _)| label),
                     "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
                     "preview":text.as_ref().map(|(_, _, preview)| preview),
-                    "grant_caption":request.kind.grant_key().map(|key| composer::grant_caption(&key.command)),
-                    "provider_text":match &request.kind { RequestKind::Approval { action, .. } => composer::approval_quotes(action, self.chosen_provider().label()), _ => Vec::new() },
+                    "grant_caption":approval.and_then(composer::approval_grant_caption),
+                    "allow_once_enabled":request.kind.accepts(&Decision::AllowOnce).is_some(),
+                    "allow_in_thread_enabled":request.kind.grant_key().is_some(),
+                    "consent_reason":approval.and_then(|action| match &action.consent { veyra_engine::domain::ApprovalConsent::DenyOnly { reason } => Some(reason), _ => None }),
+                    "provider_text":approval.map(|action| composer::approval_quotes(action, self.chosen_provider().label())).unwrap_or_default(),
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
                     "question_index":target.question});
                 if self.approval_scroll.request == Some(request.id) {
@@ -3694,6 +3701,7 @@ mod tests {
             "composer-hold",
             "dock-count",
             "approval-consequence",
+            "approval-consent-reason",
             "approval-working-folder",
             "approval-details",
             "dock-provider-question",
@@ -3998,6 +4006,20 @@ mod tests {
                 preview: preview.clone(),
             };
             cases.push(Case {
+                name: format!("Deny-only command long={long}"),
+                kind: Some(RequestKind::Approval {
+                    action: ProposedAction {
+                        consent: ApprovalConsent::DenyOnly {
+                            reason: "Grok offered only a lasting grant".into(),
+                        },
+                        tool: "Bash".into(),
+                        target: command.clone(),
+                    },
+                }),
+                question_index: 0,
+                card: None,
+            });
+            cases.push(Case {
                 name: format!("command long={long}"),
                 kind: approval("Command", command.clone()),
                 question_index: 0,
@@ -4111,7 +4133,7 @@ mod tests {
             let mut question_failures = 0;
             for viewport in [theme.layout.window_min, theme.layout.window_default] {
                 cx.simulate_resize(viewport);
-                for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+                for provider in ProviderKind::ALL {
                     for case in &cases {
                         for flags in 0..16 {
                             shell.update_in(cx, |shell, window, cx| {
@@ -4220,7 +4242,7 @@ mod tests {
                 "all dock matrix: {checked} combinations, {} failures, {question_failures} question failures",
                 failures.len()
             );
-            assert_eq!(checked, cases.len() * 64);
+            assert_eq!(checked, cases.len() * ProviderKind::ALL.len() * 32);
             assert!(
                 failures.is_empty(),
                 "{} failures; first cases: {:#?}",
@@ -5250,6 +5272,110 @@ mod tests {
             );
             assert!(!shell.read_with(cx, |shell, _| shell.dock_focused));
             assert!(cx.debug_bounds("veyra::AllowInThread").is_none());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn grok_deny_only_dock_disables_both_allows_and_keeps_deny(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let responses = shell.read_with(cx, |shell, _| shell.sent_responses.clone());
+            let request = shell.update(cx, |shell, cx| {
+                configure_dock_thread(shell, ProviderKind::Grok, false, false);
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        consent: ApprovalConsent::DenyOnly {
+                            reason: "Grok offered only a lasting grant".into(),
+                        },
+                        tool: "Bash".into(),
+                        target: ApprovalTarget::Command {
+                            command: "touch veyra-check.txt".into(),
+                            cwd: CommandCwd::ProjectFolder,
+                            reason: None,
+                            preview: ApprovalPreview::new(String::new()),
+                        },
+                    },
+                };
+                cx.notify();
+                shell.state.requests[0].id
+            });
+            draw(cx);
+            assert!(cx.debug_bounds("approval-consent-reason").is_some());
+            for selector in ["approval-allow-button", "approval-grant-button"] {
+                let button = cx.debug_bounds(selector).unwrap().center();
+                cx.simulate_click(button, gpui::Modifiers::none());
+                draw(cx);
+                assert!(
+                    responses.borrow().is_empty(),
+                    "disabled {selector} answered"
+                );
+            }
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
+            for chord in ["secondary-enter", "secondary-alt-enter"] {
+                cx.simulate_keystrokes(chord);
+                draw(cx);
+                assert!(responses.borrow().is_empty(), "disabled {chord} answered");
+                assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
+            }
+            cx.dispatch_action(super::AllowOnce {
+                request: Some(request),
+            });
+            cx.dispatch_action(super::AllowInThread {
+                request: Some(request),
+            });
+            draw(cx);
+            assert!(responses.borrow().is_empty());
+            let dump = shell.read_with(cx, |shell, cx| shell.dump_composer(cx));
+            assert_eq!(dump["dock"]["allow_once_enabled"], false);
+            assert_eq!(dump["dock"]["allow_in_thread_enabled"], false);
+            assert_eq!(
+                dump["dock"]["consent_reason"],
+                "Grok offered only a lasting grant"
+            );
+            assert_eq!(dump["dock"]["grant_caption"], "Allow in this thread");
+            let button = cx.debug_bounds("approval-deny-button").unwrap().center();
+            cx.simulate_click(button, gpui::Modifiers::none());
+            draw(cx);
+            assert_eq!(responses.borrow().as_slice(), &[(request, Decision::Deny)]);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn grok_no_catalog_menus_offer_only_default(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Grok, false, false);
+                shell.state.requests.clear();
+                shell.new_thread(window, cx);
+                shell.provider = ProviderKind::Grok;
+                shell.config.model = Some("earlier-model".into());
+                shell.config.effort = Some("earlier-effort".into());
+                cx.notify();
+            });
+            draw(cx);
+            let button = cx.debug_bounds("composer-model").unwrap().center();
+            cx.simulate_click(button, gpui::Modifiers::none());
+            draw(cx);
+            cx.simulate_keystrokes("down down enter");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.config.model.clone()),
+                None
+            );
+            let button = cx.debug_bounds("composer-effort").unwrap().center();
+            cx.simulate_click(button, gpui::Modifiers::none());
+            draw(cx);
+            cx.simulate_keystrokes("down down enter");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.config.effort.clone()),
+                None
+            );
+            assert!(cx.debug_bounds("caption-Default model").is_some());
+            assert!(cx.debug_bounds("caption-Effort").is_some());
         });
     }
 

@@ -15,8 +15,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::{
-    ApprovalTarget, CommandCwd, FileOperation, ProposedAction, RequestKind, TargetLocation,
-    WaitReason,
+    ApprovalConsent, ApprovalTarget, CommandCwd, FileOperation, ProposedAction, RequestKind,
+    TargetLocation, WaitReason,
 };
 use veyra_engine::text::{consent_line, consent_multiline};
 
@@ -132,6 +132,13 @@ pub(super) fn grant_caption(command: &str) -> String {
     format!("Allow `{}` in this thread", consent_multiline(command))
 }
 
+pub(super) fn approval_grant_caption(action: &ProposedAction) -> Option<String> {
+    match &action.consent {
+        ApprovalConsent::Once { grant } => grant.as_ref().map(|key| grant_caption(&key.command)),
+        ApprovalConsent::DenyOnly { .. } => Some("Allow in this thread".into()),
+    }
+}
+
 fn dock_chip(button: Button, focused: bool, chip: impl IntoElement) -> Button {
     button.when(focused, |button| button.child(chip))
 }
@@ -234,6 +241,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     )
     .debug_selector(|| "composer-model".into())
     .dropdown_menu(move |mut menu, _, _| {
+        if models.is_empty() {
+            return menu.menu("Default", Box::new(PickModel { model: None }));
+        }
         for model in &models {
             menu = menu.menu(
                 model.display_name.clone(),
@@ -251,6 +261,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     )
     .debug_selector(|| "composer-effort".into())
     .dropdown_menu(move |mut menu, _, _| {
+        if efforts.is_empty() {
+            return menu.menu("Default", Box::new(PickEffort { effort: None }));
+        }
         for effort in &efforts {
             menu = menu.menu(
                 effort.clone(),
@@ -402,6 +415,11 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         });
                     match &request.kind {
                         RequestKind::Approval { action } => {
+                            let allow_once = request
+                                .kind
+                                .accepts(&veyra_engine::domain::Decision::AllowOnce)
+                                .is_some();
+                            let allow_in_thread = request.kind.grant_key().is_some();
                             let (label, consequence, preview) =
                                 approval_text(action, shell.chosen_provider());
                             let mut quotes =
@@ -426,6 +444,22 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 })
                                                 .child(consequence),
                                         ),
+                                )
+                                .when_some(
+                                    match &action.consent {
+                                        ApprovalConsent::DenyOnly { reason } => Some(reason),
+                                        ApprovalConsent::Once { .. } => None,
+                                    },
+                                    |dock, reason| {
+                                        dock.child(
+                                            div()
+                                                .debug_selector(|| "approval-consent-reason".into())
+                                                .flex_none()
+                                                .text_size(t.text.label.size)
+                                                .text_color(t.colors.text_muted)
+                                                .child(reason.clone()),
+                                        )
+                                    },
                                 )
                                 .when_some(folder, |dock, value| {
                                     dock.child(
@@ -523,8 +557,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     cx,
                                                 )
                                                 .primary()
+                                                .disabled(!allow_once)
                                                 .debug_selector(|| "approval-allow-button".into()),
-                                                shell.dock_focused,
+                                                shell.dock_focused && allow_once,
                                                 shortcut_chip::<AllowOnce>(cx),
                                             )
                                             .on_click(
@@ -538,38 +573,43 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 }),
                                             ),
                                         )
-                                        .when_some(request.kind.grant_key(), |row, key| {
-                                            let caption = grant_caption(&key.command);
-                                            row.child(
-                                                dock_chip(
-                                                    labelled_button_with(
-                                                        SharedString::from(format!(
-                                                            "allow-thread-{request_id}"
-                                                        )),
-                                                        caption.clone(),
-                                                        button_text(caption.into(), cx)
-                                                            .debug_selector(|| {
-                                                                "approval-grant-caption".into()
-                                                            }),
-                                                        cx,
+                                        .when_some(
+                                            approval_grant_caption(action),
+                                            |row, caption| {
+                                                row.child(
+                                                    dock_chip(
+                                                        labelled_button_with(
+                                                            SharedString::from(format!(
+                                                                "allow-thread-{request_id}"
+                                                            )),
+                                                            caption.clone(),
+                                                            button_text(caption.into(), cx)
+                                                                .debug_selector(|| {
+                                                                    "approval-grant-caption".into()
+                                                                }),
+                                                            cx,
+                                                        )
+                                                        .debug_selector(|| {
+                                                            "approval-grant-button".into()
+                                                        })
+                                                        .disabled(!allow_in_thread)
+                                                        .max_w_full(),
+                                                        shell.dock_focused && allow_in_thread,
+                                                        shortcut_chip::<AllowInThread>(cx),
                                                     )
-                                                    .debug_selector(|| {
-                                                        "approval-grant-button".into()
-                                                    })
-                                                    .max_w_full(),
-                                                    shell.dock_focused,
-                                                    shortcut_chip::<AllowInThread>(cx),
+                                                    .on_click(cx.listener(
+                                                        move |_, _, window, cx| {
+                                                            window.dispatch_action(
+                                                                Box::new(AllowInThread {
+                                                                    request: Some(request_id),
+                                                                }),
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
                                                 )
-                                                .on_click(cx.listener(move |_, _, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(AllowInThread {
-                                                            request: Some(request_id),
-                                                        }),
-                                                        cx,
-                                                    )
-                                                })),
-                                            )
-                                        }),
+                                            },
+                                        ),
                                 );
                         }
                         RequestKind::Question { questions } => {

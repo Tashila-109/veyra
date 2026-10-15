@@ -41,7 +41,9 @@ Select each mode with PickPermission, send through Send, and preserve every dock
 Use AllowOnce or Deny as the operator directs; do not silently grant the whole thread.
 Read the project and outside files to prove the effects, then remove only this run's outside file.
 Record cell status, provider version, requested approvals, decisions, files and the run proof path.
-Codex's cells preserve the authorized run below; Grok's adapter is not built.
+Codex's cells preserve the authorized run below.
+Grok's cells remain not run until the separately authorized live lane measures each mode with this prompt, its exact dock decisions and both file effects.
+Grok's hand-written fake fixtures establish no live permission result.
 
 ## Observable success
 

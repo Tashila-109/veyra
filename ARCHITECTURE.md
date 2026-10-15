@@ -507,10 +507,16 @@ The notice includes the selected window's reset timestamp, or the individual spe
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
-An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text. The working-folder quote stays beside the consequence above the scrolling details, with its path in a vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
+An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text.
+The working-folder quote stays beside the consequence above the scrolling details, with its path in a vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
 ToolCall stores a serde-defaulted veyra_label flag: only Codex's fixed labels are unquoted, while provider-named tools and older stored rows stay quoted.
 Both kinds use the bounded display projection; web search and image viewing have Veyra labels.
-Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers. Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them. Multiline command consequences name the line count, including blank lines, above the scrolling details. The shell owns ApprovalScroll, pairing the docked request id with its details and folder scroll handles. A changed request id, including closing the dock, replaces both handles; repainting the same request preserves its offset. An always-visible kit scrollbar exposes actual overflow.
+Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers.
+Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them.
+Multiline command consequences name the line count, including blank lines, above the scrolling details.
+The shell owns ApprovalScroll, pairing the docked request id with its details and folder scroll handles.
+A changed request id, including closing the dock, replaces both handles; repainting the same request preserves its offset.
+An always-visible kit scrollbar exposes actual overflow.
 The thread-grant button shows the first line of the marked command, shortened to its available width; execution, native replies and stored grant identities retain the original bytes.
 The UI takes ProviderKind for provider-specific behavior; display labels do not select behavior.
 Only the exact project cwd may use the existing command grant; every other cwd requires a human decision.
@@ -518,7 +524,8 @@ Permissions approvals grant the requested profile for the turn, while Deny and S
 Questions retain provider question ids and send answers by those ids; cancellation sends an empty answers object.
 AgentMessage delivery and question fields are typed separately from server requests.
 A valid async questions list becomes ItemBody::AsyncQuestions with the original message text and each title, option list and optional selected index; SQLite's existing item JSON stores that additive shape without a migration.
-The transcript renders additional agent message content above the cards with the same item-id markdown cache and shared reply_markdown helper as AssistantText, preserving its full text and paragraphs. Empty messages or messages equal to the trimmed question titles are omitted.
+The transcript renders additional agent message content above the cards with the same item-id markdown cache and shared reply_markdown helper as AssistantText, preserving its full text and paragraphs.
+Empty messages or messages equal to the trimmed question titles are omitted.
 Each card quotes its provider title and option labels and explains that choosing sends a message, first stops active work and continues queued messages.
 ChooseAsyncOption is a gpui action, bound to Command-1 through Command-9 and reachable through the debug driver; the engine validates its item, question and option identity and refuses a repeated choice.
 One transaction persists the selected index and ordinary User turn.
@@ -592,8 +599,11 @@ DenyOnly cannot carry a grant, and the actor and window read grant availability 
 RequestKind::accepts rejects both allow decisions for DenyOnly and preserves Deny, including after stored action round trips.
 Existing stored approvals without consent deserialize as Once, and RequestKind moves an older outer grant_key into that consent.
 An older DenyOnly action discards any outer grant_key when loaded.
-The window can start Grok threads; its model and effort chips offer nothing without a catalog.
-A DenyOnly approval still shows Allow, which the engine refuses with a notice while the request stays pending.
+The window can start Grok threads; without a catalog, each model and effort menu offers only Default, which clears the corresponding configuration value.
+A new Grok thread created through that picker keeps both values absent, so its launch line carries neither -m nor --reasoning-effort.
+Existing or tool-created threads can retain explicit values, which grok::args sends as launch flags.
+A DenyOnly dock shows its lasting-grant reason, disables Allow once and Allow in this thread, and leaves Deny enabled.
+Shell::respond checks RequestKind::accepts before sending, so disabled allow keys and explicit actions preserve the pending request and dock focus.
 Both ask_user_question extension spellings decode the nested question payload into RequestKind::Question and reply with accepted answers keyed by question text and arrays of selected labels.
 Stop first sends cancelled outcomes for every open permission request and question, then session/cancel with _meta.cancelTrigger ctrl_c.
 The cancellation covers all open requests because the protocol cancels the whole session rather than one prompt.
@@ -872,7 +882,7 @@ On New thread, OpenProviderPicker and its key open the provider menu through a c
 An open menu rebuilds its readiness labels when probing begins and when each reply arrives.
 Not-ready providers disable Send with their repair command.
 Codex and Grok use the same picker and composer, with model labels and effort choices read from their probes.
-Grok has no catalog and therefore offers no model or effort choice; switching providers clears both selections.
+Grok has no catalog, so each model and effort menu offers only Default; switching providers clears both selections.
 Codex's commands, file changes, permissions, MCP approvals, questions and retry/limit notices use the existing dock, question card and transcript rows.
 A Claude root's Codex child uses the same task card, breadcrumb and family projection.
 CreateThread sends the draft configuration; subsequent Send targets the selected thread.
@@ -888,13 +898,13 @@ The approval dock (`ui/composer.rs`) renders only the codec's typed ProposedActi
 The chat column bounds the composer by its available height; the transcript gives up space before the dock.
 Flex layout measures the hold row, request count, consequence, wrapped decision buttons, focus hint, input and toolbar before shrinking the details to the remaining height, capped at composer_max_height (240px).
 The command or file path, model-written reason and bounded argument preview share that details scroll area, which keeps at least one code-text line.
-The consequence and any outside working folder sit above it, and Allow and Deny stay below it.
+The consequence, any Deny-only consent reason and any outside working folder sit above it, and Allow and Deny stay below it.
 The folder's viewport keeps at most three label-text lines; while a request is docked, the message input has a fixed 48px height and its draft remains scrollable.
 The dock also switches the editor from two-to-ten auto-growing rows to one row, gives its frame a definite 48px height and clips that viewport, so the editor itself fits above the toolbar while its full draft remains scrollable.
 Closing the dock restores the normal two-to-ten-row growth and 240px input limit.
 Growing the docked input when there is spare room is carried to the polish stage.
 Decision controls put Deny and Allow once before the optional thread grant, so a wide grant wraps after both decisions instead of forcing three rows.
-At both theme window sizes, the approval matrix retains the long folder's three lines and at least one code line even with all fixed controls present, so no smaller-folder fallback is needed.
+At both theme window sizes, the approval matrix includes Deny-only controls and retains the long folder's three lines and at least one code line even with all fixed controls present, so no smaller-folder fallback is needed.
 Folder, details and question text use one bounded-scroll helper whose caller supplies minimum and maximum heights, with independent kit scrollbars visible only for actual overflow.
 Its 16px logical thumb minimum leaves travel on a 20px one-line track; the kit's 4px end insets leave an 8px painted thumb at that minimum.
 The working-folder quote uses the 16px label line height and the scrolling dock question uses the 20px UI line height.
@@ -913,7 +923,9 @@ Button ids contain the request and question identity, so a repaint to a differen
 Keyboard handlers retain the focused dock's rendered target.
 Respond rejects an expired or missing request, and a question choice rejects an index that has already advanced, without selecting another request.
 Because a docked request implies a running turn, composer Command+Return with an empty draft dispatches Stop, which interrupts the turn and expires the request.
-Approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
+Enabled approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
+A disabled thread-grant button uses Allow in this thread because its consent carries no grant.
+Eligible thread grants retain the command caption.
 Requests never take focus automatically, and answering an approval or question keeps dock focus while another request remains.
 After the last response, focus returns to the composer once no other pending request remains.
 Approvals and questions share the same unfocused dock prompt and FocusDock chord.
@@ -990,6 +1002,7 @@ mailbox_free is the command sender's unreserved channel capacity; slots assigned
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
+Its allow_once_enabled, allow_in_thread_enabled and consent_reason use the same typed consent as the rendered controls.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
 
 ## Source map
@@ -1075,7 +1088,8 @@ stop_target_uses_running_or_pending_turn checks the pure window rule on Running,
 A synthetic-window test hides Stop and refuses empty Send without a target, and empty_send_stops_while_provider_is_checking checks empty Command+Return dispatches Stop with the running turn before readiness.
 Admission tests cover Stop, Interrupt, Configure, SwitchView, Quit, keep-awake, idle parking and refusal waiting for a CLI end.
 A composer unit test checks the preview cut notice; a synthetic window checks that long approval text scrolls within a bounded area while decision buttons stay on-screen.
-The approvals-questions screenshots show the real-window scroll area.
+The approvals-questions recipe captures the real-window scroll area.
+Grok window tests select Default through the actual dropdown menus and check that disabled approval clicks, keys and explicit actions send no response while Deny still sends its request id.
 Codec and storage tests cover all tool arguments, symlinks with missing parents, unverified targets, truncated Unicode previews, legacy approval rows and undecodable control failures.
 Shell tests inject an isolated provider environment and admit no process to their startup sweep.
 Their current-thread runtimes do not drive readiness tasks before replacing the probes, so their startup probes start no provider check.
@@ -1087,6 +1101,9 @@ Its macOS sandbox allows only the release Veyra executable and denies every chil
 Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.
 The multi-agent page covers family controls, stored task guidance, delivery, single-child archive holds, archive choices, quiet titles and the visible/open timing probes.
 The Codex sections of new-thread, chat-send-stream, approvals-questions and multi-agent cover CLI model/effort readiness, streamed text, approval and question docks, notices, foreign-thread filtering, the root relay and the Claude-root Codex child card.
+The Grok sections of new-thread, chat-send-stream, approvals-questions and multi-agent cover Default-only menus, streaming, session authentication failure, ordinary and Deny-only approvals, both question spellings and a root relay result.
+After Stop, the question leaves the dock and remains Expired in the request projection and SQLite; the turn shows Interrupted.
+The fake lane supplies explicit overrides and probe fixtures for all three providers.
 Permission-matrix records separately authorized live permission checks.
 The ignored live tests require fresh human consent; ordinary workspace tests use only explicit stand-ins or missing provider paths in debug and release.
 live_claude_approval_round_trip uses the public engine in Ask first to check an exact Bash request, Deny without a file, and AllowOnce on a repeat with the file created.

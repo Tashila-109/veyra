@@ -19,8 +19,9 @@ The provider menu marks Claude Code, Codex and Grok Ready, Not installed or Sign
 A missing Claude names `npm install -g @anthropic-ai/claude-code`; a signed-out Claude names `claude auth login`.
 Check again reaches `veyra::RecheckProviders`.
 Codex reads readiness, models and efforts from its app-server probe.
-The Codex sign-in mark awaits the separately authorized signal check.
-Grok stays a placeholder until its adapter exists.
+Codex uses its app-server account signal for the sign-in mark.
+Grok reads its version, keeps sign-in unknown and offers only Default in both menus while no catalog is available.
+Its picker sign-in mark waits for the separately authorized signed-out recording.
 Type in the textarea, then Send, Enter or ⌘↵ to create a thread.
 Shift+Enter inserts a newline.
 This page stops before Send so its readiness proofs must leave zero threads.
@@ -176,7 +177,51 @@ print('PASS Codex missing to Ready; CLI model and effort; no thread created')
 PYCODEX
 ```
 
+### Grok
+
+Run this fake-only section after Codex, while the database still holds zero threads.
+Grok has no recorded sign-in signal, so Ready with unknown account is intentional.
+Its empty catalog offers one Default entry in each model and effort menu; both selections remain null.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH="$PROOF" python3 - <<'PYGROK'
+from driver import *
+identity()
+assert LANE == 'fake'
+assert sql('select count(*) from threads')=='0'
+action('grok-new-thread-open','NewThread')
+action('grok-new-thread-provider','PickProvider',{'provider':'grok'})
+ready = poll('grok-new-thread-ready',lambda d:d['providers'][2]['readiness']=='ready')
+assert ready['composer']['send_enabled']
+assert ready['providers'][2]['version']=='1.0.52'
+assert ready['providers'][2]['models']==[] and ready['providers'][2]['account']=='unknown'
+action('grok-provider-menu','OpenProviderPicker')
+menu = poll('grok-provider-menu-ready',lambda d:d['composer']['provider_picker_open'])
+assert menu['composer']['provider_picker_labels'][2]=='Grok · Ready'
+capture('grok-provider-menu-ready')
+action('grok-provider-menu-close','PickProvider',{'provider':'grok'})
+for name,chord in [('model','secondary-alt-m'),('effort','secondary-alt-e')]:
+    action('grok-default-'+name,'Pick'+name.title())
+    ctl('grok-default-'+name+'-key','keys',chord)
+defaults = ctl('grok-new-thread-defaults','dump')
+assert defaults['composer']['model'] is None and defaults['composer']['effort'] is None
+assert sql('select count(*) from threads')=='0'
+capture('grok-new-thread')
+action('grok-new-thread-return-claude','PickProvider',{'provider':'claude'})
+action('grok-new-thread-reset','NewThread')
+page_done('new-thread-grok')
+print('PASS Grok Ready with unknown account; empty catalog and Default-only choices; no thread')
+PYGROK
+```
+
 ## Observable success
+
+The Grok section preserves `providers[2].readiness`, `version`, empty `models` and unknown `account`, with null `composer.model` and `composer.effort`.
+`grok-provider-menu-ready.png` shows Grok Ready and `grok-new-thread.png` shows its default chips without creating a thread.
 
 The Codex section preserves missing and Ready `providers[1].readiness`, `version` and `models`, the picker label, `composer.model` and `composer.effort`.
 Its SQLite thread count remains zero, and its PNGs show the disabled reason and selected CLI choices.

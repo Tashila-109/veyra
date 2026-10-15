@@ -83,6 +83,7 @@ mod tests {
                 Err(e) => panic!("{e}"),
             }
         };
+        connection.set_nonblocking(false).unwrap();
         connection
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -171,6 +172,7 @@ mod tests {
                 Err(e) => panic!("{e}"),
             }
         };
+        connection.set_nonblocking(false).unwrap();
         connection
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -249,6 +251,7 @@ mod tests {
                     Err(error) => panic!("{error}"),
                 }
             };
+            connection.set_nonblocking(false).unwrap();
             connection
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();

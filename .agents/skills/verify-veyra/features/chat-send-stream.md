@@ -336,7 +336,59 @@ print('PASS Codex streams ok; foreign thread creates no turn/text; two stored no
 PYCODEX
 ```
 
+### Grok
+
+Run this fake-only section after Codex.
+The signed-out fixture is an authentication failure during session opening, not a picker sign-in signal.
+The launch-argument receipt records only the fake CLI's own arguments and must contain neither optional selection flag.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH="$PROOF" python3 - <<'PYGROK'
+from driver import *
+identity()
+assert LANE == 'fake'
+records = grok_records('ok-reply',slow=True)
+records.insert(1,{'type':'record_argv','path':'grok-launch-argv.json'})
+thread = create_grok('grok-chat',records=records)
+stream = poll('grok-chat-working',lambda d:d['selected_thread']['id']==thread
+    and d['selected_thread']['status']=='Working'
+    and any(item['kind']=='assistant' and item['text']=='o' and not item['done'] for item in d['transcript']['items']))
+assert stream['composer']['provider']=='grok' and stream['composer']['stop_visible']
+assert stream['selected_thread']['config']['model'] is None and stream['selected_thread']['config']['effort'] is None
+capture('grok-chat-working')
+done = ctl('grok-chat-done','wait',thread,'Done')
+assert [(item['text'],item['done']) for item in done['transcript']['items'] if item['kind']=='assistant']==[('ok',True)]
+assert next(item for item in done['transcript']['items'] if item['kind']=='assistant')['delta_count']==2
+assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"'"))=='Completed'
+assert sql("select json_extract(body_json,'$.AssistantText.text')||'|'||done from items where thread_id='"+thread+"' and kind='assistant_text'")=='ok|1'
+arguments = json.loads((DATA/'project/grok-launch-argv.json').read_text())
+assert pathlib.Path(arguments[0]).resolve()==pathlib.Path('target/debug/veyra-fake-cli').resolve()
+assert arguments[1:]==['--no-auto-update','--permission-mode','default','agent','--no-leader','stdio']
+save('grok-launch-argv',arguments[1:])
+capture('grok-chat-done')
+thread = create_grok('grok-signed-out',scenario='signed-out',prompt='Show an authentication failure')
+failed = ctl('grok-signed-out','wait',thread,'Failed')
+assert failed['view']=='failed_thread'
+assert 'Sign in with `grok login`' in failed['selected_thread']['failure']
+assert 'grok login' in sql("select outcome_json from turns where thread_id='"+thread+"'")
+capture('grok-signed-out')
+poll('grok-chat-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+action('grok-chat-return-new','NewThread')
+action('grok-chat-return-claude','PickProvider',{'provider':'claude'})
+page_done('chat-send-stream-grok')
+print('PASS Grok streams ok; Default leaves both flags out; session auth failure names grok login')
+PYGROK
+```
+
 ## Observable success
+
+`grok-chat-working.png` shows the first streamed character and Stop; `grok-chat-done.png`, its dump and SQLite show one completed ok reply.
+`grok-launch-argv.json` proves neither model nor effort flag was sent to the fake CLI.
+`grok-signed-out.png`, `selected_thread.failure` and SQLite name `grok login` in the existing failed view.
 
 The Codex section saves streamed `o`, completed `ok` with two `delta_count` events, its stored item and Completed turn.
 The foreign-thread fixture leaves one User turn and only `ok`; the retry/limit fixture stores exactly two Notice items.

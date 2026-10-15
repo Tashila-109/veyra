@@ -308,7 +308,46 @@ print('PASS Codex root production relay list_providers and Claude root/Codex chi
 PYCODEX
 ```
 
+### Grok
+
+Run this fake-only section after Codex.
+The strict root fixture starts the production relay, calls `list_providers` and streams the returned JSON into the existing transcript.
+The log receipt names that root's accepted connection and call without arguments or credentials.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH="$PROOF" python3 - <<'PYGROK'
+from driver import *
+identity()
+assert LANE == 'fake'
+thread = create_grok('grok-relay',scenario='root-tool-call',prompt='Call Veyra list_providers and report the result')
+done = ctl('grok-relay-done','wait',thread,'Done')
+reply = ''.join(item['text'] for item in done['transcript']['items'] if item['kind']=='assistant')
+result = json.loads(reply.removeprefix('Checking providers'))
+assert result['mode_ceiling']=='ask_first' and result['remaining_fan_out']==4
+assert any(provider['provider']=='grok' for provider in result['providers'])
+assert 'remaining_fan_out' in sql("select body_json from items where thread_id='"+thread+"' and kind='assistant_text'")
+log = (DATA/'logs/veyra.log').read_text()
+lines = [line for line in log.splitlines() if thread in line and ('MCP connection accepted' in line or 'list_providers' in line)]
+assert any('MCP connection accepted' in line for line in lines)
+assert any('list_providers' in line for line in lines)
+(PROOF/'grok-relay-log.txt').write_text('\n'.join(lines)+'\n')
+capture('grok-relay')
+poll('grok-relay-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+action('grok-relay-return-new','NewThread')
+action('grok-relay-return-claude','PickProvider',{'provider':'claude'})
+page_done('multi-agent-grok')
+print('PASS Grok root relay list_providers result in transcript, SQLite and accepted-call log')
+PYGROK
+```
+
 ## Observable success
+
+`grok-relay-done.json`, `grok-relay.png` and SQLite contain the Grok root relay result with its permission ceiling and remaining fan-out.
+`grok-relay-log.txt` holds the same root thread id on the accepted connection and `list_providers` lines.
 
 The held Codex fixture saves pid, ppid, pgid and comm for named Veyra processes and asserts the relay is the fake root CLI's direct child in its own group.
 The Codex root section saves the production relay result in `transcript.items`, SQLite tool rows and `codex-relay-log.txt`.

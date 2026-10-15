@@ -84,6 +84,7 @@ SWIFT
 swiftc -O "$PROOF/capture-window.swift" -o "$PROOF/capture-window"
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
 cp crates/engine/tests/fixtures/codex/probe-ready.jsonl "$PROOF/fixtures/probe-codex.jsonl"
+cp crates/engine/tests/fixtures/grok/probe-grok.jsonl "$PROOF/fixtures/probe-grok.jsonl"
 printf 'RUN=%s\n' "$RUN"
 cat >"$PROOF/driver.py" <<'PY'
 import ctypes, errno, hashlib, json, os, pathlib, re, shutil, signal, sqlite3, struct, subprocess, sys, time
@@ -94,6 +95,7 @@ DB = DATA / 'veyra.db'
 FIXTURES = PROOF / 'fixtures'
 SOURCE = pathlib.Path('crates/engine/tests/fixtures/claude')
 CODEX_SOURCE = pathlib.Path('crates/engine/tests/fixtures/codex')
+GROK_SOURCE = pathlib.Path('crates/engine/tests/fixtures/grok')
 TABLES = 'grants items projects requests settings tasks threads turns'.split()
 LANE = (PROOF/'lane').read_text().strip()
 assert LANE in ['fake','live'], LANE
@@ -106,6 +108,7 @@ for name in ['VEYRA_CLAUDE_BIN','VEYRA_CODEX_BIN','VEYRA_GROK_BIN','VEYRA_FAKE_F
     ENV.pop(name,None)
 if LANE == 'fake':
     ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_CODEX_BIN=str(DATA/'fake-cli'),
+        VEYRA_GROK_BIN=str(DATA/'fake-cli'),
         VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()))
 else:
     ENV['VEYRA_RECORD'] = str(PROOF.resolve()/'rec')
@@ -389,6 +392,34 @@ def create_codex(name, scenario='ok-reply', slow=False, records=None, prompt='re
         and int(sql('select count(*) from threads'))==before+1)
     assert dump['composer']['provider']=='codex'
     return dump['selected_thread']['id']
+def grok_records(scenario, slow=False):
+    records = [json.loads(line) for line in (GROK_SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
+    expanded = []
+    for record in records:
+        wire = record.get('line',{})
+        if slow and wire.get('method')=='session/update' and wire['params']['update'].get('content',{}).get('text')=='ok':
+            for text in ['o','k']:
+                part = json.loads(json.dumps(record))
+                part['line']['params']['update']['content']['text'] = text
+                part['after_ms'] = 500
+                expanded.append(part)
+        else:
+            if slow and wire.get('method')=='_x.ai/session/prompt_complete': record['after_ms'] = 1000
+            expanded.append(record)
+    return expanded
+def create_grok(name, scenario='ok-reply', slow=False, records=None, prompt='reply with the word ok'):
+    assert LANE == 'fake'
+    stage_records(grok_records(scenario,slow) if records is None else records)
+    action(name+'-new','NewThread')
+    action(name+'-provider','PickProvider',{'provider':'grok'})
+    action(name+'-mode','PickPermission',{'mode':'ask_first'})
+    ctl(name+'-text','text',prompt)
+    before = int(sql('select count(*) from threads'))
+    ctl(name+'-send','keys','secondary-enter')
+    dump = poll(name+'-selected',lambda d: d['selected_thread'] is not None
+        and int(sql('select count(*) from threads'))==before+1)
+    assert dump['composer']['provider']=='grok'
+    return dump['selected_thread']['id']
 def create(name, prompt, slow=False, scenario='ok-reply'):
     if LANE == 'fake' and scenario is not None: stage(scenario,slow)
     action(name+'-new','NewThread')
@@ -523,7 +554,7 @@ PY
 
 Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.md), [chat-send-stream](features/chat-send-stream.md) and [settings](features/settings.md).
 Also run [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
-Run each page's Codex section in the fake lane after its existing drive.
+Run each page's Codex and Grok sections in the fake lane after its existing drive.
 Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
 The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
@@ -580,6 +611,9 @@ The consequence and any outside working folder sit above it.
 The folder value has its own vertical scroll, bounded to three label-text lines; replacing both scroll handles on a changed request id opens each request at the top without eliding the marked path.
 Its kit scrollbar stays visible whenever the folder overflows and is absent when the path fits.
 Allow and Deny stay below that area.
+Approval docks report `allow_once_enabled`, `allow_in_thread_enabled` and `consent_reason` from the same consent used by their buttons.
+A Deny-only request keeps both allow buttons disabled, shows its reason above the details and leaves Deny enabled.
+Disabled allow buttons show no answer chord, and their key or action cannot send a response.
 Questions share the same unfocused FocusDock prompt.
 Their quoted text scrolls within a one-line minimum and 240px maximum, independently of the label and options.
 Up to four options use one column and larger lists use three columns. Captions wrap without visual truncation; overflowing lists use the same bounded scrollbar. The request and question index own independent text and option-list scroll resets.
@@ -666,6 +700,10 @@ required = {
     'multi-agent-codex':['codex-relay-done.json','codex-relay.png','codex-relay-log.txt',
         'codex-relay-parent.json','codex-relay-processes.txt',
         'codex-child-task.json','codex-child-task.png','codex-family-done.json','codex-family-done.png'],
+    'new-thread-grok':['grok-new-thread-ready.json','grok-provider-menu-ready.png','grok-new-thread-defaults.json','grok-new-thread.png'],
+    'chat-send-stream-grok':['grok-chat-working.json','grok-chat-working.png','grok-chat-done.json','grok-chat-done.png','grok-launch-argv.json','grok-signed-out.json','grok-signed-out.png'],
+    'approvals-questions-grok':['grok-approval-deny.png','grok-approval-allow.png','grok-deny-only.json','grok-deny-only.png','grok-question.png','grok-question-second.png','grok-questions-done.json','grok-question-expired.json','grok-question-expired.png'],
+    'multi-agent-grok':['grok-relay-done.json','grok-relay.png','grok-relay-log.txt'],
     'new-thread-live':['new-thread-live.json','new-thread-live.png'],
     'chat-send-stream-live':['chat-working.json','chat-working.png','chat-done.json','chat-done.png','rec/probe.jsonl'],
 }
@@ -684,6 +722,7 @@ pairs = {
     'chat-send-stream-live':[('chat-working','chat-done')],
     'chat-send-stream-codex':[('codex-chat-working','codex-chat-done')],
     'new-thread-codex':[('codex-new-thread-missing','codex-new-thread')],
+    'chat-send-stream-grok':[('grok-chat-working','grok-chat-done')],
 }
 for page in pages:
     for first,second in pairs.get(page,[]):

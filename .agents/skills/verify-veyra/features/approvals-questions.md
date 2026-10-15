@@ -101,7 +101,7 @@ for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve(
     dock = dump['composer']['dock']
     assert dock['action_text'] == 'Write '+target
     assert dock['consequence'] == 'Claude Code writes a file '+place+' the project folder.'
-    assert dock['request']['kind']['Approval']['grant_key'] is None
+    assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
     assert json.loads(dock['preview']) == {'content':'veyra check'}
     capture('approval-write-'+place)
     action('approval-write-'+place+'-focus','FocusDock')
@@ -131,7 +131,7 @@ for label, tool, arguments in [
         assert dock['action_text'] == tool
         assert dock['consequence'] == 'Claude Code uses this tool with the arguments below.'
     assert preview == arguments
-    assert dock['request']['kind']['Approval']['grant_key'] is None
+    assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
     if label == 'mcp':
         assert '\n' in dock['preview'] and '⟨U+000A⟩' not in dock['preview']
     capture('approval-'+label)
@@ -145,7 +145,7 @@ thread = create('approval-long-command','Approve a long heredoc',scenario=None)
 dump = poll('approval-long-command-dock',lambda d: d['composer']['dock'] is not None)
 assert dump['composer']['dock']['action_text'] == command
 assert '202-line command' in dump['composer']['dock']['consequence']
-assert dump['composer']['dock']['request']['kind']['Approval']['grant_key']['command'] == command
+assert dump['composer']['dock']['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant')['command'] == command
 action('approval-long-command-focus','FocusDock')
 poll('approval-long-command-focused',lambda d: d['composer']['dock']['focused'])
 capture('approval-long-command')
@@ -286,14 +286,14 @@ same['line']['id']='same-directory'
 records[index+2:index+2] = [other,{'type':'expect_outbound','line':{'id':'other-directory','result':{'decision':'decline'}}},same,{'type':'expect_outbound','line':{'id':'same-directory','result':{'decision':'accept'}}}]
 thread = create_codex('codex-command-grants',records=records,prompt='Allow this command only in the project folder')
 first = poll('codex-grant-in-project',lambda d:d['composer']['dock'] is not None)['composer']['dock']
-assert first['request']['kind']['Approval']['grant_key']['command']=='touch veyra-check.txt'
+assert first['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant')['command']=='touch veyra-check.txt'
 capture('codex-grant-in-project')
 action('codex-grant-project','AllowInThread',{'request':first['request']['id']})
 other = poll('codex-command-other-cwd',lambda d:d['composer']['dock'] is not None and d['composer']['dock']['request']['id']!=first['request']['id'])['composer']['dock']
 assert other['action_text']=='touch veyra-check.txt'
 assert other['consequence']=='Codex will run this command in the working folder shown below.'
 assert other['provider_text'][0]=={'kind':'working_folder','label':'Working folder reported by Codex','text':'“'+str(DATA/'outside')+'”'}
-assert other['request']['kind']['Approval']['grant_key'] is None
+assert other['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
 assert other['request']['kind']['Approval']['action']['target']['cwd']=={'directory':str(DATA/'outside')}
 capture('codex-command-other-cwd')
 action('codex-command-other-deny','Deny',{'request':other['request']['id']})
@@ -305,7 +305,7 @@ assert [json.loads(value) for value in sql("select decision_json from requests w
 for label,scenario,tool in [('file','approval-file-change','File change'),('permissions','permissions','Permissions')]:
     thread = create_codex('codex-'+label,scenario=scenario)
     dock = poll('codex-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
-    assert dock['action_text']==tool and dock['request']['kind']['Approval']['grant_key'] is None
+    assert dock['action_text']==tool and dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
     capture('codex-'+label)
     action('codex-'+label+'-deny','Deny',{'request':dock['request']['id']})
     ctl('codex-'+label+'-done','wait',thread,'Done')
@@ -358,7 +358,7 @@ thread = create_codex('codex-mcp',scenario='mcp-tool-approval')
 for label,decision in [('first','AllowOnce'),('second','Deny')]:
     dock = poll('codex-mcp-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
     assert dock['action_text']=='veyra / list_providers'
-    assert dock['request']['kind']['Approval']['grant_key'] is None
+    assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
     capture('codex-mcp-'+label)
     action('codex-mcp-'+label+'-answer',decision,{'request':dock['request']['id']})
     poll('codex-mcp-'+label+'-closed',lambda d:any(r['id']==dock['request']['id'] and r['state']=={'Answered':decision} for r in d['requests']))
@@ -378,7 +378,7 @@ dock = poll('codex-long-working-folder-dock',lambda d:d['composer']['dock'] is n
 assert dock['details_scroll']['offset_y']==0
 assert dock['action_text']==long_command
 assert dock['provider_text'][0]=={'kind':'working_folder','label':'Working folder reported by Codex','text':'“'+long_folder+'”'}
-assert dock['request']['kind']['Approval']['grant_key'] is None
+assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
 capture('codex-long-working-folder')
 action('codex-long-working-folder-scroll','DebugScrollApproval',{'pixels':-100000})
 scrolled = poll('codex-long-working-folder-scrolled',lambda d:d['composer']['dock'].get('details_scroll',{}).get('offset_y',0) < 0)['composer']['dock']
@@ -411,7 +411,7 @@ assert dock['action_text']==marked
 assert dock['consequence']=='Codex will run this 2-line command with the project folder as its working folder.'
 assert dock['grant_caption']=='Allow `'+marked+'` in this thread'
 assert dock['request']['kind']['Approval']['action']['target']['command']==command
-assert dock['request']['kind']['Approval']['grant_key']['command']==command
+assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant')['command']==command
 capture('codex-command-invisibles')
 action('codex-command-invisibles-allow','AllowOnce',{'request':dock['request']['id']})
 ctl('codex-command-invisibles-done','wait',thread,'Done')
@@ -492,6 +492,7 @@ question = next(item for item in typed['transcript']['items'] if item['kind']=='
 assert question['choices_active'] is True
 ctl('codex-card-typed-answer','text',typed_answer)
 ctl('codex-card-typed-send','keys','secondary-enter')
+poll('codex-card-typed-turn-created',lambda d:sql("select count(*) from turns where thread_id='"+thread+"'")=='2')
 typed = ctl('codex-card-typed-done','wait',thread,'Done')
 closed = next(item for item in typed['transcript']['items'] if item['id']==question['id'])
 assert closed['choices_active'] is False
@@ -509,12 +510,104 @@ print('PASS Codex commands, cwd-scoped grant, file/permissions Deny, question an
 PYCODEX
 ```
 
+### Grok
+
+Run this fake-only section after Codex.
+It uses the existing approval dock and question choices, including both Grok question method spellings.
+A lasting-only request keeps Allow once and the thread grant visible but disabled, explains why, and still permits Deny.
+Stop removes the question dock; `requests` and SQLite preserve its Expired state.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH="$PROOF" python3 - <<'PYGROK'
+from driver import *
+identity()
+assert LANE == 'fake'
+check = DATA/'project/veyra-check.txt'
+check.unlink(missing_ok=True)
+for label,scenario,decision in [('deny','approval-deny','Deny'),('allow','approval-allow','AllowOnce')]:
+    thread = create_grok('grok-approval-'+label,scenario=scenario,prompt=label.title()+' the exact check command')
+    dock = poll('grok-approval-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
+    assert dock['action_text']=='touch veyra-check.txt'
+    assert dock['allow_once_enabled'] and dock['allow_in_thread_enabled']
+    assert dock['consent_reason'] is None
+    capture('grok-approval-'+label)
+    action('grok-approval-'+label+'-answer',decision,{'request':dock['request']['id']})
+    ctl('grok-approval-'+label+'-done','wait',thread,'Done')
+    assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))==decision
+    assert check.exists()==(decision=='AllowOnce')
+check.unlink()
+thread = create_grok('grok-deny-only',scenario='approval-always-only',prompt='Offer only a lasting grant')
+dock = poll('grok-deny-only',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+request = dock['request']['id']
+assert dock['allow_once_enabled'] is False and dock['allow_in_thread_enabled'] is False
+assert dock['consent_reason']=='Grok offered only a lasting grant'
+assert dock['grant_caption']=='Allow in this thread'
+assert dock['request']['kind']['Approval']['action']['consent']=={'DenyOnly':{'reason':dock['consent_reason']}}
+capture('grok-deny-only')
+action('grok-deny-only-focus','FocusDock')
+for name,operation,chord in [('once','AllowOnce','secondary-enter'),('thread','AllowInThread','secondary-alt-enter')]:
+    action('grok-deny-only-'+name,operation,{'request':request})
+    ctl('grok-deny-only-'+name+'-key','keys',chord)
+    pending = ctl('grok-deny-only-'+name+'-pending','dump')
+    assert pending['composer']['dock']['request']['id']==request and pending['composer']['dock']['focused']
+    assert sql("select state from requests where id='"+request+"'")=='pending'
+capture('grok-deny-only-focused')
+action('grok-deny-only-deny','Deny',{'request':request})
+ctl('grok-deny-only-done','wait',thread,'Done')
+assert json.loads(sql("select decision_json from requests where id='"+request+"'"))=='Deny'
+assert sql("select count(*) from grants where thread_id='"+thread+"'")=='0' and not check.exists()
+thread = create_grok('grok-question',scenario='question',prompt='Choose the checks and report')
+first = poll('grok-question',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert first['request']['kind']['Question']['questions']==[{'text':'Which check should run first?','options':['Build','Tests']}]
+capture('grok-question')
+action('grok-question-focus','FocusDock')
+ctl('grok-question-tests','keys','2')
+second = poll('grok-question-second',lambda d:d['composer']['dock'] is not None and d['composer']['dock']['request']['id']!=first['request']['id'])['composer']['dock']
+assert second['request']['kind']['Question']['questions']==[{'text':'Which report should be saved?','options':['Summary','Details']}]
+capture('grok-question-second')
+action('grok-question-summary','AnswerQuestion',{'request':second['request']['id'],'question':0,'option':0})
+done = ctl('grok-questions-done','wait',thread,'Done')
+assert done['composer']['dock'] is None
+assert [item['text'] for item in done['transcript']['items'] if item['kind']=='user']==['Choose the checks and report','Which check should run first?: Tests','Which report should be saved?: Summary']
+assert sql("select count(*) from requests where thread_id='"+thread+"' and state='answered'")=='2'
+assert [json.loads(row) for row in sql("select decision_json from requests where thread_id='"+thread+"' order by rowid").splitlines()]==[{'Answers':[{'text':'Tests'}]},{'Answers':[{'text':'Summary'}]}]
+assert sql("select group_concat(json_extract(body_json,'$.UserText'),'|') from items where thread_id='"+thread+"' and kind='user_text'")=='Choose the checks and report|Which check should run first?: Tests|Which report should be saved?: Summary'
+capture('grok-questions-answered')
+thread = create_grok('grok-question-stop',scenario='stop-pending-question',prompt='Stop with a question pending')
+request = poll('grok-question-before-stop',lambda d:d['composer']['dock'] is not None)['composer']['dock']['request']
+capture('grok-question-before-stop')
+action('grok-question-stop','Stop')
+expired = ctl('grok-question-expired','wait',thread,'Interrupted')
+assert expired['composer']['dock'] is None
+closed = next(row for row in expired['requests'] if row['id']==request['id'])
+assert closed['state']=={'Expired':{'reason':'The turn ended'}}
+assert sql("select state||'|'||json_extract(decision_json,'$') from requests where id='"+request['id']+"'")=='expired|The turn ended'
+capture('grok-question-expired')
+poll('grok-approvals-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+action('grok-approvals-return-new','NewThread')
+action('grok-approvals-return-claude','PickProvider',{'provider':'claude'})
+page_done('approvals-questions-grok')
+print('PASS Grok approvals, disabled lasting-only consent, question answer items and Expired after Stop')
+PYGROK
+```
+
 ## Observable success
+
+The Grok approval PNGs show the exact command and decisions; the file is absent after Deny and present after Allow once.
+`grok-deny-only.png` and its focused PNG show both disabled allow controls and `Grok offered only a lasting grant`.
+`composer.dock.allow_once_enabled`, `allow_in_thread_enabled` and `consent_reason` match those controls, and both allow keys and explicit actions leave the same request pending.
+The two question PNGs cover both method spellings; `grok-questions-done.json`, the answered PNG and SQLite retain Tests and Summary as user answer items.
+`grok-question-expired.json` and SQLite retain the question as Expired after Stop, and its PNG shows Interrupted with the dock removed.
 
 `question.png`, `question-focused.png` and `codex-question.png` show two-option docks with text clear of the controls.
 `question-four.png` and `codex-question-four.png` show the four realistic database labels in one column.
 `question-nine.png` and `codex-question-nine.png` show every long route label wrapped in three columns below the 400-character question, with a tall draft retained in the fixed 48px message input.
 The digit-9 replies preserve the ninth route label as the answer in both providers' strict fixtures and stored user text.
+The dock-region matrix also includes Grok and the Deny-only reason and disabled buttons.
 The GPUI matrices also check disjoint visible regions, contained text for every region, the docked editor inside its input viewport and every dock/composer button inside both theme window sizes for every dock kind (scrolling choices are clipped to their viewport).
 One held-and-queued case per theme window size and provider checks Discard queued alongside Continue.
 Caption checks shape each complete option label at its actual font and width, so truncation cannot pass as containment.
@@ -532,7 +625,7 @@ The GPUI height matrix covers both theme sizes, Claude and Codex, every combinat
 The transcript gives up space before the dock; the details use the remaining height, capped at 240px, and retain the command's first line.
 The matrix keeps the long folder's three lines and at least one code line even in its most crowded cases.
 The folder viewport shows an always-visible kit scrollbar when the path overflows, and no scrollbar when it fits.
-The Codex section checks `composer.dock.action_text`, `consequence`, `request.kind`, the typed command `target.cwd` and `grant_key`.
+The Codex section checks `composer.dock.action_text`, `consequence`, `request.kind`, the typed command `target.cwd` and `action.consent.Once.grant`.
 A grant in the project permits the identical command there; the same command in another directory docks, names that directory and is denied.
 SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
 File and permission denials, the Violet answer and both MCP decisions are persisted.
