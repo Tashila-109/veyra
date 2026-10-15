@@ -257,17 +257,21 @@ pub enum AcceptedDecision<'a> {
 impl RequestKind {
     pub fn accepts<'a>(&'a self, decision: &'a Decision) -> Option<AcceptedDecision<'a>> {
         match (self, decision) {
-            (Self::Approval { .. }, Decision::AllowOnce) => {
+            (Self::Approval { action, .. }, Decision::AllowOnce)
+                if action.consent == ApprovalConsent::Once =>
+            {
                 Some(AcceptedDecision::Allow { grant: None })
             }
             (Self::Approval { .. }, Decision::Deny) => Some(AcceptedDecision::Deny),
             (
                 Self::Approval {
                     grant_key: Some(key),
-                    ..
+                    action,
                 },
                 Decision::AllowInThread,
-            ) => Some(AcceptedDecision::Allow { grant: Some(key) }),
+            ) if action.consent == ApprovalConsent::Once => {
+                Some(AcceptedDecision::Allow { grant: Some(key) })
+            }
             (Self::Question { questions }, Decision::Answers(answers))
                 if questions.len() == answers.len() =>
             {
@@ -281,6 +285,30 @@ impl RequestKind {
 pub struct ProposedAction {
     pub tool: String,
     pub target: ApprovalTarget,
+    #[serde(skip_serializing_if = "ApprovalConsent::is_once")]
+    pub consent: ApprovalConsent,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalConsent {
+    #[default]
+    Once,
+    DenyOnly {
+        reason: String,
+    },
+}
+impl ApprovalConsent {
+    fn is_once(&self) -> bool {
+        matches!(self, Self::Once)
+    }
+}
+impl ProposedAction {
+    pub fn new(tool: String, target: ApprovalTarget) -> Self {
+        Self {
+            tool,
+            target,
+            consent: ApprovalConsent::Once,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -354,6 +382,8 @@ impl<'de> Deserialize<'de> for ProposedAction {
             Typed {
                 tool: String,
                 target: ApprovalTarget,
+                #[serde(default)]
+                consent: ApprovalConsent,
             },
             Legacy {
                 tool: String,
@@ -362,8 +392,12 @@ impl<'de> Deserialize<'de> for ProposedAction {
                 input: Option<serde_json::Value>,
             },
         }
-        let (tool, target) = match StoredAction::deserialize(deserializer)? {
-            StoredAction::Typed { tool, target } => (tool, target),
+        let (tool, target, consent) = match StoredAction::deserialize(deserializer)? {
+            StoredAction::Typed {
+                tool,
+                target,
+                consent,
+            } => (tool, target, consent),
             StoredAction::Legacy {
                 tool,
                 command,
@@ -384,10 +418,14 @@ impl<'de> Deserialize<'de> for ProposedAction {
                         preview: ApprovalPreview::new(String::new()),
                     }
                 };
-                (tool, target)
+                (tool, target, ApprovalConsent::Once)
             }
         };
-        Ok(Self { tool, target })
+        Ok(Self {
+            tool,
+            target,
+            consent,
+        })
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

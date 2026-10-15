@@ -3447,6 +3447,7 @@ mod tests {
         with_docked_shell(cx, |shell, cx, _, _| {
             let approval = |first: &str| RequestKind::Approval {
                 action: ProposedAction {
+                    consent: Default::default(),
                     tool: "command tool".into(),
                     target: ApprovalTarget::Command {
                         command: format!("{first}\n{}", "later line\n".repeat(200)),
@@ -3967,6 +3968,7 @@ mod tests {
         let approval = |tool: &str, target| {
             Some(RequestKind::Approval {
                 action: ProposedAction {
+                    consent: Default::default(),
                     tool: tool.into(),
                     target,
                 },
@@ -4616,6 +4618,7 @@ mod tests {
                                 shell.state.requests[0].id = RequestId::new();
                                 shell.state.requests[0].kind = RequestKind::Approval {
                                     action: ProposedAction {
+                                        consent: Default::default(),
                                         tool: "Command".into(),
                                         target: ApprovalTarget::Command {
                                             command: command.clone(),
@@ -4785,6 +4788,7 @@ mod tests {
                     shell.state.requests[0].id = RequestId::new();
                     shell.state.requests[0].kind = RequestKind::Approval {
                         action: ProposedAction {
+                            consent: Default::default(),
                             tool: "Command".into(),
                             target: ApprovalTarget::Command {
                                 command: format!(
@@ -4955,6 +4959,7 @@ mod tests {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
+                        consent: Default::default(),
                         tool: "Command".into(),
                         target: ApprovalTarget::Command {
                             command: format!("echo first\n{}", "later line\n".repeat(200)),
@@ -5005,6 +5010,7 @@ mod tests {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
+                        consent: Default::default(),
                         tool: "command tool".into(),
                         target: ApprovalTarget::Command {
                             command: command.clone(),
@@ -5105,6 +5111,7 @@ mod tests {
                     shell.state.requests.truncate(1);
                     shell.state.requests[0].kind = RequestKind::Approval {
                         action: ProposedAction {
+                            consent: Default::default(),
                             tool: "file tool".into(),
                             target: ApprovalTarget::File {
                                 operation,
@@ -5125,6 +5132,7 @@ mod tests {
             shell.update(cx, |shell, _| {
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
+                        consent: Default::default(),
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: command.into(),
@@ -5152,6 +5160,7 @@ mod tests {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
+                        consent: Default::default(),
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: "echo ok".into(),
@@ -5194,6 +5203,7 @@ mod tests {
                 for request in &mut shell.state.requests {
                     request.kind = RequestKind::Approval {
                         action: ProposedAction {
+                            consent: Default::default(),
                             tool: "Bash".into(),
                             target: ApprovalTarget::Command {
                                 command: "echo ok".into(),
@@ -5257,6 +5267,7 @@ mod tests {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
+                        consent: Default::default(),
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: "touch veyra-check.txt".into(),
@@ -6119,6 +6130,7 @@ mod tests {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
+                        consent: Default::default(),
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: "touch request-a".into(),
@@ -6165,6 +6177,7 @@ mod tests {
                 request.state = RequestState::Pending;
                 request.kind = RequestKind::Approval {
                     action: ProposedAction {
+                        consent: Default::default(),
                         tool: "Bash".into(),
                         target: ApprovalTarget::Command {
                             command: "touch request-b".into(),
@@ -6197,6 +6210,7 @@ mod tests {
                 for request in &mut shell.state.requests {
                     request.kind = RequestKind::Approval {
                         action: ProposedAction {
+                            consent: Default::default(),
                             tool: "Bash".into(),
                             target: ApprovalTarget::Command {
                                 command: "echo exact".into(),
@@ -6913,6 +6927,7 @@ mod tests {
                 shell.state.requests.truncate(1);
                 shell.state.requests[0].kind = RequestKind::Approval {
                     action: ProposedAction {
+                        consent: Default::default(),
                         tool: "Command".into(),
                         target: ApprovalTarget::Command {
                             command: "echo safe".into(),

@@ -3,6 +3,7 @@ use crate::{
     domain::*,
     platform,
     provider::session::{ByteLines, Line},
+    provider::{Outbound, ProviderError},
     tools,
 };
 use serde_json::{Value, json};
@@ -842,5 +843,143 @@ mod attempt_tests {
             drop(config);
             assert!(!server.active(&second.0));
         }
+    }
+}
+
+pub(crate) struct McpConfig {
+    server: std::sync::Arc<crate::mcp::Server>,
+    provider: crate::provider::ProviderKind,
+    thread: ThreadId,
+    epoch: u32,
+    pid: u32,
+    hashes: std::sync::Mutex<Vec<crate::mcp::TokenHash>>,
+}
+impl McpConfig {
+    pub(crate) fn new(
+        server: std::sync::Arc<crate::mcp::Server>,
+        thread: ThreadId,
+        epoch: u32,
+        pid: u32,
+    ) -> Self {
+        Self {
+            provider: crate::provider::ProviderKind::Codex,
+            server,
+            thread,
+            epoch,
+            pid,
+            hashes: Default::default(),
+        }
+    }
+    pub(crate) fn for_grok(
+        server: std::sync::Arc<crate::mcp::Server>,
+        thread: ThreadId,
+        epoch: u32,
+        pid: u32,
+    ) -> Self {
+        let mut config = Self::new(server, thread, epoch, pid);
+        config.provider = crate::provider::ProviderKind::Grok;
+        config
+    }
+    pub(crate) fn frame(&self, line: Value) -> Result<Outbound, ProviderError> {
+        let token = self.server.for_spawn(self.thread, self.epoch, |token| {
+            Ok((token.clone(), self.pid))
+        })?;
+        self.hashes
+            .lock()
+            .unwrap()
+            .push(crate::mcp::TokenHash(token.hash()));
+        Ok(Outbound::Provider(Box::new(ThreadFrame {
+            line,
+            provider: self.provider,
+            command: self.server.command.clone(),
+            socket: self.server.socket.clone(),
+            token,
+        })))
+    }
+    pub(crate) fn sanitize(&self, value: &mut Value, replacement: &str) {
+        for hash in self.hashes.lock().unwrap().iter() {
+            hash.sanitize(value, replacement);
+        }
+    }
+    pub(crate) fn redact(&self, text: &str, replacement: &str) -> String {
+        self.hashes
+            .lock()
+            .unwrap()
+            .iter()
+            .fold(text.to_owned(), |text, hash| {
+                hash.redact(&text, replacement)
+            })
+    }
+    pub(crate) fn revoke(&self) {
+        self.server.revoke(self.thread, self.epoch);
+    }
+}
+impl Drop for McpConfig {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+pub(crate) struct ThreadFrame {
+    provider: crate::provider::ProviderKind,
+    line: Value,
+    command: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    token: crate::mcp::McpToken,
+}
+impl ThreadFrame {
+    fn config(&self, token: &str) -> Value {
+        json!({"mcp_servers.veyra.command":self.command,
+            "mcp_servers.veyra.args":["mcp"],
+            "mcp_servers.veyra.env":{"VEYRA_SOCKET":self.socket,"VEYRA_MCP_TOKEN":token}})
+    }
+    fn inject(&self, line: &mut Value, token: &str) {
+        if self.provider == crate::provider::ProviderKind::Grok {
+            line["params"]["mcpServers"] = json!([{
+                "name":"veyra", "command":self.command, "args":["mcp"],
+                "env":[{"name":"VEYRA_SOCKET","value":self.socket},
+                    {"name":"VEYRA_MCP_TOKEN","value":token}]
+            }]);
+        } else {
+            line["params"]["config"] = self.config(token);
+        }
+    }
+    #[cfg(any(debug_assertions, test))]
+    pub(crate) fn value(&self) -> Value {
+        let mut line = self.line.clone();
+        self.inject(&mut line, "<id:token>");
+        line
+    }
+    pub(crate) fn into_bytes(mut self) -> serde_json::Result<Vec<u8>> {
+        let mut line = std::mem::take(&mut self.line);
+        self.inject(&mut line, self.token.expose());
+        serde_json::to_vec(&line)
+    }
+}
+
+#[cfg(test)]
+mod credential_frame_tests {
+    use super::*;
+    #[test]
+    fn codex_thread_credential_stays_typed_until_serialization() {
+        let token = crate::mcp::McpToken::new();
+        let outbound = Outbound::Provider(Box::new(ThreadFrame {
+            provider: crate::provider::ProviderKind::Codex,
+            line: json!({"id":1,"method":"thread/start","params":{}}),
+            command: "/owned/veyra".into(),
+            socket: "/owned/veyra.sock".into(),
+            token: token.clone(),
+        }));
+        let recorded = outbound.value();
+        assert_eq!(
+            recorded["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"],
+            "<id:token>"
+        );
+        assert!(!recorded.to_string().contains(token.expose()));
+        let bytes = outbound.into_bytes().unwrap();
+        let written: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            written["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"].as_str()
+                == Some(token.expose())
+        );
     }
 }

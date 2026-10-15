@@ -17,6 +17,7 @@ pub const KNOWN_BIN_DIRS: &[&str] = &[
     "/usr/local/bin",
     "/usr/bin",
     ".local/bin",
+    ".grok/bin",
     ".claude/local",
 ];
 

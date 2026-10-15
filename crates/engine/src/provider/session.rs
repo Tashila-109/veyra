@@ -1,7 +1,7 @@
 use super::{
     ActiveTurn, Decoded, Outbound, ProviderError, ProviderEvent, ProviderKind, SessionControl,
     SessionEvent, SessionHandle, SessionSpec, StopReason, TurnEvent, claude, codex, env::ChildEnv,
-    jsonrpc,
+    grok, jsonrpc,
 };
 use crate::{
     actor::EngineMsg,
@@ -220,18 +220,19 @@ struct SessionIo {
 enum RootMcp {
     Claude(crate::mcp::Session),
     Codex(Arc<codex::McpConfig>),
+    Grok(Arc<crate::mcp::McpConfig>),
 }
 impl RootMcp {
     fn sanitize(&self, value: &mut serde_json::Value, replacement: &str) {
         match self {
             Self::Claude(session) => session.hash.sanitize(value, replacement),
-            Self::Codex(config) => config.sanitize(value, replacement),
+            Self::Codex(config) | Self::Grok(config) => config.sanitize(value, replacement),
         }
     }
     fn redact(&self, text: &str, replacement: &str) -> String {
         match self {
             Self::Claude(session) => session.hash.redact(text, replacement),
-            Self::Codex(config) => config.redact(text, replacement),
+            Self::Codex(config) | Self::Grok(config) => config.redact(text, replacement),
         }
     }
 }
@@ -368,7 +369,30 @@ fn launch(
                 Ok((child, config.map(RootMcp::Codex), codec))
             },
         ),
-        ProviderKind::Grok => Err(ProviderError::NotBuilt),
+        ProviderKind::Grok => launch_with(
+            provider,
+            spec,
+            env,
+            grok::args(&spec.config),
+            "unknown until initialize",
+            |args, spawn| {
+                let child = spawn(args)?;
+                let config = server.map(|server| {
+                    Arc::new(crate::mcp::McpConfig::for_grok(
+                        server.clone(),
+                        spec.thread,
+                        session_epoch,
+                        child.pid(),
+                    ))
+                });
+                let codec = Codec::Grok(Box::new(grok::Codec::new(
+                    spec.clone(),
+                    child.pid(),
+                    config.clone(),
+                )));
+                Ok((child, config.map(RootMcp::Grok), codec))
+            },
+        ),
     }
 }
 fn launch_with(
@@ -1212,6 +1236,7 @@ impl SessionLines {
 enum Codec {
     Claude(Box<claude::Codec>),
     Codex(Box<codex::Codec>),
+    Grok(Box<grok::Codec>),
 }
 impl Codec {
     fn profile(&self) -> SessionProfile {
@@ -1228,6 +1253,12 @@ impl Codec {
                 reject_non_json: false,
                 resume_from_stderr: false,
             },
+            Self::Grok(_) => SessionProfile {
+                provider: ProviderKind::Grok,
+                lines: |stdout| SessionLines::Rpc(jsonrpc::Reader::start(stdout)),
+                reject_non_json: false,
+                resume_from_stderr: false,
+            },
         }
     }
     #[cfg(debug_assertions)]
@@ -1235,30 +1266,35 @@ impl Codec {
         match self {
             Self::Claude(c) => Some(c.native()),
             Self::Codex(c) => c.native(),
+            Self::Grok(c) => c.native(),
         }
     }
     fn initialize(&mut self) -> serde_json::Value {
         match self {
             Self::Claude(_) => claude::initialize(),
             Self::Codex(c) => c.initialize(),
+            Self::Grok(c) => c.initialize(),
         }
     }
     fn active(&self) -> Option<ActiveTurn> {
         match self {
             Self::Claude(c) => c.active,
             Self::Codex(c) => c.active(),
+            Self::Grok(c) => c.active(),
         }
     }
     fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
         match self {
             Self::Claude(c) => c.start(turn, text),
             Self::Codex(c) => c.start(turn, text),
+            Self::Grok(c) => c.start(turn, text),
         }
     }
     fn value(&mut self, wire: serde_json::Value) -> Result<Decoded, ProviderError> {
         match self {
             Self::Claude(c) => c.value(wire),
             Self::Codex(c) => c.value(wire),
+            Self::Grok(c) => c.value(wire),
         }
     }
     fn answer(
@@ -1269,50 +1305,113 @@ impl Codec {
         match self {
             Self::Claude(c) => c.answer(native, reply),
             Self::Codex(c) => c.answer(native, reply),
+            Self::Grok(c) => c.answer(native, reply),
         }
     }
     fn interrupt_active(&mut self, reason: StopReason) -> Vec<Outbound> {
         match self {
             Self::Claude(c) => c.interrupt_active(reason),
             Self::Codex(c) => c.interrupt_active(reason),
+            Self::Grok(c) => c.interrupt_active(reason),
         }
     }
     fn interrupt_lines(&mut self, turn: TurnId, reason: StopReason) -> Vec<Outbound> {
         match self {
             Self::Claude(c) => c.interrupt_lines(turn, reason),
             Self::Codex(c) => c.interrupt_lines(turn, reason),
+            Self::Grok(c) => c.interrupt_lines(turn, reason),
         }
     }
     fn next_deadline(&self) -> Option<tokio::time::Instant> {
         match self {
             Self::Claude(c) => c.next_deadline(),
             Self::Codex(c) => c.next_deadline(),
+            Self::Grok(c) => c.next_deadline(),
         }
     }
     fn escalate_interrupt(&mut self) -> Option<Signal> {
         match self {
             Self::Claude(c) => c.escalate_interrupt(),
             Self::Codex(c) => c.escalate_interrupt(),
+            Self::Grok(c) => c.escalate_interrupt(),
         }
     }
     fn end_outcome(&self, outcome: TurnOutcome) -> TurnOutcome {
         match self {
             Self::Claude(c) => c.end_outcome(outcome),
             Self::Codex(c) => c.end_outcome(outcome),
+            Self::Grok(c) => c.end_outcome(outcome),
         }
     }
     fn timer_lines(&mut self) -> Result<Vec<Outbound>, ProviderError> {
         match self {
             Self::Claude(_) => Ok(vec![]),
             Self::Codex(c) => c.timer_lines(),
+            Self::Grok(c) => c.timer_lines(),
         }
     }
     fn eof(&mut self) {
-        if let Self::Codex(c) = self {
-            c.eof()
+        match self {
+            Self::Codex(c) => c.eof(),
+            Self::Grok(c) => c.eof(),
+            Self::Claude(_) => {}
         }
     }
 }
+pub async fn probe_grok(
+    env: &ChildEnv,
+    cwd: &std::path::Path,
+    mut cancelled: oneshot::Receiver<()>,
+) -> Result<super::Probe, ProviderError> {
+    let binary = env.resolve(ProviderKind::Grok)?;
+    check_cancelled(&mut cancelled)?;
+    #[cfg(debug_assertions)]
+    if let Some(root) = &env.fixtures {
+        let records = crate::fixture::load(&root.join("probe-grok.jsonl"))?;
+        let version = records.into_iter().find_map(|r| match r {
+            crate::fixture::Record::TranscriptStart { cli_version, .. } => Some(cli_version),
+            _ => None,
+        });
+        return Ok(super::Probe {
+            provider: ProviderKind::Grok,
+            path: Some(binary),
+            version,
+            readiness: super::Readiness::Ready,
+            models: vec![],
+            account: None,
+        });
+    }
+    let mut child = env.spawn(
+        &binary,
+        &["--no-auto-update".into(), "--version".into()],
+        cwd,
+        None,
+    )?;
+    let stderr = discard_stderr(&mut child);
+    let mut stdout = ByteLines::new(child.stdout().expect("piped stdout"));
+    let result = tokio::select! {
+        _ = &mut cancelled => Err(ProviderError::Cancelled),
+        result = tokio::time::timeout(Duration::from_secs(4), stdout.next()) => match result {
+            Ok(Ok(Some(Line::Text(line)))) => Ok(line),
+            Ok(Err(error)) => Err(error.into()),
+            _ => Err(ProviderError::Protocol("Grok version probe did not return a bounded line".into())),
+        }
+    };
+    let status = child.stop().await;
+    stderr.abort();
+    let _ = stderr.await;
+    status?;
+    let version = result?.trim().to_owned();
+    Ok(super::Probe {
+        provider: ProviderKind::Grok,
+        path: Some(binary),
+        version: (!version.is_empty()).then_some(version),
+        readiness: super::Readiness::Ready,
+        models: vec![],
+        account: None,
+    })
+}
+
 pub async fn probe_codex(
     env: &ChildEnv,
     cwd: &std::path::Path,

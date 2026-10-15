@@ -1,0 +1,16 @@
+{"type":"transcript_start","provider":"grok","protocol":"json-rpc","cli_version":"1.0.52","scenario":"question","source":"hand-written"}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"veyra","version":"<any>"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"_meta":{"clientType":"extension"}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":{"protocolVersion":1,"authMethods":[{"id":"cached_token","name":"Saved sign-in"}],"agentCapabilities":{},"agentInfo":{"version":"1.0.52"}}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:auth>","method":"authenticate","params":{"methodId":"cached_token"}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:auth>","result":{}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:open>","method":"session/new","params":{"cwd":"<cwd>","mcpServers":"<any>"}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:open>","result":{"sessionId":"veyra-grok-session"}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc1>","method":"session/prompt","params":{"sessionId":"veyra-grok-session","prompt":[{"type":"text","text":"<any>"}],"_meta":{"promptId":"<id:prompt1>"}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"question-1","method":"_x.ai/ask_user_question","params":{"method":"ask_user_question","params":{"sessionId":"veyra-grok-session","toolCallId":"choose-1","mode":"plan","questions":[{"id":"check-1","question":"Which check should run first?","multiSelect":null,"options":[{"label":"Build","description":"A Veyra test choice"},{"label":"Tests","description":"A Veyra test choice"}]}]},"_meta":{"promptId":"<id:prompt1>"}}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"question-1","result":{"outcome":"accepted","answers":{"Which check should run first?":["Tests"]}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"question-2","method":"x.ai/ask_user_question","params":{"method":"ask_user_question","params":{"sessionId":"veyra-grok-session","toolCallId":"choose-2","mode":"plan","questions":[{"id":"check-2","question":"Which report should be saved?","multiSelect":null,"options":[{"label":"Summary","description":"A Veyra test choice"},{"label":"Details","description":"A Veyra test choice"}]}]},"_meta":{"promptId":"<id:prompt1>"}}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"question-2","result":{"outcome":"accepted","answers":{"Which report should be saved?":["Summary"]}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"veyra-grok-session","_meta":{"promptId":"<id:prompt1>"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"veyra-grok-session","promptId":"<id:prompt1>","stopReason":"end_turn"}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:rpc1>","result":{"stopReason":"end_turn"}}}
+{"type":"exit","code":0}

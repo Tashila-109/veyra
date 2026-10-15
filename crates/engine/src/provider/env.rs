@@ -73,6 +73,8 @@ pub struct ChildEnv {
     #[cfg(debug_assertions)]
     pub codex_bin: Option<PathBuf>,
     #[cfg(debug_assertions)]
+    pub grok_bin: Option<PathBuf>,
+    #[cfg(debug_assertions)]
     pub fixtures: Option<PathBuf>,
     #[cfg(debug_assertions)]
     pub record: Option<PathBuf>,
@@ -98,6 +100,7 @@ impl ChildEnv {
             {
                 env.claude_bin = std::env::var_os("VEYRA_CLAUDE_BIN").map(PathBuf::from);
                 env.codex_bin = std::env::var_os("VEYRA_CODEX_BIN").map(PathBuf::from);
+                env.grok_bin = std::env::var_os("VEYRA_GROK_BIN").map(PathBuf::from);
                 env.fixtures = std::env::var_os("VEYRA_FAKE_FIXTURES").map(PathBuf::from);
                 env.record = std::env::var_os("VEYRA_RECORD").map(PathBuf::from);
                 env.reaper_pids = std::env::var("VEYRA_REAP_PIDS")
@@ -130,6 +133,8 @@ impl ChildEnv {
             #[cfg(debug_assertions)]
             codex_bin: None,
             #[cfg(debug_assertions)]
+            grok_bin: None,
+            #[cfg(debug_assertions)]
             fixtures: None,
             #[cfg(debug_assertions)]
             record: None,
@@ -157,7 +162,7 @@ impl ChildEnv {
         if let Some(path) = match provider {
             ProviderKind::Claude => self.claude_bin.as_ref(),
             ProviderKind::Codex => self.codex_bin.as_ref(),
-            ProviderKind::Grok => None,
+            ProviderKind::Grok => self.grok_bin.as_ref(),
         } {
             return executable(path)
                 .ok_or_else(|| ProviderError::NotInstalled(path.display().to_string()));
@@ -325,6 +330,34 @@ mod tests {
             result.status.success(),
             "{}",
             String::from_utf8_lossy(&result.stdout)
+        );
+    }
+    #[test]
+    fn grok_known_install_folder_and_isolated_home() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/grok-home-{}", ThreadId::new()));
+        let _scratch = crate::tests::Scratch(root.clone());
+        std::fs::create_dir_all(root.join(".grok/bin")).unwrap();
+        let planted = root.join(".grok/bin/grok");
+        std::fs::copy("/bin/echo", &planted).unwrap();
+        let resolved = super::resolve_from_dirs(
+            "grok",
+            crate::platform::KNOWN_BIN_DIRS
+                .iter()
+                .filter(|dir| dir.starts_with('.'))
+                .map(|dir| root.join(dir)),
+        );
+        assert_eq!(resolved, Some(std::fs::canonicalize(&planted).unwrap()));
+        let mut isolated = ChildEnv::isolated();
+        isolated.home = Some(root);
+        assert!(matches!(
+            isolated.resolve(super::ProviderKind::Grok),
+            Err(super::ProviderError::NotInstalled(_))
+        ));
+        let explicit = isolated.with_binary(super::ProviderKind::Grok, planted.clone());
+        assert_eq!(
+            explicit.resolve(super::ProviderKind::Grok).unwrap(),
+            std::fs::canonicalize(planted).unwrap()
         );
     }
     #[test]

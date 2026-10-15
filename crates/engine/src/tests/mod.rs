@@ -214,6 +214,7 @@ impl Fixture {
             native: NativeRequestRef("approval-one".into()),
             kind: RequestKind::Approval {
                 action: ProposedAction {
+                    consent: Default::default(),
                     tool: "shell".into(),
                     target: ApprovalTarget::Command {
                         command: "echo own-test".into(),
@@ -293,3 +294,5 @@ fn scratch_cleanup_handles_unwind_and_an_absent_folder() {
 
 mod logs;
 pub(crate) use logs::CapturedLogs;
+
+mod grok;

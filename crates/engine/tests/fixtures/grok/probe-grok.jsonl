@@ -1,0 +1,2 @@
+{"type":"transcript_start","provider":"grok","protocol":"json-rpc","cli_version":"1.0.52","scenario":"probe-grok","source":"hand-written"}
+{"type":"exit","code":0}

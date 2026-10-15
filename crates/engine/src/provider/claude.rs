@@ -852,10 +852,7 @@ impl Codec {
                 preview: Self::preview(arguments),
             }
         };
-        ProposedAction {
-            tool: tool.tool_name.clone(),
-            target,
-        }
+        ProposedAction::new(tool.tool_name.clone(), target)
     }
     fn tool_call(name: String, arguments: Value) -> ToolCall {
         let input_summary = if name == "Bash" {

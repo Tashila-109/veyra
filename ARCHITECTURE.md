@@ -2,14 +2,14 @@
 
 ## Executive summary
 
-Veyra is one native macOS chat window backed by an orchestration actor and per-thread Claude stream-json or Codex app-server processes.
+Veyra is one native macOS chat window backed by an orchestration actor and per-thread Claude stream-json, Codex app-server or Grok ACP processes.
 SQLite rows are the source of truth for projects, threads, turns, transcript items, tasks and the default permission mode.
 The engine actor is the sole database writer after startup.
 The gpui `Shell` owns window state and a read-only event projection, not another database connection.
 The engine never depends on gpui.
 
-Claude and Codex sessions, readiness probes, replay fixtures and debug recording are implemented.
-Grok has placeholder readiness and no codec.
+Claude, Codex and Grok engine sessions, readiness probes, replay fixtures and debug recording are implemented.
+Grok readiness reads its version and offers no model or effort catalog; its sign-in signal remains unknown.
 Claude and Codex server approvals and questions reach the same window dock, whose actions send typed decisions through the engine.
 Codex async agent-message questions instead become persistent transcript cards whose option actions send ordinary user messages.
 Exact thread grants and deny/cancel replies are persisted before their provider controls run, except on storage-blocked and blocked-shutdown paths where cancellation precedes stored expiry.
@@ -17,7 +17,7 @@ Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit co
 The window owns render and event-batch counters.
 Inactive-window family changes post system banners, and busy Quit opens a sheet.
 There is no PTY.
-Engine startup binds the MCP socket server, and root Claude and Codex sessions receive its five actor-owned tools through the relay.
+Engine startup binds the MCP socket server, and root Claude, Codex and Grok sessions receive its five actor-owned tools through the relay.
 
 ### System architecture
 
@@ -39,6 +39,7 @@ Engine actor -> owned caffeinate idle-sleep assertion
 root CLI -> veyra mcp direct child -> DATA/veyra.sock -> peer + token checks -> Engine actor
 Claude session -> private run/THREAD/mcp.json -> Claude root CLI
 Codex session -> thread/start or thread/resume config -> Codex root CLI
+Grok session -> session/new, session/resume or session/load mcpServers -> Grok root CLI
 
 debug ctl -> private Unix socket -> socket thread -> gpui window actions
                                          debug session -> recorder / fake CLI
@@ -210,6 +211,7 @@ The send-to-reply path is ordered as follows.
 2. The Spawn effect starts the session on its own process group.
 While the thread is still Starting, an exit before Ready fails the oldest queued turn and holds the thread as Stopped.
 3. Claude publishes Ready on a matched initialize reply or system/init; Codex publishes it on a successful thread/start or thread/resume reply, with the returned thread id and cliVersion, after any not-found fallback or active-writer retry.
+Grok publishes Ready on a successful session/new, session/resume or session/load reply with its native session id and initialize version.
 Ready changes Starting to Structured.
 4. start_changed makes the queued turn Running, records pending admission and dispatches StartTurn with committed prompt text.
 The first prompt waits for Ready.
@@ -347,7 +349,7 @@ No provider work restarts automatically and Veyra writes no user CLI configurati
 
 `provider/mod.rs` exposes typed controls and normalized events to the actor, not Claude wire types.
 The actor dispatches through `Spawner::spawn`.
-Its `Cli` variant sends built Claude and Codex adapters to `session::spawn_provider` with the Engine's shared `ChildEnv`; Grok returns NotBuilt.
+Its `Cli` variant sends Claude, Codex and Grok adapters to `session::spawn_provider` with the Engine's shared `ChildEnv`.
 `Spawner::terminal` returns NotBuilt.
 Scripted sessions exist only in engine tests and start no OS process.
 
@@ -356,6 +358,8 @@ It retains the shell failure and reports it on load, including UI readiness load
 Engine::start initializes it on the startup caller before launching the actor, so session dispatch never runs a blocking login shell on the actor.
 Resolution tries absolute entries from inherited PATH, that snapshot, then `KNOWN_BIN_DIRS`, returning a canonical absolute executable path.
 Relative and empty search entries are ignored.
+Known home-relative folders include .grok/bin, so a Finder launch can resolve Grok without that directory in either PATH.
+Explicit isolated environments never fall through to home-relative install folders.
 Executable checks and process-group mechanics are platform functions.
 Every provider and probe child has piped stdio, `kill_on_drop(true)`, its own process group and `VEYRA_PARENT_PID` naming the application.
 It strips CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SSE_PORT, CLAUDE_AGENT_SDK_VERSION and every inherited VEYRA_* variable before adding its own marker and optional replay fixture.
@@ -374,12 +378,12 @@ Valid JSON that cannot decode as an ordinary Claude frame is skipped, logging on
 An undecodable Claude control request with a valid id gets an error control_response and reserves that id for that CLI process's lifetime; an unaddressable request fails the session.
 Undecodable Claude control replies, including initialize, fail the session instead of leaving the Ready gate waiting.
 Each accepted stdout line is parsed once as JSON, then passes through recording and its provider codec.
-Claude additionally decodes subagent frames; Codex deserializes the requests, notifications, items and replies it uses through tolerant wire types.
+Claude additionally decodes subagent frames; Grok deserializes the initialization, permission, question and tool payloads it uses, and Codex deserializes the requests, notifications, items and replies it uses through tolerant wire types.
 Unknown Codex methods and item kinds have serde fallback arms, and optional fields have defaults.
 The bounded stderr tail is redacted before display and supplies failures when the CLI exits unexpectedly.
 Claude Interrupt and Shutdown queue deny replies for every open approval and question with `interrupt: true`; Codex uses the per-kind cancel replies described below.
 Decoded::take_outbound places every reply and ordinary control before any interrupt in the same batch, so decoder collection order cannot invert cancellation and interruption.
-Both codecs use provider::StopLadder for the active turn's interrupted outcome and both deadlines: group SIGTERM after three seconds, then SIGKILL one second later.
+All three codecs use provider::StopLadder for the active turn's interrupted outcome and both deadlines: group SIGTERM after three seconds, then SIGKILL one second later.
 Each codec owns its request cancellation and supplies an Interrupt frame carrying the target and its own protocol line.
 SessionControl::Interrupt carries the turn id targeted by a human Stop and a typed StopReason.
 Storage failure uses InterruptActive with StopReason::StorageBlocked to stop whichever codec turn is active, independently of actor admission.
@@ -448,13 +452,13 @@ Replies resolve by id, server requests retain string or numeric ids including ze
 Peer::eof clears its pending tags; ordinary field destruction releases them when the peer is dropped.
 The session independently finalizes active work when stdout closes.
 The shared writer in session.rs applies the launch-closing check to prompts and the active-turn check to interrupt frames before their first byte.
-Codex uses a reader task over the same cancellation-safe provider::lines::ByteLines reader as Claude.
-session.rs reads Codex stdout through jsonrpc::Reader and Claude stdout through ByteLines directly; jsonrpc.rs imports only lines.rs and ProviderError, never the session.
+Codex and Grok use a reader task over the same cancellation-safe provider::lines::ByteLines reader as Claude.
+session.rs reads Codex and Grok stdout through jsonrpc::Reader and Claude stdout through ByteLines directly; jsonrpc.rs imports only lines.rs and ProviderError, never the session.
 The RPC reader queues four frames, an implementation choice that buffers a short reply burst while applying backpressure.
 Four slots hold at most 16 MiB of capped wire bytes or 48 MiB of worst-case lossy UTF-8 text; the reader may additionally retain one decoded frame and its bounded byte buffer.
 Reader::next returns text or an error, so an oversize line cannot leak into a caller's impossible branch.
-A Codex line over 4 MiB fails the session with the cap in its crash text; invalid UTF-8 decodes lossily and non-JSON lines are skipped.
-ACP framing is supported by the peer flag, while no Grok session is implemented.
+A Codex or Grok line over 4 MiB fails the session with the cap in its crash text; invalid UTF-8 decodes lossily and non-JSON lines are skipped.
+Grok uses the same peer and reader with the JSON-RPC version field enabled.
 
 `codex::Codec` owns its Peer<Call>, app-server wire state, native thread and turn correlation, pending approvals and questions, item output, and protocol retry deadlines.
 Conversation distinguishes opening with an optional resume retry from Ready with a native id.
@@ -532,12 +536,59 @@ A no-active-turn interrupt refusal before turn/started waits for that start and 
 Codex and Claude share process-group cleanup, the stop ladder, shutdown commitment checks and actor recovery paths.
 launch chooses its provider setup once, and launch_with shares fixture selection, recorder setup and the ChildEnv spawn boundary.
 The run loop chooses one SessionProfile from its codec for stdout reading, malformed-line diagnostics and resume-failure classification.
-RootMcp holds either Claude's private Configuration and session credential or Codex's attempt-credential factory.
-SessionIo owns the process and recording/credential lifetime, while Process owns the Claude or Codex codec variant.
+RootMcp holds either Claude's private Configuration and session credential or a shared McpConfig attempt-credential factory for Codex or Grok.
+SessionIo owns the process and recording/credential lifetime, while Process owns the Claude, Codex or Grok codec variant.
 Each Codex thread/start or thread/resume attempt registers a fresh one-use credential for the existing app-server pid, revoking the previous attempt before sending the next.
 Resume refusals revoke immediately, including not-found fallback and every active-writer retry.
 McpConfig retains the attempt hashes for inbound, stderr and recording redaction until the root session ends.
-Codex's ThreadFrame keeps its credential as McpToken; its provider-owned serialization inserts config immediately before the shared writer writes bytes, and its recording value contains only the token marker.
+mcp::ThreadFrame keeps its credential as McpToken; its provider-owned serialization inserts config immediately before the shared writer writes bytes, and its recording value contains only the token marker.
+
+## Grok ACP codec
+
+`grok::Codec` owns ACP JSON-RPC calls, native session identity, prompt ownership, open requests, background task ids and its shared StopLadder.
+`grok::args` places --no-auto-update before agent and --no-leader before stdio.
+Ask first and Accept edits select default or acceptEdits before agent; Full access uses agent --always-approve without --permission-mode.
+Model and effort are optional launch flags after agent, and Configure uses the existing respawn path.
+No model or effort values are invented when no catalog has been read.
+Initialize requests protocolVersion 1, disables filesystem and terminal client capabilities and declares _meta.clientType extension.
+An advertised xai.api_key method is chosen only with XAI_API_KEY set; otherwise an advertised cached_token is used.
+Authentication precedes opening the session when a usable method is advertised, and an authentication-required open permits one reauthentication and retry.
+Authentication failures name Sign in with `grok login`; Veyra never launches that command.
+A fresh conversation uses session/new with cwd and mcpServers.
+A resumed conversation uses session/resume when agentCapabilities.sessionCapabilities.resume is advertised, otherwise session/load.
+An import request selects session/load, but the terminal-history importer is not implemented.
+Replay-marked updates are dropped by this engine slice.
+Only a recognized session-not-found error falls back to session/new with a notice; other errors preserve the stored native id.
+
+Each session/prompt carries its Veyra turn id in _meta.promptId.
+The first frame tagged with that id emits Accepted, or a matching completion emits it immediately before the end when no tagged frame arrived.
+The matching prompt_complete notification or prompt RPC reply settles the turn once, whichever arrives first.
+A prompt RPC error without acceptance fails without marking the prompt accepted.
+A sixty-second first-frame deadline fails only if no JSON frame has arrived since dispatch; any frame cancels that deadline and there is no later silence timeout.
+Unknown prompt ids on supported content updates or valid server requests open announced Provider turns, including task-completed ids.
+A lone completion for an unknown prompt id is ignored.
+Both x.ai and _x.ai task_backgrounded and task_completed spellings update a set of update.task_id values.
+The actor's existing background-work flag prevents Configure, SwitchView, parking and early task settlement while that set is nonempty.
+Text, reasoning, tool rows, bounded tool output and plans normalize to the existing engine events.
+Unknown notifications are ignored, and unsupported or malformed server requests receive JSON-RPC errors without approval.
+
+Permission requests select options by allow_once or reject_once kind and never select allow_always.
+A Bash request with only command, description and timeout fields may use the existing exact-command thread grant, which still replies allow_once.
+Other argument shapes offer no thread grant and show an unverified command cwd or a tool preview.
+ProposedAction::consent is Once for existing approvals and DenyOnly with Grok's lasting-grant reason when no allow_once option exists.
+RequestKind::accepts rejects both allow decisions for DenyOnly and preserves Deny, including after stored action round trips.
+Existing stored approvals without consent deserialize as Once.
+The Grok-specific disabled dock controls and their visual verification belong to the later UI slice.
+Both ask_user_question extension spellings decode the nested question payload into RequestKind::Question and reply with accepted answers keyed by question text and arrays of selected labels.
+Stop first sends cancelled outcomes for open permission requests and questions, then session/cancel with _meta.cancelTrigger ctrl_c.
+The shared writer, target checks, ladder, cleanup and actor drain keep that ordering and prevent a stale Stop from targeting a later turn.
+
+A root's session-open frame carries the Veyra stdio server in mcpServers with relay command, mcp argument and environment name/value entries.
+McpConfig registers a fresh credential for each open attempt against the actual Grok process pid.
+The shared typed frame retains McpToken until the writer serializes it and supplies only a token marker to recording.
+No token-bearing config file, CLI argument or root CLI environment entry is created.
+The same executable, direct-parent, epoch, live-turn and single-use socket checks apply to Grok roots.
+Recorder redaction also masks credential values in ACP environment name/value arrays.
 
 ## MCP relay, authentication and actor tools
 
@@ -559,7 +610,7 @@ Revocation can remove a pending credential while launch runs; no credential lock
 Only the hash remains in the credential registry, and a credential permits one connection.
 The plaintext token remains readable in the relay environment for the session, so the executable, direct-parent and single-use checks all remain necessary.
 A later spawn or Codex thread-open attempt for the same thread revokes its earlier credential; a revoked open connection closes on its next input line.
-Claude Session Drop removes its credential by hash and Codex McpConfig Drop revokes its thread and epoch, and Actor::exited also revokes the thread and epoch before committing exit.
+Claude Session Drop removes its credential by hash and shared McpConfig Drop revokes its thread and epoch, and Actor::exited also revokes the thread and epoch before committing exit.
 Server::bind requires a private 0700 data folder and uses platform::bind_async_socket to unlink a stale veyra.sock and bind it at 0600.
 The server gets the peer pid with LOCAL_PEERPID, its direct parent with proc_pidinfo and its executable path with proc_pidpath.
 Authentication compares the peer executable with the supplied relay command and its direct parent with the registered CLI pid before consuming the token hash.
@@ -603,7 +654,7 @@ The token never enters argv, logs, evidence, fixture text or crash text.
 Actor::handle_inner sends every tool decision through tools::decide, the existing ChangeSet commit and the existing effects path.
 ProviderKind::is_built owns provider availability for the spawner, tool catalog, start validation and start_thread schema.
 list_providers reads the shared readiness catalog and offers built adapters with Ready and a resolved path, their models, the caller's mode ceiling and remaining fan-out.
-start_thread offers ready Codex as well as Claude, and refuses Grok with the unsupported-version rule and a list_providers call.
+start_thread offers each built provider whose probe has a resolved path and Ready status, including Grok.
 Probes populate that catalog and Engine::child_env shares it with the actor.
 start_thread creates a child lineage, first task turn and UUID-v5 task keyed by caller and start_thread:client_request_id.
 get_task reads only the caller's task and reports the child's Status::words with its settled summary when present.
@@ -669,7 +720,9 @@ One five-second timeout covers the whole Codex probe exchange, including every m
 Its version comes from initialize.userAgent, model values from model/list, and effort levels from each model's supportedReasoningEfforts.
 An explicit null account with requiresOpenaiAuth true reads Signed out; otherwise an absent account remains unknown and Ready.
 A Codex probe failure other than NotInstalled follows the same unknown-and-Ready fallback as Claude.
-Grok stays a Ready placeholder whose spawn returns NotBuilt, fails the oldest queued turn and holds the Starting thread as Stopped.
+Grok resolves its binary and reads --no-auto-update --version under a four-second deadline, without starting an ACP session or a turn.
+Its sign-in reading remains unknown and Ready, and its probe returns no models or effort values.
+Debug fake Grok probes read only the hand-written probe-grok.jsonl header.
 The Shell holds raw probe account metadata in memory.
 Dump exposes only account presence as known or unknown, never its value.
 
@@ -689,10 +742,10 @@ The mcp_stop fixture record closes and reaps that owned relay before a later att
 record_relay_pid stores only that owned relay pid under the same path restrictions, allowing process-exit assertions.
 Capture-derived fixtures come from Veyra's own CLI recordings; other cases are Veyra's scripted wires.
 
-The debug-only branches of `ChildEnv::load` are the only application read site for VEYRA_CLAUDE_BIN, VEYRA_CODEX_BIN, VEYRA_FAKE_FIXTURES, VEYRA_RECORD and VEYRA_REAP_PIDS.
-The provider overrides replace their matching Claude or Codex binary.
+The debug-only branches of `ChildEnv::load` are the only application read site for VEYRA_CLAUDE_BIN, VEYRA_CODEX_BIN, VEYRA_GROK_BIN, VEYRA_FAKE_FIXTURES, VEYRA_RECORD and VEYRA_REAP_PIDS.
+The provider overrides replace their matching Claude, Codex or Grok binary.
 Each Engine owns its lane registry through its shared ChildEnv.
-New threads register in creation order; each thread's spawn E uses tN-sE.jsonl, with probe.jsonl for Claude probes and probe-codex.jsonl for Codex probes.
+New threads register in creation order; each thread's spawn E uses tN-sE.jsonl, with probe.jsonl for Claude probes and probe-codex.jsonl for Codex probes; Grok uses the header of probe-grok.jsonl.
 Stored threads register when first spawned in that run.
 Missing replay files fail spawn with their path; the child gets the absolute singular VEYRA_FAKE_FIXTURE only in debug builds.
 The standalone fake executable reads that singular variable.
@@ -922,7 +975,7 @@ DebugStallUi blocks the window thread for its supplied milliseconds so the pump 
 - [Actor](crates/engine/src/actor.rs), [decisions](crates/engine/src/commands.rs), [domain/indexes](crates/engine/src/domain.rs), [live variants](crates/engine/src/live.rs).
 - [Relay](crates/veyra/src/relay.rs), [MCP socket and config](crates/engine/src/mcp.rs), [tool decisions and guidance](crates/engine/src/tools.rs).
 - [Storage/schema](crates/engine/src/store.rs), [recovery](crates/engine/src/reconcile.rs), [events/snapshots](crates/engine/src/events.rs).
-- [Provider boundary](crates/engine/src/provider/mod.rs), [environment](crates/engine/src/provider/env.rs), [sessions/probes](crates/engine/src/provider/session.rs), [Claude codec](crates/engine/src/provider/claude.rs), [JSON-RPC peer](crates/engine/src/provider/jsonrpc.rs), [bounded lines](crates/engine/src/provider/lines.rs), [Codex wire types](crates/engine/src/provider/codex/wire.rs), [Codex codec](crates/engine/src/provider/codex.rs).
+- [Provider boundary](crates/engine/src/provider/mod.rs), [environment](crates/engine/src/provider/env.rs), [sessions/probes](crates/engine/src/provider/session.rs), [Claude codec](crates/engine/src/provider/claude.rs), [JSON-RPC peer](crates/engine/src/provider/jsonrpc.rs), [bounded lines](crates/engine/src/provider/lines.rs), [Codex wire types](crates/engine/src/provider/codex/wire.rs), [Codex codec](crates/engine/src/provider/codex.rs), [Grok codec](crates/engine/src/provider/grok.rs).
 - [Fixture format](crates/engine/src/fixture.rs), [fake CLI](crates/engine/src/bin/veyra-fake-cli.rs), [recording/redaction](crates/engine/src/record.rs).
 - [Window/pump/fence/branch](crates/veyra/src/ui/mod.rs), [transcript](crates/veyra/src/ui/transcript.rs), [composer](crates/veyra/src/ui/composer.rs), [Settings](crates/veyra/src/ui/settings.rs), [actions](crates/veyra/src/ui/actions.rs), [theme](crates/veyra/src/ui/theme.rs).
 - [Banner decisions](crates/veyra/src/ui/notify.rs), [macOS app bundle](scripts/bundle-app.sh).
@@ -1026,3 +1079,10 @@ Peer tests cover omitted and included version fields, out-of-order replies, EOF 
 Relay tests hold the socket open while stdin or the parent ends and independently block socket and stdout writes before closing stdin.
 The MCP half-close and queue-overflow tests hold an actor reply pending and require credential revocation and connection closure.
 Codex live tests are ignored by default.
+
+Grok replays cover prompt correlation, exactly-once completion, two turns per process, permissions, both question spellings, cancellation order, authentication retry, signed-out failure and advertised resume.
+The first-frame timeout replay advances Tokio time and does not wait sixty seconds on the wall clock.
+Actor-backed Grok replays verify persisted question answers and request expiry, and background work refusing Configure and SwitchView before a Provider continuation.
+The separately invoked grok_root_real_relay proof uses the production veyra mcp executable and fake CLI without opening a window.
+Grok fixtures name version 1.0.52 and source hand-written; real Grok wires, sign-in signals, permission behavior and late-update ordering still require the authorized live lanes.
+Grok live tests are ignored by default.

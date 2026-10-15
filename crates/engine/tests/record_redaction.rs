@@ -330,3 +330,76 @@ fn privacy_sweep_detects_shapes_and_a_planted_split_needle() {
     assert!(private_detail(&joined_blocks(&planted)[0]));
     assert!(!private_detail("Veyra checks the command."));
 }
+
+#[test]
+fn grok_mcp_environment_values_are_redacted() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("grok.jsonl");
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Grok,
+        "1.0.52",
+        &scratch.0,
+        None,
+        None,
+    )
+    .unwrap();
+    recorder
+        .line(
+            true,
+            json!({"jsonrpc":"2.0","id":1,"method":"session/new",
+        "params":{"cwd":scratch.0,"mcpServers":[{"name":"veyra","command":"veyra",
+        "args":["mcp"],"env":[{"name":"VEYRA_SOCKET","value":"<cwd>/veyra.sock"},
+        {"name":"VEYRA_MCP_TOKEN","value":"synthetic-credential-needle"}]}]}}),
+        )
+        .unwrap();
+    let text = fs::read_to_string(path).unwrap();
+    assert!(
+        !text.contains("synthetic-credential-needle"),
+        "Grok environment leaked a synthetic credential"
+    );
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(
+        rows[1]["line"]["params"]["mcpServers"][0]["env"][1]["value"],
+        "<any>"
+    );
+    assert_eq!(
+        rows[1]["line"]["params"]["mcpServers"][0]["env"][0]["value"],
+        "<cwd>/veyra.sock"
+    );
+}
+
+#[test]
+fn grok_auth_method_catalog_is_public_but_credentials_are_private() {
+    let methods = json!({"authMethods":[{"id":"cached_token","name":"Saved sign-in"}]});
+    assert!(!record::secret_shapes(&methods.to_string()));
+    assert!(record::secret_shapes(
+        &json!({"authMethods":[{"id":"cached_token","access_token":"synthetic-private-value"}]})
+            .to_string()
+    ));
+    assert!(record::secret_shapes(
+        &json!({"authMethods":"synthetic-private-value"}).to_string()
+    ));
+    let scratch = Scratch::new();
+    let path = scratch.0.join("grok-auth.jsonl");
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Grok,
+        "1.0.52",
+        &scratch.0,
+        None,
+        None,
+    )
+    .unwrap();
+    recorder.line(false,json!({"authMethods":[{"id":"cached_token","name":"Saved sign-in","access_token":"synthetic-private-value"}]})).unwrap();
+    let rows: Vec<serde_json::Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(rows[1]["line"]["authMethods"][0]["id"], "cached_token");
+    assert_eq!(rows[1]["line"]["authMethods"][0]["access_token"], "<any>");
+}

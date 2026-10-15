@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod env;
+pub mod grok;
 pub mod jsonrpc;
 pub(crate) mod lines;
 #[cfg(test)]
@@ -244,7 +245,7 @@ impl Probe {
 }
 impl ProviderKind {
     pub fn is_built(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex)
+        matches!(self, Self::Claude | Self::Codex | Self::Grok)
     }
     pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
     pub fn binary(self) -> &'static str {
@@ -291,7 +292,7 @@ impl ProviderKind {
         let result = match self {
             Self::Claude => Some(session::probe(env, cwd, cancelled).await),
             Self::Codex => Some(session::probe_codex(env, cwd, cancelled).await),
-            Self::Grok => None,
+            Self::Grok => Some(session::probe_grok(env, cwd, cancelled).await),
         };
         let error = match result {
             Some(Ok(probe)) => return probe,
@@ -456,7 +457,7 @@ impl StopLadder {
 pub(crate) enum Outbound {
     Prompt(serde_json::Value),
     Message(serde_json::Value),
-    Provider(Box<codex::ThreadFrame>),
+    Provider(Box<crate::mcp::ThreadFrame>),
     Interrupt {
         turn: TurnId,
         line: serde_json::Value,

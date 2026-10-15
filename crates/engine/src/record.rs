@@ -32,12 +32,24 @@ static MATCHES: LazyLock<Vec<Redaction>> = LazyLock::new(|| {
 static HOME_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"/(?:Users|home)/[^/\s"<>]+(?:/|\b)"#).expect("personal home path expression")
 });
+fn auth_method_catalog(capture: &Captures<'_>) -> bool {
+    capture.get(1).is_some_and(|prefix| {
+        prefix
+            .as_str()
+            .trim_end()
+            .strip_suffix(':')
+            .is_some_and(|field| field.trim_end().strip_suffix('"') == Some("authMethods"))
+    }) && capture
+        .get(2)
+        .is_some_and(|value| value.as_str().starts_with('['))
+}
 pub fn secret_shapes(text: &str) -> bool {
     HOME_PATH.is_match(text)
         || MATCHES.iter().any(|rule| {
-            rule.expression
-                .captures_iter(text)
-                .any(|capture| !crate::fixture::wildcard(&capture[rule.secret_group]))
+            rule.expression.captures_iter(text).any(|capture| {
+                !auth_method_catalog(&capture)
+                    && !crate::fixture::wildcard(&capture[rule.secret_group])
+            })
         })
 }
 pub fn redact(text: &str, token: Option<&str>) -> String {
@@ -49,6 +61,9 @@ pub fn redact(text: &str, token: Option<&str>) -> String {
         text = rule
             .expression
             .replace_all(&text, |capture: &Captures<'_>| {
+                if auth_method_catalog(capture) {
+                    return capture[0].to_owned();
+                }
                 let mut replacement = String::new();
                 capture.expand(rule.replacement, &mut replacement);
                 replacement
@@ -247,6 +262,17 @@ mod capture {
             {
                 return "<id:token>".into();
             }
+            if key == Some("authMethods")
+                && let Value::Array(methods) = &value
+            {
+                return Value::Array(
+                    methods
+                        .iter()
+                        .cloned()
+                        .map(|method| self.sanitize(method, None))
+                        .collect(),
+                );
+            }
             if key == Some("account") {
                 return mask_account(value);
             }
@@ -256,6 +282,20 @@ mod capture {
                     .any(|needle| key.to_lowercase().contains(needle))
             }) {
                 return Value::String("<any>".into());
+            }
+            if let Value::Object(pair) = &value
+                && let Some(name) = pair.get("name").and_then(Value::as_str)
+                && pair.contains_key("value")
+                && ["token", "key", "secret", "password", "auth"]
+                    .iter()
+                    .any(|part| name.to_lowercase().contains(part))
+            {
+                let mut pair = pair.clone();
+                pair.insert(
+                    "value".into(),
+                    self.sanitize(pair["value"].clone(), Some(name)),
+                );
+                return Value::Object(pair);
             }
             match value {
                 Value::Object(object) => Value::Object(

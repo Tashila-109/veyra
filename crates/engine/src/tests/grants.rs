@@ -11,6 +11,7 @@ pub(super) fn approval(f: &mut Fixture, tool: &str, command: &str) -> RequestId 
             native: NativeRequestRef(format!("request-{}", before.len())),
             kind: RequestKind::Approval {
                 action: ProposedAction {
+                    consent: Default::default(),
                     tool: tool.into(),
                     target: ApprovalTarget::Command {
                         command: command.into(),

@@ -31,89 +31,7 @@ pub fn mode(mode: PermissionMode) -> (&'static str, &'static str, Value) {
         ),
     }
 }
-pub(crate) struct McpConfig {
-    server: std::sync::Arc<crate::mcp::Server>,
-    thread: ThreadId,
-    epoch: u32,
-    pid: u32,
-    hashes: std::sync::Mutex<Vec<crate::mcp::TokenHash>>,
-}
-impl McpConfig {
-    pub(crate) fn new(
-        server: std::sync::Arc<crate::mcp::Server>,
-        thread: ThreadId,
-        epoch: u32,
-        pid: u32,
-    ) -> Self {
-        Self {
-            server,
-            thread,
-            epoch,
-            pid,
-            hashes: Default::default(),
-        }
-    }
-    fn frame(&self, line: Value) -> Result<Outbound, ProviderError> {
-        let token = self.server.for_spawn(self.thread, self.epoch, |token| {
-            Ok((token.clone(), self.pid))
-        })?;
-        self.hashes
-            .lock()
-            .unwrap()
-            .push(crate::mcp::TokenHash(token.hash()));
-        Ok(Outbound::Provider(Box::new(ThreadFrame {
-            line,
-            command: self.server.command.clone(),
-            socket: self.server.socket.clone(),
-            token,
-        })))
-    }
-    pub(crate) fn sanitize(&self, value: &mut Value, replacement: &str) {
-        for hash in self.hashes.lock().unwrap().iter() {
-            hash.sanitize(value, replacement);
-        }
-    }
-    pub(crate) fn redact(&self, text: &str, replacement: &str) -> String {
-        self.hashes
-            .lock()
-            .unwrap()
-            .iter()
-            .fold(text.to_owned(), |text, hash| {
-                hash.redact(&text, replacement)
-            })
-    }
-    fn revoke(&self) {
-        self.server.revoke(self.thread, self.epoch);
-    }
-}
-impl Drop for McpConfig {
-    fn drop(&mut self) {
-        self.revoke();
-    }
-}
-pub(crate) struct ThreadFrame {
-    line: Value,
-    command: std::path::PathBuf,
-    socket: std::path::PathBuf,
-    token: crate::mcp::McpToken,
-}
-impl ThreadFrame {
-    fn config(&self, token: &str) -> Value {
-        json!({"mcp_servers.veyra.command":self.command,
-            "mcp_servers.veyra.args":["mcp"],
-            "mcp_servers.veyra.env":{"VEYRA_SOCKET":self.socket,"VEYRA_MCP_TOKEN":token}})
-    }
-    #[cfg(any(debug_assertions, test))]
-    pub(crate) fn value(&self) -> Value {
-        let mut line = self.line.clone();
-        line["params"]["config"] = self.config("<id:token>");
-        line
-    }
-    pub(crate) fn into_bytes(mut self) -> serde_json::Result<Vec<u8>> {
-        self.line["params"]["config"] = self.config(self.token.expose());
-        serde_json::to_vec(&self.line)
-    }
-}
+pub(crate) use crate::mcp::McpConfig;
 pub fn thread_params(spec: &SessionSpec) -> Value {
     let (approval, sandbox, _) = mode(spec.config.mode);
     let mut params = json!({
@@ -1066,7 +984,7 @@ impl Codec {
         let preview =
             || ApprovalPreview::new(serde_json::to_string_pretty(&params).unwrap_or_default());
         let approval = |tool: String, target| RequestKind::Approval {
-            action: ProposedAction { tool, target },
+            action: ProposedAction::new(tool, target),
             grant_key: None,
         };
         let (kind, reply) = match request {
@@ -1092,15 +1010,15 @@ impl Codec {
                 };
                 (
                     RequestKind::Approval {
-                        action: ProposedAction {
-                            tool: "Command".into(),
-                            target: ApprovalTarget::Command {
+                        action: ProposedAction::new(
+                            "Command".into(),
+                            ApprovalTarget::Command {
                                 command: text.into(),
                                 cwd: location,
                                 reason: command.reason.clone().map(ApprovalPreview::new),
                                 preview: preview(),
                             },
-                        },
+                        ),
                         grant_key: in_project.then(|| GrantKey {
                             tool: "Command".into(),
                             command: text.into(),
@@ -1771,28 +1689,6 @@ mod tests {
         assert_eq!(frames[0], json!({"id":0,"result":{"decision":"cancel"}}));
         assert_eq!(frames[1]["method"], "turn/interrupt");
         assert_eq!(frames.len(), 2);
-    }
-    #[test]
-    fn codex_thread_credential_stays_typed_until_serialization() {
-        let token = crate::mcp::McpToken::new();
-        let outbound = Outbound::Provider(Box::new(ThreadFrame {
-            line: json!({"id":1,"method":"thread/start","params":{}}),
-            command: "/owned/veyra".into(),
-            socket: "/owned/veyra.sock".into(),
-            token: token.clone(),
-        }));
-        let recorded = outbound.value();
-        assert_eq!(
-            recorded["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"],
-            "<id:token>"
-        );
-        assert!(!recorded.to_string().contains(token.expose()));
-        let bytes = outbound.into_bytes().unwrap();
-        let written: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            written["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"].as_str()
-                == Some(token.expose())
-        );
     }
     #[test]
     fn codex_early_mcp_without_turn_id_can_be_answered() {

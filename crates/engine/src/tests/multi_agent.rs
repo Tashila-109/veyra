@@ -299,7 +299,7 @@ fn start_thread_schema_offers_only_built_providers() {
         .unwrap();
     assert_eq!(
         start["inputSchema"]["properties"]["provider"]["enum"],
-        json!(["claude", "codex"])
+        json!(["claude", "codex", "grok"])
     );
 }
 
@@ -868,6 +868,7 @@ fn get_task_status_matches_window() {
                     native: NativeRequestRef("status approval".into()),
                     kind: RequestKind::Approval {
                         action: ProposedAction {
+                            consent: Default::default(),
                             tool: "Bash".into(),
                             target: ApprovalTarget::Command {
                                 command: "echo status".into(),
@@ -1119,10 +1120,32 @@ fn storage_tool_refusals_name_a_recovery_call() {
     );
 }
 #[test]
-fn tool_catalog_refuses_unbuilt_providers() {
-    let mut f = Fixture::new(LiveState::Running);
-    let caller = f.thread;
-    let listed = success(call(&mut f, caller, "list_providers", json!({})));
+fn tool_catalog_refuses_missing_provider() {
+    let f = Fixture::new(LiveState::Running);
+    let providers = [ProviderKind::Claude, ProviderKind::Codex].map(|provider| Probe {
+        provider,
+        path: Some("/scripted".into()),
+        version: None,
+        readiness: Readiness::Ready,
+        models: vec![],
+        account: None,
+    });
+    let call = |name: &str, arguments| {
+        crate::tools::decide(
+            &f.actor.projection,
+            &f.actor.live,
+            f.thread,
+            ToolCall {
+                name: name.into(),
+                arguments,
+                input_summary: None,
+                veyra_label: false,
+            },
+            &providers,
+            now(),
+        )
+    };
+    let (_, listed) = call("list_providers", json!({})).unwrap();
     let names: Vec<_> = listed["providers"]
         .as_array()
         .unwrap()
@@ -1130,17 +1153,16 @@ fn tool_catalog_refuses_unbuilt_providers() {
         .map(|provider| provider["provider"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["claude", "codex"]);
-    let provider = "grok";
-    refusal(
-        call(
-            &mut f,
-            caller,
-            "start_thread",
-            json!({"provider":provider,"title":"Worker","prompt":"x","client_request_id":provider}),
-        ),
-        &["not built", "list_providers", "{}"],
-    );
+    let error = call(
+        "start_thread",
+        json!({"provider":"grok","title":"Worker","prompt":"x","client_request_id":"grok"}),
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("not installed and ready"));
+    assert!(error.to_string().contains("list_providers"));
 }
+
 #[test]
 fn parent_stop_keeps_the_discarded_queue_reason() {
     let mut f = Fixture::new(LiveState::Running);
