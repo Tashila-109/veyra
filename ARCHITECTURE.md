@@ -821,7 +821,8 @@ Decision controls put Deny and Allow once before the optional thread grant, so a
 At both theme window sizes, the approval matrix retains the long folder's three lines and at least one code line even with all fixed controls present, so no smaller-folder fallback is needed.
 Folder, details and question text use one bounded-scroll helper whose caller supplies minimum and maximum heights, with independent kit scrollbars visible only for actual overflow.
 Its 16px logical thumb minimum leaves travel on a 20px one-line track; the kit's 4px end insets leave an 8px painted thumb at that minimum.
-Only the working-folder quote uses the 16px label line height; other quotes retain their inherited 20px UI line height and natural height.
+The working-folder quote uses the 16px label line height and the scrolling dock question uses the 20px UI line height.
+Other quotes inherit their parent line height and keep natural height; async card titles use the transcript row’s 24px read line height.
 Question text scrolls from one 20px line up to the 240px composer cap beneath its fixed label; the combined question region keeps a 44px minimum for label, gap and one text line.
 Up to four options use one column; larger lists use three columns.
 Option captions wrap without visual truncation inside buttons of at least 28px; overflowing lists scroll in a 28–240px bounded viewport with the same overflow-only scrollbar.

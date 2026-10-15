@@ -22,7 +22,7 @@ Every button's shortcut_chip reads the same bindings table as the keymap.
 Buttons answer their displayed request; an expired request or a question index that already advanced sends no answer.
 A question keeps its labeled text in a bounded scroll area above its options.
 Up to four options use one column; larger lists use three columns. Captions wrap in their buttons, and overflowing lists scroll with the shared visible scrollbar.
-A pending dock keeps the scrollable message input at its 48px minimum; closing the dock restores its normal height limit.
+A pending dock keeps the scrollable message input at a fixed 48px height; closing the dock restores its normal height limit.
 Click Focus to use shortcuts or press ⌘⇧Y to FocusDock.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
 More than one pending request shows 1 of N.
@@ -516,7 +516,7 @@ PYCODEX
 `question-nine.png` and `codex-question-nine.png` show every long route label wrapped in three columns below the 400-character question, with a tall draft retained in the fixed 48px message input.
 The digit-9 replies preserve the ninth route label as the answer in both providers' strict fixtures and stored user text.
 The GPUI matrices also check disjoint visible regions, contained text for every region, the docked editor inside its input viewport and every dock/composer button inside both theme window sizes for every dock kind (scrolling choices are clipped to their viewport).
-A queued-turn flag exercises Discard queued alongside Continue in both matrices.
+One held-and-queued case per theme window size and provider checks Discard queued alongside Continue.
 Caption checks shape each complete option label at its actual font and width, so truncation cannot pass as containment.
 The draft test scrolls to the last of 40 lines and proves the original text and normal input growth survive closing the dock.
 Question text keeps at least one 20px line, caps at 240px, and scrolls independently of its label and options; both its text and option-list handles reset for each request and question index.
@@ -528,7 +528,7 @@ Previews mark control characters too, and literal file and working-folder paths 
 `codex-long-working-folder.png` and `codex-long-working-folder-end.png` show a complete, marked working folder longer than 2,000 characters in its own viewport of at most three text lines above the scrolling details.
 Allow and Deny and the command's first line remain visible when it opens; the model-written reason stays inside the details.
 The GPUI wheel test proves the folder scrolls to its end independently without eliding its path.
-The GPUI height matrix covers both theme sizes, Claude and Codex, every combination of hold, request count, focus, grant, command length, reason, preview, draft height and queued turns, with project, unverified, short, typical, two-line and long folders.
+The GPUI height matrix covers both theme sizes, Claude and Codex, every combination of hold, request count, focus, grant, command length, reason, preview and draft height, with project, unverified, short, typical, two-line and long folders.
 The transcript gives up space before the dock; the details use the remaining height, capped at 240px, and retain the command's first line.
 The matrix keeps the long folder's three lines and at least one code line even in its most crowded cases.
 The folder viewport shows an always-visible kit scrollbar when the path overflows, and no scrollbar when it fits.

@@ -77,7 +77,7 @@ impl QuotedText {
             Some(QuoteScroll::Folder(handle)) => (
                 "approval-working-folder-text".to_owned(),
                 Length::Auto,
-                t.text.label.line_height,
+                Some(t.text.label.line_height),
                 Some((
                     "working-folder",
                     "approval-working-folder-scroll",
@@ -89,7 +89,7 @@ impl QuotedText {
             Some(QuoteScroll::Question(handle)) => (
                 format!("{selector}-value"),
                 t.layout.dock_question_min_height.into(),
-                t.text.ui.line_height,
+                Some(t.text.ui.line_height),
                 Some((
                     "question-text",
                     "dock-question-scroll",
@@ -98,12 +98,7 @@ impl QuotedText {
                     t.layout.composer_max_height.into(),
                 )),
             ),
-            None => (
-                format!("{selector}-value"),
-                Length::Auto,
-                t.text.ui.line_height,
-                None,
-            ),
+            None => (format!("{selector}-value"), Length::Auto, None, None),
         };
         let value = div()
             .pl(t.space.0[3])
@@ -125,7 +120,7 @@ impl QuotedText {
             .debug_selector(move || selector.into())
             .min_h(region_minimum)
             .v_flex()
-            .line_height(line_height)
+            .when_some(line_height, |value, height| value.line_height(height))
             .gap(t.space.0[1])
             .text_size(t.text.label.size)
             .text_color(t.colors.text_muted)

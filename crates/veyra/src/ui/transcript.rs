@@ -918,6 +918,61 @@ mod tests {
     }
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn async_question_title_inherits_transcript_row_line_height(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::{prelude::*, *};
+        struct Card(super::Item);
+        impl Render for Card {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w_full()
+                    .child(super::row(&self.0, false, None, false, cx))
+            }
+        }
+        cx.update(gpui_kit::init);
+        let item = super::Item {
+            id: super::ItemId::new(),
+            thread: super::ThreadId::new(),
+            turn: super::TurnId::new(),
+            seq: 0,
+            body: super::ItemBody::AsyncQuestions {
+                text: String::new(),
+                questions: vec![super::AsyncQuestion {
+                    title: "Which colour?".into(),
+                    options: vec!["Violet".into(), "Blue".into()],
+                    selected: None,
+                }],
+            },
+        };
+        let (card, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+            Card(item)
+        });
+        let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+        let line = cx.update(|window, _| theme.text.read.line_height.to_pixels(window.rem_size()));
+        for viewport in [theme.layout.window_min, theme.layout.window_default] {
+            cx.simulate_resize(viewport);
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.draw(
+                    Point::default(),
+                    size(
+                        AvailableSpace::Definite(viewport.width),
+                        AvailableSpace::Definite(viewport.height),
+                    ),
+                    |_, _| div().child(card.clone()),
+                );
+            }
+            for selector in ["async-question-title-label", "async-question-title-value"] {
+                let bounds = cx.debug_bounds(selector).unwrap();
+                assert_eq!(
+                    bounds.size.height, line,
+                    "{viewport:?}: {selector} must inherit the transcript row line height"
+                );
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn async_question_message_uses_reply_markdown_layout(cx: &mut gpui::TestAppContext) {
         use gpui_kit::{prelude::*, *};
         struct Reply(super::Item);

