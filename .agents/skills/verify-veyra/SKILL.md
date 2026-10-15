@@ -564,13 +564,15 @@ Task and Wake rows carry turn_label and task_card text; report_delivered marks o
 `providers` reports each probe's path, version, models, readiness and `account`, either `known` or `unknown`, with no account value.
 `transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
 `transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
-Items include `outcome`, queued `wait_reason` and a tool's `failed_last_line`.
+Items include `outcome`, queued `wait_reason`, a tool's `failed_last_line` and its rendered `tool_label`.
 `selected_thread.hold` and `wait_reason` describe held work.
 `composer.discard_queued_visible` reports the held queue control.
 `composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
 Approval answer chords appear only with dock focus; otherwise its hint shows the FocusDock chord.
 Approval dock action_text, consequence and preview report the same typed target, one-line effect and bounded arguments rendered in the window.
 A cut preview ends with a notice.
+Consent command, preview and path displays mark Unicode controls and invisible formats as ⟨U+XXXX⟩; command newlines remain for heredocs.
+The dock's grant_caption uses the same marked command as the thread-grant button; request and grant identities keep the exact raw bytes.
 The full command or file path, consequence and bounded argument preview share a scrollable area within the composer height limit.
 Allow and Deny stay below that area.
 Questions share the same unfocused FocusDock prompt.

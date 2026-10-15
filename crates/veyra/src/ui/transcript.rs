@@ -2,6 +2,7 @@ use super::{
     Shell,
     actions::*,
     composer::{self, labelled_button},
+    provider_text::{QuoteKind, QuotedText},
     theme::Theme,
 };
 use gpui_kit::base::Disableable;
@@ -235,8 +236,8 @@ fn row(
                 .join("\n");
             if !text.trim().is_empty() && text.trim() != titles {
                 row = row.child(
-                    super::provider_text::QuotedText::new(
-                        super::provider_text::QuoteKind::Message,
+                    QuotedText::new(
+                        QuoteKind::Message,
                         "Message from the provider".into(),
                         text,
                         false,
@@ -246,11 +247,27 @@ fn row(
             }
             for (question_index, question) in questions.iter().enumerate() {
                 let display = super::provider_text::question_display(question);
-                let mut card = div().v_flex().w_full().gap(t.space.0[3])
-                    .rounded(t.radius.large).bg(t.colors.card).p(t.space.0[4])
-                    .child(super::provider_text::QuotedText { kind: super::provider_text::QuoteKind::Question, label: "Question from the provider".into(), text: display.title }.render("async-question-title", cx))
-                    .child(div().text_size(t.text.label.size).text_color(t.colors.text_muted)
-                        .child("Choosing sends this option as a message, stops current work first and continues queued messages."));
+                let mut card = div()
+                    .v_flex()
+                    .w_full()
+                    .gap(t.space.0[3])
+                    .rounded(t.radius.large)
+                    .bg(t.colors.card)
+                    .p(t.space.0[4])
+                    .child(
+                        QuotedText::from_quoted(
+                            QuoteKind::Question,
+                            "Question from the provider".into(),
+                            display.title,
+                        )
+                        .render("async-question-title", cx),
+                    )
+                    .child(
+                        div()
+                            .text_size(t.text.label.size)
+                            .text_color(t.colors.text_muted)
+                            .child("Choosing sends this option as a message, stops current work first and continues queued messages."),
+                    );
                 for (option_index, _) in question.options.iter().enumerate() {
                     let action = ChooseAsyncOption {
                         item: Some(item.id),
@@ -322,7 +339,7 @@ fn row(
             let label = format!(
                 "{} {} · {}",
                 if expanded { "▾" } else { "▸" },
-                super::provider_text::quoted(&tool.call.name, false),
+                tool_label(&tool.call),
                 match &tool.result {
                     None => "Working",
                     Some(result) if result.ok => "Done",
@@ -789,6 +806,14 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .child(composer::render(shell, cx)),
         )
 }
+fn tool_label(call: &ToolCall) -> String {
+    if call.veyra_label {
+        veyra_engine::text::display_line(&call.name, false).text
+    } else {
+        super::provider_text::quoted(&call.name, false)
+    }
+}
+
 #[cfg(debug_assertions)]
 pub fn dump_item(item: &Item) -> serde_json::Value {
     let (kind, text, done) = match &item.body {
@@ -805,6 +830,9 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
         _ => ("other", String::new(), true),
     };
     let mut value = serde_json::json!({"id":item.id,"turn":item.turn,"kind":kind,"text":text,"done":done,"body":item.body});
+    if let ItemBody::Tool(tool) = &item.body {
+        value["tool_label"] = serde_json::json!(tool_label(&tool.call));
+    }
     if let ItemBody::AsyncQuestions { questions, .. } = &item.body {
         value["display_questions"] = serde_json::json!(
             questions
@@ -818,6 +846,24 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_labels_distinguish_veyra_from_provider_names() {
+        let command: super::ToolCall = serde_json::from_value(serde_json::json!({
+            "name":"Command", "arguments":{}, "veyra_label":true
+        }))
+        .unwrap();
+        assert_eq!(super::tool_label(&command), "Command");
+        let provider: super::ToolCall = serde_json::from_value(serde_json::json!({
+            "name":"server / tool", "arguments":{}
+        }))
+        .unwrap();
+        assert_eq!(super::tool_label(&provider), "“server / tool”");
+        let stored: super::ToolCall = serde_json::from_value(serde_json::json!({
+            "name":"Command", "arguments":{}
+        }))
+        .unwrap();
+        assert_eq!(super::tool_label(&stored), "“Command”");
+    }
     use super::tool_input;
     use gpui_kit::AppContext;
     use veyra_engine::domain::*;
@@ -892,6 +938,7 @@ mod tests {
             ),
         ] {
             let call = ToolCall {
+                veyra_label: false,
                 name: name.into(),
                 arguments,
                 input_summary: None,
@@ -958,6 +1005,7 @@ mod tests {
             seq: 0,
             body: ItemBody::Tool(ToolItem {
                 call: ToolCall {
+                    veyra_label: false,
                     name: "Bash".into(),
                     arguments: serde_json::json!({"command":"false"}),
                     input_summary: None,
@@ -1022,6 +1070,7 @@ mod tests {
         for name in ["Task", "Agent"] {
             let mut tool = ToolItem {
                 call: ToolCall {
+                    veyra_label: false,
                     name: name.into(),
                     arguments: serde_json::json!({}),
                     input_summary: None,
@@ -1073,6 +1122,7 @@ mod tests {
     fn failed_tool_last_line() {
         let mut tool = ToolItem {
             call: ToolCall {
+                veyra_label: false,
                 name: "Bash".into(),
                 arguments: serde_json::json!({"command":"false"}),
                 input_summary: Some("false".into()),

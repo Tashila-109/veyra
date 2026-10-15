@@ -471,20 +471,11 @@ Other resume failures keep that id and fail without starting a replacement conve
 Every turn/start sends the current model, effort, summary auto, reviewer user, approvalPolicy and sandboxPolicy.
 Ask first sends untrusted, read-only and readOnly with networkAccess true; Accept edits sends on-request, workspace-write and workspaceWrite with networkAccess true.
 Full access sends never, danger-full-access and dangerFullAccess without a networkAccess field.
-For Accept edits, Codex preparation resolves git through its prepared login PATH and runs `git rev-parse --git-dir --git-common-dir` once per app-server spawn, in the project folder.
-After validating the linked worktree, it reads `git config --get --bool extensions.worktreeConfig` in the same folder.
-The child uses the shared launch gate, owned process group and cleanup supervisor; another launch check after discovery prevents a queued Shutdown from starting the provider.
-Both Git commands share a one-second deadline, with each command's stdout capped at 8 KiB.
-codex/git.rs canonicalizes both directories and accepts only a linked worktree whose git dir is a direct child of the common .git/worktrees folder.
-The git dir's regular gitdir file must name the project's or an ancestor's .git file, that file must point back to the same git dir, and commondir must agree with the common directory.
-Each back-link read is capped at 8 KiB; malformed, redirected or unrelated metadata fails closed with one refusal log.
-It grants the worktree git dir and only existing ordinary common objects, refs and logs directories, retaining the roots for that spawn.
-The common root, hooks and config are never granted; plain repositories add no roots because their .git folder includes hooks and config and remains protected.
-Writable roots require a successful config query returning false, or exit 1 with empty stdout for an unset setting, which Git treats as false.
-An enabled setting, any other non-zero exit, exit 1 with output, malformed or oversized output, or the shared deadline adds no roots and logs one refusal, so the git-dir grant cannot expose an active config.worktree that redirects hooks.
-This policy proves the writable-root frame, not whether Codex permits a plain-repository commit without extra roots.
-Every workspaceWrite turn policy adds these roots while keeping networkAccess true; Ask first and Full access neither discover nor add roots.
-A missing git, a folder outside git, malformed output or any discovery failure adds no roots and logs one reason without paths or stdout.
+Veyra grants Codex no git metadata roots; Codex's sandbox keeps the project's git folders read-only.
+Every workspaceWrite policy is exactly `{type: workspaceWrite, networkAccess: true}`, without writableRoots.
+A commit under Accept edits docks when Codex asks to run outside its sandbox; Full access commits freely.
+A linked worktree's git dir holds commondir, which selects shared config and hooks, and Codex grants whole folders without per-file exclusions.
+Granting that directory would let Codex redirect the human's later Git commands, so neither linked nor plain repositories receive an extra grant.
 The codec reads thread reply metadata without interpreting the echoed sandbox as a string.
 The turn/start reply is Accepted; notifications received before it are buffered and then correlated to the returned native turn id.
 A valid own-thread request before that reply attaches to the Veyra turn being started and docks immediately, so a server waiting for consent can progress.
@@ -512,7 +503,10 @@ Command and file approvals answer accept or decline; cancellation answers cancel
 Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
 An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text.
-Tool-row names use the same bounded, quoted display projection; exact commands and argument/code previews retain their verbatim presentation for consent and diagnosis.
+ToolCall stores a serde-defaulted veyra_label flag: only Codex's fixed labels are unquoted, while provider-named tools and older stored rows stay quoted.
+Both kinds use the bounded display projection; web search and image viewing have Veyra labels.
+Consent commands, previews and literal paths show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers; command newlines remain intact for heredocs.
+The same marked command appears on the thread-grant button, while execution, native replies and stored grant identities retain the original bytes.
 The UI takes ProviderKind for provider-specific behavior; display labels do not select behavior.
 Only the exact project cwd may use the existing command grant; every other cwd requires a human decision.
 Permissions approvals grant the requested profile for the turn, while Deny and Stop send an empty permissions object.
@@ -854,12 +848,14 @@ Its root-id tag lets a click activate the window and select the root or the firs
 System permission and native banner clicks require operator verification.
 The debug-only DebugNotificationResponse action passes a banner tag to the same notification_response handler as the native callback, allowing stale-tag routing checks without OS delivery.
 
-Provider display text uses the engine's pure text::display_line projection, which caps input at 10,000 Unicode characters, replaces controls and line separators with spaces and removes Unicode format and default-ignorable characters.
-The dock, async card and family/plan labels use that projection with quotes and the existing truncation mark; reasons have their own labeled, muted element.
+Provider display text uses the engine's pure text::display_line projection, with its own 400-character input cap, a trailing ellipsis when cut, collapsed whitespace and removed Unicode format and default-ignorable characters.
+Dock reasons and provider tool names, async cards and family/plan labels use that projection with quotes and the existing truncation mark; reasons have their own labeled, muted element.
+Literal consent paths instead retain the full marked path, and commands retain their marked text with heredoc newlines.
 The debug dump exposes provider_text entries in approval docks and display_questions plus choices_active on async items beside the unchanged raw body.
 Those fields use the same display projection as rendering, while raw options remain available for exact protocol assertions.
+The debug tool_label and dock grant_caption fields share the row and grant-button rendering helpers.
 Raw option strings remain in the stored card and are selected by validated indices for UserText, so display cleanup cannot change the sent message.
-Commands and argument previews retain their separately styled verbatim code presentation and exact consent identity.
+Commands and argument previews retain their code styling with visible Unicode markers; their underlying consent identities keep the exact bytes.
 
 ## Debug protocol and verification trust
 

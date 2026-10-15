@@ -902,7 +902,7 @@ fn codex_repeated_near_limit_adds_one_notice() {
 }
 
 #[test]
-fn codex_accept_edits_adds_linked_worktree_git_roots() {
+fn codex_accept_edits_grants_no_git_roots() {
     use serde_json::{Value, json};
     let root = Path::new("/tmp").join(format!("veyra-codex-policy-{}", ThreadId::new()));
     fs::create_dir(&root).unwrap();
@@ -955,12 +955,6 @@ fn codex_accept_edits_adds_linked_worktree_git_roots() {
         .collect();
     assert_eq!(printed, [git_dir.clone(), common.clone()]);
     assert_ne!(printed[0], printed[1]);
-    let roots = [
-        git_dir,
-        common.join("objects"),
-        common.join("refs"),
-        common.join("logs"),
-    ];
     let mut records: Vec<Value> = fs::read_to_string(fixture("ok-reply"))
         .unwrap()
         .lines()
@@ -978,7 +972,7 @@ fn codex_accept_edits_adds_linked_worktree_git_roots() {
                 record["line"]["params"]["sandbox"] = json!("workspace-write");
             } else {
                 record["line"]["params"]["sandboxPolicy"] =
-                    json!({"type":"workspaceWrite","networkAccess":true,"writableRoots":roots});
+                    json!({"type":"workspaceWrite","networkAccess":true});
             }
         }
     }
@@ -1044,7 +1038,7 @@ fn codex_accept_edits_adds_linked_worktree_git_roots() {
         assert_eq!(
             ended,
             Some(TurnOutcome::Completed),
-            "workspaceWrite omitted the linked worktree roots"
+            "workspaceWrite must grant no git metadata roots"
         );
     });
 }

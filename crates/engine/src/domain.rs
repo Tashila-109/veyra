@@ -194,6 +194,8 @@ pub struct AsyncQuestion {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
+    #[serde(default)]
+    pub veyra_label: bool,
     pub arguments: serde_json::Value,
     #[serde(default)]
     pub input_summary: Option<String>,

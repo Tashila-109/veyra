@@ -99,7 +99,7 @@ for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve(
     assert dock['action_text'] == 'Write '+target
     assert dock['consequence'] == 'Claude Code writes a file '+place+' the project folder.'
     assert dock['request']['kind']['Approval']['grant_key'] is None
-    assert json.loads(dock['preview']) == {'content':'veyra check'}
+    assert json.loads(dock['preview'].replace('⟨U+000A⟩','\n')) == {'content':'veyra check'}
     capture('approval-write-'+place)
     action('approval-write-'+place+'-focus','FocusDock')
     ctl('approval-write-'+place+'-allow','keys','secondary-enter')
@@ -119,7 +119,7 @@ for label, tool, arguments in [
     thread = create('approval-'+label,'Approve the tool arguments',scenario=None)
     dump = poll('approval-'+label,lambda d: d['composer']['dock'] is not None)
     dock = dump['composer']['dock']
-    preview = json.loads(dock['preview'])
+    preview = json.loads(dock['preview'].replace('⟨U+000A⟩','\n'))
     if label == 'notebook-edit':
         assert dock['action_text'] == tool+' '+arguments['notebook_path']
         assert dock['consequence'] == 'Claude Code edits a file inside the project folder.'
@@ -287,6 +287,24 @@ capture('codex-reason-quoted')
 action('codex-reason-allow','AllowOnce',{'request':spoof['request']['id']})
 ctl('codex-reason-done','wait',thread,'Done')
 
+records = codex_records('approval-command')
+command = "printf 'a\u202e\u200bb'\nprintf done"
+for record in records:
+    if record.get('line',{}).get('method')=='item/commandExecution/requestApproval':
+        record['line']['params']['command']=command
+thread = create_codex('codex-command-invisibles',records=records)
+dock = poll('codex-command-invisibles',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+marked = "printf 'a⟨U+202E⟩⟨U+200B⟩b'\nprintf done"
+assert dock['action_text']==marked
+assert dock['grant_caption']=='Allow `'+marked+'` in this thread'
+assert dock['request']['kind']['Approval']['action']['target']['command']==command
+assert dock['request']['kind']['Approval']['grant_key']['command']==command
+capture('codex-command-invisibles')
+action('codex-command-invisibles-allow','AllowOnce',{'request':dock['request']['id']})
+ctl('codex-command-invisibles-done','wait',thread,'Done')
+assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))=='AllowOnce'
+assert json.loads(sql("select body_json from requests where thread_id='"+thread+"'"))[1]['Approval']['action']['target']['command']==command
+
 poll('codex-before-card-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
 records = codex_records('async-question')
 exact_option = 'Vi\u202eolet'
@@ -310,7 +328,7 @@ card = poll('codex-card-ready',lambda d:d['selected_thread'] is not None
 thread = card['selected_thread']['id']
 question = next(item for item in card['transcript']['items'] if item['kind']=='async_questions')
 assert question['body']['AsyncQuestions']['questions'][0] == {'title':'Should Veyra use Violet or Blue?\n\u200b','options':[exact_option,'Blue'],'selected':None}
-assert question['display_questions'][0]=={'title':'“Should Veyra use Violet or Blue? ”','options':['“Violet”','“Blue”']}
+assert question['display_questions'][0]=={'title':'“Should Veyra use Violet or Blue?”','options':['“Violet”','“Blue”']}
 assert question['choices_active'] is True
 capture('codex-async-question')
 ctl('codex-card-choice','keys','secondary-1')
@@ -371,6 +389,8 @@ PYCODEX
 
 ## Observable success
 
+`codex-command-invisibles.png` shows U+202E and U+200B markers in the command and grant button; the stored request keeps the exact bytes and Allow once completes the fixture.
+Previews mark control characters too, and literal file and working-folder paths mark embedded newlines.
 The Codex section checks `composer.dock.action_text`, `consequence`, `request.kind`, the typed command `target.cwd` and `grant_key`.
 A grant in the project permits the identical command there; the same command in another directory docks, names that directory and is denied.
 SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
@@ -388,7 +408,7 @@ The project file stays absent after Deny and exists after Allow once.
 The Write PNGs and action_text/consequence fields show absolute targets inside and outside the project, plus their content preview.
 The WebFetch, NotebookEdit and MCP PNGs show their full arguments in a bounded, scrollable area.
 The long-command PNG shows a heredoc in that area with Allow and Deny visible below it.
-Its action_text and grant key preserve the whole command.
+Its action_text keeps heredoc newlines and marks invisible characters; its stored grant key preserves the whole original command.
 Only the provider codec interprets tool fields and resolves file locations; rendering consumes typed data.
 Those fake requests check dock presentation, not outside file effects.
 Text input after each final approval proves composer focus returned.

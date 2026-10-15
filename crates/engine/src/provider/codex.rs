@@ -5,7 +5,6 @@ use super::{
 };
 use crate::{domain::*, platform::Signal};
 use serde_json::{Value, json};
-pub(crate) mod git;
 mod wire;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -296,7 +295,6 @@ impl TurnBinding {
 pub(crate) struct Codec {
     peer: Peer<Call>,
     spec: SessionSpec,
-    writable_roots: Vec<std::path::PathBuf>,
     mcp: Option<std::sync::Arc<McpConfig>>,
     pid: u32,
     conversation: Conversation,
@@ -320,7 +318,6 @@ impl Codec {
                 retry: None,
             },
             spec,
-            writable_roots: Vec::new(),
             pid,
             mcp,
             peer: Peer::new(false),
@@ -335,10 +332,6 @@ impl Codec {
     }
     pub(crate) fn initialize(&mut self) -> Value {
         self.peer.send(Call::Initialize, "initialize", initialize())
-    }
-    pub(crate) fn with_workspace_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
-        self.writable_roots = roots;
-        self
     }
     pub(crate) fn native(&self) -> Option<&NativeSessionId> {
         self.conversation.native()
@@ -381,10 +374,7 @@ impl Codec {
             early: vec![],
         };
         self.interrupted = None;
-        let mut params = turn_params(&native, &self.spec.config, text);
-        if !self.writable_roots.is_empty() {
-            params["sandboxPolicy"]["writableRoots"] = json!(self.writable_roots);
-        }
+        let params = turn_params(&native, &self.spec.config, text);
         Some(Outbound::Prompt(self.peer.send(
             Call::Start(turn),
             "turn/start",
@@ -858,6 +848,7 @@ impl Codec {
             if !state.started {
                 state.started = true;
                 events.push(TurnEvent::ToolStarted { key: key.clone(), call: ToolCall {
+                    veyra_label: true,
                     name: "Subagent".into(),
                     arguments: json!({"agent_path":activity.agent_path,"agent_thread_id":agent}),
                     input_summary: activity.agent_path.clone(),
@@ -983,12 +974,12 @@ impl Codec {
                             None,
                         ),
                         wire::Item::WebSearch(_) => (
-                            "webSearch".into(),
+                            "Web search".into(),
                             serde_json::to_value(item).unwrap(),
                             None,
                         ),
                         wire::Item::ImageView(_) => (
-                            "imageView".into(),
+                            "View image".into(),
                             serde_json::to_value(item).unwrap(),
                             None,
                         ),
@@ -997,6 +988,7 @@ impl Codec {
                     events.push(TurnEvent::ToolStarted {
                         key: key.clone(),
                         call: ToolCall {
+                            veyra_label: !matches!(item, wire::Item::McpToolCall(_)),
                             name,
                             arguments,
                             input_summary: summary,
@@ -1630,6 +1622,72 @@ mod tests {
             .value(json!({"id":2,"result":{"thread":{"id":"old-thread"}}}))
             .unwrap();
         codec
+    }
+    #[test]
+    fn codex_tool_labels_distinguish_authored_and_provider_names() {
+        let mut codec = early_request_codec();
+        for (index, (kind, expected, authored)) in [
+            ("commandExecution", "Command", true),
+            ("fileChange", "File change", true),
+            ("collabAgentToolCall", "Start subagent", true),
+            ("webSearch", "Web search", true),
+            ("imageView", "View image", true),
+            ("mcpToolCall", "remote / named_tool", false),
+            ("subAgentActivity", "Subagent", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let item: wire::Item = serde_json::from_value(json!({
+                "type":kind,"id":format!("item-{index}"),"tool":if kind == "collabAgentToolCall" { "spawnAgent" } else { "named_tool" },
+                "server":"remote","action":"spawnAgent","kind":"started",
+                "agentThreadId":"child","agentPath":"child"
+            }))
+            .unwrap();
+            let mut events = Vec::new();
+            codec.item("turn", &item, true, &mut events);
+            let call = events
+                .iter()
+                .find_map(|event| match event {
+                    TurnEvent::ToolStarted { call, .. } => Some(call),
+                    _ => None,
+                })
+                .expect("tool start");
+            assert_eq!(call.name, expected);
+            assert_eq!(call.veyra_label, authored);
+        }
+    }
+    #[test]
+    fn codex_invisible_command_bytes_survive_allow_once_and_grants() {
+        let mut codec = early_request_codec();
+        let command = "printf '\u{202e}\u{200b}'";
+        let mut request = early_approval("native-turn");
+        request["params"]["command"] = json!(command);
+        let decoded = codec.value(request).unwrap();
+        let kind = decoded
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Turn {
+                    event: TurnEvent::RequestOpened { kind, .. },
+                    ..
+                } => Some(kind),
+                _ => None,
+            })
+            .unwrap();
+        let RequestKind::Approval { action, grant_key } = kind else {
+            panic!("approval")
+        };
+        assert!(
+            matches!(&action.target, ApprovalTarget::Command { command: raw, .. } if raw == command)
+        );
+        assert_eq!(grant_key.as_ref().unwrap().command, command);
+        assert_eq!(
+            codec
+                .answer(NativeRequestRef("0".into()), Decision::AllowOnce)
+                .unwrap(),
+            json!({"id":0,"result":{"decision":"accept"}})
+        );
     }
     fn early_approval(turn: &str) -> Value {
         json!({"id":0,"method":"item/commandExecution/requestApproval",

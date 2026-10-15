@@ -1167,6 +1167,7 @@ fn subagent_output_updates_running_tail_and_caps_characters() {
         TurnEvent::ToolStarted {
             key: key.clone(),
             call: ToolCall {
+                veyra_label: false,
                 name: "Agent".into(),
                 arguments: serde_json::json!({}),
                 input_summary: None,

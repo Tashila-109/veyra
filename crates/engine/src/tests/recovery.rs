@@ -346,6 +346,7 @@ fn startup_completes_interrupted_transcript_items() {
         },
         ItemBody::Tool(ToolItem {
             call: ToolCall {
+                veyra_label: false,
                 name: "Bash".into(),
                 arguments: serde_json::json!({}),
                 input_summary: None,

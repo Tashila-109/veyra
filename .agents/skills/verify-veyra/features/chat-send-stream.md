@@ -307,6 +307,28 @@ assert [item['text'] for item in done['transcript']['items'] if item['kind']=='n
 stored = sql("select json_extract(body_json,'$.Notice.text') from items where thread_id='"+thread+"' and kind='notice' order by seq").splitlines()
 assert stored==expected
 capture('codex-notices')
+records = codex_records('shell-echo')
+for record in records:
+    wire = record.get('line',{})
+    if record['type']=='expect_outbound' and wire.get('method') in ['thread/start','turn/start']:
+        wire['params']['approvalPolicy']='untrusted'
+        if wire['method']=='thread/start': wire['params']['sandbox']='read-only'
+        else: wire['params']['sandboxPolicy']={'type':'readOnly','networkAccess':True}
+thread = create_codex('codex-command-row',records=records)
+done = ctl('codex-command-row-done','wait',thread,'Done')
+tool = next(item for item in done['transcript']['items'] if item['kind']=='tool')
+assert tool['tool_label']=='Command' and tool['body']['Tool']['call']['veyra_label'] is True
+capture('codex-command-row')
+action('codex-command-row-expand','ToggleItem',{'item':tool['id']})
+capture('codex-command-row-expanded')
+records = codex_records('ok-reply')
+position = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='turn/completed')
+records.insert(position,{'type':'emit_inbound','line':{'method':'item/completed','params':{'threadId':'<id:session>','turnId':'native-turn','item':{'type':'mcpToolCall','id':'provider-tool','server':'example','tool':'lookup','arguments':{},'status':'completed'}}}})
+thread = create_codex('codex-provider-tool-row',records=records)
+done = ctl('codex-provider-tool-row-done','wait',thread,'Done')
+tool = next(item for item in done['transcript']['items'] if item['kind']=='tool')
+assert tool['tool_label']=='“example / lookup”' and tool['body']['Tool']['call']['veyra_label'] is False
+capture('codex-provider-tool-row')
 action('codex-chat-return-new','NewThread')
 action('codex-chat-return-claude','PickProvider',{'provider':'claude'})
 page_done('chat-send-stream-codex')
@@ -319,6 +341,7 @@ PYCODEX
 The Codex section saves streamed `o`, completed `ok` with two `delta_count` events, its stored item and Completed turn.
 The foreign-thread fixture leaves one User turn and only `ok`; the retry/limit fixture stores exactly two Notice items.
 The Codex PNGs show Working, Done and both notices.
+`codex-command-row.png` shows Veyra’s unquoted Command label; `codex-provider-tool-row.png` keeps a provider-named MCP tool quoted. Both names share the bounded display projection.
 
 - `chat-working.json` has Working, assistant `o` with `done: false`, a native id and cleared composer; inspect its PNG for the caret and Working header.
 - `chat-done.json` has one user prompt and exactly one completed assistant `ok`, Done in the selected thread and sidebar, and an increased applied-batch counter.

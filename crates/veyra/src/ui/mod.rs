@@ -1795,6 +1795,7 @@ impl Shell {
                     "action_text":text.as_ref().map(|(label, _, _)| label),
                     "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
                     "preview":text.as_ref().map(|(_, _, preview)| preview),
+                    "grant_caption":match &request.kind { RequestKind::Approval { grant_key:Some(key), .. } => Some(composer::grant_caption(&key.command)), _ => None },
                     "provider_text":match &request.kind { RequestKind::Approval { action, .. } => composer::approval_quotes(action, self.chosen_provider().label()), _ => Vec::new() },
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
                     "question_index":target.question})

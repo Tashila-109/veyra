@@ -12,6 +12,7 @@ fn codex_ready_provider_can_be_delegated() {
             caller: f.thread,
             session: None,
             call: ToolCall {
+                veyra_label: false,
                 name: name.into(),
                 arguments,
                 input_summary: None,

@@ -867,6 +867,7 @@ impl Codec {
             None
         };
         ToolCall {
+            veyra_label: false,
             name,
             arguments,
             input_summary,

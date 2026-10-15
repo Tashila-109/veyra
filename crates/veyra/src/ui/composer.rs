@@ -18,6 +18,7 @@ use veyra_engine::domain::{
     ApprovalTarget, CommandCwd, FileOperation, ProposedAction, RequestKind, TargetLocation,
     WaitReason,
 };
+use veyra_engine::text::consent_text;
 
 pub(super) fn approval_text(
     action: &ProposedAction,
@@ -43,7 +44,7 @@ pub(super) fn approval_text(
             } else {
                 format!("{provider} will run this command {location}.")
             };
-            (command.clone(), consequence, preview)
+            (consent_text(command, true), consequence, preview)
         }
         ApprovalTarget::File {
             operation,
@@ -62,11 +63,11 @@ pub(super) fn approval_text(
                 TargetLocation::NotVerified => "at a location that is not verified",
             };
             (
-                veyra_engine::text::display_line(
-                    &format!("{} {}", action.tool, path.display()),
-                    false,
-                )
-                .text,
+                format!(
+                    "{} {}",
+                    veyra_engine::text::display_line(&action.tool, false).text,
+                    consent_text(&path.to_string_lossy(), false)
+                ),
                 format!("{provider} {operation} {location}."),
                 preview,
             )
@@ -77,7 +78,7 @@ pub(super) fn approval_text(
             preview,
         ),
     };
-    let mut preview_text = preview.text.clone();
+    let mut preview_text = consent_text(&preview.text, false);
     if preview.truncated {
         let cap = veyra_engine::domain::TOOL_OUTPUT_CHARS;
         let limit = format!("{},{:03}", cap / 1000, cap % 1000);
@@ -91,11 +92,10 @@ pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<Qu
     match &action.target {
         ApprovalTarget::Command { cwd, reason, .. } => {
             if let CommandCwd::Directory(path) = cwd {
-                values.push(QuotedText::new(
+                values.push(QuotedText::from_quoted(
                     QuoteKind::WorkingFolder,
                     format!("Working folder reported by {provider}"),
-                    &path.to_string_lossy(),
-                    false,
+                    format!("“{}”", consent_text(&path.to_string_lossy(), false)),
                 ));
             }
             if let Some(reason) = reason {
@@ -113,14 +113,16 @@ pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<Qu
             &action.tool,
             false,
         )),
-        ApprovalTarget::File { path, .. } => values.push(QuotedText::new(
+        ApprovalTarget::File { path, .. } => values.push(QuotedText::from_quoted(
             QuoteKind::File,
             format!("File requested by {provider}"),
-            &path.to_string_lossy(),
-            false,
+            format!("“{}”", consent_text(&path.to_string_lossy(), false)),
         )),
     }
     values
+}
+pub(super) fn grant_caption(command: &str) -> String {
+    format!("Allow `{}` in this thread", consent_text(command, true))
 }
 
 fn dock_chip(button: Button, focused: bool, chip: impl IntoElement) -> Button {
@@ -459,10 +461,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                         SharedString::from(format!(
                                                             "allow-thread-{request_id}"
                                                         )),
-                                                        format!(
-                                                            "Allow `{}` in this thread",
-                                                            key.command
-                                                        ),
+                                                        grant_caption(&key.command),
                                                         cx,
                                                     )
                                                     .max_w_full(),
@@ -867,7 +866,7 @@ mod display_boundary_tests {
         };
         assert_eq!(
             approval_quotes(&action, "Codex")[0].text,
-            "“server  / tool name”"
+            "“server / tool name”"
         );
         let action = ProposedAction {
             tool: "Command".into(),
@@ -878,7 +877,10 @@ mod display_boundary_tests {
                 preview,
             },
         };
-        assert_eq!(approval_quotes(&action, "Codex")[0].text, "“/tmp/a b”");
+        assert_eq!(
+            approval_quotes(&action, "Codex")[0].text,
+            "“/tmp/a⟨U+000A⟩⟨U+200B⟩b”"
+        );
         let quote = super::QuotedText::new(
             super::QuoteKind::Reason,
             "Reason".into(),
@@ -886,5 +888,55 @@ mod display_boundary_tests {
             false,
         );
         assert!(quote.text.ends_with("” [truncated]"));
+    }
+}
+
+#[cfg(test)]
+mod consent_display_tests {
+    use super::{approval_quotes, approval_text};
+    use veyra_engine::domain::*;
+    #[test]
+    fn consent_command_preview_and_paths_show_invisible_characters() {
+        let command = "cat <<'EOF'\na\u{202e}\u{200b}b\nEOF";
+        let action = ProposedAction {
+            tool: "Command".into(),
+            target: ApprovalTarget::Command {
+                command: command.into(),
+                cwd: CommandCwd::Directory("/tmp/a\nb\u{200b}".into()),
+                reason: None,
+                preview: ApprovalPreview::new("preview\t\u{202e}\n".into()),
+            },
+        };
+        let original = action.clone();
+        let (shown, _, preview) =
+            approval_text(&action, veyra_engine::provider::ProviderKind::Codex);
+        assert_eq!(shown, "cat <<'EOF'\na⟨U+202E⟩⟨U+200B⟩b\nEOF");
+        assert_eq!(preview, "preview⟨U+0009⟩⟨U+202E⟩⟨U+000A⟩");
+        assert_eq!(
+            approval_quotes(&action, "Codex")[0].text,
+            "“/tmp/a⟨U+000A⟩b⟨U+200B⟩”"
+        );
+        assert_eq!(action, original);
+        assert_eq!(
+            super::grant_caption(command),
+            "Allow `cat <<'EOF'\na⟨U+202E⟩⟨U+200B⟩b\nEOF` in this thread"
+        );
+        let file = ProposedAction {
+            tool: "Write".into(),
+            target: ApprovalTarget::File {
+                operation: FileOperation::Write,
+                path: "/tmp/a\nb\u{202e}".into(),
+                location: TargetLocation::OutsideProject,
+                preview: ApprovalPreview::new(String::new()),
+            },
+        };
+        assert_eq!(
+            approval_text(&file, veyra_engine::provider::ProviderKind::Claude).0,
+            "Write /tmp/a⟨U+000A⟩b⟨U+202E⟩"
+        );
+        assert_eq!(
+            approval_quotes(&file, "Claude Code")[0].text,
+            "“/tmp/a⟨U+000A⟩b⟨U+202E⟩”"
+        );
     }
 }

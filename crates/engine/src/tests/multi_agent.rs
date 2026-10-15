@@ -8,6 +8,7 @@ fn call(f: &mut Fixture, caller: ThreadId, name: &str, arguments: Value) -> Tool
         caller,
         session: None,
         call: ToolCall {
+            veyra_label: false,
             name: name.into(),
             arguments,
             input_summary: None,
@@ -1000,6 +1001,7 @@ fn queued_tool_request_keeps_its_originating_session() {
                 token: crate::mcp::TokenHash([0; 32]),
             }),
             call: ToolCall {
+                veyra_label: false,
                 name: "list_providers".into(),
                 arguments: json!({}),
                 input_summary: None,

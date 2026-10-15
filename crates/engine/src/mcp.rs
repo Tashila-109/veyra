@@ -381,6 +381,7 @@ async fn response_for(
             tracing::info!(thread=%caller,tool=logged_name,"MCP tools/call");
             let (reply, rx) = oneshot::channel();
             let call = ToolCall {
+                veyra_label: false,
                 name: name.into(),
                 arguments: value["params"]
                     .get("arguments")

@@ -29,11 +29,10 @@ pub(super) fn quoted(value: &str, truncated: bool) -> String {
 }
 impl QuotedText {
     pub fn new(kind: QuoteKind, label: String, value: &str, truncated: bool) -> Self {
-        Self {
-            kind,
-            label,
-            text: quoted(value, truncated),
-        }
+        Self::from_quoted(kind, label, quoted(value, truncated))
+    }
+    pub fn from_quoted(kind: QuoteKind, label: String, text: String) -> Self {
+        Self { kind, label, text }
     }
     pub fn render(self, selector: &'static str, cx: &App) -> AnyElement {
         let t = cx.global::<Theme>();
@@ -67,5 +66,17 @@ pub(super) fn question_display(question: &AsyncQuestion) -> QuestionDisplay {
             .iter()
             .map(|option| quoted(option, false))
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn quotes_have_the_provider_text_cap_and_collapsed_spaces() {
+        assert_eq!(super::quoted("one   \n\t two", false), "“one two”");
+        let text = super::quoted(&"a".repeat(1000), false);
+        assert!(text.starts_with('“'));
+        assert!(text.ends_with("…” [truncated]"));
+        assert_eq!(text, format!("“{}…” [truncated]", "a".repeat(400)));
     }
 }

@@ -84,6 +84,7 @@ fn seed_large_snapshot(db: &mut Connection, path: &std::path::Path) -> ThreadId 
                 },
                 _ => ItemBody::Tool(ToolItem {
                     call: ToolCall {
+                        veyra_label: false,
                         name: "Read".into(),
                         arguments: serde_json::json!({"file_path":format!("batch-{ordinal}/item-{seq}.rs")}),
                         input_summary: None,
