@@ -401,7 +401,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             )
                         });
                     match &request.kind {
-                        RequestKind::Approval { action, grant_key } => {
+                        RequestKind::Approval { action } => {
                             let (label, consequence, preview) =
                                 approval_text(action, shell.chosen_provider());
                             let mut quotes =
@@ -538,7 +538,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 }),
                                             ),
                                         )
-                                        .when_some(grant_key.as_ref(), |row, key| {
+                                        .when_some(request.kind.grant_key(), |row, key| {
                                             let caption = grant_caption(&key.command);
                                             row.child(
                                                 dock_chip(

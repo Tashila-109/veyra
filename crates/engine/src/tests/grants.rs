@@ -19,11 +19,11 @@ pub(super) fn approval(f: &mut Fixture, tool: &str, command: &str) -> RequestId 
                         reason: None,
                         preview: ApprovalPreview::new(String::new()),
                     },
-                },
-                grant_key: Some(GrantKey {
+                }
+                .with_grant(Some(GrantKey {
                     tool: tool.into(),
                     command: command.into(),
-                }),
+                })),
             },
         },
     ));
@@ -276,10 +276,7 @@ fn grant_does_not_answer_commands_with_extra_fields() {
             &opened.events[0],
             ProviderEvent::Turn {
                 event: TurnEvent::RequestOpened {
-                    kind: RequestKind::Approval {
-                        grant_key: None,
-                        ..
-                    },
+                    kind: RequestKind::Approval { .. },
                     ..
                 },
                 ..

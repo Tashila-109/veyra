@@ -1813,7 +1813,7 @@ impl Shell {
                     "action_text":text.as_ref().map(|(label, _, _)| label),
                     "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
                     "preview":text.as_ref().map(|(_, _, preview)| preview),
-                    "grant_caption":match &request.kind { RequestKind::Approval { grant_key:Some(key), .. } => Some(composer::grant_caption(&key.command)), _ => None },
+                    "grant_caption":request.kind.grant_key().map(|key| composer::grant_caption(&key.command)),
                     "provider_text":match &request.kind { RequestKind::Approval { action, .. } => composer::approval_quotes(action, self.chosen_provider().label()), _ => Vec::new() },
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
                     "question_index":target.question});
@@ -3456,7 +3456,6 @@ mod tests {
                         preview: ApprovalPreview::new(String::new()),
                     },
                 },
-                grant_key: None,
             };
             shell.update(cx, |shell, cx| {
                 shell.state.requests.truncate(1);
@@ -3972,7 +3971,6 @@ mod tests {
                     tool: tool.into(),
                     target,
                 },
-                grant_key: None,
             })
         };
         let mut cases = Vec::new();
@@ -4616,30 +4614,31 @@ mod tests {
                                 };
                                 shell.state.requests.truncate(1);
                                 shell.state.requests[0].id = RequestId::new();
-                                shell.state.requests[0].kind = RequestKind::Approval {
-                                    action: ProposedAction {
-                                        consent: Default::default(),
-                                        tool: "Command".into(),
-                                        target: ApprovalTarget::Command {
-                                            command: command.clone(),
-                                            cwd: cwd.clone(),
-                                            reason: reason.then(|| {
-                                                ApprovalPreview::new(
-                                                    "a long model-written reason ".repeat(400),
-                                                )
-                                            }),
-                                            preview: ApprovalPreview::new(if preview {
-                                                "argument preview\n".repeat(200)
-                                            } else {
-                                                String::new()
-                                            }),
-                                        },
-                                    },
-                                    grant_key: grant.then_some(GrantKey {
-                                        tool: "Command".into(),
-                                        command,
-                                    }),
-                                };
+                                shell.state.requests[0].kind =
+                                    RequestKind::Approval {
+                                        action: ProposedAction {
+                                            consent: Default::default(),
+                                            tool: "Command".into(),
+                                            target: ApprovalTarget::Command {
+                                                command: command.clone(),
+                                                cwd: cwd.clone(),
+                                                reason: reason.then(|| {
+                                                    ApprovalPreview::new(
+                                                        "a long model-written reason ".repeat(400),
+                                                    )
+                                                }),
+                                                preview: ApprovalPreview::new(if preview {
+                                                    "argument preview\n".repeat(200)
+                                                } else {
+                                                    String::new()
+                                                }),
+                                            },
+                                        }
+                                        .with_grant(grant.then_some(GrantKey {
+                                            tool: "Command".into(),
+                                            command,
+                                        })),
+                                    };
                                 if two {
                                     let mut second = shell.state.requests[0].clone();
                                     second.id = RequestId::new();
@@ -4800,7 +4799,6 @@ mod tests {
                                 preview: ApprovalPreview::new(String::new()),
                             },
                         },
-                        grant_key: None,
                     };
                     cx.notify();
                 });
@@ -4968,7 +4966,6 @@ mod tests {
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
-                    grant_key: None,
                 };
                 cx.notify();
             });
@@ -5018,11 +5015,11 @@ mod tests {
                             reason: None,
                             preview: ApprovalPreview::new("argument preview\n".repeat(200)),
                         },
-                    },
-                    grant_key: Some(GrantKey {
+                    }
+                    .with_grant(Some(GrantKey {
                         tool: "command tool".into(),
                         command: command.clone(),
-                    }),
+                    })),
                 };
                 cx.notify();
             });
@@ -5120,7 +5117,6 @@ mod tests {
                                 preview: ApprovalPreview::new("contents to approve".into()),
                             },
                         },
-                        grant_key: None,
                     };
                 });
                 let dock = shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"].clone());
@@ -5141,7 +5137,6 @@ mod tests {
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
-                    grant_key: None,
                 };
             });
             let dock = shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"].clone());
@@ -5169,7 +5164,6 @@ mod tests {
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
-                    grant_key: None,
                 };
                 cx.notify();
             });
@@ -5211,11 +5205,11 @@ mod tests {
                                 reason: None,
                                 preview: ApprovalPreview::new(String::new()),
                             },
-                        },
-                        grant_key: Some(GrantKey {
+                        }
+                        .with_grant(Some(GrantKey {
                             tool: "Bash".into(),
                             command: "echo ok".into(),
-                        }),
+                        })),
                     };
                 }
                 cx.notify();
@@ -5276,7 +5270,6 @@ mod tests {
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
-                    grant_key: None,
                 };
                 cx.notify();
             });
@@ -6139,7 +6132,6 @@ mod tests {
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
-                    grant_key: None,
                 };
                 cx.notify();
             });
@@ -6186,7 +6178,6 @@ mod tests {
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
-                    grant_key: None,
                 };
                 shell.state.turns.insert(turn.id, turn);
                 shell.state.requests.push(request);
@@ -6218,11 +6209,11 @@ mod tests {
                                 reason: None,
                                 preview: ApprovalPreview::new(String::new()),
                             },
-                        },
-                        grant_key: Some(GrantKey {
+                        }
+                        .with_grant(Some(GrantKey {
                             tool: "Bash".into(),
                             command: "echo exact".into(),
-                        }),
+                        })),
                     };
                 }
                 shell.state.requests[0].state = RequestState::Expired {
@@ -6938,7 +6929,6 @@ mod tests {
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
-                    grant_key: None,
                 };
                 cx.notify();
             });

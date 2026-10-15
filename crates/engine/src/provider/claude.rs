@@ -790,7 +790,9 @@ impl Codec {
                 }
                 _ => None,
             };
-            Some(RequestKind::Approval { action, grant_key })
+            Some(RequestKind::Approval {
+                action: action.with_grant(grant_key),
+            })
         }
     }
     fn unsupported_request(id: String) -> Value {
@@ -1295,7 +1297,7 @@ mod tests {
         let ProviderEvent::Turn {
             event:
                 TurnEvent::RequestOpened {
-                    kind: RequestKind::Approval { action, grant_key },
+                    kind: RequestKind::Approval { action },
                     ..
                 },
             ..
@@ -1303,7 +1305,7 @@ mod tests {
         else {
             panic!("missing approval")
         };
-        (action.clone(), grant_key.clone())
+        (action.clone(), action.consent.grant_key().cloned())
     }
     #[test]
     fn tool_rows_receive_provider_neutral_input_summaries() {

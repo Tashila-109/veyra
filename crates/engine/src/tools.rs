@@ -376,7 +376,7 @@ pub fn decide(
                     && probe.readiness == Readiness::Ready
                     && probe.path.is_some()
             }) {
-                return Err(invalid("provider is not installed and ready; call list_providers and choose an available provider".into()));
+                return Err(invalid("provider is not installed and ready; call list_providers with {} and choose an available provider".into()));
             }
             check_child_slot(p, caller, None)?;
             let family = p

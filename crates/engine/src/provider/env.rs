@@ -66,6 +66,7 @@ pub struct ChildEnv {
     resolution: Resolution,
     pub path: OsString,
     pub home: Option<PathBuf>,
+    pub(crate) xai_api_key_set: bool,
     #[cfg(debug_assertions)]
     lanes: Arc<Mutex<Lanes>>,
     #[cfg(debug_assertions)]
@@ -96,6 +97,7 @@ impl ChildEnv {
             env.reaper_pids = None;
             env.path = LOGIN_PATH.path.clone();
             env.home = std::env::var_os("HOME").map(PathBuf::from);
+            env.xai_api_key_set = std::env::var_os("XAI_API_KEY").is_some();
             #[cfg(debug_assertions)]
             {
                 env.claude_bin = std::env::var_os("VEYRA_CLAUDE_BIN").map(PathBuf::from);
@@ -126,6 +128,7 @@ impl ChildEnv {
             resolution: Resolution::Explicit(Default::default()),
             path: std::env::var_os("PATH").unwrap_or_default(),
             home: None,
+            xai_api_key_set: false,
             #[cfg(debug_assertions)]
             lanes: Arc::default(),
             #[cfg(debug_assertions)]
@@ -212,6 +215,9 @@ impl ChildEnv {
             {
                 cmd.env_remove(key);
             }
+        }
+        if !self.xai_api_key_set {
+            cmd.env_remove("XAI_API_KEY");
         }
         cmd.env("VEYRA_PARENT_PID", std::process::id().to_string());
         platform::own_group(&mut cmd);

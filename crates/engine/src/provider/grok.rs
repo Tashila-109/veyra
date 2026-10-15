@@ -109,7 +109,7 @@ struct Permission {
 #[serde(default, rename_all = "camelCase")]
 struct PermissionOption {
     option_id: String,
-    kind: String,
+    kind: OptionKind,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -122,7 +122,7 @@ struct Meta {
 struct Tool {
     tool_call_id: String,
     title: String,
-    status: String,
+    status: ToolStatus,
     raw_input: Value,
     raw_output: Value,
     content: Vec<Value>,
@@ -145,19 +145,129 @@ struct QuestionOption {
     label: String,
 }
 
+#[derive(Deserialize, PartialEq, Eq)]
+enum NotificationMethod {
+    #[serde(rename = "session/update")]
+    Update,
+    #[serde(rename = "x.ai/task_backgrounded", alias = "_x.ai/task_backgrounded")]
+    TaskBackgrounded,
+    #[serde(rename = "x.ai/task_completed", alias = "_x.ai/task_completed")]
+    TaskCompleted,
+    #[serde(
+        rename = "x.ai/session/prompt_complete",
+        alias = "_x.ai/session/prompt_complete"
+    )]
+    PromptComplete,
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Deserialize)]
+enum RequestMethod {
+    #[serde(rename = "session/request_permission")]
+    Permission,
+    #[serde(rename = "x.ai/ask_user_question", alias = "_x.ai/ask_user_question")]
+    Question,
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Content {
+    Text {
+        text: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OptionKind {
+    AllowOnce,
+    RejectOnce,
+    AllowAlways,
+    RejectAlways,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UpdateKind {
+    AgentMessageChunk,
+    AgentThoughtChunk,
+    ToolCall,
+    ToolCallUpdate,
+    Plan,
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ToolStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CompletionReason {
+    #[default]
+    EndTurn,
+    Cancelled,
+    Error,
+    Refusal,
+    RateLimit,
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Completion {
+    stop_reason: CompletionReason,
+    agent_result: Value,
+}
+#[derive(Clone)]
+enum OpenTarget {
+    New,
+    Resume(NativeSessionId),
+    Load(NativeSessionId),
+}
+#[derive(Clone, Copy)]
+enum AuthenticationRetry {
+    Available,
+    Used,
+}
+enum SessionState {
+    Initializing,
+    Authenticating {
+        target: OpenTarget,
+        retry: AuthenticationRetry,
+    },
+    Opening {
+        target: OpenTarget,
+        retry: AuthenticationRetry,
+    },
+    Ready {
+        native: NativeSessionId,
+        active: Option<String>,
+    },
+}
+
 pub(crate) struct Codec {
     peer: Peer<Call>,
     spec: SessionSpec,
     pid: u32,
     mcp: Option<Arc<McpConfig>>,
-    native: Option<NativeSessionId>,
+    state: SessionState,
+    api_key_set: bool,
     version: Option<String>,
-    resume: bool,
     auth: Option<String>,
-    auth_retried: bool,
     prompts: BTreeMap<String, Prompt>,
     ended: BTreeSet<String>,
-    active: Option<String>,
     requests: BTreeMap<String, Request>,
     seen_requests: BTreeSet<String>,
     tasks: BTreeSet<String>,
@@ -165,20 +275,23 @@ pub(crate) struct Codec {
     interrupted: Option<super::StopLadder>,
 }
 impl Codec {
-    pub(crate) fn new(spec: SessionSpec, pid: u32, mcp: Option<Arc<McpConfig>>) -> Self {
+    pub(crate) fn new(
+        spec: SessionSpec,
+        pid: u32,
+        mcp: Option<Arc<McpConfig>>,
+        api_key_set: bool,
+    ) -> Self {
         Self {
             peer: Peer::new(true),
             spec,
             pid,
             mcp,
-            native: None,
+            state: SessionState::Initializing,
+            api_key_set,
             version: None,
-            resume: false,
             auth: None,
-            auth_retried: false,
             prompts: BTreeMap::new(),
             ended: BTreeSet::new(),
-            active: None,
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
             tasks: BTreeSet::new(),
@@ -186,31 +299,46 @@ impl Codec {
             interrupted: None,
         }
     }
-    #[cfg(debug_assertions)]
     pub(crate) fn native(&self) -> Option<&NativeSessionId> {
-        self.native.as_ref()
+        match &self.state {
+            SessionState::Ready { native, .. } => Some(native),
+            _ => None,
+        }
     }
     pub(crate) fn initialize(&mut self) -> Value {
         self.peer.send(Call::Initialize, "initialize", initialize())
     }
+    fn active_id(&self) -> Option<&str> {
+        match &self.state {
+            SessionState::Ready { active, .. } => active.as_deref(),
+            _ => None,
+        }
+    }
+    fn set_active(&mut self, id: Option<String>) {
+        if let SessionState::Ready { active, .. } = &mut self.state {
+            *active = id;
+        }
+    }
     pub(crate) fn active(&self) -> Option<ActiveTurn> {
-        self.active
-            .as_ref()
+        self.active_id()
             .and_then(|id| self.prompts.get(id))
             .map(|p| p.owner)
     }
-    fn open(&mut self) -> Result<Outbound, ProviderError> {
-        let method = if self.spec.native.is_none() {
-            "session/new"
-        } else if self.resume && !self.spec.import {
-            "session/resume"
-        } else {
-            "session/load"
+    fn open(
+        &mut self,
+        target: OpenTarget,
+        retry: AuthenticationRetry,
+    ) -> Result<Outbound, ProviderError> {
+        let (method, native) = match &target {
+            OpenTarget::New => ("session/new", None),
+            OpenTarget::Resume(native) => ("session/resume", Some(native)),
+            OpenTarget::Load(native) => ("session/load", Some(native)),
         };
         let mut params = json!({"cwd":self.spec.cwd,"mcpServers":[]});
-        if let Some(native) = &self.spec.native {
+        if let Some(native) = native {
             params["sessionId"] = json!(native.0);
         }
+        self.state = SessionState::Opening { target, retry };
         let line = self.peer.send(Call::Open, method, params);
         if let Some(mcp) = &self.mcp {
             mcp.frame(line)
@@ -218,11 +346,16 @@ impl Codec {
             Ok(Outbound::Message(line))
         }
     }
-    fn authenticate(&mut self) -> Result<Value, ProviderError> {
+    fn authenticate(
+        &mut self,
+        target: OpenTarget,
+        retry: AuthenticationRetry,
+    ) -> Result<Value, ProviderError> {
         let method = self
             .auth
             .as_ref()
             .ok_or_else(|| ProviderError::Protocol("Sign in with `grok login`".into()))?;
+        self.state = SessionState::Authenticating { target, retry };
         Ok(self.peer.send(
             Call::Authenticate,
             "authenticate",
@@ -233,7 +366,7 @@ impl Codec {
         if !self.prompts.is_empty() {
             return None;
         }
-        let native = self.native.as_ref()?;
+        let native = self.native()?.clone();
         let id = turn.to_string();
         self.prompts.insert(
             id.clone(),
@@ -243,7 +376,7 @@ impl Codec {
                 first_frame: Some(Instant::now() + Duration::from_secs(60)),
             },
         );
-        self.active = Some(id.clone());
+        self.set_active(Some(id.clone()));
         self.interrupted = None;
         Some(Outbound::Prompt(self.peer.send(Call::Prompt(id.clone()),"session/prompt",
             json!({"sessionId":native.0,"prompt":[{"type":"text","text":text}],"_meta":{"promptId":id}}))))
@@ -255,7 +388,9 @@ impl Codec {
         });
     }
     fn prompt(&mut self, id: Option<&str>, decoded: &mut Decoded) -> Option<String> {
-        let id = id.map(str::to_owned).or_else(|| self.active.clone())?;
+        let id = id
+            .map(str::to_owned)
+            .or_else(|| self.active_id().map(str::to_owned))?;
         if self.ended.contains(&id) {
             return None;
         }
@@ -269,10 +404,15 @@ impl Codec {
                     first_frame: None,
                 },
             );
-            decoded.provider_turn = Some(owner.target());
-            Self::event(decoded, owner, TurnEvent::Started);
         }
-        self.active = Some(id.clone());
+        if self.active_id().is_none() {
+            self.set_active(Some(id.clone()));
+            let owner = self.prompts[&id].owner;
+            if matches!(owner, ActiveTurn::Provider(_)) {
+                decoded.provider_turn = Some(owner.target());
+                Self::event(decoded, owner, TurnEvent::Started);
+            }
+        }
         Some(id)
     }
     fn finish(&mut self, id: &str, outcome: TurnOutcome, accepted: bool, decoded: &mut Decoded) {
@@ -282,7 +422,7 @@ impl Codec {
         if accepted && !prompt.accepted {
             Self::event(decoded, prompt.owner, TurnEvent::Accepted);
         }
-        let outcome = if self.active.as_deref() == Some(id) {
+        let outcome = if self.active_id() == Some(id) {
             self.end_outcome(outcome)
         } else {
             outcome
@@ -297,8 +437,8 @@ impl Codec {
         );
         self.ended.insert(id.into());
         self.requests.retain(|_, r| r.prompt != id);
-        if self.active.as_deref() == Some(id) {
-            self.active = self.prompts.keys().next().cloned();
+        if self.active_id() == Some(id) {
+            self.set_active(None);
             self.interrupted = None;
         }
     }
@@ -329,19 +469,29 @@ impl Codec {
             } => {
                 let init: Initialization = decode(result.map_err(jsonrpc::failure)?)?;
                 self.version = init.agent_info.version.filter(|s| !s.is_empty());
-                self.resume = init
-                    .agent_capabilities
-                    .session_capabilities
-                    .resume
-                    .is_some_and(|v| v != false && !v.is_null());
-                self.auth = auth_method(
-                    &init.auth_methods,
-                    std::env::var_os("XAI_API_KEY").is_some(),
-                );
+                let target = match &self.spec.native {
+                    None => OpenTarget::New,
+                    Some(native)
+                        if !self.spec.import
+                            && init
+                                .agent_capabilities
+                                .session_capabilities
+                                .resume
+                                .is_some_and(|v| v != false && !v.is_null()) =>
+                    {
+                        OpenTarget::Resume(native.clone())
+                    }
+                    Some(native) => OpenTarget::Load(native.clone()),
+                };
+                self.auth = auth_method(&init.auth_methods, self.api_key_set);
                 if self.auth.is_some() {
-                    decoded.replies.push(self.authenticate()?);
+                    decoded
+                        .replies
+                        .push(self.authenticate(target, AuthenticationRetry::Available)?);
                 } else {
-                    decoded.controls.push(self.open()?);
+                    decoded
+                        .controls
+                        .push(self.open(target, AuthenticationRetry::Available)?);
                 }
             }
             Frame::Reply {
@@ -349,25 +499,40 @@ impl Codec {
                 result,
             } => {
                 result.map_err(|_| ProviderError::Protocol("Sign in with `grok login`".into()))?;
-                decoded.controls.push(self.open()?);
+                if let SessionState::Authenticating { target, retry } = &self.state {
+                    decoded.controls.push(self.open(target.clone(), *retry)?);
+                }
             }
             Frame::Reply {
                 tag: Call::Open,
                 result,
             } => {
+                let SessionState::Opening { target, retry } = &self.state else {
+                    return Err(ProviderError::Protocol(
+                        "Unexpected Grok session reply".into(),
+                    ));
+                };
+                let target = target.clone();
+                let retry = *retry;
                 match result {
                     Ok(result) => {
                         let native = result["sessionId"]
                             .as_str()
                             .filter(|s| !s.is_empty())
                             .map(str::to_owned)
-                            .or_else(|| self.spec.native.as_ref().map(|n| n.0.clone()))
+                            .or_else(|| match &target {
+                                OpenTarget::Resume(n) | OpenTarget::Load(n) => Some(n.0.clone()),
+                                OpenTarget::New => None,
+                            })
                             .ok_or_else(|| {
                                 ProviderError::Protocol(
                                     "Grok session reply has no sessionId".into(),
                                 )
                             })?;
-                        self.native = Some(NativeSessionId(native.clone()));
+                        self.state = SessionState::Ready {
+                            native: NativeSessionId(native.clone()),
+                            active: None,
+                        };
                         #[cfg(debug_assertions)]
                         {
                             decoded.recording = Some(crate::record::Metadata {
@@ -385,21 +550,24 @@ impl Codec {
                                 capabilities: vec![],
                             }));
                     }
-                    Err(error) if error.code == -32000 && !self.auth_retried => {
+                    Err(error)
+                        if error.code == -32000
+                            && matches!(retry, AuthenticationRetry::Available) =>
+                    {
                         if let Some(mcp) = &self.mcp {
                             mcp.revoke();
                         }
-                        self.auth_retried = true;
-                        decoded.replies.push(self.authenticate()?);
+                        decoded
+                            .replies
+                            .push(self.authenticate(target, AuthenticationRetry::Used)?);
                     }
-                    Err(error) if self.spec.native.is_some() && not_found(&error) => {
+                    Err(error) if !matches!(target, OpenTarget::New) && not_found(&error) => {
                         if let Some(mcp) = &self.mcp {
                             mcp.revoke();
                         }
-                        self.spec.native = None;
                         decoded.events.push(ProviderEvent::Session(SessionEvent::Notice {
                         text:"The earlier conversation could not be resumed; this is a new session".into() }));
-                        decoded.controls.push(self.open()?);
+                        decoded.controls.push(self.open(OpenTarget::New, retry)?);
                     }
                     Err(error) => {
                         return Err(if error.code == -32000 {
@@ -441,8 +609,7 @@ impl Codec {
         Ok(decoded)
     }
     fn own_session(&self, params: &Value) -> bool {
-        self.native
-            .as_ref()
+        self.native()
             .is_some_and(|n| params["sessionId"].as_str() == Some(n.0.as_str()))
     }
     fn notification(
@@ -451,21 +618,23 @@ impl Codec {
         params: Value,
         decoded: &mut Decoded,
     ) -> Result<(), ProviderError> {
+        let notification: NotificationMethod = decode(json!(method))?;
+        if notification == NotificationMethod::Unknown {
+            tracing::debug!(method, "Unknown Grok notification");
+            return Ok(());
+        }
         if !self.own_session(&params) {
             return Ok(());
         }
         if matches!(
-            method,
-            "x.ai/task_backgrounded"
-                | "_x.ai/task_backgrounded"
-                | "x.ai/task_completed"
-                | "_x.ai/task_completed"
+            notification,
+            NotificationMethod::TaskBackgrounded | NotificationMethod::TaskCompleted
         ) {
             if let Some(id) = params["update"]["task_id"]
                 .as_str()
                 .filter(|id| !id.is_empty())
             {
-                if method.ends_with("task_backgrounded") {
+                if notification == NotificationMethod::TaskBackgrounded {
                     self.tasks.insert(id.into());
                 } else {
                     self.tasks.remove(id);
@@ -482,33 +651,24 @@ impl Codec {
         if meta.is_replay {
             return Ok(());
         }
-        if matches!(
-            method,
-            "_x.ai/session/prompt_complete" | "x.ai/session/prompt_complete"
-        ) {
+        if notification == NotificationMethod::PromptComplete {
             let id = params["promptId"]
                 .as_str()
                 .or(meta.prompt_id.as_deref())
                 .map(str::to_owned)
-                .or_else(|| self.active.clone());
+                .or_else(|| self.active_id().map(str::to_owned));
             if let Some(id) = id {
                 self.finish(&id, outcome(&params), true, decoded);
             }
             return Ok(());
         }
-        if method != "session/update" {
-            return Ok(());
-        }
         let update = &params["update"];
-        let kind = update["sessionUpdate"].as_str().unwrap_or_default();
-        if !matches!(
-            kind,
-            "agent_message_chunk"
-                | "agent_thought_chunk"
-                | "tool_call"
-                | "tool_call_update"
-                | "plan"
-        ) {
+        let kind: UpdateKind = decode(update["sessionUpdate"].clone())?;
+        if kind == UpdateKind::Unknown {
+            tracing::debug!(
+                kind = update["sessionUpdate"].as_str().unwrap_or_default(),
+                "Unknown Grok session update"
+            );
             return Ok(());
         }
         let Some(id) = self.prompt(meta.prompt_id.as_deref(), decoded) else {
@@ -517,29 +677,27 @@ impl Codec {
         let owner = self.prompts[&id].owner;
         let key = |suffix: &str| NativeItemKey(format!("{id}/{suffix}"));
         match kind {
-            "agent_message_chunk" | "agent_thought_chunk" => {
-                if update["content"]["type"] == "text"
-                    && let Some(text) = update["content"]["text"].as_str()
-                {
+            UpdateKind::AgentMessageChunk | UpdateKind::AgentThoughtChunk => {
+                if let Ok(Content::Text { text }) = decode(update["content"].clone()) {
                     Self::event(
                         decoded,
                         owner,
-                        if kind == "agent_message_chunk" {
+                        if kind == UpdateKind::AgentMessageChunk {
                             TurnEvent::TextDelta {
                                 key: key("reply"),
-                                text: text.into(),
+                                text,
                                 streamed: true,
                             }
                         } else {
                             TurnEvent::ReasoningDelta {
                                 key: key("thought"),
-                                text: text.into(),
+                                text,
                             }
                         },
                     );
                 }
             }
-            "tool_call" | "tool_call_update" => {
+            UpdateKind::ToolCall | UpdateKind::ToolCallUpdate => {
                 let tool: Tool = decode(update.clone())?;
                 if tool.tool_call_id.is_empty() {
                     return Ok(());
@@ -573,23 +731,16 @@ impl Codec {
                             .to_owned();
                         *previous = output;
                         delta
-                            .chars()
-                            .rev()
-                            .take(TOOL_OUTPUT_CHARS)
-                            .collect::<String>()
-                            .chars()
-                            .rev()
-                            .collect::<String>()
                     })
                     .filter(|text| !text.is_empty());
-                if matches!(tool.status.as_str(), "completed" | "failed") {
+                if matches!(tool.status, ToolStatus::Completed | ToolStatus::Failed) {
                     *state = ToolState::Ended;
                     Self::event(
                         decoded,
                         owner,
                         TurnEvent::ToolFinished {
                             key: NativeItemKey(tool_key),
-                            ok: tool.status == "completed",
+                            ok: tool.status == ToolStatus::Completed,
                             output_tail: delta,
                         },
                     );
@@ -604,7 +755,7 @@ impl Codec {
                     );
                 }
             }
-            "plan" => {
+            UpdateKind::Plan => {
                 if let Some(entries) = update["entries"].as_array() {
                     Self::event(
                         decoded,
@@ -615,7 +766,9 @@ impl Codec {
                                 .filter_map(|entry| {
                                     Some(PlanStep {
                                         text: entry["content"].as_str()?.into(),
-                                        done: entry["status"] == "completed",
+                                        done: decode::<ToolStatus>(entry["status"].clone())
+                                            .unwrap_or_default()
+                                            == ToolStatus::Completed,
                                     })
                                 })
                                 .collect(),
@@ -641,13 +794,10 @@ impl Codec {
                 .push(self.peer.error(id, -32600, "Request id already used"));
             return Ok(());
         }
-        let parsed = match method {
-            "session/request_permission" => {
+        let parsed = match decode::<RequestMethod>(json!(method))? {
+            RequestMethod::Permission => {
                 let permission: Permission = decode(params.clone())?;
-                if self
-                    .native
-                    .as_ref()
-                    .is_none_or(|n| n.0 != permission.session_id)
+                if self.native().is_none_or(|n| n.0 != permission.session_id)
                     || permission.tool_call.tool_call_id.is_empty()
                 {
                     None
@@ -655,12 +805,12 @@ impl Codec {
                     let allow = permission
                         .options
                         .iter()
-                        .find(|o| o.kind == "allow_once")
+                        .find(|o| o.kind == OptionKind::AllowOnce)
                         .map(|o| o.option_id.clone());
                     let reject = permission
                         .options
                         .iter()
-                        .find(|o| o.kind == "reject_once")
+                        .find(|o| o.kind == OptionKind::RejectOnce)
                         .map(|o| o.option_id.clone());
                     let command = permission.tool_call.raw_input["command"].as_str();
                     let exact_command = permission.tool_call.title == "Bash"
@@ -673,13 +823,10 @@ impl Codec {
                                     matches!(key.as_str(), "command" | "description" | "timeout")
                                 })
                             });
-                    let grant_key =
-                        command
-                            .filter(|_| exact_command && allow.is_some())
-                            .map(|command| GrantKey {
-                                tool: permission.tool_call.title.clone(),
-                                command: command.into(),
-                            });
+                    let grant_key = command.filter(|_| exact_command).map(|command| GrantKey {
+                        tool: permission.tool_call.title.clone(),
+                        command: command.into(),
+                    });
                     let target = if let Some(command) = command {
                         ApprovalTarget::Command {
                             command: command.into(),
@@ -700,25 +847,23 @@ impl Codec {
                             )?),
                         }
                     };
-                    let mut action = ProposedAction::new(permission.tool_call.title, target);
+                    let mut action = ProposedAction::new(permission.tool_call.title, target)
+                        .with_grant(grant_key);
                     if allow.is_none() {
                         action.consent = ApprovalConsent::DenyOnly {
                             reason: "Grok offered only a lasting grant".into(),
                         };
                     }
                     Some((
-                        RequestKind::Approval { action, grant_key },
+                        RequestKind::Approval { action },
                         PermissionReply::Permission { allow, reject },
                         permission.meta.prompt_id,
                     ))
                 }
             }
-            "_x.ai/ask_user_question" | "x.ai/ask_user_question" => {
+            RequestMethod::Question => {
                 let question: QuestionParams = decode(params["params"].clone())?;
-                let valid = self
-                    .native
-                    .as_ref()
-                    .is_some_and(|n| n.0 == question.session_id)
+                let valid = self.native().is_some_and(|n| n.0 == question.session_id)
                     && !question.questions.is_empty()
                     && question.questions.iter().all(|q| {
                         !q.question.is_empty()
@@ -749,7 +894,7 @@ impl Codec {
                     )
                 })
             }
-            _ => {
+            RequestMethod::Unknown => {
                 decoded
                     .replies
                     .push(self.peer.error(id, -32601, "Unsupported server request"));
@@ -826,7 +971,7 @@ impl Codec {
         {
             return vec![];
         }
-        let Some(native) = &self.native else {
+        let Some(native) = self.native().cloned() else {
             return vec![];
         };
         self.interrupted = Some(super::StopLadder::new(reason));
@@ -893,17 +1038,21 @@ fn not_found(error: &jsonrpc::Error) -> bool {
         && (text.contains("session not found") || text.contains("session does not exist"))
 }
 fn outcome(result: &Value) -> TurnOutcome {
-    match result["stopReason"].as_str().unwrap_or("end_turn") {
-        "cancelled" => TurnOutcome::Interrupted {
+    let completion: Completion = serde_json::from_value(result.clone()).unwrap_or_default();
+    match completion.stop_reason {
+        CompletionReason::Cancelled => TurnOutcome::Interrupted {
             reason: "Grok cancelled the turn".into(),
         },
-        "error" | "refusal" | "rate_limit" => TurnOutcome::Failed {
-            message: result["agentResult"]
-                .as_str()
-                .unwrap_or("Grok could not complete the turn")
-                .into(),
-        },
-        _ => TurnOutcome::Completed,
+        CompletionReason::Error | CompletionReason::Refusal | CompletionReason::RateLimit => {
+            TurnOutcome::Failed {
+                message: completion
+                    .agent_result
+                    .as_str()
+                    .unwrap_or("Grok could not complete the turn")
+                    .into(),
+            }
+        }
+        CompletionReason::EndTurn | CompletionReason::Unknown => TurnOutcome::Completed,
     }
 }
 fn tool_output(raw: &Value, content: &[Value]) -> Option<String> {
@@ -919,4 +1068,29 @@ fn tool_output(raw: &Value, content: &[Value]) -> Option<String> {
             .join("\n")
     };
     (!text.is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    #[test]
+    fn grok_wire_unknown_kinds_have_fallbacks() {
+        let value = json!("future_kind");
+        assert!(matches!(
+            decode::<OptionKind>(value.clone()).unwrap(),
+            OptionKind::Unknown
+        ));
+        assert!(matches!(
+            decode::<UpdateKind>(value.clone()).unwrap(),
+            UpdateKind::Unknown
+        ));
+        assert!(matches!(
+            decode::<ToolStatus>(value.clone()).unwrap(),
+            ToolStatus::Unknown
+        ));
+        assert!(matches!(
+            decode::<CompletionReason>(value).unwrap(),
+            CompletionReason::Unknown
+        ));
+    }
 }

@@ -1,37 +1,16 @@
 #![cfg(debug_assertions)]
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::time::Duration;
 use tokio::{runtime::Runtime, sync::mpsc};
 use veyra_engine::{
     actor::EngineMsg,
     domain::*,
     provider::{env::ChildEnv, *},
 };
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/grok")
-        .join(format!("{name}.jsonl"))
-}
+#[path = "common/replay.rs"]
+mod harness;
+use harness::Scratch;
 fn environment(name: &str) -> (Scratch, ChildEnv) {
-    let root = Path::new("/tmp").join(format!("veyra-m6s1-{}", ThreadId::new()));
-    fs::create_dir(&root).unwrap();
-    fs::copy(fixture(name), root.join("t1-s1.jsonl")).unwrap();
-    fs::copy(fixture("probe-grok"), root.join("probe-grok.jsonl")).unwrap();
-    let mut env = ChildEnv::isolated().with_binary(
-        ProviderKind::Grok,
-        env!("CARGO_BIN_EXE_veyra-fake-cli").into(),
-    );
-    env.fixtures = Some(root.clone());
-    (Scratch(root), env)
+    harness::environment(ProviderKind::Grok, name)
 }
 #[derive(Default)]
 struct Inputs {
@@ -41,106 +20,28 @@ struct Inputs {
     multi: bool,
     resume: bool,
 }
-fn replay(name: &str, mut inputs: Inputs) -> (Vec<ProviderEvent>, bool) {
-    let (scratch, env) = environment(name);
-    Runtime::new().unwrap().block_on(async {
-        let (out, mut rx) = mpsc::channel(256);
-        let turn = TurnId::new();
-        let handle = Spawner::Cli(Box::new(env))
-            .spawn(
-                ProviderKind::Grok,
-                SessionSpec {
-                    thread: ThreadId::new(),
-                    cwd: scratch.0.canonicalize().unwrap(),
-                    config: config(),
-                    native: inputs
-                        .resume
-                        .then(|| NativeSessionId("retained-session".into())),
-                    import: false,
-                    root: false,
-                },
-                out,
-                1,
-            )
-            .unwrap();
-        let events = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut events = vec![];
-            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
-                match &event {
-                    ProviderEvent::Session(SessionEvent::Ready { .. }) => {
-                        handle
-                            .control
-                            .send(SessionControl::StartTurn {
-                                turn,
-                                text: "reply with the word ok".into(),
-                            })
-                            .unwrap();
-                    }
-                    ProviderEvent::Turn {
-                        event: TurnEvent::Accepted,
-                        ..
-                    } if inputs.stop_accepted => {
-                        inputs.stop_accepted = false;
-                        handle
-                            .control
-                            .send(SessionControl::Interrupt {
-                                turn,
-                                reason: StopReason::User,
-                            })
-                            .unwrap();
-                    }
-                    ProviderEvent::Turn {
-                        event: TurnEvent::RequestOpened { native, .. },
-                        ..
-                    } => {
-                        let control = if inputs.stop_request {
-                            SessionControl::Interrupt {
-                                turn,
-                                reason: StopReason::User,
-                            }
-                        } else {
-                            SessionControl::Answer {
-                                native: native.clone(),
-                                reply: inputs.answers.pop_front().expect("missing test answer"),
-                            }
-                        };
-                        handle.control.send(control).unwrap();
-                    }
-                    ProviderEvent::Turn {
-                        event: TurnEvent::TurnEnded { .. },
-                        ..
-                    } if inputs.multi => {
-                        inputs.multi = false;
-                        handle
-                            .control
-                            .send(SessionControl::StartTurn {
-                                turn: TurnId::new(),
-                                text: "second prompt".into(),
-                            })
-                            .unwrap();
-                    }
-                    _ => {}
-                }
-                let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
-                events.push(event);
-                if exited {
-                    break;
-                }
-            }
-            assert!(inputs.answers.is_empty());
-            assert!(
-                events.iter().any(|e| matches!(
-                    e,
-                    ProviderEvent::Session(SessionEvent::Exited { crash: None })
-                )),
-                "{events:?}"
-            );
-            events
-        })
-        .await
-        .unwrap();
-        (events, scratch.0.join("veyra-check.txt").exists())
-    })
+fn replay(name: &str, inputs: Inputs) -> (Vec<ProviderEvent>, bool) {
+    let requests = if inputs.stop_request {
+        [harness::Input::Stop].into()
+    } else {
+        inputs
+            .answers
+            .into_iter()
+            .map(harness::Input::Answer)
+            .collect()
+    };
+    harness::replay(
+        ProviderKind::Grok,
+        name,
+        PermissionMode::AskFirst,
+        false,
+        inputs.resume,
+        harness::Inputs {
+            stop_when_accepted: inputs.stop_accepted,
+            requests,
+            multi: inputs.multi,
+        },
+    )
 }
 fn config() -> ThreadConfig {
     ThreadConfig {
@@ -474,6 +375,7 @@ async fn grok_no_first_frame_fails_at_60s() {
     tokio::task::yield_now().await;
     assert!(events.try_recv().is_err());
     tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
     let (mut failed, mut exited) = (false, false);
     tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
@@ -767,152 +669,37 @@ fn grok_stream_2000() {
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
 
-#[derive(Clone)]
-struct Logs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-impl tracing::Subscriber for Logs {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, event: &tracing::Event<'_>) {
-        struct Fields(String);
-        impl tracing::field::Visit for Fields {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{}={value:?} ", field.name()));
-            }
-        }
-        let mut fields = Fields(String::new());
-        event.record(&mut fields);
-        if fields.0.contains("MCP connection") || fields.0.contains("MCP tools/call") {
-            self.0.lock().unwrap().push(fields.0);
-        }
-    }
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
+#[test]
+fn grok_foreign_prompt_overlap_keeps_stop_target() {
+    let (events, _) = replay(
+        "foreign-prompt-overlap",
+        Inputs {
+            stop_request: true,
+            ..Default::default()
+        },
+    );
+    assert!(outcomes(&events).iter().any(|outcome| matches!(outcome, TurnOutcome::Interrupted { reason } if reason == "Stopped by you")));
 }
 #[test]
-#[ignore = "requires an explicitly built production relay in VEYRA_M6_RELAY; uses only the fake Grok CLI"]
-fn grok_root_real_relay() {
-    use veyra_engine::{
-        Engine,
-        commands::{Ack, Command},
-        data_dir::DataDir,
-        events::{ChangeEvent, UiEvent},
-    };
-    let logs = Logs(Default::default());
-    tracing::subscriber::set_global_default(logs.clone()).unwrap();
-    let (scratch, mut env) = environment("root-tool-call");
-    env.relay_command = Some(
-        fs::canonicalize(std::env::var_os("VEYRA_M6_RELAY").expect("production relay path"))
-            .unwrap(),
-    );
-    let runtime = Runtime::new().unwrap();
-    let engine = Engine::start_with_env(
-        runtime.handle(),
-        DataDir::at(scratch.0.join("data")).unwrap(),
-        env,
-    )
-    .unwrap();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(async {
-            let mut probes = Probes::default();
-            let probe = probes
-                .check(
-                    &tokio::runtime::Handle::current(),
-                    ProviderKind::Grok,
-                    engine.child_env(),
-                    scratch.0.clone(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(probe.readiness, Readiness::Ready);
-            let mut events = engine.subscribe();
-            let Ack::Project(project) = engine
-                .send(Command::AddProject {
-                    path: scratch.0.clone(),
-                })
-                .await
-                .unwrap()
-                .unwrap()
-            else {
-                panic!("no project")
-            };
-            let Ack::Thread(thread) = engine
-                .send(Command::CreateThread {
-                    project,
-                    provider: ProviderKind::Grok,
-                    config: config(),
-                    text: "reply with the word ok".into(),
-                })
-                .await
-                .unwrap()
-                .unwrap()
-            else {
-                panic!("no thread")
-            };
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while let Some(event) = events.recv().await {
-                    if let UiEvent::Change {
-                        event: ChangeEvent::TurnEnded(t),
-                        ..
-                    } = event
-                    {
-                        assert!(
-                            matches!(
-                                t.state,
-                                TurnState::Ended {
-                                    outcome: TurnOutcome::Completed,
-                                    ..
-                                }
-                            ),
-                            "{:?}",
-                            t.state
-                        );
-                        let snapshot = engine.snapshot(thread).await.unwrap();
-                        let result = snapshot
-                            .items
-                            .iter()
-                            .find_map(|i| match &i.body {
-                                ItemBody::AssistantText { text, .. } => {
-                                    text.strip_prefix("Checking providers")
-                                }
-                                _ => None,
-                            })
-                            .expect("relay result in the assistant reply");
-                        let result: serde_json::Value = serde_json::from_str(result).unwrap();
-                        assert_eq!(result["providers"][0]["provider"], "grok");
-                        assert_eq!(result["mode_ceiling"], "ask_first");
-                        assert_eq!(result["remaining_fan_out"], 4);
-                        eprintln!("Grok root relay returned {result}");
-                        return;
-                    }
-                }
-                panic!("root turn never ended");
-            })
-            .await
-            .unwrap();
-        })
-    }));
-    runtime.block_on(engine.shutdown_wait());
-    drop(engine);
-    drop(runtime);
-    let lines = logs.0.lock().unwrap().join("\n");
+fn grok_isolated_auth_ignores_ambient_api_key() {
+    if std::env::var_os("VEYRA_TEST_GROK_AUTH_CHILD").is_some() {
+        let events = standard("isolated-auth");
+        assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
+        return;
+    }
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "grok_isolated_auth_ignores_ambient_api_key",
+            "--nocapture",
+        ])
+        .env("VEYRA_TEST_GROK_AUTH_CHILD", "1")
+        .env("XAI_API_KEY", "isolated-test-presence")
+        .output()
+        .unwrap();
     assert!(
-        lines.contains("MCP connection accepted"),
-        "no accepted relay connection"
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
     );
-    assert!(lines.contains("list_providers"), "no list_providers call");
-    eprintln!("{lines}");
-    if let Some(root) = std::env::var_os("VEYRA_M6_RELAY_EVIDENCE") {
-        let root = PathBuf::from(root);
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("mcp.log"), lines).unwrap();
-    }
-    if let Err(e) = result {
-        std::panic::resume_unwind(e);
-    }
 }

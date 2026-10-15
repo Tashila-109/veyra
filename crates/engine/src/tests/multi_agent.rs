@@ -877,7 +877,6 @@ fn get_task_status_matches_window() {
                                 preview: ApprovalPreview::new(String::new()),
                             },
                         },
-                        grant_key: None,
                     },
                     state: RequestState::Pending,
                 };
@@ -1120,47 +1119,47 @@ fn storage_tool_refusals_name_a_recovery_call() {
     );
 }
 #[test]
-fn tool_catalog_refuses_missing_provider() {
-    let f = Fixture::new(LiveState::Running);
-    let providers = [ProviderKind::Claude, ProviderKind::Codex].map(|provider| Probe {
-        provider,
-        path: Some("/scripted".into()),
-        version: None,
-        readiness: Readiness::Ready,
-        models: vec![],
-        account: None,
-    });
-    let call = |name: &str, arguments| {
-        crate::tools::decide(
-            &f.actor.projection,
-            &f.actor.live,
-            f.thread,
-            ToolCall {
-                name: name.into(),
-                arguments,
-                input_summary: None,
-                veyra_label: false,
+fn tool_catalog_refuses_unready_provider() {
+    let mut f = Fixture::new(LiveState::Running);
+    for provider in ProviderKind::ALL {
+        f.actor.state.catalog.lock().unwrap().insert(
+            provider,
+            Probe {
+                provider,
+                path: Some("/scripted".into()),
+                version: None,
+                readiness: if provider == ProviderKind::Grok {
+                    Readiness::SignedOut
+                } else {
+                    Readiness::Ready
+                },
+                models: vec![],
+                account: None,
             },
-            &providers,
-            now(),
-        )
-    };
-    let (_, listed) = call("list_providers", json!({})).unwrap();
+        );
+    }
+    let caller = f.thread;
+    let listed = success(call(&mut f, caller, "list_providers", json!({})));
     let names: Vec<_> = listed["providers"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|provider| provider["provider"].as_str().unwrap())
+        .map(|p| p["provider"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["claude", "codex"]);
-    let error = call(
-        "start_thread",
-        json!({"provider":"grok","title":"Worker","prompt":"x","client_request_id":"grok"}),
-    )
-    .err()
-    .unwrap();
-    assert!(error.to_string().contains("not installed and ready"));
-    assert!(error.to_string().contains("list_providers"));
+    refusal(
+        call(&mut f, caller, "list_providers", json!({"unexpected":true})),
+        &["list_providers", "{}"],
+    );
+    refusal(
+        call(
+            &mut f,
+            caller,
+            "start_thread",
+            json!({"provider":"grok","title":"Worker","prompt":"x","client_request_id":"grok"}),
+        ),
+        &["not installed and ready", "list_providers", "{}"],
+    );
 }
 
 #[test]

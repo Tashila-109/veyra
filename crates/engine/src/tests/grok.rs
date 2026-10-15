@@ -118,11 +118,10 @@ fn grok_deny_only_consent_survives_storage_and_refuses_allow() {
     }))
     .unwrap();
     let kind = RequestKind::Approval {
-        action,
-        grant_key: Some(GrantKey {
+        action: action.with_grant(Some(GrantKey {
             tool: "Bash".into(),
             command: "touch check".into(),
-        }),
+        })),
     };
     assert!(kind.accepts(&Decision::AllowOnce).is_none());
     assert!(kind.accepts(&Decision::AllowInThread).is_none());
@@ -136,9 +135,9 @@ fn grok_deny_only_consent_survives_storage_and_refuses_allow() {
     );
 }
 
-fn ready_codec() -> crate::provider::grok::Codec {
+fn initial_codec(api_key_set: bool) -> crate::provider::grok::Codec {
     use crate::{domain::*, provider::*};
-    let mut codec = grok::Codec::new(
+    grok::Codec::new(
         SessionSpec {
             thread: ThreadId::new(),
             cwd: "/project".into(),
@@ -153,7 +152,11 @@ fn ready_codec() -> crate::provider::grok::Codec {
         },
         1,
         None,
-    );
+        api_key_set,
+    )
+}
+fn ready_codec() -> crate::provider::grok::Codec {
+    let mut codec = initial_codec(false);
     codec.initialize();
     codec
         .value(serde_json::json!({"id":1,"result":{}}))
@@ -299,4 +302,98 @@ fn grok_first_tagged_unknown_frame_accepts_prompt_once() {
     assert!(
         matches!(end.events.as_slice(),[ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,..}}] if *id==turn)
     );
+}
+
+#[test]
+fn grok_unknown_notification_logs_only_method() {
+    let logs = super::logs::CapturedLogs::default();
+    tracing::subscriber::with_default(logs.clone(), || {
+        let mut codec = ready_codec();
+        let decoded = codec.value(serde_json::json!({"method":"x.ai/unknown_method","params":{"sessionId":"native","payload":"private-payload"}})).unwrap();
+        assert!(decoded.events.is_empty());
+    });
+    let entries = logs.0.lock().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.get("method").is_some_and(|s| s == "x.ai/unknown_method"))
+    );
+    assert!(!format!("{entries:?}").contains("private-payload"));
+}
+#[test]
+fn grok_unknown_update_kind_is_logged_and_skipped() {
+    let logs = super::logs::CapturedLogs::default();
+    tracing::subscriber::with_default(logs.clone(), || {
+        let mut codec = ready_codec();
+        let decoded = codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","update":{"sessionUpdate":"future_update","payload":"private-payload"}}})).unwrap();
+        assert!(decoded.events.is_empty());
+        assert!(decoded.provider_turn.is_none());
+    });
+    let entries = logs.0.lock().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.get("kind").is_some_and(|s| s == "future_update"))
+    );
+    assert!(!format!("{entries:?}").contains("private-payload"));
+}
+#[test]
+fn grok_stored_deny_only_cannot_retain_a_thread_grant() {
+    use crate::domain::*;
+    let kind: RequestKind = serde_json::from_value(serde_json::json!({"Approval":{
+        "action":{"tool":"Bash","target":{"kind":"tool","preview":{"text":"touch check","truncated":false}},
+            "consent":{"DenyOnly":{"reason":"lasting only"}}},
+        "grant_key":{"tool":"Bash","command":"touch check"}
+    }})).unwrap();
+    assert!(kind.accepts(&Decision::AllowInThread).is_none());
+    let stored = serde_json::to_value(&kind).unwrap();
+    assert!(stored["Approval"]["grant_key"].is_null());
+    assert!(stored["Approval"]["action"]["consent"]["Once"].is_null());
+}
+
+#[test]
+fn grok_legacy_stored_approval_keeps_its_thread_grant() {
+    use crate::domain::*;
+    let kind: RequestKind = serde_json::from_value(serde_json::json!({"Approval":{
+        "action":{"tool":"Bash","command":"echo own-check","input":null},
+        "grant_key":{"tool":"Bash","command":"echo own-check"}
+    }}))
+    .unwrap();
+    assert_eq!(kind.grant_key().unwrap().command, "echo own-check");
+    assert!(matches!(
+        kind.accepts(&Decision::AllowInThread),
+        Some(AcceptedDecision::Allow { grant: Some(_) })
+    ));
+    let loaded: RequestKind = serde_json::from_value(serde_json::to_value(&kind).unwrap()).unwrap();
+    assert_eq!(loaded, kind);
+}
+#[test]
+fn grok_tool_delta_keeps_text_before_actor_tail() {
+    use crate::{domain::*, provider::*};
+    let mut codec = ready_codec();
+    let turn = TurnId::new();
+    codec.start(turn, "work".into()).unwrap();
+    let output = "x".repeat(TOOL_OUTPUT_CHARS + 1);
+    let decoded = codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"in_progress","rawOutput":output}}})).unwrap();
+    assert!(decoded.events.iter().any(|e| matches!(e, ProviderEvent::Turn { event: TurnEvent::ToolOutput {text,..}, .. } if text.len() == TOOL_OUTPUT_CHARS + 1)));
+}
+
+#[test]
+fn grok_auth_uses_captured_api_key_presence() {
+    for (present, method) in [(true, "xai.api_key"), (false, "cached_token")] {
+        let mut codec = initial_codec(present);
+        codec.initialize();
+        let decoded = codec.value(serde_json::json!({"id":1,"result":{"authMethods":[{"id":"xai.api_key"},{"id":"cached_token"}]}})).unwrap();
+        assert_eq!(decoded.replies[0]["params"]["methodId"], method);
+    }
+}
+
+#[test]
+fn grok_error_completion_keeps_failure_with_nontext_result() {
+    use crate::{domain::*, provider::*};
+    let mut codec = ready_codec();
+    let turn = TurnId::new();
+    codec.start(turn, "work".into()).unwrap();
+    let decoded = codec.value(serde_json::json!({"id":3,"result":{"stopReason":"error","agentResult":{"detail":"unfamiliar metadata"}}})).unwrap();
+    assert!(decoded.events.iter().any(|e| matches!(e, ProviderEvent::Turn { event: TurnEvent::TurnEnded { outcome:TurnOutcome::Failed {message},..}, .. } if message == "Grok could not complete the turn")));
 }

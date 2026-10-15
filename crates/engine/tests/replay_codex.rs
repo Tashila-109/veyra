@@ -10,27 +10,14 @@ use veyra_engine::{
     domain::*,
     provider::{env::ChildEnv, *},
 };
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
+#[path = "common/replay.rs"]
+mod harness;
+use harness::Scratch;
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/codex")
-        .join(format!("{name}.jsonl"))
+    harness::fixture(ProviderKind::Codex, name)
 }
 fn environment(name: &str) -> (Scratch, ChildEnv) {
-    let root = Path::new("/tmp").join(format!("veyra-codex-replay-{}", ThreadId::new()));
-    fs::create_dir(&root).unwrap();
-    fs::copy(fixture(name), root.join("t1-s1.jsonl")).unwrap();
-    fs::copy(fixture("probe-ready"), root.join("probe-codex.jsonl")).unwrap();
-    let mut env = ChildEnv::isolated();
-    env.codex_bin = Some(env!("CARGO_BIN_EXE_veyra-fake-cli").into());
-    env.fixtures = Some(root.clone());
-    env.record = None;
-    (Scratch(root), env)
+    harness::environment(ProviderKind::Codex, name)
 }
 #[derive(Default)]
 struct Inputs {
@@ -66,113 +53,28 @@ fn replay(
     mode: PermissionMode,
     root: bool,
     resume: bool,
-    mut inputs: Inputs,
+    inputs: Inputs,
 ) -> Vec<ProviderEvent> {
-    let (scratch, mut env) = environment(name);
-    Runtime::new().unwrap().block_on(async {
-        let thread = ThreadId::new();
-        let turn = TurnId::new();
-        let (out, mut rx) = mpsc::channel(256);
-        if root {
-            veyra_engine::platform::private_dir(&scratch.0.join("data")).unwrap();
-            env.mcp = Some(std::sync::Arc::new(
-                veyra_engine::mcp::Server::bind(
-                    &scratch.0.join("data"),
-                    std::env::current_exe().unwrap(),
-                    out.clone(),
-                )
-                .unwrap(),
-            ));
-        }
-        let handle = Spawner::Cli(Box::new(env))
-            .spawn(
-                ProviderKind::Codex,
-                SessionSpec {
-                    thread,
-                    cwd: scratch.0.canonicalize().unwrap(),
-                    config: ThreadConfig {
-                        model: Some("veyra-model".into()),
-                        effort: Some("medium".into()),
-                        mode,
-                    },
-                    native: resume.then(|| NativeSessionId("missing-native".into())),
-                    import: false,
-                    root,
-                },
-                out,
-                1,
-            )
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(15), async {
-            let mut events = Vec::new();
-            let mut sent = false;
-            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
-                match &event {
-                    ProviderEvent::Session(SessionEvent::Ready { .. }) if !sent => {
-                        handle
-                            .control
-                            .send(SessionControl::StartTurn {
-                                turn,
-                                text: "reply with the word ok".into(),
-                            })
-                            .unwrap();
-                        sent = true;
-                    }
-                    ProviderEvent::Turn {
-                        event: TurnEvent::Accepted,
-                        ..
-                    } if inputs.stop_when_accepted => {
-                        inputs.stop_when_accepted = false;
-                        handle
-                            .control
-                            .send(SessionControl::Interrupt {
-                                turn,
-                                reason: StopReason::User,
-                            })
-                            .unwrap();
-                    }
-                    ProviderEvent::Turn {
-                        event: TurnEvent::RequestOpened { native, .. },
-                        ..
-                    } => {
-                        let input = inputs
-                            .requests
-                            .pop_front()
-                            .expect("test must supply an input for every request");
-                        let message = match input {
-                            Input::Stop => SessionControl::Interrupt {
-                                turn,
-                                reason: StopReason::User,
-                            },
-                            Input::Answer(reply) => SessionControl::Answer {
-                                native: native.clone(),
-                                reply,
-                            },
-                        };
-                        handle.control.send(message).unwrap();
-                    }
-                    _ => {}
-                }
-                let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
-                events.push(event);
-                if exited {
-                    break;
-                }
-            }
-            assert!(inputs.requests.is_empty(), "test inputs were not consumed");
-            assert!(sent, "Codex never reached Ready: {events:?}");
-            assert!(
-                events.iter().any(|e| matches!(
-                    e,
-                    ProviderEvent::Session(SessionEvent::Exited { crash: None })
-                )),
-                "Codex crashed: {events:?}"
-            );
-            events
-        })
-        .await
-        .unwrap()
-    })
+    harness::replay(
+        ProviderKind::Codex,
+        name,
+        mode,
+        root,
+        resume,
+        harness::Inputs {
+            stop_when_accepted: inputs.stop_when_accepted,
+            requests: inputs
+                .requests
+                .into_iter()
+                .map(|i| match i {
+                    Input::Answer(d) => harness::Input::Answer(d),
+                    Input::Stop => harness::Input::Stop,
+                })
+                .collect(),
+            multi: false,
+        },
+    )
+    .0
 }
 fn standard(name: &str, inputs: Inputs) -> Vec<ProviderEvent> {
     replay(name, PermissionMode::AskFirst, false, false, inputs)
@@ -253,7 +155,7 @@ fn codex_command_approval() {
 fn codex_file_change_approval() {
     let e = standard("approval-file-change", Inputs::answers([Decision::Deny]));
     assert!(
-        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,..},grant_key:None}] if tool=="File change")
+        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,consent:ApprovalConsent::Once{grant:None},..}}] if tool=="File change")
     );
     assert_eq!(text(&e), "ok");
 }
@@ -261,7 +163,7 @@ fn codex_file_change_approval() {
 fn codex_permissions_deny_grants_nothing() {
     let e = standard("permissions", Inputs::answers([Decision::Deny]));
     assert!(
-        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,..},grant_key:None}] if tool=="Permissions")
+        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,consent:ApprovalConsent::Once{grant:None},..}}] if tool=="Permissions")
     );
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
@@ -419,7 +321,7 @@ fn codex_mcp_tool_approval_docks() {
     assert_eq!(requests(&e).len(), 2);
     for r in requests(&e) {
         assert!(
-            matches!(r,RequestKind::Approval{action:ProposedAction{tool,..},grant_key:None} if tool=="veyra / list_providers")
+            matches!(r,RequestKind::Approval{action:ProposedAction{tool,consent:ApprovalConsent::Once{grant:None},..}} if tool=="veyra / list_providers")
         );
     }
     assert!(

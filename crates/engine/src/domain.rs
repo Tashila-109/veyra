@@ -234,15 +234,10 @@ pub struct Request {
     pub kind: RequestKind,
     pub state: RequestState,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum RequestKind {
-    Approval {
-        action: ProposedAction,
-        grant_key: Option<GrantKey>,
-    },
-    Question {
-        questions: Vec<Question>,
-    },
+    Approval { action: ProposedAction },
+    Question { questions: Vec<Question> },
 }
 pub enum AcceptedDecision<'a> {
     Allow {
@@ -255,23 +250,35 @@ pub enum AcceptedDecision<'a> {
     },
 }
 impl RequestKind {
+    pub fn grant_key(&self) -> Option<&GrantKey> {
+        match self {
+            Self::Approval { action } => action.consent.grant_key(),
+            _ => None,
+        }
+    }
     pub fn accepts<'a>(&'a self, decision: &'a Decision) -> Option<AcceptedDecision<'a>> {
         match (self, decision) {
-            (Self::Approval { action, .. }, Decision::AllowOnce)
-                if action.consent == ApprovalConsent::Once =>
-            {
-                Some(AcceptedDecision::Allow { grant: None })
-            }
+            (
+                Self::Approval {
+                    action:
+                        ProposedAction {
+                            consent: ApprovalConsent::Once { .. },
+                            ..
+                        },
+                },
+                Decision::AllowOnce,
+            ) => Some(AcceptedDecision::Allow { grant: None }),
             (Self::Approval { .. }, Decision::Deny) => Some(AcceptedDecision::Deny),
             (
                 Self::Approval {
-                    grant_key: Some(key),
-                    action,
+                    action:
+                        ProposedAction {
+                            consent: ApprovalConsent::Once { grant: Some(key) },
+                            ..
+                        },
                 },
                 Decision::AllowInThread,
-            ) if action.consent == ApprovalConsent::Once => {
-                Some(AcceptedDecision::Allow { grant: Some(key) })
-            }
+            ) => Some(AcceptedDecision::Allow { grant: Some(key) }),
             (Self::Question { questions }, Decision::Answers(answers))
                 if questions.len() == answers.len() =>
             {
@@ -281,32 +288,71 @@ impl RequestKind {
         }
     }
 }
+impl<'de> Deserialize<'de> for RequestKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        enum StoredRequest {
+            Approval {
+                action: Box<ProposedAction>,
+                #[serde(default)]
+                grant_key: Option<GrantKey>,
+            },
+            Question {
+                questions: Vec<Question>,
+            },
+        }
+        Ok(match StoredRequest::deserialize(deserializer)? {
+            StoredRequest::Approval { action, grant_key } => {
+                let mut action = *action;
+                if let ApprovalConsent::Once { grant } = &mut action.consent {
+                    *grant = grant.take().or(grant_key);
+                }
+                Self::Approval { action }
+            }
+            StoredRequest::Question { questions } => Self::Question { questions },
+        })
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProposedAction {
     pub tool: String,
     pub target: ApprovalTarget,
-    #[serde(skip_serializing_if = "ApprovalConsent::is_once")]
+    #[serde(skip_serializing_if = "ApprovalConsent::is_default")]
     pub consent: ApprovalConsent,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalConsent {
-    #[default]
-    Once,
-    DenyOnly {
-        reason: String,
-    },
+    Once { grant: Option<GrantKey> },
+    DenyOnly { reason: String },
+}
+impl Default for ApprovalConsent {
+    fn default() -> Self {
+        Self::Once { grant: None }
+    }
 }
 impl ApprovalConsent {
-    fn is_once(&self) -> bool {
-        matches!(self, Self::Once)
+    pub fn grant_key(&self) -> Option<&GrantKey> {
+        match self {
+            Self::Once { grant } => grant.as_ref(),
+            Self::DenyOnly { .. } => None,
+        }
+    }
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Once { grant: None })
     }
 }
 impl ProposedAction {
+    pub fn with_grant(mut self, key: Option<GrantKey>) -> Self {
+        if let ApprovalConsent::Once { grant } = &mut self.consent {
+            *grant = key;
+        }
+        self
+    }
     pub fn new(tool: String, target: ApprovalTarget) -> Self {
         Self {
             tool,
             target,
-            consent: ApprovalConsent::Once,
+            consent: ApprovalConsent::default(),
         }
     }
 }
@@ -418,7 +464,7 @@ impl<'de> Deserialize<'de> for ProposedAction {
                         preview: ApprovalPreview::new(String::new()),
                     }
                 };
-                (tool, target, ApprovalConsent::Once)
+                (tool, target, ApprovalConsent::default())
             }
         };
         Ok(Self {

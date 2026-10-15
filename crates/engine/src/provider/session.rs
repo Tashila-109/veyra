@@ -219,20 +219,19 @@ struct SessionIo {
 }
 enum RootMcp {
     Claude(crate::mcp::Session),
-    Codex(Arc<codex::McpConfig>),
-    Grok(Arc<crate::mcp::McpConfig>),
+    Rpc(Arc<crate::mcp::McpConfig>),
 }
 impl RootMcp {
     fn sanitize(&self, value: &mut serde_json::Value, replacement: &str) {
         match self {
             Self::Claude(session) => session.hash.sanitize(value, replacement),
-            Self::Codex(config) | Self::Grok(config) => config.sanitize(value, replacement),
+            Self::Rpc(config) => config.sanitize(value, replacement),
         }
     }
     fn redact(&self, text: &str, replacement: &str) -> String {
         match self {
             Self::Claude(session) => session.hash.redact(text, replacement),
-            Self::Codex(config) | Self::Grok(config) => config.redact(text, replacement),
+            Self::Rpc(config) => config.redact(text, replacement),
         }
     }
 }
@@ -345,56 +344,57 @@ fn launch(
                 },
             )
         }
-        ProviderKind::Codex => launch_with(
-            provider,
-            spec,
-            env,
-            vec!["app-server".into()],
-            "unknown until thread reply",
-            |args, spawn| {
-                let child = spawn(args)?;
-                let config = server.map(|server| {
-                    Arc::new(codex::McpConfig::new(
-                        server.clone(),
-                        spec.thread,
-                        session_epoch,
-                        child.pid(),
-                    ))
-                });
-                let codec = Codec::Codex(Box::new(codex::Codec::new(
-                    spec.clone(),
-                    child.pid(),
-                    config.clone(),
-                )));
-                Ok((child, config.map(RootMcp::Codex), codec))
-            },
-        ),
-        ProviderKind::Grok => launch_with(
-            provider,
-            spec,
-            env,
-            grok::args(&spec.config),
-            "unknown until initialize",
-            |args, spawn| {
-                let child = spawn(args)?;
-                let config = server.map(|server| {
-                    Arc::new(crate::mcp::McpConfig::for_grok(
-                        server.clone(),
-                        spec.thread,
-                        session_epoch,
-                        child.pid(),
-                    ))
-                });
-                let codec = Codec::Grok(Box::new(grok::Codec::new(
-                    spec.clone(),
-                    child.pid(),
-                    config.clone(),
-                )));
-                Ok((child, config.map(RootMcp::Grok), codec))
-            },
-        ),
+        ProviderKind::Codex => launch_rpc(spec, env, session_epoch, crate::mcp::McpWire::Codex),
+        ProviderKind::Grok => launch_rpc(spec, env, session_epoch, crate::mcp::McpWire::Grok),
     }
 }
+fn launch_rpc(
+    spec: &SessionSpec,
+    env: &ChildEnv,
+    epoch: u32,
+    wire: crate::mcp::McpWire,
+) -> Result<Process, ProviderError> {
+    use crate::mcp::{McpConfig, McpWire};
+    let (provider, args, version) = match wire {
+        McpWire::Codex => (
+            ProviderKind::Codex,
+            vec!["app-server".into()],
+            "unknown until thread reply",
+        ),
+        McpWire::Grok => (
+            ProviderKind::Grok,
+            grok::args(&spec.config),
+            "unknown until initialize",
+        ),
+    };
+    launch_with(provider, spec, env, args, version, |args, spawn| {
+        let child = spawn(args)?;
+        let config = env.mcp.as_ref().filter(|_| spec.root).map(|server| {
+            Arc::new(McpConfig::new(
+                server.clone(),
+                wire,
+                spec.thread,
+                epoch,
+                child.pid(),
+            ))
+        });
+        let codec = match wire {
+            McpWire::Codex => Codec::Codex(Box::new(codex::Codec::new(
+                spec.clone(),
+                child.pid(),
+                config.clone(),
+            ))),
+            McpWire::Grok => Codec::Grok(Box::new(grok::Codec::new(
+                spec.clone(),
+                child.pid(),
+                config.clone(),
+                env.xai_api_key_set,
+            ))),
+        };
+        Ok((child, config.map(RootMcp::Rpc), codec))
+    })
+}
+
 fn launch_with(
     provider: ProviderKind,
     spec: &SessionSpec,
@@ -1086,35 +1086,15 @@ pub async fn probe(
     let fixture = env.fixtures.as_ref().map(|root| root.join("probe.jsonl"));
     #[cfg(not(debug_assertions))]
     let fixture: Option<std::path::PathBuf> = None;
-    let version = if let Some(fixture) = &fixture {
-        crate::fixture::load(fixture)?
-            .into_iter()
-            .find_map(|record| match record {
-                crate::fixture::Record::TranscriptStart { cli_version, .. } => Some(cli_version),
-                _ => None,
-            })
-            .unwrap_or_default()
-    } else {
-        check_cancelled(&mut cancelled)?;
-        let mut child = env.spawn(&binary, &["--version".into()], cwd, None)?;
-        let mut stdout = ByteLines::new(child.stdout().expect("piped version stdout"));
-        let stderr = discard_stderr(&mut child);
-        let result = tokio::select! {
-            _ = &mut cancelled => Err(ProviderError::Cancelled),
-            result = async {
-                match stdout.next().await? {
-                    Some(Line::Text(line)) => Ok(line),
-                    Some(Line::Oversize(_)) => Err(ProviderError::Protocol("Claude version exceeded 4 MiB".into())),
-                    None => Ok(String::new()),
-                }
-            } => result,
-        };
-        let stopped = child.stop().await;
-        stderr.abort();
-        let _ = stderr.await;
-        stopped?;
-        result?
-    };
+    let version = probe_version(
+        env,
+        &binary,
+        cwd,
+        ProviderKind::Claude,
+        fixture.as_deref(),
+        &mut cancelled,
+    )
+    .await?;
     let version = version
         .split_whitespace()
         .next()
@@ -1240,25 +1220,25 @@ enum Codec {
 }
 impl Codec {
     fn profile(&self) -> SessionProfile {
-        match self {
-            Self::Claude(_) => SessionProfile {
-                provider: ProviderKind::Claude,
+        let provider = match self {
+            Self::Claude(_) => ProviderKind::Claude,
+            Self::Codex(_) => ProviderKind::Codex,
+            Self::Grok(_) => ProviderKind::Grok,
+        };
+        if provider == ProviderKind::Claude {
+            SessionProfile {
+                provider,
                 lines: |stdout| SessionLines::Direct(ByteLines::new(stdout)),
                 reject_non_json: true,
                 resume_from_stderr: true,
-            },
-            Self::Codex(_) => SessionProfile {
-                provider: ProviderKind::Codex,
+            }
+        } else {
+            SessionProfile {
+                provider,
                 lines: |stdout| SessionLines::Rpc(jsonrpc::Reader::start(stdout)),
                 reject_non_json: false,
                 resume_from_stderr: false,
-            },
-            Self::Grok(_) => SessionProfile {
-                provider: ProviderKind::Grok,
-                lines: |stdout| SessionLines::Rpc(jsonrpc::Reader::start(stdout)),
-                reject_non_json: false,
-                resume_from_stderr: false,
-            },
+            }
         }
     }
     #[cfg(debug_assertions)]
@@ -1358,50 +1338,83 @@ impl Codec {
         }
     }
 }
+async fn probe_version(
+    env: &ChildEnv,
+    binary: &std::path::Path,
+    cwd: &std::path::Path,
+    provider: ProviderKind,
+    fixture: Option<&std::path::Path>,
+    cancelled: &mut oneshot::Receiver<()>,
+) -> Result<String, ProviderError> {
+    check_cancelled(cancelled)?;
+    if let Some(fixture) = fixture {
+        return Ok(crate::fixture::load(fixture)?
+            .into_iter()
+            .find_map(|record| match record {
+                crate::fixture::Record::TranscriptStart { cli_version, .. } => Some(cli_version),
+                _ => None,
+            })
+            .unwrap_or_default());
+    }
+    let args = if provider == ProviderKind::Grok {
+        vec!["--no-auto-update".into(), "--version".into()]
+    } else {
+        vec!["--version".into()]
+    };
+    let mut child = env.spawn(binary, &args, cwd, None)?;
+    let mut stdout = ByteLines::new(child.stdout().expect("piped version stdout"));
+    let stderr = discard_stderr(&mut child);
+    let read = async {
+        match stdout.next().await? {
+            Some(Line::Text(line)) => Ok(line),
+            None if provider == ProviderKind::Claude => Ok(String::new()),
+            Some(Line::Oversize(_)) if provider == ProviderKind::Claude => Err(
+                ProviderError::Protocol("Claude version exceeded 4 MiB".into()),
+            ),
+            _ => Err(ProviderError::Protocol(format!(
+                "{} version probe did not return a bounded line",
+                provider.label()
+            ))),
+        }
+    };
+    let result = tokio::select! {
+        _ = cancelled => Err(ProviderError::Cancelled),
+        result = async {
+            if provider == ProviderKind::Grok {
+                tokio::time::timeout(Duration::from_secs(4), read).await.unwrap_or_else(|_| Err(ProviderError::Protocol("Grok version probe did not return a bounded line".into())))
+            } else { read.await }
+        } => result,
+    };
+    let stopped = child.stop().await;
+    stderr.abort();
+    let _ = stderr.await;
+    stopped?;
+    result
+}
 pub async fn probe_grok(
     env: &ChildEnv,
     cwd: &std::path::Path,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<super::Probe, ProviderError> {
     let binary = env.resolve(ProviderKind::Grok)?;
-    check_cancelled(&mut cancelled)?;
     #[cfg(debug_assertions)]
-    if let Some(root) = &env.fixtures {
-        let records = crate::fixture::load(&root.join("probe-grok.jsonl"))?;
-        let version = records.into_iter().find_map(|r| match r {
-            crate::fixture::Record::TranscriptStart { cli_version, .. } => Some(cli_version),
-            _ => None,
-        });
-        return Ok(super::Probe {
-            provider: ProviderKind::Grok,
-            path: Some(binary),
-            version,
-            readiness: super::Readiness::Ready,
-            models: vec![],
-            account: None,
-        });
-    }
-    let mut child = env.spawn(
+    let fixture = env
+        .fixtures
+        .as_ref()
+        .map(|root| root.join("probe-grok.jsonl"));
+    #[cfg(not(debug_assertions))]
+    let fixture: Option<std::path::PathBuf> = None;
+    let version = probe_version(
+        env,
         &binary,
-        &["--no-auto-update".into(), "--version".into()],
         cwd,
-        None,
-    )?;
-    let stderr = discard_stderr(&mut child);
-    let mut stdout = ByteLines::new(child.stdout().expect("piped stdout"));
-    let result = tokio::select! {
-        _ = &mut cancelled => Err(ProviderError::Cancelled),
-        result = tokio::time::timeout(Duration::from_secs(4), stdout.next()) => match result {
-            Ok(Ok(Some(Line::Text(line)))) => Ok(line),
-            Ok(Err(error)) => Err(error.into()),
-            _ => Err(ProviderError::Protocol("Grok version probe did not return a bounded line".into())),
-        }
-    };
-    let status = child.stop().await;
-    stderr.abort();
-    let _ = stderr.await;
-    status?;
-    let version = result?.trim().to_owned();
+        ProviderKind::Grok,
+        fixture.as_deref(),
+        &mut cancelled,
+    )
+    .await?
+    .trim()
+    .to_owned();
     Ok(super::Probe {
         provider: ProviderKind::Grok,
         path: Some(binary),
@@ -2682,7 +2695,13 @@ mod mcp_record_tests {
             crate::mcp::Server::bind(&root, std::env::current_exe().unwrap(), out).unwrap(),
         );
         let thread = ThreadId::new();
-        let config = Arc::new(codex::McpConfig::new(server, thread, 1, std::process::id()));
+        let config = Arc::new(codex::McpConfig::new(
+            server,
+            crate::mcp::McpWire::Codex,
+            thread,
+            1,
+            std::process::id(),
+        ));
         let mut codec = codex::Codec::new(
             SessionSpec {
                 thread,
@@ -2708,7 +2727,7 @@ mod mcp_record_tests {
         let mut next = codec.value(serde_json::json!({"id":2,"error":{"code":-32600,"message":"no rollout found for thread id lost-native"}})).unwrap();
         let next =
             String::from_utf8(next.take_outbound().pop().unwrap().into_bytes().unwrap()).unwrap();
-        let mcp = RootMcp::Codex(config);
+        let mcp = RootMcp::Rpc(config);
         for wire in [first, next] {
             let redacted = mcp.redact(&wire, "[redacted]");
             assert!(

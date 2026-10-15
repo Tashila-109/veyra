@@ -985,7 +985,6 @@ impl Codec {
             || ApprovalPreview::new(serde_json::to_string_pretty(&params).unwrap_or_default());
         let approval = |tool: String, target| RequestKind::Approval {
             action: ProposedAction::new(tool, target),
-            grant_key: None,
         };
         let (kind, reply) = match request {
             wire::Request::Command { params: command } => {
@@ -1018,11 +1017,11 @@ impl Codec {
                                 reason: command.reason.clone().map(ApprovalPreview::new),
                                 preview: preview(),
                             },
-                        ),
-                        grant_key: in_project.then(|| GrantKey {
+                        )
+                        .with_grant(in_project.then(|| GrantKey {
                             tool: "Command".into(),
                             command: text.into(),
-                        }),
+                        })),
                     },
                     RequestReply::Decision,
                 )
@@ -1601,13 +1600,13 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let RequestKind::Approval { action, grant_key } = kind else {
+        let RequestKind::Approval { action } = kind else {
             panic!("approval")
         };
         assert!(
             matches!(&action.target, ApprovalTarget::Command { command: raw, .. } if raw == command)
         );
-        assert_eq!(grant_key.as_ref().unwrap().command, command);
+        assert_eq!(kind.grant_key().unwrap().command, command);
         assert_eq!(
             codec
                 .answer(NativeRequestRef("0".into()), Decision::AllowOnce)

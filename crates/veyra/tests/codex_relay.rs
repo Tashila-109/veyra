@@ -35,33 +35,48 @@ fn fake_family(
     });
     let runtime = Runtime::new().unwrap();
     let _entered = runtime.enter();
-    let root = PathBuf::from("/tmp").join(format!("veyra-codex-replay-{}", ThreadId::new()));
+    let root = PathBuf::from("/tmp").join(format!(
+        "veyra-{}-relay-{}",
+        provider.binary(),
+        ThreadId::new()
+    ));
     fs::create_dir(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let root = root.canonicalize().unwrap();
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/fixtures/codex");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../engine/tests/fixtures")
+        .join(if provider == ProviderKind::Grok {
+            "grok"
+        } else {
+            "codex"
+        });
     for (name, lane) in files {
         fs::copy(fixtures.join(format!("{name}.jsonl")), root.join(lane)).unwrap();
     }
     let mut env = env::ChildEnv::isolated();
     env.codex_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra-test-cli")));
     env.claude_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra-test-cli")));
+    env.grok_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra-test-cli")));
     env.fixtures = Some(root.clone());
     env.record = Some(root.join("rec"));
     platform::private_dir(&root.join("data")).unwrap();
     env.relay_command = Some(PathBuf::from(env!("CARGO_BIN_EXE_veyra")));
+    let probed = if provider == ProviderKind::Grok {
+        ProviderKind::Grok
+    } else {
+        ProviderKind::Codex
+    };
     fs::copy(
-        fixtures.join("probe-ready.jsonl"),
-        root.join("probe-codex.jsonl"),
+        fixtures.join(if probed == ProviderKind::Grok {
+            "probe-grok.jsonl"
+        } else {
+            "probe-ready.jsonl"
+        }),
+        root.join(format!("probe-{}.jsonl", probed.binary())),
     )
     .unwrap();
     let mut probes = Probes::default();
-    let ready = probes.check(
-        runtime.handle(),
-        ProviderKind::Codex,
-        env.clone(),
-        root.clone(),
-    );
+    let ready = probes.check(runtime.handle(), probed, env.clone(), root.clone());
     assert_eq!(runtime.block_on(ready).unwrap().readiness, Readiness::Ready);
     let db_path = root.join("data/veyra.db");
     let mut db = store::open(&db_path).unwrap();
@@ -73,7 +88,7 @@ fn fake_family(
     let thread = Thread {
         id: ThreadId::new(),
         project: project.id,
-        title: "Codex root".into(),
+        title: format!("{} root", provider.label()),
         lineage: Lineage::Root,
         provider,
         config: ThreadConfig {
@@ -175,7 +190,7 @@ fn fake_family(
         "provider groups survived Exited"
     );
     let capture = fs::read_to_string(root.join("rec/t1-s1.jsonl")).unwrap();
-    if provider == ProviderKind::Codex {
+    if matches!(provider, ProviderKind::Codex | ProviderKind::Grok) {
         assert!(capture.contains("<id:token>"));
         let run = root.join("data/run");
         assert!(
@@ -196,7 +211,7 @@ fn fake_family(
             .is_some_and(|m| m == "MCP connection accepted")
     }));
     assert!(entries.iter().any(|e| e.get("tool").is_some_and(|m| m
-        == if provider == ProviderKind::Codex {
+        == if provider != ProviderKind::Claude {
             "list_providers"
         } else {
             "start_thread"
@@ -228,6 +243,29 @@ fn codex_root_reaches_real_relay() {
     println!(
         "Codex root completed one turn through the production relay, socket, peer check and list_providers; recorder uses <id:token>; no config file or process group remains."
     );
+}
+#[test]
+fn grok_root_reaches_real_relay() {
+    let p = fake_family(
+        ProviderKind::Grok,
+        PermissionMode::AskFirst,
+        &[("root-tool-call", "t1-s1.jsonl")],
+        None,
+    );
+    assert_eq!(p.turns.len(), 1);
+    let text: String = p
+        .items
+        .values()
+        .filter_map(|i| match &i.body {
+            ItemBody::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let result: serde_json::Value =
+        serde_json::from_str(text.strip_prefix("Checking providers").unwrap()).unwrap();
+    assert_eq!(result["providers"][0]["provider"], "grok");
+    assert_eq!(result["mode_ceiling"], "ask_first");
+    assert_eq!(result["remaining_fan_out"], 4);
 }
 #[cfg(debug_assertions)]
 #[test]

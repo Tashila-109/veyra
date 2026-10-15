@@ -1,0 +1,12 @@
+{"type":"transcript_start","provider":"grok","protocol":"json-rpc","cli_version":"1.0.52","scenario":"isolated-auth","source":"hand-written"}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"veyra","version":"<any>"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"_meta":{"clientType":"extension"}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":{"protocolVersion":1,"authMethods":[{"id":"xai.api_key","name":"API key"},{"id":"cached_token","name":"Saved sign-in"}],"agentCapabilities":{},"agentInfo":{"version":"1.0.52"}}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:auth>","method":"authenticate","params":{"methodId":"cached_token"}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:auth>","result":{}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:open>","method":"session/new","params":{"cwd":"<cwd>","mcpServers":"<any>"}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:open>","result":{"sessionId":"veyra-grok-session"}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc1>","method":"session/prompt","params":{"sessionId":"veyra-grok-session","prompt":[{"type":"text","text":"<any>"}],"_meta":{"promptId":"<id:prompt1>"}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"veyra-grok-session","_meta":{"promptId":"<id:prompt1>"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"veyra-grok-session","promptId":"<id:prompt1>","stopReason":"end_turn"}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:rpc1>","result":{"stopReason":"end_turn"}}}
+{"type":"exit","code":0}

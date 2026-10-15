@@ -199,7 +199,20 @@ impl Actor {
                 catalog: match &spawner {
                     Spawner::Cli(env) => env.catalog.clone(),
                     #[cfg(test)]
-                    Spawner::Scripted(_) => Default::default(),
+                    Spawner::Scripted(_) => Arc::new(std::sync::Mutex::new(
+                        ProviderKind::ALL
+                            .into_iter()
+                            .map(|provider| Probe {
+                                provider,
+                                path: Some("/scripted".into()),
+                                version: None,
+                                readiness: Readiness::Ready,
+                                models: vec![],
+                                account: None,
+                            })
+                            .map(|probe| (probe.provider, probe))
+                            .collect(),
+                    )),
                 },
                 ..Default::default()
             }),
@@ -478,27 +491,14 @@ impl Actor {
                     let _=reply.send(ToolResult{ok:false,output_tail:Some("the calling session ended or was replaced; call list_providers from the current root session's running turn".into())});
                     return;
                 }
-                let providers = match &self.spawner {
-                    Spawner::Cli(env) => env
-                        .catalog
-                        .lock()
-                        .unwrap()
-                        .values()
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    #[cfg(test)]
-                    Spawner::Scripted(_) => ProviderKind::ALL
-                        .into_iter()
-                        .map(|provider| Probe {
-                            provider,
-                            path: Some("/scripted".into()),
-                            version: None,
-                            readiness: Readiness::Ready,
-                            models: vec![],
-                            account: None,
-                        })
-                        .collect(),
-                };
+                let providers = self
+                    .state
+                    .catalog
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let recovery = crate::tools::storage_recovery(&call);
                 let result = crate::tools::decide(
                     &self.projection,
@@ -1272,8 +1272,9 @@ impl Actor {
                 },
             ),
             TurnEvent::RequestOpened { native, kind } => {
-                let granted = matches!(&kind, RequestKind::Approval { grant_key: Some(key), .. }
-                    if self.projection.grants.contains(&(thread, key.clone())));
+                let granted = kind
+                    .grant_key()
+                    .is_some_and(|key| self.projection.grants.contains(&(thread, key.clone())));
                 let r = Request {
                     id: RequestId::new(),
                     thread,

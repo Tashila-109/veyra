@@ -223,7 +223,6 @@ impl Fixture {
                         preview: ApprovalPreview::new(String::new()),
                     },
                 },
-                grant_key: None,
             },
             state: RequestState::Pending,
         };
