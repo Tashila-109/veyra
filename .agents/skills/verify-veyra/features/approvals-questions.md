@@ -20,7 +20,10 @@ Requests do not take focus automatically.
 Composer ⌘↵ sends a nonempty draft and leaves the request pending; an empty draft during a turn dispatches Stop.
 Every button's shortcut_chip reads the same bindings table as the keymap.
 Buttons answer their displayed request; an expired request or a question index that already advanced sends no answer.
-A question shows its options; click Focus to use shortcuts or press ⌘⇧Y to FocusDock.
+A question keeps its labeled text in a bounded scroll area above its options.
+Two options use a column; more than two use three columns so nine choices fit in the minimum window.
+A pending dock keeps the scrollable message input at its 48px minimum; closing the dock restores its normal height limit.
+Click Focus to use shortcuts or press ⌘⇧Y to FocusDock.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
 More than one pending request shows 1 of N.
 Answering one keeps dock focus while another request remains; the last answer returns focus to the composer.
@@ -205,6 +208,24 @@ result = ctl('question-two-done','wait',two,'Done')
 save('questions-done',result)
 assert result['composer']['dock'] is None
 assert sql("select count(*) from requests where thread_id='"+two+"' and state='answered'") == '2'
+records = [json.loads(line) for line in (SOURCE/'question.jsonl').read_text().splitlines()]
+question_text = ('Which route should the agent take? ' * 20)[:400]
+question_wire = records[4]['line']['request']['input']['questions'][0]
+question_wire['question'] = question_text
+question_wire['options'] = [{'label':f'Option number {i}','description':f'Route {i}'} for i in range(9)]
+records[5]['line']['response']['response']['updatedInput'] = {
+    'questions':[question_wire], 'answers':{question_text:'Option number 8'}}
+stage_records(records)
+nine = create('question-nine','Choose among nine routes',scenario=None)
+dock = poll('question-nine',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert len(dock['request']['kind']['Question']['questions'][0]['options'])==9
+ctl('question-nine-draft','text','draft line\n'*40)
+capture('question-nine')
+action('question-nine-focus','FocusDock')
+ctl('question-nine-choice','keys','9')
+done = ctl('question-nine-done','wait',nine,'Done')
+assert done['composer']['dock'] is None
+assert any(item['kind']=='user' and 'Option number 8' in item['text'] for item in done['transcript']['items'])
 save('approvals-done',ctl('approvals-final','dump'))
 poll('approvals-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null')=='0')
 page_done('approvals-questions')
@@ -282,6 +303,23 @@ done = ctl('codex-question-done','wait',thread,'Done')
 assert done['composer']['dock'] is None
 assert any(item['kind']=='user' and 'Violet' in item['text'] for item in done['transcript']['items'])
 assert 'Violet' in sql("select decision_json from requests where thread_id='"+thread+"'")
+records = codex_records('question')
+index = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/tool/requestUserInput')
+question_text = ('Which route should the agent take? ' * 20)[:400]
+question_wire = records[index]['line']['params']['questions'][0]
+question_wire['question'] = question_text
+question_wire['options'] = [{'label':f'Option number {i}','description':f'Route {i}'} for i in range(9)]
+records[index+1]['line']['result']['answers']['color']['answers'] = ['Option number 8']
+thread = create_codex('codex-question-nine',records=records,prompt='Choose among nine routes')
+dock = poll('codex-question-nine',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert len(dock['request']['kind']['Question']['questions'][0]['options'])==9
+ctl('codex-question-nine-draft','text','draft line\n'*40)
+capture('codex-question-nine')
+action('codex-question-nine-focus','FocusDock')
+ctl('codex-question-nine-choice','keys','9')
+done = ctl('codex-question-nine-done','wait',thread,'Done')
+assert done['composer']['dock'] is None
+assert any(item['kind']=='user' and 'Option number 8' in item['text'] for item in done['transcript']['items'])
 thread = create_codex('codex-mcp',scenario='mcp-tool-approval')
 for label,decision in [('first','AllowOnce'),('second','Deny')]:
     dock = poll('codex-mcp-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
@@ -438,6 +476,14 @@ PYCODEX
 ```
 
 ## Observable success
+
+`question.png`, `question-focused.png` and `codex-question.png` show two-option docks with text clear of the controls.
+`question-nine.png` and `codex-question-nine.png` show the 400-character question above nine controls in three columns, with a tall draft retained in the bounded message input.
+The digit-9 replies preserve Option number 8 as the answer in both providers' strict fixtures and stored user text.
+The GPUI matrices also check disjoint visible regions, contained quote text, the docked editor inside its input viewport and every dock/composer button inside both theme window sizes for every dock kind.
+The draft test scrolls to the last of 40 lines and proves the original text and normal input growth survive closing the dock.
+Question text keeps at least one 20px line, caps at 240px, and scrolls independently of its label and options; its handle resets for each request and question index.
+The shared scrollbar uses a 16px logical thumb minimum so even a one-line track has visible thumb travel.
 
 `codex-command-invisibles.png` shows U+202E and U+200B markers in the command and grant button; the stored request keeps the exact bytes and Allow once completes the fixture.
 Previews mark control characters too, and literal file and working-folder paths mark embedded newlines.

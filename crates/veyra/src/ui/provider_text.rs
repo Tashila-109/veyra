@@ -40,6 +40,11 @@ pub(super) fn quoted(value: &str, truncated: bool) -> String {
         if line.truncated { " [truncated]" } else { "" }
     )
 }
+#[derive(Clone, Copy)]
+enum QuoteScroll<'a> {
+    Folder(&'a ScrollHandle),
+    Question(&'a ScrollHandle),
+}
 impl QuotedText {
     pub fn new(kind: QuoteKind, label: String, value: &str, truncated: bool) -> Self {
         Self::from_quoted(kind, label, quoted(value, truncated))
@@ -52,12 +57,19 @@ impl QuotedText {
     }
     pub fn render_folder(self, handle: &ScrollHandle, cx: &App) -> AnyElement {
         let selector = self.kind.selector();
-        self.render_with_scroll(selector, Some(handle), cx)
+        self.render_with_scroll(selector, Some(QuoteScroll::Folder(handle)), cx)
+    }
+    pub fn render_question(self, handle: &ScrollHandle, cx: &App) -> AnyElement {
+        self.render_with_scroll(
+            "dock-provider-question",
+            Some(QuoteScroll::Question(handle)),
+            cx,
+        )
     }
     fn render_with_scroll(
         self,
         selector: &'static str,
-        folder: Option<&ScrollHandle>,
+        scroll: Option<QuoteScroll<'_>>,
         cx: &App,
     ) -> AnyElement {
         let t = cx.global::<Theme>();
@@ -65,35 +77,50 @@ impl QuotedText {
             .pl(t.space.0[3])
             .border_l(t.layout.border)
             .border_color(t.colors.border)
+            .debug_selector(move || format!("{selector}-value"))
             .child(self.text);
-        let value = if let Some(handle) = folder {
-            bounded_scroll(
-                "working-folder",
-                "approval-working-folder-scroll",
-                handle,
-                div()
-                    .line_height(t.text.label.line_height)
-                    .child(value.debug_selector(|| "approval-working-folder-text".into())),
-                cx,
-            )
-            .min_h(t.text.label.line_height)
-            .max_h(t.text.label.line_height * 3.)
-            .into_any_element()
+        let value = if let Some(scroll) = scroll {
+            let (id, selector, handle, min, max) = match scroll {
+                QuoteScroll::Folder(handle) => (
+                    "working-folder",
+                    "approval-working-folder-scroll",
+                    handle,
+                    t.text.label.line_height.into(),
+                    (t.text.label.line_height * 3.).into(),
+                ),
+                QuoteScroll::Question(handle) => (
+                    "question-text",
+                    "dock-question-scroll",
+                    handle,
+                    t.text.ui.line_height.into(),
+                    t.layout.composer_max_height.into(),
+                ),
+            };
+            let value = if matches!(scroll, QuoteScroll::Folder(_)) {
+                value.debug_selector(|| "approval-working-folder-text".into())
+            } else {
+                value
+            };
+            bounded_scroll(id, selector, handle, value, min, max, cx).into_any_element()
         } else {
             value.into_any_element()
         };
         div()
             .debug_selector(move || selector.into())
+            .when(matches!(scroll, Some(QuoteScroll::Question(_))), |value| {
+                value.min_h(t.layout.dock_question_min_height)
+            })
             .v_flex()
-            .min_h_0()
-            .when(folder.is_some(), |value| value.min_h_auto())
+            .when(matches!(scroll, Some(QuoteScroll::Folder(_))), |value| {
+                value.min_h_auto().line_height(t.text.label.line_height)
+            })
             .gap(t.space.0[1])
             .text_size(t.text.label.size)
-            .line_height(t.text.label.line_height)
             .text_color(t.colors.text_muted)
             .child(
                 div()
                     .flex_none()
+                    .debug_selector(move || format!("{selector}-label"))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(self.label),
             )
@@ -106,6 +133,8 @@ pub(super) fn bounded_scroll(
     selector: &'static str,
     handle: &ScrollHandle,
     content: Div,
+    min_height: Length,
+    max_height: Length,
     cx: &App,
 ) -> Div {
     let t = cx.global::<Theme>();
@@ -113,7 +142,8 @@ pub(super) fn bounded_scroll(
         .relative()
         .v_flex()
         .w_full()
-        .min_h_0()
+        .min_h(min_height)
+        .max_h(max_height)
         .child(
             div()
                 .id(id)
@@ -128,10 +158,11 @@ pub(super) fn bounded_scroll(
                 .child(content.flex_none()),
         )
         .child(
-            div()
-                .absolute()
-                .inset_0()
-                .child(Scrollbar::vertical(handle).mode(ScrollbarMode::Always)),
+            div().absolute().inset_0().child(
+                Scrollbar::vertical(handle)
+                    .mode(ScrollbarMode::Always)
+                    .styles(|style| style.thumb(|thumb| thumb.min_length(t.space.0[5]))),
+            ),
         )
 }
 #[derive(serde::Serialize)]
@@ -152,6 +183,73 @@ pub(super) fn question_display(question: &AsyncQuestion) -> QuestionDisplay {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn one_line_overflow_has_a_short_moving_scrollbar_thumb(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::{prelude::*, *};
+        struct Probe(ScrollHandle);
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let t = cx.global::<super::Theme>();
+                super::bounded_scroll(
+                    "thumb-probe",
+                    "thumb-probe-scroll",
+                    &self.0,
+                    div()
+                        .line_height(t.text.code.line_height)
+                        .child("line\n".repeat(100)),
+                    t.text.code.line_height.into(),
+                    t.text.code.line_height.into(),
+                    cx,
+                )
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (probe, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+            Probe(ScrollHandle::new())
+        });
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..2 {
+                cx.update(|window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                });
+            }
+        };
+        draw(cx);
+        let viewport = cx.debug_bounds("thumb-probe-scroll").unwrap();
+        let thumb = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, _| {
+                let track = viewport.scale(window.scale_factor());
+                window.painted_quads().iter().find_map(|quad| {
+                    (!quad.background.is_transparent()
+                        && quad.bounds.left() > track.center().x
+                        && quad.bounds.right() <= track.right()
+                        && quad.bounds.top() >= track.top()
+                        && quad.bounds.bottom() <= track.bottom()
+                        && quad.bounds.size.width < track.size.width / 2.
+                        && quad.bounds.size.height.0 > 0.
+                        && quad.bounds.size.height < track.size.height)
+                        .then_some(quad.bounds)
+                })
+            })
+        };
+        let first = thumb(cx).expect("overflow thumb must be shorter than a one-line track");
+        probe.update(cx, |probe, _| {
+            assert!(probe.0.max_offset().y > Pixels::ZERO);
+            probe
+                .0
+                .set_offset(point(Pixels::ZERO, -probe.0.max_offset().y));
+        });
+        draw(cx);
+        let last = thumb(cx).unwrap();
+        assert!(
+            last.top() > first.top(),
+            "the thumb must travel when scrolling"
+        );
+    }
+
     #[test]
     fn quotes_have_the_provider_text_cap_and_collapsed_spaces() {
         assert_eq!(super::quoted("one   \n\t two", false), "“one two”");

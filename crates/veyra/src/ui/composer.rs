@@ -204,6 +204,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         })
         .trigger(
             labelled_button("provider", provider.label(), cx)
+                .debug_selector(|| "composer-provider".into())
                 .disabled(shell.view != MainView::NewThread),
         )
         .on_open_change(move |open, window, cx| {
@@ -218,6 +219,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
             .unwrap_or_else(|| "Default model".into()),
         cx,
     )
+    .debug_selector(|| "composer-model".into())
     .dropdown_menu(move |mut menu, _, _| {
         for model in &models {
             menu = menu.menu(
@@ -234,6 +236,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         config.effort.clone().unwrap_or_else(|| "Effort".into()),
         cx,
     )
+    .debug_selector(|| "composer-effort".into())
     .dropdown_menu(move |mut menu, _, _| {
         for effort in &efforts {
             menu = menu.menu(
@@ -246,6 +249,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         menu
     });
     let permission_button = labelled_button("permission", settings::mode_label(config.mode), cx)
+        .debug_selector(|| "composer-permission".into())
         .dropdown_menu(|mut menu, _, _| {
             for mode in settings::MODES {
                 menu = menu.menu(
@@ -309,6 +313,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             .flex_none()
                             .gap(t.space.0[3])
                             .pb(t.space.0[4])
+                            .debug_selector(|| "composer-hold".into())
                             .child(
                                 div()
                                     .text_size(t.text.label.size)
@@ -321,6 +326,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                     .gap(t.space.0[3])
                                     .child(
                                         labelled_button("continue", "Continue", cx)
+                                            .debug_selector(|| "composer-continue".into())
                                             .child(shortcut_chip::<Continue>(cx))
                                             .on_click(|_, window, cx| {
                                                 window.dispatch_action(Box::new(Continue), cx)
@@ -329,6 +335,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                     .when(shell.discard_queued_visible(), |row| {
                                         row.child(
                                             labelled_button("discard-queued", "Discard queued", cx)
+                                                .debug_selector(|| "composer-discard".into())
                                                 .child(shortcut_chip::<DiscardQueued>(cx))
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(
@@ -366,6 +373,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                     .flex_none()
                                     .text_size(t.text.meta.size)
                                     .text_color(t.colors.text_muted)
+                                    .debug_selector(|| "dock-count".into())
                                     .child(format!("1 of {}", pending.len())),
                             )
                         });
@@ -397,50 +405,45 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                         ),
                                     )
                                 })
-                                .child(
-                                    bounded_scroll(
-                                        "approval-details",
-                                        "approval-details",
-                                        &shell.approval_scroll.handle,
-                                        div()
-                                            .v_flex()
-                                            .gap(t.space.0[3])
-                                            .child(
+                                .child(bounded_scroll(
+                                    "approval-details",
+                                    "approval-details",
+                                    &shell.approval_scroll.handle,
+                                    div()
+                                        .v_flex()
+                                        .gap(t.space.0[3])
+                                        .child(
+                                            div()
+                                                .font_family(t.text.mono_font.clone())
+                                                .text_size(t.text.code.size)
+                                                .line_height(t.text.code.line_height)
+                                                .debug_selector(|| "approval-action-text".into())
+                                                .child(label),
+                                        )
+                                        .children(quotes.into_iter().map(|value| {
+                                            let selector = value.kind.selector();
+                                            value.render(selector, cx)
+                                        }))
+                                        .when(!preview.is_empty(), |details| {
+                                            details.child(
                                                 div()
+                                                    .debug_selector(|| "approval-preview".into())
                                                     .font_family(t.text.mono_font.clone())
                                                     .text_size(t.text.code.size)
                                                     .line_height(t.text.code.line_height)
-                                                    .debug_selector(|| {
-                                                        "approval-action-text".into()
-                                                    })
-                                                    .child(label),
+                                                    .child(preview),
                                             )
-                                            .children(quotes.into_iter().map(|value| {
-                                                let selector = value.kind.selector();
-                                                value.render(selector, cx)
-                                            }))
-                                            .when(!preview.is_empty(), |details| {
-                                                details.child(
-                                                    div()
-                                                        .debug_selector(|| {
-                                                            "approval-preview".into()
-                                                        })
-                                                        .font_family(t.text.mono_font.clone())
-                                                        .text_size(t.text.code.size)
-                                                        .line_height(t.text.code.line_height)
-                                                        .child(preview),
-                                                )
-                                            }),
-                                        cx,
-                                    )
-                                    .min_h(t.text.code.line_height)
-                                    .max_h(t.layout.composer_max_height),
-                                )
+                                        }),
+                                    t.text.code.line_height.into(),
+                                    t.layout.composer_max_height.into(),
+                                    cx,
+                                ))
                                 .child(
                                     div()
                                         .h_flex()
                                         .flex_none()
                                         .flex_wrap()
+                                        .debug_selector(|| "approval-decisions".into())
                                         .gap(t.space.0[3])
                                         .child(
                                             dock_chip(
@@ -459,6 +462,31 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                 cx.listener(move |_, _, window, cx| {
                                                     window.dispatch_action(
                                                         Box::new(Deny {
+                                                            request: Some(request_id),
+                                                        }),
+                                                        cx,
+                                                    )
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            dock_chip(
+                                                labelled_button(
+                                                    SharedString::from(format!(
+                                                        "allow-once-{request_id}"
+                                                    )),
+                                                    "Allow once",
+                                                    cx,
+                                                )
+                                                .primary()
+                                                .debug_selector(|| "approval-allow-button".into()),
+                                                shell.dock_focused,
+                                                shortcut_chip::<AllowOnce>(cx),
+                                            )
+                                            .on_click(
+                                                cx.listener(move |_, _, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(AllowOnce {
                                                             request: Some(request_id),
                                                         }),
                                                         cx,
@@ -492,32 +520,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                     )
                                                 })),
                                             )
-                                        })
-                                        .child(
-                                            dock_chip(
-                                                labelled_button(
-                                                    SharedString::from(format!(
-                                                        "allow-once-{request_id}"
-                                                    )),
-                                                    "Allow once",
-                                                    cx,
-                                                )
-                                                .primary()
-                                                .debug_selector(|| "approval-allow-button".into()),
-                                                shell.dock_focused,
-                                                shortcut_chip::<AllowOnce>(cx),
-                                            )
-                                            .on_click(
-                                                cx.listener(move |_, _, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(AllowOnce {
-                                                            request: Some(request_id),
-                                                        }),
-                                                        cx,
-                                                    )
-                                                }),
-                                            ),
-                                        ),
+                                        }),
                                 );
                         }
                         RequestKind::Question { questions } => {
@@ -531,37 +534,58 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                             &question.text,
                                             false,
                                         )
-                                        .render("dock-provider-question", cx),
+                                        .render_question(&shell.question_scroll.handle, cx),
                                     )
-                                    .children(question.options.iter().enumerate().map(
-                                        |(option, label)| {
-                                            labelled_button(
-                                                SharedString::from(format!(
-                                                    "answer-{request_id}-{index}-{option}"
-                                                )),
-                                                format!(
-                                                    "{}  {}",
-                                                    option + 1,
-                                                    super::provider_text::quoted(label, false)
-                                                ),
-                                                cx,
-                                            )
-                                            .justify_start()
-                                            .child(div().flex_1())
-                                            .on_click(
-                                                cx.listener(move |_, _, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(AnswerQuestion {
-                                                            request: Some(request_id),
-                                                            question: Some(index),
-                                                            option: Some(option),
-                                                        }),
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "dock-options".into())
+                                            .grid()
+                                            .grid_cols(if question.options.len() > 2 {
+                                                3
+                                            } else {
+                                                1
+                                            })
+                                            .w_full()
+                                            .flex_none()
+                                            .gap(t.space.0[3])
+                                            .children(question.options.iter().enumerate().map(
+                                                |(option, label)| {
+                                                    labelled_button(
+                                                        SharedString::from(format!(
+                                                            "answer-{request_id}-{index}-{option}"
+                                                        )),
+                                                        format!(
+                                                            "{}  {}",
+                                                            option + 1,
+                                                            super::provider_text::quoted(
+                                                                label, false
+                                                            )
+                                                        ),
                                                         cx,
                                                     )
-                                                }),
-                                            )
-                                        },
-                                    ));
+                                                    .justify_start()
+                                                    .w_full()
+                                                    .min_w_0()
+                                                    .max_w_full()
+                                                    .debug_selector(move || {
+                                                        format!("dock-option-{option}")
+                                                    })
+                                                    .child(div().flex_1())
+                                                    .on_click(cx.listener(
+                                                        move |_, _, window, cx| {
+                                                            window.dispatch_action(
+                                                                Box::new(AnswerQuestion {
+                                                                    request: Some(request_id),
+                                                                    question: Some(index),
+                                                                    option: Some(option),
+                                                                }),
+                                                                cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                },
+                                            )),
+                                    );
                             }
                         }
                     }
@@ -569,6 +593,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         dock.child(
                             labelled_button("focus-dock", "Focus to use shortcuts", cx)
                                 .flex_shrink_0()
+                                .debug_selector(|| "dock-focus-hint".into())
                                 .child(shortcut_chip::<FocusDock>(cx))
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(Box::new(FocusDock), cx)
@@ -582,6 +607,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         .w_full()
                         .min_h(t.layout.composer_min_height)
                         .key_context("VeyraComposer")
+                        .debug_selector(|| "composer-input".into())
+                        .when(target.is_some(), |input| input.overflow_hidden())
                         .child(
                             Textarea::new(&shell.input)
                                 .appearance(false)
@@ -589,6 +616,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                 .w_full()
                                 .min_h(t.layout.composer_min_height)
                                 .max_h(t.layout.composer_max_height)
+                                .when(target.is_some(), |input| {
+                                    input.h(t.layout.composer_min_height)
+                                })
                                 .text_size(t.text.read.size)
                                 .line_height(t.text.read.line_height)
                                 .aria_label("Message"),
@@ -599,6 +629,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         .h_flex()
                         .flex_none()
                         .h(t.layout.composer_toolbar)
+                        .debug_selector(|| "composer-toolbar".into())
                         .items_center()
                         .gap(t.space.0[1])
                         .child(provider_button)

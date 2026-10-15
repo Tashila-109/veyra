@@ -581,6 +581,9 @@ The folder value has its own vertical scroll, bounded to three label-text lines;
 Its kit scrollbar stays visible whenever the folder overflows and is absent when the path fits.
 Allow and Deny stay below that area.
 Questions share the same unfocused FocusDock prompt.
+Their quoted text scrolls within a one-line minimum and 240px maximum, independently of the label and options.
+Two options use one column and larger lists use three columns; the request and question index own the scroll reset.
+A pending dock limits the message input to 48px with its draft scrollable; the normal height limit returns after the dock closes.
 Answering one request keeps dock focus while requests remain.
 `notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
@@ -636,7 +639,7 @@ required = {
         'new-thread-provider-menu.png','new-thread-provider-menu-ready.png','new-thread-ready.png','new-thread.png'],
     'chat-send-stream':['chat-working.json','chat-working.png','chat-done.json','chat-done.png',
         'chat-failed.json','chat-failed.png','chat-provider-done.json','chat-background-working.json'],
-    'approvals-questions':['approval-deny.png','approval-allow.png','question.png','question-two.png',
+    'approvals-questions':['approval-deny.png','approval-allow.png','question.png','question-two.png','question-nine.png',
         'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png',
         'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png',
         'approval-write-inside.png','approval-write-outside.png','approval-web-fetch.png',
@@ -657,7 +660,7 @@ required = {
     'chat-send-stream-codex':['codex-chat-working.json','codex-chat-working.png','codex-chat-done.json',
         'codex-chat-done.png','codex-other-thread-done.json','codex-other-thread.png','codex-notices-done.json','codex-notices.png'],
     'approvals-questions-codex':['codex-command.json','codex-command.png','codex-command-other-cwd.png',
-        'codex-file.png','codex-permissions.png','codex-question.png','codex-mcp-first.png','codex-mcp-second.png',
+        'codex-file.png','codex-permissions.png','codex-question.png','codex-question-nine.png','codex-mcp-first.png','codex-mcp-second.png',
         'codex-async-question.png','codex-async-question-chosen.png','codex-async-question-typed-closed.png','codex-card-done.json','codex-reason-quoted.png',
         'codex-long-working-folder.png','codex-long-working-folder-end.png'],
     'multi-agent-codex':['codex-relay-done.json','codex-relay.png','codex-relay-log.txt',
