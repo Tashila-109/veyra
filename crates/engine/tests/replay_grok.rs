@@ -8,39 +8,18 @@ use veyra_engine::{
 };
 #[path = "common/replay.rs"]
 mod harness;
-use harness::Scratch;
+use harness::{Inputs, Scratch};
 fn environment(name: &str) -> (Scratch, ChildEnv) {
     harness::environment(ProviderKind::Grok, name)
 }
-#[derive(Default)]
-struct Inputs {
-    answers: std::collections::VecDeque<Decision>,
-    stop_request: bool,
-    stop_accepted: bool,
-    multi: bool,
-    resume: bool,
-}
 fn replay(name: &str, inputs: Inputs) -> (Vec<ProviderEvent>, bool) {
-    let requests = if inputs.stop_request {
-        [harness::Input::Stop].into()
-    } else {
-        inputs
-            .answers
-            .into_iter()
-            .map(harness::Input::Answer)
-            .collect()
-    };
     harness::replay(
         ProviderKind::Grok,
         name,
         PermissionMode::AskFirst,
         false,
-        inputs.resume,
-        harness::Inputs {
-            stop_when_accepted: inputs.stop_accepted,
-            requests,
-            multi: inputs.multi,
-        },
+        false,
+        inputs,
     )
 }
 fn config() -> ThreadConfig {
@@ -118,25 +97,13 @@ fn grok_multi_turn() {
 }
 #[test]
 fn grok_approval_allow() {
-    let (e, exists) = replay(
-        "approval-allow",
-        Inputs {
-            answers: [Decision::AllowOnce].into(),
-            ..Default::default()
-        },
-    );
+    let (e, exists) = replay("approval-allow", Inputs::answers([Decision::AllowOnce]));
     assert!(exists);
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
 #[test]
 fn grok_approval_deny() {
-    let (e, exists) = replay(
-        "approval-deny",
-        Inputs {
-            answers: [Decision::Deny].into(),
-            ..Default::default()
-        },
-    );
+    let (e, exists) = replay("approval-deny", Inputs::answers([Decision::Deny]));
     assert!(!exists);
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
@@ -148,30 +115,14 @@ fn grok_never_sends_allow_always() {
         ("approval-deny", Decision::Deny),
     ] {
         assert_eq!(
-            outcomes(
-                &replay(
-                    name,
-                    Inputs {
-                        answers: [answer].into(),
-                        ..Default::default()
-                    }
-                )
-                .0
-            ),
+            outcomes(&replay(name, Inputs::answers([answer])).0),
             [TurnOutcome::Completed]
         );
     }
 }
 #[test]
 fn grok_turn_interrupt() {
-    let e = replay(
-        "turn-interrupt",
-        Inputs {
-            stop_accepted: true,
-            ..Default::default()
-        },
-    )
-    .0;
+    let e = replay("turn-interrupt", Inputs::stop_accepted()).0;
     assert_eq!(
         outcomes(&e),
         [TurnOutcome::Interrupted {
@@ -218,12 +169,13 @@ fn grok_auth_retries_once() {
 }
 #[test]
 fn grok_resume_uses_session_resume() {
-    let e = replay(
+    let e = harness::replay(
+        ProviderKind::Grok,
         "resume-advertised",
-        Inputs {
-            resume: true,
-            ..Default::default()
-        },
+        PermissionMode::AskFirst,
+        false,
+        true,
+        Inputs::default(),
     )
     .0;
     assert_eq!(text(&e), "ok");
@@ -231,14 +183,7 @@ fn grok_resume_uses_session_resume() {
 }
 #[test]
 fn grok_stop_cancels_pending_permission() {
-    let e = replay(
-        "stop-pending-permission",
-        Inputs {
-            stop_request: true,
-            ..Default::default()
-        },
-    )
-    .0;
+    let e = replay("stop-pending-permission", Inputs::stop_request()).0;
     assert_eq!(
         outcomes(&e),
         [TurnOutcome::Interrupted {
@@ -248,14 +193,7 @@ fn grok_stop_cancels_pending_permission() {
 }
 #[test]
 fn grok_stop_cancels_pending_question() {
-    let events = replay(
-        "stop-pending-question",
-        Inputs {
-            stop_request: true,
-            ..Default::default()
-        },
-    )
-    .0;
+    let events = replay("stop-pending-question", Inputs::stop_request()).0;
     assert_eq!(
         outcomes(&events),
         [TurnOutcome::Interrupted {
@@ -301,14 +239,7 @@ fn grok_stop_cancels_pending_question() {
 }
 #[test]
 fn grok_always_only_disables_allow_once() {
-    let e = replay(
-        "approval-always-only",
-        Inputs {
-            answers: [Decision::Deny].into(),
-            ..Default::default()
-        },
-    )
-    .0;
+    let e = replay("approval-always-only", Inputs::answers([Decision::Deny])).0;
     let kind = e
         .iter()
         .find_map(|e| match e {
@@ -413,56 +344,9 @@ fn engine_replay(
         &Runtime,
     ),
 ) {
-    use veyra_engine::{
-        Engine,
-        commands::{Ack, Command},
-        data_dir::DataDir,
-    };
-    let (scratch, env) = environment(name);
-    let runtime = Runtime::new().unwrap();
-    let engine = Engine::start_with_env(
-        runtime.handle(),
-        DataDir::at(scratch.0.join("data")).unwrap(),
-        env,
-    )
-    .unwrap();
-    let mut events = engine.subscribe();
-    let thread = runtime.block_on(async {
-        let Ack::Project(project) = engine
-            .send(Command::AddProject {
-                path: scratch.0.clone(),
-            })
-            .await
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("no project")
-        };
-        let Ack::Thread(thread) = engine
-            .send(Command::CreateThread {
-                project,
-                provider: ProviderKind::Grok,
-                config: config(),
-                text: "reply with the word ok".into(),
-            })
-            .await
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("no thread")
-        };
-        thread
-    });
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        check(&engine, thread, &mut events, &runtime)
-    }));
-    runtime.block_on(engine.shutdown_wait());
-    drop(engine);
-    drop(runtime);
-    if let Err(e) = result {
-        std::panic::resume_unwind(e);
-    }
+    harness::actor_replay(ProviderKind::Grok, name, check);
 }
+
 #[test]
 fn grok_question_answered() {
     engine_replay("question", |engine, thread, events, runtime| {
@@ -671,13 +555,7 @@ fn grok_stream_2000() {
 
 #[test]
 fn grok_foreign_prompt_overlap_keeps_stop_target() {
-    let (events, _) = replay(
-        "foreign-prompt-overlap",
-        Inputs {
-            stop_request: true,
-            ..Default::default()
-        },
-    );
+    let (events, _) = replay("foreign-prompt-overlap", Inputs::stop_request());
     assert!(outcomes(&events).iter().any(|outcome| matches!(outcome, TurnOutcome::Interrupted { reason } if reason == "Stopped by you")));
 }
 #[test]
@@ -701,5 +579,383 @@ fn grok_isolated_auth_ignores_ambient_api_key() {
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stdout)
+    );
+}
+#[test]
+fn grok_foreign_permission_docks_in_veyra_turn() {
+    harness::foreign_request(
+        ProviderKind::Grok,
+        "foreign-permission-dock",
+        Decision::AllowOnce,
+    );
+}
+#[test]
+fn grok_foreign_question_docks_in_veyra_turn() {
+    harness::foreign_request(
+        ProviderKind::Grok,
+        "foreign-question-dock",
+        Decision::Answers(vec![Answer {
+            text: "Tests".into(),
+        }]),
+    );
+}
+fn foreign_request_ends(name: &str, stop: bool) {
+    engine_replay(name, |engine, thread, events, runtime| {
+        runtime.block_on(async {
+        use veyra_engine::{commands::Command, events::{ChangeEvent, UiEvent}};
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut opened,mut expired)=(None,false);
+            while let Some(event)=events.recv().await {
+                match event {
+                    UiEvent::Change { event:ChangeEvent::RequestOpened(request),.. } => {
+                        opened=Some(request.id);
+                        if stop {engine.send(Command::StopThread { thread }).await.unwrap().unwrap();}
+                    }
+                    UiEvent::Change { event:ChangeEvent::RequestClosed(request),.. } => {
+                        assert_eq!(Some(request.id),opened);
+                        assert!(matches!(request.state,RequestState::Expired {..}));
+                        expired=true;
+                    }
+                    UiEvent::Change { event:ChangeEvent::TurnEnded(turn),.. } if turn.origin!=TurnOrigin::Provider => {
+                        assert!(opened.is_some() && expired,"foreign request was not persisted and expired");
+                        assert!(matches!(turn.state,TurnState::Ended { outcome:TurnOutcome::Interrupted {..},..}) == stop);
+                        let snapshot=engine.snapshot(thread).await.unwrap();
+                        assert!(snapshot.items.iter().any(|item|matches!(&item.body,ItemBody::AssistantText {text,..} if text=="working")));
+                        native_replies_checked(engine).await;
+                        return;
+                    }
+                    _=>{}
+                }
+            }
+            panic!("foreign request never expired");
+        }).await.unwrap();
+    })
+    });
+}
+#[test]
+fn grok_foreign_requests_expire_with_veyra_turn() {
+    for name in [
+        "foreign-permission-dock-expires",
+        "foreign-question-dock-expires",
+    ] {
+        foreign_request_ends(name, false);
+    }
+}
+#[test]
+fn grok_foreign_requests_stop_with_veyra_turn() {
+    for name in ["foreign-permission-dock-stop", "foreign-question-dock-stop"] {
+        foreign_request_ends(name, true);
+    }
+}
+#[test]
+fn grok_foreign_open_work_is_announced_before_later_send() {
+    engine_replay("foreign-open-send", |engine, thread, events, runtime| {
+        runtime.block_on(async {
+            use veyra_engine::{
+                commands::Command,
+                events::{ChangeEvent, UiEvent},
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut provider, mut user_ends) = (None, 0);
+                while let Some(event) = events.recv().await {
+                    match event {
+                        UiEvent::Change {
+                            event: ChangeEvent::TurnStarted(turn),
+                            ..
+                        } if turn.origin == TurnOrigin::Provider => {
+                            assert!(engine.window_threads()[&thread].busy);
+                            provider = Some(turn.id);
+                            engine
+                                .send(Command::Send {
+                                    thread,
+                                    text: "second".into(),
+                                })
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        }
+                        UiEvent::Change {
+                            event: ChangeEvent::TurnEnded(turn),
+                            ..
+                        } => {
+                            assert!(matches!(
+                                turn.state,
+                                TurnState::Ended {
+                                    outcome: TurnOutcome::Completed,
+                                    ..
+                                }
+                            ));
+                            if turn.origin == TurnOrigin::Provider {
+                                assert_eq!(Some(turn.id), provider);
+                            } else {
+                                user_ends += 1;
+                                if user_ends == 2 {
+                                    assert!(provider.is_some());
+                                    return;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                panic!("foreign work blocked a later send");
+            })
+            .await
+            .unwrap();
+        })
+    });
+}
+#[test]
+fn grok_overlapping_provider_prompts_share_one_running_row() {
+    engine_replay(
+        "foreign-provider-overlap",
+        |engine, thread, events, runtime| {
+            runtime.block_on(async {
+                use veyra_engine::events::{ChangeEvent, UiEvent};
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut provider = None;
+                    while let Some(event) = events.recv().await {
+                        match event {
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnStarted(turn),
+                                ..
+                            } if turn.origin == TurnOrigin::Provider => {
+                                assert!(
+                                    provider.is_none(),
+                                    "overlapping prompts split the Provider row"
+                                );
+                                provider = Some(turn.id);
+                            }
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnEnded(turn),
+                                ..
+                            } if turn.origin == TurnOrigin::Provider => {
+                                assert_eq!(Some(turn.id), provider);
+                                let snapshot = engine.snapshot(thread).await.unwrap();
+                                let text: String = snapshot
+                                    .items
+                                    .iter()
+                                    .filter(|item| item.turn == turn.id)
+                                    .filter_map(|item| match &item.body {
+                                        ItemBody::AssistantText { text, .. } => Some(text.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                assert_eq!(text, "firststill workingsecond");
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    panic!("Provider work never ended");
+                })
+                .await
+                .unwrap();
+            })
+        },
+    );
+}
+#[test]
+fn grok_malformed_missing_update_kind_is_skipped() {
+    assert_eq!(text(&standard("malformed-missing-kind")), "ok");
+}
+#[test]
+fn grok_malformed_null_tool_title_is_skipped() {
+    assert_eq!(text(&standard("malformed-null-title")), "ok");
+}
+#[test]
+fn grok_malformed_numeric_prompt_id_is_skipped() {
+    assert_eq!(text(&standard("malformed-numeric-prompt")), "ok");
+}
+#[test]
+fn grok_malformed_null_meta_is_skipped() {
+    assert_eq!(text(&standard("malformed-null-meta")), "ok");
+}
+#[test]
+fn grok_malformed_numeric_update_kind_is_skipped() {
+    assert_eq!(text(&standard("malformed-numeric-kind")), "ok");
+}
+fn stop_foreign_work(thread_stop: bool) {
+    engine_replay("foreign-open-stop", |engine, thread, events, runtime| {
+        runtime.block_on(async {
+            use veyra_engine::{
+                commands::Command,
+                events::{ChangeEvent, UiEvent},
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut provider = None;
+                while let Some(event) = events.recv().await {
+                    match event {
+                        UiEvent::Change {
+                            event: ChangeEvent::TurnStarted(turn),
+                            ..
+                        } if turn.origin == TurnOrigin::Provider => {
+                            provider = Some(turn.id);
+                            assert!(engine.window_threads()[&thread].busy);
+                            let command = if thread_stop {
+                                Command::StopThread { thread }
+                            } else {
+                                Command::Interrupt {
+                                    thread,
+                                    turn: turn.id,
+                                }
+                            };
+                            engine.send(command).await.unwrap().unwrap();
+                        }
+                        UiEvent::Change {
+                            event: ChangeEvent::TurnEnded(turn),
+                            ..
+                        } if turn.origin == TurnOrigin::Provider => {
+                            assert_eq!(Some(turn.id), provider);
+                            assert!(matches!(
+                                turn.state,
+                                TurnState::Ended {
+                                    outcome: TurnOutcome::Interrupted { .. },
+                                    ..
+                                }
+                            ));
+                            native_replies_checked(engine).await;
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                panic!("Stop did not reach promoted Provider work");
+            })
+            .await
+            .unwrap();
+        })
+    });
+}
+#[test]
+fn grok_foreign_open_work_accepts_targeted_stop() {
+    stop_foreign_work(false);
+}
+#[test]
+fn grok_foreign_open_work_accepts_stop_thread() {
+    stop_foreign_work(true);
+}
+#[test]
+fn grok_stop_cancels_every_foreign_request_before_session_cancel() {
+    engine_replay("foreign-both-stop", |engine, thread, events, runtime| {
+        runtime.block_on(async {
+            use veyra_engine::{
+                commands::Command,
+                events::{ChangeEvent, UiEvent},
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut opened, mut closed) = (0, 0);
+                while let Some(event) = events.recv().await {
+                    match event {
+                        UiEvent::Change {
+                            event: ChangeEvent::RequestOpened(_),
+                            ..
+                        } => {
+                            opened += 1;
+                            if opened == 2 {
+                                engine
+                                    .send(Command::StopThread { thread })
+                                    .await
+                                    .unwrap()
+                                    .unwrap();
+                            }
+                        }
+                        UiEvent::Change {
+                            event: ChangeEvent::RequestClosed(request),
+                            ..
+                        } => {
+                            assert!(matches!(request.state, RequestState::Expired { .. }));
+                            closed += 1;
+                        }
+                        UiEvent::Change {
+                            event: ChangeEvent::TurnEnded(turn),
+                            ..
+                        } if turn.origin != TurnOrigin::Provider => {
+                            assert_eq!((opened, closed), (2, 2));
+                            assert!(matches!(
+                                turn.state,
+                                TurnState::Ended {
+                                    outcome: TurnOutcome::Interrupted { .. },
+                                    ..
+                                }
+                            ));
+                            native_replies_checked(engine).await;
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                panic!("foreign requests never cancelled");
+            })
+            .await
+            .unwrap();
+        })
+    });
+}
+
+async fn native_replies_checked(engine: &veyra_engine::Engine) {
+    let path = engine
+        .child_env()
+        .fixtures
+        .unwrap()
+        .join("native-replies-checked");
+    while !path.exists() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+#[test]
+fn grok_stopped_veyra_turn_announces_unfinished_foreign_work() {
+    engine_replay(
+        "foreign-open-after-stop",
+        |engine, thread, events, runtime| {
+            runtime.block_on(async {
+                use veyra_engine::{
+                    commands::Command,
+                    events::{ChangeEvent, UiEvent},
+                };
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let (mut stopped, mut provider) = (false, None);
+                    while let Some(event) = events.recv().await {
+                        match event {
+                            UiEvent::TextAppended { .. } if !stopped => {
+                                stopped = true;
+                                engine
+                                    .send(Command::StopThread { thread })
+                                    .await
+                                    .unwrap()
+                                    .unwrap();
+                            }
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnStarted(turn),
+                                ..
+                            } if turn.origin == TurnOrigin::Provider => {
+                                assert!(stopped);
+                                assert!(engine.window_threads()[&thread].busy);
+                                provider = Some(turn.id);
+                            }
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnEnded(turn),
+                                ..
+                            } if turn.origin == TurnOrigin::Provider => {
+                                assert_eq!(Some(turn.id), provider);
+                                assert!(matches!(
+                                    turn.state,
+                                    TurnState::Ended {
+                                        outcome: TurnOutcome::Interrupted { .. },
+                                        ..
+                                    }
+                                ));
+                                native_replies_checked(engine).await;
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    panic!("unfinished foreign work was not announced after Stop");
+                })
+                .await
+                .unwrap();
+            })
+        },
     );
 }

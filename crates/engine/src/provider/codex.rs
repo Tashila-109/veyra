@@ -1088,7 +1088,10 @@ impl Codec {
             wire::Request::Unknown => return,
         };
         let owner = match native_turn {
-            Some(native) => self.route(&native, decoded),
+            Some(native) => self.route(&native, decoded).or_else(|| {
+                self.active()
+                    .filter(|owner| matches!(owner, ActiveTurn::Veyra(_)))
+            }),
             None => self.active(),
         };
         let Some(owner) = owner else {
@@ -1134,15 +1137,21 @@ impl Codec {
             (RequestReply::Decision, AcceptedDecision::Allow { .. }) => {
                 json!({"decision":"accept"})
             }
-            (RequestReply::Decision, AcceptedDecision::Deny) => json!({"decision":"decline"}),
+            (RequestReply::Decision, AcceptedDecision::Deny { .. }) => {
+                json!({"decision":"decline"})
+            }
             (RequestReply::Permissions(profile), AcceptedDecision::Allow { .. }) => {
                 json!({"permissions":profile,"scope":"turn"})
             }
-            (RequestReply::Permissions(_), AcceptedDecision::Deny) => json!({"permissions":{}}),
+            (RequestReply::Permissions(_), AcceptedDecision::Deny { .. }) => {
+                json!({"permissions":{}})
+            }
             (RequestReply::Elicitation, AcceptedDecision::Allow { .. }) => {
                 json!({"action":"accept"})
             }
-            (RequestReply::Elicitation, AcceptedDecision::Deny) => json!({"action":"decline"}),
+            (RequestReply::Elicitation, AcceptedDecision::Deny { .. }) => {
+                json!({"action":"decline"})
+            }
             (RequestReply::Question(ids), AcceptedDecision::Answers { answers, .. }) => {
                 let answers: serde_json::Map<_, _> = ids
                     .iter()

@@ -243,7 +243,9 @@ pub enum AcceptedDecision<'a> {
     Allow {
         grant: Option<&'a GrantKey>,
     },
-    Deny,
+    Deny {
+        reason: Option<&'a str>,
+    },
     Answers {
         questions: &'a [Question],
         answers: &'a [Answer],
@@ -268,7 +270,12 @@ impl RequestKind {
                 },
                 Decision::AllowOnce,
             ) => Some(AcceptedDecision::Allow { grant: None }),
-            (Self::Approval { .. }, Decision::Deny) => Some(AcceptedDecision::Deny),
+            (Self::Approval { action }, Decision::Deny) => Some(AcceptedDecision::Deny {
+                reason: match &action.consent {
+                    ApprovalConsent::DenyOnly { reason } => Some(reason),
+                    ApprovalConsent::Once { .. } => None,
+                },
+            }),
             (
                 Self::Approval {
                     action:

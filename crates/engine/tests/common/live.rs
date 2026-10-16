@@ -132,3 +132,126 @@ pub fn live(
         result.expect("live provider deadline expired")
     })
 }
+
+pub fn ok_reply(provider: ProviderKind) {
+    let (events, _) = live(
+        provider,
+        PermissionMode::FullAccess,
+        &["Reply with exactly the word ok."],
+        &[],
+    );
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { text, .. },
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text.trim().to_lowercase(), "ok");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Turn {
+            event: TurnEvent::Accepted,
+            ..
+        }
+    )));
+}
+
+pub fn approval_round_trip(provider: ProviderKind) {
+    let (events, exists) = live(
+        provider,
+        PermissionMode::AskFirst,
+        &[
+            "Run only touch veyra-check.txt. If denied, stop and report the denial.",
+            "Run only touch veyra-check.txt and report completion.",
+        ],
+        &[Decision::Deny, Decision::AllowOnce],
+    );
+    assert_eq!(exists, [false, true]);
+    let commands: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Turn {
+                event:
+                    TurnEvent::RequestOpened {
+                        kind:
+                            RequestKind::Approval {
+                                action:
+                                    ProposedAction {
+                                        target: ApprovalTarget::Command { command, .. },
+                                        ..
+                                    },
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } => Some(command),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commands.len(), 2);
+    assert!(commands.iter().all(|c| c.contains("touch veyra-check.txt")));
+}
+
+pub fn full_access_write(provider: ProviderKind) {
+    let (events, exists) = live(
+        provider,
+        PermissionMode::FullAccess,
+        &["Run only touch veyra-check.txt and report completion."],
+        &[],
+    );
+    assert_eq!(exists, [true]);
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Turn {
+            event: TurnEvent::RequestOpened { .. },
+            ..
+        }
+    )));
+}
+
+pub fn question(provider: ProviderKind) {
+    let (events, _) = live(
+        provider,
+        PermissionMode::FullAccess,
+        &[
+            "Ask me whether to use Violet or Blue using request_user_input, then repeat my choice. Make no file changes.",
+        ],
+        &[Decision::Answers(vec![Answer {
+            text: "Violet".into(),
+        }])],
+    );
+    let count = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ProviderEvent::Turn {
+                    event: TurnEvent::RequestOpened {
+                        kind: RequestKind::Question { .. },
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .count();
+    eprintln!(
+        "{}_native_user_question_requests={count}; this question path needs a live record of the supported mode when this is zero",
+        provider.binary()
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProviderEvent::Turn {
+            event: TurnEvent::TurnEnded {
+                outcome: TurnOutcome::Completed,
+                ..
+            },
+            ..
+        }
+    )));
+}

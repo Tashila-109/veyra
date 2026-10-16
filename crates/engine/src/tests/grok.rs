@@ -1,11 +1,3 @@
-use crate::provider::ProviderKind;
-#[test]
-fn grok_is_built_and_offered_in_tool_schema() {
-    assert!(ProviderKind::Grok.is_built());
-    let schema = crate::tools::list();
-    assert!(schema.to_string().contains("grok"));
-}
-
 #[test]
 fn grok_args_per_mode() {
     use crate::{domain::*, provider::grok};
@@ -396,4 +388,66 @@ fn grok_error_completion_keeps_failure_with_nontext_result() {
     codec.start(turn, "work".into()).unwrap();
     let decoded = codec.value(serde_json::json!({"id":3,"result":{"stopReason":"error","agentResult":{"detail":"unfamiliar metadata"}}})).unwrap();
     assert!(decoded.events.iter().any(|e| matches!(e, ProviderEvent::Turn { event: TurnEvent::TurnEnded { outcome:TurnOutcome::Failed {message},..}, .. } if message == "Grok could not complete the turn")));
+}
+#[test]
+fn grok_malformed_notifications_log_only_the_method() {
+    let logs = super::logs::CapturedLogs::default();
+    tracing::subscriber::with_default(logs.clone(), || {
+        let mut codec = ready_codec();
+        for params in [
+            serde_json::json!({"sessionId":"native","update":{"private":"private-payload"}}),
+            serde_json::json!({"sessionId":"native","update":{"sessionUpdate":"tool_call","title":null,"rawInput":"private-payload"}}),
+            serde_json::json!({"sessionId":"native","_meta":{"promptId":12},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"private-payload"}}}),
+            serde_json::json!({"sessionId":"native","_meta":null,"private":"private-payload"}),
+        ] {
+            let decoded = codec
+                .value(serde_json::json!({"method":"session/update","params":params}))
+                .unwrap();
+            assert!(decoded.events.is_empty());
+            assert!(codec.active().is_none());
+        }
+    });
+    let entries = logs.0.lock().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry
+                .get("method")
+                .is_some_and(|method| method == "session/update"))
+            .count(),
+        4
+    );
+    assert!(!format!("{entries:?}").contains("private-payload"));
+}
+#[test]
+fn grok_wrong_session_notification_cannot_accept_veyra_prompt() {
+    use crate::{domain::*, provider::*};
+    let mut codec = ready_codec();
+    let turn = TurnId::new();
+    codec.start(turn, "work".into()).unwrap();
+    let wrong=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"another-session","_meta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"wrong session"}}}})).unwrap();
+    assert!(wrong.events.is_empty());
+    let done = codec
+        .value(serde_json::json!({"id":3,"result":{"stopReason":"end_turn"}}))
+        .unwrap();
+    assert!(matches!(done.events.as_slice(),[
+        ProviderEvent::Turn {turn:Some(a),event:TurnEvent::Accepted},
+        ProviderEvent::Turn {turn:Some(b),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,..}}
+    ] if *a==turn && *b==turn));
+}
+#[test]
+fn grok_replay_notification_cannot_accept_veyra_prompt() {
+    use crate::{domain::*, provider::*};
+    let mut codec = ready_codec();
+    let turn = TurnId::new();
+    codec.start(turn, "work".into()).unwrap();
+    let replay=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":turn.to_string(),"isReplay":true},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old text"}}}})).unwrap();
+    assert!(replay.events.is_empty());
+    let done = codec
+        .value(serde_json::json!({"id":3,"result":{"stopReason":"end_turn"}}))
+        .unwrap();
+    assert!(matches!(done.events.as_slice(),[
+        ProviderEvent::Turn {turn:Some(a),event:TurnEvent::Accepted},
+        ProviderEvent::Turn {turn:Some(b),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,..}}
+    ] if *a==turn && *b==turn));
 }

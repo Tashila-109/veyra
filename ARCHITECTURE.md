@@ -12,7 +12,8 @@ Claude, Codex and Grok engine sessions, readiness probes, replay fixtures and de
 Grok readiness reads its version and offers no model or effort catalog; its sign-in signal remains unknown.
 Claude, Codex and Grok server approvals and questions reach the same window dock, whose actions send typed decisions through the engine.
 Codex async agent-message questions instead become persistent transcript cards whose option actions send ordinary user messages.
-Exact thread grants and deny/cancel replies are persisted before their provider controls run, except on storage-blocked and blocked-shutdown paths where cancellation precedes stored expiry.
+Human decisions and exact thread grants are persisted before their provider controls run.
+Codec cancellation on provider completion, and cancellation on storage-blocked or blocked-shutdown paths, can precede stored request expiry.
 Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
 The window owns render and event-batch counters.
 Inactive-window family changes post system banners, and busy Quit opens a sheet.
@@ -215,7 +216,9 @@ Grok publishes Ready on a successful session/new, session/resume or session/load
 Ready changes Starting to Structured.
 4. start_changed makes the queued turn Running, records pending admission and dispatches StartTurn with committed prompt text.
 The first prompt waits for Ready.
-The codec admits StartTurn only with no active turn, and the session reports StartTurnRefused when CLI work is already running.
+The codec admits StartTurn only while its provider work is idle; Grok requires its native prompt map to be empty, and Codex requires TurnBinding::Idle.
+The session reports StartTurnRefused when the codec refuses admission.
+Grok announces any still-open foreign prompts as Provider work immediately after its Veyra turn ends, so retained native work always has a running actor row and Stop target.
 ProviderTurnStarted opens the CLI's own turn under its reported id and restores a pending Veyra turn to Queued with its original ordinal.
 The queue waits with TurnRunning while that Provider turn runs, an admission remains pending, or a refused start waits for the CLI turn to end.
 Pending or Refused admission counts as busy for StopThread, Archive, Configure, SwitchView, idle parking, keep-awake and Quit.
@@ -393,13 +396,14 @@ StopThread and Archive capture the running and pending-admission turn ids before
 A targeted Interrupt whose named turn belongs to another thread or is no longer running or pending is a no-op, creating no hold, drain, control or outcome change.
 Shutdown and startup recovery use StopReason::AppClosing for their shared turn-end reason.
 The codec ignores an interrupt whose target is no longer active, including when a later Provider turn has opened.
-Only a matching targeted interrupt cancels native requests and arms its ladder; active-turn interruptions resolve the target directly from the codec.
+A targeted interrupt cancels native requests and arms its ladder only when its target matches; active-turn interruptions resolve the target directly from the codec.
 Claude and Codex cancel that turn's requests; Grok cancels every open request because session/cancel is session-wide.
 The codec returns outbound Prompt, Message, Provider or Interrupt values, with each Interrupt carrying its target turn and supplying its own protocol JSON.
 The stdin queue preserves that type, the writer applies its quit commitment check only to Prompt, and it checks an Interrupt's target against the codec's shared active id at each poll until its first byte is written.
 An unsent interrupt for an ended target is discarded; its preceding cancel replies remain ordered before any matching interrupt.
 Once writing begins, the writer finishes that frame before another frame.
-A turn end clears its ladder; an admitted new prompt starts with no active turn or old ladder.
+A completed work group clears its ladder; Grok retains a session-wide Stop ladder while unfinished foreign prompts move into a Provider row.
+An admitted new prompt starts with no active work or old ladder.
 Human interrupts use "Stopped by you"; storage and shutdown carry their own reasons.
 A session without a turn never arms that ladder.
 SessionControls drains pending controls and closes its receiver on Shutdown or the shared LaunchGate closing state, retaining cancellation through process cleanup.
@@ -484,6 +488,7 @@ Granting that directory would let Codex redirect the human's later Git commands,
 The codec reads thread reply metadata without interpreting the echoed sandbox as a string.
 The turn/start reply is Accepted; notifications received before it are buffered and then correlated to the returned native turn id.
 A valid own-thread request before that reply attaches to the Veyra turn being started and docks immediately, so a server waiting for consent can progress.
+While a Veyra turn is bound, an own-thread request tagged with another non-ended native turn also docks under that Veyra turn and uses its answer and cancellation lifetime.
 It binds a provisional native turn when one is supplied; an MCP elicitation can omit turnId and still be answered by its request id.
 A request for an idle own-thread turn opens Provider work even before turn/started.
 Another thread's requests are refused without docking, and a start reply that changes a provisional id fails the session.
@@ -542,7 +547,9 @@ Other MCP forms are declined with a notice, and unsupported server requests get 
 A command row uses completed aggregatedOutput when non-null, otherwise the bounded outputDelta tail.
 A no-active-turn interrupt refusal before turn/started waits for that start and sends one retry within the shared three-second protocol step.
 Codex and Claude share process-group cleanup, the stop ladder, shutdown commitment checks and actor recovery paths.
-launch chooses its provider setup once, launch_rpc shares Codex and Grok launch and root-credential setup, and launch_with shares fixture selection, recorder setup and the ChildEnv spawn boundary.
+launch chooses its provider setup once, launch_rpc matches the closed RpcProvider enum to choose Codex or Grok launch, codec and MCP wire, and launch_with shares fixture selection, recorder setup and the ChildEnv spawn boundary.
+VersionRules carries each version probe's arguments, optional deadline, EOF rule and error text; the shared reader does not infer those rules from the provider.
+Codec::profile matches every codec variant and assigns its direct-line or RPC reader and diagnostics.
 The run loop chooses one SessionProfile from its codec for stdout reading, malformed-line diagnostics and resume-failure classification.
 RootMcp holds either Claude's private Configuration and session credential or a shared McpConfig attempt-credential factory for Codex or Grok.
 SessionIo owns the process and recording/credential lifetime, while Process owns the Claude, Codex or Grok codec variant.
@@ -556,7 +563,9 @@ Immediately before the shared writer writes bytes, mcp::ThreadFrame writes Codex
 ## Grok ACP codec
 
 `grok::Codec` owns ACP JSON-RPC calls, prompt ownership, open requests, background task ids and its shared StopLadder.
-SessionState names initialization, authentication, opening and readiness; its Ready state holds the native identity and active prompt, while OpenTarget names new, resume or load attempts without changing the stored SessionSpec.
+SessionState names initialization, authentication, opening and readiness; its Ready state holds the native identity and optional displayed PromptWork, while OpenTarget names new, resume or load attempts without changing the stored SessionSpec.
+PromptOrigin distinguishes each native prompt sent by Veyra from foreign prompts.
+PromptWork is either one Veyra prompt with its turn id or one Provider turn that groups every open foreign prompt; native prompt tracking does not choose a different Stop target.
 `grok::args` places --no-auto-update before agent and --no-leader before stdio.
 --no-leader keeps the agent in the spawned process; without it, leader-enabled configuration can attach agent stdio to a shared leader over ~/.grok/leader.sock outside Veyra's group, which cleanup could not stop.
 This flag's effect comes from Grok help and research and has not been observed on an installed Grok by these tests.
@@ -572,7 +581,7 @@ Authentication failures name Sign in with `grok login`; Veyra never launches tha
 A fresh conversation uses session/new with cwd and mcpServers.
 A resumed conversation uses session/resume when agentCapabilities.sessionCapabilities.resume is advertised, otherwise session/load.
 An import request selects session/load, but the terminal-history importer is not implemented.
-Replay-marked updates are dropped.
+Replay-marked notifications and notifications for another session are filtered before tagged-prompt acceptance, so they cannot confirm admission.
 Only a recognized session-not-found error falls back to session/new with a notice; other errors preserve the stored native id.
 
 Each session/prompt carries its Veyra turn id in _meta.promptId.
@@ -581,21 +590,29 @@ The matching prompt_complete notification or prompt RPC reply settles the turn o
 A prompt RPC error without acceptance fails without marking the prompt accepted.
 If no JSON line arrives within sixty seconds of building the prompt, Veyra's chosen bound, the session fails: the turn ends Failed with that message, the Grok group stops and the thread parks until the next send respawns it.
 Any parsed JSON frame clears that deadline, and there is no later silence timeout.
-Unknown prompt ids on supported content updates or valid server requests are tracked as Provider prompts.
-When no prompt is active, their next supported frame announces a Provider turn before its events.
-A foreign id never replaces the active Veyra prompt, so Stop for that Veyra turn still sends cancellation; the actor ignores foreign turn events while the Veyra turn is running.
+Unknown prompt ids on supported content updates or valid server requests are tracked as foreign prompts.
+With no displayed work, the codec announces a Provider turn before emitting content or a request.
+While a Veyra prompt runs, foreign content and requests use its turn id, preserving the Veyra Stop target and the actor's persisted request dock.
+The human's answer uses the original native request id; if the displayed turn ends first, finish queues a native cancelled reply and the actor expires the request with that turn.
+After the Veyra prompt ends, still-open foreign prompts immediately open one Provider turn in event order after its TurnEnded, without waiting for another frame.
+That Provider row remains Running until every tracked foreign prompt has ended, so a second foreign prompt's completion cannot end the first prompt's row.
+After a stopped Veyra turn ends, unfinished foreign prompts still open a Provider row, and the session-wide cancellation ladder stays armed until that work ends or cleanup stops the group.
 A lone completion for an unknown prompt id is ignored.
 Both x.ai and _x.ai task_backgrounded and task_completed spellings update a set of update.task_id values.
 The actor's existing background-work flag prevents Configure, SwitchView, parking and early task settlement while that set is nonempty.
 Text, reasoning, tool rows and plans normalize to the existing engine events; tool output emits cumulative-output suffix deltas and the actor bounds their retained tail.
 Permission option kinds, session-update kinds, tool status and completion reasons decode into enums with an Unknown fallback.
-Unknown notification methods and session-update kinds are logged at debug with only their name and are skipped; unsupported or malformed server requests receive JSON-RPC errors without approval.
+Unknown notification methods and session-update kinds are logged at debug with only their name and are skipped.
+A notification whose _meta, sessionUpdate, completion, task, plan or tool payload fails typed decoding is logged at debug with its method and skipped without its payload; it does not fail the session.
+Notifications for another sessionId are dropped, and permission or question requests for another sessionId receive -32602.
+Unsupported or malformed server requests receive JSON-RPC errors without approval.
 
 Permission requests select options by allow_once or reject_once kind and never select allow_always.
 A Bash request with only command, description and timeout fields may use the existing exact-command thread grant, which still replies allow_once.
 Other argument shapes offer no thread grant and show an unverified command cwd or a tool preview.
 ProposedAction::consent is Once with its optional thread grant, or DenyOnly with Grok's lasting-grant reason when no allow_once option exists.
-DenyOnly cannot carry a grant, and the actor and window read grant availability from that consent.
+DenyOnly cannot carry a grant, and RequestKind::accepts owns allow decisions, exact thread grants and the Deny-only reason.
+The window's request_consent derives enabled allows, reason and caption only from accepts; render, respond and dump read that projection.
 RequestKind::accepts rejects both allow decisions for DenyOnly and preserves Deny, including after stored action round trips.
 Existing stored approvals without consent deserialize as Once, and RequestKind moves an older outer grant_key into that consent.
 An older DenyOnly action discards any outer grant_key when loaded.
@@ -681,9 +698,9 @@ The CLI actor refuses a tool request without its originating session; only scrip
 The token never enters argv, logs, evidence, fixture text or crash text.
 
 Actor::handle_inner sends every tool decision through tools::decide, the existing ChangeSet commit and the existing effects path.
-ProviderKind::is_built owns provider availability for the spawner, tool catalog, start validation and start_thread schema.
-list_providers reads the shared readiness catalog and offers built adapters with Ready and a resolved path, their models, the caller's mode ceiling and remaining fan-out.
-start_thread offers each built provider whose probe has a resolved path and Ready status, including Grok.
+ProviderKind::ALL supplies the start_thread schema's provider choices.
+list_providers reads the shared readiness catalog and offers adapters with Ready and a resolved path, their models, the caller's mode ceiling and remaining fan-out.
+start_thread accepts each provider whose probe has a resolved path and Ready status, including Grok.
 Probes populate that catalog and Engine::child_env shares it with the actor.
 start_thread creates a child lineage, first task turn and UUID-v5 task keyed by caller and start_thread:client_request_id.
 get_task reads only the caller's task and reports the child's Status::words with its settled summary when present.
@@ -1119,11 +1136,14 @@ Peer tests cover omitted and included version fields, out-of-order replies, EOF 
 Relay tests hold the socket open while stdin or the parent ends and independently block socket and stdout writes before closing stdin.
 The MCP half-close and queue-overflow tests hold an actor reply pending and require credential revocation and connection closure.
 Codex live tests are ignored by default.
-Codex and Grok live tests share a provider-parameterized harness, and their replay tests share the same isolated session harness.
+Codex and Grok live wrappers call the same provider-parameterized test bodies in tests/common/live.rs, and their replay tests use the shared Inputs, Input and isolated session harness in tests/common/replay.rs.
 
 Grok replays cover prompt correlation, exactly-once completion, two turns per process, permissions, both question spellings, cancellation order, authentication retry, signed-out failure and advertised resume.
 The first-frame timeout replay advances Tokio time and does not wait sixty seconds on the wall clock.
 Actor-backed Grok replays verify persisted question answers and request expiry, and background work refusing Configure and SwitchView before a Provider continuation.
+Foreign-request actor tests check permission and question docks, persisted answers and expiry, native cancellation before session/cancel, later Send after foreign-work promotion, both Stop targets, promotion after a stopped Veyra turn and overlapping Provider prompts.
+The Codex actor regression verifies a foreign native turn's permission docks under the bound Veyra turn and receives its native answer.
+Malformed-notification replays keep the session alive through missing or numeric update kinds, a null tool title, a numeric prompt id and null metadata; codec tests check method-only diagnostics and prevent wrong-session or replay notifications from confirming admission.
 grok_root_reaches_real_relay runs in the ordinary application suite with the production veyra mcp executable and fake CLI without opening a window.
 A default credential-frame test asserts the Grok mcpServers entry, preserves unrelated config and requires only the token marker in its recording value.
 Grok fixtures name version 1.0.52 and source hand-written; installed Grok wires, sign-in signals, permission behavior and late-update ordering have not been verified by these tests.

@@ -344,25 +344,31 @@ fn launch(
                 },
             )
         }
-        ProviderKind::Codex => launch_rpc(spec, env, session_epoch, crate::mcp::McpWire::Codex),
-        ProviderKind::Grok => launch_rpc(spec, env, session_epoch, crate::mcp::McpWire::Grok),
+        ProviderKind::Codex => launch_rpc(spec, env, session_epoch, RpcProvider::Codex),
+        ProviderKind::Grok => launch_rpc(spec, env, session_epoch, RpcProvider::Grok),
     }
+}
+enum RpcProvider {
+    Codex,
+    Grok,
 }
 fn launch_rpc(
     spec: &SessionSpec,
     env: &ChildEnv,
     epoch: u32,
-    wire: crate::mcp::McpWire,
+    rpc_provider: RpcProvider,
 ) -> Result<Process, ProviderError> {
     use crate::mcp::{McpConfig, McpWire};
-    let (provider, args, version) = match wire {
-        McpWire::Codex => (
+    let (provider, wire, args, version) = match rpc_provider {
+        RpcProvider::Codex => (
             ProviderKind::Codex,
+            McpWire::Codex,
             vec!["app-server".into()],
             "unknown until thread reply",
         ),
-        McpWire::Grok => (
+        RpcProvider::Grok => (
             ProviderKind::Grok,
+            McpWire::Grok,
             grok::args(&spec.config),
             "unknown until initialize",
         ),
@@ -378,13 +384,13 @@ fn launch_rpc(
                 child.pid(),
             ))
         });
-        let codec = match wire {
-            McpWire::Codex => Codec::Codex(Box::new(codex::Codec::new(
+        let codec = match rpc_provider {
+            RpcProvider::Codex => Codec::Codex(Box::new(codex::Codec::new(
                 spec.clone(),
                 child.pid(),
                 config.clone(),
             ))),
-            McpWire::Grok => Codec::Grok(Box::new(grok::Codec::new(
+            RpcProvider::Grok => Codec::Grok(Box::new(grok::Codec::new(
                 spec.clone(),
                 child.pid(),
                 config.clone(),
@@ -485,9 +491,6 @@ pub fn spawn_provider(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    if !provider.is_built() {
-        return Err(ProviderError::NotBuilt);
-    }
     env.resolve(provider)?;
     Ok(start_provider_task(provider, None, spec, env, out, epoch))
 }
@@ -1090,7 +1093,12 @@ pub async fn probe(
         env,
         &binary,
         cwd,
-        ProviderKind::Claude,
+        VersionRules {
+            args: &["--version"],
+            timeout: None,
+            empty_on_eof: true,
+            error: "Claude version exceeded 4 MiB",
+        },
         fixture.as_deref(),
         &mut cancelled,
     )
@@ -1201,6 +1209,16 @@ struct SessionProfile {
     reject_non_json: bool,
     resume_from_stderr: bool,
 }
+impl SessionProfile {
+    fn rpc(provider: ProviderKind) -> Self {
+        Self {
+            provider,
+            lines: |stdout| SessionLines::Rpc(jsonrpc::Reader::start(stdout)),
+            reject_non_json: false,
+            resume_from_stderr: false,
+        }
+    }
+}
 enum SessionLines {
     Direct(ByteLines<tokio::process::ChildStdout>),
     Rpc(jsonrpc::Reader),
@@ -1220,25 +1238,15 @@ enum Codec {
 }
 impl Codec {
     fn profile(&self) -> SessionProfile {
-        let provider = match self {
-            Self::Claude(_) => ProviderKind::Claude,
-            Self::Codex(_) => ProviderKind::Codex,
-            Self::Grok(_) => ProviderKind::Grok,
-        };
-        if provider == ProviderKind::Claude {
-            SessionProfile {
-                provider,
+        match self {
+            Self::Claude(_) => SessionProfile {
+                provider: ProviderKind::Claude,
                 lines: |stdout| SessionLines::Direct(ByteLines::new(stdout)),
                 reject_non_json: true,
                 resume_from_stderr: true,
-            }
-        } else {
-            SessionProfile {
-                provider,
-                lines: |stdout| SessionLines::Rpc(jsonrpc::Reader::start(stdout)),
-                reject_non_json: false,
-                resume_from_stderr: false,
-            }
+            },
+            Self::Codex(_) => SessionProfile::rpc(ProviderKind::Codex),
+            Self::Grok(_) => SessionProfile::rpc(ProviderKind::Grok),
         }
     }
     #[cfg(debug_assertions)]
@@ -1338,11 +1346,17 @@ impl Codec {
         }
     }
 }
+struct VersionRules {
+    args: &'static [&'static str],
+    timeout: Option<Duration>,
+    empty_on_eof: bool,
+    error: &'static str,
+}
 async fn probe_version(
     env: &ChildEnv,
     binary: &std::path::Path,
     cwd: &std::path::Path,
-    provider: ProviderKind,
+    rules: VersionRules,
     fixture: Option<&std::path::Path>,
     cancelled: &mut oneshot::Receiver<()>,
 ) -> Result<String, ProviderError> {
@@ -1356,32 +1370,26 @@ async fn probe_version(
             })
             .unwrap_or_default());
     }
-    let args = if provider == ProviderKind::Grok {
-        vec!["--no-auto-update".into(), "--version".into()]
-    } else {
-        vec!["--version".into()]
-    };
+    let args = rules
+        .args
+        .iter()
+        .map(|arg| (*arg).into())
+        .collect::<Vec<_>>();
     let mut child = env.spawn(binary, &args, cwd, None)?;
     let mut stdout = ByteLines::new(child.stdout().expect("piped version stdout"));
     let stderr = discard_stderr(&mut child);
     let read = async {
         match stdout.next().await? {
             Some(Line::Text(line)) => Ok(line),
-            None if provider == ProviderKind::Claude => Ok(String::new()),
-            Some(Line::Oversize(_)) if provider == ProviderKind::Claude => Err(
-                ProviderError::Protocol("Claude version exceeded 4 MiB".into()),
-            ),
-            _ => Err(ProviderError::Protocol(format!(
-                "{} version probe did not return a bounded line",
-                provider.label()
-            ))),
+            None if rules.empty_on_eof => Ok(String::new()),
+            _ => Err(ProviderError::Protocol(rules.error.into())),
         }
     };
     let result = tokio::select! {
         _ = cancelled => Err(ProviderError::Cancelled),
         result = async {
-            if provider == ProviderKind::Grok {
-                tokio::time::timeout(Duration::from_secs(4), read).await.unwrap_or_else(|_| Err(ProviderError::Protocol("Grok version probe did not return a bounded line".into())))
+            if let Some(timeout) = rules.timeout {
+                tokio::time::timeout(timeout, read).await.unwrap_or_else(|_| Err(ProviderError::Protocol(rules.error.into())))
             } else { read.await }
         } => result,
     };
@@ -1408,7 +1416,12 @@ pub async fn probe_grok(
         env,
         &binary,
         cwd,
-        ProviderKind::Grok,
+        VersionRules {
+            args: &["--no-auto-update", "--version"],
+            timeout: Some(Duration::from_secs(4)),
+            empty_on_eof: false,
+            error: "Grok version probe did not return a bounded line",
+        },
         fixture.as_deref(),
         &mut cancelled,
     )
@@ -2954,11 +2967,6 @@ mod availability_tests {
                 out,
                 1,
             );
-            if !provider.is_built() {
-                assert!(matches!(result, Err(ProviderError::NotBuilt)));
-                assert!(!marker.exists());
-                continue;
-            }
             let handle = result.unwrap();
             let end = tokio::time::Instant::now() + Duration::from_secs(3);
             while !marker.exists() {

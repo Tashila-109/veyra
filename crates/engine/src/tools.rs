@@ -93,7 +93,7 @@ impl Tool {
         let (properties, required) = match self {
             Self::ListProviders => (json!({}), json!([])),
             Self::StartThread => (
-                json!({"provider":{"type":"string","enum":ProviderKind::ALL.into_iter().filter(|provider|provider.is_built()).collect::<Vec<_>>()},"model":{"type":"string"},"mode":{"type":"string","enum":["ask_first","accept_edits","full_access"]},"title":{"type":"string"},"prompt":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
+                json!({"provider":{"type":"string","enum":ProviderKind::ALL},"model":{"type":"string"},"mode":{"type":"string","enum":["ask_first","accept_edits","full_access"]},"title":{"type":"string"},"prompt":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
                 json!(["provider", "title", "prompt", "client_request_id"]),
             ),
             Self::GetTask => (
@@ -337,7 +337,7 @@ pub fn decide(
                 ));
             }
             let open = open_children(p, caller);
-            json!({"providers":providers.iter().filter(|probe|probe.provider.is_built() && probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models})).collect::<Vec<_>>(),"mode_ceiling":parent.config.mode,"remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
+            json!({"providers":providers.iter().filter(|probe|probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models})).collect::<Vec<_>>(),"mode_ceiling":parent.config.mode,"remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
         }
         Tool::StartThread => {
             let args: Start = parse(call.arguments, tool)?;
@@ -363,12 +363,6 @@ pub fn decide(
                 return Err(invalid(format!(
                     "mode exceeds your {} ceiling; call start_thread with a mode at or below that ceiling",
                     ceiling.as_str().unwrap()
-                )));
-            }
-            if !args.provider.is_built() {
-                return Err(invalid(format!(
-                    "provider {} is not built in this version; call list_providers with {{}} and choose a supported provider",
-                    args.provider.label()
                 )));
             }
             if !providers.iter().any(|probe| {

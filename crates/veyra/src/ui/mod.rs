@@ -1384,7 +1384,13 @@ impl Shell {
             self.notice("This request is no longer pending", cx);
             return;
         };
-        if row.kind.accepts(&decision).is_none() {
+        let consent = composer::request_consent(&row.kind);
+        let accepted = match decision {
+            Decision::AllowOnce => consent.allow_once,
+            Decision::AllowInThread => consent.allow_in_thread,
+            Decision::Deny | Decision::Answers(_) => row.kind.accepts(&decision).is_some(),
+        };
+        if !accepted {
             return;
         }
         let request = row.id;
@@ -1812,15 +1818,16 @@ impl Shell {
                     RequestKind::Approval { action } => Some(action),
                     RequestKind::Question { .. } => None,
                 };
+                let consent = composer::request_consent(&request.kind);
                 let text = approval.map(|action| composer::approval_text(action, self.chosen_provider()));
                 let mut dock = serde_json::json!({"request":request, "position":1,
                     "action_text":text.as_ref().map(|(label, _, _)| label),
                     "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
                     "preview":text.as_ref().map(|(_, _, preview)| preview),
-                    "grant_caption":approval.and_then(composer::approval_grant_caption),
-                    "allow_once_enabled":request.kind.accepts(&Decision::AllowOnce).is_some(),
-                    "allow_in_thread_enabled":request.kind.grant_key().is_some(),
-                    "consent_reason":approval.and_then(|action| match &action.consent { veyra_engine::domain::ApprovalConsent::DenyOnly { reason } => Some(reason), _ => None }),
+                    "grant_caption":consent.caption,
+                    "allow_once_enabled":consent.allow_once,
+                    "allow_in_thread_enabled":consent.allow_in_thread,
+                    "consent_reason":consent.reason,
                     "provider_text":approval.map(|action| composer::approval_quotes(action, self.chosen_provider().label())).unwrap_or_default(),
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
                     "question_index":target.question});

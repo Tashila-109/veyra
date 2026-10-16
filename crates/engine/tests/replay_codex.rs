@@ -12,41 +12,12 @@ use veyra_engine::{
 };
 #[path = "common/replay.rs"]
 mod harness;
-use harness::Scratch;
+use harness::{Inputs, Scratch};
 fn fixture(name: &str) -> PathBuf {
     harness::fixture(ProviderKind::Codex, name)
 }
 fn environment(name: &str) -> (Scratch, ChildEnv) {
     harness::environment(ProviderKind::Codex, name)
-}
-#[derive(Default)]
-struct Inputs {
-    stop_when_accepted: bool,
-    requests: std::collections::VecDeque<Input>,
-}
-enum Input {
-    Answer(Decision),
-    Stop,
-}
-impl Inputs {
-    fn answers(answers: impl IntoIterator<Item = Decision>) -> Self {
-        Self {
-            requests: answers.into_iter().map(Input::Answer).collect(),
-            ..Default::default()
-        }
-    }
-    fn stop_request() -> Self {
-        Self {
-            requests: [Input::Stop].into(),
-            ..Default::default()
-        }
-    }
-    fn stop_accepted() -> Self {
-        Self {
-            stop_when_accepted: true,
-            ..Default::default()
-        }
-    }
 }
 fn replay(
     name: &str,
@@ -55,26 +26,7 @@ fn replay(
     resume: bool,
     inputs: Inputs,
 ) -> Vec<ProviderEvent> {
-    harness::replay(
-        ProviderKind::Codex,
-        name,
-        mode,
-        root,
-        resume,
-        harness::Inputs {
-            stop_when_accepted: inputs.stop_when_accepted,
-            requests: inputs
-                .requests
-                .into_iter()
-                .map(|i| match i {
-                    Input::Answer(d) => harness::Input::Answer(d),
-                    Input::Stop => harness::Input::Stop,
-                })
-                .collect(),
-            multi: false,
-        },
-    )
-    .0
+    harness::replay(ProviderKind::Codex, name, mode, root, resume, inputs).0
 }
 fn standard(name: &str, inputs: Inputs) -> Vec<ProviderEvent> {
     replay(name, PermissionMode::AskFirst, false, false, inputs)
@@ -1141,4 +1093,12 @@ fn codex_subagent_live_shows_one_started_and_finished_activity() {
     );
     assert_eq!(events.iter().filter(|event| matches!(event, ProviderEvent::Turn { event: TurnEvent::ToolFinished { key, ok: true, .. }, .. } if key == &starts[0])).count(), 1);
     assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
+}
+#[test]
+fn codex_foreign_permission_docks_in_veyra_turn() {
+    harness::foreign_request(
+        ProviderKind::Codex,
+        "foreign-permission-dock",
+        Decision::AllowOnce,
+    );
 }

@@ -424,7 +424,7 @@ fn respond(
                         c.grants.push((thread, key.clone()));
                     }
                 }
-                Some(AcceptedDecision::Deny) => {}
+                Some(AcceptedDecision::Deny { .. }) => {}
                 Some(AcceptedDecision::Answers { questions, answers }) => {
                     add_item(
                         p,

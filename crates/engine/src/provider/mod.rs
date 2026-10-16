@@ -244,9 +244,6 @@ impl Probe {
     }
 }
 impl ProviderKind {
-    pub fn is_built(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex | Self::Grok)
-    }
     pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
     pub fn binary(self) -> &'static str {
         match self {

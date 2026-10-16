@@ -883,7 +883,7 @@ impl Codec {
         let request = self.requests.get(&native.0)?;
         let response = match request.kind.accepts(&decision)? {
             AcceptedDecision::Allow { .. } => json!({"behavior":"allow"}),
-            AcceptedDecision::Deny => json!({"behavior":"deny", "message":"Denied by you"}),
+            AcceptedDecision::Deny { .. } => json!({"behavior":"deny", "message":"Denied by you"}),
             AcceptedDecision::Answers { questions, answers } => {
                 let mut input = request.input.clone();
                 input.insert(

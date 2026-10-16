@@ -92,6 +92,13 @@ mod capture {
         path::Path,
     };
 
+    fn credential_name(name: &str) -> bool {
+        let name = name.to_lowercase();
+        ["token", "key", "secret", "password", "auth"]
+            .iter()
+            .any(|part| name.contains(part))
+    }
+
     #[derive(Default, Deserialize)]
     enum EnvelopeKind {
         #[serde(rename = "system")]
@@ -276,19 +283,13 @@ mod capture {
             if key == Some("account") {
                 return mask_account(value);
             }
-            if key.is_some_and(|key| {
-                ["token", "key", "secret", "password", "auth"]
-                    .iter()
-                    .any(|needle| key.to_lowercase().contains(needle))
-            }) {
+            if key.is_some_and(credential_name) {
                 return Value::String("<any>".into());
             }
             if let Value::Object(pair) = &value
                 && let Some(name) = pair.get("name").and_then(Value::as_str)
                 && pair.contains_key("value")
-                && ["token", "key", "secret", "password", "auth"]
-                    .iter()
-                    .any(|part| name.to_lowercase().contains(part))
+                && credential_name(name)
             {
                 let mut pair = pair.clone();
                 pair.insert(

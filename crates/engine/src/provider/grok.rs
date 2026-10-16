@@ -74,8 +74,24 @@ enum Call {
     Open,
     Prompt(String),
 }
+enum PromptOrigin {
+    Veyra(TurnId),
+    Foreign,
+}
+enum PromptWork {
+    Veyra { id: String, turn: TurnId },
+    Provider { turn: TurnId },
+}
+impl PromptWork {
+    fn owner(&self) -> ActiveTurn {
+        match self {
+            Self::Veyra { turn, .. } => ActiveTurn::Veyra(*turn),
+            Self::Provider { turn } => ActiveTurn::Provider(*turn),
+        }
+    }
+}
 struct Prompt {
-    owner: ActiveTurn,
+    origin: PromptOrigin,
     accepted: bool,
     first_frame: Option<Instant>,
 }
@@ -94,7 +110,7 @@ struct Request {
     id: Value,
     kind: RequestKind,
     reply: PermissionReply,
-    prompt: String,
+    owner: ActiveTurn,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -129,9 +145,76 @@ struct Tool {
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-struct QuestionParams {
+struct QuestionPayload {
     session_id: String,
     questions: Vec<WireQuestion>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct QuestionParams {
+    params: QuestionPayload,
+    #[serde(rename = "_meta")]
+    meta: Meta,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PromptScope {
+    session_id: String,
+    prompt_id: Option<String>,
+    #[serde(rename = "_meta")]
+    meta: Meta,
+}
+impl PromptScope {
+    fn prompt_id(&self) -> Option<&str> {
+        self.meta.prompt_id.as_deref().or(self.prompt_id.as_deref())
+    }
+}
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct TaggedFrame {
+    params: PromptScope,
+    result: PromptScope,
+    #[serde(flatten)]
+    scope: PromptScope,
+}
+impl TaggedFrame {
+    fn prompt_id(&self) -> Option<&str> {
+        self.params
+            .prompt_id()
+            .or(self.scope.prompt_id())
+            .or(self.result.prompt_id())
+    }
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct OpenReply {
+    session_id: Option<String>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct TaskUpdate {
+    task_id: String,
+}
+#[derive(Deserialize)]
+struct UpdateHeader {
+    #[serde(rename = "sessionUpdate")]
+    kind: UpdateKind,
+}
+#[derive(Deserialize)]
+struct PlanUpdate {
+    entries: Vec<PlanEntry>,
+}
+#[derive(Deserialize)]
+struct PlanEntry {
+    content: String,
+    #[serde(default)]
+    status: ToolStatus,
+}
+enum Update {
+    Message(Content),
+    Thought(Content),
+    Tool(Tool),
+    Plan(PlanUpdate),
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -253,7 +336,7 @@ enum SessionState {
     },
     Ready {
         native: NativeSessionId,
-        active: Option<String>,
+        active: Option<PromptWork>,
     },
 }
 
@@ -308,21 +391,24 @@ impl Codec {
     pub(crate) fn initialize(&mut self) -> Value {
         self.peer.send(Call::Initialize, "initialize", initialize())
     }
-    fn active_id(&self) -> Option<&str> {
+    fn work(&self) -> Option<&PromptWork> {
         match &self.state {
-            SessionState::Ready { active, .. } => active.as_deref(),
+            SessionState::Ready { active, .. } => active.as_ref(),
             _ => None,
         }
     }
-    fn set_active(&mut self, id: Option<String>) {
+    fn set_work(&mut self, work: Option<PromptWork>) {
         if let SessionState::Ready { active, .. } = &mut self.state {
-            *active = id;
+            *active = work;
         }
     }
     pub(crate) fn active(&self) -> Option<ActiveTurn> {
-        self.active_id()
-            .and_then(|id| self.prompts.get(id))
-            .map(|p| p.owner)
+        self.work().map(PromptWork::owner)
+    }
+    fn begin_provider(&mut self) -> TurnId {
+        let turn = TurnId::new();
+        self.set_work(Some(PromptWork::Provider { turn }));
+        turn
     }
     fn open(
         &mut self,
@@ -351,10 +437,7 @@ impl Codec {
         target: OpenTarget,
         retry: AuthenticationRetry,
     ) -> Result<Value, ProviderError> {
-        let method = self
-            .auth
-            .as_ref()
-            .ok_or_else(|| ProviderError::Protocol("Sign in with `grok login`".into()))?;
+        let method = self.auth.as_ref().ok_or_else(signed_out)?;
         self.state = SessionState::Authenticating { target, retry };
         Ok(self.peer.send(
             Call::Authenticate,
@@ -371,12 +454,15 @@ impl Codec {
         self.prompts.insert(
             id.clone(),
             Prompt {
-                owner: ActiveTurn::Veyra(turn),
+                origin: PromptOrigin::Veyra(turn),
                 accepted: false,
                 first_frame: Some(Instant::now() + Duration::from_secs(60)),
             },
         );
-        self.set_active(Some(id.clone()));
+        self.set_work(Some(PromptWork::Veyra {
+            id: id.clone(),
+            turn,
+        }));
         self.interrupted = None;
         Some(Outbound::Prompt(self.peer.send(Call::Prompt(id.clone()),"session/prompt",
             json!({"sessionId":native.0,"prompt":[{"type":"text","text":text}],"_meta":{"promptId":id}}))))
@@ -388,30 +474,22 @@ impl Codec {
         });
     }
     fn prompt(&mut self, id: Option<&str>, decoded: &mut Decoded) -> Option<String> {
-        let id = id
-            .map(str::to_owned)
-            .or_else(|| self.active_id().map(str::to_owned))?;
+        let id = id.map(str::to_owned).or_else(|| match self.work() {
+            Some(PromptWork::Veyra { id, .. }) => Some(id.clone()),
+            _ => None,
+        })?;
         if self.ended.contains(&id) {
             return None;
         }
-        if !self.prompts.contains_key(&id) {
-            let owner = ActiveTurn::Provider(TurnId::new());
-            self.prompts.insert(
-                id.clone(),
-                Prompt {
-                    owner,
-                    accepted: true,
-                    first_frame: None,
-                },
-            );
-        }
-        if self.active_id().is_none() {
-            self.set_active(Some(id.clone()));
-            let owner = self.prompts[&id].owner;
-            if matches!(owner, ActiveTurn::Provider(_)) {
-                decoded.provider_turn = Some(owner.target());
-                Self::event(decoded, owner, TurnEvent::Started);
-            }
+        self.prompts.entry(id.clone()).or_insert(Prompt {
+            origin: PromptOrigin::Foreign,
+            accepted: true,
+            first_frame: None,
+        });
+        if self.work().is_none() {
+            let turn = self.begin_provider();
+            decoded.provider_turn = Some(turn);
+            Self::event(decoded, ActiveTurn::Provider(turn), TurnEvent::Started);
         }
         Some(id)
     }
@@ -419,27 +497,54 @@ impl Codec {
         let Some(prompt) = self.prompts.remove(id) else {
             return;
         };
-        if accepted && !prompt.accepted {
-            Self::event(decoded, prompt.owner, TurnEvent::Accepted);
-        }
-        let outcome = if self.active_id() == Some(id) {
-            self.end_outcome(outcome)
-        } else {
-            outcome
+        self.ended.insert(id.into());
+        let owner = match prompt.origin {
+            PromptOrigin::Veyra(turn) => {
+                if accepted && !prompt.accepted {
+                    Self::event(decoded, ActiveTurn::Veyra(turn), TurnEvent::Accepted);
+                }
+                ActiveTurn::Veyra(turn)
+            }
+            PromptOrigin::Foreign => {
+                if !self.prompts.is_empty()
+                    || !matches!(self.work(), Some(PromptWork::Provider { .. }))
+                {
+                    return;
+                }
+                self.active().unwrap()
+            }
         };
+        let requests: Vec<_> = self
+            .requests
+            .iter()
+            .filter(|(_, request)| request.owner.target() == owner.target())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in requests {
+            let request = self.requests.remove(&key).unwrap();
+            decoded
+                .replies
+                .push(self.peer.response(request.id, cancelled(&request.reply)));
+        }
         Self::event(
             decoded,
-            prompt.owner,
+            owner,
             TurnEvent::TurnEnded {
-                outcome,
+                outcome: self.end_outcome(outcome),
                 park: false,
             },
         );
-        self.ended.insert(id.into());
-        self.requests.retain(|_, r| r.prompt != id);
-        if self.active_id() == Some(id) {
-            self.set_active(None);
+        self.set_work(None);
+        if self.prompts.is_empty() {
             self.interrupted = None;
+        } else {
+            let turn = self.begin_provider();
+            decoded
+                .events
+                .push(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
+                    provider_turn: turn,
+                }));
+            Self::event(decoded, ActiveTurn::Provider(turn), TurnEvent::Started);
         }
     }
     pub(crate) fn value(&mut self, value: Value) -> Result<Decoded, ProviderError> {
@@ -447,22 +552,30 @@ impl Codec {
             prompt.first_frame = None;
         }
         let mut decoded = Decoded::default();
-        let prompt_id = [
-            "/params/_meta/promptId",
-            "/params/promptId",
-            "/_meta/promptId",
-            "/result/_meta/promptId",
-        ]
-        .into_iter()
-        .find_map(|path| value.pointer(path).and_then(Value::as_str));
-        if let Some(prompt) = prompt_id.and_then(|id| self.prompts.get_mut(id))
-            && matches!(prompt.owner, ActiveTurn::Veyra(_))
+        let tagged: Option<TaggedFrame> = serde_json::from_value(value.clone()).ok();
+        let frame = self.peer.receive(value);
+        if matches!(frame, Frame::Notification { .. })
+            && tagged.as_ref().is_some_and(|tagged| {
+                tagged.params.meta.is_replay
+                    || (!tagged.params.session_id.is_empty()
+                        && self
+                            .native()
+                            .is_none_or(|native| native.0 != tagged.params.session_id))
+            })
+        {
+            return Ok(decoded);
+        }
+        if let Some(prompt) = tagged
+            .as_ref()
+            .and_then(TaggedFrame::prompt_id)
+            .and_then(|id| self.prompts.get_mut(id))
+            && let PromptOrigin::Veyra(turn) = prompt.origin
             && !prompt.accepted
         {
             prompt.accepted = true;
-            Self::event(&mut decoded, prompt.owner, TurnEvent::Accepted);
+            Self::event(&mut decoded, ActiveTurn::Veyra(turn), TurnEvent::Accepted);
         }
-        match self.peer.receive(value) {
+        match frame {
             Frame::Reply {
                 tag: Call::Initialize,
                 result,
@@ -498,7 +611,7 @@ impl Codec {
                 tag: Call::Authenticate,
                 result,
             } => {
-                result.map_err(|_| ProviderError::Protocol("Sign in with `grok login`".into()))?;
+                result.map_err(|_| signed_out())?;
                 if let SessionState::Authenticating { target, retry } = &self.state {
                     decoded.controls.push(self.open(target.clone(), *retry)?);
                 }
@@ -516,10 +629,9 @@ impl Codec {
                 let retry = *retry;
                 match result {
                     Ok(result) => {
-                        let native = result["sessionId"]
-                            .as_str()
+                        let native = decode::<OpenReply>(result)?
+                            .session_id
                             .filter(|s| !s.is_empty())
-                            .map(str::to_owned)
                             .or_else(|| match &target {
                                 OpenTarget::Resume(n) | OpenTarget::Load(n) => Some(n.0.clone()),
                                 OpenTarget::New => None,
@@ -551,7 +663,7 @@ impl Codec {
                             }));
                     }
                     Err(error)
-                        if error.code == -32000
+                        if auth_required(&error)
                             && matches!(retry, AuthenticationRetry::Available) =>
                     {
                         if let Some(mcp) = &self.mcp {
@@ -570,8 +682,8 @@ impl Codec {
                         decoded.controls.push(self.open(OpenTarget::New, retry)?);
                     }
                     Err(error) => {
-                        return Err(if error.code == -32000 {
-                            ProviderError::Protocol("Sign in with `grok login`".into())
+                        return Err(if auth_required(&error) {
+                            signed_out()
                         } else {
                             jsonrpc::failure(error)
                         });
@@ -594,7 +706,9 @@ impl Codec {
                 self.finish(&id, outcome, accepted, &mut decoded);
             }
             Frame::Notification { method, params } => {
-                self.notification(&method, params, &mut decoded)?
+                if self.notification(&method, params, &mut decoded).is_err() {
+                    tracing::debug!(method, "Skipped malformed Grok notification");
+                }
             }
             Frame::Request { id, method, params } => {
                 let reply_id = id.clone();
@@ -608,10 +722,6 @@ impl Codec {
         }
         Ok(decoded)
     }
-    fn own_session(&self, params: &Value) -> bool {
-        self.native()
-            .is_some_and(|n| params["sessionId"].as_str() == Some(n.0.as_str()))
-    }
     fn notification(
         &mut self,
         method: &str,
@@ -623,21 +733,24 @@ impl Codec {
             tracing::debug!(method, "Unknown Grok notification");
             return Ok(());
         }
-        if !self.own_session(&params) {
+        let scope: PromptScope = decode(params.clone())?;
+        if self
+            .native()
+            .is_none_or(|native| native.0 != scope.session_id)
+            || scope.meta.is_replay
+        {
             return Ok(());
         }
         if matches!(
             notification,
             NotificationMethod::TaskBackgrounded | NotificationMethod::TaskCompleted
         ) {
-            if let Some(id) = params["update"]["task_id"]
-                .as_str()
-                .filter(|id| !id.is_empty())
-            {
+            let task: TaskUpdate = decode(params["update"].clone())?;
+            if !task.task_id.is_empty() {
                 if notification == NotificationMethod::TaskBackgrounded {
-                    self.tasks.insert(id.into());
+                    self.tasks.insert(task.task_id);
                 } else {
-                    self.tasks.remove(id);
+                    self.tasks.remove(&task.task_id);
                 }
                 decoded
                     .events
@@ -647,62 +760,63 @@ impl Codec {
             }
             return Ok(());
         }
-        let meta: Meta = decode(params.get("_meta").cloned().unwrap_or(json!({})))?;
-        if meta.is_replay {
-            return Ok(());
-        }
         if notification == NotificationMethod::PromptComplete {
-            let id = params["promptId"]
-                .as_str()
-                .or(meta.prompt_id.as_deref())
+            let completion: Completion = decode(params)?;
+            let id = scope
+                .prompt_id()
                 .map(str::to_owned)
-                .or_else(|| self.active_id().map(str::to_owned));
+                .or_else(|| match self.work() {
+                    Some(PromptWork::Veyra { id, .. }) => Some(id.clone()),
+                    _ => None,
+                });
             if let Some(id) = id {
-                self.finish(&id, outcome(&params), true, decoded);
+                self.finish(&id, completion.outcome(), true, decoded);
             }
             return Ok(());
         }
-        let update = &params["update"];
-        let kind: UpdateKind = decode(update["sessionUpdate"].clone())?;
-        if kind == UpdateKind::Unknown {
-            tracing::debug!(
-                kind = update["sessionUpdate"].as_str().unwrap_or_default(),
-                "Unknown Grok session update"
-            );
-            return Ok(());
-        }
-        let Some(id) = self.prompt(meta.prompt_id.as_deref(), decoded) else {
+        let update = params["update"].clone();
+        let header: UpdateHeader = decode(update.clone())?;
+        let update = match header.kind {
+            UpdateKind::AgentMessageChunk => Update::Message(decode(update["content"].clone())?),
+            UpdateKind::AgentThoughtChunk => Update::Thought(decode(update["content"].clone())?),
+            UpdateKind::ToolCall | UpdateKind::ToolCallUpdate => Update::Tool(decode(update)?),
+            UpdateKind::Plan => Update::Plan(decode(update)?),
+            UpdateKind::Unknown => {
+                tracing::debug!(
+                    kind = update["sessionUpdate"].as_str().unwrap_or_default(),
+                    "Unknown Grok session update"
+                );
+                return Ok(());
+            }
+        };
+        let Some(id) = self.prompt(scope.prompt_id(), decoded) else {
             return Ok(());
         };
-        let owner = self.prompts[&id].owner;
+        let owner = self.active().unwrap();
         let key = |suffix: &str| NativeItemKey(format!("{id}/{suffix}"));
-        match kind {
-            UpdateKind::AgentMessageChunk | UpdateKind::AgentThoughtChunk => {
-                if let Ok(Content::Text { text }) = decode(update["content"].clone()) {
-                    Self::event(
-                        decoded,
-                        owner,
-                        if kind == UpdateKind::AgentMessageChunk {
-                            TurnEvent::TextDelta {
-                                key: key("reply"),
-                                text,
-                                streamed: true,
-                            }
-                        } else {
-                            TurnEvent::ReasoningDelta {
-                                key: key("thought"),
-                                text,
-                            }
-                        },
-                    );
-                }
-            }
-            UpdateKind::ToolCall | UpdateKind::ToolCallUpdate => {
-                let tool: Tool = decode(update.clone())?;
+        match update {
+            Update::Message(Content::Text { text }) => Self::event(
+                decoded,
+                owner,
+                TurnEvent::TextDelta {
+                    key: key("reply"),
+                    text,
+                    streamed: true,
+                },
+            ),
+            Update::Thought(Content::Text { text }) => Self::event(
+                decoded,
+                owner,
+                TurnEvent::ReasoningDelta {
+                    key: key("thought"),
+                    text,
+                },
+            ),
+            Update::Tool(tool) => {
                 if tool.tool_call_id.is_empty() {
                     return Ok(());
                 }
-                let tool_key = format!("{id}/tool/{}", tool.tool_call_id);
+                let tool_key = format!("{}/{id}/tool/{}", owner.target(), tool.tool_call_id);
                 let output = tool_output(&tool.raw_output, &tool.content);
                 let state = self.tools.entry(tool_key.clone()).or_insert_with(|| {
                     Self::event(
@@ -755,28 +869,20 @@ impl Codec {
                     );
                 }
             }
-            UpdateKind::Plan => {
-                if let Some(entries) = update["entries"].as_array() {
-                    Self::event(
-                        decoded,
-                        owner,
-                        TurnEvent::Plan(
-                            entries
-                                .iter()
-                                .filter_map(|entry| {
-                                    Some(PlanStep {
-                                        text: entry["content"].as_str()?.into(),
-                                        done: decode::<ToolStatus>(entry["status"].clone())
-                                            .unwrap_or_default()
-                                            == ToolStatus::Completed,
-                                    })
-                                })
-                                .collect(),
-                        ),
-                    );
-                }
-            }
-            _ => {}
+            Update::Plan(plan) => Self::event(
+                decoded,
+                owner,
+                TurnEvent::Plan(
+                    plan.entries
+                        .into_iter()
+                        .map(|entry| PlanStep {
+                            text: entry.content,
+                            done: entry.status == ToolStatus::Completed,
+                        })
+                        .collect(),
+                ),
+            ),
+            Update::Message(Content::Unknown) | Update::Thought(Content::Unknown) => {}
         }
         Ok(())
     }
@@ -862,7 +968,9 @@ impl Codec {
                 }
             }
             RequestMethod::Question => {
-                let question: QuestionParams = decode(params["params"].clone())?;
+                let question: QuestionParams = decode(params)?;
+                let meta = question.meta;
+                let question = question.params;
                 let valid = self.native().is_some_and(|n| n.0 == question.session_id)
                     && !question.questions.is_empty()
                     && question.questions.iter().all(|q| {
@@ -890,7 +998,7 @@ impl Codec {
                                 .collect(),
                         },
                         PermissionReply::Question,
-                        params["_meta"]["promptId"].as_str().map(str::to_owned),
+                        meta.prompt_id,
                     )
                 })
             }
@@ -907,13 +1015,13 @@ impl Codec {
                 .push(self.peer.error(id, -32602, "Invalid Grok request"));
             return Ok(());
         };
-        let Some(prompt) = self.prompt(prompt_id.as_deref(), decoded) else {
+        let Some(_) = self.prompt(prompt_id.as_deref(), decoded) else {
             decoded
                 .replies
                 .push(self.peer.error(id, -32600, "Request has no active prompt"));
             return Ok(());
         };
-        let owner = self.prompts[&prompt].owner;
+        let owner = self.active().unwrap();
         Self::event(
             decoded,
             owner,
@@ -928,7 +1036,7 @@ impl Codec {
                 id,
                 kind,
                 reply,
-                prompt,
+                owner,
             },
         );
         Ok(())
@@ -944,10 +1052,12 @@ impl Codec {
             (PermissionReply::Permission { allow, .. }, AcceptedDecision::Allow { .. }) => {
                 json!({"outcome":{"outcome":"selected","optionId":allow.as_ref()?}})
             }
-            (PermissionReply::Permission { reject, .. }, AcceptedDecision::Deny) => match reject {
-                Some(id) => json!({"outcome":{"outcome":"selected","optionId":id}}),
-                None => json!({"outcome":{"outcome":"cancelled"}}),
-            },
+            (PermissionReply::Permission { reject, .. }, AcceptedDecision::Deny { .. }) => {
+                match reject {
+                    Some(id) => json!({"outcome":{"outcome":"selected","optionId":id}}),
+                    None => json!({"outcome":{"outcome":"cancelled"}}),
+                }
+            }
             (PermissionReply::Question, AcceptedDecision::Answers { questions, answers }) => {
                 let answers: serde_json::Map<String, Value> = questions
                     .iter()
@@ -977,10 +1087,7 @@ impl Codec {
         self.interrupted = Some(super::StopLadder::new(reason));
         let mut lines = Vec::new();
         for (_, request) in std::mem::take(&mut self.requests) {
-            let result = match request.reply {
-                PermissionReply::Permission { .. } => json!({"outcome":{"outcome":"cancelled"}}),
-                PermissionReply::Question => json!({"outcome":"cancelled"}),
-            };
+            let result = cancelled(&request.reply);
             lines.push(Outbound::Message(self.peer.response(request.id, result)));
         }
         lines.push(Outbound::Interrupt {
@@ -1034,26 +1141,43 @@ fn auth_method(methods: &[AuthMethod], api_key: bool) -> Option<String> {
 }
 fn not_found(error: &jsonrpc::Error) -> bool {
     let text = error.message.to_lowercase();
-    error.code != -32000
+    !auth_required(error)
         && (text.contains("session not found") || text.contains("session does not exist"))
 }
 fn outcome(result: &Value) -> TurnOutcome {
     let completion: Completion = serde_json::from_value(result.clone()).unwrap_or_default();
-    match completion.stop_reason {
-        CompletionReason::Cancelled => TurnOutcome::Interrupted {
-            reason: "Grok cancelled the turn".into(),
-        },
-        CompletionReason::Error | CompletionReason::Refusal | CompletionReason::RateLimit => {
-            TurnOutcome::Failed {
-                message: completion
-                    .agent_result
-                    .as_str()
-                    .unwrap_or("Grok could not complete the turn")
-                    .into(),
+    completion.outcome()
+}
+impl Completion {
+    fn outcome(self) -> TurnOutcome {
+        match self.stop_reason {
+            CompletionReason::Cancelled => TurnOutcome::Interrupted {
+                reason: "Grok cancelled the turn".into(),
+            },
+            CompletionReason::Error | CompletionReason::Refusal | CompletionReason::RateLimit => {
+                TurnOutcome::Failed {
+                    message: self
+                        .agent_result
+                        .as_str()
+                        .unwrap_or("Grok could not complete the turn")
+                        .into(),
+                }
             }
+            CompletionReason::EndTurn | CompletionReason::Unknown => TurnOutcome::Completed,
         }
-        CompletionReason::EndTurn | CompletionReason::Unknown => TurnOutcome::Completed,
     }
+}
+fn cancelled(reply: &PermissionReply) -> Value {
+    match reply {
+        PermissionReply::Permission { .. } => json!({"outcome":{"outcome":"cancelled"}}),
+        PermissionReply::Question => json!({"outcome":"cancelled"}),
+    }
+}
+fn auth_required(error: &jsonrpc::Error) -> bool {
+    error.code == -32000
+}
+fn signed_out() -> ProviderError {
+    ProviderError::Protocol("Sign in with `grok login`".into())
 }
 fn tool_output(raw: &Value, content: &[Value]) -> Option<String> {
     let text = if let Some(text) = raw.as_str() {
