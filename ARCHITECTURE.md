@@ -9,7 +9,7 @@ The gpui `Shell` owns window state and a read-only event projection, not another
 The engine never depends on gpui.
 
 Claude, Codex and Grok engine sessions, readiness probes, replay fixtures and debug recording are implemented.
-Grok readiness reads its version and offers no model or effort catalog; its sign-in signal remains unknown.
+Grok readiness reads initialize for its bare version, sign-in signal and per-model effort catalog, with Default-only menus when no catalog is advertised.
 Claude, Codex and Grok server approvals and questions reach the same window dock, whose actions send typed decisions through the engine.
 Codex async agent-message questions instead become persistent transcript cards whose option actions send ordinary user messages.
 Human decisions and exact thread grants are persisted before their provider controls run.
@@ -412,6 +412,7 @@ SessionControls drains pending controls and closes its receiver on Shutdown or t
 One drain_and_check_launch gates both initial launch and resume fallback, refusing closing, pending or consumed Shutdown, a closed control channel or a gone event consumer.
 Before admitting StartTurn, SessionControls reads the gate's closing state and drains queued controls, so a pending Shutdown or channel closure prevents the prompt without changing cancel-reply or cleanup order.
 Shutdown gives queued replies up to one second to drain, then aborts an unfinished writer before group cleanup.
+An exit after requested Shutdown or parking is not a crash for any provider, including an idle provider that needs a group signal after stdin closes.
 Blocked or failed stdin can prevent delivery; cleanup and leader reaping precede Exited.
 Dropping a live group guard immediately kills its owned group and schedules cleanup.
 A group still present after the final cleanup deadline produces a bounded warning with its id.
@@ -576,7 +577,9 @@ PromptWork is either one Veyra prompt with its turn id or one Provider turn that
 --no-leader keeps the agent in the spawned process; without it, leader-enabled configuration can attach agent stdio to a shared leader over ~/.grok/leader.sock outside Veyra's group, which cleanup could not stop.
 This flag's effect comes from Grok help and research and has not been observed on an installed Grok by these tests.
 --no-auto-update avoids an update check before the first frame.
-Ask first and Accept edits select default or acceptEdits before agent; Full access uses agent --always-approve without --permission-mode.
+Ask first and Accept edits select default before agent; Full access uses agent --always-approve without --permission-mode.
+Grok follows the user's Claude and Grok permission settings, so Ask first asks only when they do not already allow the action.
+Veyra adds no client hook gate and only answers permission requests Grok sends.
 Model and effort are optional launch flags after agent, and Configure uses the existing respawn path.
 No model or effort values are invented when no catalog has been read.
 Initialize requests protocolVersion 1, disables filesystem and terminal client capabilities and declares _meta.clientType extension.
@@ -592,7 +595,8 @@ Only a recognized session-not-found error falls back to session/new with a notic
 
 Each session/prompt carries its Veyra turn id in _meta.promptId.
 The first frame tagged with that id emits Accepted, or a matching completion emits it immediately before the end when no tagged frame arrived.
-The matching prompt_complete notification or prompt RPC reply settles the turn once, whichever arrives first.
+The matching prompt_complete notification or prompt RPC reply settles a Veyra-started turn once, whichever arrives first.
+A Grok-started prompt also ends on its own _x.ai/session_notification turn_completed update with prompt_id and stop_reason; that notification cannot settle a Veyra-started prompt.
 A prompt RPC error without acceptance fails without marking the prompt accepted.
 If no JSON line arrives within sixty seconds of building the prompt, Veyra's chosen bound, the session fails: the turn ends Failed with that message, the Grok group stops and the thread parks until the next send respawns it.
 Any parsed JSON frame clears that deadline, and there is no later silence timeout.
@@ -601,7 +605,7 @@ With no displayed work, the codec announces a Provider turn before emitting cont
 While a Veyra prompt runs, only foreign permission and question requests use its turn id, preserving the Veyra Stop target and the actor's persisted request dock.
 Foreign text, reasoning, tool and plan updates still track the foreign prompt but emit no content during Veyra work; each is logged at debug with only its method.
 Each prompt retains only the title and input of its dropped tool_call starts, keyed by native tool id, until the Provider turn emits ToolStarted or the prompt ends.
-The first subsequent tool frame uses the retained title and input when present, otherwise its own metadata, for ToolStarted; no dropped text, reasoning, plan or output is replayed.
+The first subsequent tool frame uses its nonempty title or the retained title, and the retained input when present, for ToolStarted; no dropped text, reasoning, plan or output is replayed.
 Once foreign work runs as a Provider turn, its subsequent content is emitted there.
 Task reports select the last assistant text item, so dropped content cannot replace a child's own reply.
 The human's answer uses the original native request id; if the displayed turn ends first, finish queues a native cancelled reply and the actor expires the request with that turn.
@@ -609,9 +613,12 @@ After the Veyra prompt ends, still-open foreign prompts immediately open one Pro
 That Provider row remains Running until every tracked foreign prompt has ended, so a second foreign prompt's completion cannot end the first prompt's row.
 After a stopped Veyra turn ends, unfinished foreign prompts still open a Provider row, and the session-wide cancellation ladder stays armed until that work ends or cleanup stops the group.
 A lone completion for an unknown prompt id is ignored.
-Both x.ai and _x.ai task_backgrounded and task_completed spellings update a set of update.task_id values.
+Both x.ai and _x.ai task_backgrounded and task_completed spellings update the background task set.
+Task updates prefer update.task_snapshot.task_id and fall back to update.task_id; the recorded backgrounding frames carry the root task_id.
 The actor's existing background-work flag prevents Configure, SwitchView, parking and early task settlement while that set is nonempty.
-Text, reasoning, tool rows and plans normalize to the existing engine events; tool output emits cumulative-output suffix deltas and the actor bounds their retained tail.
+Text, reasoning, tool rows and plans normalize to engine events; tool output emits cumulative-output suffix deltas and the actor bounds their retained tail.
+A nonempty changed tool title emits ToolTitleChanged before output or completion.
+The actor replaces the existing keyed ToolItem.call.name through ItemAdded, preserving its item id, sequence, input and output; it never creates a row for a title update.
 Permission option kinds, session-update kinds, tool status and completion reasons decode into enums with an Unknown fallback.
 Completion reasons also default on null, missing or other invalid values, so a matching completion still ends the prompt; only an undecodable completion scope is skipped.
 Plan entries decode individually with a default status, and an entry without string content is skipped without discarding the other entries.
@@ -621,7 +628,11 @@ Notifications for another sessionId are dropped, and permission or question requ
 Unsupported or malformed server requests receive JSON-RPC errors without approval.
 
 Permission requests select options by allow_once or reject_once kind and never select allow_always.
-A Bash request with only command, description and timeout fields may use the existing exact-command thread grant, which still replies allow_once.
+A request with rawInput.variant Bash and only variant, command, description, is_background and timeout keys may use the existing exact-command thread grant, which still replies allow_once.
+The grant uses the stable Bash tool key and CommandCwd::ProjectFolder; a Monitor variant or any other input shape gets no grant.
+In Accept edits, an edit-kind request with an allow_once option is answered with that option without opening a request or dock only when every target path resolves inside the project folder.
+Targets come from nonempty toolCall.locations, otherwise rawInput.file_path; relative paths resolve from the project folder, and existing ancestors resolve symlinks before checking containment.
+Empty, missing, unresolved and outside targets retain the ordinary dock, as do commands and edits in other modes.
 Other argument shapes offer no thread grant and show an unverified command cwd or a tool preview.
 ProposedAction::consent is Once with its optional thread grant, or DenyOnly with Grok's lasting-grant reason when no allow_once option exists.
 DenyOnly cannot carry a grant, and RequestKind::accepts owns allow decisions, exact thread grants and the Deny-only reason.
@@ -629,12 +640,15 @@ The window's request_consent derives enabled allows, reason and caption only fro
 RequestKind::accepts rejects both allow decisions for DenyOnly and preserves Deny, including after stored action round trips.
 Existing stored approvals without consent deserialize as Once, and RequestKind moves an older outer grant_key into that consent.
 An older DenyOnly action discards any outer grant_key when loaded.
+The Grok new-thread hint says the CLI loads the user's hooks and MCP servers and follows their Claude and Grok permission settings.
 The window can start Grok threads; without a catalog, each model and effort menu offers only Default, which clears the corresponding configuration value.
-A new Grok thread created through that picker keeps both values absent, so its launch line carries neither -m nor --reasoning-effort.
+With the no-catalog fallback, a new Grok picker thread keeps both values absent, so its launch line carries neither -m nor --reasoning-effort.
 Existing or tool-created threads can retain explicit values, which grok::args sends as launch flags.
 A DenyOnly dock shows its lasting-grant reason, disables Allow once and Allow in this thread, and leaves Deny enabled.
 Shell::respond checks RequestKind::accepts before sending, so disabled allow keys and explicit actions preserve the pending request and dock focus.
-Both ask_user_question extension spellings decode the nested question payload into RequestKind::Question and reply with accepted answers keyed by question text and arrays of selected labels.
+Both ask_user_question extension spellings decode flat sessionId, toolCallId, questions and mode params into RequestKind::Question under the running turn.
+Questions need no question id or prompt id, and multiSelect may be null.
+Replies are accepted outcomes with answers keyed by question text and arrays of selected labels; Stop replies with a cancelled outcome.
 Stop first sends cancelled outcomes for every open permission request and question, then session/cancel with _meta.cancelTrigger ctrl_c.
 The cancellation covers all open requests because the protocol cancels the whole session rather than one prompt.
 The shared writer, target checks, ladder, cleanup and actor drain keep that ordering and prevent a stale Stop from targeting a later turn.
@@ -645,7 +659,8 @@ Grok also revokes before its authentication retry and session-not-found fallback
 mcp::ThreadFrame retains McpToken until the writer serializes it and supplies only a token marker to recording.
 No token-bearing config file, CLI argument or root CLI environment entry is created.
 Grok starts a root's relay; the fake CLI starts it as a direct child inside the Grok group, so the group ladder or the relay's stdin EOF ends it.
-The installed Grok relay's parent and group are unmeasured, and the direct-parent check refuses an intermediate process.
+The live Grok 1.0.60 recording shows its relay is a direct child in its own process group.
+The ladder's signal to Grok's group does not reach that relay; the relay exits when Grok closes its stdin or dies, and the direct-parent check still refuses an intermediate process.
 The same executable, direct-parent, epoch, live-turn and single-use socket checks apply to Grok roots.
 Recorder redaction also masks credential values in ACP environment name/value arrays.
 
@@ -779,9 +794,14 @@ One five-second timeout covers the whole Codex probe exchange, including every m
 Its version comes from initialize.userAgent, model values from model/list, and effort levels from each model's supportedReasoningEfforts.
 An explicit null account with requiresOpenaiAuth true reads Signed out; otherwise an absent account remains unknown and Ready.
 A Codex probe failure other than NotInstalled follows the same unknown-and-Ready fallback as Claude.
-Grok resolves its binary and reads --no-auto-update --version under a four-second deadline, without starting an ACP session or a turn.
-Its sign-in reading remains unknown and Ready, and its probe returns no models or effort values.
-Debug fake Grok probes read only the hand-written probe-grok.jsonl header.
+Grok resolves its binary and starts the Ask first launch line with no model or effort flag in a fresh private empty probe directory.
+One four-second initialize exchange reads its bare _meta.agentVersion, authMethods and _meta.modelState without authenticate, session/new or a turn.
+An advertised cached_token, or xai.api_key with the captured XAI_API_KEY presence, reads Ready; otherwise it reads Signed out and the picker names grok login.
+The catalog uses availableModels ids and names and each model's _meta.reasoningEfforts, with the advertised current model and each advertised default effort ordered first.
+The picker offers only the selected model's efforts, and a Grok model change clears an unsupported effort.
+No modelState keeps the Default-only fallback; the probe does not run grok models.
+Completion, cancellation and timeout stop the probe group and remove its private directory, including Grok versions that stay alive after stdin closes.
+Debug fake probes execute the initialize exchange in probe-grok.jsonl rather than reading its header.
 The Shell holds raw probe account metadata in memory.
 Dump exposes only account presence as known or unknown, never its value.
 
@@ -805,23 +825,26 @@ Capture-derived fixtures come from Veyra's own CLI recordings; other cases are V
 The debug-only branches of `ChildEnv::load` are the only application read site for VEYRA_CLAUDE_BIN, VEYRA_CODEX_BIN, VEYRA_GROK_BIN, VEYRA_FAKE_FIXTURES, VEYRA_RECORD and VEYRA_REAP_PIDS.
 The provider overrides replace their matching Claude, Codex or Grok binary.
 Each Engine owns its recording sequence registry through its shared ChildEnv.
-New threads register in creation order; each thread's spawn E uses tN-sE.jsonl, with probe.jsonl for Claude probes and probe-codex.jsonl for Codex probes; Grok uses the header of probe-grok.jsonl.
+New threads register in creation order; each thread's spawn E uses tN-sE.jsonl, with probe.jsonl for Claude probes and probe-codex.jsonl for Codex probes; Grok probes replay probe-grok.jsonl.
 Stored threads register when first spawned in that run.
 Missing replay files fail spawn with their path; the child gets the absolute singular VEYRA_FAKE_FIXTURE only in debug builds.
 The standalone fake executable reads that singular variable.
 
-The debug Recorder creates private 0600 captures through platform::private_file.
+The debug Recorder creates private 0600 captures through platform::private_file, retrying a numbered free filename on a create_new collision without replacing another recording.
 It binds the supplied cwd, optional home folder and known ids.
 SessionIo sanitizes inbound and outbound recording values with its token hashes before calling Recorder::line, replacing any exact token with <id:token>.
 The same hashes sanitize provider inbound values and stderr before UI, storage or crash text receives them.
 The codecs hand the recorder typed native-id and version metadata decoded from their thread reply, system/init or session-open reply; recording protocol labels come from ProviderKind.
 ChildEnv reads HOME once and supplies it to the recorder; `<home>` is a capture placeholder, not a matcher binding.
-It replaces credential fields, redacts secret-shaped text, replaces hook output with a placeholder and keeps account keys with masked values.
+It replaces credential fields, redacts secret-shaped text, replaces hook output with a placeholder and keeps account and plan keys with masked values.
+Grok initialize agent and instance ids and hostname are masked, and availableCommands retains its shape with every value masked, including names.
+MCP servers_updated retains name, source and type while masking each server's URL, command, args, env and headers.
+Every recorded http(s) URL loses its path and query.
 Claude probes are recorded as probe.jsonl; a later probe replaces that capture only after the earlier probe has ended.
 Codex and Grok probes are not recorded; probe-codex.jsonl and probe-grok.jsonl are replay fixtures only.
 It records inbound/outbound wires and exit, updating Claude's header version from system/init.
 Codex captures use the json-rpc protocol label, bind returned native thread ids distinctly and update their version header from thread reply metadata.
-Grok captures use the json-rpc label and take native id and the initialized version from metadata emitted with the session-open reply.
+Grok captures use the json-rpc label, update their version from initialize agentInfo.version or the live _meta.agentVersion fallback, and bind the native id from the session-open reply.
 An authMethods array is exempt from the credential-name rule in captures, secret-shape checks and the crash redactor; credential-named fields inside it are still masked.
 Hash-redacted <id:token> bindings survive credential-field masking without retaining the credential.
 The shared crash redactor applies exact token, Bearer word, credential-name value, long sk-/xai- word and URL password matches in that order.
@@ -912,7 +935,7 @@ On New thread, OpenProviderPicker and its key open the provider menu through a c
 An open menu rebuilds its readiness labels when probing begins and when each reply arrives.
 Not-ready providers disable Send with their repair command.
 Codex and Grok use the same picker and composer, with model labels and effort choices read from their probes.
-Grok has no catalog, so each model and effort menu offers only Default; switching providers clears both selections.
+Grok uses its initialize catalog, with Default-only model and effort menus when modelState is absent; switching providers clears both selections.
 Codex's commands, file changes, permissions, MCP approvals, questions and retry/limit notices use the existing dock, question card and transcript rows.
 A Claude root's Codex child uses the same task card, breadcrumb and family projection.
 CreateThread sends the draft configuration; subsequent Send targets the selected thread.
@@ -1131,7 +1154,7 @@ Its macOS sandbox allows only the release Veyra executable and denies every chil
 Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.
 The multi-agent page covers family controls, stored task guidance, delivery, single-child archive holds, archive choices, quiet titles and the visible/open timing probes.
 The Codex sections of new-thread, chat-send-stream, approvals-questions and multi-agent cover CLI model/effort readiness, streamed text, approval and question docks, notices, foreign-thread filtering, the root relay and the Claude-root Codex child card.
-The Grok sections of new-thread, chat-send-stream, approvals-questions and multi-agent cover Default-only menus, streaming, session authentication failure, ordinary and Deny-only approvals, both question spellings and a root relay result.
+The Grok sections of new-thread, chat-send-stream, approvals-questions and multi-agent cover Default-only fallback, initialize sign-in and catalog, per-model efforts, streaming, a background report ending, session authentication failure, ordinary and Deny-only approvals, both flat question spellings and a root relay result.
 After Stop, the question leaves the dock and remains Expired in the request projection and SQLite; the turn shows Interrupted.
 The fake lane supplies explicit overrides and probe fixtures for all three providers.
 Permission-matrix records separately authorized live permission checks.
@@ -1152,6 +1175,9 @@ Codex live tests are ignored by default.
 Codex and Grok live wrappers call the same provider-parameterized test bodies in tests/common/live.rs, and their replay tests use the shared Inputs, Input and isolated session harness in tests/common/replay.rs.
 
 Grok replays cover prompt correlation, exactly-once completion, two turns per process, permissions, both question spellings, cancellation order, authentication retry, signed-out failure and advertised resume.
+The title replay checks one persisted tool row with an updated title and preserved output.
+Accept-edits regressions verify an in-project automatic answer, an outside dock and symlink-aware path boundaries; grant regressions reject Monitor and unknown keys.
+The ignored Grok approval round trip requests a printf redirect because bare touch is on Grok's safe list; Claude and Codex retain touch.
 The first-frame timeout replay advances Tokio time and does not wait sixty seconds on the wall clock.
 Actor-backed Grok replays verify persisted question answers and request expiry, and background work refusing Configure and SwitchView before a Provider continuation.
 Foreign-request actor tests check permission and question docks, persisted answers and expiry, native cancellation before session/cancel, later Send after foreign-work promotion, both Stop targets, promotion after a stopped Veyra turn and overlapping Provider prompts.
@@ -1164,5 +1190,8 @@ The foreign-tool replay preserves Bash and its input across promotion, fills par
 Malformed-notification replays keep the session alive through missing or numeric update kinds, a null tool title, a numeric prompt id and null metadata; codec tests check method-only diagnostics and prevent wrong-session or replay notifications from confirming admission.
 grok_root_reaches_real_relay runs in the ordinary application suite with the production veyra mcp executable and fake CLI without opening a window.
 A default credential-frame test asserts the Grok mcpServers entry, preserves unrelated config and requires only the token marker in its recording value.
-Grok fixtures name version 1.0.52 and source hand-written; installed Grok wires, sign-in signals, permission behavior and late-update ordering have not been verified by these tests.
+Grok fixtures name version 1.0.60 and use Veyra's masked live shapes for initialize, flat questions, task snapshots, Grok-started turn completion and resume.
+Replay tests do not prove installed Grok behavior; the retained live recording supplies those observed wire shapes.
+The live recording did not send permission requests.
+Decision 11 chose Follow my settings; replays cover the implemented approval and grant rules, while the installed live permission recheck remains unrun.
 Grok live tests are ignored by default.

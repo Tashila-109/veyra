@@ -127,6 +127,10 @@ pub enum TurnEvent {
         key: NativeItemKey,
         call: ToolCall,
     },
+    ToolTitleChanged {
+        key: NativeItemKey,
+        title: String,
+    },
     ToolFinished {
         key: NativeItemKey,
         ok: bool,
@@ -158,6 +162,7 @@ impl TurnEvent {
             | Self::RequestOpened { .. } => true,
             Self::Accepted
             | Self::ItemEnded { .. }
+            | Self::ToolTitleChanged { .. }
             | Self::ToolFinished { .. }
             | Self::ToolOutput { .. }
             | Self::TurnEnded { .. } => false,

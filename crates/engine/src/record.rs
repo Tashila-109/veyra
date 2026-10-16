@@ -83,6 +83,7 @@ pub(crate) struct Metadata {
 mod capture {
     use super::redact;
     use crate::{fixture::Record, platform};
+    use regex::Regex;
     use serde::Deserialize;
     use serde_json::Value;
     use std::{
@@ -90,7 +91,16 @@ mod capture {
         fs::{File, OpenOptions},
         io::{self, Read, Seek, SeekFrom, Write},
         path::Path,
+        sync::LazyLock,
     };
+    static ACCOUNT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+        r"(?i)^(account.*|.*_?account_?id|user_?id|user|team.*|org.*|plan(?:_?type|_?name)?|tier|subscription.*|email.*)$"
+    ).expect("account fields")
+    });
+    static URL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)(https?://)([^/\s\"'?#]+)([/?#][^\s\"']*)?"#).expect("URL path and query")
+    });
 
     fn credential_name(name: &str) -> bool {
         let name = name.to_lowercase();
@@ -166,10 +176,26 @@ mod capture {
             if let Some(parent) = path.parent() {
                 platform::private_dir(parent)?;
             }
-            let file = platform::private_file(
-                path,
-                OpenOptions::new().create_new(true).read(true).write(true),
-            )?;
+            let mut candidate = path.to_owned();
+            let mut suffix = 2;
+            let file = loop {
+                match platform::private_file(
+                    &candidate,
+                    OpenOptions::new().create_new(true).read(true).write(true),
+                ) {
+                    Ok(file) => break file,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                        let extension = path
+                            .extension()
+                            .map(|v| format!(".{}", v.to_string_lossy()))
+                            .unwrap_or_default();
+                        candidate = path.with_file_name(format!("{stem}-{suffix}{extension}"));
+                        suffix += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             let mut recorder = Self {
                 file,
                 bindings: BTreeMap::new(),
@@ -237,6 +263,21 @@ mod capture {
             Ok(())
         }
         pub fn line(&mut self, outbound: bool, mut value: Value) -> io::Result<()> {
+            if matches!(
+                value["method"].as_str(),
+                Some("_x.ai/mcp/servers_updated" | "x.ai/mcp/servers_updated")
+            ) && let Some(servers) = value["params"]["mcpServers"].as_array_mut()
+            {
+                for server in servers {
+                    if let Some(fields) = server.as_object_mut() {
+                        for key in ["url", "command", "args", "env", "headers"] {
+                            if let Some(value) = fields.get_mut(key) {
+                                *value = "<any>".into();
+                            }
+                        }
+                    }
+                }
+            }
             if Envelope::deserialize(&value).is_ok_and(|envelope| {
                 matches!(envelope.kind, EnvelopeKind::System)
                     && envelope.subtype.starts_with("hook_")
@@ -280,7 +321,16 @@ mod capture {
                         .collect(),
                 );
             }
-            if key == Some("account") {
+            if key.is_some_and(|key| {
+                ACCOUNT.is_match(key)
+                    || [
+                        "agentId",
+                        "agentInstanceId",
+                        "hostname",
+                        "availableCommands",
+                    ]
+                    .contains(&key)
+            }) {
                 return mask_account(value);
             }
             if key.is_some_and(credential_name) {
@@ -337,7 +387,24 @@ mod capture {
                     for (value, binding) in &self.bindings {
                         text = text.replace(value, binding);
                     }
-                    Value::String(redact(&text, None).replace("[redacted]", "<any>"))
+                    let text = redact(&text, None).replace("[redacted]", "<any>");
+                    Value::String(
+                        URL.replace_all(&text, |capture: &regex::Captures<'_>| {
+                            let authority = capture[2]
+                                .rsplit_once('@')
+                                .map_or(&capture[2], |(_, host)| host);
+                            format!(
+                                "{}{authority}{}",
+                                &capture[1],
+                                if capture.get(3).is_some() {
+                                    "/<path>"
+                                } else {
+                                    ""
+                                }
+                            )
+                        })
+                        .into_owned(),
+                    )
                 }
                 value => value,
             }

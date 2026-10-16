@@ -20,8 +20,8 @@ A missing Claude names `npm install -g @anthropic-ai/claude-code`; a signed-out 
 Check again reaches `veyra::RecheckProviders`.
 Codex reads readiness, models and efforts from its app-server probe.
 Codex uses its app-server account signal for the sign-in mark.
-Grok reads its version, keeps sign-in unknown and offers only Default in both menus while no catalog is available.
-Its picker sign-in mark waits for the separately authorized signed-out recording.
+Grok reads initialize once for its bare version, cached-token or API-key sign-in signal, and per-model effort catalog.
+Without modelState it offers only Default in both menus; Signed out names `grok login` and disables Send.
 Type in the textarea, then Send, Enter or ⌘↵ to create a thread.
 Shift+Enter inserts a newline.
 This page stops before Send so its readiness proofs must leave zero threads.
@@ -180,8 +180,8 @@ PYCODEX
 ### Grok
 
 Run this fake-only section after Codex, while the database still holds zero threads.
-Grok has no recorded sign-in signal, so Ready with unknown account is intentional.
-Its empty catalog offers one Default entry in each model and effort menu; both selections remain null.
+The catalog-free signed-in probe offers one Default entry in each model and effort menu.
+The signed-out fixture advertises only grok.com; the catalog fixture supplies the recorded model and effort lists.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -197,7 +197,7 @@ action('grok-new-thread-open','NewThread')
 action('grok-new-thread-provider','PickProvider',{'provider':'grok'})
 ready = poll('grok-new-thread-ready',lambda d:d['providers'][2]['readiness']=='ready')
 assert ready['composer']['send_enabled']
-assert ready['providers'][2]['version']=='1.0.52'
+assert ready['providers'][2]['version']=='1.0.60'
 assert ready['providers'][2]['models']==[] and ready['providers'][2]['account']=='unknown'
 action('grok-provider-menu','OpenProviderPicker')
 menu = poll('grok-provider-menu-ready',lambda d:d['composer']['provider_picker_open'])
@@ -211,17 +211,48 @@ defaults = ctl('grok-new-thread-defaults','dump')
 assert defaults['composer']['model'] is None and defaults['composer']['effort'] is None
 assert sql('select count(*) from threads')=='0'
 capture('grok-new-thread')
+shutil.copy2(GROK_SOURCE/'signed-out.jsonl',FIXTURES/'probe-grok.jsonl')
+action('grok-signed-out-recheck','RecheckProviders')
+signed_out = poll('grok-new-thread-signed-out',lambda d:d['providers'][2]['readiness']=='signed_out')
+assert not signed_out['composer']['send_enabled']
+assert 'grok login' in signed_out['composer']['disabled_reason']
+action('grok-signed-out-menu','OpenProviderPicker')
+menu = poll('grok-provider-menu-signed-out',lambda d:d['composer']['provider_picker_open'])
+assert menu['composer']['provider_picker_labels'][2]=='Grok · Signed out'
+capture('grok-provider-menu-signed-out')
+action('grok-signed-out-menu-close','PickProvider',{'provider':'grok'})
+capture('grok-new-thread-signed-out')
+shutil.copy2(GROK_SOURCE/'probe-catalog.jsonl',FIXTURES/'probe-grok.jsonl')
+action('grok-catalog-recheck','RecheckProviders')
+catalog = poll('grok-new-thread-catalog-ready',lambda d:d['providers'][2]['readiness']=='ready' and len(d['providers'][2]['models'])==4)
+models = catalog['providers'][2]['models']
+assert models[0]['value']=='grok-4.7'
+assert next(m for m in models if m['value']=='grok-4.5')['supportedEffortLevels']==['high','medium','low']
+action('grok-catalog-model-wide','PickModel',{'model':'grok-4.7'})
+action('grok-catalog-xhigh','PickEffort',{'effort':'xhigh'})
+action('grok-catalog-model-narrow','PickModel',{'model':'grok-4.5'})
+assert ctl('grok-catalog-effort-reset','dump')['composer']['effort'] is None
+for effort in ['high','medium','low','high']:
+    ctl('grok-catalog-effort-'+effort,'keys','secondary-alt-e')
+    assert ctl('grok-catalog-effort-after-'+effort,'dump')['composer']['effort']==effort
+capture('grok-new-thread-catalog')
+assert sql('select count(*) from threads')=='0'
+shutil.copy2(GROK_SOURCE/'probe-grok.jsonl',FIXTURES/'probe-grok.jsonl')
+action('grok-default-probe-restore','RecheckProviders')
+poll('grok-default-probe-restored',lambda d:d['providers'][2]['readiness']=='ready' and d['providers'][2]['models']==[])
 action('grok-new-thread-return-claude','PickProvider',{'provider':'claude'})
 action('grok-new-thread-reset','NewThread')
 page_done('new-thread-grok')
-print('PASS Grok Ready with unknown account; empty catalog and Default-only choices; no thread')
+print('PASS Grok initialize readiness, Signed out mark, per-model catalog/defaults and Default-only fallback; no thread')
 PYGROK
 ```
 
 ## Observable success
 
-The Grok section preserves `providers[2].readiness`, `version`, empty `models` and unknown `account`, with null `composer.model` and `composer.effort`.
-`grok-provider-menu-ready.png` shows Grok Ready and `grok-new-thread.png` shows its default chips without creating a thread.
+The Grok section preserves Ready and Signed out probes, bare version 1.0.60, advertised model names and each model's effort list, plus the catalog-free Default fallback.
+`grok-provider-menu-signed-out.png` shows the sign-in mark and `grok-new-thread-signed-out.png` shows Send disabled with `grok login`.
+`grok-new-thread-catalog.png` shows Grok 4.5 with high effort; changing from Grok 4.7 clears xhigh, and the effort key cycles only high, medium and low.
+Every Grok readiness and catalog step leaves zero threads.
 
 The Codex section preserves missing and Ready `providers[1].readiness`, `version` and `models`, the picker label, `composer.model` and `composer.effort`.
 Its SQLite thread count remains zero, and its PNGs show the disabled reason and selected CLI choices.
@@ -241,7 +272,7 @@ Inspect the provider-menu PNG for that text before accepting the page.
 ## Gotchas
 
 A missing account is unknown, not proof of sign-out.
-Do not invent a signed-out fixture before a live signal is recorded.
+Grok's signed-out fixture uses the recorded absence of cached_token, while its catalog fixture keeps the recorded modelState values masked.
 Check again may briefly show Checking; the helper polls that state at the same 50 ms cadence as ctl wait.
 The checks do not run a Claude turn or mutate any committed fixture.
 The native folder picker and external keyboard delivery are manual entry points.

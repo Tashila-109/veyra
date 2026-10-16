@@ -771,6 +771,7 @@ async fn run_one(
     let mut consumer_gone = false;
     let mut writer_done = false;
     let mut stdout_closed = false;
+    let mut shutdown_requested = false;
     while failure.is_none() {
         tokio::select! {
             biased;
@@ -794,6 +795,7 @@ async fn run_one(
                     }
                 }
                 Some(SessionControl::Shutdown) | None => {
+                    shutdown_requested = true;
                     let lines = codec.interrupt_active(StopReason::AppClosing);
                     for line in lines {
                         if let Err(error) = process.send(&writer, line) {
@@ -1004,7 +1006,9 @@ async fn run_one(
     if missing {
         return Completion::MissingSession;
     }
-    let crash = if crash.is_none()
+    let crash = if shutdown_requested {
+        None
+    } else if crash.is_none()
         && codec.active().is_none()
         && (!ready || status.is_some_and(|status| !status.success()))
     {
@@ -1412,30 +1416,47 @@ pub async fn probe_grok(
         .map(|root| root.join("probe-grok.jsonl"));
     #[cfg(not(debug_assertions))]
     let fixture: Option<std::path::PathBuf> = None;
-    let version = probe_version(
-        env,
-        &binary,
-        cwd,
-        VersionRules {
-            args: &["--no-auto-update", "--version"],
-            timeout: Some(Duration::from_secs(4)),
-            empty_on_eof: false,
-            error: "Grok version probe did not return a bounded line",
-        },
-        fixture.as_deref(),
-        &mut cancelled,
-    )
-    .await?
-    .trim()
-    .to_owned();
-    Ok(super::Probe {
-        provider: ProviderKind::Grok,
-        path: Some(binary),
-        version: (!version.is_empty()).then_some(version),
-        readiness: super::Readiness::Ready,
-        models: vec![],
-        account: None,
-    })
+    check_cancelled(&mut cancelled)?;
+    let scratch = ProbeDirectory(cwd.join(format!("grok-probe-{}", ThreadId::new())));
+    platform::private_dir(&scratch.0)?;
+    let args = grok::args(&ThreadConfig {
+        mode: PermissionMode::AskFirst,
+        model: None,
+        effort: None,
+    });
+    let mut child = env.spawn(&binary, &args, &scratch.0, fixture.as_deref())?;
+    let mut reader = jsonrpc::Reader::start(child.stdout().expect("piped stdout"));
+    let stderr = discard_stderr(&mut child);
+    let (writer, input) = mpsc::unbounded_channel();
+    let write_task = tokio::spawn(write(
+        child.stdin().expect("piped stdin"),
+        input,
+        Default::default(),
+        env.closing.clone(),
+        #[cfg(test)]
+        Default::default(),
+    ));
+    let result = tokio::select! {
+        _ = &mut cancelled => Err(ProviderError::Cancelled),
+        result = tokio::time::timeout(Duration::from_secs(4), grok::probe_exchange(&mut reader, &writer, binary, env.xai_api_key_set)) => {
+            result.unwrap_or_else(|_|Err(ProviderError::Protocol("Grok probe timed out".into())))
+        }
+    };
+    drop(writer);
+    write_task.abort();
+    let _ = write_task.await;
+    let stopped = child.stop().await;
+    stderr.abort();
+    let _ = stderr.await;
+    stopped?;
+    result
+}
+
+struct ProbeDirectory(std::path::PathBuf);
+impl Drop for ProbeDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 pub async fn probe_codex(

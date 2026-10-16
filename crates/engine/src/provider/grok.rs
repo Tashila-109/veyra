@@ -16,14 +16,9 @@ use tokio::time::Instant;
 pub fn args(config: &ThreadConfig) -> Vec<String> {
     let mut args = vec!["--no-auto-update".into()];
     match config.mode {
-        PermissionMode::AskFirst => {
+        PermissionMode::AskFirst | PermissionMode::AcceptEdits => {
             args.extend(["--permission-mode".into(), "default".into(), "agent".into()])
         }
-        PermissionMode::AcceptEdits => args.extend([
-            "--permission-mode".into(),
-            "acceptEdits".into(),
-            "agent".into(),
-        ]),
         PermissionMode::FullAccess => args.extend(["agent".into(), "--always-approve".into()]),
     }
     if let Some(model) = &config.model {
@@ -46,6 +41,50 @@ struct Initialization {
     auth_methods: Vec<AuthMethod>,
     agent_capabilities: Capabilities,
     agent_info: AgentInfo,
+    #[serde(rename = "_meta")]
+    meta: InitializationMeta,
+}
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct InitializationMeta {
+    agent_version: Option<String>,
+    model_state: Option<ModelState>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct ModelState {
+    current_model_id: String,
+    available_models: Vec<AvailableModel>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct AvailableModel {
+    model_id: String,
+    name: String,
+    #[serde(rename = "_meta")]
+    meta: ModelMeta,
+}
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct ModelMeta {
+    reasoning_efforts: Vec<ReasoningEffort>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ReasoningEffort {
+    id: String,
+    value: String,
+    default: bool,
+}
+impl Initialization {
+    fn version(&self) -> Option<String> {
+        self.agent_info
+            .version
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .or(self.meta.agent_version.as_ref().filter(|v| !v.is_empty()))
+            .cloned()
+    }
 }
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -103,9 +142,10 @@ enum PermissionReply {
     },
     Question,
 }
-enum ToolState {
-    Running(String),
-    Ended,
+struct ToolState {
+    title: String,
+    output: String,
+    ended: bool,
 }
 struct Request {
     id: Value,
@@ -143,17 +183,20 @@ struct Tool {
     raw_input: Value,
     raw_output: Value,
     content: Vec<Value>,
-}
-#[derive(Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct QuestionPayload {
-    session_id: String,
-    questions: Vec<WireQuestion>,
+    kind: String,
+    locations: Vec<ToolLocation>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default)]
+struct ToolLocation {
+    path: String,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct QuestionParams {
-    params: QuestionPayload,
+    session_id: String,
+    tool_call_id: String,
+    questions: Vec<WireQuestion>,
     #[serde(rename = "_meta")]
     meta: Meta,
 }
@@ -195,6 +238,20 @@ struct OpenReply {
 #[serde(default)]
 struct TaskUpdate {
     task_id: String,
+    task_snapshot: Option<TaskSnapshot>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct TaskSnapshot {
+    task_id: String,
+}
+#[derive(Deserialize)]
+struct TurnCompleted {
+    #[serde(rename = "sessionUpdate")]
+    update: String,
+    prompt_id: String,
+    #[serde(flatten)]
+    completion: Completion,
 }
 #[derive(Deserialize)]
 struct UpdateHeader {
@@ -214,7 +271,7 @@ struct PlanEntry {
 enum Update {
     Message(Content),
     Thought(Content),
-    Tool(Tool),
+    Tool(Box<Tool>),
     Plan(PlanUpdate),
 }
 #[derive(Default, Deserialize)]
@@ -242,6 +299,11 @@ enum NotificationMethod {
         alias = "_x.ai/session/prompt_complete"
     )]
     PromptComplete,
+    #[serde(
+        rename = "_x.ai/session_notification",
+        alias = "x.ai/session_notification"
+    )]
+    SessionNotification,
     #[serde(other)]
     Unknown,
 }
@@ -311,8 +373,9 @@ enum CompletionReason {
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Completion {
-    #[serde(deserialize_with = "default_on_invalid")]
+    #[serde(alias = "stop_reason", deserialize_with = "default_on_invalid")]
     stop_reason: CompletionReason,
+    #[serde(alias = "agent_result")]
     agent_result: Value,
 }
 #[derive(Clone)]
@@ -585,7 +648,14 @@ impl Codec {
                 result,
             } => {
                 let init: Initialization = decode(result.map_err(jsonrpc::failure)?)?;
-                self.version = init.agent_info.version.filter(|s| !s.is_empty());
+                self.version = init.version();
+                #[cfg(debug_assertions)]
+                {
+                    decoded.recording = Some(crate::record::Metadata {
+                        native: None,
+                        version: self.version.clone(),
+                    });
+                }
                 let target = match &self.spec.native {
                     None => OpenTarget::New,
                     Some(native)
@@ -750,17 +820,39 @@ impl Codec {
             NotificationMethod::TaskBackgrounded | NotificationMethod::TaskCompleted
         ) {
             let task: TaskUpdate = decode(params["update"].clone())?;
-            if !task.task_id.is_empty() {
+            let task_id = task
+                .task_snapshot
+                .map(|snapshot| snapshot.task_id)
+                .filter(|id| !id.is_empty())
+                .unwrap_or(task.task_id);
+            if !task_id.is_empty() {
                 if notification == NotificationMethod::TaskBackgrounded {
-                    self.tasks.insert(task.task_id);
+                    self.tasks.insert(task_id);
                 } else {
-                    self.tasks.remove(&task.task_id);
+                    self.tasks.remove(&task_id);
                 }
                 decoded
                     .events
                     .push(ProviderEvent::Session(SessionEvent::BackgroundWork {
                         pending: !self.tasks.is_empty(),
                     }));
+            }
+            return Ok(());
+        }
+        if notification == NotificationMethod::SessionNotification {
+            let completed: TurnCompleted = decode(params["update"].clone())?;
+            if completed.update == "turn_completed"
+                && self
+                    .prompts
+                    .get(&completed.prompt_id)
+                    .is_some_and(|prompt| matches!(prompt.origin, PromptOrigin::Foreign))
+            {
+                self.finish(
+                    &completed.prompt_id,
+                    completed.completion.outcome(),
+                    true,
+                    decoded,
+                );
             }
             return Ok(());
         }
@@ -836,7 +928,8 @@ impl Codec {
                     text,
                 },
             ),
-            Update::Tool(mut tool) => {
+            Update::Tool(tool) => {
+                let mut tool = *tool;
                 if tool.tool_call_id.is_empty() {
                     return Ok(());
                 }
@@ -849,7 +942,7 @@ impl Codec {
                     .tool_starts
                     .remove(&tool.tool_call_id)
                 {
-                    if !start.name.is_empty() {
+                    if tool.title.is_empty() {
                         tool.title = start.name;
                     }
                     if !start.arguments.is_null() {
@@ -863,18 +956,34 @@ impl Codec {
                         TurnEvent::ToolStarted {
                             key: NativeItemKey(tool_key.clone()),
                             call: ToolCall {
-                                name: tool.title,
+                                name: tool.title.clone(),
                                 arguments: tool.raw_input,
                                 veyra_label: false,
                                 input_summary: None,
                             },
                         },
                     );
-                    ToolState::Running(String::new())
+                    ToolState {
+                        title: tool.title.clone(),
+                        output: String::new(),
+                        ended: false,
+                    }
                 });
-                let ToolState::Running(previous) = state else {
+                if state.ended {
                     return Ok(());
-                };
+                }
+                if !tool.title.is_empty() && tool.title != state.title {
+                    state.title = tool.title.clone();
+                    Self::event(
+                        decoded,
+                        owner,
+                        TurnEvent::ToolTitleChanged {
+                            key: NativeItemKey(tool_key.clone()),
+                            title: tool.title,
+                        },
+                    );
+                }
+                let previous = &mut state.output;
                 let delta = output
                     .map(|output| {
                         let delta = output
@@ -886,7 +995,7 @@ impl Codec {
                     })
                     .filter(|text| !text.is_empty());
                 if matches!(tool.status, ToolStatus::Completed | ToolStatus::Failed) {
-                    *state = ToolState::Ended;
+                    state.ended = true;
                     Self::event(
                         decoded,
                         owner,
@@ -939,6 +1048,7 @@ impl Codec {
                 .push(self.peer.error(id, -32600, "Request id already used"));
             return Ok(());
         }
+        let mut accept_edit = false;
         let parsed = match decode::<RequestMethod>(json!(method))? {
             RequestMethod::Permission => {
                 let permission: Permission = decode(params.clone())?;
@@ -957,19 +1067,41 @@ impl Codec {
                         .iter()
                         .find(|o| o.kind == OptionKind::RejectOnce)
                         .map(|o| o.option_id.clone());
+                    accept_edit = self.spec.config.mode == PermissionMode::AcceptEdits
+                        && allow.is_some()
+                        && permission.tool_call.kind == "edit"
+                        && if permission.tool_call.locations.is_empty() {
+                            permission.tool_call.raw_input["file_path"]
+                                .as_str()
+                                .is_some_and(|path| project_path(&self.spec.cwd, path))
+                        } else {
+                            permission
+                                .tool_call
+                                .locations
+                                .iter()
+                                .all(|location| project_path(&self.spec.cwd, &location.path))
+                        };
                     let command = permission.tool_call.raw_input["command"].as_str();
-                    let exact_command = permission.tool_call.title == "Bash"
+                    let exact_command = permission.tool_call.raw_input["variant"].as_str()
+                        == Some("Bash")
                         && permission
                             .tool_call
                             .raw_input
                             .as_object()
                             .is_some_and(|args| {
                                 args.keys().all(|key| {
-                                    matches!(key.as_str(), "command" | "description" | "timeout")
+                                    matches!(
+                                        key.as_str(),
+                                        "variant"
+                                            | "command"
+                                            | "description"
+                                            | "is_background"
+                                            | "timeout"
+                                    )
                                 })
                             });
                     let grant_key = command.filter(|_| exact_command).map(|command| GrantKey {
-                        tool: permission.tool_call.title.clone(),
+                        tool: "Bash".into(),
                         command: command.into(),
                     });
                     let target = if let Some(command) = command {
@@ -1008,9 +1140,8 @@ impl Codec {
             }
             RequestMethod::Question => {
                 let question: QuestionParams = decode(params)?;
-                let meta = question.meta;
-                let question = question.params;
                 let valid = self.native().is_some_and(|n| n.0 == question.session_id)
+                    && !question.tool_call_id.is_empty()
                     && !question.questions.is_empty()
                     && question.questions.iter().all(|q| {
                         !q.question.is_empty()
@@ -1037,7 +1168,12 @@ impl Codec {
                                 .collect(),
                         },
                         PermissionReply::Question,
-                        meta.prompt_id,
+                        question.meta.prompt_id.or_else(|| match self.work() {
+                            Some(PromptWork::Provider { .. }) => {
+                                self.prompts.keys().next().cloned()
+                            }
+                            _ => None,
+                        }),
                     )
                 })
             }
@@ -1060,6 +1196,18 @@ impl Codec {
                 .push(self.peer.error(id, -32600, "Request has no active prompt"));
             return Ok(());
         };
+        if accept_edit
+            && let PermissionReply::Permission {
+                allow: Some(option_id),
+                ..
+            } = &reply
+        {
+            decoded.replies.push(self.peer.response(
+                id,
+                json!({"outcome":{"outcome":"selected","optionId":option_id}}),
+            ));
+            return Ok(());
+        }
         let owner = self.active().unwrap();
         Self::event(
             decoded,
@@ -1172,6 +1320,78 @@ impl Codec {
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ProviderError> {
     serde_json::from_value(value).map_err(|_| ProviderError::Protocol("Invalid Grok frame".into()))
 }
+pub(super) async fn probe_exchange(
+    reader: &mut jsonrpc::Reader,
+    writer: &tokio::sync::mpsc::UnboundedSender<Outbound>,
+    binary: std::path::PathBuf,
+    api_key: bool,
+) -> Result<super::Probe, ProviderError> {
+    let mut peer = Peer::new(true);
+    writer
+        .send(Outbound::Message(peer.send((), "initialize", initialize())))
+        .map_err(|_| ProviderError::Protocol("Grok probe writer closed".into()))?;
+    while let Some(line) = reader.next().await? {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Frame::Reply { result, .. } = peer.receive(value) {
+            let init: Initialization = decode(result.map_err(jsonrpc::failure)?)?;
+            let version = init.version();
+            let readiness = if auth_method(&init.auth_methods, api_key).is_some() {
+                super::Readiness::Ready
+            } else {
+                super::Readiness::SignedOut
+            };
+            let models = init
+                .meta
+                .model_state
+                .map(|state| {
+                    let mut models = state
+                        .available_models
+                        .into_iter()
+                        .filter(|m| !m.model_id.is_empty())
+                        .map(|mut model| {
+                            model
+                                .meta
+                                .reasoning_efforts
+                                .sort_by_key(|effort| !effort.default);
+                            super::Model {
+                                value: model.model_id,
+                                display_name: model.name,
+                                effort_levels: model
+                                    .meta
+                                    .reasoning_efforts
+                                    .into_iter()
+                                    .filter_map(|effort| {
+                                        let value = if effort.value.is_empty() {
+                                            effort.id
+                                        } else {
+                                            effort.value
+                                        };
+                                        (!value.is_empty()).then_some(value)
+                                    })
+                                    .collect(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    models.sort_by_key(|model| model.value != state.current_model_id);
+                    models
+                })
+                .unwrap_or_default();
+            return Ok(super::Probe {
+                provider: super::ProviderKind::Grok,
+                path: Some(binary),
+                version,
+                readiness,
+                models,
+                account: None,
+            });
+        }
+    }
+    Err(ProviderError::Protocol(
+        "Grok probe ended before initialize".into(),
+    ))
+}
 fn default_on_invalid<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1239,6 +1459,40 @@ fn tool_output(raw: &Value, content: &[Value]) -> Option<String> {
             .join("\n")
     };
     (!text.is_empty()).then_some(text)
+}
+
+fn project_path(project: &std::path::Path, path: &str) -> bool {
+    use std::{io::ErrorKind, path::Component};
+    if path.is_empty() {
+        return false;
+    }
+    let Ok(project) = project.canonicalize() else {
+        return false;
+    };
+    let mut ancestor = project.join(path);
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for part in missing.into_iter().rev() {
+                    resolved.push(part);
+                }
+                return resolved.starts_with(&project);
+            }
+            Err(error) => {
+                if error.kind() != ErrorKind::NotFound || ancestor.symlink_metadata().is_ok() {
+                    return false;
+                }
+                let Some(Component::Normal(part)) = ancestor.components().next_back() else {
+                    return false;
+                };
+                missing.push(part.to_owned());
+                if !ancestor.pop() {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

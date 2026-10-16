@@ -2101,7 +2101,29 @@ impl Render for Shell {
                     .model
                     .clone()
                     .or_else(|| cycle(&models, shell.composer_config().model.as_ref()).cloned());
-                shell.update_config(window, cx, |config| config.model = model);
+                let grok_efforts = (shell.chosen_provider() == ProviderKind::Grok).then(|| {
+                    shell
+                        .probe(ProviderKind::Grok)
+                        .and_then(|probe| {
+                            probe
+                                .models
+                                .iter()
+                                .find(|entry| Some(&entry.value) == model.as_ref())
+                        })
+                        .map(|entry| entry.effort_levels.clone())
+                        .unwrap_or_default()
+                });
+                shell.update_config(window, cx, |config| {
+                    config.model = model;
+                    if grok_efforts.is_some_and(|levels| {
+                        config
+                            .effort
+                            .as_ref()
+                            .is_some_and(|effort| !levels.contains(effort))
+                    }) {
+                        config.effort = None;
+                    }
+                });
             }))
             .on_action(cx.listener(|shell, action: &PickEffort, window, cx| {
                 let levels = shell
@@ -5383,6 +5405,44 @@ mod tests {
             );
             assert!(cx.debug_bounds("caption-Default model").is_some());
             assert!(cx.debug_bounds("caption-Effort").is_some());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn grok_model_change_clears_an_unadvertised_effort(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Grok, false, false);
+                shell.state.requests.clear();
+                shell.new_thread(window, cx);
+                shell.provider = ProviderKind::Grok;
+                shell.providers[0].models = serde_json::from_value(serde_json::json!([
+                    {"value":"grok-4.7","displayName":"Grok 4.7","supportedEffortLevels":["high","xhigh","medium","low"]},
+                    {"value":"grok-4.5","displayName":"Grok 4.5","supportedEffortLevels":["high","medium","low"]}
+                ])).unwrap();
+                shell.config.model = Some("grok-4.7".into());
+                shell.config.effort = Some("xhigh".into());
+                window.dispatch_action(Box::new(super::PickModel { model:Some("grok-4.5".into()) }), cx);
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.config.effort.clone()),
+                None
+            );
+            let button = cx.debug_bounds("composer-effort").unwrap().center();
+            cx.simulate_click(button, gpui::Modifiers::none());
+            draw(cx);
+            cx.simulate_keystrokes("down enter");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell
+                    .config
+                    .effort
+                    .as_deref()
+                    .map(str::to_owned)),
+                Some("high".into())
+            );
         });
     }
 

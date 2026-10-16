@@ -517,6 +517,9 @@ PYCODEX
 
 Run this fake-only section after Codex.
 It uses the existing approval dock and question choices, including both Grok question method spellings.
+Grok's approval command writes through a redirect, `printf 'veyra\n' > veyra-check.txt`; bare touch is on Grok's built-in safe list.
+Accept edits answers only verified in-project edits with allow_once, and the outside edit still docks.
+The question params are flat sessionId, toolCallId, mode and questions, without a nested params object, question id or prompt id; multiSelect may be null.
 A lasting-only request keeps Allow once and the thread grant visible but disabled, explains why, and still permits Deny.
 Stop removes the question dock; `requests` and SQLite preserve its Expired state.
 
@@ -532,9 +535,9 @@ assert LANE == 'fake'
 check = DATA/'project/veyra-check.txt'
 check.unlink(missing_ok=True)
 for label,scenario,decision in [('deny','approval-deny','Deny'),('allow','approval-allow','AllowOnce')]:
-    thread = create_grok('grok-approval-'+label,scenario=scenario,prompt=label.title()+' the exact check command')
+    thread = create_grok('grok-approval-'+label,scenario=scenario,prompt="Run only printf 'veyra\\n' > veyra-check.txt; "+label+' this request')
     dock = poll('grok-approval-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
-    assert dock['action_text']=='touch veyra-check.txt'
+    assert dock['action_text']=="printf 'veyra\\n' > veyra-check.txt"
     assert dock['allow_once_enabled'] and dock['allow_in_thread_enabled']
     assert dock['consent_reason'] is None
     capture('grok-approval-'+label)
@@ -543,6 +546,23 @@ for label,scenario,decision in [('deny','approval-deny','Deny'),('allow','approv
     assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))==decision
     assert check.exists()==(decision=='AllowOnce')
 check.unlink()
+stage_records(grok_records('approval-accept-edits'))
+action('grok-accept-edits-new','NewThread')
+action('grok-accept-edits-provider','PickProvider',{'provider':'grok'})
+action('grok-accept-edits-mode','PickPermission',{'mode':'accept_edits'})
+ctl('grok-accept-edits-text','text','Edit inside the project, then outside')
+before = int(sql('select count(*) from threads'))
+ctl('grok-accept-edits-send','keys','secondary-enter')
+selected = poll('grok-accept-edits-selected',lambda d:d['selected_thread'] is not None and int(sql('select count(*) from threads'))==before+1)
+thread = selected['selected_thread']['id']
+dock = poll('grok-accept-edits-outside',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert (DATA/'project/inside.txt').exists()
+assert sql("select count(*) from requests where thread_id='"+thread+"'")=='1'
+assert json.loads(dock['request']['native'])=='edit-outside' and dock['action_text']=='Edit outside'
+capture('grok-accept-edits-outside')
+action('grok-accept-edits-deny','Deny',{'request':dock['request']['id']})
+ctl('grok-accept-edits-done','wait',thread,'Done')
+(DATA/'project/inside.txt').unlink()
 thread = create_grok('grok-deny-only',scenario='approval-always-only',prompt='Offer only a lasting grant')
 dock = poll('grok-deny-only',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 request = dock['request']['id']
@@ -600,10 +620,11 @@ PYGROK
 
 ## Observable success
 
-The Grok approval PNGs show the exact command and decisions; the file is absent after Deny and present after Allow once.
+`grok-accept-edits-outside.png` shows only the outside edit dock, while SQLite has one request and inside.txt was created without a dock.
+The Grok approval PNGs show the exact redirect command and decisions; the file is absent after Deny and present after Allow once.
 `grok-deny-only.png` and its focused PNG show both disabled allow controls and `Grok offered only a lasting grant`.
 `composer.dock.allow_once_enabled`, `allow_in_thread_enabled` and `consent_reason` match those controls, and both allow keys and explicit actions leave the same request pending.
-The two question PNGs cover both method spellings; `grok-questions-done.json`, the answered PNG and SQLite retain Tests and Summary as user answer items.
+The two question PNGs dock the flat live shape under the running turn and cover both method spellings; `grok-questions-done.json`, the answered PNG and SQLite retain Tests and Summary as user answer items.
 `grok-question-expired.json` and SQLite retain the question as Expired after Stop, and its PNG shows Interrupted with the dock removed.
 
 `question.png`, `question-focused.png` and `codex-question.png` show two-option docks with text clear of the controls.

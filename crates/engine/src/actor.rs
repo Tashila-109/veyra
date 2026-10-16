@@ -1223,6 +1223,16 @@ impl Actor {
                     .insert((thread, epoch, turn.id, key), item.id);
                 commands::add_item(&self.projection, c, item);
             }
+            TurnEvent::ToolTitleChanged { key, title } => {
+                if let Some(id) = self.item_keys.get(&(thread, epoch, turn.id, key))
+                    && let Some(mut item) = self.projection.items.get(id).cloned()
+                    && let ItemBody::Tool(tool) = &mut item.body
+                {
+                    tool.call.name = title;
+                    c.events.push(Ev::ItemAdded(item.clone()));
+                    c.items.insert(item.id, item);
+                }
+            }
             TurnEvent::ToolOutput { key, text } => {
                 if let Some(id) = self.item_keys.get(&(thread, epoch, turn.id, key))
                     && let Some(mut item) = self.projection.items.get(id).cloned()

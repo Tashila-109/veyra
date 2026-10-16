@@ -180,6 +180,7 @@ fn grok_resume_uses_session_resume() {
     .0;
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+    assert!(e.iter().any(|event| matches!(event, ProviderEvent::Session(SessionEvent::Ready { native, cli_version, .. }) if native.0 == "retained-session" && cli_version.as_deref() == Some("1.0.60"))));
 }
 #[test]
 fn grok_stop_cancels_pending_permission() {
@@ -506,7 +507,7 @@ fn grok_background_work_blocks_replacement() {
     });
 }
 #[test]
-fn grok_signed_out_names_login() {
+fn grok_signed_out_never_authenticates() {
     let (scratch, env) = environment("signed-out");
     Runtime::new().unwrap().block_on(async {
         let (out, mut events) = mpsc::channel(32);
@@ -1075,4 +1076,74 @@ fn grok_foreign_tool_keeps_start_metadata_after_promotion() {
         outcomes(&events),
         [TurnOutcome::Completed, TurnOutcome::Completed]
     );
+}
+
+#[test]
+fn grok_tool_title_updates_one_persisted_row() {
+    engine_replay("tool-title", |engine, thread, events, runtime| {
+        runtime.block_on(async {
+            use veyra_engine::events::{ChangeEvent, UiEvent};
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut ids = std::collections::BTreeSet::new();
+                let mut titles = Vec::new();
+                let mut completions = 0;
+                while let Some(event) = events.recv().await {
+                    match event {
+                        UiEvent::Change {event:ChangeEvent::ItemAdded(item) | ChangeEvent::ItemCompleted(item),..} => {
+                            if let ItemBody::Tool(tool) = item.body {
+                                ids.insert((item.id,item.seq));
+                                if tool.result.is_some() { completions += 1; }
+                                titles.push(tool.call.name);
+                            }
+                        }
+                        UiEvent::Change {event:ChangeEvent::TurnEnded(_),..} => {
+                            let snapshot = engine.snapshot(thread).await.unwrap();
+                            let tools = snapshot.items.iter().filter_map(|item|match &item.body {ItemBody::Tool(tool)=>Some(tool),_=>None}).collect::<Vec<_>>();
+                            assert_eq!(tools.len(),1);
+                            assert_eq!(ids.len(),1);
+                            assert!(titles.iter().any(|title|title=="Running pwd"));
+                            assert_eq!(completions,1);
+                            assert_eq!(tools[0].call.name,"Execute `pwd`");
+                            assert_eq!(tools[0].call.arguments,serde_json::json!({"variant":"Bash","command":"pwd"}));
+                            assert_eq!(tools[0].result.as_ref().unwrap().output_tail.as_deref(),Some("/project\n"));
+                            let db = rusqlite::Connection::open(engine.child_env().fixtures.unwrap().join("data/veyra.db")).unwrap();
+                            let (count,body):(i64,String) = db.query_row("select count(*),body_json from items where thread_id=?1 and kind='tool'",[thread.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+                            assert_eq!(count,1);
+                            assert!(body.contains("Execute `pwd`"));
+                            return;
+                        }
+                        _=>{}
+                    }
+                }
+                panic!("tool turn did not end");
+            }).await.unwrap();
+        });
+    });
+}
+
+#[test]
+fn grok_accept_edits_answers_inside_and_docks_outside() {
+    let (events, wrote) = harness::replay(
+        ProviderKind::Grok,
+        "approval-accept-edits",
+        PermissionMode::AcceptEdits,
+        false,
+        false,
+        Inputs::answers([Decision::Deny]),
+    );
+    assert!(!wrote);
+    let requests = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Turn {
+                event: TurnEvent::RequestOpened { native, kind },
+                ..
+            } => Some((native, kind)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].0.0.contains("outside"));
+    assert_eq!(text(&events), "ok");
+    assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
 }

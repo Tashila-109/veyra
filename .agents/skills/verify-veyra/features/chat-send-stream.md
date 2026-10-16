@@ -339,7 +339,8 @@ PYCODEX
 ### Grok
 
 Run this fake-only section after Codex.
-The signed-out fixture is an authentication failure during session opening, not a picker sign-in signal.
+The signed-out fixture advertises only grok.com and fails session opening without any authenticate call.
+The background fixture clears its task snapshot and ends the Grok-started report only on its own turn_completed notification.
 The launch-argument receipt records only the fake CLI's own arguments and must contain neither optional selection flag.
 
 ```sh
@@ -376,11 +377,31 @@ assert failed['view']=='failed_thread'
 assert 'Sign in with `grok login`' in failed['selected_thread']['failure']
 assert 'grok login' in sql("select outcome_json from turns where thread_id='"+thread+"'")
 capture('grok-signed-out')
+records = grok_records('background-work')
+for record in records:
+    if record.get('line',{}).get('method')=='_x.ai/task_completed': record['after_ms']=3000
+thread = create_grok('grok-background',records=records,prompt='Start background work and report its result')
+foreground_ended('grok-background-foreground-ended',thread)
+background = poll('grok-background-working',lambda d:d['selected_thread']['id']==thread and d['selected_thread']['status']=='Working' and not d['composer']['stop_visible'])
+assert background['composer']['send_enabled']
+capture('grok-background-working')
+background = ctl('grok-background-done','wait',thread,'Done')
+assert not background['composer']['stop_visible']
+assert sql("select count(*) from turns where thread_id='"+thread+"' and outcome_json='\"Completed\"'")=='2'
+assert sql("select count(*) from turns where thread_id='"+thread+"' and origin_json='\"Provider\"'")=='1'
+assert [item['text'] for item in background['transcript']['items'] if item['kind']=='assistant']==['foreground','background reply']
+capture('grok-background-done')
+thread = create_grok('grok-tool-title',scenario='tool-title',prompt='Run pwd')
+titled = ctl('grok-tool-title-done','wait',thread,'Done')
+tools = [item for item in titled['transcript']['items'] if item['kind']=='tool']
+assert len(tools)==1 and tools[0]['body']['Tool']['call']['name']=='Execute `pwd`'
+assert sql("select count(*) from items where thread_id='"+thread+"' and kind='tool'")=='1'
+capture('grok-tool-title')
 poll('grok-chat-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
 action('grok-chat-return-new','NewThread')
 action('grok-chat-return-claude','PickProvider',{'provider':'claude'})
 page_done('chat-send-stream-grok')
-print('PASS Grok streams ok; Default leaves both flags out; session auth failure names grok login')
+print('PASS Grok streams ok; Default leaves both flags out; signed-out failure; background task and Provider turn end')
 PYGROK
 ```
 
@@ -389,6 +410,9 @@ PYGROK
 `grok-chat-working.png` shows the first streamed character and Stop; `grok-chat-done.png`, its dump and SQLite show one completed ok reply.
 `grok-launch-argv.json` proves neither model nor effort flag was sent to the fake CLI.
 `grok-signed-out.png`, `selected_thread.failure` and SQLite name `grok login` in the existing failed view.
+`grok-background-working.png` shows Working with Send after the foreground ends, and `grok-background-done.png` shows the report completed.
+SQLite retains one User turn and one Provider turn, both Completed, after task_snapshot completion and the provider prompt's turn_completed notification.
+`grok-tool-title.png` and its dump retain one tool row titled Execute `pwd` after title-only updates, with its completed output preserved.
 
 The Codex section saves streamed `o`, completed `ok` with two `delta_count` events, its stored item and Completed turn.
 The foreign-thread fixture leaves one User turn and only `ok`; the retry/limit fixture stores exactly two Notice items.

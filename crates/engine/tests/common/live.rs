@@ -161,12 +161,17 @@ pub fn ok_reply(provider: ProviderKind) {
 }
 
 pub fn approval_round_trip(provider: ProviderKind) {
+    let command = if provider == ProviderKind::Grok {
+        "printf 'veyra\\n' > veyra-check.txt"
+    } else {
+        "touch veyra-check.txt"
+    };
     let (events, exists) = live(
         provider,
         PermissionMode::AskFirst,
         &[
-            "Run only touch veyra-check.txt. If denied, stop and report the denial.",
-            "Run only touch veyra-check.txt and report completion.",
+            &format!("Run only {command}. If denied, stop and report the denial."),
+            &format!("Run only {command} and report completion."),
         ],
         &[Decision::Deny, Decision::AllowOnce],
     );
@@ -194,7 +199,7 @@ pub fn approval_round_trip(provider: ProviderKind) {
         })
         .collect();
     assert_eq!(commands.len(), 2);
-    assert!(commands.iter().all(|c| c.contains("touch veyra-check.txt")));
+    assert!(commands.iter().all(|c| c.contains(command)));
 }
 
 pub fn full_access_write(provider: ProviderKind) {

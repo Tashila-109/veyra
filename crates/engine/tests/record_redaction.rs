@@ -24,6 +24,76 @@ impl Drop for Scratch {
     }
 }
 #[test]
+fn grok_capture_masks_signed_in_frame_privacy() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("capture.jsonl");
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Grok,
+        "1.0.60",
+        &scratch.0,
+        None,
+        None,
+    )
+    .unwrap();
+    for wire in [
+        json!({"id":1,"result":{"_meta":{"agentVersion":"1.0.60","agentId":"private-agent","agentInstanceId":"private-instance","hostname":"private-host","availableCommands":[{"name":"private-skill","description":"private-description","prompt":"private-instructions"}]},"authMethods":[{"id":"cached_token"},{"id":"grok.com"}]}}),
+        json!({"id":2,"result":{"_meta":{"email":"private-person@example.invalid","team_id":"private-team","team_name":"private-team-name","organization_id":"private-org","user_id":"private-user","account_id":"private-account","subscription_tier":"private-tier","plan_name":"private-plan"}}}),
+        json!({"method":"_x.ai/settings/update","params":{"subscription_tier_display":"private-plan-display"}}),
+        json!({"method":"_x.ai/mcp/servers_updated","params":{"mcpServers":[{"name":"example-server","source":"user","type":"stdio","command":"private-command","args":["private-arg"],"env":{"VALUE":"private-env"},"headers":{"Value":"private-header"}},{"name":"example-http","source":"user","type":"http","url":"https://example.invalid/private-mcp?private-query=yes"}]}}),
+        json!({"text":"Visit https://example.invalid/private-path?private-query=yes and http://example.invalid?private-only-query=yes"}),
+        json!({"text":"https://private-user:private-password@example.invalid/private-path?private-query=yes https://private-user:private-password@example.invalid"}),
+    ] {
+        recorder.line(false, wire).unwrap();
+    }
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("private-"),
+        "capture retained a private frame value"
+    );
+    assert!(text.contains("cached_token") && text.contains("grok.com") && text.contains("1.0.60"));
+    assert!(text.contains("example-server") && text.contains("example-http"));
+    assert!(text.contains("https://example.invalid") && text.contains("http://example.invalid"));
+    assert!(!record::secret_shapes(&text));
+}
+
+#[test]
+fn simultaneous_recordings_choose_free_private_files() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("t1-s1.jsonl");
+    let captures = std::thread::scope(|scope| {
+        let tasks = (0..3)
+            .map(|_| {
+                scope.spawn(|| {
+                    Recorder::create(
+                        &path,
+                        veyra_engine::provider::ProviderKind::Grok,
+                        "1.0.60",
+                        &scratch.0,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        tasks
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    drop(captures);
+    let files = fs::read_dir(&scratch.0)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 3);
+    for file in files {
+        assert!(platform::is_private(&file).unwrap());
+        assert_eq!(fs::read_to_string(file).unwrap().lines().count(), 1);
+    }
+}
+#[test]
 fn capture_never_contains_token() {
     let scratch = Scratch::new();
     let path = scratch.0.join("t1-s1.jsonl");

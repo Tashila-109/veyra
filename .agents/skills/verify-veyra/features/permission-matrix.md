@@ -54,6 +54,8 @@ Replay evidence never marks a live cell passed.
 
 ## Gotchas
 
+Grok follows your Claude and Grok permission settings, so Ask first asks only when they do not already allow the action.
+
 Workers do not run installed providers; the Claude cells above retain the authorized live run's results.
 CLI upgrades require another live permission-grid run with human consent.
 Full access can change files outside the project.
