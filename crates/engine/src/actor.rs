@@ -1340,7 +1340,12 @@ impl Actor {
                     now(),
                 );
             }
-            commands::set_hold(&self.projection, &mut c, thread, Some(HoldReason::Stopped));
+            if matches!(old.live, Live::Starting { session: None })
+                || c.turns(&self.projection, thread)
+                    .any(|turn| turn.state == TurnState::Queued)
+            {
+                commands::set_hold(&self.projection, &mut c, thread, Some(HoldReason::Stopped));
+            }
         }
         for t in active {
             let outcome = match crash.as_ref() {

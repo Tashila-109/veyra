@@ -655,6 +655,86 @@ mod cli {
     use super::*;
 
     #[test]
+    fn grok_signed_out_holds_only_remaining_queued_turns() {
+        for queued in [false, true] {
+            let root = std::env::temp_dir().join(format!("veyra-grok-start-{}", ThreadId::new()));
+            let _scratch = Scratch(root.clone());
+            std::fs::create_dir(&root).unwrap();
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/grok/signed-out.jsonl"),
+                root.join("t1-s1.jsonl"),
+            )
+            .unwrap();
+            let binary = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("veyra-fake-cli")
+                .canonicalize()
+                .unwrap();
+            let mut env = env::ChildEnv::isolated().with_binary(ProviderKind::Grok, binary);
+            env.fixtures = Some(root.clone());
+            let mut f = Fixture::new(LiveState::Parked);
+            let mut c = ChangeSet::default();
+            let mut thread = f.loaded().threads[&f.thread].clone();
+            thread.provider = ProviderKind::Grok;
+            thread.cwd = root.canonicalize().unwrap();
+            c.threads.insert(thread.id, thread);
+            f.save(c);
+            let (out, mut messages) = mpsc::channel(256);
+            f.actor = Actor::new(f.actor.db, out, Spawner::Cli(Box::new(env))).unwrap();
+            let Ack::Turn(first) = f
+                .command(Command::Send {
+                    thread: f.thread,
+                    text: "Sign in".into(),
+                })
+                .unwrap()
+            else {
+                panic!("send did not create a turn");
+            };
+            let second = queued.then(|| f.user("Keep queued"));
+            f.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !matches!(f.actor.live[&f.thread].live, Live::Parked) {
+                        f.actor.handle(messages.recv().await.unwrap());
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            let rows = f.loaded();
+            assert!(
+                matches!(
+                    &rows.turns[&first].state,
+                    TurnState::Ended { outcome: TurnOutcome::Failed { message }, started: None, .. }
+                        if message == "Sign in with `grok login`"
+                ),
+                "{:?}",
+                rows.turns[&first].state
+            );
+            assert_eq!(
+                rows.threads[&f.thread].hold,
+                queued.then_some(HoldReason::Stopped)
+            );
+            if let Some(second) = second {
+                assert_eq!(rows.turns[&second].state, TurnState::Queued);
+            }
+            assert_eq!(f.actor.live[&f.thread].epoch, 1);
+            assert_eq!(
+                wait_reason(
+                    &ChangeSet::default()
+                        .view(&f.actor.projection, &f.actor.live, f.thread)
+                        .unwrap()
+                ),
+                queued.then_some(WaitReason::Held(HoldReason::Stopped))
+            );
+        }
+    }
+
+    #[test]
     fn clean_exit_before_ready_fails_oldest_turn_without_respawning() {
         before_ready_exit("exit 0", "claude exited unexpectedly (exit code 0)");
     }

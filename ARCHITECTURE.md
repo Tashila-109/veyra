@@ -210,7 +210,9 @@ The send-to-reply path is ordered as follows.
 
 1. CreateThread stores the thread and user item with a queued turn.
 2. The Spawn effect starts the session on its own process group.
-While the thread is still Starting, an exit before Ready fails the oldest queued turn and holds the thread as Stopped.
+While the thread is still Starting, an exit before Ready fails the oldest queued turn.
+A session that started adds a Stopped hold only if another turn remains queued, preserving any earlier hold; without queued work it adds no hold.
+A failed spawn with no session retains the Stopped hold.
 3. Claude publishes Ready on a matched initialize reply or system/init; Codex publishes it on a successful thread/start or thread/resume reply, with the returned thread id and cliVersion, after any not-found fallback or active-writer retry.
 Grok publishes Ready on a successful session/new, session/resume or session/load reply with its native session id and initialize version.
 Ready changes Starting to Structured.

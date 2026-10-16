@@ -359,6 +359,9 @@ for label,decision in [('first','AllowOnce'),('second','Deny')]:
     dock = poll('codex-mcp-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
     assert dock['action_text']=='veyra / list_providers'
     assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
+    if label=='second':
+        action('codex-mcp-second-focus','FocusDock')
+        poll('codex-mcp-second-focused',lambda d:d['composer']['dock']['focused'])
     capture('codex-mcp-'+label)
     action('codex-mcp-'+label+'-answer',decision,{'request':dock['request']['id']})
     poll('codex-mcp-'+label+'-closed',lambda d:any(r['id']==dock['request']['id'] and r['state']=={'Answered':decision} for r in d['requests']))
@@ -635,6 +638,7 @@ The chosen PNG retains the question, shows Sent Violet and disables both control
 Command-1 chooses the latest-turn card. The typed-answer PNG leaves its option unselected and closes both controls; a later key or explicit stale choice starts no third turn.
 The strict fixture requires its pending request cancellation before interrupt and Violet as ordinary user input; SQLite records two User turns, the expired request and no hold.
 Both MCP PNGs name `veyra / list_providers` and show Deny and Allow once without a thread grant.
+The second MCP dock is focused so its answer shortcuts distinguish the captures even when the changed sidebar row or request details are off-screen.
 
 The unfocused approval PNGs show the exact command, consequence and FocusDock chord.
 The focused approval PNGs show Allow once, Deny and their answer chords, matching the keys driven in those states.

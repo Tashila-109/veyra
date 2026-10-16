@@ -66,6 +66,7 @@ capture('settings-late-branch')
 ctl('settings-late-branch-return','keys','escape')
 ctl('settings-full-done','wait',first,'Done')
 poll('settings-header-chat',lambda d: d['header_branch']=='fixture-branch')
+capture('settings-branch-return')
 ctl('settings-open-key','keys','secondary-,')
 initial = poll('settings-first',lambda d: d['view']=='settings')
 assert initial['view'] == 'settings' and initial['settings']['default_mode'] == 'full_access'
@@ -139,9 +140,9 @@ for command,argument in [('action','veyra::NewThread'),('keys','secondary-n')]:
     transition = poll('settings-transition-'+command,lambda d: d['view']=='new_thread')
     assert transition['view'] == 'new_thread' and transition['selected_thread'] is None
     assert transition['composer']['mode'] == 'ask_first'
+capture('settings-relaunch')
 action('settings-final-open','OpenSettings')
 assert poll('settings-final',lambda d: d['view']=='settings')['view'] == 'settings'
-capture('settings-relaunch')
 page_done('settings')
 print('PASS default persistence: fresh Full access; stored Ask first; old thread Full access; '
     'new thread Ask first; relaunch keeps all three')
@@ -157,10 +158,12 @@ PY
 - `settings-existing.json` keeps the old Full access composer; `settings-new.json` has the new Ask first thread.
 - Both thread configuration rows are checked directly in SQLite.
 - `settings-relaunch.json` and `settings-persisted-database.txt` retain Ask first after a new pid; both thread rows retain their own modes.
+- `settings-relaunch.png` shows the post-relaunch New thread view and its Ask first chip, which remain visible when new sidebar rows are below the window.
 - Escape, SelectThread and SelectProject each assert the resulting view, and OpenSettings is driven by both its key and named action.
 - `settings-transition-action.json` and `settings-transition-keys.json` show NewThread immediately after Escape, with no selected thread and the Ask first composer.
 - `settings-late-branch-after.json` and its PNG assert Settings keeps an empty header after the delayed branch child finishes.
 - `settings-header-chat.json` shows `header_branch: fixture-branch`; Settings and NewThread dumps assert it is empty.
+- `settings-branch-return.png` captures that chat before reopening Settings, so the next Full access capture differs visibly even when the selected row is below the sidebar viewport.
 - `drive.log` records commands, replies and exits; the text request while Settings is focused exits 1 instead of editing a hidden composer.
 
 ## Gotchas
