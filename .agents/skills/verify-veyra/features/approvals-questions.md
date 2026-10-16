@@ -543,7 +543,10 @@ for label,scenario,decision in [('deny','approval-deny','Deny'),('allow','approv
     assert dock['consent_reason'] is None
     capture('grok-approval-'+label)
     action('grok-approval-'+label+'-answer',decision,{'request':dock['request']['id']})
-    ctl('grok-approval-'+label+'-done','wait',thread,'Done')
+    ctl('grok-approval-'+label+'-done','wait',thread,'Interrupted' if decision=='Deny' else 'Done')
+    if decision=='Deny':
+        assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"' order by rowid desc limit 1"))=={'Interrupted':{'reason':'Stopped after you denied a request'}}
+        capture('grok-approval-denied')
     assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))==decision
     assert check.exists()==(decision=='AllowOnce')
 check.unlink()
@@ -570,7 +573,8 @@ assert sql("select count(*) from requests where thread_id='"+thread+"'")=='2'
 assert json.loads(dock['request']['native'])=='edit-outside' and dock['action_text']=='Edit outside'
 capture('grok-accept-edits-outside')
 action('grok-accept-edits-deny','Deny',{'request':dock['request']['id']})
-ctl('grok-accept-edits-done','wait',thread,'Done')
+ctl('grok-accept-edits-done','wait',thread,'Interrupted')
+assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"' order by rowid desc limit 1"))=={'Interrupted':{'reason':'Stopped after you denied a request'}}
 assert [json.loads(row) for row in sql("select decision_json from requests where thread_id='"+thread+"' order by rowid").splitlines()]==['AllowOnce','Deny']
 (DATA/'project/inside.txt').unlink()
 thread = create_grok('grok-deny-only',scenario='approval-always-only',prompt='Offer only a lasting grant')
@@ -590,7 +594,8 @@ for name,operation,chord in [('once','AllowOnce','secondary-enter'),('thread','A
     assert sql("select state from requests where id='"+request+"'")=='pending'
 capture('grok-deny-only-focused')
 action('grok-deny-only-deny','Deny',{'request':request})
-ctl('grok-deny-only-done','wait',thread,'Done')
+ctl('grok-deny-only-done','wait',thread,'Interrupted')
+assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"' order by rowid desc limit 1"))=={'Interrupted':{'reason':'Stopped after you denied a request'}}
 assert json.loads(sql("select decision_json from requests where id='"+request+"'"))=='Deny'
 assert sql("select count(*) from grants where thread_id='"+thread+"'")=='0' and not check.exists()
 thread = create_grok('grok-question',scenario='question',prompt='Choose the checks and report')
@@ -633,6 +638,8 @@ PYGROK
 `grok-accept-edits-inside.png` shows the in-project edit dock before any file is written.
 `grok-accept-edits-outside.png` shows the next outside edit dock with its matching rawInput path; SQLite has both human decisions, and inside.txt appears only after Allow once.
 The Grok approval PNGs show the exact redirect command and decisions; the file is absent after Deny and present after Allow once.
+`grok-approval-denied.png` shows Interrupted and "Stopped after you denied a request" after the human Deny; SQLite retains the same reason.
+Accept edits and the Deny-only request end Interrupted with that reason too; Allow once still ends Done.
 `grok-deny-only.png` and its focused PNG show both disabled allow controls and `Grok offered only a lasting grant`.
 `composer.dock.allow_once_enabled`, `allow_in_thread_enabled` and `consent_reason` match those controls, and both allow keys and explicit actions leave the same request pending.
 The two question PNGs dock the flat live shape under the running turn and cover both method spellings; `grok-questions-done.json`, the answered PNG and SQLite retain Tests and Summary as user answer items.

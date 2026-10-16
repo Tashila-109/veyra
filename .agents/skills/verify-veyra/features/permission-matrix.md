@@ -1,17 +1,17 @@
 # Provider permission matrix
 
-Status: not run, 2026-10-15, bac0532, Grok live cells
+Status: passed, 2026-10-17, 211741c, Grok live cells from RUN 991af6f4 and 2816c861
 
 ## Sub-features
 
 One live prompt checks reading, a command, a project write and an outside write in every permission mode.
-Claude and Codex rows come from preserved authorized live evidence; Grok remains not run.
+Claude, Codex and Grok rows come from preserved authorized live evidence.
 
 | Provider | Ask first | Accept edits | Full access |
 | --- | --- | --- | --- |
 | Claude | passed: Read and `echo` ran without approval; both writes docked as `Write` with their absolute targets, inside and outside the project, Allow once, both files written | passed: Read, `echo` and the project write ran without approval; the outside write docked as `Write`, outside the project, Allow once, written | passed: all four steps ran with no approval; both files written |
 | Codex | passed: `cat` and `echo` each docked as Command and ran after Allow once; the project write docked as `/bin/zsh -lc "printf '%s\\n' 'veyra permission probe' > permission-project.txt"`, Allow once, written; the outside write docked with its `/tmp` target in the command, Deny (the lane allows no approval outside the scratch project), not written | passed: Read, `echo`, the project write and the `/tmp` outside write all ran without approval; Codex's workspace-write sandbox lets `/tmp` writes through; both files written | passed: all four steps ran with no approval; both files written |
-| Grok | not run | not run | not run |
+| Grok | passed: Read, `list_dir` and `echo` ran without approval (Grok's own safe tools, no request); the project write docked as ``Edit `…/permission-project.txt` `` (`SearchReplace`, inside the project), Allow once, written; the outside write docked as ``Edit `/tmp/veyra-outside-RUN.txt` ``, Deny (the lane allows no approval outside the scratch project), not written; Grok then ended the turn as cancelled (`PermissionRejected`), so it reads Interrupted | passed: Grok has no Accept edits mode, so it asked as Ask first: Read, `grep`, `list_dir` and `echo` ran without approval; the project write docked as `Edit`, Allow once, written; the outside write docked as `Edit` with its `/tmp` target, Deny, not written; Veyra answered no request by itself; Grok ended the turn cancelled (`PermissionRejected`), Interrupted | passed: all four steps ran with no request (Read, `echo`, two `Edit`s); both files written |
 
 ## How to get to it (user POV)
 
@@ -42,7 +42,7 @@ Use AllowOnce or Deny as the operator directs; do not silently grant the whole t
 Read the project and outside files to prove the effects, then remove only this run's outside file.
 Record cell status, provider version, requested approvals, decisions, files and the run proof path.
 Codex's cells preserve the authorized run below.
-Grok's cells remain not run until the separately authorized live lane measures each mode with this prompt, its exact dock decisions and both file effects.
+Grok's Ask first and Accept edits cells retain live RUN `991af6f4`; Full access retains live RUN `2816c861`, with the exact dock decisions and both file effects.
 Grok's hand-written fake fixtures establish no live permission result.
 
 ## Observable success
@@ -56,6 +56,7 @@ Replay evidence never marks a live cell passed.
 
 Grok follows your Claude and Grok permission settings, so Ask first asks only when they do not already allow the action.
 Grok has no Accept edits mode, so Accept edits asks as Ask first does.
+Veyra turns off Grok's settings-seeded auto mode in Ask first and Accept edits (`_meta.autoMode`/`yoloMode` false and `_x.ai/yolo_mode_changed`), so Grok asks for what its safe list and the user's allow rules do not cover.
 
 Workers do not run installed providers; the Claude cells above retain the authorized live run's results.
 CLI upgrades require another live permission-grid run with human consent.
@@ -98,7 +99,7 @@ Observed results below describe the preserved mode checks.
 - Accept edits records Claude's directory boundary: a write outside the project folder still asks.
 - In every mode Claude's own closing text said no step needed approval, including Ask first, where two writes docked. That is the model's narration, not Veyra state.
 - The `Write` docks show the tool input as raw JSON under the copy "Claude Code will run this command in the project folder.", also for the `/tmp` write (the recording predates the tool-target dock repair).
-- Grok cells stay not run here.
+- Grok cells retain the live results listed below.
 
 ### Codex preserved live evidence
 
@@ -106,3 +107,12 @@ Live run RUN `38bd20ba`, Codex 0.162.1, model the CLI default, 2026-10-14, check
 The row is retained exactly from the authorized live permission run in `m5-lane-3.md`; the fake worker does not rerun it.
 Codex's Accept edits workspace sandbox permits `/tmp` writes without asking, including targets outside the project folder.
 This is Codex's directory boundary; Claude's Accept edits outside write still docks.
+
+### Grok preserved live evidence
+
+Ask first and Accept edits: live RUN `991af6f4`, Grok 1.0.60, CLI default model `grok-4.7` and effort `xhigh`, 2026-10-17, checkout `211741c`.
+Full access: live RUN `2816c861`, checkout `1489439`, retained from the first recheck.
+The live recheck records are `T/results/m6-live-recheck-2.md` and `T/results/m6-live-recheck.md`; proof is under their matching `T/evidence/m6/live-recheck-2/` and `T/evidence/m6/live-recheck/` roots.
+Ask first and Accept edits each docked both writes, with Allow once for the project write and Deny for the outside write; only the project file was written.
+Every Veyra reply followed a human dock decision; the outside Deny ended the turn cancelled with PermissionRejected, displayed as Interrupted.
+Full access ran Read, echo and both edits with no request and wrote both files.

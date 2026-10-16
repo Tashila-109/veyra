@@ -63,6 +63,7 @@ pub fn live(
             let mut sent = 0;
             let mut answered = 0;
             let mut exists = vec![];
+            let mut expected_outcome = TurnOutcome::Completed;
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
                 match &event {
                     ProviderEvent::Session(SessionEvent::Ready { .. }) => {
@@ -84,6 +85,11 @@ pub fn live(
                             .expect("unexpected live request")
                             .clone();
                         answered += 1;
+                        if provider == ProviderKind::Grok && decision == Decision::Deny {
+                            expected_outcome = TurnOutcome::Interrupted {
+                                reason: "Stopped after you denied a request".into(),
+                            };
+                        }
                         handle
                             .control
                             .send(SessionControl::Answer {
@@ -96,7 +102,8 @@ pub fn live(
                         event: TurnEvent::TurnEnded { outcome, .. },
                         ..
                     } => {
-                        assert_eq!(outcome, &TurnOutcome::Completed);
+                        assert_eq!(outcome, &expected_outcome);
+                        expected_outcome = TurnOutcome::Completed;
                         exists.push(root.join("veyra-check.txt").exists());
                         if sent < prompts.len() {
                             handle

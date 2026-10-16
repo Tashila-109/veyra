@@ -339,6 +339,7 @@ struct Completion {
     stop_reason: CompletionReason,
     #[serde(alias = "agent_result")]
     agent_result: Value,
+    cancellation_category: Value,
 }
 #[derive(Clone)]
 enum OpenTarget {
@@ -1357,7 +1358,12 @@ impl Completion {
     fn outcome(self) -> TurnOutcome {
         match self.stop_reason {
             CompletionReason::Cancelled => TurnOutcome::Interrupted {
-                reason: "Grok cancelled the turn".into(),
+                reason: if self.cancellation_category.as_str() == Some("PermissionRejected") {
+                    "Stopped after you denied a request"
+                } else {
+                    "Grok cancelled the turn"
+                }
+                .into(),
             },
             CompletionReason::Error | CompletionReason::Refusal | CompletionReason::RateLimit => {
                 TurnOutcome::Failed {

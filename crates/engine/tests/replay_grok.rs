@@ -105,7 +105,12 @@ fn grok_approval_allow() {
 fn grok_approval_deny() {
     let (e, exists) = replay("approval-deny", Inputs::answers([Decision::Deny]));
     assert!(!exists);
-    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+    assert_eq!(
+        outcomes(&e),
+        [TurnOutcome::Interrupted {
+            reason: "Stopped after you denied a request".into()
+        }]
+    );
 }
 #[test]
 fn grok_never_sends_allow_always() {
@@ -114,9 +119,16 @@ fn grok_never_sends_allow_always() {
         ("approval-allow", Decision::AllowInThread),
         ("approval-deny", Decision::Deny),
     ] {
+        let expected = if answer == Decision::Deny {
+            TurnOutcome::Interrupted {
+                reason: "Stopped after you denied a request".into(),
+            }
+        } else {
+            TurnOutcome::Completed
+        };
         assert_eq!(
             outcomes(&replay(name, Inputs::answers([answer])).0),
-            [TurnOutcome::Completed]
+            [expected]
         );
     }
 }
@@ -254,7 +266,12 @@ fn grok_always_only_disables_allow_once() {
     assert!(kind.accepts(&Decision::AllowOnce).is_none());
     assert!(kind.accepts(&Decision::AllowInThread).is_none());
     assert!(kind.accepts(&Decision::Deny).is_some());
-    assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
+    assert_eq!(
+        outcomes(&e),
+        [TurnOutcome::Interrupted {
+            reason: "Stopped after you denied a request".into()
+        }]
+    );
 }
 #[tokio::test]
 async fn grok_no_first_frame_fails_at_60s() {
@@ -1147,8 +1164,13 @@ fn grok_accept_edits_docks_inside_and_outside() {
         requests.iter().map(|r| r.0.0.as_str()).collect::<Vec<_>>(),
         ["\"edit-inside\"", "\"edit-outside\""]
     );
-    assert_eq!(text(&events), "ok");
-    assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
+    assert!(text(&events).is_empty());
+    assert_eq!(
+        outcomes(&events),
+        [TurnOutcome::Interrupted {
+            reason: "Stopped after you denied a request".into()
+        }]
+    );
 }
 
 #[test]

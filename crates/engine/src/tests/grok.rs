@@ -1246,3 +1246,53 @@ fn grok_non_full_access_disables_auto_on_every_open() {
         }
     }
 }
+
+#[test]
+fn grok_cancellation_reason_uses_only_permission_rejected() {
+    use crate::{domain::*, provider::*};
+    use serde_json::json;
+    for category in [
+        json!(null),
+        json!("UserCancelled"),
+        json!("permissionrejected"),
+        json!(17),
+        json!({"name":"PermissionRejected"}),
+        json!("PermissionRejected"),
+    ] {
+        for reason in ["cancelled", "end_turn"] {
+            let mut codec = ready_codec();
+            let turn = TurnId::new();
+            codec.start(turn, "Run a command".into()).unwrap();
+            let frame = json!({"method":"_x.ai/session/prompt_complete","params":{
+                "sessionId":"native","promptId":turn.to_string(),"stopReason":reason,
+                "cancellationCategory":category
+            }});
+            let decoded = codec.value(frame.clone()).unwrap();
+            let expected = if reason == "end_turn" {
+                TurnOutcome::Completed
+            } else {
+                TurnOutcome::Interrupted {
+                    reason: if category == "PermissionRejected" {
+                        "Stopped after you denied a request"
+                    } else {
+                        "Grok cancelled the turn"
+                    }
+                    .into(),
+                }
+            };
+            let outcomes: Vec<_> = decoded
+                .events
+                .into_iter()
+                .filter_map(|event| match event {
+                    ProviderEvent::Turn {
+                        turn: Some(id),
+                        event: TurnEvent::TurnEnded { outcome, .. },
+                    } if id == turn => Some(outcome),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(outcomes, [expected]);
+            assert!(codec.value(frame).unwrap().events.is_empty());
+        }
+    }
+}
