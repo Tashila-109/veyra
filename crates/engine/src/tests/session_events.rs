@@ -681,6 +681,7 @@ mod cli {
             let mut c = ChangeSet::default();
             let mut thread = f.loaded().threads[&f.thread].clone();
             thread.provider = ProviderKind::Grok;
+            thread.config.mode = PermissionMode::AskFirst;
             thread.cwd = root.canonicalize().unwrap();
             c.threads.insert(thread.id, thread);
             f.save(c);

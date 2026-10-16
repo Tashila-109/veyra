@@ -58,6 +58,79 @@ fn grok_capture_masks_signed_in_frame_privacy() {
 }
 
 #[test]
+fn grok_capture_masks_near_account_variants_and_other_sessions() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("capture.jsonl");
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Grok,
+        "1.0.60",
+        &scratch.0,
+        None,
+        None,
+    )
+    .unwrap();
+    recorder.line(false,json!({"id":1,"result":{"_meta":{"hostname":"private-host.invalid","availableCommands":[{"name":"private-command"}]}}})).unwrap();
+    recorder.line(false,json!({"text":"Signed in as private-person@example.invalid on private-host.invalid; contact another+person@sub.example.invalid and owner@private-host.invalid."})).unwrap();
+    recorder.line(false,json!({"method":"_x.ai/mcp/server_status","params":{"name":"example-server","status":"ready","detail":"Loaded private-command"}})).unwrap();
+    let account = [
+        "user_email",
+        "userEmail",
+        "username",
+        "user_name",
+        "login",
+        "display_name",
+        "x_username",
+        "plan_display",
+        "planDisplayName",
+        "billing_tier",
+    ]
+    .into_iter()
+    .map(|key| (key.to_owned(), json!(format!("private-{key}"))))
+    .collect::<serde_json::Map<_, _>>();
+    recorder
+        .line(false, json!({"accountVariants":account}))
+        .unwrap();
+    recorder.line(false, json!({"variants":account})).unwrap();
+    for method in ["_x.ai/sessions/changed", "x.ai/sessions/changed"] {
+        recorder.line(false,json!({"method":method,"params":{"upserted":[
+            {"sessionId":"current","title":"Project work","cwd":scratch.0,"activity":"working"},
+            {"sessionId":"private-session","title":"private-title","cwd":"/private-other-folder","activity":"working","origin":{"kind":"local"}}
+        ],"removed":[]}})).unwrap();
+    }
+    let rows: Vec<serde_json::Value> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("private-"),
+        "capture retained a private variant"
+    );
+    assert!(!text.contains("another+person@sub.example.invalid"));
+    assert_eq!(
+        rows[2]["line"]["text"],
+        "Signed in as <email> on <hostname>; contact <email> and <email>."
+    );
+    assert_eq!(rows[3]["line"]["params"]["name"], "example-server");
+    assert_eq!(rows[3]["line"]["params"]["status"], "ready");
+    assert_eq!(rows[3]["line"]["params"]["detail"], "<any>");
+    for row in &rows[6..] {
+        let sessions = &row["line"]["params"]["upserted"];
+        assert_eq!(
+            sessions[0],
+            json!({"sessionId":"current","title":"Project work","cwd":"<cwd>","activity":"working"})
+        );
+        assert_eq!(
+            sessions[1],
+            json!({"sessionId":"<any>","title":"<any>","cwd":"<any>","activity":"<any>","origin":{"kind":"<any>"}})
+        );
+    }
+    assert_eq!(rows[5]["line"]["variants"]["x_username"], "<any>");
+}
+
+#[test]
 fn simultaneous_recordings_choose_free_private_files() {
     let scratch = Scratch::new();
     let path = scratch.0.join("t1-s1.jsonl");

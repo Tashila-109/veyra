@@ -1122,14 +1122,14 @@ fn grok_tool_title_updates_one_persisted_row() {
 }
 
 #[test]
-fn grok_accept_edits_answers_inside_and_docks_outside() {
+fn grok_accept_edits_docks_inside_and_outside() {
     let (events, wrote) = harness::replay(
         ProviderKind::Grok,
         "approval-accept-edits",
         PermissionMode::AcceptEdits,
         false,
         false,
-        Inputs::answers([Decision::Deny]),
+        Inputs::answers([Decision::AllowOnce, Decision::Deny]),
     );
     assert!(!wrote);
     let requests = events
@@ -1142,8 +1142,106 @@ fn grok_accept_edits_answers_inside_and_docks_outside() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].0.0.contains("outside"));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests.iter().map(|r| r.0.0.as_str()).collect::<Vec<_>>(),
+        ["\"edit-inside\"", "\"edit-outside\""]
+    );
     assert_eq!(text(&events), "ok");
     assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
+}
+
+#[test]
+fn grok_provider_permission_without_prompt_is_persisted_and_answered() {
+    engine_replay(
+        "provider-permission-no-prompt",
+        |engine, thread, events, runtime| {
+            runtime.block_on(async {
+                use veyra_engine::{
+                    commands::Command,
+                    events::{ChangeEvent, UiEvent},
+                };
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut opened = None;
+                    while let Some(event) = events.recv().await {
+                        match event {
+                            UiEvent::Change {
+                                event: ChangeEvent::RequestOpened(request),
+                                ..
+                            } => {
+                                assert_eq!(request.thread, thread);
+                                assert_eq!(request.state, RequestState::Pending);
+                                let db = rusqlite::Connection::open(
+                                    engine.child_env().fixtures.unwrap().join("data/veyra.db"),
+                                )
+                                .unwrap();
+                                let (turn_id, state): (String, String) = db
+                                    .query_row(
+                                        "select turn_id,state from requests where id=?1",
+                                        [request.id.to_string()],
+                                        |row| Ok((row.get(0)?, row.get(1)?)),
+                                    )
+                                    .unwrap();
+                                assert_eq!(
+                                    (turn_id, state),
+                                    (request.turn.to_string(), "pending".into())
+                                );
+                                let origin: String = db
+                                    .query_row(
+                                        "select origin_json from turns where id=?1",
+                                        [request.turn.to_string()],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap();
+                                assert!(origin.contains("Provider"));
+                                opened = Some(request.id);
+                                engine
+                                    .send(Command::Respond {
+                                        request: request.id,
+                                        decision: Decision::AllowOnce,
+                                    })
+                                    .await
+                                    .unwrap()
+                                    .unwrap();
+                            }
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnEnded(turn),
+                                ..
+                            } if turn.origin == TurnOrigin::Provider => {
+                                assert!(matches!(
+                                    turn.state,
+                                    TurnState::Ended {
+                                        outcome: TurnOutcome::Completed,
+                                        ..
+                                    }
+                                ));
+                                let snapshot = engine.snapshot(thread).await.unwrap();
+                                assert!(snapshot.items.iter().any(|item| matches!(
+                                    &item.body, ItemBody::AssistantText {text,..} if text=="report"
+                                )));
+                                let db = rusqlite::Connection::open(
+                                    engine.child_env().fixtures.unwrap().join("data/veyra.db"),
+                                )
+                                .unwrap();
+                                let state: String = db
+                                    .query_row(
+                                        "select state from requests where id=?1",
+                                        [opened.unwrap().to_string()],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap();
+                                assert_eq!(state, "answered");
+                                native_replies_checked(engine).await;
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    panic!("Provider permission never docked and completed");
+                })
+                .await
+                .unwrap();
+            });
+        },
+    );
 }

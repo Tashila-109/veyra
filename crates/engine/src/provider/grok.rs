@@ -42,39 +42,7 @@ struct Initialization {
     agent_capabilities: Capabilities,
     agent_info: AgentInfo,
     #[serde(rename = "_meta")]
-    meta: InitializationMeta,
-}
-#[derive(Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-struct InitializationMeta {
-    agent_version: Option<String>,
-    model_state: Option<ModelState>,
-}
-#[derive(Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-struct ModelState {
-    current_model_id: String,
-    available_models: Vec<AvailableModel>,
-}
-#[derive(Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-struct AvailableModel {
-    model_id: String,
-    name: String,
-    #[serde(rename = "_meta")]
-    meta: ModelMeta,
-}
-#[derive(Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-struct ModelMeta {
-    reasoning_efforts: Vec<ReasoningEffort>,
-}
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ReasoningEffort {
-    id: String,
-    value: String,
-    default: bool,
+    meta: Value,
 }
 impl Initialization {
     fn version(&self) -> Option<String> {
@@ -82,8 +50,9 @@ impl Initialization {
             .version
             .as_ref()
             .filter(|v| !v.is_empty())
-            .or(self.meta.agent_version.as_ref().filter(|v| !v.is_empty()))
-            .cloned()
+            .map(String::as_str)
+            .or(self.meta["agentVersion"].as_str().filter(|v| !v.is_empty()))
+            .map(str::to_owned)
     }
 }
 #[derive(Deserialize, Default)]
@@ -183,13 +152,6 @@ struct Tool {
     raw_input: Value,
     raw_output: Value,
     content: Vec<Value>,
-    kind: String,
-    locations: Vec<ToolLocation>,
-}
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct ToolLocation {
-    path: String,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -249,7 +211,7 @@ struct TaskSnapshot {
 struct TurnCompleted {
     #[serde(rename = "sessionUpdate")]
     update: String,
-    prompt_id: String,
+    prompt_id: Option<String>,
     #[serde(flatten)]
     completion: Completion,
 }
@@ -486,6 +448,9 @@ impl Codec {
             OpenTarget::Load(native) => ("session/load", Some(native)),
         };
         let mut params = json!({"cwd":self.spec.cwd,"mcpServers":[]});
+        if self.spec.config.mode != PermissionMode::FullAccess {
+            params["_meta"] = json!({"yoloMode":false,"autoMode":false});
+        }
         if let Some(native) = native {
             params["sessionId"] = json!(native.0);
         }
@@ -719,6 +684,12 @@ impl Codec {
                             native: NativeSessionId(native.clone()),
                             active: None,
                         };
+                        if self.spec.config.mode != PermissionMode::FullAccess {
+                            decoded.replies.push(self.peer.notification(
+                                "_x.ai/yolo_mode_changed",
+                                json!({"sessionId":native,"yolo_mode":false,"auto_mode":false}),
+                            ));
+                        }
                         #[cfg(debug_assertions)]
                         {
                             decoded.recording = Some(crate::record::Metadata {
@@ -842,17 +813,16 @@ impl Codec {
         if notification == NotificationMethod::SessionNotification {
             let completed: TurnCompleted = decode(params["update"].clone())?;
             if completed.update == "turn_completed"
-                && self
-                    .prompts
-                    .get(&completed.prompt_id)
-                    .is_some_and(|prompt| matches!(prompt.origin, PromptOrigin::Foreign))
+                && let Some(id) = completed.prompt_id
             {
-                self.finish(
-                    &completed.prompt_id,
-                    completed.completion.outcome(),
-                    true,
-                    decoded,
-                );
+                self.ended.insert(id.clone());
+                if self
+                    .prompts
+                    .get(&id)
+                    .is_some_and(|prompt| matches!(prompt.origin, PromptOrigin::Foreign))
+                {
+                    self.finish(&id, completed.completion.outcome(), true, decoded);
+                }
             }
             return Ok(());
         }
@@ -1048,7 +1018,6 @@ impl Codec {
                 .push(self.peer.error(id, -32600, "Request id already used"));
             return Ok(());
         }
-        let mut accept_edit = false;
         let parsed = match decode::<RequestMethod>(json!(method))? {
             RequestMethod::Permission => {
                 let permission: Permission = decode(params.clone())?;
@@ -1067,20 +1036,6 @@ impl Codec {
                         .iter()
                         .find(|o| o.kind == OptionKind::RejectOnce)
                         .map(|o| o.option_id.clone());
-                    accept_edit = self.spec.config.mode == PermissionMode::AcceptEdits
-                        && allow.is_some()
-                        && permission.tool_call.kind == "edit"
-                        && if permission.tool_call.locations.is_empty() {
-                            permission.tool_call.raw_input["file_path"]
-                                .as_str()
-                                .is_some_and(|path| project_path(&self.spec.cwd, path))
-                        } else {
-                            permission
-                                .tool_call
-                                .locations
-                                .iter()
-                                .all(|location| project_path(&self.spec.cwd, &location.path))
-                        };
                     let command = permission.tool_call.raw_input["command"].as_str();
                     let exact_command = permission.tool_call.raw_input["variant"].as_str()
                         == Some("Bash")
@@ -1168,12 +1123,7 @@ impl Codec {
                                 .collect(),
                         },
                         PermissionReply::Question,
-                        question.meta.prompt_id.or_else(|| match self.work() {
-                            Some(PromptWork::Provider { .. }) => {
-                                self.prompts.keys().next().cloned()
-                            }
-                            _ => None,
-                        }),
+                        question.meta.prompt_id,
                     )
                 })
             }
@@ -1190,24 +1140,16 @@ impl Codec {
                 .push(self.peer.error(id, -32602, "Invalid Grok request"));
             return Ok(());
         };
+        let prompt_id = prompt_id.or_else(|| match self.work() {
+            Some(PromptWork::Provider { .. }) => self.prompts.keys().next().cloned(),
+            _ => None,
+        });
         let Some(_) = self.prompt(prompt_id.as_deref(), decoded) else {
             decoded
                 .replies
                 .push(self.peer.error(id, -32600, "Request has no active prompt"));
             return Ok(());
         };
-        if accept_edit
-            && let PermissionReply::Permission {
-                allow: Some(option_id),
-                ..
-            } = &reply
-        {
-            decoded.replies.push(self.peer.response(
-                id,
-                json!({"outcome":{"outcome":"selected","optionId":option_id}}),
-            ));
-            return Ok(());
-        }
         let owner = self.active().unwrap();
         Self::event(
             decoded,
@@ -1342,42 +1284,38 @@ pub(super) async fn probe_exchange(
             } else {
                 super::Readiness::SignedOut
             };
-            let models = init
-                .meta
-                .model_state
-                .map(|state| {
-                    let mut models = state
-                        .available_models
+            let state = &init.meta["modelState"];
+            let mut models = state["availableModels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|model| {
+                    let id = model["modelId"].as_str().filter(|id| !id.is_empty())?;
+                    let mut efforts = model["_meta"]["reasoningEfforts"]
+                        .as_array()
                         .into_iter()
-                        .filter(|m| !m.model_id.is_empty())
-                        .map(|mut model| {
-                            model
-                                .meta
-                                .reasoning_efforts
-                                .sort_by_key(|effort| !effort.default);
-                            super::Model {
-                                value: model.model_id,
-                                display_name: model.name,
-                                effort_levels: model
-                                    .meta
-                                    .reasoning_efforts
-                                    .into_iter()
-                                    .filter_map(|effort| {
-                                        let value = if effort.value.is_empty() {
-                                            effort.id
-                                        } else {
-                                            effort.value
-                                        };
-                                        (!value.is_empty()).then_some(value)
-                                    })
-                                    .collect(),
-                            }
-                        })
+                        .flatten()
                         .collect::<Vec<_>>();
-                    models.sort_by_key(|model| model.value != state.current_model_id);
-                    models
+                    efforts.sort_by_key(|effort| effort["default"].as_bool() != Some(true));
+                    Some(super::Model {
+                        value: id.into(),
+                        display_name: model["name"].as_str().unwrap_or_default().into(),
+                        effort_levels: efforts
+                            .into_iter()
+                            .filter_map(|effort| {
+                                effort["value"]
+                                    .as_str()
+                                    .filter(|v| !v.is_empty())
+                                    .or_else(|| effort["id"].as_str().filter(|v| !v.is_empty()))
+                                    .map(str::to_owned)
+                            })
+                            .collect(),
+                    })
                 })
-                .unwrap_or_default();
+                .collect::<Vec<_>>();
+            models.sort_by_key(|model| {
+                Some(model.value.as_str()) != state["currentModelId"].as_str()
+            });
             return Ok(super::Probe {
                 provider: super::ProviderKind::Grok,
                 path: Some(binary),
@@ -1459,40 +1397,6 @@ fn tool_output(raw: &Value, content: &[Value]) -> Option<String> {
             .join("\n")
     };
     (!text.is_empty()).then_some(text)
-}
-
-fn project_path(project: &std::path::Path, path: &str) -> bool {
-    use std::{io::ErrorKind, path::Component};
-    if path.is_empty() {
-        return false;
-    }
-    let Ok(project) = project.canonicalize() else {
-        return false;
-    };
-    let mut ancestor = project.join(path);
-    let mut missing = Vec::new();
-    loop {
-        match ancestor.canonicalize() {
-            Ok(mut resolved) => {
-                for part in missing.into_iter().rev() {
-                    resolved.push(part);
-                }
-                return resolved.starts_with(&project);
-            }
-            Err(error) => {
-                if error.kind() != ErrorKind::NotFound || ancestor.symlink_metadata().is_ok() {
-                    return false;
-                }
-                let Some(Component::Normal(part)) = ancestor.components().next_back() else {
-                    return false;
-                };
-                missing.push(part.to_owned());
-                if !ancestor.pop() {
-                    return false;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

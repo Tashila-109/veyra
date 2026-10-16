@@ -578,11 +578,18 @@ PromptWork is either one Veyra prompt with its turn id or one Provider turn that
 This flag's effect comes from Grok help and research and has not been observed on an installed Grok by these tests.
 --no-auto-update avoids an update check before the first frame.
 Ask first and Accept edits select default before agent; Full access uses agent --always-approve without --permission-mode.
+Every Ask first and Accept edits session/new, session/resume and session/load carries _meta with yoloMode false and autoMode false.
+After a successful open yields or retains the session id, the codec queues _x.ai/yolo_mode_changed with sessionId, yolo_mode false and auto_mode false before publishing Ready.
+The runtime notification requests clearing settings-seeded auto; user allow rules remain in force.
+Full access sends neither override and keeps --always-approve.
 Grok follows the user's Claude and Grok permission settings, so Ask first asks only when they do not already allow the action.
-Veyra adds no client hook gate and only answers permission requests Grok sends.
+Veyra adds no client hook gate.
+Grok has no Accept edits mode, so Accept edits asks as Ask first does.
 Model and effort are optional launch flags after agent, and Configure uses the existing respawn path.
 No model or effort values are invented when no catalog has been read.
 Initialize requests protocolVersion 1, disables filesystem and terminal client capabilities and declares _meta.clientType extension.
+The initialization catalog remains an untyped Value; missing, null or mistyped metadata and catalog fields cannot prevent session authentication.
+Only the probe reads model and effort fields, treating each invalid field as missing.
 ChildEnv captures whether XAI_API_KEY is set at environment construction and passes that fact to the Grok codec; isolated environments report it unset and remove the key from their child environment.
 An advertised xai.api_key method is chosen only with that captured presence; otherwise an advertised cached_token is used.
 Authentication precedes opening the session when a usable method is advertised, and an authentication-required open permits one reauthentication and retry.
@@ -612,7 +619,8 @@ The human's answer uses the original native request id; if the displayed turn en
 After the Veyra prompt ends, still-open foreign prompts immediately open one Provider turn in event order after its TurnEnded, without waiting for another frame.
 That Provider row remains Running until every tracked foreign prompt has ended, so a second foreign prompt's completion cannot end the first prompt's row.
 After a stopped Veyra turn ends, unfinished foreign prompts still open a Provider row, and the session-wide cancellation ladder stays armed until that work ends or cleanup stops the group.
-A lone completion for an unknown prompt id is ignored.
+A lone prompt_complete for an unknown prompt id is ignored.
+Every session-notification turn_completed with a prompt id records it as ended, including an unknown id, so later tagged content cannot reopen that prompt.
 Both x.ai and _x.ai task_backgrounded and task_completed spellings update the background task set.
 Task updates prefer update.task_snapshot.task_id and fall back to update.task_id; the recorded backgrounding frames carry the root task_id.
 The actor's existing background-work flag prevents Configure, SwitchView, parking and early task settlement while that set is nonempty.
@@ -623,6 +631,7 @@ Permission option kinds, session-update kinds, tool status and completion reason
 Completion reasons also default on null, missing or other invalid values, so a matching completion still ends the prompt; only an undecodable completion scope is skipped.
 Plan entries decode individually with a default status, and an entry without string content is skipped without discarding the other entries.
 Unknown notification methods and session-update kinds are logged at debug with only their name and are skipped.
+Ordinary session notifications without prompt_id are ignored without a malformed-notification log.
 A notification whose scope, sessionUpdate, task, plan container or tool payload fails typed decoding is logged at debug with its method and skipped without its payload; it does not fail the session.
 Notifications for another sessionId are dropped, and permission or question requests for another sessionId receive -32602.
 Unsupported or malformed server requests receive JSON-RPC errors without approval.
@@ -630,9 +639,9 @@ Unsupported or malformed server requests receive JSON-RPC errors without approva
 Permission requests select options by allow_once or reject_once kind and never select allow_always.
 A request with rawInput.variant Bash and only variant, command, description, is_background and timeout keys may use the existing exact-command thread grant, which still replies allow_once.
 The grant uses the stable Bash tool key and CommandCwd::ProjectFolder; a Monitor variant or any other input shape gets no grant.
-In Accept edits, an edit-kind request with an allow_once option is answered with that option without opening a request or dock only when every target path resolves inside the project folder.
-Targets come from nonempty toolCall.locations, otherwise rawInput.file_path; relative paths resolve from the project folder, and existing ancestors resolve symlinks before checking containment.
-Empty, missing, unresolved and outside targets retain the ordinary dock, as do commands and edits in other modes.
+Every permission request in Accept edits follows the same dock path as Ask first, including in-project edits, protected files, mismatched targets and requests arriving after Stop.
+The codec never selects an edit option automatically; typed answers and existing human-authorized exact-command grants keep their ordinary response path.
+Permissions and questions without a prompt id use the running Provider turn when Grok started the work.
 Other argument shapes offer no thread grant and show an unverified command cwd or a tool preview.
 ProposedAction::consent is Once with its optional thread grant, or DenyOnly with Grok's lasting-grant reason when no allow_once option exists.
 DenyOnly cannot carry a grant, and RequestKind::accepts owns allow decisions, exact thread grants and the Deny-only reason.
@@ -640,8 +649,9 @@ The window's request_consent derives enabled allows, reason and caption only fro
 RequestKind::accepts rejects both allow decisions for DenyOnly and preserves Deny, including after stored action round trips.
 Existing stored approvals without consent deserialize as Once, and RequestKind moves an older outer grant_key into that consent.
 An older DenyOnly action discards any outer grant_key when loaded.
-The Grok new-thread hint says the CLI loads the user's hooks and MCP servers and follows their Claude and Grok permission settings.
+The Grok new-thread hint says the CLI loads the user's hooks and MCP servers, follows their Claude and Grok permission settings, and asks as Ask first does in Accept edits.
 The window can start Grok threads; without a catalog, each model and effort menu offers only Default, which clears the corresponding configuration value.
+The model and effort action/key cycles return Default after the last advertised value; provider cycling still wraps to the first provider.
 With the no-catalog fallback, a new Grok picker thread keeps both values absent, so its launch line carries neither -m nor --reasoning-effort.
 Existing or tool-created threads can retain explicit values, which grok::args sends as launch flags.
 A DenyOnly dock shows its lasting-grant reason, disables Allow once and Allow in this thread, and leaves Deny enabled.
@@ -798,6 +808,7 @@ Grok resolves its binary and starts the Ask first launch line with no model or e
 One four-second initialize exchange reads its bare _meta.agentVersion, authMethods and _meta.modelState without authenticate, session/new or a turn.
 An advertised cached_token, or xai.api_key with the captured XAI_API_KEY presence, reads Ready; otherwise it reads Signed out and the picker names grok login.
 The catalog uses availableModels ids and names and each model's _meta.reasoningEfforts, with the advertised current model and each advertised default effort ordered first.
+Null or mistyped catalog containers, models and fields are treated as missing without losing the authMethods sign-in reading.
 The picker offers only the selected model's efforts, and a Grok model change clears an unsupported effort.
 No modelState keeps the Default-only fallback; the probe does not run grok models.
 Completion, cancellation and timeout stop the probe group and remove its private directory, including Grok versions that stay alive after stdin closes.
@@ -838,6 +849,10 @@ The codecs hand the recorder typed native-id and version metadata decoded from t
 ChildEnv reads HOME once and supplies it to the recorder; `<home>` is a capture placeholder, not a matcher binding.
 It replaces credential fields, redacts secret-shaped text, replaces hook output with a placeholder and keeps account and plan keys with masked values.
 Grok initialize agent and instance ids and hostname are masked, and availableCommands retains its shape with every value masked, including names.
+The first initialize hostname is bound and replaced wherever it recurs, and email shapes are masked in text.
+Account masking includes user-prefixed, email-containing, login, username, display_name, plan-prefixed and billing-prefixed keys.
+Grok sessions/changed entries for another cwd retain their keys with masked values; the recorded project entry remains useful.
+MCP server_status keeps server identity and status while masking detail values.
 MCP servers_updated retains name, source and type while masking each server's URL, command, args, env and headers.
 Every recorded http(s) URL loses its path and query.
 Claude probes are recorded as probe.jsonl; a later probe replaces that capture only after the earlier probe has ended.
@@ -1176,7 +1191,13 @@ Codex and Grok live wrappers call the same provider-parameterized test bodies in
 
 Grok replays cover prompt correlation, exactly-once completion, two turns per process, permissions, both question spellings, cancellation order, authentication retry, signed-out failure and advertised resume.
 The title replay checks one persisted tool row with an updated title and preserved output.
-Accept-edits regressions verify an in-project automatic answer, an outside dock and symlink-aware path boundaries; grant regressions reject Monitor and unknown keys.
+Accept-edits regressions verify both edit docks and no automatic reply, including mismatched paths, protected paths and requests arriving after Stop; grant regressions reject Monitor and unknown keys.
+Initialize regressions cover the seven reviewed null or mistyped variants plus malformed catalog containers and entries, preserving authentication and the probe sign-in reading.
+A Provider-turn permission replay persists an untagged request and its human answer; an early-completion regression drops late content while allowing a fresh prompt.
+Recorder regressions cover free-text email and bound hostname, account-key variants, other-folder session entries and MCP status detail.
+Ordinary session-notification regressions require no logs while a malformed content update still logs its method.
+Mode regressions verify false open metadata and a post-open notification for new, resumed and loaded Ask first and Accept edits sessions, with neither override in Full access.
+A synthetic-window regression drives both actions and keys through the advertised models and efforts back to Default.
 The ignored Grok approval round trip requests a printf redirect because bare touch is on Grok's safe list; Claude and Codex retain touch.
 The first-frame timeout replay advances Tokio time and does not wait sixty seconds on the wall clock.
 Actor-backed Grok replays verify persisted question answers and request expiry, and background work refusing Configure and SwitchView before a Provider continuation.
@@ -1193,5 +1214,6 @@ A default credential-frame test asserts the Grok mcpServers entry, preserves unr
 Grok fixtures name version 1.0.60 and use Veyra's masked live shapes for initialize, flat questions, task snapshots, Grok-started turn completion and resume.
 Replay tests do not prove installed Grok behavior; the retained live recording supplies those observed wire shapes.
 The live recording did not send permission requests.
-Decision 11 chose Follow my settings; replays cover the implemented approval and grant rules, while the installed live permission recheck remains unrun.
+Decision 11 chose Follow my settings; the installed 1.0.60 live recheck observed Grok resolving the redirect write itself without sending a permission request.
+Round 7 replays cover both edit docks and explicit auto/yolo disablement; their effect on installed Grok still needs a separately authorized live recheck.
 Grok live tests are ignored by default.

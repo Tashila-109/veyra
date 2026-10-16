@@ -596,7 +596,7 @@ where
     T: PartialEq,
 {
     let index = current.and_then(|current| values.iter().position(|value| value == current));
-    values.get(index.map(|index| (index + 1) % values.len()).unwrap_or(0))
+    values.get(index.map(|index| index + 1).unwrap_or(0))
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DockTarget {
@@ -2083,7 +2083,8 @@ impl Render for Shell {
                     return;
                 }
                 shell.provider = action.provider.unwrap_or_else(|| {
-                    *cycle(&ProviderKind::ALL, Some(&shell.provider)).expect("providers")
+                    *cycle(&ProviderKind::ALL, Some(&shell.provider))
+                        .unwrap_or(&ProviderKind::ALL[0])
                 });
                 shell.provider_picker = None;
                 shell.input.update(cx, |input, cx| input.focus(window, cx));
@@ -5404,6 +5405,59 @@ mod tests {
                 None
             );
             assert!(cx.debug_bounds("caption-Default model").is_some());
+            assert!(cx.debug_bounds("caption-Effort").is_some());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn grok_model_and_effort_cycles_include_default(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx,|shell,window,cx| {
+                configure_dock_thread(shell,ProviderKind::Grok,false,false);
+                shell.state.requests.clear();
+                shell.new_thread(window,cx);
+                shell.provider=ProviderKind::Grok;
+                shell.providers[0].models=serde_json::from_value(serde_json::json!([
+                    {"value":"grok-4.7","displayName":"Grok 4.7","supportedEffortLevels":["high","medium"]},
+                    {"value":"grok-4.5","displayName":"Grok 4.5","supportedEffortLevels":["high","medium"]}
+                ])).unwrap();
+                shell.config.model=None;
+                shell.config.effort=None;
+                window.dispatch_action(Box::new(super::PickModel::default()),cx);
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |s, _| s.config.model.clone()),
+                Some("grok-4.7".into())
+            );
+            cx.simulate_keystrokes("secondary-alt-m");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |s, _| s.config.model.clone()),
+                Some("grok-4.5".into())
+            );
+            cx.simulate_keystrokes("secondary-alt-m");
+            draw(cx);
+            assert_eq!(shell.read_with(cx, |s, _| s.config.model.clone()), None);
+            assert!(cx.debug_bounds("caption-Default model").is_some());
+            shell.update_in(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(super::PickEffort::default()), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |s, _| s.config.effort.clone()),
+                Some("high".into())
+            );
+            cx.simulate_keystrokes("secondary-alt-e");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |s, _| s.config.effort.clone()),
+                Some("medium".into())
+            );
+            cx.simulate_keystrokes("secondary-alt-e");
+            draw(cx);
+            assert_eq!(shell.read_with(cx, |s, _| s.config.effort.clone()), None);
             assert!(cx.debug_bounds("caption-Effort").is_some());
         });
     }

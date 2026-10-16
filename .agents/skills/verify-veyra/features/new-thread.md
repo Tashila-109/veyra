@@ -232,10 +232,16 @@ action('grok-catalog-model-wide','PickModel',{'model':'grok-4.7'})
 action('grok-catalog-xhigh','PickEffort',{'effort':'xhigh'})
 action('grok-catalog-model-narrow','PickModel',{'model':'grok-4.5'})
 assert ctl('grok-catalog-effort-reset','dump')['composer']['effort'] is None
-for effort in ['high','medium','low','high']:
-    ctl('grok-catalog-effort-'+effort,'keys','secondary-alt-e')
-    assert ctl('grok-catalog-effort-after-'+effort,'dump')['composer']['effort']==effort
+for index,effort in enumerate(['high','medium','low',None,'high']):
+    ctl('grok-catalog-effort-'+str(index),'keys','secondary-alt-e')
+    assert ctl('grok-catalog-effort-after-'+str(index),'dump')['composer']['effort']==effort
+    if effort is None: capture('grok-effort-default')
 capture('grok-new-thread-catalog')
+position = next(index for index,entry in enumerate(models) if entry['value']=='grok-4.5')
+for index,model in enumerate([entry['value'] for entry in models[position+1:]]+[None]):
+    ctl('grok-catalog-model-cycle-'+str(index),'keys','secondary-alt-m')
+    assert ctl('grok-catalog-model-cycle-after-'+str(index),'dump')['composer']['model']==model
+capture('grok-model-default')
 assert sql('select count(*) from threads')=='0'
 shutil.copy2(GROK_SOURCE/'probe-grok.jsonl',FIXTURES/'probe-grok.jsonl')
 action('grok-default-probe-restore','RecheckProviders')
@@ -251,7 +257,8 @@ PYGROK
 
 The Grok section preserves Ready and Signed out probes, bare version 1.0.60, advertised model names and each model's effort list, plus the catalog-free Default fallback.
 `grok-provider-menu-signed-out.png` shows the sign-in mark and `grok-new-thread-signed-out.png` shows Send disabled with `grok login`.
-`grok-new-thread-catalog.png` shows Grok 4.5 with high effort; changing from Grok 4.7 clears xhigh, and the effort key cycles only high, medium and low.
+`grok-new-thread-catalog.png` shows Grok 4.5 with high effort; changing from Grok 4.7 clears xhigh, and the effort key cycles high, medium, low and Default.
+`grok-effort-default.png` and `grok-model-default.png` show both key cycles returning to Default after a pick.
 Every Grok readiness and catalog step leaves zero threads.
 
 The Codex section preserves missing and Ready `providers[1].readiness`, `version` and `models`, the picker label, `composer.model` and `composer.effort`.

@@ -518,7 +518,8 @@ PYCODEX
 Run this fake-only section after Codex.
 It uses the existing approval dock and question choices, including both Grok question method spellings.
 Grok's approval command writes through a redirect, `printf 'veyra\n' > veyra-check.txt`; bare touch is on Grok's built-in safe list.
-Accept edits answers only verified in-project edits with allow_once, and the outside edit still docks.
+Grok has no Accept edits mode, so Accept edits asks as Ask first does.
+Both the in-project and outside edit requests dock, and Veyra sends no edit answer until the human decides.
 The question params are flat sessionId, toolCallId, mode and questions, without a nested params object, question id or prompt id; multiSelect may be null.
 A lasting-only request keeps Allow once and the thread grant visible but disabled, explains why, and still permits Deny.
 Stop removes the question dock; `requests` and SQLite preserve its Expired state.
@@ -555,13 +556,22 @@ before = int(sql('select count(*) from threads'))
 ctl('grok-accept-edits-send','keys','secondary-enter')
 selected = poll('grok-accept-edits-selected',lambda d:d['selected_thread'] is not None and int(sql('select count(*) from threads'))==before+1)
 thread = selected['selected_thread']['id']
-dock = poll('grok-accept-edits-outside',lambda d:d['composer']['dock'] is not None)['composer']['dock']
-assert (DATA/'project/inside.txt').exists()
+dock = poll('grok-accept-edits-inside',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert json.loads(dock['request']['native'])=='edit-inside' and dock['action_text']=='Edit inside'
+assert json.loads(dock['preview'])['file_path']=='inside.txt'
+assert not (DATA/'project/inside.txt').exists()
 assert sql("select count(*) from requests where thread_id='"+thread+"'")=='1'
+capture('grok-accept-edits-inside')
+action('grok-accept-edits-allow-inside','AllowOnce',{'request':dock['request']['id']})
+dock = poll('grok-accept-edits-outside',lambda d:d['composer']['dock'] is not None and json.loads(d['composer']['dock']['request']['native'])=='edit-outside')['composer']['dock']
+assert (DATA/'project/inside.txt').exists()
+assert json.loads(dock['preview'])['file_path']=='/veyra-outside/file.txt'
+assert sql("select count(*) from requests where thread_id='"+thread+"'")=='2'
 assert json.loads(dock['request']['native'])=='edit-outside' and dock['action_text']=='Edit outside'
 capture('grok-accept-edits-outside')
 action('grok-accept-edits-deny','Deny',{'request':dock['request']['id']})
 ctl('grok-accept-edits-done','wait',thread,'Done')
+assert [json.loads(row) for row in sql("select decision_json from requests where thread_id='"+thread+"' order by rowid").splitlines()]==['AllowOnce','Deny']
 (DATA/'project/inside.txt').unlink()
 thread = create_grok('grok-deny-only',scenario='approval-always-only',prompt='Offer only a lasting grant')
 dock = poll('grok-deny-only',lambda d:d['composer']['dock'] is not None)['composer']['dock']
@@ -620,7 +630,8 @@ PYGROK
 
 ## Observable success
 
-`grok-accept-edits-outside.png` shows only the outside edit dock, while SQLite has one request and inside.txt was created without a dock.
+`grok-accept-edits-inside.png` shows the in-project edit dock before any file is written.
+`grok-accept-edits-outside.png` shows the next outside edit dock with its matching rawInput path; SQLite has both human decisions, and inside.txt appears only after Allow once.
 The Grok approval PNGs show the exact redirect command and decisions; the file is absent after Deny and present after Allow once.
 `grok-deny-only.png` and its focused PNG show both disabled allow controls and `Grok offered only a lasting grant`.
 `composer.dock.allow_once_enabled`, `allow_in_thread_enabled` and `consent_reason` match those controls, and both allow keys and explicit actions leave the same request pending.

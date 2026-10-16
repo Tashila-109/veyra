@@ -106,12 +106,7 @@ fn grok_probe_without_catalog_offers_default() {
 
 #[cfg(debug_assertions)]
 fn grok_initialize_probe(auth: &[&str], catalog: bool, api_key: bool) -> crate::provider::Probe {
-    use crate::{domain::*, provider::*};
     use serde_json::json;
-    let root = std::env::temp_dir().join(format!("veyra-grok-probe-test-{}", ThreadId::new()));
-    let _scratch = super::Scratch(root.clone());
-    std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("private-project-file"), "unrelated project data").unwrap();
     let mut result = json!({"protocolVersion":1,"authMethods":auth.iter().map(|id|json!({"id":id})).collect::<Vec<_>>(),
         "agentCapabilities":{"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"_meta":{"agentVersion":"1.0.60"}});
     if catalog {
@@ -120,6 +115,17 @@ fn grok_initialize_probe(auth: &[&str], catalog: bool, api_key: bool) -> crate::
             {"modelId":"grok-4.7","name":"Grok 4.7","_meta":{"reasoningEfforts":[{"value":"xhigh"},{"value":"high","default":true},{"value":"medium"},{"value":"low"}]}}
         ]});
     }
+    grok_probe_result(result, api_key)
+}
+
+#[cfg(debug_assertions)]
+fn grok_probe_result(result: serde_json::Value, api_key: bool) -> crate::provider::Probe {
+    use crate::{domain::*, provider::*};
+    use serde_json::json;
+    let root = std::env::temp_dir().join(format!("veyra-grok-probe-test-{}", ThreadId::new()));
+    let _scratch = super::Scratch(root.clone());
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("private-project-file"), "unrelated project data").unwrap();
     let records = [
         json!({"type":"transcript_start","provider":"grok","protocol":"json-rpc","cli_version":"1.0.60","scenario":"probe-grok","source":"hand-written"}),
         json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":grok::initialize()}}),
@@ -926,144 +932,317 @@ fn grok_bash_variant_grants_only_the_exact_command_shape() {
 }
 
 #[test]
-fn grok_accept_edits_only_allows_verified_project_paths() {
+fn grok_accept_edits_docks_every_permission_without_reply() {
     use crate::{domain::*, provider::*};
     use serde_json::json;
     let root = std::env::temp_dir().join(format!("veyra-grok-edit-test-{}", ThreadId::new()));
     let _scratch = super::Scratch(root.clone());
     let project = root.join("project");
-    let outside = root.join("outside");
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::create_dir(&outside).unwrap();
-    crate::platform::test_symlink(&outside, &project.join("linked")).unwrap();
-    crate::platform::test_symlink(&root.join("absent"), &project.join("dangling")).unwrap();
-    let cases = [
-        (
-            json!([]),
-            json!("inside.txt"),
-            "edit",
-            PermissionMode::AcceptEdits,
-            true,
-        ),
-        (
-            json!([]),
-            json!(project.join("new/parents/file.txt")),
-            "edit",
-            PermissionMode::AcceptEdits,
-            true,
-        ),
-        (
-            json!([{"path":project.join("one.txt")},{"path":"two.txt"}]),
-            json!(outside.join("ignored.txt")),
-            "edit",
-            PermissionMode::AcceptEdits,
-            true,
-        ),
-        (
-            json!([{"path":project.join("one.txt")},{"path":outside.join("two.txt")}]),
-            json!("inside.txt"),
-            "edit",
-            PermissionMode::AcceptEdits,
-            false,
-        ),
-        (
-            json!([]),
-            json!("linked/file.txt"),
-            "edit",
-            PermissionMode::AcceptEdits,
-            false,
-        ),
-        (
-            json!([]),
-            json!("dangling/file.txt"),
-            "edit",
-            PermissionMode::AcceptEdits,
-            false,
-        ),
-        (
-            json!([]),
-            json!("../outside/file.txt"),
-            "edit",
-            PermissionMode::AcceptEdits,
-            false,
-        ),
-        (
-            json!([{"path":""}]),
-            json!("inside.txt"),
-            "edit",
-            PermissionMode::AcceptEdits,
-            false,
-        ),
-        (
-            json!([]),
-            json!(null),
-            "edit",
-            PermissionMode::AcceptEdits,
-            false,
-        ),
-        (
-            json!([]),
-            json!("inside.txt"),
-            "execute",
-            PermissionMode::AcceptEdits,
-            false,
-        ),
-        (
-            json!([]),
-            json!("inside.txt"),
-            "edit",
-            PermissionMode::AskFirst,
-            false,
-        ),
-    ];
-    for (locations, path, kind, mode, automatic) in cases {
-        let mut codec = grok::Codec::new(
-            SessionSpec {
-                thread: ThreadId::new(),
-                cwd: project.clone(),
-                config: ThreadConfig {
-                    mode,
-                    model: None,
-                    effort: None,
-                },
-                native: None,
-                root: false,
-                import: false,
-            },
-            1,
-            None,
-            false,
-        );
-        codec.initialize();
-        codec.value(json!({"id":1,"result":{}})).unwrap();
-        codec
-            .value(json!({"id":2,"result":{"sessionId":"native"}}))
-            .unwrap();
-        codec.start(TurnId::new(), "edit".into()).unwrap();
-        let decoded = codec.value(json!({"id":0,"method":"session/request_permission","params":{
-            "sessionId":"native","toolCall":{"toolCallId":"edit","title":"Edit file","kind":kind,"locations":locations,"rawInput":{"file_path":path}},
-            "options":[{"optionId":"once","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]
-        }})).unwrap();
-        assert_eq!(
-            decoded.events.iter().any(|event| matches!(
-                event,
-                ProviderEvent::Turn {
-                    event: TurnEvent::RequestOpened { .. },
-                    ..
+    for mode in [PermissionMode::AcceptEdits, PermissionMode::AskFirst] {
+        for (locations, path) in [
+            (
+                json!([{"path":project.join("inside.txt")}]),
+                json!(root.join("outside.txt")),
+            ),
+            (
+                json!([{"path":project.join("inside.txt")}]),
+                json!(project.join("inside.txt")),
+            ),
+            (json!([]), json!(".git/hooks/pre-commit")),
+            (json!([]), json!(".grok/config.toml")),
+            (json!([]), json!(".claude/settings.json")),
+            (json!([]), json!("~/.zshrc")),
+            (json!([]), json!("$HOME/.zshrc")),
+            (json!([]), json!(null)),
+        ] {
+            for stopped in [false, true] {
+                let mut codec = grok::Codec::new(
+                    SessionSpec {
+                        thread: ThreadId::new(),
+                        cwd: project.clone(),
+                        config: ThreadConfig {
+                            mode,
+                            model: None,
+                            effort: None,
+                        },
+                        native: None,
+                        root: false,
+                        import: false,
+                    },
+                    1,
+                    None,
+                    false,
+                );
+                codec.initialize();
+                codec.value(json!({"id":1,"result":{}})).unwrap();
+                codec
+                    .value(json!({"id":2,"result":{"sessionId":"native"}}))
+                    .unwrap();
+                let turn = TurnId::new();
+                codec.start(turn, "edit".into()).unwrap();
+                if stopped {
+                    codec.interrupt_active(StopReason::User);
                 }
-            )),
-            !automatic,
-            "{kind} {mode:?} {path}"
-        );
-        if automatic {
-            assert_eq!(
-                decoded.replies,
-                [
-                    json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"once"}}})
-                ]
+                let decoded = codec.value(json!({"id":0,"method":"session/request_permission","params":{
+                    "sessionId":"native","toolCall":{"toolCallId":"edit","title":"Edit file","kind":"edit","locations":locations,"rawInput":{"file_path":path}},
+                    "options":[{"optionId":"once","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]
+                }})).unwrap();
+                assert!(
+                    decoded.replies.is_empty(),
+                    "automatic reply for {mode:?}, stopped={stopped}, {path}"
+                );
+                let request = decoded
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        ProviderEvent::Turn {
+                            turn: Some(owner),
+                            event:
+                                TurnEvent::RequestOpened {
+                                    native,
+                                    kind: RequestKind::Approval { action },
+                                },
+                        } if *owner == turn => Some((native, action)),
+                        _ => None,
+                    })
+                    .expect("every edit must dock under the running turn");
+                assert_eq!(request.1.tool, "Edit file");
+                assert_eq!(
+                    codec.answer(request.0.clone(), Decision::Deny),
+                    Some(
+                        json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"deny"}}})
+                    )
+                );
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn grok_initialize_odd_catalog_values_keep_authentication_and_sign_in() {
+    use crate::provider::*;
+    use serde_json::json;
+    let base = json!({"authMethods":[{"id":"cached_token"}],"_meta":{"agentVersion":"1.0.60","modelState":{"currentModelId":"grok-4.7","availableModels":[{"modelId":"grok-4.7","name":"Grok 4.7","_meta":{"reasoningEfforts":[{"value":"high","default":true}]}}]}}});
+    let mut failures = Vec::new();
+    for (path, value) in [
+        (
+            "/_meta/modelState/availableModels/0/_meta/reasoningEfforts",
+            json!(null),
+        ),
+        ("/_meta/modelState/availableModels/0/_meta", json!(null)),
+        ("/_meta/modelState/availableModels/0/name", json!(null)),
+        (
+            "/_meta/modelState/availableModels/0/_meta/reasoningEfforts/0/default",
+            json!(null),
+        ),
+        ("/_meta/modelState/currentModelId", json!(null)),
+        ("/_meta/agentVersion", json!(1)),
+        ("/_meta", json!(null)),
+        ("/_meta/modelState", json!(false)),
+        ("/_meta/modelState/availableModels", json!(17)),
+        ("/_meta/modelState/availableModels/0", json!(false)),
+        ("/_meta/modelState/availableModels/0/modelId", json!([])),
+        (
+            "/_meta/modelState/availableModels/0/_meta/reasoningEfforts/0",
+            json!(false),
+        ),
+        (
+            "/_meta/modelState/availableModels/0/_meta/reasoningEfforts/0/value",
+            json!({}),
+        ),
+    ] {
+        let mut result = base.clone();
+        *result.pointer_mut(path).unwrap() = value;
+        let mut codec = initial_codec(false);
+        codec.initialize();
+        let authenticated = codec.value(json!({"id":1,"result":result})).is_ok_and(|d| {
+            d.replies
+                .iter()
+                .any(|r| r["method"] == "authenticate" && r["params"]["methodId"] == "cached_token")
+        });
+        if !authenticated {
+            failures.push(format!("session {path}"));
+        }
+        result["authMethods"] = json!([{"id":"grok.com"}]);
+        let probe = grok_probe_result(result, false);
+        if probe.readiness != Readiness::SignedOut {
+            failures.push(format!("probe {path}"));
+        }
+    }
+    assert_eq!(failures, Vec::<String>::new());
+}
+
+#[test]
+fn grok_provider_permission_without_prompt_docks_and_answers() {
+    use crate::{domain::*, provider::*};
+    use serde_json::json;
+    let mut codec = ready_codec();
+    let started=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"task-completed-permission"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"report"}}}})).unwrap();
+    assert!(started.provider_turn.is_some());
+    let decoded=codec.value(json!({"id":0,"method":"session/request_permission","params":{"sessionId":"native","toolCall":{"toolCallId":"tool","title":"Execute `pwd`","rawInput":{"variant":"Bash","command":"pwd"}},"options":[{"optionId":"once","kind":"allow_once"}]}})).unwrap();
+    assert!(decoded.replies.is_empty());
+    let native = decoded
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ProviderEvent::Turn {
+                turn: None,
+                event:
+                    TurnEvent::RequestOpened {
+                        native,
+                        kind: RequestKind::Approval { action },
+                    },
+            } if action.tool == "Execute `pwd`" => Some(native.clone()),
+            _ => None,
+        })
+        .expect("permission must dock in the running Provider turn");
+    assert_eq!(
+        codec.answer(native, Decision::AllowOnce),
+        Some(
+            json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"once"}}})
+        )
+    );
+    let ended=codec.value(json!({"method":"_x.ai/session_notification","params":{"sessionId":"native","update":{"sessionUpdate":"turn_completed","prompt_id":"task-completed-permission","stop_reason":"end_turn"}}})).unwrap();
+    assert!(matches!(
+        ended.events.as_slice(),
+        [ProviderEvent::Turn {
+            turn: None,
+            event: TurnEvent::TurnEnded {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        }]
+    ));
+    assert!(codec.active().is_none());
+}
+
+#[test]
+fn grok_early_turn_completed_prevents_late_prompt_reopening() {
+    use crate::provider::*;
+    use serde_json::json;
+    let mut codec = ready_codec();
+    for method in ["_x.ai/session_notification", "x.ai/session_notification"] {
+        let completed=codec.value(json!({"method":method,"params":{"sessionId":"native","update":{"sessionUpdate":"turn_completed","prompt_id":"task-completed-early","stop_reason":"end_turn"}}})).unwrap();
+        assert!(completed.events.is_empty());
+        let late=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"task-completed-early"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"late"}}}})).unwrap();
+        assert!(late.events.is_empty() && late.provider_turn.is_none());
+        assert!(codec.active().is_none());
+    }
+    let fresh=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"task-completed-fresh"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh"}}}})).unwrap();
+    assert!(fresh.provider_turn.is_some());
+    assert!(fresh.events.iter().any(|e|matches!(e,ProviderEvent::Turn {event:TurnEvent::TextDelta {text,..},..} if text=="fresh")));
+}
+
+#[test]
+fn grok_ordinary_session_notifications_log_nothing() {
+    use serde_json::json;
+    let logs = super::logs::CapturedLogs::default();
+    tracing::subscriber::with_default(logs.clone(), || {
+        let mut codec = ready_codec();
+        for method in ["_x.ai/session_notification", "x.ai/session_notification"] {
+            for update in [
+                "pending_interaction",
+                "interaction_resolved",
+                "response_completed",
+                "tool_call_delta_chunk",
+                "hook_started",
+                "session_summary_generated",
+                "model_changed",
+                "background_tasks",
+                "auto_compact_completed",
+                "turn_completed",
+            ] {
+                let decoded=codec.value(json!({"method":method,"params":{"sessionId":"native","update":{"sessionUpdate":update}}})).unwrap();
+                assert!(decoded.events.is_empty() && decoded.provider_turn.is_none());
+            }
+        }
+        assert!(logs.0.lock().unwrap().is_empty());
+        codec
+            .value(json!({"method":"session/update","params":{"sessionId":"native","update":{}}}))
+            .unwrap();
+    });
+    let entries = logs.0.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].get("method").map(String::as_str),
+        Some("session/update")
+    );
+}
+
+#[test]
+fn grok_non_full_access_disables_auto_on_every_open() {
+    use crate::{domain::*, provider::*};
+    use serde_json::json;
+    for mode in [
+        PermissionMode::AskFirst,
+        PermissionMode::AcceptEdits,
+        PermissionMode::FullAccess,
+    ] {
+        for method in ["session/new", "session/resume", "session/load"] {
+            let retained =
+                (method != "session/new").then(|| NativeSessionId("retained-session".into()));
+            let mut codec = grok::Codec::new(
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: "/project".into(),
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode,
+                    },
+                    native: retained,
+                    root: false,
+                    import: method == "session/load",
+                },
+                1,
+                None,
+                false,
             );
-        } else {
-            assert!(decoded.replies.is_empty());
+            codec.initialize();
+            let init=codec.value(json!({"id":1,"result":{"authMethods":[{"id":"cached_token"}],"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}})).unwrap();
+            assert_eq!(init.replies[0]["method"], "authenticate");
+            let auth = codec.value(json!({"id":2,"result":{}})).unwrap();
+            let open = auth.controls[0].value();
+            assert_eq!(open["method"], method);
+            if mode == PermissionMode::FullAccess {
+                assert!(open["params"].get("_meta").is_none());
+            } else {
+                assert_eq!(
+                    open["params"]["_meta"],
+                    json!({"yoloMode":false,"autoMode":false}),
+                    "{mode:?} {method}"
+                );
+            }
+            let result = if method == "session/new" {
+                json!({"sessionId":"new-session"})
+            } else {
+                json!({})
+            };
+            let opened = codec.value(json!({"id":3,"result":result})).unwrap();
+            let native = if method == "session/new" {
+                "new-session"
+            } else {
+                "retained-session"
+            };
+            assert!(
+                matches!(opened.events.as_slice(),[ProviderEvent::Session(SessionEvent::Ready {native:NativeSessionId(id),..})] if id==native)
+            );
+            if mode == PermissionMode::FullAccess {
+                assert!(opened.replies.is_empty());
+            } else {
+                assert_eq!(
+                    opened.replies,
+                    [
+                        json!({"jsonrpc":"2.0","method":"_x.ai/yolo_mode_changed","params":{"sessionId":native,"yolo_mode":false,"auto_mode":false}})
+                    ]
+                );
+            }
+            assert!(matches!(
+                codec.start(TurnId::new(), "work".into()),
+                Some(Outbound::Prompt(_))
+            ));
         }
     }
 }

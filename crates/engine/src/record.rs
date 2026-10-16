@@ -95,8 +95,11 @@ mod capture {
     };
     static ACCOUNT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-        r"(?i)^(account.*|.*_?account_?id|user_?id|user|team.*|org.*|plan(?:_?type|_?name)?|tier|subscription.*|email.*)$"
+        r"(?i)^(account.*|.*_?account_?id|user.*|.*username|.*email.*|login|display_name|team.*|org.*|plan.*|billing.*|tier|subscription.*)$"
     ).expect("account fields")
+    });
+    static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+").expect("email text")
     });
     static URL: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)(https?://)([^/\s\"'?#]+)([/?#][^\s\"']*)?"#).expect("URL path and query")
@@ -263,6 +266,33 @@ mod capture {
             Ok(())
         }
         pub fn line(&mut self, outbound: bool, mut value: Value) -> io::Result<()> {
+            if !self.bindings.values().any(|v| v == "<hostname>")
+                && let Some(hostname) = value["result"]["_meta"]["hostname"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+            {
+                self.bind(hostname.into(), "<hostname>".into());
+            }
+            if matches!(
+                value["method"].as_str(),
+                Some("_x.ai/sessions/changed" | "x.ai/sessions/changed")
+            ) && let Some(sessions) = value["params"]["upserted"].as_array_mut()
+            {
+                for session in sessions {
+                    if session["cwd"].as_str().is_none_or(|cwd| {
+                        cwd != "<cwd>" && self.bindings.get(cwd).is_none_or(|v| v != "<cwd>")
+                    }) {
+                        *session = mask_account(session.take());
+                    }
+                }
+            }
+            if matches!(
+                value["method"].as_str(),
+                Some("_x.ai/mcp/server_status" | "x.ai/mcp/server_status")
+            ) && let Some(detail) = value["params"].get_mut("detail")
+            {
+                *detail = mask_account(detail.take());
+            }
             if matches!(
                 value["method"].as_str(),
                 Some("_x.ai/mcp/servers_updated" | "x.ai/mcp/servers_updated")
@@ -383,28 +413,25 @@ mod capture {
                         self.bind(text, binding.clone());
                         return Value::String(binding);
                     }
-                    let mut text = text;
+                    let text = URL.replace_all(&text, |capture: &regex::Captures<'_>| {
+                        let authority = capture[2]
+                            .rsplit_once('@')
+                            .map_or(&capture[2], |(_, host)| host);
+                        format!(
+                            "{}{authority}{}",
+                            &capture[1],
+                            if capture.get(3).is_some() {
+                                "/<path>"
+                            } else {
+                                ""
+                            }
+                        )
+                    });
+                    let mut text = EMAIL.replace_all(&text, "<email>").into_owned();
                     for (value, binding) in &self.bindings {
                         text = text.replace(value, binding);
                     }
-                    let text = redact(&text, None).replace("[redacted]", "<any>");
-                    Value::String(
-                        URL.replace_all(&text, |capture: &regex::Captures<'_>| {
-                            let authority = capture[2]
-                                .rsplit_once('@')
-                                .map_or(&capture[2], |(_, host)| host);
-                            format!(
-                                "{}{authority}{}",
-                                &capture[1],
-                                if capture.get(3).is_some() {
-                                    "/<path>"
-                                } else {
-                                    ""
-                                }
-                            )
-                        })
-                        .into_owned(),
-                    )
+                    Value::String(redact(&text, None).replace("[redacted]", "<any>"))
                 }
                 value => value,
             }
