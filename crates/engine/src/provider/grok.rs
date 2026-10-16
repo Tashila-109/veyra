@@ -202,12 +202,12 @@ struct UpdateHeader {
 }
 #[derive(Deserialize)]
 struct PlanUpdate {
-    entries: Vec<PlanEntry>,
+    entries: Vec<Value>,
 }
 #[derive(Deserialize)]
 struct PlanEntry {
     content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_on_invalid")]
     status: ToolStatus,
 }
 enum Update {
@@ -310,6 +310,7 @@ enum CompletionReason {
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Completion {
+    #[serde(deserialize_with = "default_on_invalid")]
     stop_reason: CompletionReason,
     agent_result: Value,
 }
@@ -793,6 +794,12 @@ impl Codec {
             return Ok(());
         };
         let owner = self.active().unwrap();
+        if matches!(owner, ActiveTurn::Veyra(_))
+            && matches!(self.prompts[&id].origin, PromptOrigin::Foreign)
+        {
+            tracing::debug!(method, "Skipped foreign Grok content during Veyra prompt");
+            return Ok(());
+        }
         let key = |suffix: &str| NativeItemKey(format!("{id}/{suffix}"));
         match update {
             Update::Message(Content::Text { text }) => Self::event(
@@ -875,6 +882,7 @@ impl Codec {
                 TurnEvent::Plan(
                     plan.entries
                         .into_iter()
+                        .filter_map(|entry| serde_json::from_value::<PlanEntry>(entry).ok())
                         .map(|entry| PlanStep {
                             text: entry.content,
                             done: entry.status == ToolStatus::Completed,
@@ -1132,6 +1140,14 @@ impl Codec {
 }
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ProviderError> {
     serde_json::from_value(value).map_err(|_| ProviderError::Protocol("Invalid Grok frame".into()))
+}
+fn default_on_invalid<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 fn auth_method(methods: &[AuthMethod], api_key: bool) -> Option<String> {
     ["xai.api_key", "cached_token"]

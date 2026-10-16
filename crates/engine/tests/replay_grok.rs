@@ -959,3 +959,81 @@ fn grok_stopped_veyra_turn_announces_unfinished_foreign_work() {
         },
     );
 }
+#[test]
+fn grok_foreign_completion_with_null_reason_ends_provider_turn() {
+    engine_replay(
+        "foreign-completion-null",
+        |engine, thread, events, runtime| {
+            runtime.block_on(async {
+                use veyra_engine::events::{ChangeEvent, UiEvent};
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let mut provider = None;
+                    while let Some(event) = events.recv().await {
+                        match event {
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnStarted(turn),
+                                ..
+                            } if turn.origin == TurnOrigin::Provider => provider = Some(turn.id),
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnEnded(turn),
+                                ..
+                            } if turn.origin == TurnOrigin::Provider => {
+                                assert_eq!(provider, Some(turn.id));
+                                assert_eq!(turn.thread, thread);
+                                assert!(
+                                    matches!(
+                                        turn.state,
+                                        TurnState::Ended {
+                                            outcome: TurnOutcome::Completed,
+                                            ..
+                                        }
+                                    ),
+                                    "{turn:?}"
+                                );
+                                assert!(!engine.window_threads()[&thread].busy);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    panic!("null completion did not end Provider work");
+                })
+                .await
+                .unwrap();
+            })
+        },
+    );
+}
+#[test]
+fn grok_plan_defaults_each_entry_status() {
+    let events = standard("plan-entry-defaults");
+    let plans: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Turn {
+                event: TurnEvent::Plan(steps),
+                ..
+            } => Some(steps.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        plans,
+        [vec![
+            PlanStep {
+                text: "Step one".into(),
+                done: true
+            },
+            PlanStep {
+                text: "Step two".into(),
+                done: false
+            },
+            PlanStep {
+                text: "Step three".into(),
+                done: false
+            },
+        ]]
+    );
+    assert_eq!(text(&events), "ok");
+    assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
+}

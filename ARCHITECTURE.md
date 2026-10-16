@@ -488,8 +488,11 @@ Granting that directory would let Codex redirect the human's later Git commands,
 The codec reads thread reply metadata without interpreting the echoed sandbox as a string.
 The turn/start reply is Accepted; notifications received before it are buffered and then correlated to the returned native turn id.
 A valid own-thread request before that reply attaches to the Veyra turn being started and docks immediately, so a server waiting for consent can progress.
-While a Veyra turn is bound, an own-thread request tagged with another non-ended native turn also docks under that Veyra turn and uses its answer and cancellation lifetime.
-It binds a provisional native turn when one is supplied; an MCP elicitation can omit turnId and still be answered by its request id.
+While a Veyra turn is bound, an own-thread request tagged with another non-ended native turn also docks under that Veyra turn for answers and expiry.
+Each request keeps its native turn id separately from its displayed owner.
+When the Veyra turn completes, the codec queues a cancel reply for each of its docked requests whose native turn differs from the completed turn, before the actor expires those requests.
+Requests for the completed native turn are removed without an extra reply.
+Before the turn/start reply, a request with a native turn id binds it provisionally; an MCP elicitation can omit turnId and still be answered by its request id.
 A request for an idle own-thread turn opens Provider work even before turn/started.
 Another thread's requests are refused without docking, and a start reply that changes a provisional id fails the session.
 The matching turn/completed ends that turn even before turn/started, and a completed native id cannot reopen work.
@@ -592,7 +595,10 @@ If no JSON line arrives within sixty seconds of building the prompt, Veyra's cho
 Any parsed JSON frame clears that deadline, and there is no later silence timeout.
 Unknown prompt ids on supported content updates or valid server requests are tracked as foreign prompts.
 With no displayed work, the codec announces a Provider turn before emitting content or a request.
-While a Veyra prompt runs, foreign content and requests use its turn id, preserving the Veyra Stop target and the actor's persisted request dock.
+While a Veyra prompt runs, only foreign permission and question requests use its turn id, preserving the Veyra Stop target and the actor's persisted request dock.
+Foreign text, reasoning, tool and plan updates still track the foreign prompt but emit no content during Veyra work; each is logged at debug with only its method.
+Once foreign work runs as a Provider turn, its subsequent content is emitted there.
+Task reports select the last assistant text item, so dropped content cannot replace a child's own reply.
 The human's answer uses the original native request id; if the displayed turn ends first, finish queues a native cancelled reply and the actor expires the request with that turn.
 After the Veyra prompt ends, still-open foreign prompts immediately open one Provider turn in event order after its TurnEnded, without waiting for another frame.
 That Provider row remains Running until every tracked foreign prompt has ended, so a second foreign prompt's completion cannot end the first prompt's row.
@@ -602,8 +608,10 @@ Both x.ai and _x.ai task_backgrounded and task_completed spellings update a set 
 The actor's existing background-work flag prevents Configure, SwitchView, parking and early task settlement while that set is nonempty.
 Text, reasoning, tool rows and plans normalize to the existing engine events; tool output emits cumulative-output suffix deltas and the actor bounds their retained tail.
 Permission option kinds, session-update kinds, tool status and completion reasons decode into enums with an Unknown fallback.
+Completion reasons also default on null, missing or other invalid values, so a matching completion still ends the prompt; only an undecodable completion scope is skipped.
+Plan entries decode individually with a default status, and an entry without string content is skipped without discarding the other entries.
 Unknown notification methods and session-update kinds are logged at debug with only their name and are skipped.
-A notification whose _meta, sessionUpdate, completion, task, plan or tool payload fails typed decoding is logged at debug with its method and skipped without its payload; it does not fail the session.
+A notification whose scope, sessionUpdate, task, plan container or tool payload fails typed decoding is logged at debug with its method and skipped without its payload; it does not fail the session.
 Notifications for another sessionId are dropped, and permission or question requests for another sessionId receive -32602.
 Unsupported or malformed server requests receive JSON-RPC errors without approval.
 
@@ -1142,7 +1150,10 @@ Grok replays cover prompt correlation, exactly-once completion, two turns per pr
 The first-frame timeout replay advances Tokio time and does not wait sixty seconds on the wall clock.
 Actor-backed Grok replays verify persisted question answers and request expiry, and background work refusing Configure and SwitchView before a Provider continuation.
 Foreign-request actor tests check permission and question docks, persisted answers and expiry, native cancellation before session/cancel, later Send after foreign-work promotion, both Stop targets, promotion after a stopped Veyra turn and overlapping Provider prompts.
-The Codex actor regression verifies a foreign native turn's permission docks under the bound Veyra turn and receives its native answer.
+Codex actor regressions verify a foreign native turn's permission docks under the bound Veyra turn, receives its native answer, or gets a cancel reply when that Veyra turn completes first.
+Grok regressions verify null completion reasons end Provider work, invalid completion scopes leave it running, and a bad plan-entry status preserves the other entries.
+The Grok child report regression drives decoded fixture frames through the actor and verifies the child's own reply reaches its parent despite later foreign content during that prompt.
+The foreign-content unit regression checks payload-free logging and suppression during Veyra work, then normal content during Provider work.
 Malformed-notification replays keep the session alive through missing or numeric update kinds, a null tool title, a numeric prompt id and null metadata; codec tests check method-only diagnostics and prevent wrong-session or replay notifications from confirming admission.
 grok_root_reaches_real_relay runs in the ordinary application suite with the production veyra mcp executable and fake CLI without opening a window.
 A default credential-frame test asserts the Grok mcpServers entry, preserves unrelated config and requires only the token marker in its recording value.

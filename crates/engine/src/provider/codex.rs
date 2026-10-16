@@ -142,6 +142,7 @@ struct Request {
     kind: RequestKind,
     reply: RequestReply,
     owner: ActiveTurn,
+    native_turn: Option<String>,
 }
 #[derive(Default)]
 struct Item {
@@ -659,8 +660,18 @@ impl Codec {
                 if let Some(turn) = self.turns.get_mut(&id) {
                     turn.phase = TurnPhase::Ended;
                 }
-                self.requests
-                    .retain(|_, request| request.owner.target() != owner.target());
+                self.requests.retain(|_, request| {
+                    if request.owner.target() != owner.target() {
+                        return true;
+                    }
+                    if request.native_turn.as_deref() != Some(id.as_str()) {
+                        decoded.replies.push(
+                            self.peer
+                                .response(request.id.clone(), cancel(&request.reply)),
+                        );
+                    }
+                    false
+                });
                 if self
                     .active()
                     .is_some_and(|active| active.target() == owner.target())
@@ -1087,8 +1098,8 @@ impl Codec {
             }
             wire::Request::Unknown => return,
         };
-        let owner = match native_turn {
-            Some(native) => self.route(&native, decoded).or_else(|| {
+        let owner = match native_turn.as_deref() {
+            Some(native) => self.route(native, decoded).or_else(|| {
                 self.active()
                     .filter(|owner| matches!(owner, ActiveTurn::Veyra(_)))
             }),
@@ -1120,6 +1131,7 @@ impl Codec {
                 kind: kind.clone(),
                 reply,
                 owner,
+                native_turn,
             },
         );
         decoded.events.push(ProviderEvent::Turn {

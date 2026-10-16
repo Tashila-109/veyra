@@ -1102,3 +1102,65 @@ fn codex_foreign_permission_docks_in_veyra_turn() {
         Decision::AllowOnce,
     );
 }
+#[test]
+fn codex_foreign_request_expiry_sends_cancel() {
+    harness::actor_replay(
+        ProviderKind::Codex,
+        "foreign-permission-expiry",
+        |engine, thread, events, runtime| {
+            runtime.block_on(async {
+                use veyra_engine::events::{ChangeEvent, UiEvent};
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let (mut opened, mut expired) = (None, false);
+                    while let Some(event) = events.recv().await {
+                        match event {
+                            UiEvent::Change {
+                                event: ChangeEvent::RequestOpened(request),
+                                ..
+                            } => {
+                                assert_eq!(request.thread, thread);
+                                assert_eq!(request.state, RequestState::Pending);
+                                opened = Some((request.id, request.turn));
+                            }
+                            UiEvent::Change {
+                                event: ChangeEvent::RequestClosed(request),
+                                ..
+                            } => {
+                                assert_eq!(opened, Some((request.id, request.turn)));
+                                assert!(matches!(request.state, RequestState::Expired { .. }));
+                                expired = true;
+                            }
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnEnded(turn),
+                                ..
+                            } if turn.origin != TurnOrigin::Provider => {
+                                assert_eq!(opened.map(|(_, turn)| turn), Some(turn.id));
+                                assert!(expired);
+                                assert!(matches!(
+                                    turn.state,
+                                    TurnState::Ended {
+                                        outcome: TurnOutcome::Completed,
+                                        ..
+                                    }
+                                ));
+                                let marker = engine
+                                    .child_env()
+                                    .fixtures
+                                    .unwrap()
+                                    .join("native-cancel-checked");
+                                while !marker.exists() {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    panic!("foreign request did not expire with a native cancel");
+                })
+                .await
+                .unwrap();
+            })
+        },
+    );
+}
