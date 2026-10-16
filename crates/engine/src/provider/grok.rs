@@ -94,6 +94,7 @@ struct Prompt {
     origin: PromptOrigin,
     accepted: bool,
     first_frame: Option<Instant>,
+    tool_starts: BTreeMap<String, ToolCall>,
 }
 enum PermissionReply {
     Permission {
@@ -458,6 +459,7 @@ impl Codec {
                 origin: PromptOrigin::Veyra(turn),
                 accepted: false,
                 first_frame: Some(Instant::now() + Duration::from_secs(60)),
+                tool_starts: BTreeMap::new(),
             },
         );
         self.set_work(Some(PromptWork::Veyra {
@@ -486,6 +488,7 @@ impl Codec {
             origin: PromptOrigin::Foreign,
             accepted: true,
             first_frame: None,
+            tool_starts: BTreeMap::new(),
         });
         if self.work().is_none() {
             let turn = self.begin_provider();
@@ -797,6 +800,20 @@ impl Codec {
         if matches!(owner, ActiveTurn::Veyra(_))
             && matches!(self.prompts[&id].origin, PromptOrigin::Foreign)
         {
+            if header.kind == UpdateKind::ToolCall
+                && let Update::Tool(tool) = update
+                && !tool.tool_call_id.is_empty()
+            {
+                self.prompts.get_mut(&id).unwrap().tool_starts.insert(
+                    tool.tool_call_id,
+                    ToolCall {
+                        name: tool.title,
+                        arguments: tool.raw_input,
+                        veyra_label: false,
+                        input_summary: None,
+                    },
+                );
+            }
             tracing::debug!(method, "Skipped foreign Grok content during Veyra prompt");
             return Ok(());
         }
@@ -819,12 +836,26 @@ impl Codec {
                     text,
                 },
             ),
-            Update::Tool(tool) => {
+            Update::Tool(mut tool) => {
                 if tool.tool_call_id.is_empty() {
                     return Ok(());
                 }
                 let tool_key = format!("{}/{id}/tool/{}", owner.target(), tool.tool_call_id);
                 let output = tool_output(&tool.raw_output, &tool.content);
+                if let Some(start) = self
+                    .prompts
+                    .get_mut(&id)
+                    .unwrap()
+                    .tool_starts
+                    .remove(&tool.tool_call_id)
+                {
+                    if !start.name.is_empty() {
+                        tool.title = start.name;
+                    }
+                    if !start.arguments.is_null() {
+                        tool.raw_input = start.arguments;
+                    }
+                }
                 let state = self.tools.entry(tool_key.clone()).or_insert_with(|| {
                     Self::event(
                         decoded,

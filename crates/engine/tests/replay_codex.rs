@@ -1164,3 +1164,49 @@ fn codex_foreign_request_expiry_sends_cancel() {
         },
     );
 }
+#[test]
+fn codex_untagged_elicitation_expires_without_an_extra_reply() {
+    harness::actor_replay(
+        ProviderKind::Codex,
+        "elicitation-without-turn-completes",
+        |engine, thread, events, runtime| {
+            runtime.block_on(async {
+            use veyra_engine::{commands::Command, events::{ChangeEvent, UiEvent}};
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut opened, mut expired, mut ended) = (None, false, 0);
+                while let Some(event) = events.recv().await {
+                    match event {
+                        UiEvent::Change { event: ChangeEvent::RequestOpened(request), .. } => {
+                            assert_eq!(request.thread, thread);
+                            assert_eq!(request.state, RequestState::Pending);
+                            opened = Some((request.id, request.turn));
+                        }
+                        UiEvent::Change { event: ChangeEvent::RequestClosed(request), .. } => {
+                            assert_eq!(opened, Some((request.id, request.turn)));
+                            assert!(matches!(request.state, RequestState::Expired { .. }));
+                            expired = true;
+                        }
+                        UiEvent::Change { event: ChangeEvent::TurnEnded(turn), .. } => {
+                            assert_eq!(turn.thread, thread);
+                            assert!(matches!(turn.state, TurnState::Ended { outcome: TurnOutcome::Completed, .. }), "{turn:?}");
+                            ended += 1;
+                            if ended == 1 {
+                                assert_eq!(opened.map(|(_, turn)| turn), Some(turn.id));
+                                assert!(expired);
+                                engine.send(Command::Send { thread, text: "second".into() }).await.unwrap().unwrap();
+                            } else {
+                                assert!(engine.child_env().fixtures.unwrap().join("no-extra-reply-checked").exists());
+                                let snapshot = engine.snapshot(thread).await.unwrap();
+                                assert!(snapshot.items.iter().any(|item| matches!(&item.body, ItemBody::AssistantText { text, .. } if text == "second")));
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                panic!("the next prompt did not follow the expired elicitation");
+            }).await.unwrap();
+        })
+        },
+    );
+}

@@ -1037,3 +1037,42 @@ fn grok_plan_defaults_each_entry_status() {
     assert_eq!(text(&events), "ok");
     assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
 }
+#[test]
+fn grok_foreign_tool_keeps_start_metadata_after_promotion() {
+    let events = standard("foreign-tool-span");
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Turn {
+                turn,
+                event: TurnEvent::ToolStarted { key, call },
+            } => Some((turn, key, call)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 3);
+    for ((owner, key, call), (name, arguments, tail)) in starts.into_iter().zip([
+        ("Bash", serde_json::json!({"command":"ls"}), "file.txt"),
+        ("Read", serde_json::json!({"path":"two"}), "two.txt"),
+        ("Read", serde_json::json!({"path":"three"}), "three.txt"),
+    ]) {
+        assert_eq!(*owner, None);
+        assert_eq!(call.name, name);
+        assert_eq!(call.arguments, arguments);
+        assert_eq!(events.iter().filter(|event| matches!(event, ProviderEvent::Turn { turn: None, event: TurnEvent::ToolFinished { key: finished, ok: true, output_tail: Some(output) } } if finished == key && output == tail)).count(), 1);
+    }
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::Turn {
+            event: TurnEvent::ToolOutput { .. }
+                | TurnEvent::ReasoningDelta { .. }
+                | TurnEvent::Plan(_),
+            ..
+        }
+    )));
+    assert_eq!(text(&events), "okafter");
+    assert_eq!(
+        outcomes(&events),
+        [TurnOutcome::Completed, TurnOutcome::Completed]
+    );
+}

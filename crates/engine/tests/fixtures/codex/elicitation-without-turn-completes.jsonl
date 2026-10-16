@@ -1,0 +1,18 @@
+{"type":"transcript_start","provider":"codex","protocol":"json-rpc","cli_version":"0.161.0","scenario":"elicitation-without-turn-completes","source":"Veyra hand-written stable-schema scenario"}
+{"type":"expect_outbound","line":{"id":"<id:initialize>","method":"initialize","params":{"clientInfo":{"name":"veyra","title":"Veyra","version":"0.0.1"}}}}
+{"type":"emit_inbound","line":{"id":"<id:initialize>","result":{"userAgent":"veyra/0.161.0"}}}
+{"type":"expect_outbound","line":{"method":"initialized"}}
+{"type":"expect_outbound","line":{"id":"<id:thread_request>","method":"thread/start","params":{"cwd":"<cwd>","model":"<any>","approvalPolicy":"untrusted","sandbox":"read-only","approvalsReviewer":"user","config":"<any>"}}}
+{"type":"emit_inbound","line":{"id":"<id:thread_request>","result":{"thread":{"id":"native-thread","cliVersion":"0.161.0"}}}}
+{"type":"expect_outbound","line":{"id":"<id:turn_request>","method":"turn/start","params":{"threadId":"<id:session>","input":[{"type":"text","text":"<any>","text_elements":[]}],"model":"<any>","effort":"<any>","summary":"auto","approvalPolicy":"untrusted","approvalsReviewer":"user","sandboxPolicy":{"type":"readOnly","networkAccess":true}}}}
+{"type":"emit_inbound","line":{"id":"elicit","method":"mcpServer/elicitation/request","params":{"threadId":"<id:session>","serverName":"files","mode":"form","message":"Allow the files MCP server to run tool \"read\"?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call"}}}}
+{"type":"emit_inbound","line":{"id":"<id:turn_request>","result":{"turn":{"id":"native-turn","status":"inProgress","items":[],"error":null}}},"after_ms":200}
+{"type":"emit_inbound","line":{"method":"turn/started","params":{"threadId":"<id:session>","turn":{"id":"native-turn","status":"inProgress","items":[],"error":null}}}}
+{"type":"emit_inbound","line":{"method":"turn/completed","params":{"threadId":"<id:session>","turn":{"id":"native-turn","status":"completed","items":[],"error":null}}},"after_ms":300}
+{"type":"expect_outbound","line":{"id":"<id:next_request>","method":"turn/start","params":{"threadId":"<id:session>","input":[{"type":"text","text":"<any>","text_elements":[]}],"model":"<any>","effort":"<any>","summary":"auto","approvalPolicy":"untrusted","approvalsReviewer":"user","sandboxPolicy":{"type":"readOnly","networkAccess":true}}}}
+{"type":"touch","path":"no-extra-reply-checked"}
+{"type":"emit_inbound","line":{"id":"<id:next_request>","result":{"turn":{"id":"next-turn","status":"inProgress","items":[],"error":null}}}}
+{"type":"emit_inbound","line":{"method":"turn/started","params":{"threadId":"<id:session>","turn":{"id":"next-turn","status":"inProgress","items":[],"error":null}}}}
+{"type":"emit_inbound","line":{"method":"item/agentMessage/delta","params":{"threadId":"<id:session>","turnId":"next-turn","itemId":"reply","delta":"second"}}}
+{"type":"emit_inbound","line":{"method":"turn/completed","params":{"threadId":"<id:session>","turn":{"id":"next-turn","status":"completed","items":[],"error":null}}}}
+{"type":"exit","code":0}

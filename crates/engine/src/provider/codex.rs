@@ -664,7 +664,11 @@ impl Codec {
                     if request.owner.target() != owner.target() {
                         return true;
                     }
-                    if request.native_turn.as_deref() != Some(id.as_str()) {
+                    if request
+                        .native_turn
+                        .as_deref()
+                        .is_some_and(|turn| turn != id)
+                    {
                         decoded.replies.push(
                             self.peer
                                 .response(request.id.clone(), cancel(&request.reply)),

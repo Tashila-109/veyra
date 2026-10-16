@@ -490,8 +490,9 @@ The turn/start reply is Accepted; notifications received before it are buffered 
 A valid own-thread request before that reply attaches to the Veyra turn being started and docks immediately, so a server waiting for consent can progress.
 While a Veyra turn is bound, an own-thread request tagged with another non-ended native turn also docks under that Veyra turn for answers and expiry.
 Each request keeps its native turn id separately from its displayed owner.
-When the Veyra turn completes, the codec queues a cancel reply for each of its docked requests whose native turn differs from the completed turn, before the actor expires those requests.
+When the Veyra turn completes, the codec queues a cancel reply for each of its docked requests whose known native turn differs from the completed turn, before the actor expires those requests.
 Requests for the completed native turn are removed without an extra reply.
+An untagged request docked under that Veyra turn is also removed without an extra reply.
 Before the turn/start reply, a request with a native turn id binds it provisionally; an MCP elicitation can omit turnId and still be answered by its request id.
 A request for an idle own-thread turn opens Provider work even before turn/started.
 Another thread's requests are refused without docking, and a start reply that changes a provisional id fails the session.
@@ -597,6 +598,8 @@ Unknown prompt ids on supported content updates or valid server requests are tra
 With no displayed work, the codec announces a Provider turn before emitting content or a request.
 While a Veyra prompt runs, only foreign permission and question requests use its turn id, preserving the Veyra Stop target and the actor's persisted request dock.
 Foreign text, reasoning, tool and plan updates still track the foreign prompt but emit no content during Veyra work; each is logged at debug with only its method.
+Each prompt retains only the title and input of its dropped tool_call starts, keyed by native tool id, until the Provider turn emits ToolStarted or the prompt ends.
+The first subsequent tool frame uses the retained title and input when present, otherwise its own metadata, for ToolStarted; no dropped text, reasoning, plan or output is replayed.
 Once foreign work runs as a Provider turn, its subsequent content is emitted there.
 Task reports select the last assistant text item, so dropped content cannot replace a child's own reply.
 The human's answer uses the original native request id; if the displayed turn ends first, finish queues a native cancelled reply and the actor expires the request with that turn.
@@ -1154,6 +1157,8 @@ Codex actor regressions verify a foreign native turn's permission docks under th
 Grok regressions verify null completion reasons end Provider work, invalid completion scopes leave it running, and a bad plan-entry status preserves the other entries.
 The Grok child report regression drives decoded fixture frames through the actor and verifies the child's own reply reaches its parent despite later foreign content during that prompt.
 The foreign-content unit regression checks payload-free logging and suppression during Veyra work, then normal content during Provider work.
+Codex's untagged elicitation regression requires the next native prompt instead of an extra completion reply, while the foreign-request expiry regression still requires cancellation.
+The foreign-tool replay preserves Bash and its input across promotion, fills partial start metadata from later frames, keeps the later output, and emits none of the other dropped content.
 Malformed-notification replays keep the session alive through missing or numeric update kinds, a null tool title, a numeric prompt id and null metadata; codec tests check method-only diagnostics and prevent wrong-session or replay notifications from confirming admission.
 grok_root_reaches_real_relay runs in the ordinary application suite with the production veyra mcp executable and fake CLI without opening a window.
 A default credential-frame test asserts the Grok mcpServers entry, preserves unrelated config and requires only the token marker in its recording value.
