@@ -18,8 +18,11 @@ fn switch_refused_with_pending_request() {
     let mut f = Fixture::new(LiveState::Idle);
     let request = f.req();
     assert!(matches!(
-        f.command(Command::SwitchView { thread: f.thread, to: View::Terminal }),
-        Err(CommandError::Invalid(reason)) if reason == "Answer the pending request before switching views"
+        f.command(Command::SwitchView {
+            thread: f.thread,
+            to: View::Terminal
+        }),
+        Err(CommandError::Busy(WaitReason::PendingRequest))
     ));
     assert_eq!(f.loaded().requests[&request].state, RequestState::Pending);
     assert_eq!(f.loaded().threads[&f.thread].view, View::Chat);
@@ -31,7 +34,7 @@ fn switch_from_parked_opens_pty_with_new_epoch() {
     let mut f = Fixture::new(LiveState::Parked);
     let mut c = ChangeSet::default();
     let mut row = f.actor.projection.threads[&f.thread].clone();
-    row.native = Some(NativeSessionId("m7-parked".into()));
+    row.native = Some(NativeSessionId("parked-session".into()));
     row.provider = ProviderKind::Grok;
     c.threads.insert(f.thread, row);
     f.save(c);
@@ -49,20 +52,43 @@ fn switch_from_parked_opens_pty_with_new_epoch() {
     let thread = f.thread;
     let runtime = f.runtime;
     runtime.block_on(async move {
-        let (_scratch, env) = grok_terminal_env("m7-parked");
-        let engine = crate::Engine::launch(&tokio::runtime::Handle::current(), f.actor.db, Spawner::Cli(Box::new(env)), None).unwrap();
-        let mut events = engine.subscribe();
-        engine.send(Command::SwitchView { thread, to: View::Terminal }).await.unwrap().unwrap();
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while let Some(event) = events.recv().await {
-                if matches!(event, UiEvent::Change { event: crate::events::ChangeEvent::ThreadStatusChanged { thread: id, status: Status::InTerminal }, .. } if id == thread) {
-                    return true;
+        let (_scratch, env) = grok_terminal_env("parked-session");
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        let groups = engine.inner.groups.clone();
+        engine
+            .send(Command::SwitchView {
+                thread,
+                to: View::Terminal,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(handle) = engine.terminal(thread)
+                    && handle
+                        .emulator()
+                        .unwrap()
+                        .lock()
+                        .text()
+                        .iter()
+                        .any(|line| line == "VEYRA_TUI_READY")
+                {
+                    break;
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            false
-        }).await;
+        })
+        .await;
         engine.shutdown_wait().await;
-        assert_eq!(terminal.ok(), Some(true), "real-provider terminal launch never reached InTerminal");
+        terminal.unwrap();
+        assert!(groups.lock().unwrap().is_empty());
     });
 }
 
@@ -95,30 +121,11 @@ fn fake_binary() -> std::path::PathBuf {
 
 #[cfg(debug_assertions)]
 fn grok_terminal_env(native: &str) -> (Scratch, env::ChildEnv) {
-    use serde_json::json;
     let root =
-        std::path::Path::new("/tmp").join(format!("veyra-m7s1-terminal-{}", ThreadId::new()));
+        std::path::Path::new("/tmp").join(format!("veyra-term-terminal-{}", ThreadId::new()));
     std::fs::create_dir(&root).unwrap();
-    let records = [
-        json!({"type":"transcript_start","provider":"grok","protocol":"acp","cli_version":"fake","scenario":"cursor capture","source":"Veyra authored"}),
-        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":"<id:init-params>"}}),
-        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"version":"fake"}}}}),
-        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:load>","method":"session/load","params":"<id:load-params>"}}),
-        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:load>","result":{"sessionId":native}}}),
-        json!({"type":"spin","ms":200}),
-        json!({"type":"exit","code":0}),
-    ];
-    std::fs::write(
-        root.join("t1-s1.jsonl"),
-        records
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
-    )
-    .unwrap();
-    std::fs::write(root.join("t1-s2.jsonl"), "").unwrap();
+    let _ = native;
+    std::fs::write(root.join("t1-s1.jsonl"), "").unwrap();
     let mut env = env::ChildEnv::isolated().with_binary(ProviderKind::Grok, fake_binary());
     env.fixtures = Some(root.clone());
     (Scratch(root), env)
@@ -132,11 +139,11 @@ fn terminal_input_skips_actor_mailbox() {
     let mut c = ChangeSet::default();
     let mut row = f.actor.projection.threads[&f.thread].clone();
     row.provider = ProviderKind::Grok;
-    row.native = Some(NativeSessionId("m7-echo".into()));
+    row.native = Some(NativeSessionId("echo-session".into()));
     c.threads.insert(f.thread, row);
     f.save(c);
     let (out, mut receiver) = mpsc::channel(256);
-    let (_scratch, env) = grok_terminal_env("m7-echo");
+    let (_scratch, env) = grok_terminal_env("echo-session");
     let groups = env.groups.clone();
     let mut actor = Actor::new(f.actor.db, out.clone(), Spawner::Cli(Box::new(env))).unwrap();
     let (reply, result) = oneshot::channel();
@@ -222,12 +229,20 @@ fn terminal_input_skips_actor_mailbox() {
 #[test]
 fn switch_idle_waits_for_exit_and_increments_epoch_once() {
     let mut f = Fixture::new(LiveState::Idle);
+    let mut c = ChangeSet::default();
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.native = Some(NativeSessionId("conversation".into()));
+    c.threads.insert(f.thread, row);
+    f.save(c);
     f.command(Command::SwitchView {
         thread: f.thread,
         to: View::Terminal,
     })
     .unwrap();
-    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Shutdown);
+    assert_eq!(
+        f.controls.try_recv().unwrap(),
+        SessionControl::ShutdownForTerminal
+    );
     assert!(matches!(
         f.actor.live[&f.thread].live,
         Live::Stopping {
@@ -276,7 +291,10 @@ fn switch_quit_processes_terminal_exit_without_deadline() {
     f.actor.handle(EngineMsg::Terminal {
         thread: f.thread,
         epoch: 1,
-        event: TerminalEvent::Exited,
+        event: TerminalEvent::Exited {
+            started: true,
+            crash: None,
+        },
     });
     assert!(matches!(f.actor.live[&f.thread].live, Live::Parked));
     let row = &f.loaded().threads[&f.thread];
@@ -289,7 +307,7 @@ fn switch_quit_processes_terminal_exit_without_deadline() {
 fn switch_idle_closes_stdin_before_ladder() {
     use serde_json::json;
     use std::{path::Path, time::Duration};
-    let root = Path::new("/tmp").join(format!("veyra-m7s1-grace-{}", ThreadId::new()));
+    let root = Path::new("/tmp").join(format!("veyra-term-grace-{}", ThreadId::new()));
     std::fs::create_dir(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let records = [
@@ -313,7 +331,9 @@ fn switch_idle_closes_stdin_before_ladder() {
     let mut env = env::ChildEnv::isolated().with_binary(ProviderKind::Claude, fake_binary());
     env.fixtures = Some(root.clone());
     let groups = env.groups.clone();
-    Runtime::new().unwrap().block_on(async {
+    let mut f = Fixture::new(LiveState::Idle);
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
         let (out, mut events) = mpsc::channel(256);
         let handle = session::spawn(
             SessionSpec {
@@ -321,8 +341,8 @@ fn switch_idle_closes_stdin_before_ladder() {
                 cwd: root.clone(),
                 config: config(),
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -334,7 +354,28 @@ fn switch_idle_closes_stdin_before_ladder() {
             while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
                 match event {
                     ProviderEvent::Session(SessionEvent::Ready { .. }) => {
-                        handle.control.send(SessionControl::Shutdown).unwrap()
+                        let mut c = ChangeSet::default();
+                        let mut row = f.actor.projection.threads[&f.thread].clone();
+                        row.native = Some(NativeSessionId("conversation".into()));
+                        c.threads.insert(f.thread, row);
+                        let mut live = f.actor.live[&f.thread].clone();
+                        live.live = Live::Structured {
+                            session: handle.clone(),
+                            pid: 1,
+                            pgid: 1,
+                            draining: None,
+                        };
+                        c.live.insert(f.thread, live);
+                        f.save(c);
+                        let (reply, result) = oneshot::channel();
+                        f.actor.handle(EngineMsg::Command {
+                            command: Command::SwitchView {
+                                thread: f.thread,
+                                to: View::Terminal,
+                            },
+                            reply,
+                        });
+                        result.await.unwrap().unwrap();
                     }
                     ProviderEvent::Session(SessionEvent::Exited { crash }) => {
                         assert_eq!(crash, None);
@@ -366,18 +407,35 @@ fn import_takes_only_turns_after_cursor() {
     let mut c = ChangeSet::default();
     c.threads.insert(f.thread, row);
     f.save(c);
-    let history = History {
-        cursor: Some("after".into()),
-        text: "typed\nreply".into(),
-    };
+    let root = std::path::Path::new("/tmp").join(format!("veyra-term-cursor-{}", ThreadId::new()));
+    std::fs::create_dir_all(root.join("projects/isolated")).unwrap();
+    let _scratch = Scratch(root.clone());
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude/session-file-import.jsonl"),
+        root.join("projects/isolated/native-import.jsonl"),
+    )
+    .unwrap();
+    let history = crate::provider::claude::session_file_import(
+        &root,
+        &NativeSessionId("native-import".into()),
+        &HistoryRequest {
+            cursor: Some("old-user".into()),
+            sent: ["sent".into()].into(),
+        },
+    )
+    .unwrap();
     f.event(ProviderEvent::Session(SessionEvent::History {
         native: native.clone(),
         history: history.clone(),
     }));
     let p = f.loaded();
-    assert_eq!(p.threads[&f.thread].native_cursor.as_deref(), Some("after"));
+    assert_eq!(
+        p.threads[&f.thread].native_cursor.as_deref(),
+        Some("new-user")
+    );
     assert!(!p.threads[&f.thread].import_pending);
-    assert_eq!(p.items.values().filter(|item| matches!(&item.body, ItemBody::TerminalSpan(span) if span.text == "typed\nreply")).count(), 1);
+    assert_eq!(p.items.values().filter(|item| matches!(&item.body, ItemBody::TerminalSpan(span) if span.text == "second\nreply second")).count(), 1);
     f.event(ProviderEvent::Session(SessionEvent::History {
         native,
         history,
@@ -390,7 +448,7 @@ fn import_takes_only_turns_after_cursor() {
 fn switch_back_imports_once() {
     use serde_json::json;
     use std::{fs, path::Path, time::Duration};
-    let root = Path::new("/tmp").join(format!("veyra-m7s1-roundtrip-{}", ThreadId::new()));
+    let root = Path::new("/tmp").join(format!("veyra-term-roundtrip-{}", ThreadId::new()));
     crate::platform::private_dir(&root).unwrap();
     let scratch = Scratch(root.clone());
     let f = Fixture::new(LiveState::Parked);
@@ -399,7 +457,7 @@ fn switch_back_imports_once() {
     let config_root = root.join("claude-config");
     fs::create_dir_all(config_root.join("projects/veyra-fake")).unwrap();
     let history_path = config_root.join(format!("projects/veyra-fake/{}.jsonl", native.0));
-    fs::write(&history_path, format!("{}\n", json!({"sessionId":native.0,"uuid":"sdk-anchor","parentUuid":null,"isSidechain":false,"type":"assistant","entrypoint":"sdk-cli","message":{"content":[{"type":"text","text":"already in chat"}]}}))).unwrap();
+    fs::write(&history_path, format!("{}\n", json!({"sessionId":native.0,"uuid":"sdk-anchor","parentUuid":null,"isSidechain":false,"type":"user","entrypoint":"sdk-cli","message":{"content":[{"type":"text","text":"already in chat"}]}}))).unwrap();
     let db_path = root.join("test.db");
     let mut db = store::open(&db_path).unwrap();
     let mut c = ChangeSet {
@@ -409,6 +467,7 @@ fn switch_back_imports_once() {
     let mut row = f.actor.projection.threads[&thread].clone();
     row.cwd = root.clone();
     row.native = Some(native.clone());
+    row.native_cursor = Some("sdk-anchor".into());
     c.threads.insert(thread, row);
     let tx = db.transaction().unwrap();
     store::apply(&tx, &c, now()).unwrap();
@@ -667,7 +726,7 @@ fn switch_back_imports_once() {
                 ) {
                     let p = read();
                     assert!(!p.threads[&thread].import_pending);
-                    assert_eq!(count(), before_quit_import + 1);
+                    assert_eq!(count(), before_quit_import + 2);
                     assert_eq!(p.threads[&thread].native, Some(native.clone()));
                     let spans: Vec<_> = p
                         .items
@@ -705,7 +764,7 @@ fn switch_stalled_sync_flushes_fake_tui_without_more_bytes() {
     use serde_json::json;
     use std::time::{Duration, Instant};
     let mut f = Fixture::new(LiveState::Parked);
-    let root = std::path::Path::new("/tmp").join(format!("veyra-m7s1-sync-{}", ThreadId::new()));
+    let root = std::path::Path::new("/tmp").join(format!("veyra-term-sync-{}", ThreadId::new()));
     std::fs::create_dir(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let mut c = ChangeSet::default();
@@ -764,7 +823,7 @@ fn switch_stalled_sync_flushes_fake_tui_without_more_bytes() {
 }
 
 #[test]
-fn import_must_finish_before_ready_can_start_queued_work() {
+fn import_failure_before_ready_clears_pending_and_starts_queued_work() {
     let mut f = Fixture::new(LiveState::Starting);
     let mut row = f.actor.projection.threads[&f.thread].clone();
     row.import_pending = true;
@@ -778,10 +837,860 @@ fn import_must_finish_before_ready_can_start_queued_work() {
         pgid: 1,
         capabilities: vec![],
     }));
-    assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Shutdown);
     assert!(matches!(
         f.actor.live[&f.thread].live,
-        Live::Starting { .. }
+        Live::Structured { .. }
     ));
-    assert!(f.loaded().threads[&f.thread].import_pending);
+    assert!(!f.loaded().threads[&f.thread].import_pending);
+    assert!(f.loaded().items.values().any(|item| matches!(&item.body, ItemBody::Notice(text) if text.text == crate::provider::IMPORT_NOTICE)));
+}
+
+#[test]
+fn repair_no_native_refuses_switch() {
+    let mut f = Fixture::new(LiveState::Parked);
+    let result = f.command(Command::SwitchView {
+        thread: f.thread,
+        to: View::Terminal,
+    });
+    assert!(matches!(&result, Err(CommandError::Busy(_))), "{result:?}");
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Send a message first; the terminal opens the CLI's conversation."
+    );
+    assert_eq!(f.loaded().threads[&f.thread].view, View::Chat);
+}
+
+#[test]
+fn repair_stop_before_terminal_has_no_import() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut c = ChangeSet::default();
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.native = Some(NativeSessionId("conversation".into()));
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    f.command(Command::SwitchView {
+        thread: f.thread,
+        to: View::Terminal,
+    })
+    .unwrap();
+    f.command(Command::StopThread { thread: f.thread }).unwrap();
+    assert_eq!(f.loaded().threads[&f.thread].view, View::Chat);
+    assert!(!f.loaded().threads[&f.thread].import_pending);
+}
+
+#[test]
+fn repair_claude_truncated_line_is_skipped() {
+    use std::io::Write;
+    let root = std::path::Path::new("/tmp").join(format!("veyra-term-cut-{}", ThreadId::new()));
+    std::fs::create_dir_all(root.join("projects/test")).unwrap();
+    let scratch = Scratch(root);
+    let file = scratch.0.join("projects/test/native-import.jsonl");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude/session-file-import.jsonl"),
+        &file,
+    )
+    .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .unwrap()
+        .write_all(b"{\"type\":")
+        .unwrap();
+    let history = claude::session_file_import(
+        &scratch.0,
+        &NativeSessionId("native-import".into()),
+        &HistoryRequest {
+            cursor: Some("anchor".into()),
+            ..Default::default()
+        },
+    );
+    assert!(history.is_ok(), "{history:?}");
+    assert_eq!(history.unwrap().text, "second\nreply second");
+}
+
+#[test]
+fn repair_unknown_cursor_adopts_without_text() {
+    let root = std::path::Path::new("/tmp").join(format!("veyra-term-unknown-{}", ThreadId::new()));
+    std::fs::create_dir_all(root.join("projects/test")).unwrap();
+    let scratch = Scratch(root);
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude/session-file-import.jsonl"),
+        scratch.0.join("projects/test/native-import.jsonl"),
+    )
+    .unwrap();
+    let history = claude::session_file_import(
+        &scratch.0,
+        &NativeSessionId("native-import".into()),
+        &HistoryRequest::default(),
+    )
+    .unwrap();
+    assert!(history.text.is_empty(), "{}", history.text);
+    assert!(history.cursor.is_some());
+}
+
+#[cfg(debug_assertions)]
+fn repair_terminal(
+    provider: ProviderKind,
+    records: &[serde_json::Value],
+) -> (Fixture, Scratch, env::ChildEnv) {
+    let mut f = Fixture::new(LiveState::Parked);
+    let root = std::path::Path::new("/tmp").join(format!("veyra-term-repair-{}", ThreadId::new()));
+    crate::platform::private_dir(&root).unwrap();
+    std::fs::write(
+        root.join("t1-s1.jsonl"),
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let mut c = ChangeSet::default();
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.provider = provider;
+    row.cwd = root.clone();
+    row.native = Some(NativeSessionId(ThreadId::new().to_string()));
+    row.native_cursor = Some("anchor".into());
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    let mut db = store::open(&root.join("test.db")).unwrap();
+    let tx = db.transaction().unwrap();
+    store::apply(
+        &tx,
+        &ChangeSet {
+            projects: f.actor.projection.projects.clone(),
+            threads: f.actor.projection.threads.clone(),
+            ..Default::default()
+        },
+        now(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    f.actor.db = db;
+    let mut env = env::ChildEnv::isolated()
+        .with_binary(provider, fake_binary())
+        .with_variable("CLAUDE_CONFIG_DIR", root.join("config"));
+    env.fixtures = Some(root.clone());
+    (f, Scratch(root), env)
+}
+#[cfg(debug_assertions)]
+async fn repair_grid(engine: &crate::Engine, thread: ThreadId, text: &str) -> TerminalHandle {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(handle) = engine.terminal(thread)
+                && handle
+                    .terminal
+                    .as_ref()
+                    .unwrap()
+                    .emulator
+                    .lock()
+                    .text()
+                    .iter()
+                    .any(|line| line.contains(text))
+            {
+                return handle;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[cfg(debug_assertions)]
+#[test]
+fn repair_large_paste_keeps_reader_moving() {
+    use base64::Engine;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+    let raw = |bytes: &[u8]| json!({"type":"emit_raw","base64":base64::engine::general_purpose::STANDARD.encode(bytes)});
+    let (f, _scratch, env) = repair_terminal(
+        ProviderKind::Claude,
+        &[
+            raw(b"PASTE_READY\r\n"),
+            json!({"type":"spin","ms":300}),
+            raw(b"\x1b[6n"),
+            json!({"type":"spin","ms":100}),
+            raw(b"GRID_MOVED\r\n"),
+            json!({"type":"spin","ms":2000}),
+        ],
+    );
+    f.runtime.block_on(async {
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        engine
+            .send(Command::SwitchView {
+                thread: f.thread,
+                to: View::Terminal,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = repair_grid(&engine, f.thread, "PASTE_READY").await;
+        let (sent, result) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        let writing = std::thread::spawn(move || {
+            let outcome = handle.write(&vec![b'x'; 8 * 1024 * 1024]);
+            let _ = sent.send(outcome);
+        });
+        let returned = result.recv_timeout(Duration::from_millis(200)).is_ok();
+        let grid = tokio::time::timeout(
+            Duration::from_millis(1200),
+            repair_grid(&engine, f.thread, "GRID_MOVED"),
+        )
+        .await
+        .is_ok();
+        engine.shutdown_wait().await;
+        writing.join().unwrap();
+        assert!(
+            returned,
+            "paste blocked its caller for {:?}",
+            start.elapsed()
+        );
+        assert!(grid, "query reply stalled the reader");
+        assert!(engine.inner.groups.lock().unwrap().is_empty());
+    });
+}
+#[cfg(debug_assertions)]
+#[test]
+fn repair_failed_terminal_shows_reason_without_import() {
+    let (f, _scratch, mut env) = repair_terminal(ProviderKind::Grok, &[]);
+    env = env.with_binary(ProviderKind::Grok, "/nonexistent/terminal-test".into());
+    f.runtime.block_on(async {
+        let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();
+        engine.send(Command::SwitchView {thread:f.thread,to:View::Terminal}).await.unwrap().unwrap();
+        let result=tokio::time::timeout(std::time::Duration::from_secs(3),async {loop {if engine.terminal(f.thread).is_none() {return engine.snapshot(f.thread).await.unwrap();}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}}).await;
+        engine.shutdown_wait().await;let snapshot=result.unwrap();
+        assert!(!store::load(&Connection::open(_scratch.0.join("test.db")).unwrap()).unwrap().threads[&f.thread].import_pending);assert!(snapshot.items.iter().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("not installed"))));
+    });
+}
+#[cfg(debug_assertions)]
+#[test]
+fn repair_signed_out_terminal_keeps_sign_in_reason() {
+    let (f, _scratch, env) = repair_terminal(
+        ProviderKind::Grok,
+        &[
+            serde_json::json!({"type":"exit","code":1,"stderr":["Sign in to Grok before continuing"]}),
+        ],
+    );
+    f.runtime.block_on(async {
+        let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();engine.send(Command::SwitchView {thread:f.thread,to:View::Terminal}).await.unwrap().unwrap();
+        let result=tokio::time::timeout(std::time::Duration::from_secs(3),async {loop {if engine.terminal(f.thread).is_none() {return engine.snapshot(f.thread).await.unwrap();}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}}).await;
+        engine.shutdown_wait().await;let snapshot=result.unwrap();assert!(store::load(&Connection::open(_scratch.0.join("test.db")).unwrap()).unwrap().threads[&f.thread].import_pending);assert!(snapshot.items.iter().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("Sign in to Grok"))));
+    });
+}
+#[cfg(debug_assertions)]
+#[test]
+fn repair_worker_panic_still_exits() {
+    let (f, _scratch, env) = repair_terminal(ProviderKind::Claude, &[]);
+    let gate = env.closing.clone();
+    let _ = std::thread::spawn(move || {
+        let _locked = gate.lock.lock().unwrap();
+        panic!("owned launch gate poison");
+    })
+    .join();
+    let (out, mut events) = mpsc::channel(256);
+    let row = &f.actor.projection.threads[&f.thread];
+    let _entered = f.runtime.enter();
+    let _handle = crate::terminal::spawn(
+        ProviderKind::Claude,
+        SessionSpec {
+            thread: f.thread,
+            cwd: row.cwd.clone(),
+            config: config(),
+            native: row.native.clone(),
+            import: None,
+            root: false,
+        },
+        env,
+        out,
+        1,
+        crate::terminal::Colors::default(),
+    )
+    .unwrap();
+    let exited = f.runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(message) = events.recv().await {
+                if matches!(
+                    message,
+                    EngineMsg::Terminal {
+                        event: TerminalEvent::Exited { .. },
+                        ..
+                    }
+                ) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    });
+    assert!(exited, "worker panic left the terminal live");
+}
+#[test]
+fn repair_structured_cursor_tracks_turn_state() {
+    for provider in [ProviderKind::Claude, ProviderKind::Grok] {
+        let mut f = Fixture::new(LiveState::Idle);
+        let mut c = ChangeSet::default();
+        let mut row = f.actor.projection.threads[&f.thread].clone();
+        row.provider = provider;
+        c.threads.insert(f.thread, row);
+        f.save(c);
+        let Ack::Turn(turn) = f
+            .command(Command::Send {
+                thread: f.thread,
+                text: "sent prompt".into(),
+            })
+            .unwrap()
+        else {
+            panic!("turn")
+        };
+        let p = f.loaded();
+        assert!(matches!(p.turns[&turn].state, TurnState::Running { .. }));
+        assert_eq!(p.threads[&f.thread].native_cursor, Some(turn.to_string()));
+    }
+}
+
+#[cfg(debug_assertions)]
+fn repair_rpc_roundtrip(
+    provider: ProviderKind,
+    fixture: &str,
+    cursor: &str,
+    expected: &str,
+    typed: &[u8],
+) {
+    use std::time::Duration;
+    let (mut f, scratch, env) = repair_terminal(provider, &[]);
+    let mut c = ChangeSet::default();
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.native = Some(NativeSessionId("native-import".into()));
+    row.native_cursor = Some(cursor.into());
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    let folder = match provider {
+        ProviderKind::Codex => "codex",
+        ProviderKind::Grok => "grok",
+        ProviderKind::Claude => unreachable!(),
+    };
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/fixtures/{folder}/{fixture}.jsonl")),
+    )
+    .unwrap();
+    std::fs::write(scratch.0.join("t1-s2.jsonl"), text).unwrap();
+    let read = || store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
+    f.runtime.block_on(async {
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        engine
+            .send(Command::SwitchView {
+                thread: f.thread,
+                to: View::Terminal,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let ready = tokio::time::timeout(
+            Duration::from_secs(3),
+            repair_grid(&engine, f.thread, "VEYRA_TUI_READY"),
+        )
+        .await;
+        if ready.is_err() {
+            engine.shutdown_wait().await;
+            panic!("Parked opened a structured process before its TUI");
+        }
+        ready.unwrap().write(typed).unwrap();
+        repair_grid(&engine, f.thread, "0d").await;
+        engine
+            .send(Command::SwitchView {
+                thread: f.thread,
+                to: View::Chat,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let imported = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let p = read();
+                if !p.threads[&f.thread].import_pending {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        engine.shutdown_wait().await;
+        let p = imported.unwrap();
+        assert_eq!(
+            p.threads[&f.thread].native,
+            Some(NativeSessionId("native-import".into()))
+        );
+        let spans = p
+            .items
+            .values()
+            .filter_map(|item| {
+                if let ItemBody::TerminalSpan(span) = &item.body {
+                    Some(span.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [expected]);
+        assert!(engine.inner.groups.lock().unwrap().is_empty());
+    });
+}
+#[cfg(debug_assertions)]
+#[test]
+fn repair_codex_roundtrip_without_capture() {
+    repair_rpc_roundtrip(
+        ProviderKind::Codex,
+        "turns-list-import",
+        "anchor",
+        "second\nreply second\nthird\nreply third",
+        b"second\rthird\r",
+    );
+}
+#[cfg(debug_assertions)]
+#[test]
+fn repair_grok_roundtrip_without_capture() {
+    repair_rpc_roundtrip(
+        ProviderKind::Grok,
+        "load-replay-import",
+        "sent",
+        "second\nreply second",
+        b"second\r",
+    );
+}
+
+#[test]
+fn repair_grok_not_found_import_runs_queued_work() {
+    use serde_json::json;
+    let mut f = Fixture::new(LiveState::Starting);
+    let mut c = ChangeSet::default();
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.provider = ProviderKind::Grok;
+    row.native = Some(NativeSessionId("missing".into()));
+    row.native_cursor = Some("anchor".into());
+    row.import_pending = true;
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    let turn = f.user("continue after terminal");
+    let mut codec = crate::provider::grok::Codec::new(
+        SessionSpec {
+            thread: f.thread,
+            cwd: "/tmp".into(),
+            config: config(),
+            native: Some(NativeSessionId("missing".into())),
+            import: Some(HistoryRequest {
+                cursor: Some("anchor".into()),
+                ..Default::default()
+            }),
+            root: false,
+        },
+        1,
+        None,
+        false,
+    );
+    let init = codec.initialize();
+    let mut open = codec.value(json!({"jsonrpc":"2.0","id":init["id"],"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{}}})).unwrap();
+    let open = open.take_outbound();
+    let crate::provider::Outbound::Message(load) = &open[0] else {
+        panic!("load message")
+    };
+    assert_eq!(load["method"], "session/load");
+    let mut fallback = codec.value(json!({"jsonrpc":"2.0","id":load["id"],"error":{"code":-32602,"message":"Session not found"}})).unwrap();
+    let fallback = fallback.take_outbound();
+    let crate::provider::Outbound::Message(new) = &fallback[0] else {
+        panic!("new message")
+    };
+    assert_eq!(new["method"], "session/new");
+    let ready = codec
+        .value(json!({"jsonrpc":"2.0","id":new["id"],"result":{"sessionId":"replacement"}}))
+        .unwrap();
+    for event in ready.events {
+        f.event(event);
+    }
+    let p = f.loaded();
+    assert!(!p.threads[&f.thread].import_pending);
+    assert_eq!(
+        p.threads[&f.thread].native.as_ref().unwrap().0,
+        "replacement"
+    );
+    assert!(matches!(p.turns[&turn].state, TurnState::Running { .. }));
+    assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("CLI still has them"))));
+    assert!(
+        matches!(f.controls.try_recv().unwrap(),SessionControl::StartTurn {turn:id,..} if id==turn)
+    );
+}
+
+#[test]
+fn repair_codex_bad_page_still_resumes() {
+    use serde_json::json;
+    let mut codec = crate::provider::codex::Codec::new(
+        SessionSpec {
+            thread: ThreadId::new(),
+            cwd: "/tmp".into(),
+            config: config(),
+            native: Some(NativeSessionId("native".into())),
+            import: Some(HistoryRequest {
+                cursor: Some("anchor".into()),
+                ..Default::default()
+            }),
+            root: false,
+        },
+        1,
+        None,
+    );
+    let init = codec.initialize();
+    let opening = codec.value(json!({"id":init["id"],"result":{}})).unwrap();
+    let page = opening
+        .replies
+        .iter()
+        .find(|reply| reply["method"] == "thread/turns/list")
+        .unwrap();
+    let result=codec.value(json!({"id":page["id"],"result":{"data":[{"id":"newest","items":[{"type":"userMessage","content":"invalid"}]}],"nextCursor":null}}));
+    assert!(result.is_ok(), "bad display history blocked resume");
+    let decoded = result.unwrap();
+    assert!(
+        decoded
+            .replies
+            .iter()
+            .any(|reply| reply["method"] == "thread/resume")
+    );
+    assert!(decoded.history.unwrap().failed);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn repair_closing_terminal_uses_one_second_ladder() {
+    use std::time::{Duration, Instant};
+    let (f, scratch, mut env) = repair_terminal(ProviderKind::Claude, &[]);
+    let script = scratch.0.join("terminal-fixture");
+    std::fs::write(&script,"#!/usr/bin/python3\nimport signal,time\nsignal.signal(signal.SIGHUP,signal.SIG_IGN)\nprint('VEYRA_TUI_READY',flush=True)\nwhile True: time.sleep(1)\n").unwrap();
+    assert!(
+        std::process::Command::new("/bin/chmod")
+            .env_clear()
+            .args(["700"])
+            .arg(&script)
+            .status()
+            .unwrap()
+            .success()
+    );
+    env = env.with_binary(ProviderKind::Claude, script);
+    f.runtime.block_on(async {
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        engine
+            .send(Command::SwitchView {
+                thread: f.thread,
+                to: View::Terminal,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        repair_grid(&engine, f.thread, "VEYRA_TUI_READY").await;
+        let start = Instant::now();
+        engine.shutdown_wait().await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(900));
+        assert!(elapsed < Duration::from_secs(2), "closing took {elapsed:?}");
+        assert!(engine.inner.groups.lock().unwrap().is_empty());
+    });
+}
+
+#[cfg(debug_assertions)]
+fn repair_codex_session(bad_history: bool) {
+    use serde_json::json;
+    use std::time::Duration;
+    let (mut f, scratch, env) = repair_terminal(ProviderKind::Codex, &[]);
+    let native = f.loaded().threads[&f.thread]
+        .native
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
+    let mut records = vec![
+        json!({"type":"transcript_start","provider":"codex","protocol":"json-rpc","cli_version":"fake","scenario":"structured cursor and failed display history","source":"Veyra authored"}),
+        json!({"type":"expect_outbound","line":{"id":"<id:init>","method":"initialize","params":"<id:params>"}}),
+        json!({"type":"emit_inbound","line":{"id":"<id:init>","result":{}}}),
+        json!({"type":"expect_outbound","line":{"method":"initialized"}}),
+    ];
+    if bad_history {
+        let mut c = ChangeSet::default();
+        let mut row = f.loaded().threads[&f.thread].clone();
+        row.import_pending = true;
+        c.threads.insert(f.thread, row);
+        f.save(c);
+        records.extend([json!({"type":"expect_outbound","line":{"id":"<id:page>","method":"thread/turns/list","params":"<id:page-params>"}}),json!({"type":"emit_inbound","line":{"id":"<id:page>","result":{"data":[{"id":"newest","items":[{"type":"userMessage","content":"invalid"}]}]}}})]);
+    }
+    records.extend([json!({"type":"expect_outbound","line":{"id":"<id:resume>","method":"thread/resume","params":"<id:resume-params>"}}),json!({"type":"emit_inbound","line":{"id":"<id:resume>","result":{"thread":{"id":native}}}}),json!({"type":"expect_outbound","line":{"id":"<id:turn>","method":"turn/start","params":"<id:turn-params>"}}),json!({"type":"emit_inbound","line":{"id":"<id:turn>","result":{"turn":{"id":"server-turn","status":"inProgress","items":[]}}}}),json!({"type":"emit_inbound","line":{"method":"turn/completed","params":{"threadId":native,"turn":{"id":"server-turn","status":"completed","items":[]}}}}),json!({"type":"spin","ms":200}),json!({"type":"exit","code":0})]);
+    std::fs::write(
+        scratch.0.join("t1-s1.jsonl"),
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    f.runtime.block_on(async {
+        let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();let Ack::Turn(turn)=engine.send(Command::Send {thread:f.thread,text:"queued work".into()}).await.unwrap().unwrap() else {panic!("turn")};
+        let result=tokio::time::timeout(Duration::from_secs(5),async {loop {let p=store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();if matches!(p.turns[&turn].state,TurnState::Ended {..}) {return p;}tokio::time::sleep(Duration::from_millis(5)).await;}}).await;engine.shutdown_wait().await;let p=result.unwrap();
+        assert!(matches!(p.turns[&turn].state,TurnState::Ended {outcome:TurnOutcome::Completed,..}));assert!(!p.threads[&f.thread].import_pending);
+        if bad_history {assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("CLI still has them"))));}
+        assert_eq!(p.threads[&f.thread].native_cursor.as_deref(),Some("server-turn"));
+        assert!(engine.inner.groups.lock().unwrap().is_empty());
+    });
+}
+#[cfg(debug_assertions)]
+#[test]
+fn repair_codex_structured_cursor() {
+    repair_codex_session(false);
+}
+#[cfg(debug_assertions)]
+#[test]
+fn repair_codex_typed_bad_page_runs_queued_work() {
+    repair_codex_session(true);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn repair_plain_shutdown_has_no_switch_grace() {
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+    let (f, scratch, env) = repair_terminal(
+        ProviderKind::Claude,
+        &[
+            json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
+            json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}),
+            json!({"type":"spin","ms":1600}),
+            json!({"type":"touch","path":"graceful-exit"}),
+            json!({"type":"exit","code":0}),
+        ],
+    );
+    f.runtime.block_on(async {
+        let (out, mut events) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: f.thread,
+                cwd: scratch.0.clone(),
+                config: config(),
+                native: None,
+                import: None,
+                root: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let elapsed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut started = None;
+            while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
+                match event {
+                    ProviderEvent::Session(SessionEvent::Ready { .. }) => {
+                        started = Some(Instant::now());
+                        handle.control.send(SessionControl::Shutdown).unwrap();
+                    }
+                    ProviderEvent::Session(SessionEvent::Exited { crash }) => {
+                        assert_eq!(crash, None);
+                        return started.unwrap().elapsed();
+                    }
+                    _ => {}
+                }
+            }
+            panic!("missing exit")
+        })
+        .await
+        .unwrap();
+        assert!(
+            elapsed < Duration::from_millis(1300),
+            "ordinary Shutdown took {elapsed:?}"
+        );
+        assert!(!scratch.0.join("graceful-exit").exists());
+    });
+}
+
+#[test]
+fn repair_codex_unacknowledged_turn_has_unknown_cursor() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut c = ChangeSet::default();
+    let mut row = f.loaded().threads[&f.thread].clone();
+    row.provider = ProviderKind::Codex;
+    row.native = Some(NativeSessionId("native".into()));
+    row.native_cursor = Some("previous-server-turn".into());
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    f.command(Command::Send {
+        thread: f.thread,
+        text: "not acknowledged yet".into(),
+    })
+    .unwrap();
+    assert_eq!(f.loaded().threads[&f.thread].native_cursor, None);
+    f.event(ProviderEvent::Session(SessionEvent::Exited {
+        crash: Some("reply lost".into()),
+    }));
+    assert_eq!(f.loaded().threads[&f.thread].native_cursor, None);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn repair_grok_promoted_overlap_keeps_newest_cursor() {
+    use serde_json::json;
+    use std::time::Duration;
+    let (f, scratch, env) = repair_terminal(ProviderKind::Grok, &[]);
+    let native = f.loaded().threads[&f.thread]
+        .native
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
+    let message = |id: &str, text: &str| json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":native,"_meta":{"promptId":id},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}}});
+    let complete = |id: &str| json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":native,"promptId":id,"stopReason":"end_turn"}}});
+    let records = [
+        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":"<id:initparams>"}}),
+        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":true}},"agentInfo":{}}}}),
+        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:resume>","method":"session/resume","params":"<id:resumeparams>"}}),
+        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:resume>","result":{"sessionId":native}}}),
+        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc>","method":"session/prompt","params":"<id:promptparams>"}}),
+        message("foreign-first", "skip before promotion"),
+        message("foreign-newest", "skip before promotion"),
+        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:rpc>","result":{"stopReason":"end_turn"}}}),
+        message("foreign-first", "first"),
+        message("foreign-newest", "newest"),
+        complete("foreign-newest"),
+        message("foreign-first", " tail"),
+        complete("foreign-first"),
+        json!({"type":"spin","ms":200}),
+        json!({"type":"exit","code":0}),
+    ];
+    std::fs::write(
+        scratch.0.join("t1-s1.jsonl"),
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    f.runtime.block_on(async {
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        engine
+            .send(Command::Send {
+                thread: f.thread,
+                text: "own prompt".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let p = store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
+                if p.turns.values().any(|turn| {
+                    turn.origin == TurnOrigin::Provider
+                        && matches!(turn.state, TurnState::Ended { .. })
+                }) {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        engine.shutdown_wait().await;
+        let p = result.unwrap();
+        assert_eq!(
+            p.threads[&f.thread].native_cursor.as_deref(),
+            Some("foreign-newest")
+        );
+        assert_eq!(
+            p.turns
+                .values()
+                .filter(|turn| turn.origin == TurnOrigin::Provider)
+                .count(),
+            1
+        );
+        assert!(p.items.values().any(
+            |item| matches!(&item.body,ItemBody::AssistantText {text,..} if text=="first tail")
+        ));
+        assert!(
+            p.items.values().any(
+                |item| matches!(&item.body,ItemBody::AssistantText {text,..} if text=="newest")
+            )
+        );
+        assert!(engine.inner.groups.lock().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn repair_stop_or_switch_before_ready_has_no_import() {
+    for stop in [false, true] {
+        let mut f = Fixture::new(LiveState::Terminal);
+        let mut c = ChangeSet::default();
+        let mut live = f.actor.live[&f.thread].clone();
+        if let Live::Terminal { pid, .. } = &mut live.live {
+            *pid = None;
+        }
+        c.live.insert(f.thread, live);
+        f.save(c);
+        let command = if stop {
+            Command::StopThread { thread: f.thread }
+        } else {
+            Command::SwitchView {
+                thread: f.thread,
+                to: View::Chat,
+            }
+        };
+        f.command(command).unwrap();
+        let p = f.loaded();
+        assert_eq!(p.threads[&f.thread].view, View::Chat);
+        assert!(!p.threads[&f.thread].import_pending);
+    }
+}
+
+#[test]
+fn repair_worker_setup_error_before_handle_is_visible() {
+    let mut f = Fixture::new(LiveState::Parked);
+    let mut c = ChangeSet::default();
+    let mut row = f.loaded().threads[&f.thread].clone();
+    row.view = View::Terminal;
+    row.native = Some(NativeSessionId("conversation".into()));
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    let _entered = f.runtime.enter();
+    f.actor.handle(EngineMsg::Terminal {
+        thread: f.thread,
+        epoch: 1,
+        event: TerminalEvent::Exited {
+            started: false,
+            crash: Some("PTY worker could not start".into()),
+        },
+    });
+    let p = f.loaded();
+    assert_eq!(p.threads[&f.thread].view, View::Chat);
+    assert!(!p.threads[&f.thread].import_pending);
+    assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text=="PTY worker could not start")));
 }

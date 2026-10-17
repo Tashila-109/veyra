@@ -43,7 +43,7 @@ pub enum Live {
     },
     Terminal {
         term: TerminalHandle,
-        pid: u32,
+        pid: Option<u32>,
     },
     Stopping {
         then: AfterStop,

@@ -291,8 +291,7 @@ impl Engine {
             .unwrap()
             .values()
             .filter_map(|handle| handle.terminal.as_ref())
-            .map(|terminal| (terminal.pid(), terminal.clone()))
-            .filter(|(pid, _)| *pid != 0)
+            .filter_map(|terminal| terminal.pid().map(|pid| (pid, terminal.clone())))
             .collect();
         for &group in self.inner.groups.lock().unwrap().iter() {
             if let Some(terminal) = terminals.get(&group) {

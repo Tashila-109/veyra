@@ -483,6 +483,7 @@ fn shutdown_request_prevents_ready_start_before_mailbox_shutdown() {
         .inner
         .sender
         .try_send(EngineMsg::Provider {
+            cursor: None,
             thread: f.thread,
             epoch: 1,
             event: ProviderEvent::Session(SessionEvent::Ready {
@@ -575,6 +576,7 @@ fn shutdown_request_prevents_retiring_session_restart_before_mailbox_shutdown() 
                 .inner
                 .sender
                 .try_send(EngineMsg::Provider {
+                    cursor: None,
                     thread: f.thread,
                     epoch: 1,
                     event: ProviderEvent::Session(SessionEvent::Exited { crash: None }),

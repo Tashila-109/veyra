@@ -1,4 +1,4 @@
-{"type":"transcript_start","provider":"grok","protocol":"json-rpc","cli_version":"fake","scenario":"load replay before reply","source":"Veyra authored from lane 0 wire shapes"}
+{"type":"transcript_start","provider":"grok","protocol":"json-rpc","cli_version":"fake","scenario":"load replay before reply","source":"Veyra authored from live wire shapes"}
 {"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":"<id:initparams>"}}
 {"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":true}},"agentInfo":{"version":"fake"}}}}
 {"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:load>","method":"session/load","params":"<id:loadparams>"}}

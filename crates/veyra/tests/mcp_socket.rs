@@ -399,8 +399,8 @@ async fn session_config_lifecycle(root_thread: bool, reported: Option<&str>) {
                 effort: None,
             },
             native: None,
-            history: Default::default(),
-            import: false,
+
+            import: None,
             root: root_thread,
         },
         env,

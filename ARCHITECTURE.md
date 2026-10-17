@@ -2,7 +2,7 @@
 
 ## Executive summary
 
-Veyra is one native macOS chat window backed by an orchestration actor and per-thread Claude stream-json, Codex app-server or Grok ACP processes.
+Veyra is one native macOS chat window backed by an orchestration actor and per-thread Claude stream-json, Codex app-server or Grok ACP processes, with an engine-owned PTY path for their native TUIs.
 SQLite rows are the source of truth for projects, threads, turns, transcript items, tasks and the default permission mode.
 The engine actor is the sole database writer after startup.
 The gpui `Shell` owns window state and a read-only event projection, not another database connection.
@@ -32,6 +32,9 @@ main -> tokio runtime -> Engine actor -> veyra.db
                          provider session -> owned CLI process group
                               | normalized events
                               +--------------------> Engine actor
+Engine actor -> veyra-pty worker -> TUI in own PTY session (portable-pty)
+veyra-pty-reader -> alacritty emulator -> queued PTY writer replies
+Engine::terminal handle -> queued PTY writer / emulator lock (no actor)
 Shell -> runtime readiness probes -> short-lived probe CLI process (no turn)
 Shell -> runtime branch task -> git child
 Engine startup -> validated orphan sweep -> veyra-reaper thread
@@ -136,7 +139,7 @@ It combines an atomic closing state with a small synchronous lock; no guard cros
 Engine::shutdown sets closing while holding the gate before enqueueing Shutdown, asynchronously sending that message if the mailbox is full.
 Dropping the last Engine handle and Actor::shutdown also set closing under the gate.
 The Shell reads Engine::is_closing rather than keeping its own flag, and begin_quitting closes the engine and cancels probes and branch work for both quit paths.
-The actor never holds the launch gate across decisions, SQLite writes, installation or effect dispatch, so a synchronous Spawner::spawn or Spawner::terminal can enter the launch boundary without re-entering a held lock.
+The actor never holds the launch gate across decisions, SQLite writes, installation or effect dispatch, so a structured session task or PTY worker can enter the launch boundary without re-entering a held lock.
 Quit can wait for multiple contending launch critical sections at the gate, never for the actor or SQLite.
 Queued turns other than a pending admission remain Queued and held, retiring sessions become Parked without a replacement, and Starting threads without a session handle park during shutdown rather than waiting for an impossible exit.
 If the shutdown write fails, a Starting thread that still owns a session can instead fail its oldest queued turn when that session exits.
@@ -366,7 +369,7 @@ Resolution tries absolute entries from inherited PATH, that snapshot, then `KNOW
 Relative and empty search entries are ignored.
 Known home-relative folders include .grok/bin, so a Finder launch can resolve Grok without that directory in either PATH.
 Explicit isolated environments never fall through to home-relative install folders.
-Executable checks and process-group mechanics are platform functions.
+Executable checks and process-group setup for structured and probe children are platform functions.
 Every structured provider and probe child has piped stdio, `kill_on_drop(true)`, its own process group and `VEYRA_PARENT_PID` naming the application.
 It strips CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SSE_PORT, CLAUDE_AGENT_SDK_VERSION and every inherited VEYRA_* variable before adding its own marker and optional replay fixture.
 Veyra inherits the user's hooks/MCP configuration and never edits it.
@@ -459,49 +462,67 @@ Only a resume-not-found stderr class starts a fresh native session; other errors
 The PTY worker resolves the provider and prepares the PTY and command before entering the shared launch gate.
 The gate covers the final closing check, spawn in the thread's cwd and process-group registration.
 The terminal launch carries no Veyra tool-server arguments or credentials.
+portable-pty's spawn calls setsid, so each TUI leads its own session and process group whose id equals its pid.
+Veyra stores and signals that id; descendants that start another session or group are outside it.
 The worker reports its actual pid through an epoch-tagged TerminalEvent::Ready; store::apply persists that pid as both leader and group.
-A TerminalHandle exposes write and resize directly through its shared Terminal, and Engine::terminal returns that handle without sending an actor message.
+Live::Terminal carries an optional pid until Ready, and hangup does nothing before the terminal has a pid.
+Engine::terminal returns a TerminalHandle without sending an actor message.
+The UI may write, resize, subscribe to a watch::Receiver<u64> wake counter and lock the emulator through that handle.
+The control sender is engine-private; Stop and switching views go through StopThread and SwitchView commands.
+Writes, query replies and resizes enqueue to one ordered writer thread and return without waiting for PTY I/O.
+The queue is unbounded, so a sustained paste faster than the TUI reads can retain queued input in memory.
 Input returns NotConnected before the PTY is ready or after it exits.
+Resize rejects fewer than two columns or one row; the PTY and emulator start at 80 columns by 24 rows.
 The separate blocking reader parses at most 64 KiB while holding an alacritty FairMutex and releases the lock between reads.
+The 64 KiB read and 16 ms worker polling interval are implementation choices.
 Emulator callbacks collect in an Arc-shared Mutex list, so the emulator and terminal can move between threads.
-A consumer can reserve FairMutex::lease and snapshot the grid with lock_unfair while the reader waits.
-Every alacritty PtyWrite reply, including DSR, DA and DECRQM, goes to the PTY writer after parsing, without entering the actor mailbox.
+Alacritty's FairMutex offers lease and lock_unfair; no Veyra consumer uses them yet.
+Every alacritty PtyWrite reply, including DSR, DA and DECRQM, goes to the writer queue after parsing, without entering the actor mailbox or blocking further reads.
 ColorRequest callbacks answer OSC foreground, background and palette queries from terminal::Colors supplied to Spawner::terminal, with engine defaults at the actor call site and standard indexed colors unless the terminal changed them.
 Kitty keyboard mode stays disabled.
-The worker flushes an expired synchronized-update block on its polling interval even while the reader is blocked without new bytes.
-The reader marks the grid dirty, and the worker coalesces watch-channel wakes on its 16 ms polling interval.
+The worker flushes an expired synchronized-update block even while no new bytes arrive and coalesces dirty-grid watch wakes on its polling interval.
 Debug-only flood stamps record monotonic time and consumed bytes at FLOOD_START and FLOOD_DONE title terminators, including when both occur within one read.
-The flood fixture uses emit_raw's repeat count to generate exactly 50,000,020 payload bytes rather than storing every line.
-The fake TUI uses the calling process's own terminal input in raw mode and emits one hex byte per line.
-Claude fake TUI launch requires an explicit CLAUDE_CONFIG_DIR.
-The terminal environment sets TERM=xterm-256color and COLORTERM=truecolor.
-It strips TERM_PROGRAM, TERM_PROGRAM_VERSION, TERM_SESSION_ID, NO_COLOR, FORCE_COLOR, CLICOLOR_FORCE and COLORFGBG, and names prefixed by ITERM_, GHOSTTY_, KITTY_, WEZTERM_, ALACRITTY_ or VTE_.
-It also applies the structured child nesting-variable and VEYRA_ filtering and adds only Veyra's parent marker and an optional debug fixture.
-From Parked, SwitchView increments the epoch and opens the terminal worker, unless a pending import first requires a structured spawn.
-An idle structured session enters Stopping with StartTerminal, closes stdin, and gets up to two seconds to exit before its existing group cleanup ladder.
-Running or pending-admission turns, pending requests and background work refuse the switch.
+The flood fixture uses emit_raw's repeat count; no window or performance consumer runs it yet.
+Only the fake TUI calls the raw-input platform helper; real TUIs set their own raw mode.
+The fake TUI echoes hex bytes, and its Claude mode requires an explicit CLAUDE_CONFIG_DIR and appends linked user, attachment and assistant entries there.
+ChildEnv shares one nesting-variable and VEYRA_ filter across structured and terminal launches.
+The TUI environment additionally strips host-terminal identity and forced-color settings, and sets TERM=xterm-256color and COLORTERM=truecolor.
+From Parked, SwitchView increments the epoch and opens the PTY immediately, even with an import pending; no capture session runs.
+An idle structured session enters Stopping with StartTerminal and receives ShutdownForTerminal, which closes stdin and allows up to two seconds including the ordinary one-second writer drain before group cleanup.
+Ordinary Shutdown retains the one-second writer drain without that additional exit wait.
+Running or pending-admission turns, pending requests, background work and a missing native id refuse the switch with Busy and a WaitReason.
 Switching back enters Stopping with StartStructured and import=true, sends SIGHUP, and kills a terminal group that survives three seconds.
-Shutdown uses the same three-second terminal grace and processes TerminalEvent::Exited as soon as it arrives.
-The native on_app_quit path identifies PTY groups from the handles' atomic pid and sends them SIGHUP, while keeping SIGTERM for structured groups.
-An atomic flag prevents the native quit pass and PTY worker from sending duplicate SIGHUP signals.
-The child guard signals its owned group with SIGKILL and reaps its leader, the worker joins its reader, then Exited permits the next writer.
-Stop changes terminal view to Chat with import_pending and parks after exit; a terminal's spontaneous exit also preserves that pending import.
-A quit or crash with Terminal stored is reconciled to Chat with import_pending before another structured spawn.
-Before the TUI starts, the worker captures the native store's latest cursor and waits for the actor to commit it with view=Terminal.
-Claude capture reads its session file off the actor; Codex and Grok capture open a short-lived structured session without Veyra tool-server access, request history and wait for that process to exit before the PTY launch.
-Codex and Grok capture check cancellation and a fifteen-second deadline, send Shutdown when either occurs, and wait for the session supervisor's reaped Exited before returning.
-Claude capture finishes its blocking file read before checking the terminal control channel.
-SessionSpec carries a HistoryRequest with the stored cursor and Veyra-sent turn ids.
-On the switch back or the next spawn after recovery, Claude reads projects/*/NATIVE.jsonl under ChildEnv's CLAUDE_CONFIG_DIR or its production home/.claude.
-Only main-chain user string/text content and assistant text blocks after the cursor are imported; SDK turns and other entry types are skipped, while the cursor follows the last main-chain uuid.
-Codex pages thread/turns/list newest first until the cursor turn, imports newer user messages and final agent messages oldest first, then resumes the thread.
-Grok opens with session/load for an import, collects replay frames before its reply, and uses the highest replay user promptIndex as the cursor.
-It groups later user and agent text through turn_completed, skips thoughts and Veyra prompt ids, and leaves plain respawns on session/resume when the provider supports it.
-An incomplete later replay turn fails the import without committing its cursor or clearing import_pending.
-SessionEvent::History reaches the actor before Ready; one transaction adds an ended Provider turn with one TerminalSpan when text exists, advances native_cursor and clears import_pending.
-An empty import advances only the cursor when needed, and Ready refuses to start queued work while import_pending remains set.
-The fake Claude TUI appends a uuid-linked user, environment attachment and assistant reply under its required isolated config directory.
-Codex's TUI command disables the daemon and startup update check, uses read-only sandboxing in Ask first, on-request/workspace-write in Accept edits and never/danger-full-access in Full access.
+While closing, the terminal grace is one second, and shutdown processes TerminalEvent::Exited as soon as it arrives.
+The native on_app_quit path identifies PTY groups from the handles' optional pid and sends them SIGHUP, while keeping SIGTERM for structured groups.
+An atomic flag prevents the native quit pass and worker from sending duplicate SIGHUP signals.
+The child guard kills its owned group and reaps its leader; cleanup joins the writer and reader before an exit guard sends Exited, including on worker unwind.
+A failed PTY setup or launch returns Chat without import_pending and stores its crash text in a notice; a nonzero TUI exit retains the emulator tail as the reason.
+Stop during Stopping toward a terminal also returns Chat without an import.
+A TUI that actually ran sets import_pending on exit, and a stored Terminal view is reconciled to Chat with import_pending after a quit or crash.
+The structured path maintains native_cursor in the transaction that changes the turn's state, rather than reading it during the switch.
+For Claude and Grok, dispatch to the structured session marks Running and stores the outgoing user uuid or prompt id, which is the Veyra turn id.
+Codex clears its cursor to unknown at dispatch and supplies its server turn id on the turn/start reply or the first scoped frame of a CLI-started turn, carried as optional cursor context on the same actor event.
+A Grok-started turn stores its first prompt id, including a foreign prompt promoted after Veyra work ends.
+When overlapping foreign prompts share a Provider turn, the codec retains their arrival order and advances to the newest observed prompt id without regressing on an older prompt's later frames.
+Promotion cursor context travels on that ProviderTurnStarted event, after the outgoing Veyra TurnEnded.
+A Claude-started turn outside Veyra dispatch can leave the cursor behind; the structured process writes sdk-cli entries, which the importer excludes even after an older cursor.
+A dispatch that is refused or cancelled before the CLI saves it can leave a cursor absent from the native store; that import copies no text and adopts the newest readable native turn.
+A Codex turn awaiting its start reply has no server id yet, and the busy admission refuses the terminal switch until it retires.
+If Stop, an exit or a crash retires that turn before the id arrives, the cursor stays unknown; a later import adopts the native newest turn without copying text, so the missing acknowledgement cannot duplicate a Veyra turn.
+SessionSpec carries import: Option<HistoryRequest>, containing the cursor and Claude/Grok sent-prompt context.
+On the switch back or the next spawn after recovery, ProviderKind dispatches Claude's file import once, off the actor, under ChildEnv's CLAUDE_CONFIG_DIR or its production home/.claude.
+The Claude reader skips malformed JSON lines and copies later main-chain cli user string/text content and assistant text blocks, excluding sdk-cli and Veyra-sent turns and keeping the cursor at the newest user uuid.
+Codex pages typed thread/turns/list results newest first until the cursor turn, imports newer user messages and final agent messages oldest first, then resumes the thread.
+Its page limit of 100 is an implementation choice, and it does not compare server turn ids with Veyra turn ids.
+Grok imports through session/load, collecting typed replay updates before the reply, grouping user and agent text through turn_completed and skipping thoughts and Veyra prompt ids.
+Its cursor is the native prompt_id, and a failed incomplete replay can adopt the newest identified unfinished prompt; a plain respawn uses session/resume when supported.
+An unknown cursor imports no text and adopts the newest native turn.
+A missing cursor anchor, Codex page failure or incomplete Grok replay instead produces one notice that the terminal turns could not be shown here and the CLI still has them, adopts a readable newest cursor and clears import_pending.
+Grok's load-not-found fallback still opens a new session; if Ready arrives without matching History, the actor clears the pending import with the same notice before starting queued work.
+SessionEvent::History precedes Ready; one transaction adds an ended Provider turn with one TerminalSpan when text exists, advances native_cursor and clears import_pending.
+An empty successful import adds no span, and every import outcome allows queued work to run once the structured session is ready.
+Claude's TUI uses default, acceptEdits or bypassPermissions, adding allow-dangerously-skip-permissions in Full access.
+Codex's TUI disables the daemon and startup update check, uses read-only sandboxing in Ask first, on-request/workspace-write in Accept edits and never/danger-full-access in Full access.
 Grok explicitly selects default permission mode outside Full access and always-approve in Full access.
 
 ## JSON-RPC peer and Codex codec
@@ -827,7 +848,7 @@ A kept child settles into its archived root's queued wake, which never starts: t
 
 ## Platform and keep-awake
 
-The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals, process inspection, idle-sleep assertions, Terminal opening and the fake TUI's raw-input setup.
+The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, structured/probe group setup, group signals, process inspection, idle-sleep assertions, Terminal opening and the fake TUI's raw-input setup.
 Only the fake CLI TUI and its platform regression call raw_terminal_input; the application runtime leaves raw-mode setup to each real TUI.
 Each agent and probe spawn attempts to set group nice 10 and logs failure while continuing.
 The actor attempts to hold one caffeinate guard while any thread is Starting, has a busy turn or has non-ambient background work.
@@ -1232,6 +1253,7 @@ The ignored live tests require fresh human consent; ordinary workspace tests use
 live_claude_approval_round_trip uses the public engine in Ask first to check an exact Bash request, Deny without a file, and AllowOnce on a repeat with the file created.
 Actor tests check account-error retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.
 Live CLI behavior and performance need explicitly authorized checks; fake replay and structural checks cannot establish them.
+Terminal launch flags and all three importers are proven only against Veyra-authored fixtures and the fake TUI; no live test runs an installed TUI or import.
 Real provider permission behavior, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.
 Composer Stop sends Interrupt and sidebar StopThread sends StopThread; real-provider continuation requires explicitly authorized live verification.
 

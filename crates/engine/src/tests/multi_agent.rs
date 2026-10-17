@@ -51,6 +51,7 @@ fn task_turn(f: &Fixture, task: TaskId) -> TurnId {
 fn child_event(f: &mut Fixture, child: ThreadId, event: ProviderEvent) {
     let _entered = f.runtime.enter();
     f.actor.handle(EngineMsg::Provider {
+        cursor: None,
         thread: child,
         epoch: f.actor.live[&child].epoch,
         event,
@@ -915,7 +916,7 @@ fn get_task_status_matches_window() {
                         control,
                         terminal: None,
                     },
-                    pid: 1,
+                    pid: Some(1),
                 };
             }
             _ => unreachable!(),
@@ -1264,6 +1265,7 @@ fn quit_retries_retained_changes_after_the_write_lock_clears() {
     {
         let _entered = f.runtime.enter();
         actor.handle(EngineMsg::Provider {
+            cursor: None,
             thread: f.thread,
             epoch: actor.live[&f.thread].epoch,
             event: ProviderEvent::Session(SessionEvent::Notice {

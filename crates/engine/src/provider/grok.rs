@@ -140,6 +140,7 @@ struct PermissionOption {
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Meta {
+    prompt_index: Option<i64>,
     prompt_id: Option<String>,
     is_replay: bool,
 }
@@ -301,6 +302,8 @@ enum OptionKind {
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum UpdateKind {
+    UserMessageChunk,
+    TurnCompleted,
     AgentMessageChunk,
     AgentThoughtChunk,
     ToolCall,
@@ -368,83 +371,100 @@ enum SessionState {
     },
 }
 
-fn replay_import(
-    frames: &[Value],
-    request: &super::HistoryRequest,
-) -> Result<super::History, ProviderError> {
-    let after = request
-        .cursor
-        .as_deref()
-        .map(str::parse::<u64>)
-        .transpose()
-        .map_err(|_| ProviderError::Protocol("Invalid Grok history cursor".into()))?;
-    let mut cursor = after;
-    let mut text = Vec::new();
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayFrame {
+    session_id: String,
+    update: ReplayUpdate,
+    #[serde(rename = "_meta", default)]
+    meta: Meta,
+}
+#[derive(Deserialize)]
+struct ReplayUpdate {
+    #[serde(rename = "_meta", default)]
+    meta: Meta,
+    #[serde(rename = "sessionUpdate")]
+    kind: UpdateKind,
+    #[serde(default)]
+    content: Option<Content>,
+    #[serde(default)]
+    prompt_id: Option<String>,
+}
+fn replay_import(frames: &[ReplayFrame], request: &super::HistoryRequest) -> super::History {
+    let mut turns = Vec::new();
     let mut user = String::new();
     let mut agent = String::new();
-    let mut index = None;
-    let mut include = false;
-    let mut own = false;
+    let mut id = None;
+    let mut failed = false;
+    let mut user_index = None;
     for frame in frames {
-        let update = &frame["update"];
-        let kind = update["sessionUpdate"].as_str().unwrap_or_default();
-        if kind == "user_message_chunk" {
-            let next = update["_meta"]["promptIndex"].as_u64().ok_or_else(|| {
-                ProviderError::Protocol("Grok replay user has no promptIndex".into())
-            })?;
-            cursor = Some(cursor.map_or(next, |old| old.max(next)));
-            if index != Some(next) {
-                if include {
-                    return Err(ProviderError::Protocol(
-                        "Grok history turn has no turn_completed".into(),
-                    ));
-                }
-                index = Some(next);
-                include = after.is_none_or(|after| next > after);
-                own = false;
-                user.clear();
-                agent.clear();
-            }
-        }
-        if frame["_meta"]["promptId"]
-            .as_str()
-            .or_else(|| update["prompt_id"].as_str())
-            .is_some_and(|id| request.sent.contains(id))
+        let update = &frame.update;
+        if update.kind == UpdateKind::UserMessageChunk
+            && !user.is_empty()
+            && (!agent.is_empty() || user_index.is_some() && update.meta.prompt_index != user_index)
         {
-            own = true;
+            failed = true;
+            user.clear();
+            agent.clear();
+            id = None;
         }
-        if include
-            && update["content"]["type"] == "text"
-            && let Some(value) = update["content"]["text"].as_str()
+        if update.kind == UpdateKind::UserMessageChunk {
+            user_index = update.meta.prompt_index.or(user_index);
+        }
+        if let Some(prompt) = update
+            .prompt_id
+            .as_ref()
+            .or(frame.meta.prompt_id.as_ref())
+            .or(update.meta.prompt_id.as_ref())
         {
-            match kind {
-                "user_message_chunk" => user.push_str(value),
-                "agent_message_chunk" => agent.push_str(value),
-                _ => {}
-            }
+            id = Some(prompt.clone());
         }
-        if kind == "turn_completed" {
-            if include && !own {
-                if !user.is_empty() {
-                    text.push(std::mem::take(&mut user));
-                }
-                if !agent.is_empty() {
-                    text.push(std::mem::take(&mut agent));
-                }
+        match (&update.kind, &update.content) {
+            (UpdateKind::UserMessageChunk, Some(Content::Text { text })) => user.push_str(text),
+            (UpdateKind::AgentMessageChunk, Some(Content::Text { text })) => agent.push_str(text),
+            _ => {}
+        }
+        if update.kind == UpdateKind::TurnCompleted {
+            user_index = None;
+            if let Some(prompt) = id.take() {
+                turns.push((
+                    prompt,
+                    std::mem::take(&mut user),
+                    std::mem::take(&mut agent),
+                ));
+            } else {
+                failed = true;
             }
-            include = false;
-            index = None;
         }
     }
-    if include {
-        return Err(ProviderError::Protocol(
-            "Grok history ended before turn_completed".into(),
-        ));
+    let incomplete = id.is_some() || !user.is_empty() || !agent.is_empty();
+    let cursor = id
+        .or_else(|| turns.last().map(|turn| turn.0.clone()))
+        .or_else(|| request.cursor.clone());
+    let anchor = request
+        .cursor
+        .as_ref()
+        .and_then(|cursor| turns.iter().position(|turn| &turn.0 == cursor));
+    failed |= incomplete || request.cursor.is_some() && anchor.is_none();
+    let mut text = Vec::new();
+    if !failed && let Some(anchor) = anchor {
+        for (id, user, agent) in turns.into_iter().skip(anchor + 1) {
+            if request.sent.contains(&id) {
+                continue;
+            }
+            if !user.is_empty() {
+                text.push(user);
+            }
+            if !agent.is_empty() {
+                text.push(agent);
+            }
+        }
     }
-    Ok(super::History {
-        cursor: cursor.map(|value| value.to_string()),
+    super::History {
+        cursor,
         text: text.join("\n"),
-    })
+        failed,
+    }
 }
 
 pub(crate) struct Codec {
@@ -457,13 +477,15 @@ pub(crate) struct Codec {
     version: Option<String>,
     auth: Option<String>,
     prompts: BTreeMap<String, Prompt>,
+    foreign: Vec<String>,
     ended: BTreeSet<String>,
     requests: BTreeMap<String, Request>,
     seen_requests: BTreeSet<String>,
     tasks: BTreeSet<String>,
     tools: BTreeMap<String, ToolState>,
     interrupted: Option<super::StopLadder>,
-    replay: Vec<Value>,
+    replay: Vec<ReplayFrame>,
+    replay_failed: bool,
 }
 impl Codec {
     pub(crate) fn new(
@@ -482,6 +504,7 @@ impl Codec {
             version: None,
             auth: None,
             prompts: BTreeMap::new(),
+            foreign: Vec::new(),
             ended: BTreeSet::new(),
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
@@ -489,6 +512,7 @@ impl Codec {
             tools: BTreeMap::new(),
             interrupted: None,
             replay: vec![],
+            replay_failed: false,
         }
     }
     pub(crate) fn native(&self) -> Option<&NativeSessionId> {
@@ -594,6 +618,9 @@ impl Codec {
         if self.ended.contains(&id) {
             return None;
         }
+        if !self.prompts.contains_key(&id) {
+            self.foreign.push(id.clone());
+        }
         self.prompts.entry(id.clone()).or_insert(Prompt {
             origin: PromptOrigin::Foreign,
             accepted: true,
@@ -604,6 +631,9 @@ impl Codec {
             let turn = self.begin_provider();
             decoded.provider_turn = Some(turn);
             Self::event(decoded, ActiveTurn::Provider(turn), TurnEvent::Started);
+        }
+        if matches!(self.work(), Some(PromptWork::Provider { .. })) {
+            decoded.cursor = self.foreign.last().cloned();
         }
         Some(id)
     }
@@ -620,6 +650,9 @@ impl Codec {
                 ActiveTurn::Veyra(turn)
             }
             PromptOrigin::Foreign => {
+                if matches!(self.work(), Some(PromptWork::Veyra { .. })) {
+                    self.foreign.retain(|prompt| prompt != id);
+                }
                 if !self.prompts.is_empty()
                     || !matches!(self.work(), Some(PromptWork::Provider { .. }))
                 {
@@ -650,9 +683,11 @@ impl Codec {
         );
         self.set_work(None);
         if self.prompts.is_empty() {
+            self.foreign.clear();
             self.interrupted = None;
         } else {
             let turn = self.begin_provider();
+            decoded.cursor = self.foreign.last().cloned();
             decoded
                 .events
                 .push(ProviderEvent::Session(SessionEvent::ProviderTurnStarted {
@@ -666,8 +701,8 @@ impl Codec {
             prompt.first_frame = None;
         }
         let mut decoded = Decoded::default();
-        if self.spec.import
-            && self.spec.history.is_some()
+        let tagged: Option<TaggedFrame> = serde_json::from_value(value.clone()).ok();
+        if self.spec.import.is_some()
             && matches!(
                 self.state,
                 SessionState::Opening {
@@ -676,20 +711,25 @@ impl Codec {
                 }
             )
             && value.get("id").is_none()
-            && value["params"]["_meta"]["isReplay"] == true
-        {
-            let params = &value["params"];
-            if self
-                .spec
-                .native
+            && tagged
                 .as_ref()
-                .is_some_and(|native| params["sessionId"].as_str() == Some(&native.0))
-            {
-                self.replay.push(params.clone());
+                .is_some_and(|frame| frame.params.meta.is_replay)
+        {
+            match decode::<ReplayFrame>(value["params"].clone()) {
+                Ok(frame)
+                    if self
+                        .spec
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| frame.session_id == native.0) =>
+                {
+                    self.replay.push(frame)
+                }
+                Ok(_) => {}
+                Err(_) => self.replay_failed = true,
             }
             return Ok(decoded);
         }
-        let tagged: Option<TaggedFrame> = serde_json::from_value(value.clone()).ok();
         let frame = self.peer.receive(value);
         if matches!(frame, Frame::Notification { .. })
             && tagged.as_ref().is_some_and(|tagged| {
@@ -729,7 +769,7 @@ impl Codec {
                 let target = match &self.spec.native {
                     None => OpenTarget::New,
                     Some(native)
-                        if !self.spec.import
+                        if self.spec.import.is_none()
                             && init
                                 .agent_capabilities
                                 .session_capabilities
@@ -785,17 +825,13 @@ impl Codec {
                                     "Grok session reply has no sessionId".into(),
                                 )
                             })?;
-                        if matches!(target, OpenTarget::Load(_))
-                            && self.spec.import
-                            && let Some(request) = &self.spec.history
-                        {
-                            let history = replay_import(&self.replay, request)?;
-                            decoded
-                                .events
-                                .push(ProviderEvent::Session(SessionEvent::History {
-                                    native: NativeSessionId(native.clone()),
-                                    history,
-                                }));
+                        if let Some(request) = &self.spec.import {
+                            let mut history = replay_import(&self.replay, request);
+                            history.failed |= self.replay_failed;
+                            if history.failed {
+                                history.text.clear();
+                            }
+                            decoded.history = Some(history);
                             self.replay.clear();
                         }
                         self.state = SessionState::Ready {
@@ -965,7 +1001,7 @@ impl Codec {
             UpdateKind::AgentThoughtChunk => Update::Thought(decode(update["content"].clone())?),
             UpdateKind::ToolCall | UpdateKind::ToolCallUpdate => Update::Tool(decode(update)?),
             UpdateKind::Plan => Update::Plan(decode(update)?),
-            UpdateKind::Unknown => {
+            UpdateKind::UserMessageChunk | UpdateKind::TurnCompleted | UpdateKind::Unknown => {
                 tracing::debug!(
                     kind = update["sessionUpdate"].as_str().unwrap_or_default(),
                     "Unknown Grok session update"
@@ -1540,16 +1576,24 @@ pub fn tui_command(
 #[test]
 fn import_grok_rejects_incomplete_turn() {
     let request = super::HistoryRequest {
-        cursor: Some("0".into()),
+        cursor: Some("anchor".into()),
         ..Default::default()
     };
-    let user = json!({"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"keep me"},"_meta":{"promptIndex":1}}});
-    assert!(replay_import(std::slice::from_ref(&user), &request).is_err());
-    let complete = json!({"update":{"sessionUpdate":"turn_completed","prompt_id":"terminal"}});
+    let frame = |update| {
+        serde_json::from_value::<ReplayFrame>(json!({"sessionId":"native", "update":update}))
+            .unwrap()
+    };
+    let user = frame(
+        json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"keep me"}}),
+    );
+    assert!(replay_import(std::slice::from_ref(&user), &request).failed);
+    let anchor = frame(json!({"sessionUpdate":"turn_completed","prompt_id":"anchor"}));
+    let complete = frame(json!({"sessionUpdate":"turn_completed","prompt_id":"terminal"}));
     assert_eq!(
-        replay_import(&[user, complete], &request).unwrap(),
+        replay_import(&[anchor, user, complete], &request),
         super::History {
-            cursor: Some("1".into()),
+            failed: false,
+            cursor: Some("terminal".into()),
             text: "keep me".into()
         }
     );

@@ -524,38 +524,29 @@ fn start_provider_task(
         {
             receiver.close_before_user_write = env.close_before_user_write.clone();
         }
-        if provider == ProviderKind::Claude
-            && spec.import
-            && let (Some(native), Some(request)) = (&spec.native, &spec.history)
-        {
-            let request = request.clone();
+        if let (Some(native), Some(request)) = (&spec.native, &spec.import) {
             let native = native.clone();
-            let import_native = native.clone();
-            let root = env.claude_config_dir();
+            let request = request.clone();
+            let import_env = env.clone();
             let history = tokio::task::spawn_blocking(move || {
-                claude::session_file_import(&root?, &import_native, &request)
+                provider.file_import(&import_env, &native, &request)
             })
             .await;
-            let history = match history {
-                Ok(Ok(history)) => history,
-                Ok(Err(error)) => return emit(&out, thread, epoch, launch_failed(error)).await,
-                Err(error) => {
-                    return emit(
-                        &out,
-                        thread,
-                        epoch,
-                        launch_failed(ProviderError::Protocol(error.to_string())),
-                    )
-                    .await;
-                }
-            };
-            if !emit(
-                &out,
-                thread,
-                epoch,
-                ProviderEvent::Session(SessionEvent::History { native, history }),
-            )
-            .await
+            let history = history.unwrap_or(Some(super::History {
+                failed: true,
+                ..Default::default()
+            }));
+            if let Some(history) = history
+                && !emit(
+                    &out,
+                    thread,
+                    epoch,
+                    ProviderEvent::Session(SessionEvent::History {
+                        native: spec.native.clone().unwrap(),
+                        history,
+                    }),
+                )
+                .await
             {
                 return false;
             }
@@ -675,6 +666,7 @@ async fn emit(
     event: ProviderEvent,
 ) -> bool {
     out.send(EngineMsg::Provider {
+        cursor: None,
         thread,
         epoch,
         event,
@@ -707,7 +699,10 @@ impl SessionControls {
             self.receiver.close();
         }
         while let Ok(message) = self.receiver.try_recv() {
-            if matches!(message, SessionControl::Shutdown) {
+            if matches!(
+                message,
+                SessionControl::Shutdown | SessionControl::ShutdownForTerminal
+            ) {
                 self.receiver.close();
             }
             self.pending.push_back(message);
@@ -735,10 +730,13 @@ impl SessionControls {
                 return Some(SessionControl::Shutdown);
             }
         }
-        if matches!(message, Some(SessionControl::Shutdown) | None) {
+        if matches!(
+            message,
+            Some(SessionControl::Shutdown | SessionControl::ShutdownForTerminal) | None
+        ) {
             self.receiver.close();
         }
-        message
+        message.or(Some(SessionControl::Shutdown))
     }
 }
 
@@ -830,7 +828,7 @@ async fn run_one(
                         break;
                     }
                 }
-                Some(SessionControl::Shutdown) | None => {
+                Some(shutdown @ (SessionControl::Shutdown | SessionControl::ShutdownForTerminal)) => {
                     shutdown_requested = true;
                     let lines = codec.interrupt_active(StopReason::AppClosing);
                     for line in lines {
@@ -844,7 +842,7 @@ async fn run_one(
                     if tokio::time::timeout(Duration::from_secs(1), &mut write_task).await.is_ok() {
                         writer_done = true;
                     }
-                    if !control.closing.is_closing() {
+                    if matches!(shutdown, SessionControl::ShutdownForTerminal) && !control.closing.is_closing() {
                         while tokio::time::Instant::now() < deadline {
                             if process.child.child.as_mut().is_none_or(|child| child.try_wait().ok().flatten().is_some()) { break; }
                             if control.closing.is_closing() { break; }
@@ -853,6 +851,7 @@ async fn run_one(
                     }
                     break;
                 }
+                None => unreachable!("closed controls become Shutdown"),
                 Some(SessionControl::Interrupt { turn, reason }) => {
                     for line in codec.interrupt_lines(turn, reason) {
                         if let Err(error) = process.send(&writer, line) {
@@ -928,16 +927,23 @@ async fn run_one(
                                 if let Err(error) = process.send(&writer, line) { failure = Some(error.to_string()); break; }
                             }
                             if failure.is_some() { break; }
-                            if let Some(provider_turn) = decoded.provider_turn
-                                && !emit(out, thread, epoch, ProviderEvent::Session(
-                                    SessionEvent::ProviderTurnStarted { provider_turn }
-                                )).await
-                            { consumer_gone = true; break; }
+                            if let Some(provider_turn) = decoded.provider_turn {
+                                let event = ProviderEvent::Session(SessionEvent::ProviderTurnStarted { provider_turn });
+                                let sent = if let Some(cursor) = decoded.cursor.take() { out.send(EngineMsg::Provider { thread, epoch, cursor: Some(cursor), event }).await.is_ok() } else { emit(out, thread, epoch, event).await };
+                                if !sent { consumer_gone = true; break; }
+                            }
+                            if let Some(history) = decoded.history.take() && let Some(native) = codec.native()
+                                && !emit(out, thread, epoch, ProviderEvent::Session(SessionEvent::History { native: native.clone(), history })).await { consumer_gone = true; break; }
+                            let provider_cursor = decoded.events.iter().any(|event| matches!(event, ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })));
                             for event in decoded.events {
                                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                                     ready = true;
                                 }
-                                if !emit(out, thread, epoch, event).await { consumer_gone = true; break; }
+                                let cursor = if !provider_cursor || matches!(&event, ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })) { decoded.cursor.take() } else { None };
+                                let sent = if let Some(cursor) = cursor {
+                                    out.send(EngineMsg::Provider { thread, epoch, cursor: Some(cursor), event }).await.is_ok()
+                                } else { emit(out, thread, epoch, event).await };
+                                if !sent { consumer_gone = true; break; }
                             }
                             if consumer_gone { break; }
                         }
@@ -1297,7 +1303,6 @@ impl Codec {
             Self::Grok(_) => SessionProfile::rpc(ProviderKind::Grok),
         }
     }
-    #[cfg(debug_assertions)]
     fn native(&self) -> Option<&NativeSessionId> {
         match self {
             Self::Claude(c) => Some(c.native()),
@@ -1890,8 +1895,8 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -2160,8 +2165,8 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -2342,8 +2347,8 @@ mod tests {
                             mode: PermissionMode::AskFirst,
                         },
                         native: Some(NativeSessionId("missing-native".into())),
-                        history: Default::default(),
-                        import: false,
+
+                        import: None,
                         root: false,
                     },
                     env.clone(),
@@ -2444,8 +2449,8 @@ mod tests {
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 env.clone(),
@@ -2542,8 +2547,8 @@ done
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 env.clone(),
@@ -2674,8 +2679,8 @@ done
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 env.clone(),
@@ -2796,8 +2801,8 @@ mod mcp_record_tests {
                     effort: None,
                 },
                 native: Some(NativeSessionId("lost-native".into())),
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: true,
             },
             std::process::id(),
@@ -2940,8 +2945,8 @@ mod recorder_tests {
                         effort: None,
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 child.pid(),
@@ -3033,8 +3038,8 @@ mod availability_tests {
                         effort: None,
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 env.clone(),

@@ -13,7 +13,7 @@ use alacritty_terminal::{
     index::{Column, Line},
     sync::FairMutex,
     term::{Config, Term},
-    vte::ansi::Processor,
+    vte::ansi::{NamedColor, Processor},
 };
 pub use portable_pty::PtySize;
 use portable_pty::{CommandBuilder, MasterPty};
@@ -21,7 +21,7 @@ use std::{
     io::{self, Read, Write},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -72,8 +72,13 @@ impl Default for Colors {
 impl Colors {
     fn get(self, index: usize) -> Rgb {
         match index {
-            256 | 258 | 267 => self.foreground,
-            257 | 268 => self.background,
+            index
+                if index == NamedColor::Foreground as usize
+                    || index == NamedColor::Cursor as usize =>
+            {
+                self.foreground
+            }
+            index if index == NamedColor::Background as usize => self.background,
             16..=231 => {
                 let value = index - 16;
                 let channel = |part| if part == 0 { 0 } else { (55 + part * 40) as u8 };
@@ -231,15 +236,15 @@ impl Emulator {
     }
 }
 
-struct PtyIo {
-    master: Box<dyn MasterPty + Send>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+enum Input {
+    Write(Vec<u8>),
+    Resize(PtySize),
 }
 pub struct Terminal {
     pub emulator: FairMutex<Emulator>,
-    io: Mutex<Option<PtyIo>>,
+    input: Mutex<Option<std::sync::mpsc::Sender<Input>>>,
     dirty: AtomicBool,
-    pid: AtomicU32,
+    pid: Mutex<Option<u32>>,
     hangup_sent: AtomicBool,
     wake: watch::Sender<u64>,
 }
@@ -249,27 +254,27 @@ impl std::fmt::Debug for Terminal {
     }
 }
 impl Terminal {
-    pub(crate) fn pid(&self) -> u32 {
-        self.pid.load(Ordering::Acquire)
+    pub(crate) fn pid(&self) -> Option<u32> {
+        *self.pid.lock().unwrap()
     }
     pub(crate) fn hangup(&self) {
-        if !self.hangup_sent.swap(true, Ordering::AcqRel) {
-            let _ = platform::signal_group(self.pid(), Signal::Hangup);
+        if let Some(pid) = self.pid()
+            && !self.hangup_sent.swap(true, Ordering::AcqRel)
+        {
+            let _ = platform::signal_group(pid, Signal::Hangup);
         }
     }
-    pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
-        let writer = self
-            .io
+    fn enqueue(&self, input: Input) -> io::Result<()> {
+        self.input
             .lock()
             .unwrap()
             .as_ref()
-            .map(|io| io.writer.clone())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "terminal is not running")
-            })?;
-        let mut writer = writer.lock().unwrap();
-        writer.write_all(bytes)?;
-        writer.flush()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "terminal is not running"))?
+            .send(input)
+            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "terminal input ended"))
+    }
+    pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        self.enqueue(Input::Write(bytes.to_vec()))
     }
     pub fn resize(&self, size: PtySize) -> io::Result<()> {
         if size.cols < 2 || size.rows == 0 {
@@ -278,126 +283,80 @@ impl Terminal {
                 "terminal needs at least two columns and one row",
             ));
         }
-        let io = self.io.lock().unwrap();
-        io.as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "terminal is not running"))?
-            .master
-            .resize(size)
-            .map_err(io::Error::other)?;
-        self.emulator.lock().term.resize(Size(size));
-        self.dirty.store(true, Ordering::Release);
-        Ok(())
+        self.enqueue(Input::Resize(size))
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.wake.subscribe()
     }
 }
-
+struct Exit {
+    out: mpsc::Sender<EngineMsg>,
+    thread: crate::domain::ThreadId,
+    epoch: u32,
+    started: bool,
+    crash: Option<String>,
+}
+impl Drop for Exit {
+    fn drop(&mut self) {
+        let crash = if std::thread::panicking() {
+            Some("The terminal stopped unexpectedly".into())
+        } else {
+            self.crash.take()
+        };
+        let _ = self.out.blocking_send(EngineMsg::Terminal {
+            thread: self.thread,
+            epoch: self.epoch,
+            event: TerminalEvent::Exited {
+                started: self.started,
+                crash,
+            },
+        });
+    }
+}
 pub(crate) fn spawn(
     provider: ProviderKind,
-    spec: SessionSpec,
+    mut spec: SessionSpec,
     env: ChildEnv,
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
     colors: Colors,
 ) -> Result<TerminalHandle, ProviderError> {
-    if spec.native.is_none() {
-        return Err(ProviderError::Protocol(
-            "Start the conversation in chat before opening its terminal".into(),
-        ));
-    }
-    let size = PtySize::default();
+    let native = spec.native.take().ok_or_else(|| {
+        ProviderError::Protocol(
+            "Send a message first; the terminal opens the CLI's conversation.".into(),
+        )
+    })?;
     let terminal = Arc::new(Terminal {
-        emulator: FairMutex::new(Emulator::with_colors(size, colors)),
-        io: Mutex::new(None),
+        emulator: FairMutex::new(Emulator::with_colors(PtySize::default(), colors)),
+        input: Mutex::new(None),
         dirty: AtomicBool::new(false),
-        pid: AtomicU32::new(0),
+        pid: Mutex::new(None),
         hangup_sent: AtomicBool::new(false),
         wake: watch::channel(0).0,
     });
-    let (control, mut controls) = mpsc::unbounded_channel();
+    let (control, controls) = mpsc::unbounded_channel();
     let handle = TerminalHandle {
         control,
         terminal: Some(terminal.clone()),
     };
-    let runtime = tokio::runtime::Handle::current();
-    std::thread::Builder::new().name("veyra-pty".into()).spawn(move || {
-        let thread = spec.thread;
-        let result = (|| {
-            let cursor = runtime.block_on(capture_cursor(provider, spec.clone(), env.clone(), epoch, &mut controls))?;
-            if controls.try_recv().is_ok() || controls.is_closed() { return Err(ProviderError::Cancelled); }
-            let (reply, prepared) = std::sync::mpsc::sync_channel(1);
-            out.blocking_send(EngineMsg::Terminal { thread, epoch, event: TerminalEvent::Prepared { cursor, reply } }).map_err(|_| ProviderError::Cancelled)?;
-            loop {
-                match prepared.recv_timeout(Duration::from_millis(25)) {
-                    Ok(true) => break,
-                    Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(ProviderError::Cancelled),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) if env.closing.is_closing() || out.is_closed() => return Err(ProviderError::Cancelled),
-                    Err(_) => {}
-                }
+    std::thread::Builder::new()
+        .name("veyra-pty".into())
+        .spawn(move || {
+            let mut exit = Exit {
+                out,
+                thread: spec.thread,
+                epoch,
+                started: false,
+                crash: None,
+            };
+            if let Err(error) = run(provider, spec, native, env, terminal, controls, &mut exit)
+                && !matches!(error, ProviderError::Cancelled)
+            {
+                exit.crash = Some(crate::record::redact(&error.to_string(), None));
             }
-            run(provider, spec, env, &out, epoch, terminal, controls)
-        })();
-        if let Err(error) = result {
-            tracing::warn!(error = %crate::record::redact(&error.to_string(), None), "terminal ended with an error");
-        }
-        let _ = out.blocking_send(EngineMsg::Terminal { thread, epoch, event: TerminalEvent::Exited });
-    })?;
+        })?;
     Ok(handle)
 }
-
-async fn capture_cursor(
-    provider: ProviderKind,
-    mut spec: SessionSpec,
-    env: ChildEnv,
-    epoch: u32,
-    controls: &mut mpsc::UnboundedReceiver<TerminalControl>,
-) -> Result<Option<String>, ProviderError> {
-    if provider == ProviderKind::Claude {
-        return tokio::task::spawn_blocking(move || {
-            super::provider::claude::session_file_import(
-                &env.claude_config_dir()?,
-                spec.native.as_ref().unwrap(),
-                &Default::default(),
-            )
-            .map(|history| history.cursor)
-        })
-        .await
-        .map_err(|error| ProviderError::Protocol(error.to_string()))?;
-    }
-    spec.import = true;
-    spec.root = false;
-    spec.history.get_or_insert_default().cursor = None;
-    let (out, mut events) = mpsc::channel(256);
-    let handle = super::provider::session::spawn_provider(provider, spec, env.clone(), out, epoch)?;
-    let mut history = None;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut failure = None;
-    loop {
-        tokio::select! {
-            message = events.recv() => match message {
-                Some(EngineMsg::Provider { event: super::provider::ProviderEvent::Session(event), .. }) => match event {
-                    super::provider::SessionEvent::History { history: value, .. } => history = Some(value),
-                    super::provider::SessionEvent::Ready { .. } => { let _ = handle.control.send(super::provider::SessionControl::Shutdown); }
-                    super::provider::SessionEvent::Exited { crash } => {
-                        if let Some(error) = failure.or(crash) { return Err(ProviderError::Protocol(error)); }
-                        return history.map(|history| history.cursor).ok_or_else(|| ProviderError::Protocol("Provider exited before history capture".into()));
-                    }
-                    _ => {}
-                },
-                None => return Err(ProviderError::Protocol("History capture ended without exit".into())),
-                _ => {}
-            },
-            _ = tokio::time::sleep(Duration::from_millis(25)) => {
-                if failure.is_none() && (Instant::now() >= deadline || env.closing.is_closing() || controls.try_recv().is_ok() || controls.is_closed()) {
-                    failure = Some("History capture cancelled or timed out".into());
-                    let _ = handle.control.send(super::provider::SessionControl::Shutdown);
-                }
-            }
-        }
-    }
-}
-
 struct ChildGroup {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     pid: u32,
@@ -410,21 +369,41 @@ impl Drop for ChildGroup {
         self.groups.lock().unwrap().remove(&self.pid);
     }
 }
+struct Workers {
+    child: Option<ChildGroup>,
+    terminal: Arc<Terminal>,
+    reader: Option<std::thread::JoinHandle<io::Result<()>>>,
+    writer: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+impl Drop for Workers {
+    fn drop(&mut self) {
+        drop(self.child.take());
+        *self.terminal.pid.lock().unwrap() = None;
+        *self.terminal.input.lock().unwrap() = None;
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        self.terminal.wake.send_modify(|counter| *counter += 1);
+    }
+}
 fn run(
     provider: ProviderKind,
     spec: SessionSpec,
+    native: crate::domain::NativeSessionId,
     env: ChildEnv,
-    out: &mpsc::Sender<EngineMsg>,
-    epoch: u32,
     terminal: Arc<Terminal>,
     mut controls: mpsc::UnboundedReceiver<TerminalControl>,
+    exit: &mut Exit,
 ) -> Result<(), ProviderError> {
     let binary = env.resolve(provider)?;
     let pair = portable_pty::native_pty_system()
         .openpty(PtySize::default())
         .map_err(io::Error::other)?;
     let mut command = CommandBuilder::new(binary);
-    command.args(provider.tui_command(spec.native.as_ref().unwrap(), &spec.config));
+    command.args(provider.tui_command(&native, &spec.config));
     command.cwd(&spec.cwd);
     command.env_clear();
     for (key, value) in env.tui_environment(std::env::vars_os()) {
@@ -440,105 +419,134 @@ fn run(
         command.env("VEYRA_FAKE_FIXTURE", std::fs::canonicalize(fixture)?);
     }
     let admission = env.closing.enter();
-    if env.closing.is_closing() {
+    if env.closing.is_closing() || controls.is_closed() || controls.try_recv().is_ok() {
         return Err(ProviderError::Cancelled);
     }
     let child = pair
         .slave
         .spawn_command(command)
         .map_err(io::Error::other)?;
+    exit.started = true;
     let pid = child
         .process_id()
         .ok_or_else(|| io::Error::other("PTY child has no pid"))?;
-    env.groups.lock().unwrap().insert(pid);
-    terminal.pid.store(pid, Ordering::Release);
-    let mut child = ChildGroup {
-        child,
-        pid,
-        groups: env.groups.clone(),
+    let mut workers = Workers {
+        child: Some(ChildGroup {
+            child,
+            pid,
+            groups: env.groups.clone(),
+        }),
+        terminal: terminal.clone(),
+        reader: None,
+        writer: None,
     };
+    env.groups.lock().unwrap().insert(pid);
+    *terminal.pid.lock().unwrap() = Some(pid);
     drop(admission);
     drop(pair.slave);
     if let Err(error) = platform::lower_priority(pid) {
         tracing::warn!(%error, "could not lower terminal priority");
     }
     let reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
-    let writer = Arc::new(Mutex::new(
-        pair.master.take_writer().map_err(io::Error::other)?,
-    ));
+    let writer = pair.master.take_writer().map_err(io::Error::other)?;
+    let (input, queue) = std::sync::mpsc::channel();
+    *terminal.input.lock().unwrap() = Some(input);
+    let writing = terminal.clone();
+    workers.writer = Some(
+        std::thread::Builder::new()
+            .name("veyra-pty-writer".into())
+            .spawn(move || write(pair.master, writer, queue, &writing))?,
+    );
     let reading = terminal.clone();
-    let replies = writer.clone();
-    let reader = std::thread::Builder::new()
-        .name("veyra-pty-reader".into())
-        .spawn(move || {
-            let result = read(reader, &reading, &replies);
-            if let Err(error) = result {
-                tracing::warn!(%error, "terminal reader stopped");
-            }
-        })?;
-    *terminal.io.lock().unwrap() = Some(PtyIo {
-        master: pair.master,
-        writer,
-    });
-    let _ = out.blocking_send(EngineMsg::Terminal {
+    workers.reader = Some(
+        std::thread::Builder::new()
+            .name("veyra-pty-reader".into())
+            .spawn(move || read(reader, &reading))?,
+    );
+    let _ = exit.out.blocking_send(EngineMsg::Terminal {
         thread: spec.thread,
-        epoch,
+        epoch: exit.epoch,
         event: TerminalEvent::Ready { pid },
     });
-    let result = (|| -> io::Result<()> {
-        let mut stopping = None;
-        loop {
-            if child.child.try_wait()?.is_some() {
-                break;
+    let mut stopping = None;
+    loop {
+        if let Some(status) = workers.child.as_mut().unwrap().child.try_wait()? {
+            drop(workers.child.take());
+            if let Some(reader) = workers.reader.take() {
+                let _ = reader.join();
             }
-            if stopping.is_none()
-                && (controls.try_recv().is_ok()
-                    || controls.is_closed()
-                    || env.closing.is_closing()
-                    || out.is_closed())
-            {
-                terminal.hangup();
-                stopping = Some(Instant::now());
+            if !status.success() && stopping.is_none() {
+                let text = terminal.emulator.lock().text().join("\n");
+                return Err(ProviderError::Protocol(format!(
+                    "{} terminal exited: {}",
+                    provider.name(),
+                    text.trim()
+                )));
             }
-            let stop_grace = Duration::from_secs(3);
-            if stopping.is_some_and(|at: Instant| at.elapsed() >= stop_grace) {
-                let _ = platform::signal_group(pid, Signal::Kill);
-            }
-            let reply = {
-                let mut emulator = terminal.emulator.lock();
-                if emulator.flush_sync_timeout() {
-                    terminal.dirty.store(true, Ordering::Release);
-                    emulator.feed(&[], 0)
-                } else {
-                    vec![]
-                }
-            };
-            if !reply.is_empty() {
-                terminal.write(&reply)?;
-            }
-            if terminal.dirty.swap(false, Ordering::AcqRel) {
-                terminal.wake.send_modify(|counter| *counter += 1);
-            }
-            std::thread::sleep(Duration::from_millis(16));
+            break;
         }
-        Ok(())
-    })();
-    drop(child);
-    terminal.pid.store(0, Ordering::Release);
-    *terminal.io.lock().unwrap() = None;
-    let joined = reader
-        .join()
-        .map_err(|_| io::Error::other("terminal reader panicked"));
-    terminal.wake.send_modify(|counter| *counter += 1);
-    result?;
-    joined?;
+        if stopping.is_none()
+            && (controls.try_recv().is_ok()
+                || controls.is_closed()
+                || env.closing.is_closing()
+                || exit.out.is_closed())
+        {
+            terminal.hangup();
+            stopping = Some(Instant::now());
+        }
+        let grace = Duration::from_secs(if env.closing.is_closing() { 1 } else { 3 });
+        if stopping.is_some_and(|at: Instant| at.elapsed() >= grace) {
+            let _ = platform::signal_group(pid, Signal::Kill);
+        }
+        if stopping.is_none()
+            && workers
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.is_finished())
+        {
+            return Err(ProviderError::Protocol("The terminal input stopped".into()));
+        }
+        let reply = {
+            let mut emulator = terminal.emulator.lock();
+            if emulator.flush_sync_timeout() {
+                terminal.dirty.store(true, Ordering::Release);
+                emulator.feed(&[], 0)
+            } else {
+                vec![]
+            }
+        };
+        if !reply.is_empty() {
+            terminal.write(&reply)?;
+        }
+        if terminal.dirty.swap(false, Ordering::AcqRel) {
+            terminal.wake.send_modify(|counter| *counter += 1);
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
     Ok(())
 }
-fn read(
-    mut reader: Box<dyn Read + Send>,
+fn write(
+    master: Box<dyn MasterPty + Send>,
+    mut writer: Box<dyn Write + Send>,
+    queue: std::sync::mpsc::Receiver<Input>,
     terminal: &Terminal,
-    writer: &Mutex<Box<dyn Write + Send>>,
 ) -> io::Result<()> {
+    for input in queue {
+        match input {
+            Input::Write(bytes) => {
+                writer.write_all(&bytes)?;
+                writer.flush()?;
+            }
+            Input::Resize(size) => {
+                master.resize(size).map_err(io::Error::other)?;
+                terminal.emulator.lock().term.resize(Size(size));
+                terminal.dirty.store(true, Ordering::Release);
+            }
+        }
+    }
+    Ok(())
+}
+fn read(mut reader: Box<dyn Read + Send>, terminal: &Terminal) -> io::Result<()> {
     let mut bytes = [0; 64 * 1024];
     let mut consumed = 0;
     loop {
@@ -551,9 +559,7 @@ fn read(
         consumed += count as u64;
         let reply = terminal.emulator.lock().feed(&bytes[..count], consumed);
         if !reply.is_empty() {
-            let mut writer = writer.lock().unwrap();
-            writer.write_all(&reply)?;
-            writer.flush()?;
+            terminal.write(&reply)?;
         }
         terminal.dirty.store(true, Ordering::Release);
     }
@@ -605,13 +611,13 @@ mod tests {
         let emulator = std::thread::spawn(|| {
             let mut emulator = Emulator::new(PtySize::default());
             assert_eq!(
-                emulator.feed(b"\x1b[2;4HM7\x1b[6n\x1b[c", 16),
+                emulator.feed(b"\x1b[2;4HOK\x1b[6n\x1b[c", 16),
                 b"\x1b[2;6R\x1b[?6c"
             );
             emulator
         })
         .join()
         .unwrap();
-        assert_eq!(emulator.text()[1], "   M7");
+        assert_eq!(emulator.text()[1], "   OK");
     }
 }

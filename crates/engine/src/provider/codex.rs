@@ -225,7 +225,7 @@ pub(crate) struct Codec {
     requests: BTreeMap<String, Request>,
     seen_requests: BTreeSet<String>,
     interrupted: Option<Interruption>,
-    history_turns: Vec<Value>,
+    history_turns: Vec<wire::Turn>,
     history_pages: BTreeSet<String>,
 }
 impl Codec {
@@ -262,6 +262,45 @@ impl Codec {
     }
     pub(crate) fn active(&self) -> Option<ActiveTurn> {
         self.turn.active()
+    }
+    fn finish_history(&mut self, decoded: &mut Decoded, failed: bool) {
+        let request = self.spec.import.as_ref().unwrap();
+        let cursor = self
+            .history_turns
+            .first()
+            .and_then(|turn| turn.id.clone())
+            .or_else(|| request.cursor.clone());
+        let mut text = Vec::new();
+        if !failed && request.cursor.is_some() {
+            for turn in self.history_turns.drain(..).rev() {
+                let items = turn.items.unwrap_or_default();
+                for item in items {
+                    match item {
+                        wire::Item::UserMessage(user) => {
+                            for content in user.content {
+                                if let wire::UserContent::Text { text: value } = content {
+                                    text.push(value);
+                                }
+                            }
+                        }
+                        wire::Item::AgentMessage(agent)
+                            if agent.phase.as_deref() == Some("final_answer") =>
+                        {
+                            if let Some(value) = agent.text {
+                                text.push(value);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.history_turns.clear();
+        decoded.history = Some(super::History {
+            cursor,
+            text: text.join("\n"),
+            failed,
+        });
     }
     fn history_page(&mut self, cursor: Option<&str>) -> Value {
         self.peer.send(Call::History, "thread/turns/list", json!({"threadId":self.native().unwrap().0,"cursor":cursor,"limit":100,"sortDirection":"desc"}))
@@ -320,7 +359,7 @@ impl Codec {
                 decoded
                     .replies
                     .push(self.peer.notification("initialized", Value::Null));
-                if self.spec.import && self.spec.history.is_some() && self.native().is_some() {
+                if self.spec.import.is_some() && self.native().is_some() {
                     decoded.replies.push(self.history_page(None));
                 } else {
                     self.queue_thread(&mut decoded)?;
@@ -330,92 +369,44 @@ impl Codec {
                 tag: Call::History,
                 result,
             } => {
-                let result = result.map_err(jsonrpc::failure)?;
-                let turns = result["data"].as_array().ok_or_else(|| {
-                    ProviderError::Protocol("Codex turns list has no data".into())
-                })?;
-                let mut found = false;
-                for turn in turns {
-                    if self
-                        .spec
-                        .history
-                        .as_ref()
-                        .unwrap()
-                        .cursor
-                        .as_deref()
-                        .is_some_and(|cursor| turn["id"].as_str() == Some(cursor))
-                    {
-                        found = true;
-                        break;
-                    }
-                    self.history_turns.push(turn.clone());
-                }
-                if !found && let Some(cursor) = result["nextCursor"].as_str() {
-                    if !self.history_pages.insert(cursor.to_owned()) {
-                        return Err(ProviderError::Protocol(
-                            "Codex turns list repeated a page cursor".into(),
-                        ));
-                    }
-                    decoded.replies.push(self.history_page(Some(cursor)));
-                } else {
-                    if !found && self.spec.history.as_ref().unwrap().cursor.is_some() {
-                        return Err(ProviderError::Protocol(
-                            "Codex history cursor was not found".into(),
-                        ));
-                    }
-                    let cursor = self
-                        .history_turns
-                        .first()
-                        .and_then(|turn| turn["id"].as_str())
-                        .map(str::to_owned)
-                        .or_else(|| self.spec.history.as_ref().unwrap().cursor.clone());
-                    let mut text = Vec::new();
-                    for turn in self.history_turns.drain(..).rev() {
-                        let Some(items) = turn["items"].as_array() else {
-                            continue;
-                        };
-                        if self
-                            .spec
-                            .history
-                            .as_ref()
-                            .unwrap()
-                            .sent
-                            .contains(turn["id"].as_str().unwrap_or_default())
-                        {
-                            continue;
-                        }
-                        for item in items {
-                            match item["type"].as_str() {
-                                Some("userMessage") => {
-                                    if let Some(content) = item["content"].as_array() {
-                                        text.extend(
-                                            content
-                                                .iter()
-                                                .filter(|block| block["type"] == "text")
-                                                .filter_map(|block| block["text"].as_str())
-                                                .map(str::to_owned),
-                                        );
-                                    }
-                                }
-                                Some("agentMessage") if item["phase"] == "final_answer" => {
-                                    if let Some(value) = item["text"].as_str() {
-                                        text.push(value.to_owned());
-                                    }
-                                }
-                                _ => {}
+                let page = result
+                    .map_err(jsonrpc::failure)
+                    .and_then(|result| decode::<wire::TurnsPage>(result, "history page"));
+                match page {
+                    Ok(page) => {
+                        let request = self.spec.import.as_ref().unwrap();
+                        let mut found = false;
+                        for turn in page.data {
+                            if turn.id.as_deref().is_none_or(str::is_empty) {
+                                continue;
                             }
+                            if turn.id.as_deref() == request.cursor.as_deref()
+                                && request.cursor.is_some()
+                            {
+                                found = true;
+                                break;
+                            }
+                            self.history_turns.push(turn);
+                        }
+                        if !found
+                            && request.cursor.is_some()
+                            && let Some(cursor) = page.next_cursor
+                        {
+                            if self.history_pages.insert(cursor.clone()) {
+                                decoded.replies.push(self.history_page(Some(&cursor)));
+                            } else {
+                                self.finish_history(&mut decoded, true);
+                                self.queue_thread(&mut decoded)?;
+                            }
+                        } else {
+                            self.finish_history(&mut decoded, !found && request.cursor.is_some());
+                            self.queue_thread(&mut decoded)?;
                         }
                     }
-                    decoded
-                        .events
-                        .push(ProviderEvent::Session(SessionEvent::History {
-                            native: self.native().unwrap().clone(),
-                            history: super::History {
-                                cursor,
-                                text: text.join("\n"),
-                            },
-                        }));
-                    self.queue_thread(&mut decoded)?;
+                    Err(_) => {
+                        self.finish_history(&mut decoded, true);
+                        self.queue_thread(&mut decoded)?;
+                    }
                 }
             }
             Frame::Reply {
@@ -508,6 +499,7 @@ impl Codec {
                     }
                     _ => vec![],
                 };
+                decoded.cursor = Some(id.clone());
                 self.turns.entry(id).or_insert(Turn {
                     owner: ActiveTurn::Veyra(turn),
                     phase: TurnPhase::Pending,
@@ -603,6 +595,7 @@ impl Codec {
             TurnBinding::Idle => {
                 let owner = ActiveTurn::Provider(TurnId::new());
                 decoded.provider_turn = Some(owner.target());
+                decoded.cursor = Some(id.into());
                 self.turn = TurnBinding::Bound {
                     owner,
                     native: id.into(),
@@ -720,6 +713,7 @@ impl Codec {
         let agent = matches!(&notification, N::AgentDelta { params: _ });
         match notification {
             N::TurnStarted { params: _ } => {
+                decoded.cursor = Some(id.clone());
                 if let Some(turn) = self.turns.get_mut(&id)
                     && turn.phase == TurnPhase::Pending
                 {
@@ -1583,8 +1577,8 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: Some(NativeSessionId("old-thread".into())),
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             1,
@@ -1967,8 +1961,8 @@ mod limit_tests {
                     effort: None,
                 },
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             1,
@@ -2045,8 +2039,8 @@ mod collaboration_tests {
                         effort: None,
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 1,

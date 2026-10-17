@@ -286,8 +286,8 @@ async fn grok_no_first_frame_fails_at_60s() {
                 cwd: scratch.0.canonicalize().unwrap(),
                 config: config(),
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             out,
@@ -537,8 +537,8 @@ fn grok_signed_out_never_authenticates() {
                     cwd: scratch.0.canonicalize().unwrap(),
                     config: config(),
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 out,
@@ -1287,12 +1287,11 @@ fn grok_load_replay_import() {
                         mode: PermissionMode::FullAccess,
                     },
                     native: Some(NativeSessionId("native-import".into())),
-                    import: true,
-                    root: false,
-                    history: Some(HistoryRequest {
-                        cursor: Some("0".into()),
+                    import: Some(HistoryRequest {
+                        cursor: Some("old".into()),
                         sent: ["sent".into()].into(),
                     }),
+                    root: false,
                 },
                 out,
                 1,
@@ -1333,7 +1332,8 @@ fn grok_load_replay_import() {
         assert_eq!(
             history.unwrap(),
             History {
-                cursor: Some("2".into()),
+                failed: false,
+                cursor: Some("terminal".into()),
                 text: "second\nreply second".into()
             }
         );

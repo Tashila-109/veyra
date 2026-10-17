@@ -190,6 +190,7 @@ pub(super) struct InitializeReply {
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub(super) enum Item {
+    UserMessage(UserMessage),
     AgentMessage(AgentMessage),
     Reasoning(Reasoning),
     CommandExecution(CommandExecution),
@@ -208,6 +209,7 @@ pub(super) enum Item {
 pub(super) struct AgentMessage {
     pub id: Option<String>,
     pub text: Option<String>,
+    pub phase: Option<String>,
     pub delivery: Option<AgentDelivery>,
     pub questions: Option<Vec<AsyncQuestion>>,
 }
@@ -320,6 +322,7 @@ pub(super) struct McpToolCall {
 impl Item {
     pub fn id(&self) -> Option<&str> {
         match self {
+            Self::UserMessage(user) => user.id.as_deref(),
             Self::AgentMessage(p) => p.id.as_deref(),
             Self::Reasoning(p) => p.id.as_deref(),
             Self::CommandExecution(p) => p.tool.id.as_deref(),
@@ -547,4 +550,26 @@ pub(super) struct RateWindow {
     pub used_percent: f64,
     pub window_duration_mins: Option<i64>,
     pub resets_at: Option<i64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct TurnsPage {
+    pub data: Vec<Turn>,
+    pub next_cursor: Option<String>,
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct UserMessage {
+    pub id: Option<String>,
+    pub content: Vec<UserContent>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub(super) enum UserContent {
+    Text {
+        text: String,
+    },
+    #[serde(other)]
+    Unknown,
 }

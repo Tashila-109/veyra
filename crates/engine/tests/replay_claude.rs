@@ -77,8 +77,8 @@ fn replay(name: &str, resume: bool) -> Vec<ProviderEvent> {
                     mode: PermissionMode::AskFirst,
                 },
                 native: resume.then(|| NativeSessionId("missing-native".into())),
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -609,8 +609,8 @@ fn controlled_replay_with(
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -992,8 +992,8 @@ fn shutdown_during_spawn_never_ready() {
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 env,
@@ -1054,8 +1054,8 @@ fn request_replay(
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -1226,8 +1226,8 @@ for line in sys.stdin:
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -1410,8 +1410,8 @@ for line in sys.stdin:
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -1580,8 +1580,8 @@ for line in sys.stdin:
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-                history: Default::default(),
-                import: false,
+
+                import: None,
                 root: false,
             },
             env,
@@ -1762,7 +1762,7 @@ while read_line(5) is not None: pass
         let handle = session::spawn(SessionSpec {
             thread: ThreadId::new(), cwd: scratch.0.clone(),
             config: ThreadConfig { model: None, effort: None, mode: PermissionMode::AskFirst },
-            native: None, history: Default::default(), import: false,
+            native: None,  import: None,
                     root: false,
         }, env, out, 1).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(15), async {
@@ -1835,7 +1835,7 @@ fn blocked_writer_without_stop_leaves_provider_turn_completed() {
 #[test]
 fn claude_session_file_import() {
     use veyra_engine::provider::{History, HistoryRequest, claude::session_file_import};
-    let root = std::path::Path::new("/tmp").join(format!("veyra-m7s1-import-{}", ThreadId::new()));
+    let root = std::path::Path::new("/tmp").join(format!("veyra-term-import-{}", ThreadId::new()));
     std::fs::create_dir_all(root.join("projects/isolated-project")).unwrap();
     let scratch = Scratch(root);
     std::fs::copy(
@@ -1846,7 +1846,7 @@ fn claude_session_file_import() {
     )
     .unwrap();
     let request = HistoryRequest {
-        cursor: Some("anchor".into()),
+        cursor: Some("old-user".into()),
         sent: ["sent".into()].into(),
     };
     let imported = session_file_import(
@@ -1858,7 +1858,8 @@ fn claude_session_file_import() {
     assert_eq!(
         imported,
         History {
-            cursor: Some("end".into()),
+            failed: false,
+            cursor: Some("new-user".into()),
             text: "second\nreply second".into()
         }
     );
@@ -1872,12 +1873,12 @@ fn claude_session_file_import() {
     )
     .unwrap();
     assert_eq!(repeat.text, "");
-    assert_eq!(repeat.cursor.as_deref(), Some("end"));
+    assert_eq!(repeat.cursor.as_deref(), Some("new-user"));
 }
 
 #[test]
 fn claude_import_precedes_ready() {
-    let root = Path::new("/tmp").join(format!("veyra-m7s1-claude-open-{}", ThreadId::new()));
+    let root = Path::new("/tmp").join(format!("veyra-term-claude-open-{}", ThreadId::new()));
     fs::create_dir_all(root.join("config/projects/isolated")).unwrap();
     let scratch = Scratch(root);
     fs::copy(
@@ -1922,11 +1923,11 @@ fn claude_import_precedes_ready() {
                     mode: PermissionMode::FullAccess,
                 },
                 native: Some(NativeSessionId("native-import".into())),
-                import: true,
-                history: Some(HistoryRequest {
-                    cursor: Some("anchor".into()),
+                import: Some(HistoryRequest {
+                    cursor: Some("old-user".into()),
                     sent: ["sent".into()].into(),
                 }),
+
                 root: false,
             },
             env,

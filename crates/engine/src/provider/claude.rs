@@ -476,7 +476,6 @@ pub(crate) struct Codec {
     seen_commands: BTreeSet<String>,
 }
 impl Codec {
-    #[cfg(debug_assertions)]
     pub fn native(&self) -> &NativeSessionId {
         &self.native
     }
@@ -552,6 +551,8 @@ impl Codec {
                     controls: Vec::new(),
                     replies: vec![Self::unsupported_request(id)],
                     provider_turn: None,
+                    cursor: None,
+                    history: None,
                     #[cfg(debug_assertions)]
                     recording: None,
                 });
@@ -1316,11 +1317,14 @@ pub fn session_file_import(
         return Ok(Default::default());
     };
     let mut history = super::History::default();
-    let mut after = request.cursor.is_none();
+    let mut after = false;
     let mut own = false;
+    let mut include = false;
     let mut text = Vec::new();
     for line in std::io::BufReader::new(file).lines() {
-        let value: Value = serde_json::from_str(&line?)?;
+        let Ok(value): Result<Value, _> = serde_json::from_str(&line?) else {
+            continue;
+        };
         if value["sessionId"].as_str() != Some(&native.0) || value["isSidechain"] != false {
             continue;
         }
@@ -1330,7 +1334,9 @@ pub fn session_file_import(
         let Some(uuid) = value["uuid"].as_str() else {
             continue;
         };
-        history.cursor = Some(uuid.into());
+        if value["type"] == "user" {
+            history.cursor = Some(uuid.into());
+        }
         if value["type"] == "user" {
             own = request.sent.contains(uuid)
                 || value["entrypoint"] == "sdk-cli"
@@ -1342,7 +1348,10 @@ pub fn session_file_import(
             }
             continue;
         }
-        if own {
+        if value["type"] == "user" {
+            include = !own && value["entrypoint"] == "cli";
+        }
+        if !include || value["entrypoint"] != "cli" {
             continue;
         }
         let content = &value["message"]["content"];
@@ -1361,12 +1370,10 @@ pub fn session_file_import(
             }
         }
     }
-    if !after {
-        return Err(super::ProviderError::Protocol(
-            "Claude history cursor was not found".into(),
-        ));
+    history.failed = request.cursor.is_some() && !after;
+    if after {
+        history.text = text.join("\n");
     }
-    history.text = text.join("\n");
     Ok(history)
 }
 
@@ -2202,8 +2209,8 @@ mod tests {
                 mode: PermissionMode::AskFirst,
             },
             native: None,
-            history: Default::default(),
-            import: false,
+
+            import: None,
             root: false,
         };
         for (mode, expected, dangerous) in [

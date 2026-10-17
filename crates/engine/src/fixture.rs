@@ -88,6 +88,14 @@ fn run_tui(args: &[String]) -> io::Result<i32> {
         for record in load(Path::new(&path))? {
             match record {
                 Record::TranscriptStart { .. } => {}
+                Record::Spin { ms } => std::thread::sleep(std::time::Duration::from_millis(ms)),
+                Record::Exit { code, stderr } => {
+                    for line in stderr {
+                        writeln!(output, "{line}\r")?;
+                    }
+                    output.flush()?;
+                    return Ok(code);
+                }
                 Record::EmitRaw { base64, repeat } => {
                     use base64::Engine;
                     let bytes = base64::engine::general_purpose::STANDARD
@@ -99,9 +107,7 @@ fn run_tui(args: &[String]) -> io::Result<i32> {
                     output.flush()?;
                 }
                 _ => {
-                    return Err(io::Error::other(
-                        "TUI fixture accepts only transcript_start and emit_raw",
-                    ));
+                    return Err(io::Error::other("Unsupported TUI fixture record"));
                 }
             }
         }

@@ -105,7 +105,7 @@ impl Fixture {
                         control,
                         terminal: None,
                     },
-                    pid: 9,
+                    pid: Some(9),
                 }
             }
             LiveState::Stopping => Live::Stopping {
@@ -183,6 +183,7 @@ impl Fixture {
     fn event_epoch(&mut self, epoch: u32, event: ProviderEvent) {
         let _entered = self.runtime.enter();
         self.actor.handle(EngineMsg::Provider {
+            cursor: None,
             thread: self.thread,
             epoch,
             event,

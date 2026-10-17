@@ -703,6 +703,8 @@ pub fn family_status(root: &ThreadView<'_>, children: &[ThreadView<'_>]) -> Stat
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitReason {
+    NoNativeSession,
+    PendingRequest,
     Held(HoldReason),
     TurnRunning,
     Starting,
@@ -714,6 +716,10 @@ pub enum WaitReason {
 impl std::fmt::Display for WaitReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::NoNativeSession => {
+                "Send a message first; the terminal opens the CLI's conversation."
+            }
+            Self::PendingRequest => "Answer the pending request before switching views",
             Self::Held(HoldReason::Interrupted) => "Held because you pressed Stop",
             Self::Held(HoldReason::Stopped) => "Held because this thread was stopped",
             Self::Held(HoldReason::Restarted) => "Held because Veyra closed while this ran",

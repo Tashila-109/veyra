@@ -804,8 +804,8 @@ mod attempt_tests {
                         effort: None,
                     },
                     native: Some(NativeSessionId("old-thread".into())),
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: true,
                 },
                 std::process::id(),

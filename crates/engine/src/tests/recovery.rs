@@ -30,6 +30,7 @@ fn child_task(f: &mut Fixture) -> (ThreadId, TaskId, TurnId) {
 fn child_event(f: &mut Fixture, child: ThreadId, turn: TurnId, event: TurnEvent) {
     let _enter = f.runtime.enter();
     f.actor.handle(EngineMsg::Provider {
+        cursor: None,
         thread: child,
         epoch: f.actor.live[&child].epoch,
         event: turn_event(Some(turn), event),
@@ -467,6 +468,7 @@ fn child_settlement_keeps_final_buffered_report() {
     ] {
         let _enter = f.runtime.enter();
         f.actor.handle(EngineMsg::Provider {
+            cursor: None,
             thread: child,
             epoch: child_epoch,
             event: turn_event(Some(turn), event),

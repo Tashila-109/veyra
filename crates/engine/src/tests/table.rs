@@ -25,6 +25,13 @@ fn cell(row: Row, state: LiveState) {
         vec![false]
     } {
         let mut f = Fixture::new(state);
+        if matches!(row, Row::Switch) {
+            let mut c = ChangeSet::default();
+            let mut thread = f.actor.projection.threads[&f.thread].clone();
+            thread.native = Some(NativeSessionId("conversation".into()));
+            c.threads.insert(f.thread, thread);
+            f.save(c);
+        }
         let mut old_user = None;
         if matches!(row, Row::SendHeld | Row::Continue) {
             f.hold(Some(HoldReason::Interrupted));

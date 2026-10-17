@@ -307,8 +307,8 @@ fn codex_grant_codec(f: &Fixture) -> crate::provider::codex::Codec {
             cwd: "/tmp".into(),
             config: config(),
             native: Some(NativeSessionId("codex-thread".into())),
-            history: Default::default(),
-            import: false,
+
+            import: None,
             root: false,
         },
         1,

@@ -537,14 +537,16 @@ fn switch_view(
         return Err(CommandError::Busy(WaitReason::BackgroundWork));
     }
     if c.view(p, l, thread).unwrap().pending_request {
-        return Err(CommandError::Invalid(
-            "Answer the pending request before switching views".into(),
-        ));
+        return Err(CommandError::Busy(WaitReason::PendingRequest));
+    }
+    if to == View::Terminal
+        && t.native.is_none()
+        && matches!(l[&thread].live, Live::Parked | Live::Structured { .. })
+        && !c.view(p, l, thread).unwrap().turn_busy()
+    {
+        return Err(CommandError::Busy(WaitReason::NoNativeSession));
     }
     match &l[&thread].live {
-        Live::Parked if to == View::Terminal && t.import_pending => {
-            spawn(l, c, thread, true);
-        }
         Live::Parked if to == View::Terminal => {
             let mut live = l[&thread].clone();
             live.epoch += 1;
@@ -556,13 +558,20 @@ fn switch_view(
             return Err(CommandError::Busy(WaitReason::TurnRunning));
         }
         Live::Structured { .. } if to == View::Terminal => {
-            control(c, thread, SessionControl::Shutdown);
+            control(c, thread, SessionControl::ShutdownForTerminal);
             stopping(l, c, thread, AfterStop::StartTerminal);
         }
-        Live::Terminal { .. } if to == View::Chat => {
+        Live::Terminal { pid, .. } if to == View::Chat => {
             c.effects.push(Effect::StopTerminal { thread });
-            stopping(l, c, thread, AfterStop::StartStructured { import: true });
-            t.import_pending = true;
+            t.import_pending = pid.is_some();
+            stopping(
+                l,
+                c,
+                thread,
+                AfterStop::StartStructured {
+                    import: t.import_pending,
+                },
+            );
         }
         Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
         Live::Parked | Live::Structured { .. } | Live::Terminal { .. } => {}
@@ -691,28 +700,27 @@ pub(crate) fn stop_one(
         Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
             interrupt_active(p, l, c, thread, reason);
         }
-        Live::Terminal { .. } => {
+        Live::Terminal { pid, .. } => {
             c.effects.push(Effect::StopTerminal { thread });
             stopping(l, c, thread, AfterStop::Park);
-            chat_after_terminal(p, c, thread);
+            let mut row = c.thread(p, thread).unwrap().clone();
+            row.view = View::Chat;
+            row.import_pending = pid.is_some();
+            c.threads.insert(thread, row);
         }
-        Live::Stopping { .. } => {
+        Live::Stopping { then } => {
+            let imported = matches!(then, AfterStop::StartStructured { import: true });
             stopping(l, c, thread, AfterStop::Park);
-            chat_after_terminal(p, c, thread);
+            let mut row = c.thread(p, thread).unwrap().clone();
+            row.view = View::Chat;
+            row.import_pending = imported;
+            c.threads.insert(thread, row);
         }
         Live::Parked | Live::Structured { .. } => {}
     }
     end_active(p, l, c, thread, reason, now);
     drop_turns(p, c, thread, false, now);
     set_hold(p, c, thread, Some(HoldReason::Stopped));
-}
-fn chat_after_terminal(p: &Projection, c: &mut ChangeSet, thread: ThreadId) {
-    let mut t = c.thread(p, thread).unwrap().clone();
-    if t.view == View::Terminal {
-        t.import_pending = true;
-    }
-    t.view = View::Chat;
-    c.threads.insert(thread, t);
 }
 fn set_default_mode(c: &mut ChangeSet, mode: PermissionMode) {
     let s = Settings { default_mode: mode };
@@ -861,6 +869,14 @@ pub fn start_changed(
                 t.state = TurnState::Running { since: now };
                 c.events.push(Ev::TurnStarted(t.clone()));
                 c.turns.insert(t.id, t.clone());
+                let mut row = c.thread(p, id).unwrap().clone();
+                row.native_cursor = match row.provider {
+                    crate::provider::ProviderKind::Codex => None,
+                    crate::provider::ProviderKind::Claude | crate::provider::ProviderKind::Grok => {
+                        Some(t.id.to_string())
+                    }
+                };
+                c.threads.insert(id, row);
                 let mut live = c.live(l, id).clone();
                 live.admission = Some(TurnAdmission::Pending(t.id));
                 c.live.insert(id, live);

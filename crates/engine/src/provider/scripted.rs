@@ -21,6 +21,7 @@ impl Scripted {
         let this = self.clone();
         tokio::spawn(async move {
             let emit = |event| EngineMsg::Provider {
+                cursor: None,
                 thread: spec.thread,
                 epoch,
                 event,
@@ -45,7 +46,7 @@ impl Scripted {
             while let Some(c) = rx.recv().await {
                 this.controls.lock().unwrap().push(c.clone());
                 match c {
-                    SessionControl::Shutdown => {
+                    SessionControl::Shutdown | SessionControl::ShutdownForTerminal => {
                         let _ = out
                             .send(emit(ProviderEvent::Session(SessionEvent::Exited {
                                 crash: None,

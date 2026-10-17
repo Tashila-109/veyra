@@ -59,8 +59,8 @@ async fn requested_shutdown_of_idle_provider_is_not_a_crash() {
                             mode: PermissionMode::AskFirst,
                         },
                         native: None,
-                        history: Default::default(),
-                        import: false,
+
+                        import: None,
                         root: false,
                     },
                     out,

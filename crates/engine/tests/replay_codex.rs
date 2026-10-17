@@ -658,8 +658,8 @@ fn codex_session_cancels_early_request_before_interrupt() {
                         effort: Some("medium".into()),
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 out,
@@ -862,8 +862,8 @@ fn codex_accept_edits_grants_no_git_roots() {
                     },
                     native: None,
                     root: false,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                 },
                 out,
                 1,
@@ -1230,12 +1230,11 @@ fn codex_thread_read_import() {
                         mode: PermissionMode::FullAccess,
                     },
                     native: Some(NativeSessionId("native-import".into())),
-                    import: true,
-                    root: false,
-                    history: Some(HistoryRequest {
+                    import: Some(HistoryRequest {
                         cursor: Some("anchor".into()),
                         sent: ["sent".into()].into(),
                     }),
+                    root: false,
                 },
                 out,
                 1,
@@ -1276,6 +1275,7 @@ fn codex_thread_read_import() {
         assert_eq!(
             history.unwrap(),
             History {
+                failed: false,
                 cursor: Some("newer".into()),
                 text: "second\nreply second\nthird\nreply third".into()
             }

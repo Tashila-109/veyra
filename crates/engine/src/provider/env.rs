@@ -184,12 +184,10 @@ impl ChildEnv {
         &self,
         parent: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> std::collections::BTreeMap<OsString, OsString> {
-        let mut variables: std::collections::BTreeMap<_, _> = parent.into_iter().collect();
-        variables.extend(self.variables.clone());
+        let mut variables = self.environment(parent);
         variables.retain(|key, _| {
             let name = key.to_string_lossy();
             ![
-                "VEYRA_",
                 "ITERM_",
                 "GHOSTTY_",
                 "KITTY_",
@@ -207,6 +205,23 @@ impl ChildEnv {
                     "FORCE_COLOR",
                     "CLICOLOR_FORCE",
                     "COLORFGBG",
+                ]
+                .contains(&name.as_ref())
+        });
+        variables.insert("TERM".into(), "xterm-256color".into());
+        variables.insert("COLORTERM".into(), "truecolor".into());
+        variables
+    }
+    fn environment(
+        &self,
+        parent: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> std::collections::BTreeMap<OsString, OsString> {
+        let mut variables: std::collections::BTreeMap<_, _> = parent.into_iter().collect();
+        variables.extend(self.variables.clone());
+        variables.retain(|key, _| {
+            let name = key.to_string_lossy();
+            !name.starts_with("VEYRA_")
+                && ![
                     "CLAUDECODE",
                     "CLAUDE_CODE_ENTRYPOINT",
                     "CLAUDE_CODE_SSE_PORT",
@@ -218,8 +233,6 @@ impl ChildEnv {
             variables.remove(std::ffi::OsStr::new("XAI_API_KEY"));
         }
         variables.insert("PATH".into(), self.path.clone());
-        variables.insert("TERM".into(), "xterm-256color".into());
-        variables.insert("COLORTERM".into(), "truecolor".into());
         variables.insert(
             "VEYRA_PARENT_PID".into(),
             std::process::id().to_string().into(),
@@ -268,25 +281,7 @@ impl ChildEnv {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("VEYRA_")
-                || [
-                    "CLAUDECODE",
-                    "CLAUDE_CODE_ENTRYPOINT",
-                    "CLAUDE_CODE_SSE_PORT",
-                    "CLAUDE_AGENT_SDK_VERSION",
-                ]
-                .contains(&name.as_ref())
-            {
-                cmd.env_remove(key);
-            }
-        }
-        if !self.xai_api_key_set {
-            cmd.env_remove("XAI_API_KEY");
-        }
-        cmd.envs(&self.variables);
-        cmd.env("VEYRA_PARENT_PID", std::process::id().to_string());
+        cmd.env_clear().envs(self.environment(std::env::vars_os()));
         platform::own_group(&mut cmd);
         cmd
     }

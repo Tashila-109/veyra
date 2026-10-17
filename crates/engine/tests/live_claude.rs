@@ -31,8 +31,8 @@ fn live_claude_ok_reply() {
                         mode: PermissionMode::FullAccess,
                     },
                     native: None,
-                    history: Default::default(),
-                    import: false,
+
+                    import: None,
                     root: false,
                 },
                 out,

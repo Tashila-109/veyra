@@ -291,8 +291,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         }
         let (pid, pgid) = match live.live {
             Live::Structured { pid, pgid, .. } => (Some(pid), Some(pgid)),
-            Live::Terminal { pid, .. } if pid != 0 => (Some(pid), Some(pid)),
-            Live::Terminal { .. } => (None, None),
+            Live::Terminal { pid, .. } => (pid, pid),
             _ => (None, None),
         };
         tx.execute(

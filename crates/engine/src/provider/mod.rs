@@ -25,8 +25,7 @@ pub struct SessionSpec {
     pub cwd: PathBuf,
     pub config: ThreadConfig,
     pub native: Option<NativeSessionId>,
-    pub import: bool,
-    pub history: Option<HistoryRequest>,
+    pub import: Option<HistoryRequest>,
     pub root: bool,
 }
 #[derive(Clone, Debug, Default)]
@@ -38,6 +37,7 @@ pub struct HistoryRequest {
 pub struct History {
     pub cursor: Option<String>,
     pub text: String,
+    pub failed: bool,
 }
 #[derive(Clone, Debug)]
 pub struct SessionHandle {
@@ -59,6 +59,7 @@ pub enum SessionControl {
         reply: Reply,
     },
     Shutdown,
+    ShutdownForTerminal,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -186,7 +187,7 @@ impl TurnEvent {
 }
 #[derive(Clone, Debug)]
 pub struct TerminalHandle {
-    pub control: mpsc::UnboundedSender<TerminalControl>,
+    pub(crate) control: mpsc::UnboundedSender<TerminalControl>,
     pub terminal: Option<std::sync::Arc<crate::terminal::Terminal>>,
 }
 impl TerminalHandle {
@@ -197,6 +198,14 @@ impl TerminalHandle {
                 std::io::Error::new(std::io::ErrorKind::NotConnected, "terminal has no PTY")
             })?
             .write(bytes)
+    }
+    pub fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.terminal.as_ref().map(|terminal| terminal.subscribe())
+    }
+    pub fn emulator(
+        &self,
+    ) -> Option<&alacritty_terminal::sync::FairMutex<crate::terminal::Emulator>> {
+        self.terminal.as_ref().map(|terminal| &terminal.emulator)
     }
     pub fn resize(&self, size: portable_pty::PtySize) -> std::io::Result<()> {
         self.terminal
@@ -213,14 +222,13 @@ pub enum TerminalControl {
 }
 #[derive(Clone, Debug)]
 pub enum TerminalEvent {
-    Prepared {
-        cursor: Option<String>,
-        reply: std::sync::mpsc::SyncSender<bool>,
-    },
     Ready {
         pid: u32,
     },
-    Exited,
+    Exited {
+        started: bool,
+        crash: Option<String>,
+    },
 }
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -541,6 +549,8 @@ impl Outbound {
 }
 #[derive(Default)]
 pub(crate) struct Decoded {
+    pub cursor: Option<String>,
+    pub history: Option<History>,
     pub events: Vec<ProviderEvent>,
     pub replies: Vec<serde_json::Value>,
     pub controls: Vec<Outbound>,
@@ -565,6 +575,29 @@ impl Decoded {
         }
         frames.extend(interrupts);
         frames
+    }
+}
+
+pub const IMPORT_NOTICE: &str =
+    "The turns typed in the terminal could not be shown here. The CLI still has them.";
+impl ProviderKind {
+    pub(crate) fn file_import(
+        self,
+        env: &env::ChildEnv,
+        native: &NativeSessionId,
+        request: &HistoryRequest,
+    ) -> Option<History> {
+        match self {
+            Self::Claude => Some(
+                env.claude_config_dir()
+                    .and_then(|root| claude::session_file_import(&root, native, request))
+                    .unwrap_or(History {
+                        failed: true,
+                        ..Default::default()
+                    }),
+            ),
+            Self::Codex | Self::Grok => None,
+        }
     }
 }
 
@@ -690,7 +723,7 @@ fn decoded_batch_always_places_replies_before_interrupts() {
 #[cfg(test)]
 #[test]
 fn tui_command_per_mode() {
-    let native = NativeSessionId("native-m7".into());
+    let native = NativeSessionId("native-session".into());
     for (mode, claude_mode) in [
         (PermissionMode::AskFirst, "default"),
         (PermissionMode::AcceptEdits, "acceptEdits"),
@@ -701,10 +734,15 @@ fn tui_command_per_mode() {
             effort: None,
             mode,
         };
-        let mut claude = vec!["--resume", "native-m7", "--permission-mode", claude_mode];
+        let mut claude = vec![
+            "--resume",
+            "native-session",
+            "--permission-mode",
+            claude_mode,
+        ];
         let mut codex = vec![
             "resume",
-            "native-m7",
+            "native-session",
             "--include-non-interactive",
             "--no-daemon",
             "-c",
@@ -724,7 +762,7 @@ fn tui_command_per_mode() {
         } else {
             grok.extend(["--permission-mode", "default"]);
         }
-        grok.extend(["--resume", "native-m7"]);
+        grok.extend(["--resume", "native-session"]);
         for (provider, expected) in [
             (ProviderKind::Claude, claude),
             (ProviderKind::Codex, codex),
