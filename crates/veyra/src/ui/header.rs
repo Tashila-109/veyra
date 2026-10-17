@@ -1,9 +1,10 @@
 use super::{
     MainView, Shell,
-    actions::{NewThread, SelectThread},
+    actions::{NewThread, SelectThread, SwitchView},
     composer::labelled_button,
     theme::Theme,
 };
+use gpui_kit::base::Selectable;
 use gpui_kit::component::StyledExt;
 use gpui_kit::{prelude::*, *};
 use std::collections::BTreeMap;
@@ -167,6 +168,51 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                     .text_size(t.text.meta.size)
                     .text_color(t.colors.text_muted)
                     .child(project),
+            )
+        })
+        .when(shell.view.chat().is_some(), |header| {
+            header.child(
+                div()
+                    .debug_selector(|| "view-switch".into())
+                    .h_flex()
+                    .flex_none()
+                    .child(
+                        labelled_button("view-chat", "Chat", cx)
+                            .debug_selector(|| "view-chat".into())
+                            .selected(shell.terminal_selected().is_none())
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(SwitchView {
+                                        terminal: Some(false),
+                                    }),
+                                    cx,
+                                )
+                            }),
+                    )
+                    .child(
+                        labelled_button("view-terminal", "Terminal", cx)
+                            .debug_selector(|| "view-terminal".into())
+                            .selected(shell.terminal_selected().is_some())
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(SwitchView {
+                                        terminal: Some(true),
+                                    }),
+                                    cx,
+                                )
+                            }),
+                    ),
+            )
+        })
+        .when_some(shell.view_refusal.as_ref(), |header, reason| {
+            header.child(
+                div()
+                    .debug_selector(|| "view-refusal".into())
+                    .min_w_0()
+                    .truncate()
+                    .text_size(t.text.meta.size)
+                    .text_color(t.colors.text_muted)
+                    .child(reason.clone()),
             )
         })
         .child(

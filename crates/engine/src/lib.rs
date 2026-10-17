@@ -60,6 +60,7 @@ struct EngineInner {
 #[derive(Default)]
 pub(crate) struct RuntimeState {
     pub awake: AtomicBool,
+    pub terminal_colors: Mutex<terminal::Colors>,
     pub terminals: Mutex<std::collections::BTreeMap<ThreadId, provider::TerminalHandle>>,
     pub catalog: Arc<Mutex<std::collections::BTreeMap<provider::ProviderKind, provider::Probe>>>,
     pub closing: Arc<LaunchGate>,
@@ -314,6 +315,9 @@ impl Engine {
         env.groups = self.inner.groups.clone();
         env.catalog = self.inner.state.catalog.clone();
         env
+    }
+    pub fn set_terminal_colors(&self, colors: terminal::Colors) {
+        *self.inner.state.terminal_colors.lock().unwrap() = colors;
     }
     pub fn terminal(&self, thread: ThreadId) -> Option<provider::TerminalHandle> {
         self.inner

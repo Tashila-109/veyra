@@ -107,6 +107,7 @@ ENV['VEYRA_REAP_PIDS'] = ''
 for name in ['VEYRA_CLAUDE_BIN','VEYRA_CODEX_BIN','VEYRA_GROK_BIN','VEYRA_FAKE_FIXTURES','VEYRA_FAKE_FIXTURE','VEYRA_RECORD']:
     ENV.pop(name,None)
 if LANE == 'fake':
+    ENV['CLAUDE_CONFIG_DIR'] = str(DATA/'claude-home')
     ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_CODEX_BIN=str(DATA/'fake-cli'),
         VEYRA_GROK_BIN=str(DATA/'fake-cli'),
         VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()))
@@ -233,7 +234,8 @@ def capture(name):
     subprocess.run([helper,pid,window],check=True)
     dump = ctl(name+'-capture-state','dump')
     visible = {key:dump[key] for key in ['view','sidebar','selected_thread','transcript','composer_text',
-        'composer','settings','notice','quit_sheet']}
+        'composer','settings','notice','quit_sheet','view_refusal']}
+    visible['terminal'] = None if dump['terminal'] is None else {key:dump['terminal'][key] for key in ['grid','focused','columns','rows']}
     visible['providers'] = [probe['readiness'] for probe in dump['providers']]
     state = json.dumps(visible,sort_keys=True)
     target = PROOF/(name+'.png')
@@ -318,6 +320,28 @@ def start(label):
 def restart(label, crash=False):
     stop(label,crash)
     return start(label)
+def terminal_seed(thread):
+    assert LANE == 'fake'
+    native = sql("select native_id from threads where id='"+thread+"'")
+    cursor = sql("select native_cursor from threads where id='"+thread+"'")
+    assert native and cursor
+    path = DATA/'claude-home'/'projects'/'veyra-fake'/(native+'.jsonl')
+    path.parent.mkdir(parents=True,exist_ok=True)
+    if not path.exists():
+        entry = {'sessionId':native,'uuid':cursor,'parentUuid':None,'isSidechain':False,
+            'type':'user','entrypoint':'sdk-cli','message':{'role':'user','content':'Already shown in chat'}}
+        path.write_text(json.dumps(entry)+'\n')
+    return native,path
+def terminal_enter(name, fixture='echo'):
+    source = pathlib.Path('crates/engine/tests/fixtures/tui')/(fixture+'.jsonl')
+    stage_records([json.loads(line) for line in source.read_text().splitlines()])
+    ctl(name+'-switch','keys','cmd-shift-v')
+    return poll(name,lambda d:d['view']=='terminal' and d['terminal']['focused']
+        and 'VEYRA_TUI_READY' in ''.join(d['terminal']['grid']))
+def terminal_back(name, scenario='ok-reply'):
+    stage(scenario)
+    ctl(name+'-switch','keys','cmd-shift-v')
+    return poll(name,lambda d:d['view']=='chat' and not d['selected_thread']['import_pending'])
 def stage_records(records):
     text = '\n'.join(json.dumps(record) for record in records)+'\n'
     for n in range(1,int(sql('select count(*) from threads'))+2):
@@ -556,6 +580,7 @@ Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.
 Also run [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
 Run each page's Codex and Grok sections in the fake lane after its existing drive.
 Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
+Run [chat-terminal-switch](features/chat-terminal-switch.md) for the fake TUI, recovery import and one flood.
 The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
 Use the same exported `RUN` in every fresh shell.
@@ -566,7 +591,7 @@ Without a request payload, consent actions use the rendered dock target, as focu
 For an explicit AnswerQuestion request, supply its question index as well.
 Action and key replies acknowledge dispatch; poll `dump` for the resulting view or use `ctl wait` for a thread state.
 `keys KEYSTROKES` dispatches each key through the window.
-`text STRING` uses the focused textarea's public input handler; Settings has no text handler.
+`text STRING` uses the focused textarea's public input handler or dispatches character key events while Terminal has focus; Settings has no text handler.
 Enter or ⌘↵ sends through `veyra::Send`; Shift+Enter inserts a newline.
 `wait THREAD STATUS [SECONDS]` is a client-only loop over `dump`, polling every 50 ms for 30 seconds by default.
 It exits 0 for the status, 1 for timeout or a driver/connection error, 2 for bad usage and 3 for a missing or archived thread.
@@ -580,7 +605,13 @@ After another Send on an existing thread, gate `wait Done` on the new turn row o
 
 The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
 `header_branch` is the branch text used by the header and is empty after leaving Chat.
-`view` is `new_thread`, `chat`, `failed_thread` or `settings`.
+`view` is `new_thread`, `chat`, `terminal`, `failed_thread` or `settings`.
+`veyra::SwitchView` toggles the selected thread through the window-level ⌘⇧V binding; its optional terminal boolean selects Chat or Terminal.
+`view_refusal` holds the last switch refusal shown in the header.
+`terminal` holds the emulator text `grid`, focus, columns, rows and debug repaint count, or null in chat.
+`selected_thread.native_cursor`, `import_pending` and stored `view` expose the engine metadata.
+`perf.flood` is null before FLOOD_DONE, then holds `pty_bytes`, `elapsed_ms`, `repaints`, `median_repaint_gap_ms` and `max_repaint_gap_ms` between the reader markers.
+The bytes exclude both OSC markers; the repaint gaps use only painted frames inside those timestamps.
 `sidebar.rows` holds project and thread rows in tree order, with status for each thread, row_status for its rendered family glyph, depth, quiet_minutes and archive_keep_children.
 `sidebar.menu_thread` names the open row menu.
 OpenThreadMenu, Archive and ArchiveKeepChildren accept a thread id; the latter keeps a root's children running.
@@ -678,7 +709,7 @@ required = {
         'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png',
         'approval-write-inside.png','approval-write-outside.png','approval-web-fetch.png',
         'approval-notebook-edit.png','approval-mcp.png','approval-long-command.png',
-        'approval-long-command-end.png','approval-new-long-command.png'],
+        'approval-long-command-end.png','approval-new-long-command.png','approval-switch-refused.png','approval-view-switch-grant.json','approval-view-switch-grant.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json',
@@ -687,6 +718,8 @@ required = {
         'multi-child-parent-needs.png','multi-menu.png','multi-child-stop-held.png','multi-parent-stop-held.png',
         'multi-child-archive-held.json','multi-child-archive-held.png',
         'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png'],
+    'chat-terminal-switch':['terminal-open.png','terminal-imported.png','terminal-recovered.png',
+        'terminal-hex.json','terminal-empty-repeat.json','terminal-cursor-updates.json','terminal-history-grep.txt','terminal-flood.json','terminal-flood.png'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
         'settings-existing.json','settings-new.json'],
     'new-thread-codex':['codex-new-thread-missing.json','codex-new-thread-missing.png',
@@ -718,6 +751,7 @@ pairs = {
     'new-thread':[('new-thread-missing','new-thread-ready'),
         ('new-thread-provider-menu','new-thread-provider-menu-ready')],
     'chat-send-stream':[('chat-working','chat-done'),('chat-tool-collapsed','chat-tool-expanded')],
+    'chat-terminal-switch':[('terminal-open','terminal-imported')],
     'settings':[('settings-full-access','settings')],
     'chat-send-stream-live':[('chat-working','chat-done')],
     'chat-send-stream-codex':[('codex-chat-working','codex-chat-done')],

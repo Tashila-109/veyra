@@ -72,6 +72,15 @@ pub struct Stop {
     pub target: Option<StopTarget>,
 }
 choice_action!(AddProject, path, std::path::PathBuf);
+#[derive(
+    Clone, Default, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action,
+)]
+#[serde(default)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct SwitchView {
+    pub terminal: Option<bool>,
+}
 choice_action!(PickProvider, provider, ProviderKind);
 choice_action!(PickModel, model, String);
 choice_action!(PickEffort, effort, String);
@@ -177,6 +186,7 @@ macro_rules! binding {
 pub fn bindings() -> Vec<Binding> {
     vec![
         binding!(Quit, "secondary-q", None),
+        binding!(SwitchView, "secondary-shift-v", None),
         binding!(ConfirmQuit, "secondary-enter", Some("VeyraQuit")),
         binding!(CancelQuit, "escape", Some("VeyraQuit")),
         binding!(OpenSettings, "secondary-,", Some("Veyra")),
@@ -246,6 +256,7 @@ pub fn shortcut<A: Action + Default>() -> Option<String> {
                 .replace("ctrl-", "⌃")
                 .replace("alt-", "⌥")
                 .replace("shift-", "⇧")
+                .replace("⇧v", "⇧V")
                 .replace("enter", "↵")
                 .replace("backspace", "⌫")
                 .replace("escape", "Esc")

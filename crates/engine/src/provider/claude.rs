@@ -1321,8 +1321,8 @@ pub fn session_file_import(
     let mut own = false;
     let mut include = false;
     let mut text = Vec::new();
-    for line in std::io::BufReader::new(file).lines() {
-        let Ok(value): Result<Value, _> = serde_json::from_str(&line?) else {
+    for line in std::io::BufReader::new(file).split(b'\n') {
+        let Ok(value): Result<Value, _> = serde_json::from_slice(&line?) else {
             continue;
         };
         if value["sessionId"].as_str() != Some(&native.0) || value["isSidechain"] != false {

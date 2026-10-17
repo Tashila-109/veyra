@@ -17,7 +17,7 @@ Codec cancellation on provider completion, and cancellation on storage-blocked o
 Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
 The window owns render and event-batch counters.
 Inactive-window family changes post system banners, and busy Quit opens a sheet.
-The engine can run a provider TUI in a PTY with a shared alacritty emulator; the window has no terminal renderer yet.
+The engine runs a provider TUI in a PTY with a shared alacritty emulator, and the window paints its grid through ui::terminal_view.
 Engine startup binds the MCP socket server, and root Claude, Codex and Grok sessions receive its five actor-owned tools through the relay.
 
 ### System architecture
@@ -476,13 +476,17 @@ Resize rejects fewer than two columns or one row; the PTY and emulator start at 
 The separate blocking reader parses at most 64 KiB while holding an alacritty FairMutex and releases the lock between reads.
 The 64 KiB read and 16 ms worker polling interval are implementation choices.
 Emulator callbacks collect in an Arc-shared Mutex list, so the emulator and terminal can move between threads.
-Alacritty's FairMutex offers lease and lock_unfair; no Veyra consumer uses them yet.
+The terminal element takes a FairMutex lease, snapshots the visible cells, palette overrides, cursor and debug flood stamps under lock_unfair at prepaint, then releases both guards before shaping or painting.
 Every alacritty PtyWrite reply, including DSR, DA and DECRQM, goes to the writer queue after parsing, without entering the actor mailbox or blocking further reads.
-ColorRequest callbacks answer OSC foreground, background and palette queries from terminal::Colors supplied to Spawner::terminal, with engine defaults at the actor call site and standard indexed colors unless the terminal changed them.
+ColorRequest callbacks answer OSC foreground, background and palette queries from terminal::Colors supplied to Spawner::terminal, with engine defaults for callers without a window and standard indexed colors unless the terminal changed them.
+Shell passes the current light or dark theme's terminal foreground and background through Engine::set_terminal_colors before switching; the actor reads those colours when opening the PTY.
 Kitty keyboard mode stays disabled.
 The worker flushes an expired synchronized-update block even while no new bytes arrive and coalesces dirty-grid watch wakes on its polling interval.
 Debug-only flood stamps record monotonic time and consumed bytes at FLOOD_START and FLOOD_DONE title terminators, including when both occur within one read.
-The flood fixture uses emit_raw's repeat count; no window or performance consumer runs it yet.
+The flood fixture uses emit_raw's repeat count, and the terminal view counts only painted frames whose monotonic timestamps fall between its reader stamps.
+Debug perf.flood becomes available after FLOOD_DONE and reports pty_bytes excluding the OSC markers, elapsed_ms, repaints, median_repaint_gap_ms and max_repaint_gap_ms.
+The median averages the two middle gaps for an even count and is zero when there is no pair of painted frames.
+The verification page runs one 50,000,020-byte flood; the separate phase lane owns the performance series.
 Only the fake TUI calls the raw-input platform helper; real TUIs set their own raw mode.
 The fake TUI echoes hex bytes, and its Claude mode requires an explicit CLAUDE_CONFIG_DIR and appends linked user, attachment and assistant entries there.
 ChildEnv shares one nesting-variable and VEYRA_ filter across structured and terminal launches.
@@ -491,33 +495,35 @@ From Parked, SwitchView increments the epoch and opens the PTY immediately, even
 An idle structured session enters Stopping with StartTerminal and receives ShutdownForTerminal, which closes stdin and allows up to two seconds including the ordinary one-second writer drain before group cleanup.
 Ordinary Shutdown retains the one-second writer drain without that additional exit wait.
 Running or pending-admission turns, pending requests, background work and a missing native id refuse the switch with Busy and a WaitReason.
-Switching back enters Stopping with StartStructured and import=true, sends SIGHUP, and kills a terminal group that survives three seconds.
+Switching back enters Stopping with StartStructured, sends SIGHUP, and kills a terminal group that survives three seconds.
+The resumed structured session imports only if the PTY reached TerminalEvent::Ready before it stopped.
 While closing, the terminal grace is one second, and shutdown processes TerminalEvent::Exited as soon as it arrives.
 The native on_app_quit path identifies PTY groups from the handles' optional pid and sends them SIGHUP, while keeping SIGTERM for structured groups.
 An atomic flag prevents the native quit pass and worker from sending duplicate SIGHUP signals.
 The child guard kills its owned group and reaps its leader; cleanup joins the writer and reader before an exit guard sends Exited, including on worker unwind.
-A failed PTY setup or launch returns Chat without import_pending and stores its crash text in a notice; a nonzero TUI exit retains the emulator tail as the reason.
+A failed PTY setup or launch returns Chat without import_pending and stores its crash text in a notice; an unexpected nonzero TUI exit retains the emulator tail as the reason.
+A sent native-quit hangup or an engine closing counts as stopping, so its TUI exit creates no failed turn or crash notice.
 Stop during Stopping toward a terminal also returns Chat without an import.
 A TUI that actually ran sets import_pending on exit, and a stored Terminal view is reconciled to Chat with import_pending after a quit or crash.
 The structured path maintains native_cursor in the transaction that changes the turn's state, rather than reading it during the switch.
 For Claude and Grok, dispatch to the structured session marks Running and stores the outgoing user uuid or prompt id, which is the Veyra turn id.
 Codex clears its cursor to unknown at dispatch and supplies its server turn id on the turn/start reply or the first scoped frame of a CLI-started turn, carried as optional cursor context on the same actor event.
-A Grok-started turn stores its first prompt id, including a foreign prompt promoted after Veyra work ends.
-When overlapping foreign prompts share a Provider turn, the codec retains their arrival order and advances to the newest observed prompt id without regressing on an older prompt's later frames.
-Promotion cursor context travels on that ProviderTurnStarted event, after the outgoing Veyra TurnEnded.
+A Grok-started turn stores its prompt id when that prompt completes.
+When overlapping foreign prompts share a Provider turn, the cursor follows their completion order, matching the importer's turn_completed order.
+Unchanged cursor context does not write the thread row again while text chunks stream.
 A Claude-started turn outside Veyra dispatch can leave the cursor behind; the structured process writes sdk-cli entries, which the importer excludes even after an older cursor.
 A dispatch that is refused or cancelled before the CLI saves it can leave a cursor absent from the native store; that import copies no text and adopts the newest readable native turn.
 A Codex turn awaiting its start reply has no server id yet, and the busy admission refuses the terminal switch until it retires.
 If Stop, an exit or a crash retires that turn before the id arrives, the cursor stays unknown; a later import adopts the native newest turn without copying text, so the missing acknowledgement cannot duplicate a Veyra turn.
 SessionSpec carries import: Option<HistoryRequest>, containing the cursor and Claude/Grok sent-prompt context.
 On the switch back or the next spawn after recovery, ProviderKind dispatches Claude's file import once, off the actor, under ChildEnv's CLAUDE_CONFIG_DIR or its production home/.claude.
-The Claude reader skips malformed JSON lines and copies later main-chain cli user string/text content and assistant text blocks, excluding sdk-cli and Veyra-sent turns and keeping the cursor at the newest user uuid.
+The Claude reader splits bytes at line feeds, skips malformed JSON or invalid UTF-8 lines and copies later main-chain cli user string/text content and assistant text blocks, excluding sdk-cli and Veyra-sent turns and keeping the cursor at the newest user uuid.
 Codex pages typed thread/turns/list results newest first until the cursor turn, imports newer user messages and final agent messages oldest first, then resumes the thread.
 Its page limit of 100 is an implementation choice, and it does not compare server turn ids with Veyra turn ids.
-Grok imports through session/load, collecting typed replay updates before the reply, grouping user and agent text through turn_completed and skipping thoughts and Veyra prompt ids.
+Grok imports through session/load, collecting replay updates before the reply, decoding content only for user and agent message chunks, grouping their text through turn_completed and skipping thoughts and Veyra prompt ids.
 Its cursor is the native prompt_id, and a failed incomplete replay can adopt the newest identified unfinished prompt; a plain respawn uses session/resume when supported.
-An unknown cursor imports no text and adopts the newest native turn.
-A missing cursor anchor, Codex page failure or incomplete Grok replay instead produces one notice that the terminal turns could not be shown here and the CLI still has them, adopts a readable newest cursor and clears import_pending.
+An unknown cursor imports no text, adopts the newest native turn and produces the import failure notice.
+A missing cursor anchor, Codex page failure or incomplete Grok replay also produces one notice that the terminal turns could not be shown here and the CLI still has them, adopts a readable newest cursor and clears import_pending.
 Grok's load-not-found fallback still opens a new session; if Ready arrives without matching History, the actor clears the pending import with the same notice before starting queued work.
 SessionEvent::History precedes Ready; one transaction adds an ended Provider turn with one TerminalSpan when text exists, advances native_cursor and clears import_pending.
 An empty successful import adds no span, and every import outcome allows queued work to run once the structured session is ready.
@@ -949,6 +955,8 @@ The subscription starts with SettingsChanged, projects, threads, turn rows, task
 It also sends StorageBlocked if storage is blocked and RecoveryNotice when startup could not read its storage receipt.
 Every thread-scoped initial row advances that thread's counter.
 The gpui pump drains every queued event into one entity update, applies it and notifies once.
+ChangeSet::install publishes ThreadUpdated for a changed existing thread after the actor commits its rows, keeping the window's view, native_cursor and import_pending synchronized with switches, imports and exits.
+AppState replaces that thread metadata without treating it as a new provider fixture lane.
 AppState counts applied batches and the largest measured gap between text-bearing batches.
 Debug-only VisiblePerf counts applied TextAppended batches for the selected Chat thread, ignoring other threads' text; batches buffered behind a loading snapshot still count.
 VisiblePerf and AppState each keep a BatchGap value for their largest gap and previous timestamp, sharing its type while retaining their own counts and resets.
@@ -977,6 +985,18 @@ An unarchived child whose root is archived becomes a top-level row and keeps its
 OpenThreadMenu exposes Stop thread, Archive and, for a root with unarchived children, Archive, keep child threads.
 All resizing paths dispatch SetSidebarWidth.
 The header reads title, status/elapsed time, project and a separate Git branch task on the tokio runtime.
+Its Chat and Terminal buttons dispatch SwitchView with an explicit destination; the same action without a destination toggles the selected thread.
+A refused switch keeps the current view and shows the engine's reason in the header until another switch or navigation.
+MainView::Chat still identifies the selected conversation; the engine thread's stored View selects the chat surface or TerminalView, rather than another navigation state.
+TerminalView owns only its focus, queued grid size, wake coalescing and paint state, and uses TerminalHandle for direct writes and resizes.
+It renders a gpui canvas across the thread width above the theme's 30 px hint row, whose shortcut comes from the bindings table and whose copy says switching ends the CLI session.
+Prepaint derives cell width from the resolved bundled mono font and row height from the terminal type token, then queues a resize when the grid dimensions change.
+The snapshot releases the emulator lock before merging each row's equal background colours and shaping ASCII runs with matching attributes.
+Non-ASCII glyphs and combining marks start segments at their grid columns, wide spacers are skipped, and calt, liga and dlig are disabled.
+The canvas paints those quads, shaped segments and a still cursor within its content mask.
+The handle's watch channel schedules at most one pending next-frame notification, with no polling in the view.
+The sidebar's In terminal status uses a still open arc in text_muted.
+
 A child shows the root title, a slash and its title; SelectThread links back while that root remains unarchived.
 An archived root's breadcrumb is plain text, and a parent in NeedsYou adds its provider's needs-you hint.
 Branch lookup starts once the selected Chat thread's cwd is known, either at selection or after an event batch supplies its row.
@@ -1036,6 +1056,11 @@ SetDefaultMode publishes SettingsChanged; Escape or thread/project selection lea
 
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
 Ctrl+C is literal control in the composer and preserves its draft while interrupting the turn.
+SwitchView is bound to secondary-shift-v without a key context, so its window binding remains reachable from terminal focus.
+The terminal key handler leaves platform chords other than Command-Left and Command-Right unconsumed, letting that switch binding win through normal key resolution.
+The pure terminal_key_bytes maps Shift-Enter to ESC CR, Option-Left and Option-Right to ESC b and ESC f, Command-Left and Command-Right to Ctrl-A and Ctrl-E, and Ctrl-L to form feed.
+It also maps ordinary text, control bytes, navigation and function keys, including application-cursor arrows, directly to the PTY queue.
+Selection, paste and IME are not implemented by the terminal view.
 The approval dock (`ui/composer.rs`) renders only the codec's typed ProposedAction and does no disk work to render it.
 The chat column bounds the composer by its available height; the transcript gives up space before the dock.
 Flex layout measures the hold row, request count, consequence, wrapped decision buttons, focus hint, input and toolbar before shrinking the details to the remaining height, capped at composer_max_height (240px).
@@ -1121,7 +1146,7 @@ The reply limit is Veyra's implementation choice to carry the 5,000-item snapsho
 An incremental same-user sender can keep a line read occupied inside the per-read timeout.
 A full queue rejects before enqueueing; a reply timeout does not cancel an action already queued.
 
-Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler, and quit dispatches ConfirmQuit.
+Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler or dispatches character key events to the focused terminal, and quit dispatches ConfirmQuit.
 Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
 Each sidebar thread and selected thread includes lineage, and tasks includes each received task row with its state, delivery and optional report source.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
@@ -1139,7 +1164,10 @@ Captures require the owned window to remain on-screen and frontmost; the guard p
 Release ignores the debug reap filter and can signal any validated orphan, so the skill keeps release checks away from another run's deliberate orphan.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
-Debug perf reports commits, actor_max_ms, actor_busy_ms, mailbox_free, repaints and max_batch_events.
+Debug perf reports commits, actor_max_ms, actor_busy_ms, mailbox_free, repaints, max_batch_events and the completed terminal flood measurement.
+Dump terminal holds the emulator text grid, focus, queued columns and rows and terminal repaint count; it is null when the selected surface is chat.
+Dump view_refusal carries the header refusal, and selected_thread includes native_cursor, import_pending and its engine view.
+All terminal repaint counters and flood measurement consumers are excluded from release builds with cfg(debug_assertions).
 mailbox_free is the command sender's unreserved channel capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
@@ -1153,6 +1181,7 @@ DebugStallUi blocks the window thread for its supplied milliseconds so the pump 
 - [Actor](crates/engine/src/actor.rs), [decisions](crates/engine/src/commands.rs), [domain/indexes](crates/engine/src/domain.rs), [live variants](crates/engine/src/live.rs).
 - [Relay](crates/veyra/src/relay.rs), [MCP socket and config](crates/engine/src/mcp.rs), [tool decisions and guidance](crates/engine/src/tools.rs).
 - [PTY and emulator](crates/engine/src/terminal.rs).
+- [Terminal canvas, focus, keys and repaint measurements](crates/veyra/src/ui/terminal_view.rs).
 - [Storage/schema](crates/engine/src/store.rs), [recovery](crates/engine/src/reconcile.rs), [events/snapshots](crates/engine/src/events.rs).
 - [Provider boundary](crates/engine/src/provider/mod.rs), [environment](crates/engine/src/provider/env.rs), [sessions/probes](crates/engine/src/provider/session.rs), [Claude codec](crates/engine/src/provider/claude.rs), [JSON-RPC peer](crates/engine/src/provider/jsonrpc.rs), [bounded lines](crates/engine/src/provider/lines.rs), [Codex wire types](crates/engine/src/provider/codex/wire.rs), [Codex codec](crates/engine/src/provider/codex.rs), [Grok codec](crates/engine/src/provider/grok.rs).
 - [Fixture format](crates/engine/src/fixture.rs), [fake CLI](crates/engine/src/bin/veyra-fake-cli.rs), [recording/redaction](crates/engine/src/record.rs).
@@ -1294,3 +1323,9 @@ The live recording did not send permission requests.
 Decision 11 chose Follow my settings; the installed 1.0.60 live recheck observed Grok resolving the redirect write itself without sending a permission request.
 Round 7 replays cover both edit docks and explicit auto/yolo disablement; their effect on installed Grok still needs a separately authorized live recheck.
 Grok live tests are ignored by default.
+
+Terminal slice-2 tests cover the six editing chords and plain input, ASCII grouping and pinned wide cells, marker-bounded flood arithmetic, theme colours, full-width grid and hint layout, thread metadata publication and terminal-span dump text.
+A synthetic window drives a real isolated fake PTY for key bytes, text, resize and Command-Shift-V precedence; its OS-thread subscription is omitted because gpui's deterministic test scheduler rejects cross-thread wakeups.
+The guarded verify-veyra page supplies the native-window subscription, import-once, quit/relaunch, exact-grant and one-flood evidence; it does not establish installed-provider or external keyboard behaviour.
+
+The SIGHUP-ignoring terminal test fixture closes launch admission, kills its recorded groups and waits for the worker to reap them during unwind; a regression catches both an assertion failure and an explicit panic and checks that each group is gone.

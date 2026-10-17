@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 pub enum ChangeEvent {
     ProjectAdded(Project),
     ThreadCreated(Box<Thread>),
+    ThreadUpdated(Box<Thread>),
     ThreadArchived {
         thread: ThreadId,
     },
@@ -41,7 +42,7 @@ impl ChangeEvent {
     pub fn thread(&self) -> Option<ThreadId> {
         match self {
             Self::ProjectAdded(_) | Self::SettingsChanged(_) => None,
-            Self::ThreadCreated(t) => Some(t.id),
+            Self::ThreadCreated(t) | Self::ThreadUpdated(t) => Some(t.id),
             Self::ThreadArchived { thread }
             | Self::ThreadConfigured { thread, .. }
             | Self::ThreadHoldChanged { thread, .. }
@@ -217,6 +218,11 @@ impl ChangeSet {
             .chain(self.threads.keys().copied())
             .chain(self.requests.values().map(|request| request.thread))
             .collect();
+        for row in self.threads.values() {
+            if p.threads.get(&row.id).is_some_and(|old| old != row) {
+                events.push(ChangeEvent::ThreadUpdated(Box::new(row.clone())));
+            }
+        }
         for id in changed {
             events.push(self.status_event(p, live, id));
         }

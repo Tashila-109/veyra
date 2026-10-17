@@ -386,6 +386,8 @@ background = poll('grok-background-working',lambda d:d['selected_thread']['id']=
 assert background['composer']['send_enabled']
 capture('grok-background-working')
 background = ctl('grok-background-done','wait',thread,'Done')
+background = poll('grok-background-done-rendered',lambda d:d['selected_thread']['id']==thread
+    and d['selected_thread']['status']=='Done' and not d['composer']['stop_visible'])
 assert not background['composer']['stop_visible']
 assert sql("select count(*) from turns where thread_id='"+thread+"' and outcome_json='\"Completed\"'")=='2'
 assert sql("select count(*) from turns where thread_id='"+thread+"' and origin_json='\"Provider\"'")=='1'

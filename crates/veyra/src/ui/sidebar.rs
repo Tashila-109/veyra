@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use veyra_engine::domain::{Status, ThreadId};
 pub fn glyph(status: &Status) -> &'static str {
     match status {
-        Status::Working { .. } => "◔",
+        Status::Working { .. } | Status::InTerminal => "◔",
         Status::Failed => "×",
         Status::Done { .. } => "✓",
         Status::NeedsYou | Status::Held => "◇",

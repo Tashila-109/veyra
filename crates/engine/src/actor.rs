@@ -470,7 +470,13 @@ impl Actor {
             } => {
                 let c = self.provider(thread, epoch, event);
                 if let Some(mut c) = c {
-                    if let Some(cursor) = cursor {
+                    if let Some(cursor) = cursor
+                        && c.thread(&self.projection, thread)
+                            .unwrap()
+                            .native_cursor
+                            .as_ref()
+                            != Some(&cursor)
+                    {
                         let mut row = c.thread(&self.projection, thread).unwrap().clone();
                         row.native_cursor = Some(cursor);
                         c.threads.insert(thread, row);
@@ -917,13 +923,11 @@ impl Actor {
                         root: false,
                     };
                     let epoch = self.live[&thread].epoch;
-                    match self.spawner.terminal(
-                        Default::default(),
-                        row.provider,
-                        spec,
-                        self.out.clone(),
-                        epoch,
-                    ) {
+                    let colors = *self.state.terminal_colors.lock().unwrap();
+                    match self
+                        .spawner
+                        .terminal(colors, row.provider, spec, self.out.clone(), epoch)
+                    {
                         Ok(term) => {
                             self.state
                                 .terminals
@@ -1412,9 +1416,14 @@ impl Actor {
         }
     }
     fn import_history(&self, c: &mut ChangeSet, thread: ThreadId, history: History) {
-        if history.failed || !history.text.is_empty() {
+        let failed = history.failed
+            || c.thread(&self.projection, thread)
+                .unwrap()
+                .native_cursor
+                .is_none();
+        if failed || !history.text.is_empty() {
             let turn = commands::queue(&self.projection, c, thread, TurnOrigin::Provider);
-            let body = if history.failed {
+            let body = if failed {
                 ItemBody::Notice(Notice {
                     text: IMPORT_NOTICE.into(),
                 })

@@ -78,6 +78,18 @@ fn verify_nested_dump_names() {
         "applied_batches",
         "max_batch_gap_ms",
         "transcript_open_ms",
+        "terminal",
+        "view_refusal",
+        "grid",
+        "columns",
+        "rows",
+        "native_cursor",
+        "import_pending",
+        "flood",
+        "pty_bytes",
+        "elapsed_ms",
+        "median_repaint_gap_ms",
+        "max_repaint_gap_ms",
     ] {
         assert!(mapped.contains(name), "verify-veyra map is missing {name}");
     }

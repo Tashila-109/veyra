@@ -9,6 +9,7 @@
 [stop-interrupt](stop-interrupt.md) covers Stop, held queues, awake and banners.
 [restart-recovery](restart-recovery.md) covers the quit sheet, ConfirmQuit, ctl quit and recovery.
 [multi-agent](multi-agent.md) covers child rows, task and family cards, archive choices, held wakes, report delivery and quiet time, plus Codex and Grok root relay calls and a Claude root's Codex child.
+[chat-terminal-switch](chat-terminal-switch.md) covers the Chat and Terminal switch, header refusal, terminal keys and text, import once, quit recovery and one debug flood.
 [permission-matrix](permission-matrix.md) records the live provider permission grid.
 
 ## Preconditions
@@ -29,7 +30,7 @@ Read the PNG.
 Preserve the app log and proof after Cleanup.
 Report a skipped native entry point as skipped.
 The driver does not prove external keyboard delivery, IME, or pointer input.
-`view`, `sidebar.rows`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings` and `perf` are live state.
+`view`, `sidebar.rows`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `terminal`, `view_refusal` and `perf` are live state.
 Use their assertions alongside identity, appearance, sidebar width and notice, and inspect the PNG for layout.
 Each key check must reset to a state that its key changes.
 The sidebar recipe checks the theme's 240 px default, 200 to 448 px bounds, and 16 px key step.

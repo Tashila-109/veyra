@@ -846,7 +846,7 @@ fn import_failure_before_ready_clears_pending_and_starts_queued_work() {
 }
 
 #[test]
-fn repair_no_native_refuses_switch() {
+fn no_native_refuses_switch() {
     let mut f = Fixture::new(LiveState::Parked);
     let result = f.command(Command::SwitchView {
         thread: f.thread,
@@ -861,7 +861,7 @@ fn repair_no_native_refuses_switch() {
 }
 
 #[test]
-fn repair_stop_before_terminal_has_no_import() {
+fn stop_before_terminal_has_no_import() {
     let mut f = Fixture::new(LiveState::Idle);
     let mut c = ChangeSet::default();
     let mut row = f.actor.projection.threads[&f.thread].clone();
@@ -879,7 +879,7 @@ fn repair_stop_before_terminal_has_no_import() {
 }
 
 #[test]
-fn repair_claude_truncated_line_is_skipped() {
+fn claude_truncated_line_is_skipped() {
     use std::io::Write;
     let root = std::path::Path::new("/tmp").join(format!("veyra-term-cut-{}", ThreadId::new()));
     std::fs::create_dir_all(root.join("projects/test")).unwrap();
@@ -910,7 +910,7 @@ fn repair_claude_truncated_line_is_skipped() {
 }
 
 #[test]
-fn repair_unknown_cursor_adopts_without_text() {
+fn unknown_cursor_adopts_without_text() {
     let root = std::path::Path::new("/tmp").join(format!("veyra-term-unknown-{}", ThreadId::new()));
     std::fs::create_dir_all(root.join("projects/test")).unwrap();
     let scratch = Scratch(root);
@@ -931,7 +931,7 @@ fn repair_unknown_cursor_adopts_without_text() {
 }
 
 #[cfg(debug_assertions)]
-fn repair_terminal(
+fn terminal_fixture(
     provider: ProviderKind,
     records: &[serde_json::Value],
 ) -> (Fixture, Scratch, env::ChildEnv) {
@@ -976,7 +976,11 @@ fn repair_terminal(
     (f, Scratch(root), env)
 }
 #[cfg(debug_assertions)]
-async fn repair_grid(engine: &crate::Engine, thread: ThreadId, text: &str) -> TerminalHandle {
+async fn terminal_grid_containing(
+    engine: &crate::Engine,
+    thread: ThreadId,
+    text: &str,
+) -> TerminalHandle {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let Some(handle) = engine.terminal(thread)
@@ -1000,12 +1004,12 @@ async fn repair_grid(engine: &crate::Engine, thread: ThreadId, text: &str) -> Te
 }
 #[cfg(debug_assertions)]
 #[test]
-fn repair_large_paste_keeps_reader_moving() {
+fn large_paste_keeps_reader_moving() {
     use base64::Engine;
     use serde_json::json;
     use std::time::{Duration, Instant};
     let raw = |bytes: &[u8]| json!({"type":"emit_raw","base64":base64::engine::general_purpose::STANDARD.encode(bytes)});
-    let (f, _scratch, env) = repair_terminal(
+    let (f, _scratch, env) = terminal_fixture(
         ProviderKind::Claude,
         &[
             raw(b"PASTE_READY\r\n"),
@@ -1032,7 +1036,7 @@ fn repair_large_paste_keeps_reader_moving() {
             .await
             .unwrap()
             .unwrap();
-        let handle = repair_grid(&engine, f.thread, "PASTE_READY").await;
+        let handle = terminal_grid_containing(&engine, f.thread, "PASTE_READY").await;
         let (sent, result) = std::sync::mpsc::channel();
         let start = Instant::now();
         let writing = std::thread::spawn(move || {
@@ -1042,7 +1046,7 @@ fn repair_large_paste_keeps_reader_moving() {
         let returned = result.recv_timeout(Duration::from_millis(200)).is_ok();
         let grid = tokio::time::timeout(
             Duration::from_millis(1200),
-            repair_grid(&engine, f.thread, "GRID_MOVED"),
+            terminal_grid_containing(&engine, f.thread, "GRID_MOVED"),
         )
         .await
         .is_ok();
@@ -1059,8 +1063,8 @@ fn repair_large_paste_keeps_reader_moving() {
 }
 #[cfg(debug_assertions)]
 #[test]
-fn repair_failed_terminal_shows_reason_without_import() {
-    let (f, _scratch, mut env) = repair_terminal(ProviderKind::Grok, &[]);
+fn failed_terminal_shows_reason_without_import() {
+    let (f, _scratch, mut env) = terminal_fixture(ProviderKind::Grok, &[]);
     env = env.with_binary(ProviderKind::Grok, "/nonexistent/terminal-test".into());
     f.runtime.block_on(async {
         let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();
@@ -1072,8 +1076,8 @@ fn repair_failed_terminal_shows_reason_without_import() {
 }
 #[cfg(debug_assertions)]
 #[test]
-fn repair_signed_out_terminal_keeps_sign_in_reason() {
-    let (f, _scratch, env) = repair_terminal(
+fn signed_out_terminal_keeps_sign_in_reason() {
+    let (f, _scratch, env) = terminal_fixture(
         ProviderKind::Grok,
         &[
             serde_json::json!({"type":"exit","code":1,"stderr":["Sign in to Grok before continuing"]}),
@@ -1087,8 +1091,8 @@ fn repair_signed_out_terminal_keeps_sign_in_reason() {
 }
 #[cfg(debug_assertions)]
 #[test]
-fn repair_worker_panic_still_exits() {
-    let (f, _scratch, env) = repair_terminal(ProviderKind::Claude, &[]);
+fn worker_panic_still_exits() {
+    let (f, _scratch, env) = terminal_fixture(ProviderKind::Claude, &[]);
     let gate = env.closing.clone();
     let _ = std::thread::spawn(move || {
         let _locked = gate.lock.lock().unwrap();
@@ -1135,7 +1139,7 @@ fn repair_worker_panic_still_exits() {
     assert!(exited, "worker panic left the terminal live");
 }
 #[test]
-fn repair_structured_cursor_tracks_turn_state() {
+fn structured_cursor_tracks_turn_state() {
     for provider in [ProviderKind::Claude, ProviderKind::Grok] {
         let mut f = Fixture::new(LiveState::Idle);
         let mut c = ChangeSet::default();
@@ -1159,7 +1163,7 @@ fn repair_structured_cursor_tracks_turn_state() {
 }
 
 #[cfg(debug_assertions)]
-fn repair_rpc_roundtrip(
+fn rpc_terminal_roundtrip(
     provider: ProviderKind,
     fixture: &str,
     cursor: &str,
@@ -1167,7 +1171,7 @@ fn repair_rpc_roundtrip(
     typed: &[u8],
 ) {
     use std::time::Duration;
-    let (mut f, scratch, env) = repair_terminal(provider, &[]);
+    let (mut f, scratch, env) = terminal_fixture(provider, &[]);
     let mut c = ChangeSet::default();
     let mut row = f.actor.projection.threads[&f.thread].clone();
     row.native = Some(NativeSessionId("native-import".into()));
@@ -1204,7 +1208,7 @@ fn repair_rpc_roundtrip(
             .unwrap();
         let ready = tokio::time::timeout(
             Duration::from_secs(3),
-            repair_grid(&engine, f.thread, "VEYRA_TUI_READY"),
+            terminal_grid_containing(&engine, f.thread, "VEYRA_TUI_READY"),
         )
         .await;
         if ready.is_err() {
@@ -1212,7 +1216,7 @@ fn repair_rpc_roundtrip(
             panic!("Parked opened a structured process before its TUI");
         }
         ready.unwrap().write(typed).unwrap();
-        repair_grid(&engine, f.thread, "0d").await;
+        terminal_grid_containing(&engine, f.thread, "0d").await;
         engine
             .send(Command::SwitchView {
                 thread: f.thread,
@@ -1254,8 +1258,8 @@ fn repair_rpc_roundtrip(
 }
 #[cfg(debug_assertions)]
 #[test]
-fn repair_codex_roundtrip_without_capture() {
-    repair_rpc_roundtrip(
+fn codex_roundtrip_without_capture() {
+    rpc_terminal_roundtrip(
         ProviderKind::Codex,
         "turns-list-import",
         "anchor",
@@ -1265,8 +1269,8 @@ fn repair_codex_roundtrip_without_capture() {
 }
 #[cfg(debug_assertions)]
 #[test]
-fn repair_grok_roundtrip_without_capture() {
-    repair_rpc_roundtrip(
+fn grok_roundtrip_without_capture() {
+    rpc_terminal_roundtrip(
         ProviderKind::Grok,
         "load-replay-import",
         "sent",
@@ -1276,7 +1280,7 @@ fn repair_grok_roundtrip_without_capture() {
 }
 
 #[test]
-fn repair_grok_not_found_import_runs_queued_work() {
+fn grok_not_found_import_runs_queued_work() {
     use serde_json::json;
     let mut f = Fixture::new(LiveState::Starting);
     let mut c = ChangeSet::default();
@@ -1337,7 +1341,7 @@ fn repair_grok_not_found_import_runs_queued_work() {
 }
 
 #[test]
-fn repair_codex_bad_page_still_resumes() {
+fn codex_bad_page_still_resumes() {
     use serde_json::json;
     let mut codec = crate::provider::codex::Codec::new(
         SessionSpec {
@@ -1374,10 +1378,8 @@ fn repair_codex_bad_page_still_resumes() {
 }
 
 #[cfg(debug_assertions)]
-#[test]
-fn repair_closing_terminal_uses_one_second_ladder() {
-    use std::time::{Duration, Instant};
-    let (f, scratch, mut env) = repair_terminal(ProviderKind::Claude, &[]);
+fn hangup_ignoring_terminal_fixture() -> (Fixture, Scratch, env::ChildEnv) {
+    let (f, scratch, mut env) = terminal_fixture(ProviderKind::Claude, &[]);
     let script = scratch.0.join("terminal-fixture");
     std::fs::write(&script,"#!/usr/bin/python3\nimport signal,time\nsignal.signal(signal.SIGHUP,signal.SIG_IGN)\nprint('VEYRA_TUI_READY',flush=True)\nwhile True: time.sleep(1)\n").unwrap();
     assert!(
@@ -1390,6 +1392,15 @@ fn repair_closing_terminal_uses_one_second_ladder() {
             .success()
     );
     env = env.with_binary(ProviderKind::Claude, script);
+    (f, scratch, env)
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn closing_terminal_uses_one_second_ladder() {
+    use std::time::{Duration, Instant};
+    let (f, _scratch, env) = hangup_ignoring_terminal_fixture();
+    let _cleanup = StandInGroups::new(&env);
     f.runtime.block_on(async {
         let engine = crate::Engine::launch(
             &tokio::runtime::Handle::current(),
@@ -1406,7 +1417,7 @@ fn repair_closing_terminal_uses_one_second_ladder() {
             .await
             .unwrap()
             .unwrap();
-        repair_grid(&engine, f.thread, "VEYRA_TUI_READY").await;
+        terminal_grid_containing(&engine, f.thread, "VEYRA_TUI_READY").await;
         let start = Instant::now();
         engine.shutdown_wait().await;
         let elapsed = start.elapsed();
@@ -1417,10 +1428,10 @@ fn repair_closing_terminal_uses_one_second_ladder() {
 }
 
 #[cfg(debug_assertions)]
-fn repair_codex_session(bad_history: bool) {
+fn codex_import_before_resume(bad_history: bool) {
     use serde_json::json;
     use std::time::Duration;
-    let (mut f, scratch, env) = repair_terminal(ProviderKind::Codex, &[]);
+    let (mut f, scratch, env) = terminal_fixture(ProviderKind::Codex, &[]);
     let native = f.loaded().threads[&f.thread]
         .native
         .as_ref()
@@ -1462,21 +1473,21 @@ fn repair_codex_session(bad_history: bool) {
 }
 #[cfg(debug_assertions)]
 #[test]
-fn repair_codex_structured_cursor() {
-    repair_codex_session(false);
+fn codex_structured_cursor() {
+    codex_import_before_resume(false);
 }
 #[cfg(debug_assertions)]
 #[test]
-fn repair_codex_typed_bad_page_runs_queued_work() {
-    repair_codex_session(true);
+fn codex_typed_bad_page_runs_queued_work() {
+    codex_import_before_resume(true);
 }
 
 #[cfg(debug_assertions)]
 #[test]
-fn repair_plain_shutdown_has_no_switch_grace() {
+fn plain_shutdown_has_no_switch_grace() {
     use serde_json::json;
     use std::time::{Duration, Instant};
-    let (f, scratch, env) = repair_terminal(
+    let (f, scratch, env) = terminal_fixture(
         ProviderKind::Claude,
         &[
             json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
@@ -1530,7 +1541,7 @@ fn repair_plain_shutdown_has_no_switch_grace() {
 }
 
 #[test]
-fn repair_codex_unacknowledged_turn_has_unknown_cursor() {
+fn codex_unacknowledged_turn_has_unknown_cursor() {
     let mut f = Fixture::new(LiveState::Idle);
     let mut c = ChangeSet::default();
     let mut row = f.loaded().threads[&f.thread].clone();
@@ -1553,10 +1564,10 @@ fn repair_codex_unacknowledged_turn_has_unknown_cursor() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn repair_grok_promoted_overlap_keeps_newest_cursor() {
+fn grok_promoted_overlap_keeps_last_completed_cursor() {
     use serde_json::json;
     use std::time::Duration;
-    let (f, scratch, env) = repair_terminal(ProviderKind::Grok, &[]);
+    let (f, scratch, env) = terminal_fixture(ProviderKind::Grok, &[]);
     let native = f.loaded().threads[&f.thread]
         .native
         .as_ref()
@@ -1624,7 +1635,7 @@ fn repair_grok_promoted_overlap_keeps_newest_cursor() {
         let p = result.unwrap();
         assert_eq!(
             p.threads[&f.thread].native_cursor.as_deref(),
-            Some("foreign-newest")
+            Some("foreign-first")
         );
         assert_eq!(
             p.turns
@@ -1646,7 +1657,7 @@ fn repair_grok_promoted_overlap_keeps_newest_cursor() {
 }
 
 #[test]
-fn repair_stop_or_switch_before_ready_has_no_import() {
+fn stop_or_switch_before_ready_has_no_import() {
     for stop in [false, true] {
         let mut f = Fixture::new(LiveState::Terminal);
         let mut c = ChangeSet::default();
@@ -1672,7 +1683,7 @@ fn repair_stop_or_switch_before_ready_has_no_import() {
 }
 
 #[test]
-fn repair_worker_setup_error_before_handle_is_visible() {
+fn worker_setup_error_before_handle_is_visible() {
     let mut f = Fixture::new(LiveState::Parked);
     let mut c = ChangeSet::default();
     let mut row = f.loaded().threads[&f.thread].clone();
@@ -1693,4 +1704,302 @@ fn repair_worker_setup_error_before_handle_is_visible() {
     assert_eq!(p.threads[&f.thread].view, View::Chat);
     assert!(!p.threads[&f.thread].import_pending);
     assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text=="PTY worker could not start")));
+}
+
+#[test]
+fn switch_publishes_thread_view_to_window() {
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.native = Some(NativeSessionId("window-conversation".into()));
+    row.native_cursor = Some("window-anchor".into());
+    let mut changes = ChangeSet::default();
+    changes.threads.insert(f.thread, row.clone());
+    f.save(changes);
+    while f.events.try_recv().is_ok() {}
+    f.command(Command::SwitchView {
+        thread: f.thread,
+        to: View::Terminal,
+    })
+    .unwrap();
+    let mut shown = row;
+    while let Ok(event) = f.events.try_recv() {
+        if let UiEvent::Change {
+            event:
+                crate::events::ChangeEvent::ThreadCreated(row)
+                | crate::events::ChangeEvent::ThreadUpdated(row),
+            ..
+        } = event
+        {
+            shown = *row;
+        }
+    }
+    assert_eq!(shown.view, View::Terminal);
+    assert_eq!(shown.native_cursor.as_deref(), Some("window-anchor"));
+}
+
+#[test]
+fn claude_import_skips_lines_cut_inside_utf8() {
+    let scratch =
+        Scratch(std::path::Path::new("/tmp").join(format!("veyra-term-utf8-{}", ThreadId::new())));
+    std::fs::create_dir_all(scratch.0.join("projects/fixture")).unwrap();
+    let mut bytes = b"{\"type\":\"user\",\"message\":{\"content\":\"\xe2\x82\n".to_vec();
+    bytes.extend(
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/claude/session-file-import.jsonl"),
+        )
+        .unwrap(),
+    );
+    bytes.extend_from_slice(b"\n{\"type\":\"user\",\"message\":{\"content\":\"\xe2\x82");
+    std::fs::write(
+        scratch.0.join("projects/fixture/native-import.jsonl"),
+        bytes,
+    )
+    .unwrap();
+    let history = claude::session_file_import(
+        &scratch.0,
+        &NativeSessionId("native-import".into()),
+        &HistoryRequest {
+            cursor: Some("anchor".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        history,
+        History {
+            cursor: Some("new-user".into()),
+            text: "second\nreply second".into(),
+            failed: false
+        }
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn native_quit_hangup_creates_no_failed_turn_or_crash_notice() {
+    for _ in 0..5 {
+        let (f, scratch, env) = terminal_fixture(ProviderKind::Claude, &[]);
+        f.runtime.block_on(async {
+            let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();
+            engine.send(Command::SwitchView {thread:f.thread,to:View::Terminal}).await.unwrap().unwrap();
+            terminal_grid_containing(&engine,f.thread,"VEYRA_TUI_READY").await;
+            engine.on_app_quit().await;
+            engine.shutdown_wait().await;
+            let loaded=store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
+            assert!(loaded.threads[&f.thread].import_pending);
+            assert_eq!(loaded.threads[&f.thread].view,View::Chat);
+            assert_eq!(loaded.turns.values().filter(|turn|matches!(turn.state,TurnState::Ended {outcome:TurnOutcome::Failed {..},..})).count(),0);
+            assert_eq!(loaded.items.values().filter(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("terminal exited"))).count(),0);
+            assert!(engine.inner.groups.lock().unwrap().is_empty());
+        });
+    }
+}
+
+#[test]
+fn unknown_import_cursor_notifies_and_starts_queued_work() {
+    for provider in [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::Grok,
+    ] {
+        let mut f = Fixture::new(LiveState::Starting);
+        let native = NativeSessionId("retained-native".into());
+        let mut c = ChangeSet::default();
+        let mut row = f.actor.projection.threads[&f.thread].clone();
+        row.provider = provider;
+        row.native = Some(native.clone());
+        row.native_cursor = None;
+        row.import_pending = true;
+        c.threads.insert(f.thread, row);
+        f.save(c);
+        let queued = f.user("continue after unknown cursor");
+        f.event(ProviderEvent::Session(SessionEvent::History {
+            native: native.clone(),
+            history: History {
+                cursor: Some("latest-native-turn".into()),
+                text: String::new(),
+                failed: false,
+            },
+        }));
+        let p = f.loaded();
+        assert_eq!(p.items.values().filter(|item| matches!(&item.body, ItemBody::Notice(notice) if notice.text == crate::provider::IMPORT_NOTICE)).count(), 1, "{provider:?}");
+        assert!(
+            !p.items
+                .values()
+                .any(|item| matches!(item.body, ItemBody::TerminalSpan(_)))
+        );
+        assert_eq!(
+            p.threads[&f.thread].native_cursor.as_deref(),
+            Some("latest-native-turn")
+        );
+        assert!(!p.threads[&f.thread].import_pending);
+        assert_eq!(p.threads[&f.thread].native, Some(native.clone()));
+        assert!(matches!(p.turns[&queued].state, TurnState::Queued));
+        f.event(ProviderEvent::Session(SessionEvent::Ready {
+            native,
+            cli_version: None,
+            pid: 1,
+            pgid: 1,
+            capabilities: vec![],
+        }));
+        assert!(matches!(
+            f.loaded().turns[&queued].state,
+            TurnState::Running { .. }
+        ));
+        assert!(
+            matches!(f.controls.try_recv().unwrap(), SessionControl::StartTurn {turn,text,..} if turn == queued && text == "continue after unknown cursor")
+        );
+    }
+}
+
+#[test]
+fn streamed_cursor_writes_thread_only_when_it_changes() {
+    let mut f = Fixture::new(LiveState::Running);
+    let turn = f.running().unwrap();
+    let mut c = ChangeSet::default();
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.provider = ProviderKind::Grok;
+    row.native_cursor = Some("previous-turn".into());
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    f.actor.db.execute_batch("CREATE TABLE thread_writes (value TEXT); CREATE TRIGGER count_thread_write AFTER UPDATE ON threads BEGIN INSERT INTO thread_writes VALUES (NEW.native_cursor); END;").unwrap();
+    for _ in 0..20 {
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::Provider {
+            thread: f.thread,
+            epoch: 1,
+            cursor: Some("streamed-turn".into()),
+            event: turn_event(
+                Some(turn),
+                TurnEvent::TextDelta {
+                    streamed: true,
+                    key: NativeItemKey("answer".into()),
+                    text: "x".into(),
+                },
+            ),
+        });
+    }
+    let writes: i64 = f
+        .actor
+        .db
+        .query_row("SELECT count(*) FROM thread_writes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(writes, 1);
+    {
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::Provider {
+            thread: f.thread,
+            epoch: 1,
+            cursor: Some("next-turn".into()),
+            event: turn_event(
+                Some(turn),
+                TurnEvent::TextDelta {
+                    streamed: true,
+                    key: NativeItemKey("answer".into()),
+                    text: "z".into(),
+                },
+            ),
+        });
+        f.actor.handle(EngineMsg::TextWrite);
+    }
+    let writes: i64 = f
+        .actor
+        .db
+        .query_row("SELECT count(*) FROM thread_writes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(writes, 2);
+    let p = f.loaded();
+    assert_eq!(
+        p.threads[&f.thread].native_cursor.as_deref(),
+        Some("next-turn")
+    );
+    assert_eq!(p.items_for(f.thread).filter(|item| matches!(&item.body, ItemBody::AssistantText {text,..} if text == "xxxxxxxxxxxxxxxxxxxxz")).count(), 1);
+}
+
+#[cfg(debug_assertions)]
+struct StandInGroups {
+    groups: env::Groups,
+    closing: std::sync::Arc<crate::LaunchGate>,
+}
+#[cfg(debug_assertions)]
+impl StandInGroups {
+    fn new(env: &env::ChildEnv) -> Self {
+        Self {
+            groups: env.groups.clone(),
+            closing: env.closing.clone(),
+        }
+    }
+}
+#[cfg(debug_assertions)]
+impl Drop for StandInGroups {
+    fn drop(&mut self) {
+        self.closing.close();
+        if !stop_stand_in_groups(&self.groups) {
+            eprintln!("stand-in cleanup did not finish reaping its groups");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn stop_stand_in_groups(groups: &env::Groups) -> bool {
+    let pids = groups.lock().unwrap().clone();
+    for &pid in &pids {
+        let _ = crate::platform::signal_group(pid, crate::platform::Signal::Kill);
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let reaped = groups.lock().unwrap().is_empty()
+            && pids
+                .iter()
+                .all(|pid| crate::platform::group_exists(*pid).is_ok_and(|exists| !exists));
+        if reaped || std::time::Instant::now() >= until {
+            return reaped;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hangup_ignoring_stand_in_is_reaped_after_assertion_failure() {
+    for assertion in [true, false] {
+        let (f, _scratch, env) = hangup_ignoring_terminal_fixture();
+        let groups = env.groups.clone();
+        let mut pid = None;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = StandInGroups::new(&env);
+            f.runtime.block_on(async {
+                let engine = crate::Engine::launch(
+                    &tokio::runtime::Handle::current(),
+                    f.actor.db,
+                    Spawner::Cli(Box::new(env)),
+                    None,
+                )
+                .unwrap();
+                engine
+                    .send(Command::SwitchView {
+                        thread: f.thread,
+                        to: View::Terminal,
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let handle = terminal_grid_containing(&engine, f.thread, "VEYRA_TUI_READY").await;
+                pid = handle.terminal.as_ref().unwrap().pid();
+                assert!(!assertion, "intentional stand-in assertion failure");
+                panic!("intentional stand-in panic");
+            });
+        }));
+        let reaped = groups.lock().unwrap().is_empty()
+            && pid.is_some_and(|pid| !crate::platform::group_exists(pid).unwrap());
+        let cleaned = stop_stand_in_groups(&groups);
+        eprintln!("stand_in_group={pid:?} reaped_on_unwind={reaped} forced_assertion={assertion}");
+        assert!(cleaned, "emergency test cleanup failed");
+        assert!(failed.is_err());
+        assert!(
+            reaped,
+            "unwinding left the SIGHUP-ignoring stand-in group alive or unreaped"
+        );
+    }
 }

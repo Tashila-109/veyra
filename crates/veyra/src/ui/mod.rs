@@ -6,6 +6,7 @@ mod notify;
 mod provider_text;
 mod settings;
 mod sidebar;
+mod terminal_view;
 pub mod theme;
 mod transcript;
 
@@ -23,6 +24,7 @@ use std::{
 };
 use theme::{Appearance, Theme};
 use transcript::MessageScrollerState;
+use veyra_engine::domain::View;
 use veyra_engine::{
     Engine,
     commands::{Ack, Command},
@@ -189,7 +191,7 @@ impl AppState {
                 ChangeEvent::ProjectAdded(project) => {
                     self.projects.insert(project.id, project.clone());
                 }
-                ChangeEvent::ThreadCreated(thread) => {
+                ChangeEvent::ThreadCreated(thread) | ChangeEvent::ThreadUpdated(thread) => {
                     self.threads.insert(thread.id, thread.as_ref().clone());
                 }
                 ChangeEvent::ThreadArchived { thread } => {
@@ -625,6 +627,8 @@ pub struct Shell {
     sent_archives: Vec<(ThreadId, bool)>,
     #[cfg(debug_assertions)]
     repaints: u64,
+    terminal: Option<(ThreadId, Entity<terminal_view::TerminalView>)>,
+    view_refusal: Option<String>,
     focus: FocusHandle,
     dock_focus: FocusHandle,
     approval_scroll: ApprovalScroll,
@@ -815,6 +819,8 @@ impl Shell {
         let mut shell = Self {
             #[cfg(debug_assertions)]
             repaints: 0,
+            terminal: None,
+            view_refusal: None,
             focus,
             dock_focus: cx.focus_handle(),
             approval_scroll: ApprovalScroll::default(),
@@ -1097,6 +1103,7 @@ impl Shell {
         } else {
             self.forget_branch();
         }
+        self.view_refusal = None;
         self.view = view;
     }
     fn start_branch_lookup(&mut self, cx: &mut Context<Self>) {
@@ -1138,6 +1145,76 @@ impl Shell {
                     }
                 });
             }
+        })
+        .detach();
+    }
+    #[cfg(debug_assertions)]
+    pub fn terminal_has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|(_, view)| view.focus_handle(cx).is_focused(window))
+    }
+    fn terminal_selected(&self) -> Option<ThreadId> {
+        self.view.chat().filter(|id| {
+            self.state
+                .threads
+                .get(id)
+                .is_some_and(|row| row.view == View::Terminal)
+        })
+    }
+    fn sync_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.terminal_selected() else {
+            if self.terminal.take().is_some() && self.view.chat().is_some() {
+                self.input.update(cx, |input, cx| input.focus(window, cx));
+            }
+            return;
+        };
+        let handle = self.engine.terminal(thread);
+        let current = self.terminal.as_ref().is_some_and(|(id, view)| {
+            *id == thread
+                && match (&view.read(cx).handle, &handle) {
+                    (Some(old), Some(new)) => match (&old.terminal, &new.terminal) {
+                        (Some(old), Some(new)) => std::sync::Arc::ptr_eq(old, new),
+                        _ => false,
+                    },
+                    (None, None) => true,
+                    _ => false,
+                }
+        });
+        if !current {
+            let view = cx.new(|cx| terminal_view::TerminalView::new(handle, window, cx));
+            window.focus(&view.focus_handle(cx), cx);
+            self.terminal = Some((thread, view));
+        }
+    }
+    fn switch_view(&mut self, action: &SwitchView, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.view.chat() else {
+            return;
+        };
+        let to = if action
+            .terminal
+            .unwrap_or(self.terminal_selected().is_none())
+        {
+            View::Terminal
+        } else {
+            View::Chat
+        };
+        self.engine
+            .set_terminal_colors(cx.global::<Theme>().terminal.engine_colors());
+        let reply = self.engine.send(Command::SwitchView { thread, to });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = reply.await;
+            let _ = this.update_in(cx, |shell, window, cx| {
+                if shell.view.chat() == Some(thread) {
+                    shell.view_refusal = match result {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(_) => Some("The engine closed before answering".into()),
+                    };
+                    shell.sync_terminal(window, cx);
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -1714,6 +1791,7 @@ impl Shell {
                     "breadcrumb":self.state.parent(thread.id).map(|parent| serde_json::json!({"thread":parent.id,"title":parent.title,"linked":!parent.archived})),
                     "parent_attention":header::parent_attention(&self.state,thread.id),
                     "failure":self.state.failure(thread.id), "hold":thread.hold,
+                    "native_cursor":thread.native_cursor, "import_pending":thread.import_pending, "view":thread.view,
                     "wait_reason":self.engine.window_threads().get(&thread.id)
                         .and_then(|state| state.wait_reason).map(|reason| reason.to_string())
                 })
@@ -1853,7 +1931,8 @@ impl Shell {
         serde_json::json!({
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
-            "header_branch":self.branch,
+            "header_branch":self.branch, "view_refusal":self.view_refusal,
+            "terminal":self.terminal.as_ref().map(|(_,view)|view.read(cx).dump()),
             "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows(), "menu_thread":self.thread_menu.as_ref().map(|(id,_)|id)},
             "selected_thread":self.dump_selected(), "transcript":transcript,
             "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(cx),
@@ -1865,7 +1944,8 @@ impl Shell {
                 "transcript_open_ms":self.state.transcript_open.as_ref().and_then(|open|open.milliseconds),
                 "mailbox_free":perf.mailbox_free,
                 "commits":perf.commits, "actor_max_ms":perf.actor_max_ms, "actor_busy_ms":perf.actor_busy_ms,
-                "repaints":self.repaints, "max_batch_events":self.state.max_batch_events},
+                "repaints":self.repaints, "max_batch_events":self.state.max_batch_events,
+                "flood":self.terminal.as_ref().and_then(|(_,view)|view.read(cx).flood())},
             "window_active":self.window_active, "notifications":{"posted":self.notifications_posted},
             "quit_sheet":{"open":self.quit_sheet, "threads":self.busy_threads()},
             "requests":self.state.requests,
@@ -1878,6 +1958,7 @@ impl Shell {
         match self.view {
             MainView::Settings { .. } => "settings",
             MainView::NewThread => "new_thread",
+            MainView::Chat(_) if self.terminal_selected().is_some() => "terminal",
             MainView::Chat(thread) if self.state.failure(thread).is_some() => "failed_thread",
             MainView::Chat(_) => "chat",
         }
@@ -1889,7 +1970,8 @@ impl Focusable for Shell {
     }
 }
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_terminal(window, cx);
         #[cfg(debug_assertions)]
         {
             self.repaints += 1;
@@ -1939,6 +2021,9 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
             .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
+            .on_action(cx.listener(|shell, action: &SwitchView, window, cx| {
+                shell.switch_view(action, window, cx)
+            }))
             .on_action(
                 cx.listener(|shell, action: &ChooseAsyncOption, window, cx| {
                     shell.choose_async_option(action, window, cx)
@@ -2316,6 +2401,9 @@ impl Render for Shell {
                             settings::render(self.state.settings, self.notice.clone(), cx)
                                 .into_any_element()
                         }
+                        MainView::Chat(_) if self.terminal.is_some() => {
+                            self.terminal.as_ref().unwrap().1.clone().into_any_element()
+                        }
                         MainView::Chat(_) => transcript::render(self, cx).into_any_element(),
                     }),
             );
@@ -2478,6 +2566,7 @@ mod tests {
                 let allowed = self.dispatched.clone();
                 let denied = self.dispatched.clone();
                 let granted = self.dispatched.clone();
+                let switched = self.dispatched.clone();
                 div()
                     .size_full()
                     .capture_action(move |_: &super::Stop, _, _| {
@@ -2491,6 +2580,13 @@ mod tests {
                     })
                     .capture_action(move |_: &super::AllowInThread, _, _| {
                         granted.borrow_mut().push("AllowInThread");
+                    })
+                    .capture_action(move |action: &super::SwitchView, _, _| {
+                        switched.borrow_mut().push(match action.terminal {
+                            Some(true) => "Terminal",
+                            Some(false) => "Chat",
+                            None => "SwitchView",
+                        });
                     })
                     .child(self.shell.clone())
             }
@@ -7184,6 +7280,116 @@ mod tests {
             let reason = cx.debug_bounds("approval-provider-reason").unwrap();
             assert!(reason.origin.y >= consequence.origin.y + consequence.size.height);
             assert_ne!(reason.size.height, gpui::Pixels::default());
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn terminal_window_layout_matrix(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.state.threads.get_mut(&thread).unwrap().view = View::Terminal;
+                shell.state.statuses.insert(thread, Status::InTerminal);
+                cx.notify();
+            });
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            for viewport in [theme.layout.window_min, theme.layout.window_default] {
+                cx.simulate_resize(viewport);
+                draw(cx);
+                let hint = cx.debug_bounds("terminal-hint").expect("terminal hint row");
+                let grid = cx.debug_bounds("terminal-grid").expect("terminal grid");
+                let header = cx
+                    .debug_bounds("view-switch")
+                    .expect("Chat and Terminal switch");
+                assert_eq!(hint.size.height, theme.layout.terminal_hint);
+                assert_eq!(hint.size.width, grid.size.width);
+                assert_eq!(hint.top(), grid.bottom());
+                assert!(header.right() <= viewport.width && header.top() < grid.top());
+                assert_eq!(
+                    shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx))["view"],
+                    "terminal"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_sidebar_uses_muted_open_arc() {
+        let theme = super::Theme::new(super::Appearance::Dark);
+        assert_eq!(super::sidebar::glyph(&Status::InTerminal), "◔");
+        assert_eq!(
+            super::sidebar::glyph_color(&Status::InTerminal, &theme),
+            theme.colors.text_muted
+        );
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn terminal_header_buttons_dispatch_requested_view(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, dispatched, _| {
+            shell.update(cx, |shell, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                cx.notify();
+            });
+            draw(cx);
+            for button in ["view-terminal", "view-chat"] {
+                let bounds = cx.debug_bounds(button).expect("header view button");
+                cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+                draw(cx);
+            }
+            assert_eq!(*dispatched.borrow(), ["Terminal", "Chat"]);
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn terminal_metadata_switches_surface_and_restores_composer_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Focusable;
+        with_docked_shell(cx, |shell, cx, _, events| {
+            let mut row = shell.update(cx, |shell, cx| {
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                cx.notify();
+                shell.state.threads[&thread].clone()
+            });
+            row.view = View::Terminal;
+            events
+                .send(UiEvent::Change {
+                    counter: Some(1),
+                    event: ChangeEvent::ThreadCreated(Box::new(row.clone())),
+                })
+                .unwrap();
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx))["view"],
+                "terminal"
+            );
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx))["terminal"]
+                    ["focused"],
+                true
+            );
+            row.view = View::Chat;
+            row.native_cursor = Some("imported-native-turn".into());
+            events
+                .send(UiEvent::Change {
+                    counter: Some(2),
+                    event: ChangeEvent::ThreadCreated(Box::new(row)),
+                })
+                .unwrap();
+            draw(cx);
+            let dump =
+                shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx));
+            assert_eq!(dump["view"], "chat");
+            assert!(dump["terminal"].is_null());
+            assert_eq!(
+                dump["selected_thread"]["native_cursor"],
+                "imported-native-turn"
+            );
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
         });
     }
 }

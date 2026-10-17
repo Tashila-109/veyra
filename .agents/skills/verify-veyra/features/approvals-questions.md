@@ -5,7 +5,7 @@ Status: passed, 2026-10-17, b7661f7, none
 ## Sub-features
 
 - Typed commands, file operations and other tools, with absolute file targets and bounded argument previews.
-- Exact command, Deny, AllowOnce and AllowInThread, including a compound command.
+- Exact command, Deny, AllowOnce and AllowInThread, including a compound command and a grant preserved across Chat and Terminal.
 - AnswerQuestion choices, FocusDock and FocusComposer, digit focus isolation and two pending requests.
 - NextNeedsYou selects the request's thread across the sidebar.
 - The request closes as Answered and its answer appears in the transcript.
@@ -82,6 +82,10 @@ assert check.is_file()
 thread = create('approval-grant','Run touch veyra-grant.txt',scenario='approval-grant')
 grant = poll('approval-grant-dock',lambda d: d['composer']['dock'] is not None)
 capture('approval-grant')
+ctl('approval-switch-pending','keys','cmd-shift-v')
+refused = poll('approval-switch-refused',lambda d:d['view_refusal'] is not None)
+assert refused['view']=='chat' and 'pending request' in refused['view_refusal']
+capture('approval-switch-refused')
 action('approval-grant-answer','AllowInThread',{'request':grant['composer']['dock']['request']['id']})
 compound = poll('approval-compound',lambda d: d['composer']['dock'] is not None
     and '&&' in d['composer']['dock']['request']['kind']['Approval']['action']['target']['command'])
@@ -91,6 +95,33 @@ assert (DATA/'project'/'veyra-grant.txt').is_file()
 capture('approval-compound')
 action('approval-compound-deny','Deny',{'request':compound['composer']['dock']['request']['id']})
 ctl('approval-grant-done','wait',thread,'Done')
+grant_before = sql("select thread_id||'|'||tool||'|'||command from grants where thread_id='"+thread+"'")
+assert grant_before
+native,_ = terminal_seed(thread)
+terminal_enter('approval-grant-terminal')
+capture('approval-grant-terminal')
+records = [json.loads(line) for line in (SOURCE/'approval-allow.jsonl').read_text().splitlines()]
+records[4]['line']['request']['input']['command'] = 'touch veyra-grant.txt'
+records[6]['path'] = 'veyra-grant.txt'
+stage_records(records)
+ctl('approval-grant-chat-switch','keys','cmd-shift-v')
+poll('approval-grant-chat',lambda d:d['view']=='chat' and not d['selected_thread']['import_pending'])
+assert sql("select native_id from threads where id='"+thread+"'")==native
+assert sql("select thread_id||'|'||tool||'|'||command from grants where thread_id='"+thread+"'")==grant_before
+(DATA/'project'/'veyra-grant.txt').unlink()
+requests = int(sql("select count(*) from requests where thread_id='"+thread+"'"))
+turns = int(sql("select count(*) from turns where thread_id='"+thread+"'"))
+ctl('approval-grant-after-switch-text','text','Run touch veyra-grant.txt')
+ctl('approval-grant-after-switch-send','keys','secondary-enter')
+grant_after = poll('approval-grant-after-switch',lambda d:d['selected_thread']['status']=='Done'
+    and int(sql("select count(*) from turns where thread_id='"+thread+"'"))>turns)
+assert grant_after['composer']['dock'] is None
+assert sql("select count(*) from requests where thread_id='"+thread+"' and state='pending'")=='0'
+assert int(sql("select count(*) from requests where thread_id='"+thread+"'"))==requests+1
+assert (DATA/'project'/'veyra-grant.txt').is_file()
+assert sql("select thread_id||'|'||tool||'|'||command from grants where thread_id='"+thread+"'")==grant_before
+save('approval-view-switch-grant',{'before':grant_before,'after':grant_before,'native_id':native,'dump':grant_after})
+capture('approval-view-switch-grant')
 for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve())),
     ('outside', '/tmp/veyra-outside-'+RUN+'.txt')]:
     records = [json.loads(line) for line in (SOURCE/'approval-allow.jsonl').read_text().splitlines()]

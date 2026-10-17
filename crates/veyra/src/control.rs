@@ -138,8 +138,22 @@ pub fn attach(
                             Ok(json!({"ok": true}))
                         }
                         Command::Text { text } => {
-                            shell
-                                .update(cx, |shell, cx| shell.insert_text(&text, window, cx))??;
+                            if shell.update(cx, |shell, cx| shell.terminal_has_focus(window, cx))? {
+                                for keystroke in text_keystrokes(&text) {
+                                    window.dispatch_event(
+                                        PlatformInput::KeyDown(KeyDownEvent {
+                                            keystroke,
+                                            is_held: false,
+                                            prefer_character_input: false,
+                                        }),
+                                        cx,
+                                    );
+                                }
+                            } else {
+                                shell.update(cx, |shell, cx| {
+                                    shell.insert_text(&text, window, cx)
+                                })??;
+                            }
                             Ok(json!({"ok":true}))
                         }
                         Command::Quit => {
@@ -158,6 +172,21 @@ pub fn attach(
         })
         .detach();
     });
+}
+
+pub(crate) fn text_keystrokes(text: &str) -> Vec<Keystroke> {
+    text.chars()
+        .map(|character| Keystroke {
+            modifiers: Default::default(),
+            key: match character {
+                '\n' | '\r' => "enter".into(),
+                '\t' => "tab".into(),
+                ' ' => "space".into(),
+                _ => character.to_string(),
+            },
+            key_char: Some(character.to_string()),
+        })
+        .collect()
 }
 
 enum ClientCommand {

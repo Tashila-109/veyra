@@ -833,6 +833,7 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
             tool.result.is_some(),
         ),
         ItemBody::Notice(notice) => ("notice", notice.text.clone(), true),
+        ItemBody::TerminalSpan(span) => ("terminal_span", span.text.clone(), true),
         _ => ("other", String::new(), true),
     };
     let mut value = serde_json::json!({"id":item.id,"turn":item.turn,"kind":kind,"text":text,"done":done,"body":item.body});
@@ -852,6 +853,22 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(debug_assertions)]
+    #[test]
+    fn terminal_span_dump_keeps_imported_text() {
+        let item = super::Item {
+            id: super::ItemId::new(),
+            thread: super::ThreadId::new(),
+            turn: super::TurnId::new(),
+            seq: 1,
+            body: super::ItemBody::TerminalSpan(super::TerminalSpan {
+                text: "window heron\nfake reply: window heron".into(),
+            }),
+        };
+        let dump = super::dump_item(&item);
+        assert_eq!(dump["kind"], "terminal_span");
+        assert_eq!(dump["text"], "window heron\nfake reply: window heron");
+    }
     #[test]
     fn tool_labels_distinguish_veyra_from_provider_names() {
         let command: super::ToolCall = serde_json::from_value(serde_json::json!({

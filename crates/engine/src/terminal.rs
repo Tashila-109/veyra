@@ -6,14 +6,20 @@ use crate::{
         env::ChildEnv,
     },
 };
-pub use alacritty_terminal::vte::ansi::Rgb;
 use alacritty_terminal::{
     event::{Event, EventListener},
-    grid::Dimensions,
-    index::{Column, Line},
     sync::FairMutex,
     term::{Config, Term},
-    vte::ansi::{NamedColor, Processor},
+    vte::ansi::Processor,
+};
+pub use alacritty_terminal::{
+    grid::Dimensions,
+    index::{Column, Line},
+    term::{
+        TermMode,
+        cell::{Cell, Flags},
+    },
+    vte::ansi::{Color, CursorShape, NamedColor, Rgb},
 };
 pub use portable_pty::PtySize;
 use portable_pty::{CommandBuilder, MasterPty};
@@ -475,7 +481,11 @@ fn run(
             if let Some(reader) = workers.reader.take() {
                 let _ = reader.join();
             }
-            if !status.success() && stopping.is_none() {
+            if !status.success()
+                && stopping.is_none()
+                && !terminal.hangup_sent.load(Ordering::Acquire)
+                && !env.closing.is_closing()
+            {
                 let text = terminal.emulator.lock().text().join("\n");
                 return Err(ProviderError::Protocol(format!(
                     "{} terminal exited: {}",

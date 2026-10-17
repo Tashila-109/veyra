@@ -1,9 +1,10 @@
 use gpui_kit::component::{Theme as KitTheme, ThemeMode};
 use gpui_kit::{
-    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Point, Rems, SharedString, Size, Window,
-    WindowAppearance, point, px, rems, rgb, rgba, size,
+    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Point, Rems, Rgba, SharedString, Size,
+    Window, WindowAppearance, point, px, rems, rgb, rgba, size,
 };
 use std::{borrow::Cow, time::Duration};
+use veyra_engine::terminal::{Color, NamedColor, Rgb};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appearance {
@@ -569,6 +570,111 @@ mod tests {
                 let ratio = contrast(fg, bg, base);
                 assert!(ratio >= min, "{appearance:?} {name} {ratio:.2} < {min}");
             }
+        }
+    }
+}
+
+impl TerminalPalette {
+    pub(super) fn resolve(&self, value: Color, palette: &[Option<Rgb>]) -> Hsla {
+        let index = match value {
+            Color::Spec(value) => {
+                return rgb(value.r as u32 * 65536 + value.g as u32 * 256 + value.b as u32).into();
+            }
+            Color::Indexed(index) => index as usize,
+            Color::Named(name) => name as usize,
+        };
+        if let Some(Some(value)) = palette.get(index) {
+            return rgb(value.r as u32 * 65536 + value.g as u32 * 256 + value.b as u32).into();
+        }
+        match index {
+            0..16 => self.ansi[index],
+            16..232 => {
+                let n = index - 16;
+                let channel = |v| if v == 0 { 0 } else { (v * 40 + 55) as u32 };
+                rgb(channel(n / 36) * 65536 + channel(n / 6 % 6) * 256 + channel(n % 6)).into()
+            }
+            232..256 => {
+                let channel = (index as u32 - 232) * 10 + 8;
+                rgb(channel * 65793).into()
+            }
+            n if n == NamedColor::Background as usize => self.bg,
+            n if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&n) => {
+                self.ansi[n - NamedColor::DimBlack as usize]
+            }
+            _ => self.fg,
+        }
+    }
+
+    pub(super) fn engine_colors(&self) -> veyra_engine::terminal::Colors {
+        let convert = |color: Hsla| {
+            let color = Rgba::from(color);
+            Rgb {
+                r: (color.r * 255.).round() as u8,
+                g: (color.g * 255.).round() as u8,
+                b: (color.b * 255.).round() as u8,
+            }
+        };
+        veyra_engine::terminal::Colors {
+            foreground: convert(self.fg),
+            background: convert(self.bg),
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::{Appearance, Theme};
+    use veyra_engine::terminal::{Color, NamedColor, Rgb};
+    #[test]
+    fn terminal_theme_answers_and_paints_light_and_dark() {
+        for (appearance, foreground, background) in [
+            (
+                Appearance::Dark,
+                Rgb {
+                    r: 231,
+                    g: 232,
+                    b: 234,
+                },
+                Rgb { r: 6, g: 6, b: 8 },
+            ),
+            (
+                Appearance::Light,
+                Rgb {
+                    r: 47,
+                    g: 47,
+                    b: 49,
+                },
+                Rgb {
+                    r: 251,
+                    g: 252,
+                    b: 254,
+                },
+            ),
+        ] {
+            let theme = Theme::new(appearance);
+            let colors = theme.terminal.engine_colors();
+            assert_eq!(colors.foreground, foreground);
+            assert_eq!(colors.background, background);
+            assert_eq!(
+                theme
+                    .terminal
+                    .resolve(Color::Named(NamedColor::Foreground), &[]),
+                theme.terminal.fg
+            );
+            assert_eq!(
+                theme.terminal.resolve(Color::Indexed(3), &[]),
+                theme.terminal.ansi[3]
+            );
+            assert_eq!(
+                theme
+                    .terminal
+                    .resolve(Color::Spec(Rgb { r: 0, g: 255, b: 0 }), &[]),
+                super::rgb(0x00ff00).into()
+            );
+            assert_eq!(
+                theme.terminal.resolve(Color::Indexed(196), &[]),
+                super::rgb(0xff0000).into()
+            );
         }
     }
 }
