@@ -26,7 +26,18 @@ pub struct SessionSpec {
     pub config: ThreadConfig,
     pub native: Option<NativeSessionId>,
     pub import: bool,
+    pub history: Option<HistoryRequest>,
     pub root: bool,
+}
+#[derive(Clone, Debug, Default)]
+pub struct HistoryRequest {
+    pub cursor: Option<String>,
+    pub sent: std::collections::BTreeSet<String>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct History {
+    pub cursor: Option<String>,
+    pub text: String,
 }
 #[derive(Clone, Debug)]
 pub struct SessionHandle {
@@ -79,6 +90,10 @@ pub enum ProviderEvent {
 }
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
+    History {
+        native: NativeSessionId,
+        history: History,
+    },
     StartTurnRefused {
         turn: TurnId,
     },
@@ -172,6 +187,25 @@ impl TurnEvent {
 #[derive(Clone, Debug)]
 pub struct TerminalHandle {
     pub control: mpsc::UnboundedSender<TerminalControl>,
+    pub terminal: Option<std::sync::Arc<crate::terminal::Terminal>>,
+}
+impl TerminalHandle {
+    pub fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.terminal
+            .as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "terminal has no PTY")
+            })?
+            .write(bytes)
+    }
+    pub fn resize(&self, size: portable_pty::PtySize) -> std::io::Result<()> {
+        self.terminal
+            .as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "terminal has no PTY")
+            })?
+            .resize(size)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalControl {
@@ -179,6 +213,13 @@ pub enum TerminalControl {
 }
 #[derive(Clone, Debug)]
 pub enum TerminalEvent {
+    Prepared {
+        cursor: Option<String>,
+        reply: std::sync::mpsc::SyncSender<bool>,
+    },
+    Ready {
+        pid: u32,
+    },
     Exited,
 }
 #[derive(Debug, thiserror::Error)]
@@ -255,6 +296,13 @@ impl ProviderKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
+        }
+    }
+    pub fn tui_command(self, native: &NativeSessionId, config: &ThreadConfig) -> Vec<String> {
+        match self {
+            Self::Claude => claude::tui_command(native, config.mode),
+            Self::Codex => codex::tui_command(native, config.mode),
+            Self::Grok => grok::tui_command(native, config.mode),
         }
     }
     pub fn install_hint(self) -> &'static str {
@@ -340,9 +388,18 @@ impl Spawner {
             Self::Scripted(script) => Ok(script.spawn(spec, out, epoch)),
         }
     }
-    pub fn terminal(&self) -> Result<TerminalHandle, ProviderError> {
+    pub fn terminal(
+        &self,
+        colors: crate::terminal::Colors,
+        provider: ProviderKind,
+        spec: SessionSpec,
+        out: mpsc::Sender<EngineMsg>,
+        epoch: u32,
+    ) -> Result<TerminalHandle, ProviderError> {
         match self {
-            Self::Cli(_) => Err(ProviderError::NotBuilt),
+            Self::Cli(env) => {
+                crate::terminal::spawn(provider, spec, env.as_ref().clone(), out, epoch, colors)
+            }
             #[cfg(test)]
             Self::Scripted(script) => Ok(script.terminal()),
         }
@@ -628,4 +685,56 @@ fn decoded_batch_always_places_replies_before_interrupts() {
             serde_json::json!({"interrupt":true})
         ]
     );
+}
+
+#[cfg(test)]
+#[test]
+fn tui_command_per_mode() {
+    let native = NativeSessionId("native-m7".into());
+    for (mode, claude_mode) in [
+        (PermissionMode::AskFirst, "default"),
+        (PermissionMode::AcceptEdits, "acceptEdits"),
+        (PermissionMode::FullAccess, "bypassPermissions"),
+    ] {
+        let config = ThreadConfig {
+            model: None,
+            effort: None,
+            mode,
+        };
+        let mut claude = vec!["--resume", "native-m7", "--permission-mode", claude_mode];
+        let mut codex = vec![
+            "resume",
+            "native-m7",
+            "--include-non-interactive",
+            "--no-daemon",
+            "-c",
+            "check_for_update_on_startup=false",
+        ];
+        let mut grok = vec!["--no-auto-update"];
+        match mode {
+            PermissionMode::AskFirst => codex.extend(["-s", "read-only"]),
+            PermissionMode::AcceptEdits => {
+                codex.extend(["-a", "on-request", "-s", "workspace-write"])
+            }
+            PermissionMode::FullAccess => codex.extend(["-a", "never", "-s", "danger-full-access"]),
+        }
+        if mode == PermissionMode::FullAccess {
+            claude.push("--allow-dangerously-skip-permissions");
+            grok.push("--always-approve");
+        } else {
+            grok.extend(["--permission-mode", "default"]);
+        }
+        grok.extend(["--resume", "native-m7"]);
+        for (provider, expected) in [
+            (ProviderKind::Claude, claude),
+            (ProviderKind::Codex, codex),
+            (ProviderKind::Grok, grok),
+        ] {
+            assert_eq!(
+                provider.tui_command(&native, &config),
+                expected,
+                "{provider:?} {mode:?}"
+            );
+        }
+    }
 }

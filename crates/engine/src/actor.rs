@@ -326,6 +326,22 @@ impl Actor {
                     let _ = reply.send(Err(CommandError::Closed));
                     return;
                 }
+                EngineMsg::Terminal {
+                    thread,
+                    epoch,
+                    event: TerminalEvent::Exited,
+                } if self.current(thread, epoch) => {
+                    self.state.terminals.lock().unwrap().remove(&thread);
+                    if self.blocked.is_some() {
+                        let live = self.live.get_mut(&thread).unwrap();
+                        live.live = Live::Parked;
+                        live.background_work = false;
+                    } else {
+                        let c = self.exited(thread, None);
+                        self.commit_event(c);
+                    }
+                    return;
+                }
                 EngineMsg::Provider {
                     thread,
                     epoch,
@@ -449,6 +465,42 @@ impl Actor {
             } => {
                 let c = self.provider(thread, epoch, event);
                 if let Some(c) = c {
+                    self.commit_event(c);
+                }
+            }
+            EngineMsg::Terminal {
+                thread,
+                epoch,
+                event: TerminalEvent::Prepared { cursor, reply },
+            } => {
+                let allowed = self.current(thread, epoch)
+                    && matches!(self.live[&thread].live, Live::Terminal { .. })
+                    && !self.state.closing.is_closing();
+                if allowed {
+                    let mut row = self.projection.threads[&thread].clone();
+                    row.native_cursor = cursor;
+                    row.view = View::Terminal;
+                    let mut c = ChangeSet::default();
+                    c.threads.insert(thread, row);
+                    self.commit_event(c);
+                }
+                let _ = reply.send(allowed && self.blocked.is_none());
+            }
+            EngineMsg::Terminal {
+                thread,
+                epoch,
+                event: TerminalEvent::Ready { pid },
+            } => {
+                if self.current(thread, epoch)
+                    && let Live::Terminal { term, .. } = &self.live[&thread].live
+                {
+                    let mut live = self.live[&thread].clone();
+                    live.live = Live::Terminal {
+                        term: term.clone(),
+                        pid,
+                    };
+                    let mut c = ChangeSet::default();
+                    c.live.insert(thread, live);
                     self.commit_event(c);
                 }
             }
@@ -826,7 +878,8 @@ impl Actor {
                         cwd: row.cwd.clone(),
                         config: row.config.clone(),
                         native: row.native.clone(),
-                        import,
+                        import: import || row.import_pending,
+                        history: Some(self.history_request(thread)),
                         root: matches!(row.lineage, Lineage::Root),
                     };
                     let epoch = self.live[&thread].epoch;
@@ -860,28 +913,53 @@ impl Actor {
                             .send(SessionControl::StartTurn { turn, text });
                     }
                 }
-                Effect::OpenTerminal { thread } => match self.spawner.terminal() {
-                    Ok(term) => {
-                        self.live.get_mut(&thread).unwrap().live = Live::Terminal { term, pid: 1 };
-                        let event =
-                            ChangeSet::default().status_event(&self.projection, &self.live, thread);
-                        let counter = self.next_counter(thread);
-                        self.publish(UiEvent::Change {
-                            counter: Some(counter),
-                            event,
-                        });
-                    }
-                    Err(error) => {
-                        let epoch = self.live[&thread].epoch;
-                        self.post(EngineMsg::Provider {
+                Effect::OpenTerminal { thread } => {
+                    let row = &self.projection.threads[&thread];
+                    let spec = SessionSpec {
+                        thread,
+                        cwd: row.cwd.clone(),
+                        config: row.config.clone(),
+                        native: row.native.clone(),
+                        history: Some(self.history_request(thread)),
+                        import: false,
+                        root: false,
+                    };
+                    let epoch = self.live[&thread].epoch;
+                    match self.spawner.terminal(
+                        Default::default(),
+                        row.provider,
+                        spec,
+                        self.out.clone(),
+                        epoch,
+                    ) {
+                        Ok(term) => {
+                            self.state
+                                .terminals
+                                .lock()
+                                .unwrap()
+                                .insert(thread, term.clone());
+                            self.live.get_mut(&thread).unwrap().live =
+                                Live::Terminal { term, pid: 0 };
+                            let event = ChangeSet::default().status_event(
+                                &self.projection,
+                                &self.live,
+                                thread,
+                            );
+                            let counter = self.next_counter(thread);
+                            self.publish(UiEvent::Change {
+                                counter: Some(counter),
+                                event,
+                            });
+                        }
+                        Err(error) => self.post(EngineMsg::Provider {
                             thread,
                             epoch,
                             event: ProviderEvent::Session(SessionEvent::Exited {
                                 crash: Some(error.to_string()),
                             }),
-                        });
+                        }),
                     }
-                },
+                }
                 Effect::Control { .. } | Effect::StopTerminal { .. } => {}
             }
         }
@@ -955,6 +1033,38 @@ impl Actor {
                 c.turns.insert(turn.id, turn);
                 return Some(c);
             }
+            ProviderEvent::Session(SessionEvent::History { native, history }) => {
+                let mut row = self.projection.threads[&thread].clone();
+                if row.native.as_ref() != Some(&native) || !row.import_pending {
+                    return None;
+                }
+                if !history.text.is_empty() {
+                    let turn =
+                        commands::queue(&self.projection, &mut c, thread, TurnOrigin::Provider);
+                    commands::add_item(
+                        &self.projection,
+                        &mut c,
+                        Item {
+                            id: ItemId::new(),
+                            thread,
+                            turn,
+                            seq: 0,
+                            body: ItemBody::TerminalSpan(TerminalSpan { text: history.text }),
+                        },
+                    );
+                    let turn = c.turns[&turn].clone();
+                    commands::end_turn(
+                        &self.projection,
+                        &mut c,
+                        turn,
+                        TurnOutcome::Completed,
+                        now(),
+                    );
+                }
+                row.native_cursor = history.cursor;
+                row.import_pending = false;
+                c.threads.insert(thread, row);
+            }
             ProviderEvent::Session(SessionEvent::Ready {
                 native,
                 cli_version,
@@ -962,6 +1072,10 @@ impl Actor {
                 pgid,
                 capabilities,
             }) => {
+                if self.projection.threads[&thread].import_pending {
+                    commands::control(&mut c, thread, SessionControl::Shutdown);
+                    return Some(c);
+                }
                 let session = match self.live[&thread].live.session() {
                     Some(session) => session.clone(),
                     None => {
@@ -988,7 +1102,6 @@ impl Actor {
                     t.cli_version = Some(cli_version);
                 }
                 let cli_version = t.cli_version.clone();
-                t.import_pending = false;
                 if t != self.projection.threads[&thread] {
                     c.threads.insert(thread, t);
                 }
@@ -997,6 +1110,12 @@ impl Actor {
                     native,
                     cli_version,
                 });
+                if self.projection.threads[&thread].view == View::Terminal {
+                    commands::control(&mut c, thread, SessionControl::Shutdown);
+                    c.live.get_mut(&thread).unwrap().live = Live::Stopping {
+                        then: AfterStop::StartTerminal,
+                    };
+                }
             }
             ProviderEvent::Session(SessionEvent::Notice { text }) => {
                 if let Some(turn) = notice_turn(&self.projection, &c, thread, "session") {
@@ -1317,14 +1436,32 @@ impl Actor {
             }
         }
     }
+    fn history_request(&self, thread: ThreadId) -> HistoryRequest {
+        HistoryRequest {
+            cursor: self.projection.threads[&thread].native_cursor.clone(),
+            sent: self
+                .projection
+                .turns_for(thread)
+                .filter(|turn| !matches!(turn.origin, TurnOrigin::Provider))
+                .map(|turn| turn.id.to_string())
+                .collect(),
+        }
+    }
     fn exited(&self, thread: ThreadId, crash: Option<String>) -> ChangeSet {
         if let Spawner::Cli(env) = &self.spawner
             && let Some(server) = &env.mcp
         {
             server.revoke(thread, self.live[&thread].epoch);
         }
+        self.state.terminals.lock().unwrap().remove(&thread);
         let mut c = ChangeSet::default();
         let old = &self.live[&thread];
+        if matches!(old.live, Live::Terminal { .. }) {
+            let mut row = self.projection.threads[&thread].clone();
+            row.view = View::Chat;
+            row.import_pending = true;
+            c.threads.insert(thread, row);
+        }
         let active: Vec<_> = self
             .projection
             .turns_for(thread)

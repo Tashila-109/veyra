@@ -286,6 +286,7 @@ async fn grok_no_first_frame_fails_at_60s() {
                 cwd: scratch.0.canonicalize().unwrap(),
                 config: config(),
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -536,6 +537,7 @@ fn grok_signed_out_never_authenticates() {
                     cwd: scratch.0.canonicalize().unwrap(),
                     config: config(),
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },
@@ -1266,4 +1268,74 @@ fn grok_provider_permission_without_prompt_is_persisted_and_answered() {
             });
         },
     );
+}
+
+#[test]
+fn grok_load_replay_import() {
+    let (_scratch, env) = harness::environment(ProviderKind::Grok, "load-replay-import");
+    Runtime::new().unwrap().block_on(async {
+        let (out, mut events) = mpsc::channel(256);
+        let handle = Spawner::Cli(Box::new(env))
+            .spawn(
+                ProviderKind::Grok,
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: _scratch.0.clone(),
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode: PermissionMode::FullAccess,
+                    },
+                    native: Some(NativeSessionId("native-import".into())),
+                    import: true,
+                    root: false,
+                    history: Some(HistoryRequest {
+                        cursor: Some("0".into()),
+                        sent: ["sent".into()].into(),
+                    }),
+                },
+                out,
+                1,
+            )
+            .unwrap();
+        let mut history = None;
+        let mut ready = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
+                match event {
+                    ProviderEvent::Session(SessionEvent::History {
+                        native,
+                        history: value,
+                    }) => {
+                        assert!(!ready);
+                        assert!(history.is_none());
+                        assert_eq!(native.0, "native-import");
+                        history = Some(value);
+                    }
+                    ProviderEvent::Session(SessionEvent::Ready { .. }) => {
+                        assert!(history.is_some(), "Ready preceded the import");
+                        ready = true;
+                        handle.control.send(SessionControl::Shutdown).unwrap();
+                    }
+                    ProviderEvent::Session(SessionEvent::Exited { crash }) => {
+                        assert_eq!(crash, None);
+                        return;
+                    }
+                    ProviderEvent::Turn { .. } => panic!("replay escaped as a new running turn"),
+                    _ => {}
+                }
+            }
+            panic!("import session ended without Exited");
+        })
+        .await
+        .unwrap();
+        assert!(ready);
+        assert_eq!(
+            history.unwrap(),
+            History {
+                cursor: Some("2".into()),
+                text: "second\nreply second".into()
+            }
+        );
+    });
 }

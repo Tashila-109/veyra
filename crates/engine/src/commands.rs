@@ -536,7 +536,15 @@ fn switch_view(
     if l[&thread].background_work {
         return Err(CommandError::Busy(WaitReason::BackgroundWork));
     }
+    if c.view(p, l, thread).unwrap().pending_request {
+        return Err(CommandError::Invalid(
+            "Answer the pending request before switching views".into(),
+        ));
+    }
     match &l[&thread].live {
+        Live::Parked if to == View::Terminal && t.import_pending => {
+            spawn(l, c, thread, true);
+        }
         Live::Parked if to == View::Terminal => {
             let mut live = l[&thread].clone();
             live.epoch += 1;

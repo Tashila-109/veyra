@@ -1,0 +1,2 @@
+{"type":"transcript_start","provider":"tui","protocol":"pty","cli_version":"veyra-fake","scenario":"engine terminal output","source":"Veyra authored"}
+{"type":"emit_raw","base64":"ZW5naW5lIHRlcm1pbmFsIGVjaG8NCg==","repeat":1}

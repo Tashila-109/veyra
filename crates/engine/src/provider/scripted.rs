@@ -90,6 +90,9 @@ impl Scripted {
                 records.lock().unwrap().push(c);
             }
         });
-        TerminalHandle { control }
+        TerminalHandle {
+            control,
+            terminal: None,
+        }
     }
 }

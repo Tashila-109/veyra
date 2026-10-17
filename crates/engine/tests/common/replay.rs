@@ -120,6 +120,7 @@ pub fn replay(
                             .into(),
                         )
                     }),
+                    history: Default::default(),
                     import: false,
                     root,
                 },

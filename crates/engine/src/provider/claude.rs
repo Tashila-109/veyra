@@ -1273,6 +1273,124 @@ impl Codec {
     }
 }
 
+pub fn session_file_import(
+    root: &std::path::Path,
+    native: &NativeSessionId,
+    request: &super::HistoryRequest,
+) -> Result<super::History, super::ProviderError> {
+    use std::io::BufRead;
+    if std::path::Path::new(&native.0).file_name() != Some(std::ffi::OsStr::new(&native.0)) {
+        return Err(super::ProviderError::Protocol(
+            "Invalid Claude history id".into(),
+        ));
+    }
+    let folders = match std::fs::read_dir(root.join("projects")) {
+        Ok(folders) => folders,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && request.cursor.is_none() => {
+            return Ok(Default::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut file = None;
+    for folder in folders {
+        let folder = folder?;
+        if !folder.file_type()?.is_dir() {
+            continue;
+        }
+        let path = folder.path().join(format!("{}.jsonl", native.0));
+        if path.is_file() {
+            if file.is_some() {
+                return Err(super::ProviderError::Protocol(
+                    "Claude history id matches more than one file".into(),
+                ));
+            }
+            file = Some(std::fs::File::open(path)?);
+        }
+    }
+    let Some(file) = file else {
+        if request.cursor.is_some() {
+            return Err(super::ProviderError::Protocol(
+                "Claude history cursor file is missing".into(),
+            ));
+        }
+        return Ok(Default::default());
+    };
+    let mut history = super::History::default();
+    let mut after = request.cursor.is_none();
+    let mut own = false;
+    let mut text = Vec::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let value: Value = serde_json::from_str(&line?)?;
+        if value["sessionId"].as_str() != Some(&native.0) || value["isSidechain"] != false {
+            continue;
+        }
+        if value.get("parentUuid").is_none() {
+            continue;
+        }
+        let Some(uuid) = value["uuid"].as_str() else {
+            continue;
+        };
+        history.cursor = Some(uuid.into());
+        if value["type"] == "user" {
+            own = request.sent.contains(uuid)
+                || value["entrypoint"] == "sdk-cli"
+                || value["turnOrigin"] == "sdk";
+        }
+        if !after {
+            if request.cursor.as_deref() == Some(uuid) {
+                after = true;
+            }
+            continue;
+        }
+        if own {
+            continue;
+        }
+        let content = &value["message"]["content"];
+        if value["type"] == "user"
+            && let Some(value) = content.as_str().filter(|text| !text.is_empty())
+        {
+            text.push(value.to_owned());
+        }
+        if value["type"] == "user" || value["type"] == "assistant" {
+            for block in content.as_array().into_iter().flatten() {
+                if block["type"] == "text"
+                    && let Some(value) = block["text"].as_str().filter(|text| !text.is_empty())
+                {
+                    text.push(value.to_owned());
+                }
+            }
+        }
+    }
+    if !after {
+        return Err(super::ProviderError::Protocol(
+            "Claude history cursor was not found".into(),
+        ));
+    }
+    history.text = text.join("\n");
+    Ok(history)
+}
+
+pub fn tui_command(
+    native: &crate::domain::NativeSessionId,
+    mode: crate::domain::PermissionMode,
+) -> Vec<String> {
+    let mut args = vec![
+        "--resume".into(),
+        native.0.clone(),
+        "--permission-mode".into(),
+        match mode {
+            crate::domain::PermissionMode::AskFirst => "default",
+            crate::domain::PermissionMode::AcceptEdits => "acceptEdits",
+            crate::domain::PermissionMode::FullAccess => "bypassPermissions",
+        }
+        .into(),
+    ];
+    if mode == crate::domain::PermissionMode::FullAccess {
+        args.push("--allow-dangerously-skip-permissions".into());
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2084,6 +2202,7 @@ mod tests {
                 mode: PermissionMode::AskFirst,
             },
             native: None,
+            history: Default::default(),
             import: false,
             root: false,
         };

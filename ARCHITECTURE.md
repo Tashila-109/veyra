@@ -17,7 +17,7 @@ Codec cancellation on provider completion, and cancellation on storage-blocked o
 Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
 The window owns render and event-batch counters.
 Inactive-window family changes post system banners, and busy Quit opens a sheet.
-There is no PTY.
+The engine can run a provider TUI in a PTY with a shared alacritty emulator; the window has no terminal renderer yet.
 Engine startup binds the MCP socket server, and root Claude, Codex and Grok sessions receive its five actor-owned tools through the relay.
 
 ### System architecture
@@ -51,6 +51,7 @@ debug ctl -> private Unix socket -> socket thread -> gpui window actions
 ```text
 veyra -> veyra-engine -> rusqlite (bundled) + tokio
                      -> serde + serde_json + uuid + thiserror + tracing + regex + base64 + sha2
+                     -> portable-pty + alacritty_terminal
                      -> platform -> libc + Rust standard library
 veyra -> gpui-kit + gpui-pre
       -> tokio + serde + serde_json + tracing + tracing-subscriber + anyhow
@@ -160,7 +161,7 @@ An unreadable or malformed receipt is renamed aside privately when possible, log
 The notice identifies what may have been lost and asks the user to inspect the provider conversation before sending more work.
 Receipt creation failures are logged; unavailable storage can prevent the next-launch notice from being saved.
 Database work and queued messages can delay handling that deadline; shutdown_wait bounds its own wait with a three-second runtime timeout.
-`Engine::on_app_quit` closes the engine before sending SIGTERM to every registered provider/probe group, then waits 100 ms on the runtime.
+`Engine::on_app_quit` closes the engine before sending SIGHUP to registered PTY groups and SIGTERM to other registered provider/probe groups, then waits 100 ms on the runtime.
 The application registers on_app_quit with gpui and runs begin_quitting before awaiting native termination cleanup.
 macOS termination does not promise Rust destructors, so verification explicitly cleans run-owned provider groups.
 
@@ -346,7 +347,7 @@ The actor routes that change through `prepare_commit`, completing interrupted te
 It interrupts stored running turns, expires requests and holds affected queues as Restarted without replacing an earlier hold.
 It replaces an already-started unaccepted wake, preserves an unstarted wake, and leaves running child tasks open.
 Terminal view returns to Chat with import_pending.
-InTerminal and Terminal view are reachable only through engine tests until a PTY exists.
+The engine terminal handle and switch are exercised without a window by fake CLI tests.
 After startup reaping handles stored process pairs, reconciliation writes every thread Parked and clears both live_pid and live_pgid.
 No provider work restarts automatically and Veyra writes no user CLI configuration.
 
@@ -355,7 +356,7 @@ No provider work restarts automatically and Veyra writes no user CLI configurati
 `provider/mod.rs` exposes typed controls and normalized events to the actor, not Claude wire types.
 The actor dispatches through `Spawner::spawn`.
 Its `Cli` variant sends Claude, Codex and Grok adapters to `session::spawn_provider` with the Engine's shared `ChildEnv`.
-`Spawner::terminal` returns NotBuilt.
+`Spawner::terminal` starts the PTY worker with the provider, native conversation, thread cwd, configuration and current epoch.
 Scripted sessions exist only in engine tests and start no OS process.
 
 `ChildEnv` shares one login-shell PATH snapshot, with inherited PATH as fallback.
@@ -366,7 +367,7 @@ Relative and empty search entries are ignored.
 Known home-relative folders include .grok/bin, so a Finder launch can resolve Grok without that directory in either PATH.
 Explicit isolated environments never fall through to home-relative install folders.
 Executable checks and process-group mechanics are platform functions.
-Every provider and probe child has piped stdio, `kill_on_drop(true)`, its own process group and `VEYRA_PARENT_PID` naming the application.
+Every structured provider and probe child has piped stdio, `kill_on_drop(true)`, its own process group and `VEYRA_PARENT_PID` naming the application.
 It strips CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SSE_PORT, CLAUDE_AGENT_SDK_VERSION and every inherited VEYRA_* variable before adding its own marker and optional replay fixture.
 Veyra inherits the user's hooks/MCP configuration and never edits it.
 The new-thread hint names that behavior.
@@ -451,6 +452,57 @@ Unknown or finished child parents are ignored, and snapshots retain a running to
 Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
+
+## Engine terminal ownership
+
+`terminal.rs` owns the portable-pty child, master, writer, reader and alacritty emulator.
+The PTY worker resolves the provider and prepares the PTY and command before entering the shared launch gate.
+The gate covers the final closing check, spawn in the thread's cwd and process-group registration.
+The terminal launch carries no Veyra tool-server arguments or credentials.
+The worker reports its actual pid through an epoch-tagged TerminalEvent::Ready; store::apply persists that pid as both leader and group.
+A TerminalHandle exposes write and resize directly through its shared Terminal, and Engine::terminal returns that handle without sending an actor message.
+Input returns NotConnected before the PTY is ready or after it exits.
+The separate blocking reader parses at most 64 KiB while holding an alacritty FairMutex and releases the lock between reads.
+Emulator callbacks collect in an Arc-shared Mutex list, so the emulator and terminal can move between threads.
+A consumer can reserve FairMutex::lease and snapshot the grid with lock_unfair while the reader waits.
+Every alacritty PtyWrite reply, including DSR, DA and DECRQM, goes to the PTY writer after parsing, without entering the actor mailbox.
+ColorRequest callbacks answer OSC foreground, background and palette queries from terminal::Colors supplied to Spawner::terminal, with engine defaults at the actor call site and standard indexed colors unless the terminal changed them.
+Kitty keyboard mode stays disabled.
+The worker flushes an expired synchronized-update block on its polling interval even while the reader is blocked without new bytes.
+The reader marks the grid dirty, and the worker coalesces watch-channel wakes on its 16 ms polling interval.
+Debug-only flood stamps record monotonic time and consumed bytes at FLOOD_START and FLOOD_DONE title terminators, including when both occur within one read.
+The flood fixture uses emit_raw's repeat count to generate exactly 50,000,020 payload bytes rather than storing every line.
+The fake TUI uses the calling process's own terminal input in raw mode and emits one hex byte per line.
+Claude fake TUI launch requires an explicit CLAUDE_CONFIG_DIR.
+The terminal environment sets TERM=xterm-256color and COLORTERM=truecolor.
+It strips TERM_PROGRAM, TERM_PROGRAM_VERSION, TERM_SESSION_ID, NO_COLOR, FORCE_COLOR, CLICOLOR_FORCE and COLORFGBG, and names prefixed by ITERM_, GHOSTTY_, KITTY_, WEZTERM_, ALACRITTY_ or VTE_.
+It also applies the structured child nesting-variable and VEYRA_ filtering and adds only Veyra's parent marker and an optional debug fixture.
+From Parked, SwitchView increments the epoch and opens the terminal worker, unless a pending import first requires a structured spawn.
+An idle structured session enters Stopping with StartTerminal, closes stdin, and gets up to two seconds to exit before its existing group cleanup ladder.
+Running or pending-admission turns, pending requests and background work refuse the switch.
+Switching back enters Stopping with StartStructured and import=true, sends SIGHUP, and kills a terminal group that survives three seconds.
+Shutdown uses the same three-second terminal grace and processes TerminalEvent::Exited as soon as it arrives.
+The native on_app_quit path identifies PTY groups from the handles' atomic pid and sends them SIGHUP, while keeping SIGTERM for structured groups.
+An atomic flag prevents the native quit pass and PTY worker from sending duplicate SIGHUP signals.
+The child guard signals its owned group with SIGKILL and reaps its leader, the worker joins its reader, then Exited permits the next writer.
+Stop changes terminal view to Chat with import_pending and parks after exit; a terminal's spontaneous exit also preserves that pending import.
+A quit or crash with Terminal stored is reconciled to Chat with import_pending before another structured spawn.
+Before the TUI starts, the worker captures the native store's latest cursor and waits for the actor to commit it with view=Terminal.
+Claude capture reads its session file off the actor; Codex and Grok capture open a short-lived structured session without Veyra tool-server access, request history and wait for that process to exit before the PTY launch.
+Codex and Grok capture check cancellation and a fifteen-second deadline, send Shutdown when either occurs, and wait for the session supervisor's reaped Exited before returning.
+Claude capture finishes its blocking file read before checking the terminal control channel.
+SessionSpec carries a HistoryRequest with the stored cursor and Veyra-sent turn ids.
+On the switch back or the next spawn after recovery, Claude reads projects/*/NATIVE.jsonl under ChildEnv's CLAUDE_CONFIG_DIR or its production home/.claude.
+Only main-chain user string/text content and assistant text blocks after the cursor are imported; SDK turns and other entry types are skipped, while the cursor follows the last main-chain uuid.
+Codex pages thread/turns/list newest first until the cursor turn, imports newer user messages and final agent messages oldest first, then resumes the thread.
+Grok opens with session/load for an import, collects replay frames before its reply, and uses the highest replay user promptIndex as the cursor.
+It groups later user and agent text through turn_completed, skips thoughts and Veyra prompt ids, and leaves plain respawns on session/resume when the provider supports it.
+An incomplete later replay turn fails the import without committing its cursor or clearing import_pending.
+SessionEvent::History reaches the actor before Ready; one transaction adds an ended Provider turn with one TerminalSpan when text exists, advances native_cursor and clears import_pending.
+An empty import advances only the cursor when needed, and Ready refuses to start queued work while import_pending remains set.
+The fake Claude TUI appends a uuid-linked user, environment attachment and assistant reply under its required isolated config directory.
+Codex's TUI command disables the daemon and startup update check, uses read-only sandboxing in Ask first, on-request/workspace-write in Accept edits and never/danger-full-access in Full access.
+Grok explicitly selects default permission mode outside Full access and always-approve in Full access.
 
 ## JSON-RPC peer and Codex codec
 
@@ -596,7 +648,7 @@ Authentication precedes opening the session when a usable method is advertised, 
 Authentication failures name Sign in with `grok login`; Veyra never launches that command.
 A fresh conversation uses session/new with cwd and mcpServers.
 A resumed conversation uses session/resume when agentCapabilities.sessionCapabilities.resume is advertised, otherwise session/load.
-An import request selects session/load, but the terminal-history importer is not implemented.
+An import request selects session/load and collects the replay before its reply, as described in Engine terminal ownership.
 Replay-marked notifications and notifications for another session are filtered before tagged-prompt acceptance, so they cannot confirm admission.
 Only a recognized session-not-found error falls back to session/new with a notice; other errors preserve the stored native id.
 
@@ -775,7 +827,8 @@ A kept child settles into its archived root's queued wake, which never starts: t
 
 ## Platform and keep-awake
 
-The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals, process inspection, idle-sleep assertions and Terminal opening.
+The platform module owns macOS file modes, locks, sockets, login-shell PATH, executable checks, group setup/signals, process inspection, idle-sleep assertions, Terminal opening and the fake TUI's raw-input setup.
+Only the fake CLI TUI and its platform regression call raw_terminal_input; the application runtime leaves raw-mode setup to each real TUI.
 Each agent and probe spawn attempts to set group nice 10 and logs failure while continuing.
 The actor attempts to hold one caffeinate guard while any thread is Starting, has a busy turn or has non-ambient background work.
 An assertion-helper spawn failure is logged without stopping work.
@@ -1078,6 +1131,7 @@ DebugStallUi blocks the window thread for its supplied milliseconds so the pump 
 - [Entry and runtime](crates/veyra/src/main.rs), [engine handle](crates/engine/src/lib.rs), [data folder](crates/engine/src/data_dir.rs).
 - [Actor](crates/engine/src/actor.rs), [decisions](crates/engine/src/commands.rs), [domain/indexes](crates/engine/src/domain.rs), [live variants](crates/engine/src/live.rs).
 - [Relay](crates/veyra/src/relay.rs), [MCP socket and config](crates/engine/src/mcp.rs), [tool decisions and guidance](crates/engine/src/tools.rs).
+- [PTY and emulator](crates/engine/src/terminal.rs).
 - [Storage/schema](crates/engine/src/store.rs), [recovery](crates/engine/src/reconcile.rs), [events/snapshots](crates/engine/src/events.rs).
 - [Provider boundary](crates/engine/src/provider/mod.rs), [environment](crates/engine/src/provider/env.rs), [sessions/probes](crates/engine/src/provider/session.rs), [Claude codec](crates/engine/src/provider/claude.rs), [JSON-RPC peer](crates/engine/src/provider/jsonrpc.rs), [bounded lines](crates/engine/src/provider/lines.rs), [Codex wire types](crates/engine/src/provider/codex/wire.rs), [Codex codec](crates/engine/src/provider/codex.rs), [Grok codec](crates/engine/src/provider/grok.rs).
 - [Fixture format](crates/engine/src/fixture.rs), [fake CLI](crates/engine/src/bin/veyra-fake-cli.rs), [recording/redaction](crates/engine/src/record.rs).
@@ -1095,7 +1149,8 @@ mcp.rs launch_lock_tests blocks a launch closure and exercises revocation concur
 mcp_socket also exercises production root session config lifetime, non-connected init cleanup, pre-init exit cleanup, child argv isolation and token redaction.
 
 Real-relay socket and Codex and Grok family tests live in the application package, which receives CARGO_BIN_EXE_veyra and a fixture binary target from Cargo.
-Both fixture binary entrypoints call the same engine fixture::cli implementation; engine-only fake-session tests resolve their helper beside the current test profile instead of a fixed target/debug path.
+Both fixture binary entrypoints call the engine fixture::run dispatcher, which routes TUI launches to run_tui and structured launches to cli::run.
+Engine-only fake-session tests resolve their helper beside the current test profile instead of a fixed target/debug path.
 No stale-binary timestamp guard or preparatory workspace build is required; the empty-target workspace test covers that ownership boundary.
 
 Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
@@ -1211,7 +1266,7 @@ The foreign-tool replay preserves Bash and its input across promotion, fills par
 Malformed-notification replays keep the session alive through missing or numeric update kinds, a null tool title, a numeric prompt id and null metadata; codec tests check method-only diagnostics and prevent wrong-session or replay notifications from confirming admission.
 grok_root_reaches_real_relay runs in the ordinary application suite with the production veyra mcp executable and fake CLI without opening a window.
 A default credential-frame test asserts the Grok mcpServers entry, preserves unrelated config and requires only the token marker in its recording value.
-Grok fixtures name version 1.0.60 and use Veyra's masked live shapes for initialize, flat questions, task snapshots, Grok-started turn completion and resume.
+The older recording-derived Grok fixtures name version 1.0.60 and use Veyra's masked live shapes for initialize, flat questions, task snapshots, Grok-started turn completion and resume.
 Replay tests do not prove installed Grok behavior; the retained live recording supplies those observed wire shapes.
 The live recording did not send permission requests.
 Decision 11 chose Follow my settings; the installed 1.0.60 live recheck observed Grok resolving the redirect write itself without sending a permission request.

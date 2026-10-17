@@ -524,6 +524,42 @@ fn start_provider_task(
         {
             receiver.close_before_user_write = env.close_before_user_write.clone();
         }
+        if provider == ProviderKind::Claude
+            && spec.import
+            && let (Some(native), Some(request)) = (&spec.native, &spec.history)
+        {
+            let request = request.clone();
+            let native = native.clone();
+            let import_native = native.clone();
+            let root = env.claude_config_dir();
+            let history = tokio::task::spawn_blocking(move || {
+                claude::session_file_import(&root?, &import_native, &request)
+            })
+            .await;
+            let history = match history {
+                Ok(Ok(history)) => history,
+                Ok(Err(error)) => return emit(&out, thread, epoch, launch_failed(error)).await,
+                Err(error) => {
+                    return emit(
+                        &out,
+                        thread,
+                        epoch,
+                        launch_failed(ProviderError::Protocol(error.to_string())),
+                    )
+                    .await;
+                }
+            };
+            if !emit(
+                &out,
+                thread,
+                epoch,
+                ProviderEvent::Session(SessionEvent::History { native, history }),
+            )
+            .await
+            {
+                return false;
+            }
+        }
         let mut process = match process {
             Some(process) => process,
             None => {
@@ -803,9 +839,17 @@ async fn run_one(
                             break;
                         }
                     }
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
                     drop(writer);
                     if tokio::time::timeout(Duration::from_secs(1), &mut write_task).await.is_ok() {
                         writer_done = true;
+                    }
+                    if !control.closing.is_closing() {
+                        while tokio::time::Instant::now() < deadline {
+                            if process.child.child.as_mut().is_none_or(|child| child.try_wait().ok().flatten().is_some()) { break; }
+                            if control.closing.is_closing() { break; }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
                     }
                     break;
                 }
@@ -1846,6 +1890,7 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -2115,6 +2160,7 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -2296,6 +2342,7 @@ mod tests {
                             mode: PermissionMode::AskFirst,
                         },
                         native: Some(NativeSessionId("missing-native".into())),
+                        history: Default::default(),
                         import: false,
                         root: false,
                     },
@@ -2397,6 +2444,7 @@ mod tests {
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },
@@ -2494,6 +2542,7 @@ done
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },
@@ -2625,6 +2674,7 @@ done
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },
@@ -2746,6 +2796,7 @@ mod mcp_record_tests {
                     effort: None,
                 },
                 native: Some(NativeSessionId("lost-native".into())),
+                history: Default::default(),
                 import: false,
                 root: true,
             },
@@ -2889,6 +2940,7 @@ mod recorder_tests {
                         effort: None,
                     },
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },
@@ -2981,6 +3033,7 @@ mod availability_tests {
                         effort: None,
                     },
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },

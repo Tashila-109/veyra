@@ -15,6 +15,7 @@ pub mod provider;
 pub mod reconcile;
 pub mod record;
 pub mod store;
+pub mod terminal;
 #[cfg(test)]
 mod tests;
 pub mod text;
@@ -59,6 +60,7 @@ struct EngineInner {
 #[derive(Default)]
 pub(crate) struct RuntimeState {
     pub awake: AtomicBool,
+    pub terminals: Mutex<std::collections::BTreeMap<ThreadId, provider::TerminalHandle>>,
     pub catalog: Arc<Mutex<std::collections::BTreeMap<provider::ProviderKind, provider::Probe>>>,
     pub closing: Arc<LaunchGate>,
     pub window_threads: Mutex<std::collections::BTreeMap<ThreadId, WindowThread>>,
@@ -281,8 +283,23 @@ impl Engine {
     }
     pub async fn on_app_quit(&self) {
         self.shutdown();
+        let terminals: std::collections::BTreeMap<_, _> = self
+            .inner
+            .state
+            .terminals
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|handle| handle.terminal.as_ref())
+            .map(|terminal| (terminal.pid(), terminal.clone()))
+            .filter(|(pid, _)| *pid != 0)
+            .collect();
         for &group in self.inner.groups.lock().unwrap().iter() {
-            let _ = platform::signal_group(group, platform::Signal::Terminate);
+            if let Some(terminal) = terminals.get(&group) {
+                terminal.hangup();
+            } else {
+                let _ = platform::signal_group(group, platform::Signal::Terminate);
+            }
         }
         let _ = self
             .inner
@@ -298,6 +315,15 @@ impl Engine {
         env.groups = self.inner.groups.clone();
         env.catalog = self.inner.state.catalog.clone();
         env
+    }
+    pub fn terminal(&self, thread: ThreadId) -> Option<provider::TerminalHandle> {
+        self.inner
+            .state
+            .terminals
+            .lock()
+            .unwrap()
+            .get(&thread)
+            .cloned()
     }
     pub fn window_threads(&self) -> std::collections::BTreeMap<ThreadId, WindowThread> {
         self.inner.state.window_threads.lock().unwrap().clone()

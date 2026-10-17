@@ -77,6 +77,7 @@ fn replay(name: &str, resume: bool) -> Vec<ProviderEvent> {
                     mode: PermissionMode::AskFirst,
                 },
                 native: resume.then(|| NativeSessionId("missing-native".into())),
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -608,6 +609,7 @@ fn controlled_replay_with(
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -990,6 +992,7 @@ fn shutdown_during_spawn_never_ready() {
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },
@@ -1051,6 +1054,7 @@ fn request_replay(
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -1222,6 +1226,7 @@ for line in sys.stdin:
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -1405,6 +1410,7 @@ for line in sys.stdin:
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -1574,6 +1580,7 @@ for line in sys.stdin:
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -1755,7 +1762,7 @@ while read_line(5) is not None: pass
         let handle = session::spawn(SessionSpec {
             thread: ThreadId::new(), cwd: scratch.0.clone(),
             config: ThreadConfig { model: None, effort: None, mode: PermissionMode::AskFirst },
-            native: None, import: false,
+            native: None, history: Default::default(), import: false,
                     root: false,
         }, env, out, 1).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(15), async {
@@ -1823,4 +1830,156 @@ fn blocked_writer_stop_cannot_reach_later_provider_turn() {
 #[test]
 fn blocked_writer_without_stop_leaves_provider_turn_completed() {
     blocked_interrupt_probe(false);
+}
+
+#[test]
+fn claude_session_file_import() {
+    use veyra_engine::provider::{History, HistoryRequest, claude::session_file_import};
+    let root = std::path::Path::new("/tmp").join(format!("veyra-m7s1-import-{}", ThreadId::new()));
+    std::fs::create_dir_all(root.join("projects/isolated-project")).unwrap();
+    let scratch = Scratch(root);
+    std::fs::copy(
+        fixture("session-file-import"),
+        scratch
+            .0
+            .join("projects/isolated-project/native-import.jsonl"),
+    )
+    .unwrap();
+    let request = HistoryRequest {
+        cursor: Some("anchor".into()),
+        sent: ["sent".into()].into(),
+    };
+    let imported = session_file_import(
+        &scratch.0,
+        &NativeSessionId("native-import".into()),
+        &request,
+    )
+    .unwrap();
+    assert_eq!(
+        imported,
+        History {
+            cursor: Some("end".into()),
+            text: "second\nreply second".into()
+        }
+    );
+    let repeat = session_file_import(
+        &scratch.0,
+        &NativeSessionId("native-import".into()),
+        &HistoryRequest {
+            cursor: imported.cursor,
+            ..request
+        },
+    )
+    .unwrap();
+    assert_eq!(repeat.text, "");
+    assert_eq!(repeat.cursor.as_deref(), Some("end"));
+}
+
+#[test]
+fn claude_import_precedes_ready() {
+    let root = Path::new("/tmp").join(format!("veyra-m7s1-claude-open-{}", ThreadId::new()));
+    fs::create_dir_all(root.join("config/projects/isolated")).unwrap();
+    let scratch = Scratch(root);
+    fs::copy(
+        fixture("session-file-import"),
+        scratch
+            .0
+            .join("config/projects/isolated/native-import.jsonl"),
+    )
+    .unwrap();
+    let records = [
+        serde_json::json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
+        serde_json::json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}),
+        serde_json::json!({"type":"spin","ms":200}),
+        serde_json::json!({"type":"exit","code":0}),
+    ];
+    fs::write(
+        scratch.0.join("t1-s1.jsonl"),
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let mut env = ChildEnv::isolated()
+        .with_binary(
+            ProviderKind::Claude,
+            env!("CARGO_BIN_EXE_veyra-fake-cli").into(),
+        )
+        .with_variable("CLAUDE_CONFIG_DIR", scratch.0.join("config"));
+    env.fixtures = Some(scratch.0.clone());
+    Runtime::new().unwrap().block_on(async {
+        let (out, mut events) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::FullAccess,
+                },
+                native: Some(NativeSessionId("native-import".into())),
+                import: true,
+                history: Some(HistoryRequest {
+                    cursor: Some("anchor".into()),
+                    sent: ["sent".into()].into(),
+                }),
+                root: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let mut imported = false;
+        let mut ready = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
+                match event {
+                    ProviderEvent::Session(SessionEvent::History { history, .. }) => {
+                        assert!(!ready);
+                        assert_eq!(history.text, "second\nreply second");
+                        imported = true;
+                    }
+                    ProviderEvent::Session(SessionEvent::Ready { .. }) => {
+                        assert!(imported);
+                        ready = true;
+                        handle.control.send(SessionControl::Shutdown).unwrap();
+                    }
+                    ProviderEvent::Session(SessionEvent::Exited { crash }) => {
+                        assert_eq!(crash, None);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("Claude import session did not exit");
+        })
+        .await
+        .unwrap();
+        assert!(ready);
+    });
+}
+
+#[test]
+fn fake_claude_tui_requires_isolated_config() {
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_veyra-fake-cli"))
+        .env_clear()
+        .args([
+            "--resume",
+            &ThreadId::new().to_string(),
+            "--permission-mode",
+            "default",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .contains("requires CLAUDE_CONFIG_DIR")
+    );
 }

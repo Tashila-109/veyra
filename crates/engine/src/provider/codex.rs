@@ -67,6 +67,7 @@ pub fn initialize() -> Value {
 enum Call {
     Initialize,
     Thread,
+    History,
     Start(TurnId),
     Interrupt(TurnId),
 }
@@ -224,6 +225,8 @@ pub(crate) struct Codec {
     requests: BTreeMap<String, Request>,
     seen_requests: BTreeSet<String>,
     interrupted: Option<Interruption>,
+    history_turns: Vec<Value>,
+    history_pages: BTreeSet<String>,
 }
 impl Codec {
     pub(crate) fn new(
@@ -247,6 +250,8 @@ impl Codec {
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
             interrupted: None,
+            history_turns: vec![],
+            history_pages: BTreeSet::new(),
         }
     }
     pub(crate) fn initialize(&mut self) -> Value {
@@ -257,6 +262,9 @@ impl Codec {
     }
     pub(crate) fn active(&self) -> Option<ActiveTurn> {
         self.turn.active()
+    }
+    fn history_page(&mut self, cursor: Option<&str>) -> Value {
+        self.peer.send(Call::History, "thread/turns/list", json!({"threadId":self.native().unwrap().0,"cursor":cursor,"limit":100,"sortDirection":"desc"}))
     }
     fn open_thread(&mut self) -> Result<Outbound, ProviderError> {
         let mut spec = self.spec.clone();
@@ -312,7 +320,103 @@ impl Codec {
                 decoded
                     .replies
                     .push(self.peer.notification("initialized", Value::Null));
-                self.queue_thread(&mut decoded)?;
+                if self.spec.import && self.spec.history.is_some() && self.native().is_some() {
+                    decoded.replies.push(self.history_page(None));
+                } else {
+                    self.queue_thread(&mut decoded)?;
+                }
+            }
+            Frame::Reply {
+                tag: Call::History,
+                result,
+            } => {
+                let result = result.map_err(jsonrpc::failure)?;
+                let turns = result["data"].as_array().ok_or_else(|| {
+                    ProviderError::Protocol("Codex turns list has no data".into())
+                })?;
+                let mut found = false;
+                for turn in turns {
+                    if self
+                        .spec
+                        .history
+                        .as_ref()
+                        .unwrap()
+                        .cursor
+                        .as_deref()
+                        .is_some_and(|cursor| turn["id"].as_str() == Some(cursor))
+                    {
+                        found = true;
+                        break;
+                    }
+                    self.history_turns.push(turn.clone());
+                }
+                if !found && let Some(cursor) = result["nextCursor"].as_str() {
+                    if !self.history_pages.insert(cursor.to_owned()) {
+                        return Err(ProviderError::Protocol(
+                            "Codex turns list repeated a page cursor".into(),
+                        ));
+                    }
+                    decoded.replies.push(self.history_page(Some(cursor)));
+                } else {
+                    if !found && self.spec.history.as_ref().unwrap().cursor.is_some() {
+                        return Err(ProviderError::Protocol(
+                            "Codex history cursor was not found".into(),
+                        ));
+                    }
+                    let cursor = self
+                        .history_turns
+                        .first()
+                        .and_then(|turn| turn["id"].as_str())
+                        .map(str::to_owned)
+                        .or_else(|| self.spec.history.as_ref().unwrap().cursor.clone());
+                    let mut text = Vec::new();
+                    for turn in self.history_turns.drain(..).rev() {
+                        let Some(items) = turn["items"].as_array() else {
+                            continue;
+                        };
+                        if self
+                            .spec
+                            .history
+                            .as_ref()
+                            .unwrap()
+                            .sent
+                            .contains(turn["id"].as_str().unwrap_or_default())
+                        {
+                            continue;
+                        }
+                        for item in items {
+                            match item["type"].as_str() {
+                                Some("userMessage") => {
+                                    if let Some(content) = item["content"].as_array() {
+                                        text.extend(
+                                            content
+                                                .iter()
+                                                .filter(|block| block["type"] == "text")
+                                                .filter_map(|block| block["text"].as_str())
+                                                .map(str::to_owned),
+                                        );
+                                    }
+                                }
+                                Some("agentMessage") if item["phase"] == "final_answer" => {
+                                    if let Some(value) = item["text"].as_str() {
+                                        text.push(value.to_owned());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    decoded
+                        .events
+                        .push(ProviderEvent::Session(SessionEvent::History {
+                            native: self.native().unwrap().clone(),
+                            history: super::History {
+                                cursor,
+                                text: text.join("\n"),
+                            },
+                        }));
+                    self.queue_thread(&mut decoded)?;
+                }
             }
             Frame::Reply {
                 tag: Call::Thread,
@@ -1435,6 +1539,36 @@ pub(super) async fn probe_exchange(
     ))
 }
 
+pub fn tui_command(
+    native: &crate::domain::NativeSessionId,
+    mode: crate::domain::PermissionMode,
+) -> Vec<String> {
+    let mut args = vec![
+        "resume".into(),
+        native.0.clone(),
+        "--include-non-interactive".into(),
+        "--no-daemon".into(),
+        "-c".into(),
+        "check_for_update_on_startup=false".into(),
+    ];
+    match mode {
+        PermissionMode::AskFirst => args.extend(["-s".into(), "read-only".into()]),
+        PermissionMode::AcceptEdits => args.extend([
+            "-a".into(),
+            "on-request".into(),
+            "-s".into(),
+            "workspace-write".into(),
+        ]),
+        PermissionMode::FullAccess => args.extend([
+            "-a".into(),
+            "never".into(),
+            "-s".into(),
+            "danger-full-access".into(),
+        ]),
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1449,6 +1583,7 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: Some(NativeSessionId("old-thread".into())),
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -1832,6 +1967,7 @@ mod limit_tests {
                     effort: None,
                 },
                 native: None,
+                history: Default::default(),
                 import: false,
                 root: false,
             },
@@ -1909,6 +2045,7 @@ mod collaboration_tests {
                         effort: None,
                     },
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },

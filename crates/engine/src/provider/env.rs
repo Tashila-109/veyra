@@ -64,6 +64,7 @@ pub struct ChildEnv {
     #[cfg(test)]
     pub(crate) close_before_user_write: Arc<AtomicBool>,
     resolution: Resolution,
+    variables: std::collections::BTreeMap<OsString, OsString>,
     pub path: OsString,
     pub home: Option<PathBuf>,
     pub(crate) xai_api_key_set: bool,
@@ -97,6 +98,9 @@ impl ChildEnv {
             env.reaper_pids = None;
             env.path = LOGIN_PATH.path.clone();
             env.home = std::env::var_os("HOME").map(PathBuf::from);
+            if let Some(root) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+                env.variables.insert("CLAUDE_CONFIG_DIR".into(), root);
+            }
             env.xai_api_key_set = std::env::var_os("XAI_API_KEY").is_some();
             #[cfg(debug_assertions)]
             {
@@ -126,6 +130,7 @@ impl ChildEnv {
             #[cfg(test)]
             close_before_user_write: Default::default(),
             resolution: Resolution::Explicit(Default::default()),
+            variables: Default::default(),
             path: std::env::var_os("PATH").unwrap_or_default(),
             home: None,
             xai_api_key_set: false,
@@ -159,6 +164,67 @@ impl ChildEnv {
             binaries.insert(provider, binary);
         }
         self
+    }
+    pub(crate) fn claude_config_dir(&self) -> Result<PathBuf, ProviderError> {
+        self.variables
+            .get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(PathBuf::from)
+            .or_else(|| self.home.as_ref().map(|home| home.join(".claude")))
+            .ok_or_else(|| {
+                ProviderError::Protocol(
+                    "Claude history requires an explicit isolated config directory".into(),
+                )
+            })
+    }
+    pub fn with_variable(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.variables.insert(key.into(), value.into());
+        self
+    }
+    pub(crate) fn tui_environment(
+        &self,
+        parent: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> std::collections::BTreeMap<OsString, OsString> {
+        let mut variables: std::collections::BTreeMap<_, _> = parent.into_iter().collect();
+        variables.extend(self.variables.clone());
+        variables.retain(|key, _| {
+            let name = key.to_string_lossy();
+            ![
+                "VEYRA_",
+                "ITERM_",
+                "GHOSTTY_",
+                "KITTY_",
+                "WEZTERM_",
+                "ALACRITTY_",
+                "VTE_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+                && ![
+                    "TERM_PROGRAM",
+                    "TERM_PROGRAM_VERSION",
+                    "TERM_SESSION_ID",
+                    "NO_COLOR",
+                    "FORCE_COLOR",
+                    "CLICOLOR_FORCE",
+                    "COLORFGBG",
+                    "CLAUDECODE",
+                    "CLAUDE_CODE_ENTRYPOINT",
+                    "CLAUDE_CODE_SSE_PORT",
+                    "CLAUDE_AGENT_SDK_VERSION",
+                ]
+                .contains(&name.as_ref())
+        });
+        if !self.xai_api_key_set {
+            variables.remove(std::ffi::OsStr::new("XAI_API_KEY"));
+        }
+        variables.insert("PATH".into(), self.path.clone());
+        variables.insert("TERM".into(), "xterm-256color".into());
+        variables.insert("COLORTERM".into(), "truecolor".into());
+        variables.insert(
+            "VEYRA_PARENT_PID".into(),
+            std::process::id().to_string().into(),
+        );
+        variables
     }
     pub fn resolve(&self, provider: ProviderKind) -> Result<PathBuf, ProviderError> {
         #[cfg(debug_assertions)]
@@ -219,6 +285,7 @@ impl ChildEnv {
         if !self.xai_api_key_set {
             cmd.env_remove("XAI_API_KEY");
         }
+        cmd.envs(&self.variables);
         cmd.env("VEYRA_PARENT_PID", std::process::id().to_string());
         platform::own_group(&mut cmd);
         cmd
@@ -680,4 +747,62 @@ fn selecting_an_explicit_binary_disables_ambient_resolution() {
         env.resolve(ProviderKind::Claude),
         Err(ProviderError::NotInstalled(_))
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn tui_env_sets_term_and_strips_host() {
+    let stripped = [
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "TERM_SESSION_ID",
+        "ITERM_SESSION_ID",
+        "GHOSTTY_RESOURCES_DIR",
+        "KITTY_WINDOW_ID",
+        "WEZTERM_PANE",
+        "ALACRITTY_SOCKET",
+        "VTE_VERSION",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "CLICOLOR_FORCE",
+        "COLORFGBG",
+        "VEYRA_MCP_TOKEN",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SSE_PORT",
+        "CLAUDE_AGENT_SDK_VERSION",
+    ];
+    let mut parent: Vec<(OsString, OsString)> = stripped
+        .iter()
+        .map(|key| ((*key).into(), "host-value".into()))
+        .collect();
+    parent.extend([
+        ("TERM".into(), "wrong-terminal".into()),
+        ("COLORTERM".into(), "wrong-color".into()),
+        ("KEEP_ME".into(), "kept".into()),
+    ]);
+    let env = ChildEnv::isolated().with_variable("CLAUDE_CONFIG_DIR", "/tmp/owned-claude-config");
+    let actual = env.tui_environment(parent);
+    assert_eq!(
+        actual.get(std::ffi::OsStr::new("TERM")),
+        Some(&OsString::from("xterm-256color"))
+    );
+    assert_eq!(
+        actual.get(std::ffi::OsStr::new("COLORTERM")),
+        Some(&OsString::from("truecolor"))
+    );
+    assert_eq!(
+        actual.get(std::ffi::OsStr::new("KEEP_ME")),
+        Some(&OsString::from("kept"))
+    );
+    assert_eq!(
+        actual.get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")),
+        Some(&OsString::from("/tmp/owned-claude-config"))
+    );
+    for key in stripped {
+        assert!(
+            !actual.contains_key(std::ffi::OsStr::new(key)),
+            "inherited {key}"
+        );
+    }
 }

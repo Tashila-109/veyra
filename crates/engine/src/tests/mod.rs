@@ -10,6 +10,7 @@ mod shutdown;
 mod stop;
 mod storage;
 mod table;
+mod view_switch;
 
 use crate::{
     actor::{Actor, EngineMsg, now},
@@ -100,7 +101,10 @@ impl Fixture {
             LiveState::Terminal => {
                 let (control, _rx) = mpsc::unbounded_channel();
                 Live::Terminal {
-                    term: TerminalHandle { control },
+                    term: TerminalHandle {
+                        control,
+                        terminal: None,
+                    },
                     pid: 9,
                 }
             }

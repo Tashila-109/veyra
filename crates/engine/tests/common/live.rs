@@ -51,6 +51,7 @@ pub fn live(
                         mode,
                     },
                     native: None,
+                    history: Default::default(),
                     import: false,
                     root: false,
                 },

@@ -911,7 +911,10 @@ fn get_task_status_matches_window() {
             "InTerminal" => {
                 let (control, _) = mpsc::unbounded_channel();
                 live.live = Live::Terminal {
-                    term: TerminalHandle { control },
+                    term: TerminalHandle {
+                        control,
+                        terminal: None,
+                    },
                     pid: 1,
                 };
             }

@@ -368,6 +368,85 @@ enum SessionState {
     },
 }
 
+fn replay_import(
+    frames: &[Value],
+    request: &super::HistoryRequest,
+) -> Result<super::History, ProviderError> {
+    let after = request
+        .cursor
+        .as_deref()
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(|_| ProviderError::Protocol("Invalid Grok history cursor".into()))?;
+    let mut cursor = after;
+    let mut text = Vec::new();
+    let mut user = String::new();
+    let mut agent = String::new();
+    let mut index = None;
+    let mut include = false;
+    let mut own = false;
+    for frame in frames {
+        let update = &frame["update"];
+        let kind = update["sessionUpdate"].as_str().unwrap_or_default();
+        if kind == "user_message_chunk" {
+            let next = update["_meta"]["promptIndex"].as_u64().ok_or_else(|| {
+                ProviderError::Protocol("Grok replay user has no promptIndex".into())
+            })?;
+            cursor = Some(cursor.map_or(next, |old| old.max(next)));
+            if index != Some(next) {
+                if include {
+                    return Err(ProviderError::Protocol(
+                        "Grok history turn has no turn_completed".into(),
+                    ));
+                }
+                index = Some(next);
+                include = after.is_none_or(|after| next > after);
+                own = false;
+                user.clear();
+                agent.clear();
+            }
+        }
+        if frame["_meta"]["promptId"]
+            .as_str()
+            .or_else(|| update["prompt_id"].as_str())
+            .is_some_and(|id| request.sent.contains(id))
+        {
+            own = true;
+        }
+        if include
+            && update["content"]["type"] == "text"
+            && let Some(value) = update["content"]["text"].as_str()
+        {
+            match kind {
+                "user_message_chunk" => user.push_str(value),
+                "agent_message_chunk" => agent.push_str(value),
+                _ => {}
+            }
+        }
+        if kind == "turn_completed" {
+            if include && !own {
+                if !user.is_empty() {
+                    text.push(std::mem::take(&mut user));
+                }
+                if !agent.is_empty() {
+                    text.push(std::mem::take(&mut agent));
+                }
+            }
+            include = false;
+            index = None;
+        }
+    }
+    if include {
+        return Err(ProviderError::Protocol(
+            "Grok history ended before turn_completed".into(),
+        ));
+    }
+    Ok(super::History {
+        cursor: cursor.map(|value| value.to_string()),
+        text: text.join("\n"),
+    })
+}
+
 pub(crate) struct Codec {
     peer: Peer<Call>,
     spec: SessionSpec,
@@ -384,6 +463,7 @@ pub(crate) struct Codec {
     tasks: BTreeSet<String>,
     tools: BTreeMap<String, ToolState>,
     interrupted: Option<super::StopLadder>,
+    replay: Vec<Value>,
 }
 impl Codec {
     pub(crate) fn new(
@@ -408,6 +488,7 @@ impl Codec {
             tasks: BTreeSet::new(),
             tools: BTreeMap::new(),
             interrupted: None,
+            replay: vec![],
         }
     }
     pub(crate) fn native(&self) -> Option<&NativeSessionId> {
@@ -585,6 +666,29 @@ impl Codec {
             prompt.first_frame = None;
         }
         let mut decoded = Decoded::default();
+        if self.spec.import
+            && self.spec.history.is_some()
+            && matches!(
+                self.state,
+                SessionState::Opening {
+                    target: OpenTarget::Load(_),
+                    ..
+                }
+            )
+            && value.get("id").is_none()
+            && value["params"]["_meta"]["isReplay"] == true
+        {
+            let params = &value["params"];
+            if self
+                .spec
+                .native
+                .as_ref()
+                .is_some_and(|native| params["sessionId"].as_str() == Some(&native.0))
+            {
+                self.replay.push(params.clone());
+            }
+            return Ok(decoded);
+        }
         let tagged: Option<TaggedFrame> = serde_json::from_value(value.clone()).ok();
         let frame = self.peer.receive(value);
         if matches!(frame, Frame::Notification { .. })
@@ -681,6 +785,19 @@ impl Codec {
                                     "Grok session reply has no sessionId".into(),
                                 )
                             })?;
+                        if matches!(target, OpenTarget::Load(_))
+                            && self.spec.import
+                            && let Some(request) = &self.spec.history
+                        {
+                            let history = replay_import(&self.replay, request)?;
+                            decoded
+                                .events
+                                .push(ProviderEvent::Session(SessionEvent::History {
+                                    native: NativeSessionId(native.clone()),
+                                    history,
+                                }));
+                            self.replay.clear();
+                        }
                         self.state = SessionState::Ready {
                             native: NativeSessionId(native.clone()),
                             active: None,
@@ -1403,6 +1520,39 @@ fn tool_output(raw: &Value, content: &[Value]) -> Option<String> {
             .join("\n")
     };
     (!text.is_empty()).then_some(text)
+}
+
+pub fn tui_command(
+    native: &crate::domain::NativeSessionId,
+    mode: crate::domain::PermissionMode,
+) -> Vec<String> {
+    let mut args = vec!["--no-auto-update".into()];
+    if mode == PermissionMode::FullAccess {
+        args.push("--always-approve".into());
+    } else {
+        args.extend(["--permission-mode".into(), "default".into()]);
+    }
+    args.extend(["--resume".into(), native.0.clone()]);
+    args
+}
+
+#[cfg(test)]
+#[test]
+fn import_grok_rejects_incomplete_turn() {
+    let request = super::HistoryRequest {
+        cursor: Some("0".into()),
+        ..Default::default()
+    };
+    let user = json!({"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"keep me"},"_meta":{"promptIndex":1}}});
+    assert!(replay_import(std::slice::from_ref(&user), &request).is_err());
+    let complete = json!({"update":{"sessionUpdate":"turn_completed","prompt_id":"terminal"}});
+    assert_eq!(
+        replay_import(&[user, complete], &request).unwrap(),
+        super::History {
+            cursor: Some("1".into()),
+            text: "keep me".into()
+        }
+    );
 }
 
 #[cfg(test)]

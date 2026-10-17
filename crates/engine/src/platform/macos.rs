@@ -841,3 +841,82 @@ mod timestamp_tests {
         assert!(super::utc_timestamp(i64::MAX).is_none());
     }
 }
+
+pub fn raw_terminal_input() -> io::Result<()> {
+    let input = io::stdin();
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(input.as_raw_fd(), attributes.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut attributes = unsafe { attributes.assume_init() };
+    unsafe { libc::cfmakeraw(&mut attributes) };
+    if unsafe { libc::tcsetattr(input.as_raw_fd(), libc::TCSANOW, &attributes) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn raw_terminal_input_preserves_escape_and_carriage_return() {
+    use std::io::{Read, Write};
+    if std::env::var_os("VEYRA_TEST_RAW_INPUT").is_some() {
+        raw_terminal_input().unwrap();
+        std::io::stdout().write_all(b"RAW_READY\n").unwrap();
+        std::io::stdout().flush().unwrap();
+        let mut bytes = [0; 2];
+        std::io::stdin().read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [27, 13]);
+        return;
+    }
+    let pair = portable_pty::native_pty_system()
+        .openpty(Default::default())
+        .unwrap();
+    let mut command = portable_pty::CommandBuilder::new(std::env::current_exe().unwrap());
+    command.args([
+        "--exact",
+        "platform::macos::raw_terminal_input_preserves_escape_and_carriage_return",
+        "--nocapture",
+    ]);
+    command.env("VEYRA_TEST_RAW_INPUT", "1");
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    let pid = child.process_id().unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reading = std::thread::spawn(move || {
+        let mut line = Vec::new();
+        let mut byte = [0];
+        while reader.read(&mut byte).unwrap_or(0) != 0 {
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                if line.ends_with(b"RAW_READY\n") {
+                    let _ = sender.send(());
+                }
+                line.clear();
+            }
+        }
+    });
+    let ready = receiver.recv_timeout(std::time::Duration::from_secs(5));
+    if ready.is_ok() {
+        writer.write_all(&[27, 13]).unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = signal_group(pid, super::Signal::Kill);
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    drop(writer);
+    drop(pair.master);
+    reading.join().unwrap();
+    ready.unwrap();
+    assert!(status.unwrap().success());
+}

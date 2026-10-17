@@ -107,6 +107,7 @@ fn codex_params_per_mode() {
             cwd: "/project".into(),
             config: config.clone(),
             native: Some(NativeSessionId("native".into())),
+            history: Default::default(),
             import: false,
             root: false,
         };
