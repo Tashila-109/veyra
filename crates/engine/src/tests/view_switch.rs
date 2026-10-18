@@ -1,5 +1,304 @@
 use super::*;
 
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug)]
+enum HeldCancellation {
+    Interrupt,
+    StopThread,
+    StorageBlocked,
+}
+
+#[cfg(debug_assertions)]
+struct HeldSessionCleanup {
+    runtime: tokio::runtime::Handle,
+    env: env::ChildEnv,
+    session: SessionHandle,
+}
+#[cfg(debug_assertions)]
+impl Drop for HeldSessionCleanup {
+    fn drop(&mut self) {
+        self.env.closing.close();
+        let _ = self.session.control.send(SessionControl::Shutdown);
+        for pid in self.env.groups.lock().unwrap().iter().copied() {
+            let _ = crate::platform::signal_group(pid, crate::platform::Signal::Kill);
+        }
+        let cleaned = self.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !self.env.groups.lock().unwrap().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+        });
+        if cleaned.is_err() && !std::thread::panicking() {
+            panic!("held-prompt session cleanup did not reap its group");
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn cancel_held_prompt(cancellation: HeldCancellation) {
+    use serde_json::json;
+    use std::{fs, time::Duration};
+    let scratch = Scratch(
+        std::path::Path::new("/tmp").join(format!("veyra-term-held-prompt-{}", ThreadId::new())),
+    );
+    fs::create_dir_all(scratch.0.join("projects/fixture")).unwrap();
+    let binary = scratch.0.join("provider");
+    fs::write(
+        &binary,
+        r#"#!/usr/bin/python3
+import json,pathlib,sys
+root=pathlib.Path.cwd()
+history=root/'projects/fixture/native.jsonl'
+active=None
+for raw in sys.stdin:
+    wire=json.loads(raw)
+    with (root/'stdin.jsonl').open('a') as out: out.write(raw)
+    if wire.get('type')=='user':
+        active=wire['uuid']
+        with history.open('a') as out:
+            out.write(json.dumps({'type':'user','entrypoint':'sdk-cli','sessionId':'native','uuid':active,'message':wire['message']})+'\n')
+    elif wire.get('request',{}).get('subtype')=='initialize':
+        print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':wire['request_id'],'response':{}}}),flush=True)
+    elif wire.get('request',{}).get('subtype')=='interrupt' and active:
+        print(json.dumps({'type':'result','subtype':'error_during_execution','session_id':'native','is_error':True,'uuid':'result','result':'interrupted'}),flush=True)
+        active=None
+"#,
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("/bin/chmod")
+            .arg("700")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let native = NativeSessionId("native".into());
+    let history_path = scratch.0.join("projects/fixture/native.jsonl");
+    fs::write(&history_path, format!("{}\n", json!({"type":"user","entrypoint":"sdk-cli","sessionId":"native","uuid":"previous","message":{"content":"already shown"}}))).unwrap();
+    let mut f = Fixture::new(LiveState::Idle);
+    let mut changes = ChangeSet::default();
+    let mut row = f.loaded().threads[&f.thread].clone();
+    row.cwd = scratch.0.clone();
+    row.native = Some(native.clone());
+    row.native_cursor = Some("previous".into());
+    changes.threads.insert(f.thread, row);
+    f.save(changes);
+    let env = env::ChildEnv::isolated()
+        .with_binary(ProviderKind::Claude, binary)
+        .with_variable("CLAUDE_CONFIG_DIR", scratch.0.as_os_str());
+    let (out, mut events) = mpsc::channel(256);
+    let session = {
+        let _entered = f.runtime.enter();
+        session::spawn(
+            SessionSpec {
+                thread: f.thread,
+                cwd: scratch.0.clone(),
+                config: config(),
+                native: Some(native.clone()),
+                import: None,
+                root: false,
+            },
+            env.clone(),
+            out,
+            1,
+        )
+        .unwrap()
+    };
+    let cleanup = HeldSessionCleanup {
+        runtime: f.runtime.handle().clone(),
+        env,
+        session: session.clone(),
+    };
+    f.actor.live.get_mut(&f.thread).unwrap().live = Live::Starting {
+        session: Some(session.clone()),
+    };
+    let ready = f.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    {
+        let _entered = f.runtime.enter();
+        f.actor.handle(ready);
+    }
+    let Ack::Turn(turn) = f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "held prompt".into(),
+        })
+        .unwrap()
+    else {
+        panic!("missing turn")
+    };
+    let dispatched = f.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    assert!(
+        matches!(&dispatched, EngineMsg::Provider { event: ProviderEvent::Session(SessionEvent::Dispatched { turn: id }), .. } if *id == turn)
+    );
+    let started = std::time::Instant::now();
+    match cancellation {
+        HeldCancellation::Interrupt => {
+            f.command(Command::Interrupt {
+                thread: f.thread,
+                turn,
+            })
+            .unwrap();
+        }
+        HeldCancellation::StopThread => {
+            f.command(Command::StopThread { thread: f.thread }).unwrap();
+        }
+        HeldCancellation::StorageBlocked => {
+            f.actor.fail_write = true;
+            f.event(ProviderEvent::Session(SessionEvent::Notice {
+                text: "storage write".into(),
+            }));
+        }
+    }
+    {
+        let _entered = f.runtime.enter();
+        f.actor.handle(dispatched);
+    }
+    let ended = f.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let message = events.recv().await.unwrap();
+                let end = match &message {
+                    EngineMsg::Provider {
+                        event:
+                            ProviderEvent::Turn {
+                                event: TurnEvent::TurnEnded { outcome, park },
+                                ..
+                            },
+                        ..
+                    } => Some((outcome.clone(), *park)),
+                    _ => None,
+                };
+                f.actor.handle(message);
+                if let Some(end) = end {
+                    return end;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    });
+    let elapsed = started.elapsed();
+    let kept_process = !cleanup.env.groups.lock().unwrap().is_empty();
+    f.actor.fail_write = false;
+    {
+        let _entered = f.runtime.enter();
+        f.actor.handle(EngineMsg::Tick);
+    }
+    let cursor = f.loaded().threads[&f.thread].native_cursor.clone();
+    session.control.send(SessionControl::Shutdown).ok();
+    f.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = events.recv().await {
+                if matches!(
+                    message,
+                    EngineMsg::Provider {
+                        event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    });
+    drop(cleanup);
+    let wires: Vec<serde_json::Value> = fs::read_to_string(scratch.0.join("stdin.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let order: Vec<_> = wires
+        .iter()
+        .map(|wire| {
+            wire["request"]["subtype"]
+                .as_str()
+                .unwrap_or(wire["type"].as_str().unwrap())
+        })
+        .collect();
+    use std::io::Write;
+    let mut history_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&history_path)
+        .unwrap();
+    for entry in [
+        json!({"type":"user","entrypoint":"cli","sessionId":"native","uuid":"terminal-user","message":{"content":"typed in terminal"}}),
+        json!({"type":"assistant","entrypoint":"cli","sessionId":"native","uuid":"terminal-reply","message":{"content":[{"type":"text","text":"terminal reply"}]}}),
+    ] {
+        writeln!(history_file, "{entry}").unwrap();
+    }
+    let history = claude::session_file_import(
+        &scratch.0,
+        &native,
+        &HistoryRequest {
+            cursor: cursor.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "{cancellation:?}: stdin={order:?} elapsed={elapsed:?} end={ended:?} kept_process={kept_process} cursor={cursor:?} import={history:?}"
+    );
+    assert_eq!(order, ["initialize", "user", "interrupt"]);
+    assert_eq!(wires[1]["uuid"], turn.to_string());
+    assert_eq!(wires[1]["message"]["content"], "held prompt");
+    assert_eq!(cursor.as_deref(), Some(turn.to_string().as_str()));
+    assert_eq!(
+        ended,
+        (
+            TurnOutcome::Interrupted {
+                reason: if matches!(cancellation, HeldCancellation::StorageBlocked) {
+                    StopReason::StorageBlocked.text().into()
+                } else {
+                    StopReason::User.text().into()
+                },
+            },
+            false
+        )
+    );
+    assert!(kept_process && elapsed < Duration::from_secs(2));
+    assert_eq!(
+        history,
+        History {
+            cursor: Some("terminal-user".into()),
+            text: "typed in terminal\nterminal reply".into(),
+            failed: false,
+        }
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn interrupt_held_prompt_preserves_import_cursor() {
+    cancel_held_prompt(HeldCancellation::Interrupt);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn stop_thread_held_prompt_preserves_import_cursor() {
+    cancel_held_prompt(HeldCancellation::StopThread);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn storage_blocked_held_prompt_preserves_import_cursor() {
+    cancel_held_prompt(HeldCancellation::StorageBlocked);
+}
+
 #[test]
 fn switch_refused_while_turn_runs() {
     let mut f = Fixture::new(LiveState::Running);

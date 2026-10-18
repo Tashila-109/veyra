@@ -24,7 +24,7 @@ Launch then removes replay overrides, records to `$PROOF/rec`, and the new-threa
 A live lane needs separate human authorization because it runs the installed CLI and spends its quota.
 The debug-only VEYRA_REAP_PIDS filter restricts startup reaping to the run's saved provider pids, including after a crash.
 An empty list permits no startup signals.
-The debug-only VEYRA_DEBUG_TERMINAL_GRID=COLSxROWS override is read once at window-app launch; decimal columns 2–65535 and rows 1–65535 fix the PTY/emulator grid at the terminal area’s top left, clipped to that area.
+The debug-only VEYRA_DEBUG_TERMINAL_GRID=COLSxROWS override is read once at window-app launch; decimal columns 2–1000 and rows 1–1000 fix the PTY/emulator grid at the terminal area’s top left, clipped to that area.
 An absent or invalid value uses layout sizing; release contains neither the variable nor its override code.
 The release check refuses to launch while any same-user marked process names a dead parent.
 Its preflight and Cleanup share an in-memory marker reader and report counts only.
@@ -370,7 +370,7 @@ def stage_records(records):
     except ProcessLookupError: pass
     else:
         for path in (PROOF/'rec').rglob('t*-s*.jsonl'):
-            match = re.fullmatch(r't(\d+)-s(\d+)\.jsonl',path.name)
+            match = re.fullmatch(r't(\d+)-s(\d+)(?:-\d+)?\.jsonl',path.name)
             if match and path.stat().st_mtime_ns >= pid_file.stat().st_mtime_ns:
                 lane,epoch = map(int,match.groups())
                 observed[lane] = max(observed.get(lane,0),epoch)

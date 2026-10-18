@@ -876,10 +876,11 @@ async fn run_one(
                 }
                 None => unreachable!("closed controls become Shutdown"),
                 Some(SessionControl::Interrupt { turn, reason }) => {
-                    if pending_dispatch.as_ref().is_some_and(|pending| pending.turn == turn) {
-                        pending_dispatch = None;
-                    }
-                    for line in codec.interrupt_lines(turn, reason) {
+                    let prompts = pending_dispatch
+                        .take_if(|pending| pending.turn == turn)
+                        .into_iter()
+                        .flat_map(|pending| pending.prompts);
+                    for line in prompts.chain(codec.interrupt_lines(turn, reason)) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;
@@ -887,8 +888,8 @@ async fn run_one(
                     }
                 }
                 Some(SessionControl::InterruptActive(reason)) => {
-                    pending_dispatch = None;
-                    for line in codec.interrupt_active(reason) {
+                    let prompts = pending_dispatch.take().into_iter().flat_map(|pending| pending.prompts);
+                    for line in prompts.chain(codec.interrupt_active(reason)) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
                             break;

@@ -26,7 +26,7 @@ impl DebugTerminalGrid {
         }
         let cols = cols.parse::<u16>().ok()?;
         let rows = rows.parse::<u16>().ok()?;
-        (cols >= 2 && rows >= 1).then_some((cols, rows))
+        ((2..=1000).contains(&cols) && (1..=1000).contains(&rows)).then_some((cols, rows))
     }
 }
 #[cfg(debug_assertions)]
@@ -664,7 +664,7 @@ mod tests {
         for (value, expected) in [
             ("127x33", (127, 33)),
             ("2x1", (2, 1)),
-            ("65535x65535", (65535, 65535)),
+            ("1000x1000", (1000, 1000)),
         ] {
             assert_eq!(DebugTerminalGrid::parse(Some(value)), Some(expected));
         }
@@ -684,6 +684,9 @@ mod tests {
             "127x33x1",
             " 127x33",
             "127x33 ",
+            "1001x33",
+            "127x1001",
+            "65535x65535",
             "65536x33",
             "127x65536",
             "１２７x33",
