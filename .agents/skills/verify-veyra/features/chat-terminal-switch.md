@@ -243,7 +243,9 @@ terminal_seed(flood)
 terminal_enter('terminal-flood-open','flood-50mb')
 flood_dump = poll('terminal-flood',lambda d:d['perf']['flood'] is not None)
 assert flood_dump['perf']['flood']['pty_bytes']==50000020, flood_dump['perf']['flood']
-save('terminal-flood',flood_dump['perf']['flood'])
+flood_grid = {key:flood_dump['terminal'][key] for key in ['columns','rows']}
+save('terminal-flood',dict(flood_dump['perf']['flood'],**flood_grid))
+print('terminal flood grid='+str(flood_grid['columns'])+'x'+str(flood_grid['rows']))
 capture('terminal-flood')
 terminal_back('terminal-flood-back')
 turns = int(sql("select count(*) from turns where thread_id='"+flood+"'"))
@@ -267,6 +269,9 @@ The SQLite audit records every cursor change and marks import completion separat
 `terminal-hex.json` holds the fake byte echoes, and `terminal-history-grep.txt` holds grep's count.
 `perf.flood` holds `pty_bytes`, `elapsed_ms`, `repaints`, `median_repaint_gap_ms` and `max_repaint_gap_ms` after FLOOD_DONE.
 The one flood here checks measurement availability and payload size; the separate five-sample performance check owns the throughput and repaint-gap baseline.
+Every terminal-flood.json sample also records the measured terminal.columns and terminal.rows.
+For the performance baseline, export VEYRA_DEBUG_TERMINAL_GRID=127x33 before Launch to match the P2 grid; also record an ordinary layout-sized smoke as the known full-width limit.
+The override is debug-only, read once at app launch, paints from the terminal area’s top left and clips to the available area; unset or invalid values retain layout sizing.
 Read terminal-open.png, terminal-imported.png, terminal-recovered.png and terminal-flood.png for the full-width grid, switch, hint, sidebar arc and imported text.
 
 ## Gotchas

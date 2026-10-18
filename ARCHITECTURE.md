@@ -1021,6 +1021,7 @@ MainView::Chat still identifies the selected conversation; the engine thread's s
 TerminalView owns only its focus, queued grid size, wake coalescing and paint state, and uses TerminalHandle for direct writes and resizes.
 It renders a gpui canvas across the thread width above the theme's 30 px hint row, whose shortcut comes from the bindings table and whose copy says switching ends the CLI session.
 Prepaint derives cell width from the resolved bundled mono font and row height from the terminal type token, then queues a resize when the grid dimensions change.
+Debug startup reads VEYRA_DEBUG_TERMINAL_GRID=COLSxROWS once into app state; valid decimal columns 2–65535 and rows 1–65535 override PTY/emulator sizing while preserving top-left painting and content-mask clipping, absent or invalid values use layout sizing, and release excludes the variable and override code.
 The snapshot releases the emulator lock before merging each row's equal background colours and shaping ASCII runs with matching attributes.
 Non-ASCII glyphs and combining marks start segments at their grid columns, wide spacers are skipped, and calt, liga and dlig are disabled.
 The canvas paints those quads, shaped segments and a still cursor within its content mask.

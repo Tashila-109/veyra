@@ -2488,6 +2488,8 @@ pub fn run(
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            #[cfg(debug_assertions)]
+            terminal_view::init(cx);
             cx.set_app_identity("dev.veyra.app", "Veyra");
             theme::register_fonts(cx).expect("bundled Geist fonts");
             actions::init(cx);

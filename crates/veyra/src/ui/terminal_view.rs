@@ -10,6 +10,33 @@ use veyra_engine::{
     },
 };
 
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Default)]
+struct DebugTerminalGrid(Option<(u16, u16)>);
+#[cfg(debug_assertions)]
+impl Global for DebugTerminalGrid {}
+#[cfg(debug_assertions)]
+impl DebugTerminalGrid {
+    fn parse(value: Option<&str>) -> Option<(u16, u16)> {
+        let (cols, rows) = value?.split_once('x')?;
+        if !cols.bytes().all(|byte| byte.is_ascii_digit())
+            || !rows.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let cols = cols.parse::<u16>().ok()?;
+        let rows = rows.parse::<u16>().ok()?;
+        (cols >= 2 && rows >= 1).then_some((cols, rows))
+    }
+}
+#[cfg(debug_assertions)]
+pub(super) fn init(cx: &mut App) {
+    let value = std::env::var("VEYRA_DEBUG_TERMINAL_GRID").ok();
+    cx.set_global(DebugTerminalGrid(DebugTerminalGrid::parse(
+        value.as_deref(),
+    )));
+}
+
 pub fn terminal_key_bytes(key: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     let m = key.modifiers;
     let name = key.key.as_str();
@@ -403,6 +430,11 @@ impl TerminalView {
         let cols = (((bounds.size.width - padding.width * 2.) / cell_width).floor() as u16).max(2);
         let rows =
             (((bounds.size.height - padding.height * 2.) / line_height).floor() as u16).max(1);
+        #[cfg(debug_assertions)]
+        let (cols, rows) = cx
+            .try_global::<DebugTerminalGrid>()
+            .and_then(|grid| grid.0)
+            .unwrap_or((cols, rows));
         if self.resize != Some((cols, rows))
             && let Some(handle) = &self.handle
         {
@@ -624,6 +656,41 @@ impl Render for TerminalView {
 mod tests {
     use super::terminal_key_bytes;
     use gpui_kit::Keystroke;
+    #[cfg(debug_assertions)]
+    #[test]
+    fn terminal_debug_grid_parser() {
+        use super::DebugTerminalGrid;
+        assert_eq!(DebugTerminalGrid::parse(None), None);
+        for (value, expected) in [
+            ("127x33", (127, 33)),
+            ("2x1", (2, 1)),
+            ("65535x65535", (65535, 65535)),
+        ] {
+            assert_eq!(DebugTerminalGrid::parse(Some(value)), Some(expected));
+        }
+        for value in [
+            "",
+            "127",
+            "127X33",
+            "127x",
+            "x33",
+            "0x33",
+            "1x33",
+            "127x0",
+            "-2x33",
+            "+127x33",
+            "127x+33",
+            "127x-1",
+            "127x33x1",
+            " 127x33",
+            "127x33 ",
+            "65536x33",
+            "127x65536",
+            "１２７x33",
+        ] {
+            assert_eq!(DebugTerminalGrid::parse(Some(value)), None, "{value}");
+        }
+    }
     #[test]
     fn terminal_key_bytes_per_chord() {
         for (key, expected) in [
@@ -855,6 +922,55 @@ mod window_tests {
             window.draw(cx).clear(cx);
         });
         cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn terminal_debug_grid_overrides_layout(cx: &mut gpui::TestAppContext) {
+        use veyra_engine::terminal::Dimensions;
+        let fixture = TerminalFixture::new();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            actions::init(cx);
+            cx.set_global(super::DebugTerminalGrid(Some((127, 33))));
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Theme::apply(Appearance::Dark, window, cx);
+            let terminal = cx.new(|cx| {
+                let mut terminal = TerminalView::new(None, window, cx);
+                terminal.handle = Some(fixture.handle.clone());
+                terminal
+            });
+            window.focus(&terminal.focus_handle(cx), cx);
+            KeyWindow {
+                terminal,
+                switches: Rc::new(Cell::new(0)),
+                new_threads: Rc::new(Cell::new(0)),
+            }
+        });
+        let view = root.read_with(cx, |root, _| root.terminal.clone());
+        let theme = cx.update(|_, cx| cx.global::<Theme>().clone());
+        for bounds in [theme.layout.window_min, theme.layout.window_default] {
+            cx.simulate_resize(bounds);
+            draw(cx);
+            assert_eq!(view.read_with(cx, |view, _| view.resize), Some((127, 33)));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(cx);
+                let actual = {
+                    let emulator = fixture.handle.emulator().unwrap();
+                    let emulator = emulator.lock();
+                    (emulator.term.columns(), emulator.term.screen_lines())
+                };
+                if actual == (127, 33) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "emulator grid: {actual:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let dump = view.read_with(cx, |view, _| view.dump());
+            assert_eq!(dump["columns"], 127);
+            assert_eq!(dump["rows"], 33);
+            assert_eq!(dump["grid"].as_array().unwrap().len(), 33);
+        }
     }
     #[gpui::test]
     fn terminal_window_keys_text_resize_and_switch_precedence(cx: &mut gpui::TestAppContext) {
