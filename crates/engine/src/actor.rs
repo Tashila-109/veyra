@@ -29,7 +29,7 @@ pub enum EngineMsg {
         reply: oneshot::Sender<ThreadSnapshot>,
     },
     Provider {
-        cursor: Option<String>,
+        cursor: Option<CursorUpdate>,
         thread: ThreadId,
         epoch: u32,
         event: ProviderEvent,
@@ -470,16 +470,8 @@ impl Actor {
             } => {
                 let c = self.provider(thread, epoch, event);
                 if let Some(mut c) = c {
-                    if let Some(cursor) = cursor
-                        && c.thread(&self.projection, thread)
-                            .unwrap()
-                            .native_cursor
-                            .as_ref()
-                            != Some(&cursor)
-                    {
-                        let mut row = c.thread(&self.projection, thread).unwrap().clone();
-                        row.native_cursor = Some(cursor);
-                        c.threads.insert(thread, row);
+                    if let Some(cursor) = cursor {
+                        self.apply_cursor(&mut c, thread, cursor.value());
                     }
                     self.commit_event(c);
                 }
@@ -982,6 +974,16 @@ impl Actor {
         }
         let mut c = ChangeSet::default();
         match event {
+            ProviderEvent::Session(SessionEvent::Dispatched { turn }) => {
+                if !self
+                    .projection
+                    .turns
+                    .get(&turn)
+                    .is_some_and(|row| row.thread == thread)
+                {
+                    return None;
+                }
+            }
             ProviderEvent::Session(SessionEvent::StartTurnRefused { turn }) => {
                 if self.live[&thread].pending_turn() != Some(turn) {
                     return None;
@@ -1415,6 +1417,13 @@ impl Actor {
             }
         }
     }
+    fn apply_cursor(&self, c: &mut ChangeSet, thread: ThreadId, cursor: Option<NativeCursor>) {
+        if c.thread(&self.projection, thread).unwrap().native_cursor != cursor {
+            let mut row = c.thread(&self.projection, thread).unwrap().clone();
+            row.native_cursor = cursor;
+            c.threads.insert(thread, row);
+        }
+    }
     fn import_history(&self, c: &mut ChangeSet, thread: ThreadId, history: History) {
         let failed = history.failed
             || c.thread(&self.projection, thread)
@@ -1422,7 +1431,7 @@ impl Actor {
                 .native_cursor
                 .is_none();
         if failed || !history.text.is_empty() {
-            let turn = commands::queue(&self.projection, c, thread, TurnOrigin::Provider);
+            let turn = commands::queue_import(&self.projection, c, thread);
             let body = if failed {
                 ItemBody::Notice(Notice {
                     text: IMPORT_NOTICE.into(),
@@ -1444,8 +1453,8 @@ impl Actor {
             let turn = c.turns[&turn].clone();
             commands::end_turn(&self.projection, c, turn, TurnOutcome::Completed, now());
         }
+        self.apply_cursor(c, thread, history.cursor);
         let mut row = c.thread(&self.projection, thread).unwrap().clone();
-        row.native_cursor = history.cursor;
         row.import_pending = false;
         c.threads.insert(thread, row);
     }
@@ -1464,7 +1473,7 @@ impl Actor {
         let mut c = self.exited(thread, crash.clone());
         let mut row = c.thread(&self.projection, thread).unwrap().clone();
         row.view = View::Chat;
-        row.import_pending = started;
+        row.import_pending |= started;
         c.threads.insert(thread, row);
         if let Some(message) = crash {
             let turn = commands::queue(&self.projection, &mut c, thread, TurnOrigin::Provider);

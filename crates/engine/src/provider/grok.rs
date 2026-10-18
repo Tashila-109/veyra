@@ -448,11 +448,12 @@ fn replay_import(frames: &[ReplayFrame], request: &super::HistoryRequest) -> sup
     let incomplete = id.is_some() || !user.is_empty() || !agent.is_empty();
     let cursor = id
         .or_else(|| turns.last().map(|turn| turn.0.clone()))
+        .map(Into::into)
         .or_else(|| request.cursor.clone());
     let anchor = request
         .cursor
         .as_ref()
-        .and_then(|cursor| turns.iter().position(|turn| &turn.0 == cursor));
+        .and_then(|cursor| turns.iter().position(|turn| turn.0 == **cursor));
     failed |= incomplete || request.cursor.is_some() && anchor.is_none();
     let mut text = Vec::new();
     if !failed && let Some(anchor) = anchor {
@@ -485,7 +486,6 @@ pub(crate) struct Codec {
     version: Option<String>,
     auth: Option<String>,
     prompts: BTreeMap<String, Prompt>,
-    foreign: Vec<String>,
     ended: BTreeSet<String>,
     requests: BTreeMap<String, Request>,
     seen_requests: BTreeSet<String>,
@@ -512,7 +512,6 @@ impl Codec {
             version: None,
             auth: None,
             prompts: BTreeMap::new(),
-            foreign: Vec::new(),
             ended: BTreeSet::new(),
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
@@ -589,7 +588,7 @@ impl Codec {
             json!({"methodId":method}),
         ))
     }
-    pub(crate) fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
+    pub(crate) fn start(&mut self, turn: TurnId, text: String) -> Option<Decoded> {
         if !self.prompts.is_empty() {
             return None;
         }
@@ -609,8 +608,13 @@ impl Codec {
             turn,
         }));
         self.interrupted = None;
-        Some(Outbound::Prompt(self.peer.send(Call::Prompt(id.clone()),"session/prompt",
-            json!({"sessionId":native.0,"prompt":[{"type":"text","text":text}],"_meta":{"promptId":id}}))))
+        Some(Decoded {
+            cursor: Some(turn.to_string().into()),
+            events: vec![ProviderEvent::Session(SessionEvent::Dispatched { turn })],
+            controls: vec![Outbound::Prompt(self.peer.send(Call::Prompt(id.clone()),"session/prompt",
+            json!({"sessionId":native.0,"prompt":[{"type":"text","text":text}],"_meta":{"promptId":id}})))],
+            ..Default::default()
+        })
     }
     fn event(decoded: &mut Decoded, owner: ActiveTurn, event: TurnEvent) {
         decoded.events.push(ProviderEvent::Turn {
@@ -625,9 +629,6 @@ impl Codec {
         })?;
         if self.ended.contains(&id) {
             return None;
-        }
-        if !self.prompts.contains_key(&id) {
-            self.foreign.push(id.clone());
         }
         self.prompts.entry(id.clone()).or_insert(Prompt {
             origin: PromptOrigin::Foreign,
@@ -656,10 +657,7 @@ impl Codec {
             }
             PromptOrigin::Foreign => {
                 if matches!(self.work(), Some(PromptWork::Provider { .. })) {
-                    decoded.cursor = Some(id.to_owned());
-                }
-                if matches!(self.work(), Some(PromptWork::Veyra { .. })) {
-                    self.foreign.retain(|prompt| prompt != id);
+                    decoded.cursor = Some(id.into());
                 }
                 if !self.prompts.is_empty()
                     || !matches!(self.work(), Some(PromptWork::Provider { .. }))
@@ -691,7 +689,6 @@ impl Codec {
         );
         self.set_work(None);
         if self.prompts.is_empty() {
-            self.foreign.clear();
             self.interrupted = None;
         } else {
             let turn = self.begin_provider();
@@ -1693,7 +1690,12 @@ fn grok_overlap_cursor_does_not_reimport_displayed_tail() {
         active: None,
     };
     let own = TurnId::new();
-    let Outbound::Prompt(prompt) = codec.start(own, "own prompt".into()).unwrap() else {
+    let Outbound::Prompt(prompt) = codec
+        .start(own, "own prompt".into())
+        .unwrap()
+        .take_outbound()
+        .remove(0)
+    else {
         panic!("prompt outbound");
     };
     let message = |id: &str, text: &str| json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":native.0,"_meta":{"promptId":id},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}});
@@ -1707,7 +1709,10 @@ fn grok_overlap_cursor_does_not_reimport_displayed_tail() {
     let promoted = codec
         .value(json!({"jsonrpc":"2.0","id":prompt["id"],"result":{"stopReason":"end_turn"}}))
         .unwrap();
-    let mut cursor = promoted.cursor.or(Some(own.to_string()));
+    let mut cursor = promoted
+        .cursor
+        .and_then(super::CursorUpdate::value)
+        .or(Some(own.to_string().into()));
     let wires = [
         message("foreign-first", "first"),
         message("foreign-newest", "newest"),
@@ -1719,7 +1724,7 @@ fn grok_overlap_cursor_does_not_reimport_displayed_tail() {
     for wire in wires {
         let decoded = codec.value(wire.clone()).unwrap();
         if decoded.cursor.is_some() {
-            cursor = decoded.cursor;
+            cursor = decoded.cursor.and_then(super::CursorUpdate::value);
         }
         let params = if wire["method"] == "_x.ai/session/prompt_complete" {
             json!({"sessionId":native.0,"update":{"sessionUpdate":"turn_completed","prompt_id":wire["params"]["promptId"]}})

@@ -320,6 +320,16 @@ async fn grok_no_first_frame_fails_at_60s() {
     })
     .await
     .unwrap();
+    let EngineMsg::Provider {
+        cursor: Some(cursor),
+        event: ProviderEvent::Session(SessionEvent::Dispatched { turn: dispatched }),
+        ..
+    } = events.try_recv().unwrap()
+    else {
+        panic!("missing dispatched cursor");
+    };
+    assert_eq!(dispatched, turn);
+    assert_eq!(cursor.value().as_deref(), Some(turn.to_string().as_str()));
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(59)).await;
     tokio::task::yield_now().await;

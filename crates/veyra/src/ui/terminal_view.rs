@@ -140,6 +140,7 @@ pub fn terminal_key_bytes(key: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> 
 }
 
 struct Grid {
+    app_cursor: bool,
     rows: Vec<Vec<Cell>>,
     palette: Vec<Option<Rgb>>,
     cursor: Option<(usize, usize, CursorShape)>,
@@ -153,6 +154,7 @@ fn snapshot(handle: &TerminalHandle) -> Option<Grid> {
     let term = &emulator.term;
     let cursor = term.renderable_content().cursor;
     Some(Grid {
+        app_cursor: term.mode().contains(TermMode::APP_CURSOR),
         rows: (0..term.screen_lines())
             .map(|row| {
                 (0..term.columns())
@@ -279,6 +281,7 @@ pub(super) struct TerminalView {
     focus: FocusHandle,
     resize: Option<(u16, u16)>,
     pending_frame: bool,
+    app_cursor: bool,
     error: Option<SharedString>,
     #[cfg(debug_assertions)]
     perf: FloodPerf,
@@ -341,6 +344,7 @@ impl TerminalView {
             focus,
             resize: None,
             pending_frame: false,
+            app_cursor: false,
             error: None,
             #[cfg(debug_assertions)]
             perf: FloodPerf::default(),
@@ -352,10 +356,7 @@ impl TerminalView {
         let Some(handle) = &self.handle else {
             return;
         };
-        let app_cursor = handle
-            .emulator()
-            .is_some_and(|emulator| emulator.lock().term.mode().contains(TermMode::APP_CURSOR));
-        if let Some(bytes) = terminal_key_bytes(&event.keystroke, app_cursor) {
+        if let Some(bytes) = terminal_key_bytes(&event.keystroke, self.app_cursor) {
             if let Err(error) = handle.write(&bytes) {
                 self.error = Some(error.to_string().into());
                 cx.notify();
@@ -427,6 +428,7 @@ impl TerminalView {
         let Some(grid) = self.handle.as_ref().and_then(snapshot) else {
             return frame;
         };
+        self.app_cursor = grid.app_cursor;
         #[cfg(debug_assertions)]
         {
             frame.flood = grid.flood;
@@ -823,6 +825,7 @@ mod window_tests {
     struct KeyWindow {
         terminal: gpui::Entity<TerminalView>,
         switches: Rc<Cell<usize>>,
+        new_threads: Rc<Cell<usize>>,
     }
     impl Render for KeyWindow {
         fn render(
@@ -831,10 +834,17 @@ mod window_tests {
             _: &mut gpui::Context<Self>,
         ) -> impl IntoElement {
             let switches = self.switches.clone();
+            let new_threads = self.new_threads.clone();
             gpui::div()
                 .size_full()
                 .key_context("Veyra")
                 .on_action(move |_: &actions::SwitchView, _, _| switches.set(switches.get() + 1))
+                .on_action(move |_: &actions::NewThread, _, _| {
+                    new_threads.set(new_threads.get() + 1)
+                })
+                .on_action(|_: &actions::DismissNotice, _, _| {})
+                .on_action(|_: &actions::ScrollTranscriptUp, _, _| {})
+                .on_action(|_: &actions::ScrollTranscriptDown, _, _| {})
                 .child(self.terminal.clone())
         }
     }
@@ -865,6 +875,7 @@ mod window_tests {
             KeyWindow {
                 terminal,
                 switches: switches.clone(),
+                new_threads: Rc::new(Cell::new(0)),
             }
         });
         let view = root.read_with(cx, |root, _| root.terminal.clone());
@@ -899,19 +910,32 @@ mod window_tests {
                 );
             });
         }
-        for key in ["shift-enter", "alt-left", "ctrl-l"] {
+        for key in [
+            "shift-enter",
+            "alt-left",
+            "ctrl-l",
+            "escape",
+            "pageup",
+            "pagedown",
+            "tab",
+            "ctrl-c",
+        ] {
             cx.simulate_keystrokes(key);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             draw(cx);
             let grid = fixture.handle.emulator().unwrap().lock().text().join(" ");
-            if grid.contains("51 c3 a9 1b 0d 1b 62 0c") {
+            if grid.contains("51 c3 a9 1b 0d 1b 62 0c 1b 1b 5b 35 7e 1b 5b 36 7e 09 03") {
                 break;
             }
             assert!(Instant::now() < deadline, "{grid}");
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert!(view.read_with(cx, |view, _| view.focused));
+        cx.simulate_keystrokes("secondary-n");
+        draw(cx);
+        assert_eq!(root.read_with(cx, |root, _| root.new_threads.get()), 1);
         let grid = fixture.handle.emulator().unwrap().lock().text();
         cx.simulate_keystrokes("secondary-shift-v");
         draw(cx);
@@ -922,5 +946,59 @@ mod window_tests {
             None
         );
         assert!(view.read_with(cx, |view, _| view.perf.repaints) > 0);
+    }
+    #[gpui::test]
+    fn terminal_keydown_does_not_wait_for_emulator(cx: &mut gpui::TestAppContext) {
+        let fixture = TerminalFixture::new();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            actions::init(cx);
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Theme::apply(Appearance::Dark, window, cx);
+            let terminal = cx.new(|cx| {
+                let mut terminal = TerminalView::new(None, window, cx);
+                terminal.handle = Some(fixture.handle.clone());
+                terminal
+            });
+            window.focus(&terminal.focus_handle(cx), cx);
+            KeyWindow {
+                terminal,
+                switches: Rc::new(Cell::new(0)),
+                new_threads: Rc::new(Cell::new(0)),
+            }
+        });
+        draw(cx);
+        let view = root.read_with(cx, |root, _| root.terminal.clone());
+        let handle = fixture.handle.clone();
+        let (ready, reached) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let _lock = handle.emulator().unwrap().lock();
+            ready.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_millis(300));
+        });
+        reached.recv_timeout(Duration::from_secs(2)).unwrap();
+        let elapsed = cx.update(|window, cx| {
+            let start = Instant::now();
+            view.update(cx, |view, cx| {
+                view.key(
+                    &gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("up").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                )
+            });
+            start.elapsed()
+        });
+        let _ = release.send(());
+        reader.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "keydown waited for emulator: {elapsed:?}"
+        );
     }
 }

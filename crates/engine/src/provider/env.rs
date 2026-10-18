@@ -62,6 +62,8 @@ pub struct ChildEnv {
     #[cfg(test)]
     pub(crate) before_spawn: Arc<Mutex<Option<SpawnPause>>>,
     #[cfg(test)]
+    pub(crate) terminal_controlling_tty: bool,
+    #[cfg(test)]
     pub(crate) close_before_user_write: Arc<AtomicBool>,
     resolution: Resolution,
     variables: std::collections::BTreeMap<OsString, OsString>,
@@ -128,6 +130,8 @@ impl ChildEnv {
             #[cfg(test)]
             before_spawn: Default::default(),
             #[cfg(test)]
+            terminal_controlling_tty: true,
+            #[cfg(test)]
             close_before_user_write: Default::default(),
             resolution: Resolution::Explicit(Default::default()),
             variables: Default::default(),
@@ -165,16 +169,10 @@ impl ChildEnv {
         }
         self
     }
-    pub(crate) fn claude_config_dir(&self) -> Result<PathBuf, ProviderError> {
+    pub(crate) fn variable(&self, name: &str) -> Option<&std::ffi::OsStr> {
         self.variables
-            .get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
-            .map(PathBuf::from)
-            .or_else(|| self.home.as_ref().map(|home| home.join(".claude")))
-            .ok_or_else(|| {
-                ProviderError::Protocol(
-                    "Claude history requires an explicit isolated config directory".into(),
-                )
-            })
+            .get(std::ffi::OsStr::new(name))
+            .map(OsString::as_os_str)
     }
     pub fn with_variable(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.variables.insert(key.into(), value.into());
@@ -778,6 +776,10 @@ fn tui_env_sets_term_and_strips_host() {
     ]);
     let env = ChildEnv::isolated().with_variable("CLAUDE_CONFIG_DIR", "/tmp/owned-claude-config");
     let actual = env.tui_environment(parent);
+    assert_eq!(
+        actual.get(std::ffi::OsStr::new("VEYRA_PARENT_PID")),
+        Some(&OsString::from(std::process::id().to_string()))
+    );
     assert_eq!(
         actual.get(std::ffi::OsStr::new("TERM")),
         Some(&OsString::from("xterm-256color"))

@@ -2,6 +2,12 @@ use super::*;
 use crate::live::needs_awake;
 
 #[test]
+fn an_open_terminal_does_not_hold_keep_awake() {
+    let f = Fixture::new(LiveState::Terminal);
+    assert!(!needs_awake(&f.actor.projection, &f.actor.live));
+}
+
+#[test]
 fn needs_awake_while_running_or_starting() {
     let mut f = Fixture::new(LiveState::Idle);
     assert!(!needs_awake(&f.actor.projection, &f.actor.live));

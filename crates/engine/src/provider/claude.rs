@@ -495,7 +495,7 @@ impl Codec {
             seen_commands: BTreeSet::new(),
         }
     }
-    pub fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
+    pub fn start(&mut self, turn: TurnId, text: String) -> Option<Decoded> {
         if self.active.is_some() {
             return None;
         }
@@ -504,10 +504,15 @@ impl Codec {
         self.stream = MessageStream::default();
         self.error = None;
         self.interrupted = None;
-        Some(Outbound::Prompt(json!({
-            "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
-            "parent_tool_use_id":null, "message":{"role":"user","content":text}
-        })))
+        Some(Decoded {
+            cursor: Some(turn.to_string().into()),
+            events: vec![ProviderEvent::Session(SessionEvent::Dispatched { turn })],
+            controls: vec![Outbound::Prompt(json!({
+                "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
+                "parent_tool_use_id":null, "message":{"role":"user","content":text}
+            }))],
+            ..Default::default()
+        })
     }
     fn prompt(&self) -> Option<TurnId> {
         self.active.and_then(ActiveTurn::id)
@@ -1274,6 +1279,79 @@ impl Codec {
     }
 }
 
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SessionEntryType {
+    User,
+    Assistant,
+    #[serde(other)]
+    Other,
+}
+#[derive(Default, Deserialize, PartialEq)]
+enum Entrypoint {
+    #[serde(rename = "cli")]
+    Cli,
+    #[serde(rename = "sdk-cli")]
+    SdkCli,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SessionOrigin {
+    Sdk,
+    #[serde(other)]
+    Other,
+}
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SessionBlock {
+    Text {
+        text: String,
+    },
+    #[serde(other)]
+    Other,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SessionContent {
+    Text(String),
+    Blocks(Vec<SessionBlock>),
+}
+#[derive(Deserialize)]
+struct SessionMessage {
+    content: SessionContent,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionEntry {
+    session_id: String,
+    uuid: String,
+    #[serde(rename = "parentUuid")]
+    _parent_uuid: serde::de::IgnoredAny,
+    is_sidechain: bool,
+    #[serde(rename = "type")]
+    kind: SessionEntryType,
+    #[serde(default)]
+    entrypoint: Entrypoint,
+    turn_origin: Option<SessionOrigin>,
+    message: Option<SessionMessage>,
+}
+
+pub(crate) fn config_dir(
+    env: &super::env::ChildEnv,
+) -> Result<std::path::PathBuf, super::ProviderError> {
+    env.variable("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env.home.as_ref().map(|home| home.join(".claude")))
+        .ok_or_else(|| {
+            super::ProviderError::Protocol(
+                "Claude history requires an explicit isolated config directory".into(),
+            )
+        })
+}
+
 pub fn session_file_import(
     root: &std::path::Path,
     native: &NativeSessionId,
@@ -1318,56 +1396,54 @@ pub fn session_file_import(
     };
     let mut history = super::History::default();
     let mut after = false;
-    let mut own = false;
     let mut include = false;
     let mut text = Vec::new();
     for line in std::io::BufReader::new(file).split(b'\n') {
-        let Ok(value): Result<Value, _> = serde_json::from_slice(&line?) else {
+        let Ok(entry): Result<SessionEntry, _> = serde_json::from_slice(&line?) else {
             continue;
         };
-        if value["sessionId"].as_str() != Some(&native.0) || value["isSidechain"] != false {
+        if entry.session_id != native.0 || entry.is_sidechain {
             continue;
         }
-        if value.get("parentUuid").is_none() {
-            continue;
-        }
-        let Some(uuid) = value["uuid"].as_str() else {
-            continue;
-        };
-        if value["type"] == "user" {
-            history.cursor = Some(uuid.into());
-        }
-        if value["type"] == "user" {
-            own = request.sent.contains(uuid)
-                || value["entrypoint"] == "sdk-cli"
-                || value["turnOrigin"] == "sdk";
+        if entry.kind == SessionEntryType::User {
+            history.cursor = Some(entry.uuid.clone().into());
         }
         if !after {
-            if request.cursor.as_deref() == Some(uuid) {
+            if request.cursor.as_deref() == Some(entry.uuid.as_str()) {
                 after = true;
             }
             continue;
         }
-        if value["type"] == "user" {
-            include = !own && value["entrypoint"] == "cli";
+        if entry.kind == SessionEntryType::User {
+            let own = request.sent.contains(&entry.uuid)
+                || entry.entrypoint == Entrypoint::SdkCli
+                || entry.turn_origin == Some(SessionOrigin::Sdk);
+            include = !own && entry.entrypoint == Entrypoint::Cli;
         }
-        if !include || value["entrypoint"] != "cli" {
+        if !include || entry.entrypoint != Entrypoint::Cli {
             continue;
         }
-        let content = &value["message"]["content"];
-        if value["type"] == "user"
-            && let Some(value) = content.as_str().filter(|text| !text.is_empty())
-        {
-            text.push(value.to_owned());
-        }
-        if value["type"] == "user" || value["type"] == "assistant" {
-            for block in content.as_array().into_iter().flatten() {
-                if block["type"] == "text"
-                    && let Some(value) = block["text"].as_str().filter(|text| !text.is_empty())
-                {
-                    text.push(value.to_owned());
+        match entry.message.map(|message| message.content) {
+            Some(SessionContent::Text(value)) if entry.kind == SessionEntryType::User => {
+                if !value.is_empty() {
+                    text.push(value);
                 }
             }
+            Some(SessionContent::Blocks(blocks))
+                if matches!(
+                    entry.kind,
+                    SessionEntryType::User | SessionEntryType::Assistant
+                ) =>
+            {
+                for block in blocks {
+                    if let SessionBlock::Text { text: value } = block
+                        && !value.is_empty()
+                    {
+                        text.push(value);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     history.failed = request.cursor.is_some() && !after;

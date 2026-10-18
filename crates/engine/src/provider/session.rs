@@ -812,7 +812,7 @@ async fn run_one(
             _ = out.closed() => { consumer_gone = true; break; }
             message = control.recv() => match message {
                 Some(SessionControl::StartTurn { turn, text }) => {
-                    let Some(prompt) = codec.start(turn, text) else {
+                    let Some(mut dispatched) = codec.start(turn, text) else {
                         if !emit(out, thread, epoch, ProviderEvent::Session(
                             SessionEvent::StartTurnRefused { turn }
                         )).await { consumer_gone = true; break; }
@@ -823,9 +823,18 @@ async fn run_one(
                         recorder.bind(turn.to_string(), format!("<id:turn:{turn}>"));
                     }
                     *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
-                    if let Err(error) = process.send(&writer, prompt) {
-                        failure = Some(error.to_string());
-                        break;
+                    for event in std::mem::take(&mut dispatched.events) {
+                        if out.send(EngineMsg::Provider { thread, epoch, cursor: dispatched.cursor.take(), event }).await.is_err() {
+                            consumer_gone = true;
+                            break;
+                        }
+                    }
+                    if consumer_gone { break; }
+                    for prompt in dispatched.take_outbound() {
+                        if let Err(error) = process.send(&writer, prompt) {
+                            failure = Some(error.to_string());
+                            break;
+                        }
                     }
                 }
                 Some(shutdown @ (SessionControl::Shutdown | SessionControl::ShutdownForTerminal)) => {
@@ -1324,7 +1333,7 @@ impl Codec {
             Self::Grok(c) => c.active(),
         }
     }
-    fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
+    fn start(&mut self, turn: TurnId, text: String) -> Option<Decoded> {
         match self {
             Self::Claude(c) => c.start(turn, text),
             Self::Codex(c) => c.start(turn, text),
@@ -1597,6 +1606,18 @@ mod tests {
         assert!(stderr.is_finished());
     }
 
+    fn expect_claude_dispatch(message: EngineMsg) {
+        let EngineMsg::Provider {
+            cursor: Some(cursor),
+            event: ProviderEvent::Session(SessionEvent::Dispatched { turn }),
+            ..
+        } = message
+        else {
+            panic!("missing dispatched cursor");
+        };
+        assert_eq!(cursor.value().as_deref(), Some(turn.to_string().as_str()));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn natural_exit_after_stdout_eof_wakes_without_a_timer() {
         let env = ChildEnv::load();
@@ -1632,8 +1653,13 @@ mod tests {
             run_one(process, &mut control, &out, ThreadId::new(), 1, false).await
         });
         let end = std::time::Instant::now() + Duration::from_secs(5);
+        let mut dispatched = None;
         let ended = loop {
             if let Ok(event) = events.try_recv() {
+                if dispatched.is_none() {
+                    dispatched = Some(event);
+                    continue;
+                }
                 break Some(event);
             }
             if std::time::Instant::now() >= end {
@@ -1644,6 +1670,7 @@ mod tests {
         tokio::time::resume();
         task.await.unwrap();
         assert!(!platform::group_exists(pid).unwrap());
+        expect_claude_dispatch(dispatched.unwrap());
         let EngineMsg::Provider {
             event:
                 ProviderEvent::Turn {
@@ -1711,6 +1738,7 @@ mod tests {
             let (out, mut events) = mpsc::channel(256);
             run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
             assert!(!platform::group_exists(pid).unwrap());
+            expect_claude_dispatch(events.try_recv().unwrap());
             let EngineMsg::Provider {
                 event:
                     ProviderEvent::Turn {
@@ -1771,6 +1799,7 @@ mod tests {
         let (out, mut events) = mpsc::channel(256);
         run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
         assert!(!platform::group_exists(pid).unwrap());
+        expect_claude_dispatch(events.try_recv().unwrap());
         let EngineMsg::Provider {
             event:
                 ProviderEvent::Turn {
@@ -1826,6 +1855,7 @@ mod tests {
         let task = tokio::spawn(async move {
             run_one(process, &mut control, &out, ThreadId::new(), 1, false).await
         });
+        let dispatched = tokio::time::timeout(Duration::from_secs(9), events.recv()).await;
         let ended = tokio::time::timeout(Duration::from_secs(9), events.recv())
             .await
             .unwrap()
@@ -1833,6 +1863,7 @@ mod tests {
         let elapsed = start.elapsed();
         task.await.unwrap();
         assert!(!platform::group_exists(pid).unwrap());
+        expect_claude_dispatch(dispatched.unwrap().unwrap());
         assert!(
             elapsed < Duration::from_secs(1),
             "EOF observation added a grace period: {elapsed:?}"
@@ -1911,13 +1942,16 @@ mod tests {
             })
             .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let dispatched = events.recv().await.unwrap();
             let failed = events.recv().await.unwrap();
             let exited = events.recv().await.unwrap();
-            (failed, exited)
+            (dispatched, failed, exited)
         })
         .await;
         assert!(!platform::group_exists(pid).unwrap());
-        let (failed, exited) = result.expect("cleanup must return after the two one-second waits");
+        let (dispatched, failed, exited) =
+            result.expect("cleanup must return after the two one-second waits");
+        expect_claude_dispatch(dispatched);
         let expected = "Claude protocol: expected ident at line 1 column 2";
         assert!(matches!(failed, EngineMsg::Provider {
             event: ProviderEvent::Turn {
@@ -2044,6 +2078,7 @@ mod tests {
         };
         assert_eq!(text, expected);
         assert!(!platform::group_exists(pid).unwrap());
+        expect_claude_dispatch(events.try_recv().unwrap());
         assert!(matches!(
             events.try_recv().unwrap(),
             EngineMsg::Provider {

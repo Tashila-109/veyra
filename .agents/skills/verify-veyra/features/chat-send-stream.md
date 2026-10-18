@@ -223,7 +223,8 @@ capture('chat-failed-tool')
 index = next(i for i,item in enumerate(tool_dump['transcript']['items']) if item['id']==failed_row['id'])
 old_top = poll('chat-failed-tool-measured',lambda d: d['transcript']['item_tops'][index] is not None)['transcript']['item_tops'][index]
 action('chat-failed-tool-expand','ToggleItem',{'item':failed_row['id']})
-expanded = poll('chat-failed-tool-expanded',lambda d: next(item for item in d['transcript']['items'] if item['id']==failed_row['id'])['expanded'])
+expanded = poll('chat-failed-tool-expanded',lambda d: next(item for item in d['transcript']['items'] if item['id']==failed_row['id'])['expanded']
+    and d['transcript']['item_tops'][index] is not None)
 assert abs(expanded['transcript']['item_tops'][index]-old_top)<1
 capture('chat-failed-tool-expanded')
 signed = create('chat-signed-out','Sign-in failure',scenario='assistant-error-signed-out')

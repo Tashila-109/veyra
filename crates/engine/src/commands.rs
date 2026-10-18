@@ -248,6 +248,22 @@ pub fn queue(p: &Projection, c: &mut ChangeSet, thread: ThreadId, origin: TurnOr
     c.turns.insert(turn.id, turn.clone());
     turn.id
 }
+pub fn queue_import(p: &Projection, c: &mut ChangeSet, thread: ThreadId) -> TurnId {
+    let mut queued: Vec<_> = c
+        .turns(p, thread)
+        .filter(|turn| turn.state == TurnState::Queued)
+        .cloned()
+        .collect();
+    queued.sort_by_key(|turn| turn.ordinal);
+    let id = queue(p, c, thread, TurnOrigin::Provider);
+    let ordinal = c.turns[&id].ordinal;
+    for (index, mut turn) in queued.into_iter().enumerate() {
+        turn.ordinal = ordinal + index as u32 + 1;
+        c.events.push(Ev::TurnQueued(turn.clone()));
+        c.turns.insert(turn.id, turn);
+    }
+    id
+}
 pub fn add_item(p: &Projection, c: &mut ChangeSet, mut item: Item) {
     item.seq = c.items(p, item.thread).map(|i| i.seq).max().unwrap_or(0) + 1;
     c.events.push(Ev::ItemAdded(item.clone()));
@@ -563,7 +579,7 @@ fn switch_view(
         }
         Live::Terminal { pid, .. } if to == View::Chat => {
             c.effects.push(Effect::StopTerminal { thread });
-            t.import_pending = pid.is_some();
+            t.import_pending |= pid.is_some();
             stopping(
                 l,
                 c,
@@ -705,7 +721,7 @@ pub(crate) fn stop_one(
             stopping(l, c, thread, AfterStop::Park);
             let mut row = c.thread(p, thread).unwrap().clone();
             row.view = View::Chat;
-            row.import_pending = pid.is_some();
+            row.import_pending |= pid.is_some();
             c.threads.insert(thread, row);
         }
         Live::Stopping { then } => {
@@ -713,7 +729,7 @@ pub(crate) fn stop_one(
             stopping(l, c, thread, AfterStop::Park);
             let mut row = c.thread(p, thread).unwrap().clone();
             row.view = View::Chat;
-            row.import_pending = imported;
+            row.import_pending |= imported;
             c.threads.insert(thread, row);
         }
         Live::Parked | Live::Structured { .. } => {}
@@ -869,14 +885,6 @@ pub fn start_changed(
                 t.state = TurnState::Running { since: now };
                 c.events.push(Ev::TurnStarted(t.clone()));
                 c.turns.insert(t.id, t.clone());
-                let mut row = c.thread(p, id).unwrap().clone();
-                row.native_cursor = match row.provider {
-                    crate::provider::ProviderKind::Codex => None,
-                    crate::provider::ProviderKind::Claude | crate::provider::ProviderKind::Grok => {
-                        Some(t.id.to_string())
-                    }
-                };
-                c.threads.insert(id, row);
                 let mut live = c.live(l, id).clone();
                 live.admission = Some(TurnAdmission::Pending(t.id));
                 c.live.insert(id, live);

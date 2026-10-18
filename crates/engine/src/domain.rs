@@ -25,6 +25,25 @@ id!(ProjectId, ThreadId, TurnId, ItemId, RequestId, TaskId);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSessionId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NativeCursor(pub String);
+impl From<String> for NativeCursor {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for NativeCursor {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+impl std::ops::Deref for NativeCursor {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeRequestRef(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NativeItemKey(pub String);
@@ -44,7 +63,7 @@ pub struct Thread {
     pub config: ThreadConfig,
     pub cwd: PathBuf,
     pub native: Option<NativeSessionId>,
-    pub native_cursor: Option<String>,
+    pub native_cursor: Option<NativeCursor>,
     pub cli_version: Option<String>,
     pub hold: Option<HoldReason>,
     pub view: View,

@@ -269,6 +269,7 @@ impl Codec {
             .history_turns
             .first()
             .and_then(|turn| turn.id.clone())
+            .map(Into::into)
             .or_else(|| request.cursor.clone());
         let mut text = Vec::new();
         if !failed && request.cursor.is_some() {
@@ -329,7 +330,7 @@ impl Codec {
         }
         Ok(())
     }
-    pub(crate) fn start(&mut self, turn: TurnId, text: String) -> Option<Outbound> {
+    pub(crate) fn start(&mut self, turn: TurnId, text: String) -> Option<Decoded> {
         if self.active().is_some() {
             return None;
         }
@@ -341,11 +342,16 @@ impl Codec {
         };
         self.interrupted = None;
         let params = turn_params(&native, &self.spec.config, text);
-        Some(Outbound::Prompt(self.peer.send(
-            Call::Start(turn),
-            "turn/start",
-            params,
-        )))
+        Some(Decoded {
+            cursor: Some(super::CursorUpdate::Unknown),
+            events: vec![ProviderEvent::Session(SessionEvent::Dispatched { turn })],
+            controls: vec![Outbound::Prompt(self.peer.send(
+                Call::Start(turn),
+                "turn/start",
+                params,
+            ))],
+            ..Default::default()
+        })
     }
     pub(crate) fn value(&mut self, value: Value) -> Result<Decoded, ProviderError> {
         let mut decoded = Decoded::default();
@@ -499,7 +505,7 @@ impl Codec {
                     }
                     _ => vec![],
                 };
-                decoded.cursor = Some(id.clone());
+                decoded.cursor = Some(id.clone().into());
                 self.turns.entry(id).or_insert(Turn {
                     owner: ActiveTurn::Veyra(turn),
                     phase: TurnPhase::Pending,
@@ -713,7 +719,7 @@ impl Codec {
         let agent = matches!(&notification, N::AgentDelta { params: _ });
         match notification {
             N::TurnStarted { params: _ } => {
-                decoded.cursor = Some(id.clone());
+                decoded.cursor = Some(id.clone().into());
                 if let Some(turn) = self.turns.get_mut(&id)
                     && turn.phase == TurnPhase::Pending
                 {

@@ -245,6 +245,7 @@ pub fn bindings() -> Vec<Binding> {
         binding!(ChooseAsyncOption, "secondary-9", Some("Veyra"), option: 8),
     ]
 }
+
 pub fn shortcut<A: Action + Default>() -> Option<String> {
     bindings()
         .iter()
@@ -278,12 +279,30 @@ pub fn shortcut_chip<A: Action + Default>(cx: &App) -> impl IntoElement {
 }
 pub fn init(cx: &mut App) {
     cx.bind_keys(bindings().into_iter().map(|binding| {
+        let key = Keystroke::parse(binding.chord).expect("valid window binding");
+        let mut context = binding
+            .context
+            .map(|context| KeyBindingContextPredicate::parse(context).unwrap());
+        if !key.modifiers.platform
+            || (matches!(key.key.as_str(), "left" | "right")
+                && !key.modifiers.shift
+                && !key.modifiers.alt
+                && !key.modifiers.control)
+        {
+            let outside_terminal = KeyBindingContextPredicate::Not(Box::new(
+                KeyBindingContextPredicate::Identifier("VeyraTerminal".into()),
+            ));
+            context = Some(match context {
+                Some(context) => {
+                    KeyBindingContextPredicate::And(Box::new(context), Box::new(outside_terminal))
+                }
+                None => outside_terminal,
+            });
+        }
         KeyBinding::load(
             binding.chord,
             (binding.build)(),
-            binding
-                .context
-                .map(|context| KeyBindingContextPredicate::parse(context).unwrap().into()),
+            context.map(Into::into),
             false,
             None,
             &DummyKeyboardMapper,

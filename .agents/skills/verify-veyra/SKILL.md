@@ -112,6 +112,7 @@ if LANE == 'fake':
         VEYRA_GROK_BIN=str(DATA/'fake-cli'),
         VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()))
 else:
+    ENV.pop('CLAUDE_CONFIG_DIR',None)
     ENV['VEYRA_RECORD'] = str(PROOF.resolve()/'rec')
 lib = ctypes.CDLL(None,use_errno=True)
 lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,

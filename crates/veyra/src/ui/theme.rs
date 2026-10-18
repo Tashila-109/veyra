@@ -588,14 +588,9 @@ impl TerminalPalette {
         }
         match index {
             0..16 => self.ansi[index],
-            16..232 => {
-                let n = index - 16;
-                let channel = |v| if v == 0 { 0 } else { (v * 40 + 55) as u32 };
-                rgb(channel(n / 36) * 65536 + channel(n / 6 % 6) * 256 + channel(n % 6)).into()
-            }
-            232..256 => {
-                let channel = (index as u32 - 232) * 10 + 8;
-                rgb(channel * 65793).into()
+            16..256 => {
+                let color = veyra_engine::terminal::xterm_color(index as u8);
+                rgb(color.r as u32 * 65536 + color.g as u32 * 256 + color.b as u32).into()
             }
             n if n == NamedColor::Background as usize => self.bg,
             n if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&n) => {

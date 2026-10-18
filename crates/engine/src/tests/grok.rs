@@ -1246,7 +1246,9 @@ fn grok_non_full_access_disables_auto_on_every_open() {
                 );
             }
             assert!(matches!(
-                codec.start(TurnId::new(), "work".into()),
+                codec
+                    .start(TurnId::new(), "work".into())
+                    .map(|mut decoded| decoded.take_outbound().remove(0)),
                 Some(Outbound::Prompt(_))
             ));
         }

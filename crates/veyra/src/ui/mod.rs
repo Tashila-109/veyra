@@ -426,10 +426,24 @@ impl AppState {
         let Some(items) = self.items.get(&thread) else {
             return;
         };
+        let mut imports: Vec<_> = items
+            .values()
+            .filter(|item| matches!(item.body, ItemBody::TerminalSpan(_)))
+            .filter_map(|item| self.turns.get(&item.turn).map(|turn| turn.ordinal))
+            .collect();
+        imports.sort_unstable();
+        imports.dedup();
         let mut ids: Vec<_> = items.keys().copied().collect();
         ids.sort_by_key(|id| {
             let item = &items[id];
+            let ordinal = self
+                .turns
+                .get(&item.turn)
+                .map_or(u32::MAX, |turn| turn.ordinal);
+            let section = imports.partition_point(|&import| import < ordinal) * 2
+                + usize::from(imports.binary_search(&ordinal).is_ok());
             (
+                section,
                 self.turns
                     .get(&item.turn)
                     .map(Turn::recency)
@@ -1173,10 +1187,7 @@ impl Shell {
         let current = self.terminal.as_ref().is_some_and(|(id, view)| {
             *id == thread
                 && match (&view.read(cx).handle, &handle) {
-                    (Some(old), Some(new)) => match (&old.terminal, &new.terminal) {
-                        (Some(old), Some(new)) => std::sync::Arc::ptr_eq(old, new),
-                        _ => false,
-                    },
+                    (Some(old), Some(new)) => old.same(new),
                     (None, None) => true,
                     _ => false,
                 }
@@ -1387,16 +1398,15 @@ impl Shell {
         self.send_command(command, window, cx);
     }
     fn busy_threads(&self) -> Vec<String> {
-        self.engine
-            .window_threads()
-            .iter()
-            .filter(|(_, state)| state.busy)
-            .filter_map(|(id, _)| {
-                self.state
-                    .threads
-                    .get(id)
-                    .map(|thread| thread.title.clone())
+        let work = self.engine.window_threads();
+        self.state
+            .threads
+            .values()
+            .filter(|thread| {
+                thread.view == View::Terminal
+                    || work.get(&thread.id).is_some_and(|state| state.busy)
             })
+            .map(|thread| thread.title.clone())
             .collect()
     }
     fn stop_target(&self) -> Option<StopTarget> {
@@ -1553,6 +1563,13 @@ impl Shell {
                     .border_color(t.colors.border_strong)
                     .child(div().text_size(t.text.h2.size).child("Quit Veyra?"))
                     .child("Quitting stops these threads:")
+                    .when(
+                        self.state
+                            .threads
+                            .values()
+                            .any(|thread| thread.view == View::Terminal),
+                        |sheet| sheet.child("Quitting ends any open CLI session."),
+                    )
                     .children(
                         self.busy_threads()
                             .into_iter()
@@ -7357,7 +7374,7 @@ mod tests {
             events
                 .send(UiEvent::Change {
                     counter: Some(1),
-                    event: ChangeEvent::ThreadCreated(Box::new(row.clone())),
+                    event: ChangeEvent::ThreadUpdated(Box::new(row.clone())),
                 })
                 .unwrap();
             draw(cx);
@@ -7375,7 +7392,7 @@ mod tests {
             events
                 .send(UiEvent::Change {
                     counter: Some(2),
-                    event: ChangeEvent::ThreadCreated(Box::new(row)),
+                    event: ChangeEvent::ThreadUpdated(Box::new(row)),
                 })
                 .unwrap();
             draw(cx);
@@ -7391,5 +7408,99 @@ mod tests {
                 shell.input.focus_handle(cx).is_focused(window)
             }));
         });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn open_terminal_uses_the_quit_sheet_and_command_new_thread(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.state.threads.get_mut(&thread).unwrap().view = View::Terminal;
+                cx.notify();
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, cx| {
+                shell.terminal.as_ref().unwrap().1.read(cx).dump()["focused"] == true
+            }));
+            cx.simulate_keystrokes("secondary-q");
+            draw(cx);
+            assert!(
+                shell.read_with(cx, |shell, _| shell.quit_sheet),
+                "open terminal bypassed quit confirmation"
+            );
+            shell.update_in(cx, |shell, window, cx| {
+                shell.quit_sheet = false;
+                use gpui::Focusable;
+                window.focus(&shell.terminal.as_ref().unwrap().1.focus_handle(cx), cx);
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-n");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| matches!(
+                shell.view,
+                super::MainView::NewThread
+            )));
+        });
+    }
+
+    #[test]
+    fn terminal_spans_bound_transcript_order_independently_of_time() {
+        for later_time in [0, 100, 200] {
+            let thread = ThreadId::new();
+            let imported = TurnId::new();
+            let queued = TurnId::new();
+            let mut state = AppState::default();
+            for (turn, ordinal, at, body) in [
+                (
+                    queued,
+                    2,
+                    later_time,
+                    ItemBody::UserText("new prompt".into()),
+                ),
+                (
+                    imported,
+                    1,
+                    100,
+                    ItemBody::TerminalSpan(TerminalSpan {
+                        text: "terminal first".into(),
+                    }),
+                ),
+            ] {
+                state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::TurnEnded(Turn {
+                        id: turn,
+                        thread,
+                        ordinal,
+                        origin: TurnOrigin::Provider,
+                        state: TurnState::Ended {
+                            outcome: TurnOutcome::Completed,
+                            started: Some(at),
+                            at,
+                        },
+                    }),
+                });
+                state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemAdded(Item {
+                        id: ItemId::new(),
+                        thread,
+                        turn,
+                        seq: ordinal,
+                        body,
+                    }),
+                });
+            }
+            assert_eq!(
+                state
+                    .transcript(thread)
+                    .iter()
+                    .map(|item| item.turn)
+                    .collect::<Vec<_>>(),
+                [imported, queued]
+            );
+        }
     }
 }

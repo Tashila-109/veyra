@@ -136,7 +136,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
                 json(&t.config)?,
                 t.cwd.to_string_lossy(),
                 t.native.as_ref().map(|n| &n.0),
-                t.native_cursor,
+                t.native_cursor.as_deref(),
                 t.cli_version.as_deref(),
                 t.hold.as_ref().map(word).transpose()?,
                 word(&t.view)?,
@@ -350,7 +350,7 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             config: parse(r.get(7)?)?,
             cwd: Path::new(&r.get::<_, String>(8)?).to_owned(),
             native: r.get::<_, Option<String>>(9)?.map(NativeSessionId),
-            native_cursor: r.get(10)?,
+            native_cursor: r.get::<_, Option<String>>(10)?.map(NativeCursor),
             cli_version: r
                 .get::<_, Option<String>>(11)?
                 .filter(|version| !version.is_empty()),

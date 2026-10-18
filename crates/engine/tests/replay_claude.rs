@@ -1834,7 +1834,7 @@ fn blocked_writer_without_stop_leaves_provider_turn_completed() {
 
 #[test]
 fn claude_session_file_import() {
-    use veyra_engine::provider::{History, HistoryRequest, claude::session_file_import};
+    use veyra_engine::provider::{History, HistoryRequest};
     let root = std::path::Path::new("/tmp").join(format!("veyra-term-import-{}", ThreadId::new()));
     std::fs::create_dir_all(root.join("projects/isolated-project")).unwrap();
     let scratch = Scratch(root);
@@ -1849,12 +1849,7 @@ fn claude_session_file_import() {
         cursor: Some("old-user".into()),
         sent: ["sent".into()].into(),
     };
-    let imported = session_file_import(
-        &scratch.0,
-        &NativeSessionId("native-import".into()),
-        &request,
-    )
-    .unwrap();
+    let imported = claude_history_from_config_env(&scratch.0, &request);
     assert_eq!(
         imported,
         History {
@@ -1863,15 +1858,13 @@ fn claude_session_file_import() {
             text: "second\nreply second".into()
         }
     );
-    let repeat = session_file_import(
+    let repeat = claude_history_from_config_env(
         &scratch.0,
-        &NativeSessionId("native-import".into()),
         &HistoryRequest {
             cursor: imported.cursor,
             ..request
         },
-    )
-    .unwrap();
+    );
     assert_eq!(repeat.text, "");
     assert_eq!(repeat.cursor.as_deref(), Some("new-user"));
 }
@@ -1983,4 +1976,74 @@ fn fake_claude_tui_requires_isolated_config() {
             .unwrap()
             .contains("requires CLAUDE_CONFIG_DIR")
     );
+}
+
+fn claude_history_from_config_env(root: &Path, request: &HistoryRequest) -> History {
+    let records = [
+        serde_json::json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
+        serde_json::json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}),
+        serde_json::json!({"type":"spin","ms":10000}),
+    ];
+    fs::write(
+        root.join("t1-s1.jsonl"),
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let mut env = ChildEnv::isolated()
+        .with_binary(
+            ProviderKind::Claude,
+            env!("CARGO_BIN_EXE_veyra-fake-cli").into(),
+        )
+        .with_variable("CLAUDE_CONFIG_DIR", root);
+    env.fixtures = Some(root.to_owned());
+    Runtime::new().unwrap().block_on(async {
+        let (out, mut events) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: root.to_owned(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::FullAccess,
+                },
+                native: Some(NativeSessionId("native-import".into())),
+                import: Some(request.clone()),
+                root: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let mut history = None;
+        let exited = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = events.recv().await {
+                if let EngineMsg::Provider { event, .. } = message {
+                    match event {
+                        ProviderEvent::Session(SessionEvent::History {
+                            history: value, ..
+                        }) => history = Some(value),
+                        ProviderEvent::Session(SessionEvent::Ready { .. }) => {
+                            let _ = handle.control.send(SessionControl::Shutdown);
+                        }
+                        ProviderEvent::Session(SessionEvent::Exited { crash }) => {
+                            assert!(crash.is_none(), "{crash:?}");
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            panic!("config environment session lost Exited");
+        })
+        .await;
+        let _ = handle.control.send(SessionControl::Shutdown);
+        exited.unwrap();
+        history.expect("Claude History through config environment")
+    })
 }

@@ -477,7 +477,7 @@ pub fn peer_pid(stream: &Socket) -> io::Result<u32> {
     }
     Ok(pid as u32)
 }
-pub fn parent_pid(pid: u32) -> io::Result<u32> {
+fn bsd_info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
     if unsafe {
@@ -492,7 +492,64 @@ pub fn parent_pid(pid: u32) -> io::Result<u32> {
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(unsafe { info.assume_init() }.pbi_ppid)
+    Ok(unsafe { info.assume_init() })
+}
+pub fn parent_pid(pid: u32) -> io::Result<u32> {
+    bsd_info(pid).map(|info| info.pbi_ppid)
+}
+const VNODE_FD_INFO: i32 = 1;
+
+#[repr(C)]
+struct DescriptorInfo {
+    flags: u32,
+    status: u32,
+    offset: i64,
+    kind: i32,
+    guard: u32,
+}
+#[repr(C)]
+struct VnodeDescriptor {
+    file: DescriptorInfo,
+    vnode: libc::vnode_info,
+}
+fn descriptor_device(pid: u32, fd: i32) -> io::Result<u32> {
+    let mut info = std::mem::MaybeUninit::<VnodeDescriptor>::uninit();
+    let size = std::mem::size_of::<VnodeDescriptor>();
+    if unsafe {
+        libc::proc_pidfdinfo(
+            pid as i32,
+            fd,
+            VNODE_FD_INFO,
+            info.as_mut_ptr().cast(),
+            size as i32,
+        )
+    } != size as i32
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { info.assume_init() }.vnode.vi_stat;
+    if stat.vst_mode & libc::S_IFMT != libc::S_IFCHR {
+        return Err(io::Error::other("descriptor is not a character device"));
+    }
+    Ok(stat.vst_rdev)
+}
+pub fn terminal_device(pid: u32) -> io::Result<u32> {
+    let device = bsd_info(pid)?.e_tdev;
+    if device != u32::MAX {
+        Ok(device)
+    } else {
+        descriptor_device(pid, 0)
+    }
+}
+pub fn terminal_holder(device: u32) -> Option<u32> {
+    if device == u32::MAX {
+        return None;
+    }
+    list_processes().ok()?.into_iter().find_map(|process| {
+        (bsd_info(process.pid).is_ok_and(|info| info.e_tdev == device)
+            || (0..3).any(|fd| descriptor_device(process.pid, fd).ok() == Some(device)))
+        .then_some(process.pid)
+    })
 }
 pub fn exe_path(pid: u32) -> io::Result<PathBuf> {
     process_executable(pid)
@@ -548,6 +605,35 @@ mod tests {
         }));
         assert!(rss.unwrap() > 0);
         assert!(alive.unwrap());
+        assert!(!is_alive(pid).unwrap());
+    }
+    #[test]
+    fn terminal_holder_finds_an_owner_without_a_controlling_terminal() {
+        struct OwnedPtyChild(Box<dyn portable_pty::Child + Send + Sync>);
+        impl Drop for OwnedPtyChild {
+            fn drop(&mut self) {
+                let _ = signal_group(self.0.process_id().unwrap(), crate::platform::Signal::Kill);
+                let _ = self.0.wait();
+            }
+        }
+        let pair = portable_pty::native_pty_system()
+            .openpty(Default::default())
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new("/bin/sleep");
+        command.arg("30");
+        command.set_controlling_tty(false);
+        command.env("VEYRA_PARENT_PID", std::process::id().to_string());
+        let child = OwnedPtyChild(pair.slave.spawn_command(command).unwrap());
+        drop(pair.slave);
+        let pid = child.0.process_id().unwrap();
+        let device = terminal_device(pid).unwrap();
+        assert_ne!(device, u32::MAX);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while terminal_holder(device) != Some(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(terminal_holder(device), Some(pid));
+        drop(child);
         assert!(!is_alive(pid).unwrap());
     }
     #[test]

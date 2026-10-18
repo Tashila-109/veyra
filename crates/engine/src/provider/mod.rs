@@ -30,12 +30,12 @@ pub struct SessionSpec {
 }
 #[derive(Clone, Debug, Default)]
 pub struct HistoryRequest {
-    pub cursor: Option<String>,
+    pub cursor: Option<NativeCursor>,
     pub sent: std::collections::BTreeSet<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct History {
-    pub cursor: Option<String>,
+    pub cursor: Option<NativeCursor>,
     pub text: String,
     pub failed: bool,
 }
@@ -91,6 +91,9 @@ pub enum ProviderEvent {
 }
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
+    Dispatched {
+        turn: TurnId,
+    },
     History {
         native: NativeSessionId,
         history: History,
@@ -188,9 +191,15 @@ impl TurnEvent {
 #[derive(Clone, Debug)]
 pub struct TerminalHandle {
     pub(crate) control: mpsc::UnboundedSender<TerminalControl>,
-    pub terminal: Option<std::sync::Arc<crate::terminal::Terminal>>,
+    pub(crate) terminal: Option<std::sync::Arc<crate::terminal::Terminal>>,
 }
 impl TerminalHandle {
+    pub fn same(&self, other: &Self) -> bool {
+        match (&self.terminal, &other.terminal) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
     pub fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.terminal
             .as_ref()
@@ -547,9 +556,32 @@ impl Outbound {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CursorUpdate {
+    Known(NativeCursor),
+    Unknown,
+}
+impl CursorUpdate {
+    pub fn value(self) -> Option<NativeCursor> {
+        match self {
+            Self::Known(cursor) => Some(cursor),
+            Self::Unknown => None,
+        }
+    }
+}
+impl From<String> for CursorUpdate {
+    fn from(value: String) -> Self {
+        Self::Known(value.into())
+    }
+}
+impl From<&str> for CursorUpdate {
+    fn from(value: &str) -> Self {
+        Self::Known(value.into())
+    }
+}
 #[derive(Default)]
 pub(crate) struct Decoded {
-    pub cursor: Option<String>,
+    pub cursor: Option<CursorUpdate>,
     pub history: Option<History>,
     pub events: Vec<ProviderEvent>,
     pub replies: Vec<serde_json::Value>,
@@ -589,7 +621,7 @@ impl ProviderKind {
     ) -> Option<History> {
         match self {
             Self::Claude => Some(
-                env.claude_config_dir()
+                claude::config_dir(env)
                     .and_then(|root| claude::session_file_import(&root, native, request))
                     .unwrap_or(History {
                         failed: true,

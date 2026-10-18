@@ -85,32 +85,39 @@ impl Colors {
                 self.foreground
             }
             index if index == NamedColor::Background as usize => self.background,
-            16..=231 => {
-                let value = index - 16;
-                let channel = |part| if part == 0 { 0 } else { (55 + part * 40) as u8 };
-                Rgb {
-                    r: channel(value / 36),
-                    g: channel(value / 6 % 6),
-                    b: channel(value % 6),
-                }
+            _ => xterm_color((index % 256) as u8),
+        }
+    }
+}
+
+pub fn xterm_color(index: u8) -> Rgb {
+    let index = index as usize;
+    match index {
+        16..=231 => {
+            let value = index - 16;
+            let channel = |part| if part == 0 { 0 } else { (55 + part * 40) as u8 };
+            Rgb {
+                r: channel(value / 36),
+                g: channel(value / 6 % 6),
+                b: channel(value % 6),
             }
-            232..=255 => {
-                let value = (8 + 10 * (index - 232)) as u8;
-                Rgb {
-                    r: value,
-                    g: value,
-                    b: value,
-                }
+        }
+        232..=255 => {
+            let value = (8 + 10 * (index - 232)) as u8;
+            Rgb {
+                r: value,
+                g: value,
+                b: value,
             }
-            _ => {
-                let value = index % 16;
-                let level = if value >= 8 { 255 } else { 170 };
-                let low = if value >= 8 { 85 } else { 0 };
-                Rgb {
-                    r: if value & 1 != 0 { level } else { low },
-                    g: if value & 2 != 0 { level } else { low },
-                    b: if value & 4 != 0 { level } else { low },
-                }
+        }
+        _ => {
+            let value = index % 16;
+            let level = if value >= 8 { 255 } else { 170 };
+            let low = if value >= 8 { 85 } else { 0 };
+            Rgb {
+                r: if value & 1 != 0 { level } else { low },
+                g: if value & 2 != 0 { level } else { low },
+                b: if value & 4 != 0 { level } else { low },
             }
         }
     }
@@ -121,7 +128,6 @@ pub struct Emulator {
     parser: Processor,
     colors: Colors,
     listener: Listener,
-    pub title: Option<String>,
     #[cfg(debug_assertions)]
     pub flood: FloodStamps,
 }
@@ -155,7 +161,6 @@ impl Emulator {
             colors,
             parser: Processor::new(),
             listener,
-            title: None,
             #[cfg(debug_assertions)]
             flood: FloodStamps::default(),
         }
@@ -164,10 +169,13 @@ impl Emulator {
         let mut reply = Vec::new();
         #[cfg(debug_assertions)]
         let mut parsed = consumed - bytes.len() as u64;
-        for part in bytes
+        #[cfg(debug_assertions)]
+        let parts = bytes
             .split_inclusive(|byte| *byte == 7 || *byte == b'\\')
-            .chain(bytes.is_empty().then_some(&[][..]))
-        {
+            .chain(bytes.is_empty().then_some(&[][..]));
+        #[cfg(not(debug_assertions))]
+        let parts = std::iter::once(bytes);
+        for part in parts {
             #[cfg(debug_assertions)]
             {
                 parsed += part.len() as u64;
@@ -198,9 +206,9 @@ impl Emulator {
                                 _ => {}
                             }
                         }
-                        self.title = Some(title);
+                        #[cfg(not(debug_assertions))]
+                        let _ = title;
                     }
-                    Event::ResetTitle => self.title = None,
                     _ => {}
                 }
             }
@@ -221,6 +229,18 @@ impl Emulator {
         } else {
             false
         }
+    }
+    fn visible_tail(&self) -> String {
+        let mut lines: Vec<_> = self
+            .text()
+            .into_iter()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .rev()
+            .take(10)
+            .collect();
+        lines.reverse();
+        lines.join("\n")
     }
     pub fn text(&self) -> Vec<String> {
         (0..self.term.screen_lines())
@@ -380,18 +400,48 @@ struct Workers {
     terminal: Arc<Terminal>,
     reader: Option<std::thread::JoinHandle<io::Result<()>>>,
     writer: Option<std::thread::JoinHandle<io::Result<()>>>,
+    deadline: Option<Instant>,
+    device: Option<u32>,
+    closing: Arc<crate::LaunchGate>,
+}
+impl Workers {
+    fn finish(&mut self, worker: Option<std::thread::JoinHandle<io::Result<()>>>, kind: &str) {
+        if let Some(worker) = worker {
+            let mut deadline = *self.deadline.get_or_insert_with(|| {
+                Instant::now() + Duration::from_secs(if self.closing.is_closing() { 1 } else { 3 })
+            });
+            while !worker.is_finished() {
+                if self.closing.is_closing() {
+                    deadline = deadline.min(Instant::now() + Duration::from_secs(1));
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.deadline = Some(deadline);
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                let holder_pid = self.device.and_then(platform::terminal_holder);
+                tracing::warn!(
+                    holder_pid,
+                    worker = kind,
+                    "terminal I/O deadline reached; a surviving process may hold the PTY"
+                );
+            }
+        }
+    }
 }
 impl Drop for Workers {
     fn drop(&mut self) {
         drop(self.child.take());
         *self.terminal.pid.lock().unwrap() = None;
         *self.terminal.input.lock().unwrap() = None;
-        if let Some(writer) = self.writer.take() {
-            let _ = writer.join();
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        let writer = self.writer.take();
+        self.finish(writer, "writer");
+        let reader = self.reader.take();
+        self.finish(reader, "reader");
         self.terminal.wake.send_modify(|counter| *counter += 1);
     }
 }
@@ -409,6 +459,8 @@ fn run(
         .openpty(PtySize::default())
         .map_err(io::Error::other)?;
     let mut command = CommandBuilder::new(binary);
+    #[cfg(test)]
+    command.set_controlling_tty(env.terminal_controlling_tty);
     command.args(provider.tui_command(&native, &spec.config));
     command.cwd(&spec.cwd);
     command.env_clear();
@@ -445,6 +497,9 @@ fn run(
         terminal: terminal.clone(),
         reader: None,
         writer: None,
+        deadline: None,
+        device: platform::terminal_device(pid).ok(),
+        closing: env.closing.clone(),
     };
     env.groups.lock().unwrap().insert(pid);
     *terminal.pid.lock().unwrap() = Some(pid);
@@ -478,15 +533,14 @@ fn run(
     loop {
         if let Some(status) = workers.child.as_mut().unwrap().child.try_wait()? {
             drop(workers.child.take());
-            if let Some(reader) = workers.reader.take() {
-                let _ = reader.join();
-            }
+            let reader = workers.reader.take();
+            workers.finish(reader, "reader");
             if !status.success()
                 && stopping.is_none()
                 && !terminal.hangup_sent.load(Ordering::Acquire)
                 && !env.closing.is_closing()
             {
-                let text = terminal.emulator.lock().text().join("\n");
+                let text = terminal.emulator.lock().visible_tail();
                 return Err(ProviderError::Protocol(format!(
                     "{} terminal exited: {}",
                     provider.name(),
@@ -505,6 +559,9 @@ fn run(
             stopping = Some(Instant::now());
         }
         let grace = Duration::from_secs(if env.closing.is_closing() { 1 } else { 3 });
+        if let Some(at) = stopping {
+            workers.deadline = Some(at + grace);
+        }
         if stopping.is_some_and(|at: Instant| at.elapsed() >= grace) {
             let _ = platform::signal_group(pid, Signal::Kill);
         }
@@ -558,6 +615,7 @@ fn write(
 }
 fn read(mut reader: Box<dyn Read + Send>, terminal: &Terminal) -> io::Result<()> {
     let mut bytes = [0; 64 * 1024];
+    #[cfg(debug_assertions)]
     let mut consumed = 0;
     loop {
         let count = match reader.read(&mut bytes) {
@@ -566,8 +624,13 @@ fn read(mut reader: Box<dyn Read + Send>, terminal: &Terminal) -> io::Result<()>
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        consumed += count as u64;
-        let reply = terminal.emulator.lock().feed(&bytes[..count], consumed);
+        #[cfg(debug_assertions)]
+        let reply = {
+            consumed += count as u64;
+            terminal.emulator.lock().feed(&bytes[..count], consumed)
+        };
+        #[cfg(not(debug_assertions))]
+        let reply = terminal.emulator.lock().feed(&bytes[..count], 0);
         if !reply.is_empty() {
             terminal.write(&reply)?;
         }
@@ -590,7 +653,6 @@ mod tests {
         assert_eq!(start.bytes, 17);
         assert_eq!(done.bytes, 37);
         assert!(done.at >= start.at);
-        assert_eq!(emulator.title.as_deref(), Some("FLOOD_DONE"));
         assert_eq!(&emulator.text()[..2], &["xone", ""]);
     }
     #[test]
