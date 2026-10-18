@@ -1,6 +1,6 @@
 # Chat and terminal switch
 
-Status: not run, DATE, COMMIT, all
+Status: passed, 2026-10-18, ec5469f, live Codex, Claude and Grok in Lanes 3 and 4; page smoke at d91bb3e
 
 ## Sub-features
 
