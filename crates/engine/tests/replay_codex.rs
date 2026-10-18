@@ -669,6 +669,19 @@ fn codex_session_cancels_early_request_before_interrupt() {
         let mut ended = None;
         tokio::time::timeout(Duration::from_secs(8), async {
             while let Some(EngineMsg::Provider { event, .. }) = messages.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    session
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                    session
+                        .control
+                        .send(SessionControl::Interrupt {
+                            turn: *turn,
+                            reason: StopReason::User,
+                        })
+                        .unwrap();
+                }
                 match event {
                     ProviderEvent::Session(SessionEvent::Ready { pid, .. }) => {
                         owned.push(pid);
@@ -677,13 +690,6 @@ fn codex_session_cancels_early_request_before_interrupt() {
                             .send(SessionControl::StartTurn {
                                 turn,
                                 text: "work".into(),
-                            })
-                            .unwrap();
-                        session
-                            .control
-                            .send(SessionControl::Interrupt {
-                                turn,
-                                reason: StopReason::User,
                             })
                             .unwrap();
                     }
@@ -872,6 +878,12 @@ fn codex_accept_edits_grants_no_git_roots() {
         let mut ended = None;
         tokio::time::timeout(Duration::from_secs(8), async {
             while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 match event {
                     ProviderEvent::Session(SessionEvent::Ready { .. }) => handle
                         .control

@@ -412,6 +412,16 @@ async fn session_config_lifecycle(root_thread: bool, reported: Option<&str>) {
     let mut started = false;
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(event) = events.recv().await {
+            if let EngineMsg::Provider {
+                event: ProviderEvent::Session(SessionEvent::Dispatched { turn }),
+                ..
+            } = &event
+            {
+                handle
+                    .control
+                    .send(SessionControl::DispatchCommitted { turn: *turn })
+                    .unwrap();
+            }
             match event {
                 EngineMsg::Provider {
                     event: ProviderEvent::Session(SessionEvent::Ready { .. }),

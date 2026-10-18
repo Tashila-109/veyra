@@ -2337,7 +2337,11 @@ impl Render for Shell {
                     return;
                 }
                 shell.quit_sheet = false;
-                shell.input.update(cx, |input, cx| input.focus(window, cx));
+                if let Some((_, terminal)) = &shell.terminal {
+                    window.focus(&terminal.focus_handle(cx), cx);
+                } else {
+                    shell.input.update(cx, |input, cx| input.focus(window, cx));
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, action: &SetSidebarWidth, _, cx| {
@@ -7442,6 +7446,71 @@ mod tests {
                 shell.view,
                 super::MainView::NewThread
             )));
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn cancel_quit_restores_the_visible_thread_surface(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        with_docked_shell(cx, |shell, cx, _, _| {
+            struct Shutdown {
+                engine: veyra_engine::Engine,
+                runtime: tokio::runtime::Runtime,
+            }
+            impl Drop for Shutdown {
+                fn drop(&mut self) {
+                    self.runtime.block_on(self.engine.shutdown_wait());
+                }
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
+            let engine = veyra_engine::Engine::start_with_env(
+                runtime.handle(),
+                veyra_engine::data_dir::DataDir::at(data).unwrap(),
+                veyra_engine::provider::env::ChildEnv::isolated(),
+            )
+            .unwrap();
+            shell.update(cx, |shell, _| {
+                shell.engine = engine.clone();
+                shell.runtime = runtime.handle().clone();
+            });
+            let _shutdown = Shutdown { engine, runtime };
+            for view in [View::Terminal, View::Chat] {
+                shell.update(cx, |shell, cx| {
+                    let (thread, _) =
+                        configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                    shell.state.requests.clear();
+                    shell.state.threads.get_mut(&thread).unwrap().view = view;
+                    cx.notify();
+                });
+                draw(cx);
+                shell.update_in(cx, |shell, window, cx| {
+                    shell.quit_sheet = true;
+                    window.focus(&shell.quit_focus, cx);
+                    cx.notify();
+                });
+                draw(cx);
+                cx.simulate_keystrokes("escape");
+                draw(cx);
+                assert!(!shell.read_with(cx, |shell, _| shell.quit_sheet));
+                assert!(
+                    shell.update_in(cx, |shell, window, cx| match view {
+                        View::Terminal => shell
+                            .terminal
+                            .as_ref()
+                            .unwrap()
+                            .1
+                            .focus_handle(cx)
+                            .is_focused(window),
+                        View::Chat => shell.input.focus_handle(cx).is_focused(window),
+                    }),
+                    "cancel did not restore {view:?} focus"
+                );
+            }
         });
     }
 

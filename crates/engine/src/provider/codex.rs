@@ -1595,6 +1595,25 @@ mod tests {
         codec
     }
     #[test]
+    fn dispatch_cursor_is_unknown_until_the_server_names_the_turn() {
+        let mut codec = resumed();
+        codec
+            .value(json!({"id":2,"result":{"thread":{"id":"old-thread"}}}))
+            .unwrap();
+        let turn = TurnId::new();
+        let dispatched = codec.start(turn, "cursor probe".into()).unwrap();
+        assert_eq!(dispatched.cursor, Some(super::super::CursorUpdate::Unknown));
+        assert!(
+            matches!(dispatched.events.as_slice(), [ProviderEvent::Session(SessionEvent::Dispatched { turn: owner })] if *owner == turn)
+        );
+        let decoded = codec.value(json!({"id":dispatched.controls[0].value()["id"],"result":{"turn":{"id":"server-turn"}}})).unwrap();
+        assert_eq!(decoded.cursor, Some("server-turn".into()));
+        codec.value(json!({"method":"turn/completed","params":{"threadId":"old-thread","turn":{"id":"server-turn","status":"completed"}}})).unwrap();
+        let decoded = codec.value(json!({"method":"turn/started","params":{"threadId":"old-thread","turn":{"id":"cli-turn"}}})).unwrap();
+        assert_eq!(decoded.cursor, Some("cli-turn".into()));
+    }
+
+    #[test]
     fn codex_other_resume_errors_preserve_native() {
         let mut codec = resumed();
         assert_eq!(

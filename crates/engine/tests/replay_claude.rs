@@ -90,6 +90,12 @@ fn replay(name: &str, resume: bool) -> Vec<ProviderEvent> {
             let mut sent = false;
             let mut events = Vec::new();
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) && !sent {
                     handle
                         .control
@@ -624,6 +630,12 @@ fn controlled_replay_with(
         let events = tokio::time::timeout(Duration::from_secs(10), async {
             let mut events = Vec::new();
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 let start = matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. }))
                     && next == 0
                     || matches!(
@@ -1069,6 +1081,12 @@ fn request_replay(
             let turn = TurnId::new();
             let mut started = false;
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 if !started && matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                     handle
                         .control
@@ -1240,6 +1258,12 @@ for line in sys.stdin:
             let mut ends = 0;
             let turn = TurnId::new();
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                     handle
                         .control
@@ -1425,6 +1449,12 @@ for line in sys.stdin:
             let mut provider = None;
             let mut interrupted = false;
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                     handle
                         .control
@@ -1593,6 +1623,12 @@ for line in sys.stdin:
             let mut events = Vec::new();
             let mut sent_next = false;
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 if matches!(&event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                     handle
                         .control
@@ -1785,6 +1821,9 @@ while read_line(5) is not None: pass
                     }
                     msg = rx.recv() => {
                         let Some(EngineMsg::Provider { event, .. }) = msg else { break; };
+                        if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                            handle.control.send(SessionControl::DispatchCommitted { turn: *turn }).unwrap();
+                        }
                         match event {
                             ProviderEvent::Session(SessionEvent::Ready { .. }) if !sent => {
                                 sent = true;

@@ -1304,14 +1304,42 @@ enum SessionOrigin {
     #[serde(other)]
     Other,
 }
+fn session_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(try_from = "SessionBlockFields")]
 enum SessionBlock {
-    Text {
-        text: String,
-    },
-    #[serde(other)]
+    Text { text: String },
     Other,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SessionBlockFields {
+    Object {
+        #[serde(rename = "type", default, deserialize_with = "session_optional")]
+        kind: Option<String>,
+        #[serde(default, deserialize_with = "session_optional")]
+        text: Option<String>,
+    },
+    Other(serde::de::IgnoredAny),
+}
+impl TryFrom<SessionBlockFields> for SessionBlock {
+    type Error = &'static str;
+    fn try_from(fields: SessionBlockFields) -> Result<Self, Self::Error> {
+        match fields {
+            SessionBlockFields::Object { kind, text } if kind.as_deref() == Some("text") => text
+                .map(|text| Self::Text { text })
+                .ok_or("unreadable session text"),
+            _ => Ok(Self::Other),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -1326,15 +1354,16 @@ struct SessionMessage {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionEntry {
-    session_id: String,
+    #[serde(default, deserialize_with = "session_optional")]
+    session_id: Option<String>,
     uuid: String,
-    #[serde(rename = "parentUuid")]
-    _parent_uuid: serde::de::IgnoredAny,
-    is_sidechain: bool,
+    #[serde(default, deserialize_with = "session_optional")]
+    is_sidechain: Option<bool>,
     #[serde(rename = "type")]
     kind: SessionEntryType,
-    #[serde(default)]
-    entrypoint: Entrypoint,
+    #[serde(default, deserialize_with = "session_optional")]
+    entrypoint: Option<Entrypoint>,
+    #[serde(default, deserialize_with = "session_optional")]
     turn_origin: Option<SessionOrigin>,
     message: Option<SessionMessage>,
 }
@@ -1402,7 +1431,9 @@ pub fn session_file_import(
         let Ok(entry): Result<SessionEntry, _> = serde_json::from_slice(&line?) else {
             continue;
         };
-        if entry.session_id != native.0 || entry.is_sidechain {
+        if entry.session_id.as_ref().is_some_and(|id| *id != native.0)
+            || entry.is_sidechain == Some(true)
+        {
             continue;
         }
         if entry.kind == SessionEntryType::User {
@@ -1416,11 +1447,11 @@ pub fn session_file_import(
         }
         if entry.kind == SessionEntryType::User {
             let own = request.sent.contains(&entry.uuid)
-                || entry.entrypoint == Entrypoint::SdkCli
+                || entry.entrypoint == Some(Entrypoint::SdkCli)
                 || entry.turn_origin == Some(SessionOrigin::Sdk);
-            include = !own && entry.entrypoint == Entrypoint::Cli;
+            include = !own;
         }
-        if !include || entry.entrypoint != Entrypoint::Cli {
+        if !include || entry.entrypoint == Some(Entrypoint::SdkCli) {
             continue;
         }
         match entry.message.map(|message| message.content) {

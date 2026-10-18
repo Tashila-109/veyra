@@ -313,6 +313,20 @@ async fn grok_no_first_frame_fails_at_60s() {
             text: "reply with the word ok".into(),
         })
         .unwrap();
+    let EngineMsg::Provider {
+        cursor: Some(cursor),
+        event: ProviderEvent::Session(SessionEvent::Dispatched { turn: dispatched }),
+        ..
+    } = events.recv().await.unwrap()
+    else {
+        panic!("missing dispatched cursor");
+    };
+    assert_eq!(dispatched, turn);
+    assert_eq!(cursor.value().as_deref(), Some(turn.to_string().as_str()));
+    handle
+        .control
+        .send(SessionControl::DispatchCommitted { turn })
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !scratch.0.join("prompt-received").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -320,16 +334,6 @@ async fn grok_no_first_frame_fails_at_60s() {
     })
     .await
     .unwrap();
-    let EngineMsg::Provider {
-        cursor: Some(cursor),
-        event: ProviderEvent::Session(SessionEvent::Dispatched { turn: dispatched }),
-        ..
-    } = events.try_recv().unwrap()
-    else {
-        panic!("missing dispatched cursor");
-    };
-    assert_eq!(dispatched, turn);
-    assert_eq!(cursor.value().as_deref(), Some(turn.to_string().as_str()));
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(59)).await;
     tokio::task::yield_now().await;

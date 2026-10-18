@@ -635,7 +635,7 @@ fn switch_back_imports_once() {
                     None
                 })
                 .collect::<Vec<_>>(),
-            ["hello\x1b\nfake reply: hello\x1b"]
+            ["hello\nfake reply: hello"]
         );
         tokio::time::sleep(Duration::from_millis(1700)).await;
         engine
@@ -2571,4 +2571,208 @@ fn dispatched_cursor(f: &mut Fixture, turn: TurnId, cursor: CursorUpdate) {
         event: ProviderEvent::Session(SessionEvent::Dispatched { turn }),
         cursor: Some(cursor),
     });
+}
+
+#[test]
+fn claude_history_tolerates_optional_field_and_block_variants() {
+    use serde_json::json;
+    let scratch = Scratch(
+        std::path::Path::new("/tmp").join(format!("veyra-term-optional-{}", ThreadId::new())),
+    );
+    std::fs::create_dir_all(scratch.0.join("projects/fixture")).unwrap();
+    let entry = |id: &str, kind: &str, text: &str| json!({"sessionId":"optional-native","uuid":id,"parentUuid":null,"isSidechain":false,"type":kind,"entrypoint":"cli","message":{"content":[{"type":"text","text":text}]}});
+    let mut variants = Vec::new();
+    for field in ["turnOrigin", "entrypoint", "sessionId", "isSidechain"] {
+        for value in [
+            json!(null),
+            json!(17),
+            json!([]),
+            json!({}),
+            json!("future-value"),
+        ] {
+            if field == "sessionId" && value.is_string()
+                || field == "isSidechain" && value.is_boolean()
+            {
+                continue;
+            }
+            let mut user = entry("typed", "user", "typed prompt");
+            user[field] = value;
+            variants.push(user);
+        }
+    }
+    let mut no_parent = entry("typed", "user", "typed prompt");
+    no_parent.as_object_mut().unwrap().remove("parentUuid");
+    variants.push(no_parent);
+    for block in [
+        json!(17),
+        json!(null),
+        json!([]),
+        json!({}),
+        json!({"type":17}),
+        json!({"type":"future","text":17}),
+    ] {
+        let mut user = entry("typed", "user", "typed prompt");
+        user["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(block);
+        variants.push(user);
+    }
+    for user in variants {
+        let path = scratch.0.join("projects/fixture/optional-native.jsonl");
+        std::fs::write(
+            path,
+            [
+                entry("anchor", "user", "old"),
+                user.clone(),
+                entry("reply", "assistant", "typed reply"),
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let history = claude::session_file_import(
+            &scratch.0,
+            &NativeSessionId("optional-native".into()),
+            &HistoryRequest {
+                cursor: Some("anchor".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            history.text, "typed prompt\ntyped reply",
+            "optional input: {user}"
+        );
+        assert_eq!(history.cursor.as_deref(), Some("typed"));
+        assert!(!history.failed);
+    }
+}
+
+#[test]
+fn imported_spans_keep_display_text_for_every_provider() {
+    use serde_json::json;
+    for provider in ProviderKind::ALL {
+        let mut f = Fixture::new(LiveState::Idle);
+        let mut row = f.actor.projection.threads[&f.thread].clone();
+        row.provider = provider;
+        row.native = Some(NativeSessionId("display-native".into()));
+        row.native_cursor = Some("anchor".into());
+        row.import_pending = true;
+        let mut changes = ChangeSet::default();
+        changes.threads.insert(f.thread, row);
+        f.save(changes);
+        let fixture_line =
+            json!({"text":"terminal\u{1b}\u{7}\u{0}\u{1f}\u{7f}\n\tC1: \u{85} é 🦢"}).to_string();
+        let line: serde_json::Value = serde_json::from_str(&fixture_line).unwrap();
+        f.event(ProviderEvent::Session(SessionEvent::History {
+            native: NativeSessionId("display-native".into()),
+            history: History {
+                cursor: Some("typed".into()),
+                text: line["text"].as_str().unwrap().into(),
+                failed: false,
+            },
+        }));
+        let imported: Vec<_> = f
+            .loaded()
+            .items
+            .values()
+            .filter_map(|item| match &item.body {
+                ItemBody::TerminalSpan(span) => Some(span.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imported, ["terminal\n\tC1: \u{85} é 🦢"], "{provider:?}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn dispatch_cursor_commits_before_prompt_delivery() {
+    use std::time::Duration;
+    let mut f = Fixture::new(LiveState::Idle);
+    let scratch = Scratch(
+        std::path::Path::new("/tmp").join(format!("veyra-term-dispatch-{}", ThreadId::new())),
+    );
+    std::fs::create_dir(&scratch.0).unwrap();
+    let binary = scratch.0.join("owned-cli");
+    std::fs::write(&binary, "#!/bin/sh\nread initialize\nprintf ready > initialized\nread prompt\nprintf '%s' \"$prompt\" > delivered\nwhile read ignored; do :; done\n").unwrap();
+    assert!(
+        std::process::Command::new("/bin/chmod")
+            .args(["700"])
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let env = env::ChildEnv::isolated().with_binary(ProviderKind::Claude, binary);
+    let groups = env.groups.clone();
+    let turn = f.user("dispatch payload");
+    let mut c = ChangeSet::default();
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.native_cursor = Some("previous-server-turn".into());
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    let (out, mut events) = mpsc::channel(256);
+    let handle = {
+        let _entered = f.runtime.enter();
+        session::spawn(
+            SessionSpec {
+                thread: f.thread,
+                cwd: scratch.0.clone(),
+                config: config(),
+                native: None,
+                import: None,
+                root: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap()
+    };
+    let mut c = ChangeSet::default();
+    let mut live = f.actor.live[&f.thread].clone();
+    live.live = Live::Structured {
+        session: handle.clone(),
+        pid: 1,
+        pgid: 1,
+        draining: None,
+    };
+    c.live.insert(f.thread, live);
+    f.save(c);
+    let runtime = f.runtime.handle().clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async {
+        handle.control.send(SessionControl::StartTurn {turn,text:"dispatch payload".into()}).unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
+        assert!(matches!(&message, EngineMsg::Provider {event:ProviderEvent::Session(SessionEvent::Dispatched {turn:owner}),..} if *owner==turn));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !scratch.0.join("initialized").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let delivered_before_commit = scratch.0.join("delivered").exists();
+        f.actor.handle(message);
+        assert_eq!(f.loaded().threads[&f.thread].native_cursor.as_deref(), Some(turn.to_string().as_str()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !scratch.0.join("delivered").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.unwrap();
+        let delivered:serde_json::Value = serde_json::from_str(&std::fs::read_to_string(scratch.0.join("delivered")).unwrap()).unwrap();
+        assert_eq!(delivered["message"]["content"], "dispatch payload");
+        assert!(!delivered_before_commit, "fake CLI received the prompt before the actor committed its dispatch cursor");
+    })
+    }));
+    let _ = handle.control.send(SessionControl::Shutdown);
+    let cleanup = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !groups.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    });
+    assert!(cleanup.is_ok(), "owned dispatch fixture did not reap");
+    outcome.unwrap();
 }

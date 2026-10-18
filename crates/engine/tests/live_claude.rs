@@ -44,6 +44,12 @@ fn live_claude_ok_reply() {
             let mut completed = false;
             let mut text = String::new();
             while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 match event {
                     ProviderEvent::Session(SessionEvent::Ready { .. }) if !sent => {
                         handle

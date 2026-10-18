@@ -983,6 +983,7 @@ impl Actor {
                 {
                     return None;
                 }
+                commands::control(&mut c, thread, SessionControl::DispatchCommitted { turn });
             }
             ProviderEvent::Session(SessionEvent::StartTurnRefused { turn }) => {
                 if self.live[&thread].pending_turn() != Some(turn) {
@@ -1424,12 +1425,15 @@ impl Actor {
             c.threads.insert(thread, row);
         }
     }
-    fn import_history(&self, c: &mut ChangeSet, thread: ThreadId, history: History) {
+    fn import_history(&self, c: &mut ChangeSet, thread: ThreadId, mut history: History) {
         let failed = history.failed
             || c.thread(&self.projection, thread)
                 .unwrap()
                 .native_cursor
                 .is_none();
+        history
+            .text
+            .retain(|ch| ch >= ' ' && ch != '\u{7f}' || matches!(ch, '\n' | '\t'));
         if failed || !history.text.is_empty() {
             let turn = commands::queue_import(&self.projection, c, thread);
             let body = if failed {

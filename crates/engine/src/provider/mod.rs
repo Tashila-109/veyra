@@ -45,6 +45,9 @@ pub struct SessionHandle {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionControl {
+    DispatchCommitted {
+        turn: TurnId,
+    },
     StartTurn {
         turn: TurnId,
         text: String,

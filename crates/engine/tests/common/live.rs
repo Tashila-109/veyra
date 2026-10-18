@@ -66,6 +66,12 @@ pub fn live(
             let mut exists = vec![];
             let mut expected_outcome = TurnOutcome::Completed;
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 match &event {
                     ProviderEvent::Session(SessionEvent::Ready { .. }) => {
                         handle

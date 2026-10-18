@@ -724,7 +724,10 @@ impl SessionControls {
             Some(message) => Some(message),
             None => self.receiver.recv().await,
         };
-        if matches!(message, Some(SessionControl::StartTurn { .. })) {
+        if matches!(
+            message,
+            Some(SessionControl::StartTurn { .. } | SessionControl::DispatchCommitted { .. })
+        ) {
             self.drain_and_close();
             if self.receiver.is_closed() {
                 return Some(SessionControl::Shutdown);
@@ -744,6 +747,11 @@ enum Completion {
     MissingSession,
     Exited(Option<String>),
     ConsumerGone,
+}
+
+struct PendingDispatch {
+    turn: TurnId,
+    prompts: Vec<Outbound>,
 }
 
 async fn run_one(
@@ -806,6 +814,7 @@ async fn run_one(
     let mut writer_done = false;
     let mut stdout_closed = false;
     let mut shutdown_requested = false;
+    let mut pending_dispatch: Option<PendingDispatch> = None;
     while failure.is_none() {
         tokio::select! {
             biased;
@@ -830,7 +839,12 @@ async fn run_one(
                         }
                     }
                     if consumer_gone { break; }
-                    for prompt in dispatched.take_outbound() {
+                    pending_dispatch = Some(PendingDispatch { turn, prompts: dispatched.take_outbound() });
+                }
+                Some(SessionControl::DispatchCommitted { turn }) => {
+                    if pending_dispatch.as_ref().is_none_or(|pending| pending.turn != turn) { continue; }
+                    let prompts = pending_dispatch.take().unwrap().prompts;
+                    for prompt in prompts {
                         if let Err(error) = process.send(&writer, prompt) {
                             failure = Some(error.to_string());
                             break;
@@ -862,6 +876,9 @@ async fn run_one(
                 }
                 None => unreachable!("closed controls become Shutdown"),
                 Some(SessionControl::Interrupt { turn, reason }) => {
+                    if pending_dispatch.as_ref().is_some_and(|pending| pending.turn == turn) {
+                        pending_dispatch = None;
+                    }
                     for line in codec.interrupt_lines(turn, reason) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
@@ -870,6 +887,7 @@ async fn run_one(
                     }
                 }
                 Some(SessionControl::InterruptActive(reason)) => {
+                    pending_dispatch = None;
                     for line in codec.interrupt_active(reason) {
                         if let Err(error) = process.send(&writer, line) {
                             failure = Some(error.to_string());
@@ -1642,11 +1660,15 @@ mod tests {
         );
         let (sender, control) = mpsc::unbounded_channel();
         let mut control = SessionControls::new(control, Default::default());
+        let turn = TurnId::new();
         sender
             .send(SessionControl::StartTurn {
-                turn: TurnId::new(),
+                turn,
                 text: "reply".into(),
             })
+            .unwrap();
+        sender
+            .send(SessionControl::DispatchCommitted { turn })
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
         let task = tokio::spawn(async move {
@@ -1729,11 +1751,15 @@ mod tests {
             );
             let (sender, control) = mpsc::unbounded_channel();
             let mut control = SessionControls::new(control, Default::default());
+            let turn = TurnId::new();
             sender
                 .send(SessionControl::StartTurn {
-                    turn: TurnId::new(),
+                    turn,
                     text: "reply".into(),
                 })
+                .unwrap();
+            sender
+                .send(SessionControl::DispatchCommitted { turn })
                 .unwrap();
             let (out, mut events) = mpsc::channel(256);
             run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
@@ -1790,11 +1816,15 @@ mod tests {
         );
         let (sender, control) = mpsc::unbounded_channel();
         let mut control = SessionControls::new(control, Default::default());
+        let turn = TurnId::new();
         sender
             .send(SessionControl::StartTurn {
-                turn: TurnId::new(),
+                turn,
                 text: "reply".into(),
             })
+            .unwrap();
+        sender
+            .send(SessionControl::DispatchCommitted { turn })
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
         run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
@@ -1844,11 +1874,15 @@ mod tests {
         );
         let (sender, control) = mpsc::unbounded_channel();
         let mut control = SessionControls::new(control, Default::default());
+        let turn = TurnId::new();
         sender
             .send(SessionControl::StartTurn {
-                turn: TurnId::new(),
+                turn,
                 text: "reply".into(),
             })
+            .unwrap();
+        sender
+            .send(SessionControl::DispatchCommitted { turn })
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
         let start = tokio::time::Instant::now();
@@ -1940,6 +1974,10 @@ mod tests {
                 turn,
                 text: "reply".into(),
             })
+            .unwrap();
+        handle
+            .control
+            .send(SessionControl::DispatchCommitted { turn })
             .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(3), async {
             let dispatched = events.recv().await.unwrap();
@@ -2065,6 +2103,9 @@ mod tests {
                 turn,
                 text: "reply".into(),
             })
+            .unwrap();
+        sender
+            .send(SessionControl::DispatchCommitted { turn })
             .unwrap();
         let (out, mut events) = mpsc::channel(256);
         let completion = run_one(process, &mut control, &out, ThreadId::new(), 1, false).await;
@@ -2214,6 +2255,10 @@ mod tests {
                 turn,
                 text: "reply".into(),
             })
+            .unwrap();
+        handle
+            .control
+            .send(SessionControl::DispatchCommitted { turn })
             .unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -2493,12 +2538,17 @@ mod tests {
                 1,
             )
             .unwrap();
+            let turn = TurnId::new();
             handle
                 .control
                 .send(SessionControl::StartTurn {
-                    turn: TurnId::new(),
+                    turn,
                     text: "queued before shutdown".into(),
                 })
+                .unwrap();
+            handle
+                .control
+                .send(SessionControl::DispatchCommitted { turn })
                 .unwrap();
             if shutdown {
                 handle.control.send(SessionControl::Shutdown).unwrap();
@@ -2607,12 +2657,17 @@ done
             })
             .await
             .unwrap();
+            let turn = TurnId::new();
             handle
                 .control
                 .send(SessionControl::StartTurn {
-                    turn: TurnId::new(),
+                    turn,
                     text: "already cancelled".into(),
                 })
+                .unwrap();
+            handle
+                .control
+                .send(SessionControl::DispatchCommitted { turn })
                 .unwrap();
             match cancellation {
                 "shutdown" => handle.control.send(SessionControl::Shutdown).unwrap(),
@@ -2742,12 +2797,17 @@ done
             if cancellation == "writer" {
                 env.close_before_user_write.store(true, Ordering::Release);
             }
+            let turn = TurnId::new();
             handle
                 .control
                 .send(SessionControl::StartTurn {
-                    turn: TurnId::new(),
+                    turn,
                     text: "already cancelled".into(),
                 })
+                .unwrap();
+            handle
+                .control
+                .send(SessionControl::DispatchCommitted { turn })
                 .unwrap();
             match cancellation {
                 "shutdown" => handle.control.send(SessionControl::Shutdown).unwrap(),

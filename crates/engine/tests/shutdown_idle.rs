@@ -72,6 +72,14 @@ async fn requested_shutdown_of_idle_provider_is_not_a_crash() {
             let mut ended = false;
             tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
+                    if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                        handle
+                            .as_ref()
+                            .unwrap()
+                            .control
+                            .send(SessionControl::DispatchCommitted { turn: *turn })
+                            .unwrap();
+                    }
                     match event {
                         ProviderEvent::Session(SessionEvent::Ready { pid: owned, .. }) => {
                             pid = Some(owned);

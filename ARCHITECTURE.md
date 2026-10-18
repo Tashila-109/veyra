@@ -131,7 +131,7 @@ The debug listener binds before the window opens.
 
 Quit opens the existing sheet for running, pending- or refused-admission, Starting and background-busy threads and for any thread open in Terminal, or runs ConfirmQuit immediately when none qualify.
 With an open terminal, the sheet also says that quitting ends its CLI session.
-CancelQuit dismisses it and restores composer focus until ConfirmQuit begins; afterward Escape and CancelQuit keep the sheet open.
+CancelQuit dismisses it and restores focus to the visible terminal, or the composer in Chat, until ConfirmQuit begins; afterward Escape and CancelQuit keep the sheet open.
 ConfirmQuit synchronously closes the engine and cancels readiness probes and the branch task, then awaits Engine::shutdown_wait in a gpui task and calls cx.quit.
 The debug ctl quit verb dispatches ConfirmQuit directly.
 `Engine::shutdown_wait` refuses new commands, ends running and pending-admission turns, expires pending requests and asks every session to shut down.
@@ -526,6 +526,8 @@ The first structured turn after recovery waits for Send or Continue.
 NativeCursor is a distinct string newtype for the provider’s native history position, separate from Veyra turn and native session ids.
 Each codec sets Decoded.cursor when it dispatches a prompt, and Actor::apply_cursor applies dispatch, scoped-frame and import cursor updates in their event transaction.
 The shared command and session paths do not choose provider cursor values.
+The session holds prompt frames until the actor commits the dispatch cursor and sends DispatchCommitted for that turn.
+Interrupt discards that held prompt, and closing or Shutdown refuses its delivery even when the acknowledgement was already queued.
 Claude and Grok dispatch store the outgoing user uuid or prompt id, which is the Veyra turn id.
 Codex clears its cursor to unknown at dispatch and supplies its server turn id on the turn/start reply or the first scoped frame of a CLI-started turn, carried as optional cursor context on the same actor event.
 A Grok-started turn stores its prompt id when that prompt completes.
@@ -538,9 +540,10 @@ If Stop, an exit or a crash retires that turn before the id arrives, the cursor 
 SessionSpec carries import: Option<HistoryRequest>, containing the cursor and Claude/Grok sent-prompt context.
 On the switch back or the next spawn after recovery, ProviderKind dispatches Claude’s file import once, off the actor, under the CLI environment’s CLAUDE_CONFIG_DIR or production home/.claude.
 The Claude module owns that folder policy; ChildEnv only carries variable overrides and the home.
-The Claude reader splits bytes at line feeds and parses tolerant SessionEntry values with typed entry kinds, entrypoints and content blocks, skipping malformed JSON, invalid UTF-8 and mistyped known fields.
+The Claude reader splits bytes at line feeds and parses tolerant SessionEntry values with typed entry kinds, entrypoints and content blocks, skipping malformed JSON, invalid UTF-8 and unreadable entry types, uuids or message text.
+Optional fields with unexpected types fall back to None, unknown enum values fall back to Other, and non-text block variants do not discard the turn.
 Unknown entry and block kinds remain ignorable.
-It copies later main-chain cli user string/text content and assistant text blocks, excludes sdk-cli and Veyra-sent turns, and keeps the cursor at the newest valid user uuid.
+It copies later user string/text content and assistant text blocks from the main session file unless a readable session id or sidechain flag excludes them, excludes sdk-cli and Veyra-sent turns, and keeps the cursor at the newest valid user uuid.
 Codex pages typed thread/turns/list results newest first until the cursor turn, imports newer user messages and final agent messages oldest first, then resumes the thread.
 Its page limit of 100 is an implementation choice, and it does not compare server turn ids with Veyra turn ids.
 Grok imports through session/load, collecting replay updates before the reply, decoding content only for user and agent message chunks, grouping their text through turn_completed and skipping thoughts and Veyra prompt ids.
@@ -550,6 +553,7 @@ A missing cursor anchor, Codex page failure or incomplete Grok replay also produ
 A Claude file lookup or read error supplies no cursor, so the actor clears native_cursor on that failure.
 Grok's load-not-found fallback still opens a new session; if Ready arrives without matching History, the actor clears the pending import with the same notice before starting queued work.
 SessionEvent::History precedes Ready; one transaction adds an ended Provider turn with one TerminalSpan when text exists, advances native_cursor and clears import_pending.
+The actor removes C0 controls except newline and tab, and DEL, from every provider’s imported display text while preserving C1 and other Unicode.
 The import appends its turn after existing non-queued turns and moves every queued turn behind it by ordinal in the same transaction, preserving queued order.
 Engine snapshots use those ordinals, and the window treats terminal spans as ordinal boundaries around its ordinary time-based ordering, so imported text precedes every later prompt even when History and Ready share a millisecond or timestamps move backwards.
 An empty successful import adds no span, and every import outcome allows queued work to run once the structured session is ready.
@@ -1347,9 +1351,9 @@ grok_root_reaches_real_relay runs in the ordinary application suite with the pro
 A default credential-frame test asserts the Grok mcpServers entry, preserves unrelated config and requires only the token marker in its recording value.
 The older recording-derived Grok fixtures name version 1.0.60 and use Veyra's masked live shapes for initialize, flat questions, task snapshots, Grok-started turn completion and resume.
 Replay tests do not prove installed Grok behavior; the retained live recording supplies those observed wire shapes.
-The live recording did not send permission requests.
-Decision 11 chose Follow my settings; the installed 1.0.60 live recheck observed Grok resolving the redirect write itself without sending a permission request.
-Round 7 replays cover both edit docks and explicit auto/yolo disablement; their effect on installed Grok still needs a separately authorized live recheck.
+The live recording sent no permission requests, because Grok's settings-seeded auto mode approved them itself.
+With auto and yolo mode turned off on every Ask first and Accept edits session, installed Grok 1.0.60 sends `session/request_permission`, and a Deny ends the turn cancelled with `PermissionRejected`.
+The ignored live tests check that path on the installed CLI.
 Grok live tests are ignored by default.
 
 Terminal tests cover the six editing chords and plain input, ASCII grouping and pinned wide cells, marker-bounded flood arithmetic, theme colours, full-width grid and hint layout, thread metadata publication and terminal-span dump text.

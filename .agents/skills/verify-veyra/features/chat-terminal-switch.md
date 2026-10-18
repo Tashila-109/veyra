@@ -25,7 +25,7 @@ The optional `SwitchView` action payload `{"terminal":true}` selects Terminal; f
 
 Run Launch, Doctor and new-thread first in the fake lane.
 For an authorized live drive, select an idle existing provider thread first and use the same block.
-The live drive waits for the provider’s own history and prompt glyphs, accepts Claude’s folder trust choice with Down then Enter, and leaves CLI home resolution to the user’s environment without CLAUDE_CONFIG_DIR.
+The live drive waits for the provider’s own history and prompt glyphs, reads Claude’s highlighted folder trust choice before accepting it, and leaves CLI home resolution to the user’s environment without CLAUDE_CONFIG_DIR.
 When checking a thread grant, establish the exact `touch veyra-grant.txt` grant in that disposable project before the block; its final request checks that command runs without docking after the round trips.
 The SDK anchor written by `terminal_seed` is Veyra-authored fixture setup for the already-visible chat turn; all later entries come from the fake TUI's typed input.
 The fake drives use `CLAUDE_CONFIG_DIR=$DATA/claude-home`; live drives never set it.
@@ -63,7 +63,18 @@ if LANE == 'live':
             if d['view']!='terminal' or not d['terminal'] or not d['terminal']['focused']: return False
             text = '\n'.join(d['terminal']['grid'])
             if provider=='claude' and not trusted and 'Yes, I trust this folder' in text and 'No, exit' in text:
-                ctl(name+'-trust-choice','keys','down')
+                chosen = [line for line in d['terminal']['grid'] if '❯' in line]
+                if not any('Yes, I trust this folder' in line for line in chosen):
+                    ctl(name+'-trust-choice','keys','down')
+                    try:
+                        moved = poll(name+'-trust-moved',lambda e:e['terminal'] is not None
+                            and any('❯' in line and 'Yes, I trust this folder' in line for line in e['terminal']['grid']))
+                    except AssertionError as error:
+                        screen = ctl(name+'-trust-stopped','dump')['terminal']
+                        raise AssertionError('Trust choice was not confirmed:\n'+('\n'.join(screen['grid']) if screen else text)) from error
+                    text = '\n'.join(moved['terminal']['grid'])
+                    chosen = [line for line in moved['terminal']['grid'] if '❯' in line]
+                assert any('Yes, I trust this folder' in line for line in chosen), text
                 ctl(name+'-trust-accept','keys','enter')
                 trusted = True
                 return False

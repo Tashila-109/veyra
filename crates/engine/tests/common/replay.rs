@@ -132,6 +132,12 @@ pub fn replay(
             let mut events = Vec::new();
             let mut sent = false;
             while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
                 match &event {
                     ProviderEvent::Session(SessionEvent::Ready { .. }) if !sent => {
                         handle
