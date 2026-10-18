@@ -110,7 +110,8 @@ if LANE == 'fake':
     ENV['CLAUDE_CONFIG_DIR'] = str(DATA/'claude-home')
     ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_CODEX_BIN=str(DATA/'fake-cli'),
         VEYRA_GROK_BIN=str(DATA/'fake-cli'),
-        VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()))
+        VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()),
+        VEYRA_RECORD=str(PROOF.resolve()/'rec'))
 else:
     ENV.pop('CLAUDE_CONFIG_DIR',None)
     ENV['VEYRA_RECORD'] = str(PROOF.resolve()/'rec')
@@ -343,11 +344,38 @@ def terminal_back(name, scenario='ok-reply'):
     stage(scenario)
     ctl(name+'-switch','keys','cmd-shift-v')
     return poll(name,lambda d:d['view']=='chat' and not d['selected_thread']['import_pending'])
-def stage_records(records):
+def fixture_source(records):
     text = '\n'.join(json.dumps(record) for record in records)+'\n'
-    for n in range(1,int(sql('select count(*) from threads'))+2):
-        for epoch in range(1,int(sql('select count(*) from turns'))+2):
-            (FIXTURES/f't{n}-s{epoch}.jsonl').write_text(text)
+    folder = FIXTURES/'records'
+    folder.mkdir(exist_ok=True)
+    source = folder/(hashlib.sha256(text.encode()).hexdigest()+'.jsonl')
+    if not source.exists(): source.write_text(text)
+    return source
+def link_fixture(name, source):
+    target = FIXTURES/name
+    if target.exists() and target.samefile(source): return
+    pending = target.with_name(target.name+'.next')
+    pending.unlink(missing_ok=True)
+    os.link(source,pending)
+    os.replace(pending,target)
+def stage_records(records):
+    source = fixture_source(records)
+    rows = sql('select threads.id,count(turns.id) from threads left join turns on turns.thread_id=threads.id group by threads.id order by threads.id')
+    turns = [int(row.split('|')[1]) for row in rows.splitlines()]+[0]
+    observed = {}
+    pid_file = PROOF/'pid'
+    try: os.kill(int(pid_file.read_text()),0)
+    except ProcessLookupError: pass
+    else:
+        for path in (PROOF/'rec').rglob('t*-s*.jsonl'):
+            match = re.fullmatch(r't(\d+)-s(\d+)\.jsonl',path.name)
+            if match and path.stat().st_mtime_ns >= pid_file.stat().st_mtime_ns:
+                lane,epoch = map(int,match.groups())
+                observed[lane] = max(observed.get(lane,0),epoch)
+    for lane,count in enumerate(turns,1):
+        last = observed.get(lane,0)
+        for epoch in range(last+1,max(last,count)+9):
+            link_fixture(f't{lane}-s{epoch}.jsonl',source)
 def stage(scenario, slow=False, turns=1):
     records = [json.loads(line) for line in (SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
     if slow:
@@ -484,7 +512,7 @@ def stage_family(parent='waiting', child='complete'):
         assert child == 'running'
         child_records = [json.loads(line) for line in (SOURCE/'long-reply.jsonl').read_text().splitlines()]
     def write(lane,epoch,records):
-        (FIXTURES/f't{lane}-s{epoch}.jsonl').write_text('\n'.join(json.dumps(record) for record in records)+'\n')
+        link_fixture(f't{lane}-s{epoch}.jsonl',fixture_source(records))
     write(number,1,records)
     write(number+1,1,child_records)
     resumed = [json.loads(line) for line in (SOURCE/'parent-wake.jsonl').read_text().splitlines()]
@@ -545,6 +573,10 @@ The slowed `ok` fixture uses 500 ms, the design's stderr-wait bound, between its
 The background proof uses three-second intervals, the design's interrupt grace, before ambient-only and empty lists.
 The family proof delays its child reply by two seconds so selection precedes the text batch and the visible counter can observe it.
 Those delays affect proof copies only; the committed capture-derived fixture is unchanged.
+Fixture staging uses each database thread’s turn count and the current app’s recorded structured-spawn names, with eight future slots for terminal entries and resume fallback.
+A stopped app stages from slot one because its next launch resets the fake CLI’s lane counters.
+Identical fixture content lives once under fixtures/records, and named spawn files are atomically replaced with hard links to those immutable contents.
+Use fixture_source and link_fixture for explicit spawn files too; writing through a hard link would change every alias.
 
 ## Doctor
 

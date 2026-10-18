@@ -149,7 +149,7 @@ pid = identity()
 groups = [int(x) for x in sql('select live_pgid from threads where live_pgid is not null').splitlines()]
 os.kill(pid,signal.SIGKILL)
 wait_gone(pid)
-shutil.copy2(SOURCE/'parent-wake.jsonl',FIXTURES/'t1-s1.jsonl')
+link_fixture('t1-s1.jsonl',fixture_source([json.loads(line) for line in (SOURCE/'parent-wake.jsonl').read_text().splitlines()]))
 start('restart-child-crash')
 owned_groups_gone(groups)
 started = time.monotonic()

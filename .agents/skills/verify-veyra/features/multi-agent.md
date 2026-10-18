@@ -276,7 +276,7 @@ for record in child:
     if method=='item/agentMessage/delta': record['after_ms']=2000
     if method=='turn/completed': record['after_ms']=1000
 for lane,records in [(1,parent),(2,child)]:
-    (FIXTURES/('t'+str(lane)+'-s1.jsonl')).write_text('\n'.join(json.dumps(r) for r in records)+'\n')
+    link_fixture('t'+str(lane)+'-s1.jsonl',fixture_source(records))
 action('codex-family-default','SetDefaultMode',{'mode':'full_access'})
 action('codex-family-new','NewThread')
 action('codex-family-parent-provider','PickProvider',{'provider':'claude'})
