@@ -1940,7 +1940,8 @@ fn grok_promoted_overlap_keeps_last_completed_cursor() {
         })
         .await;
         engine.shutdown_wait().await;
-        let p = result.unwrap();
+        result.unwrap();
+        let p = store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
         assert_eq!(
             p.threads[&f.thread].native_cursor.as_deref(),
             Some("foreign-first")

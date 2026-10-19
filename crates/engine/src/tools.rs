@@ -320,6 +320,7 @@ pub fn decide(
         )
     })?;
     let mut c = ChangeSet::default();
+    let parent_mode = parent.provider.run_mode(parent.config.mode);
     if parent.archived
         || !c
             .view(p, l, caller)
@@ -337,7 +338,7 @@ pub fn decide(
                 ));
             }
             let open = open_children(p, caller);
-            json!({"providers":providers.iter().filter(|probe|probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models})).collect::<Vec<_>>(),"mode_ceiling":parent.config.mode,"remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
+            json!({"providers":providers.iter().filter(|probe|probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models,"offered_modes":probe.provider.offered_modes()})).collect::<Vec<_>>(),"mode_ceiling":parent_mode,"remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
         }
         Tool::StartThread => {
             let args: Start = parse(call.arguments, tool)?;
@@ -357,9 +358,9 @@ pub fn decide(
                 }
                 return Ok((c, json!({"task_id":task.id,"thread_id":task.child})));
             }
-            let mode = args.mode.unwrap_or(parent.config.mode);
-            if mode > parent.config.mode {
-                let ceiling = serde_json::to_value(parent.config.mode).unwrap();
+            let mode = args.provider.run_mode(args.mode.unwrap_or(parent_mode));
+            if mode > parent_mode {
+                let ceiling = serde_json::to_value(parent_mode).unwrap();
                 return Err(invalid(format!(
                     "mode exceeds your {} ceiling; call start_thread with a mode at or below that ceiling",
                     ceiling.as_str().unwrap()

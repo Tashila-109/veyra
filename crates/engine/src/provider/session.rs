@@ -920,11 +920,16 @@ async fn run_one(
                     None => std::future::pending().await,
                 }
             } => {
-                let timer_lines = match codec.timer_lines() { Ok(lines) => lines, Err(error) => { failure = Some(error.to_string()); break; } };
-                for line in timer_lines {
+                let mut decoded = match codec.timer() { Ok(decoded) => decoded, Err(error) => { failure = Some(error.to_string()); break; } };
+                *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
+                for line in decoded.take_outbound() {
                     if let Err(error) = process.send(&writer, line) { failure = Some(error.to_string()); break; }
                 }
                 if failure.is_some() { break; }
+                for event in decoded.events {
+                    if !emit(out, thread, epoch, event).await { consumer_gone = true; break; }
+                }
+                if consumer_gone { break; }
                 if let Some(signal) = codec.escalate_interrupt() {
                     let kill = matches!(signal, Signal::Kill);
                     let _ = platform::signal_group(pid, signal);
@@ -1166,6 +1171,10 @@ pub async fn probe(
     cwd: &std::path::Path,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<super::Probe, ProviderError> {
+    let env = &env
+        .clone()
+        .with_variable("CLAUDE_CODE_AUTO_CONNECT_IDE", "0")
+        .with_variable("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
     let binary = env.resolve(ProviderKind::Claude)?;
     #[cfg(debug_assertions)]
     let fixture = env.fixtures.as_ref().map(|root| root.join("probe.jsonl"));
@@ -1210,7 +1219,12 @@ pub async fn probe(
         })
         .transpose()?;
     check_cancelled(&mut cancelled)?;
-    let mut child = env.spawn(&binary, &claude::args(None), cwd, fixture.as_deref())?;
+    let mut child = env.spawn(
+        &binary,
+        &claude::probe_args(&env.claude_managed_mcp(cwd)),
+        cwd,
+        fixture.as_deref(),
+    )?;
     let mut lines = ByteLines::new(child.stdout().expect("piped stdout"));
     let stderr = discard_stderr(&mut child);
     let mut stdin = child.stdin().expect("piped stdin");
@@ -1412,11 +1426,19 @@ impl Codec {
             Self::Grok(c) => c.end_outcome(outcome),
         }
     }
-    fn timer_lines(&mut self) -> Result<Vec<Outbound>, ProviderError> {
+    fn timer(&mut self) -> Result<Decoded, ProviderError> {
         match self {
-            Self::Claude(_) => Ok(vec![]),
-            Self::Codex(c) => c.timer_lines(),
-            Self::Grok(c) => c.timer_lines(),
+            Self::Claude(_) => Ok(Decoded::default()),
+            Self::Codex(c) => Ok(Decoded {
+                controls: c.timer_lines()?,
+                ..Default::default()
+            }),
+            Self::Grok(c) => {
+                let controls = c.timer_lines()?;
+                let mut decoded = c.completed_prompts();
+                decoded.controls.extend(controls);
+                Ok(decoded)
+            }
         }
     }
     fn eof(&mut self) {

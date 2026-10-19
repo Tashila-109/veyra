@@ -1353,3 +1353,82 @@ fn grok_load_replay_import() {
         );
     });
 }
+
+#[test]
+fn grok_guarded_fixture_keeps_three_turns_on_one_process() {
+    let (scratch, env) = environment("turn-completed-only");
+    let started = std::time::Instant::now();
+    let events = Runtime::new().unwrap().block_on(async {
+        let (out, mut rx) = mpsc::channel(256);
+        let handle = session::spawn_provider(
+            ProviderKind::Grok,
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.canonicalize().unwrap(),
+                config: config(),
+                native: None,
+                import: None,
+                root: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let mut sent = 0;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
+                let advance = matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. }))
+                    || matches!(
+                        event,
+                        ProviderEvent::Turn {
+                            event: TurnEvent::TurnEnded { .. },
+                            ..
+                        }
+                    ) && sent < 3;
+                if advance {
+                    sent += 1;
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: TurnId::new(),
+                            text: format!("message {sent}"),
+                        })
+                        .unwrap();
+                }
+                let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        events
+    });
+    assert_eq!(
+        outcomes(&events),
+        [
+            TurnOutcome::Completed,
+            TurnOutcome::Completed,
+            TurnOutcome::Completed
+        ]
+    );
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(text(&events), "First reply.Second reply.Third reply.");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })))
+            .count(),
+        1
+    );
+}

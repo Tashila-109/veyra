@@ -1,0 +1,4 @@
+{"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"2.1.296","scenario":"probe-api-key","source":"Veyra authored account-shape probe"}
+{"type":"expect_outbound","line":{"type":"control_request","request_id":"veyra-initialize","request":{"subtype":"initialize"}}}
+{"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"veyra-initialize","response":{"account":{"apiProvider":"firstParty","tokenSource":"none","apiKeySource":"<any>"},"models":[{"value":"default","displayName":"Default"}]}}}}
+{"type":"exit","code":0}

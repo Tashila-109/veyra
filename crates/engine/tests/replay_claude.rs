@@ -2086,3 +2086,230 @@ fn claude_history_from_config_env(root: &Path, request: &HistoryRequest) -> Hist
         history.expect("Claude History through config environment")
     })
 }
+
+fn probe_reads(name: &str, expected: Readiness) {
+    let (scratch, env) = environment("ok-reply", false);
+    fs::copy(fixture(name), scratch.0.join("probe.jsonl")).unwrap();
+    let result = Runtime::new().unwrap().block_on(probe(&env, &scratch.0));
+    assert_eq!(result.readiness, expected);
+    assert_eq!(result.models[0].value, "default");
+}
+#[test]
+fn claude_probe_signed_out_needs_token_source_none() {
+    probe_reads("probe-signed-out", Readiness::SignedOut);
+}
+#[test]
+fn claude_probe_api_key_reads_ready() {
+    probe_reads("probe-api-key", Readiness::Ready);
+}
+#[test]
+fn claude_probe_third_party_reads_ready() {
+    probe_reads("probe-third-party", Readiness::Ready);
+}
+#[test]
+fn claude_probe_silent_account_reads_ready() {
+    probe_reads("probe-no-account", Readiness::Ready);
+}
+#[test]
+fn claude_probe_env_turns_off_ide_and_connectors() {
+    let (scratch, mut env) = environment("ok-reply", false);
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.296\n'; exit; fi
+printf '%s\n' "$@" > '{0}/probe-args'
+printf '%s\n' "$CLAUDE_CODE_AUTO_CONNECT_IDE" "$ENABLE_CLAUDEAI_MCP_SERVERS" > '{0}/probe-env'
+read -r initialize
+printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"veyra-initialize","response":{{}}}}}}'
+"#,
+        scratch.0.display()
+    );
+    env.claude_bin = Some(stand_in(&scratch, "probe-stand-in", &script));
+    let result = Runtime::new().unwrap().block_on(probe(&env, &scratch.0));
+    assert_eq!(result.readiness, Readiness::Ready);
+    assert_eq!(
+        fs::read_to_string(scratch.0.join("probe-env")).unwrap(),
+        "0\nfalse\n"
+    );
+    let args = fs::read_to_string(scratch.0.join("probe-args")).unwrap();
+    assert!(args.contains("--settings\n{\"disableAllHooks\":true}\n"));
+    assert!(args.contains("--strict-mcp-config\n"));
+    let command = env.command(Path::new("/bin/sh"), &[], &scratch.0);
+    let variables: std::collections::BTreeMap<_, _> = command.as_std().get_envs().collect();
+    assert!(!variables.contains_key(std::ffi::OsStr::new("CLAUDE_CODE_AUTO_CONNECT_IDE")));
+    assert!(!variables.contains_key(std::ffi::OsStr::new("ENABLE_CLAUDEAI_MCP_SERVERS")));
+}
+fn two_turns_on_one_process(name: &str, first: &str) {
+    let (scratch, env) = environment(name, false);
+    let events = Runtime::new().unwrap().block_on(async {
+        let (out, mut rx) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: None,
+                import: None,
+                root: false,
+            },
+            env,
+            out,
+            1,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let mut turns = 0;
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                let send = matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. }))
+                    || matches!(
+                        event,
+                        ProviderEvent::Turn {
+                            event: TurnEvent::TurnEnded { .. },
+                            ..
+                        }
+                    ) && turns == 1;
+                if let ProviderEvent::Session(SessionEvent::Dispatched { turn }) = &event {
+                    handle
+                        .control
+                        .send(SessionControl::DispatchCommitted { turn: *turn })
+                        .unwrap();
+                }
+                if send {
+                    turns += 1;
+                    handle
+                        .control
+                        .send(SessionControl::StartTurn {
+                            turn: TurnId::new(),
+                            text: "Continue here".into(),
+                        })
+                        .unwrap();
+                }
+                let exited = matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+        })
+        .await;
+        if finished.is_err() {
+            handle.control.send(SessionControl::Shutdown).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(EngineMsg::Provider { event, .. }) = rx.recv().await {
+                    let exited =
+                        matches!(event, ProviderEvent::Session(SessionEvent::Exited { .. }));
+                    events.push(event);
+                    if exited {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        events
+    });
+    assert_eq!(
+        outcomes(&events),
+        [
+            TurnOutcome::Failed {
+                message: first.into()
+            },
+            TurnOutcome::Completed
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })))
+            .count(),
+        1
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        ProviderEvent::Turn {
+            event: TurnEvent::TurnEnded { park: true, .. },
+            ..
+        }
+    )));
+    assert!(text(&events).contains("The next message ran on this process."));
+}
+#[test]
+fn claude_403_shows_cli_text_and_keeps_session() {
+    two_turns_on_one_process(
+        "result-403",
+        "Your organization cannot use this model. Choose another model and send again.",
+    );
+}
+#[test]
+fn claude_skipped_prompt_fails_turn() {
+    two_turns_on_one_process(
+        "prompt-skipped",
+        "Claude took this message but never started a turn for it. Send it again.",
+    );
+}
+
+fn shell_snapshot_case(test: &str, failing: bool) {
+    if std::env::var_os("VEYRA_M8_SHELL_CHILD").is_some() {
+        let env = ChildEnv::load();
+        let result = Runtime::new().unwrap().block_on(async {
+            env.command(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "printf '%s\\n%s\\n' \"$PATH\" \"$__MISE_DIFF\"".into(),
+                ],
+                Path::new("/tmp"),
+            )
+            .output()
+            .await
+            .unwrap()
+        });
+        assert!(result.status.success());
+        assert_eq!(
+            result.stdout,
+            if failing {
+                b"/inherited-path\ninherited-diff\n".as_slice()
+            } else {
+                b"/shell-path\nshell-diff\n".as_slice()
+            }
+        );
+        return;
+    }
+    let (scratch, _) = environment("ok-reply", false);
+    let script = if failing {
+        "#!/bin/sh\nexit 7\n"
+    } else {
+        "#!/bin/sh\nexport PATH=/shell-path\nexport __MISE_DIFF=shell-diff\nexec /bin/sh -c \"$3\"\n"
+    };
+    let shell = stand_in(&scratch, "login-shell", script);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("VEYRA_M8_SHELL_CHILD", "1")
+        .env("SHELL", shell)
+        .env("PATH", "/inherited-path")
+        .env("__MISE_DIFF", "inherited-diff")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    );
+}
+#[test]
+fn login_shell_reads_mise_diff() {
+    shell_snapshot_case("login_shell_reads_mise_diff", false);
+}
+#[test]
+fn child_env_carries_mise_diff_with_path() {
+    shell_snapshot_case("child_env_carries_mise_diff_with_path", true);
+}

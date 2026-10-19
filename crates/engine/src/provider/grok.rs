@@ -102,7 +102,12 @@ struct Prompt {
     origin: PromptOrigin,
     accepted: bool,
     first_frame: Option<Instant>,
+    completion: Option<PromptCompletion>,
     tool_starts: BTreeMap<String, ToolCall>,
+}
+struct PromptCompletion {
+    deadline: Instant,
+    outcome: TurnOutcome,
 }
 enum PermissionReply {
     Permission {
@@ -600,6 +605,7 @@ impl Codec {
                 origin: PromptOrigin::Veyra(turn),
                 accepted: false,
                 first_frame: Some(Instant::now() + Duration::from_secs(60)),
+                completion: None,
                 tool_starts: BTreeMap::new(),
             },
         );
@@ -634,6 +640,7 @@ impl Codec {
             origin: PromptOrigin::Foreign,
             accepted: true,
             first_frame: None,
+            completion: None,
             tool_starts: BTreeMap::new(),
         });
         if self.work().is_none() {
@@ -973,28 +980,28 @@ impl Codec {
             if completed.update == "turn_completed"
                 && let Some(id) = completed.prompt_id
             {
-                self.ended.insert(id.clone());
-                if self
-                    .prompts
-                    .get(&id)
-                    .is_some_and(|prompt| matches!(prompt.origin, PromptOrigin::Foreign))
-                {
-                    self.finish(&id, completed.completion.outcome(), true, decoded);
+                match self.prompts.get_mut(&id) {
+                    Some(prompt) if matches!(prompt.origin, PromptOrigin::Veyra(_)) => {
+                        prompt.completion.get_or_insert_with(|| PromptCompletion {
+                            deadline: Instant::now() + Duration::from_secs(2),
+                            outcome: completed.completion.outcome(),
+                        });
+                    }
+                    _ => {
+                        self.ended.insert(id.clone());
+                        self.finish(&id, completed.completion.outcome(), true, decoded);
+                    }
                 }
             }
             return Ok(());
         }
         if notification == NotificationMethod::PromptComplete {
             let completion: Completion = decode(params)?;
-            let id = scope
-                .prompt_id()
-                .map(str::to_owned)
-                .or_else(|| match self.work() {
-                    Some(PromptWork::Veyra { id, .. }) => Some(id.clone()),
-                    _ => None,
-                });
+            let id = scope.prompt_id().map(str::to_owned);
             if let Some(id) = id {
                 self.finish(&id, completion.outcome(), true, decoded);
+            } else {
+                tracing::info!("ignored untagged Grok prompt_complete");
             }
             return Ok(());
         }
@@ -1390,6 +1397,11 @@ impl Codec {
         self.prompts
             .values()
             .filter_map(|p| p.first_frame)
+            .chain(
+                self.prompts
+                    .values()
+                    .filter_map(|prompt| prompt.completion.as_ref().map(|end| end.deadline)),
+            )
             .chain(self.interrupted.as_ref().map(super::StopLadder::deadline))
             .min()
     }
@@ -1404,6 +1416,24 @@ impl Codec {
             ));
         }
         Ok(vec![])
+    }
+    pub(crate) fn completed_prompts(&mut self) -> Decoded {
+        let due: Vec<_> = self
+            .prompts
+            .iter()
+            .filter_map(|(id, prompt)| {
+                prompt
+                    .completion
+                    .as_ref()
+                    .filter(|end| Instant::now() >= end.deadline)
+                    .map(|end| (id.clone(), end.outcome.clone()))
+            })
+            .collect();
+        let mut decoded = Decoded::default();
+        for (id, outcome) in due {
+            self.finish(&id, outcome, true, &mut decoded);
+        }
+        decoded
     }
     pub(crate) fn escalate_interrupt(&mut self) -> Option<Signal> {
         self.interrupted.as_mut()?.escalate()

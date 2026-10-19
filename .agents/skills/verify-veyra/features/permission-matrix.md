@@ -6,12 +6,15 @@ Status: passed, 2026-10-17, 211741c, Grok live cells from RUN 991af6f4 and 2816c
 
 One live prompt checks reading, a command, a project write and an outside write in every permission mode.
 Claude, Codex and Grok rows come from preserved authorized live evidence.
+Claude and Codex offer Ask first, Accept edits and Full access.
+Grok offers Ask first and Full access.
+Its Accept edits cell tests a stored mode that runs as Ask first.
 
 | Provider | Ask first | Accept edits | Full access |
 | --- | --- | --- | --- |
 | Claude | passed: Read and `echo` ran without approval; both writes docked as `Write` with their absolute targets, inside and outside the project, Allow once, both files written | passed: Read, `echo` and the project write ran without approval; the outside write docked as `Write`, outside the project, Allow once, written | passed: all four steps ran with no approval; both files written |
 | Codex | passed: `cat` and `echo` each docked as Command and ran after Allow once; the project write docked as `/bin/zsh -lc "printf '%s\\n' 'veyra permission probe' > permission-project.txt"`, Allow once, written; the outside write docked with its `/tmp` target in the command, Deny (the lane allows no approval outside the scratch project), not written | passed: Read, `echo`, the project write and the `/tmp` outside write all ran without approval; Codex's workspace-write sandbox lets `/tmp` writes through; both files written | passed: all four steps ran with no approval; both files written |
-| Grok | passed: Read, `list_dir` and `echo` ran without approval (Grok's own safe tools, no request); the project write docked as ``Edit `…/permission-project.txt` `` (`SearchReplace`, inside the project), Allow once, written; the outside write docked as ``Edit `/tmp/veyra-outside-RUN.txt` ``, Deny (the lane allows no approval outside the scratch project), not written; Grok then ended the turn as cancelled (`PermissionRejected`), so it reads Interrupted | passed: Grok has no Accept edits mode, so it asked as Ask first: Read, `grep`, `list_dir` and `echo` ran without approval; the project write docked as `Edit`, Allow once, written; the outside write docked as `Edit` with its `/tmp` target, Deny, not written; Veyra answered no request by itself; Grok ended the turn cancelled (`PermissionRejected`), Interrupted | passed: all four steps ran with no request (Read, `echo`, two `Edit`s); both files written |
+| Grok | passed: Read, `list_dir` and `echo` ran without approval (Grok's own safe tools, no request); the project write docked as ``Edit `…/permission-project.txt` `` (`SearchReplace`, inside the project), Allow once, written; the outside write docked as ``Edit `/tmp/veyra-outside-RUN.txt` ``, Deny (the lane allows no approval outside the scratch project), not written; Grok then ended the turn as cancelled (`PermissionRejected`), so it reads Interrupted | Required stored-mode check: create with `veyra ctl action veyra::PickPermission` and `{"mode":"accept_edits"}`; retain the stored Accept edits value, show Ask first in the chip and dock the in-project write. Preserved live result: Grok has no Accept edits mode, so it asked as Ask first: Read, `grep`, `list_dir` and `echo` ran without approval; the project write docked as `Edit`, Allow once, written; the outside write docked as `Edit` with its `/tmp` target, Deny, not written; Veyra answered no request by itself; Grok ended the turn cancelled (`PermissionRejected`), Interrupted | passed: all four steps ran with no request (Read, `echo`, two `Edit`s); both files written |
 
 ## How to get to it (user POV)
 
@@ -37,7 +40,10 @@ Replace RUN in this one prompt with the exported run identity:
 
 > Read permission-input.txt and report its content. Run echo veyra-permission-probe. Write permission-project.txt in this project containing veyra permission probe. Write /tmp/veyra-outside-RUN.txt containing veyra permission probe. Describe each step and wait for required approvals.
 
-Select each mode with PickPermission, send through Send, and preserve every dock and decision with dump and capture.
+Select each offered mode with PickPermission, send through Send, and preserve every dock and decision with dump and capture.
+For Grok’s Accept edits cell, use `veyra ctl action veyra::PickPermission '{"mode":"accept_edits"}'` before Send to create a thread stored in Accept edits.
+Assert the stored configuration remains accept_edits, the chip and composer.mode show Ask first, and an in-project write docks.
+Open its permission chip and preserve a screenshot showing only Ask first and Full access.
 Use AllowOnce or Deny as the operator directs; do not silently grant the whole thread.
 Read the project and outside files to prove the effects, then remove only this run's outside file.
 Record cell status, provider version, requested approvals, decisions, files and the run proof path.
@@ -55,7 +61,7 @@ Replay evidence never marks a live cell passed.
 ## Gotchas
 
 Grok follows your Claude and Grok permission settings, so Ask first asks only when they do not already allow the action.
-Grok has no Accept edits mode, so Accept edits asks as Ask first does.
+A Grok thread stored in Accept edits runs and shows Ask first without rewriting its stored mode.
 Veyra turns off Grok's settings-seeded auto mode in Ask first and Accept edits (`_meta.autoMode`/`yoloMode` false and `_x.ai/yolo_mode_changed`), so Grok asks for what its safe list and the user's allow rules do not cover.
 
 Workers do not run installed providers; the Claude cells above retain the authorized live run's results.

@@ -61,7 +61,7 @@ pub fn turn_params(native: &str, config: &ThreadConfig, text: String) -> Value {
     })
 }
 pub fn initialize() -> Value {
-    json!({"clientInfo":{"name":"veyra","title":"Veyra","version":env!("CARGO_PKG_VERSION")}})
+    json!({"clientInfo":{"name":"veyra","title":"Veyra","version":env!("CARGO_PKG_VERSION")},"capabilities":{"optOutNotificationMethods":["turn/diff/updated"]}})
 }
 #[derive(Clone, Copy)]
 enum Call {
@@ -442,6 +442,14 @@ impl Codec {
                             pgid: self.pid,
                             capabilities: vec![],
                         }));
+                }
+                Err(error)
+                    if self
+                        .mcp
+                        .as_ref()
+                        .is_some_and(|mcp| mcp.reject_codex_option(&error.message)) =>
+                {
+                    self.queue_thread(&mut decoded)?;
                 }
                 Err(error) if self.native().is_some() && not_found(&error.message) => {
                     if let Some(mcp) = &self.mcp {

@@ -49,6 +49,20 @@ pub fn args(spec: Option<&SessionSpec>) -> Vec<String> {
         if let Some(effort) = &spec.config.effort {
             args.extend(["--effort".into(), effort.clone()]);
         }
+        if spec.root {
+            args.extend([
+                "--append-system-prompt".into(),
+                crate::tools::instructions(),
+            ]);
+        }
+    }
+    args
+}
+pub fn probe_args(managed: &std::path::Path) -> Vec<String> {
+    let mut args = args(None);
+    args.extend(["--settings".into(), r#"{"disableAllHooks":true}"#.into()]);
+    if !managed.is_file() {
+        args.push("--strict-mcp-config".into());
     }
     args
 }
@@ -134,6 +148,7 @@ struct Assistant {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ResultFrame {
+    api_error_status: Option<u16>,
     is_error: bool,
     subtype: String,
     result: String,
@@ -474,6 +489,7 @@ pub(crate) struct Codec {
     requests: BTreeMap<String, PendingRequest>,
     seen_requests: BTreeSet<String>,
     seen_commands: BTreeSet<String>,
+    prompt_started: bool,
 }
 impl Codec {
     pub fn native(&self) -> &NativeSessionId {
@@ -493,6 +509,7 @@ impl Codec {
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
             seen_commands: BTreeSet::new(),
+            prompt_started: false,
         }
     }
     pub fn start(&mut self, turn: TurnId, text: String) -> Option<Decoded> {
@@ -504,6 +521,7 @@ impl Codec {
         self.stream = MessageStream::default();
         self.error = None;
         self.interrupted = None;
+        self.prompt_started = false;
         Some(Decoded {
             cursor: Some(turn.to_string().into()),
             events: vec![ProviderEvent::Session(SessionEvent::Dispatched { turn })],
@@ -649,8 +667,18 @@ impl Codec {
                     .is_some_and(|turn| lifecycle.command_uuid == turn.to_string())
                 {
                     self.echo = EchoMode::Known;
+                    if lifecycle.state == "started" {
+                        self.prompt_started = true;
+                    }
                     if ["queued", "started"].contains(&lifecycle.state.as_str()) {
                         events.push(TurnEvent::Accepted);
+                    } else if lifecycle.state == "completed" && !self.prompt_started {
+                        events.push(TurnEvent::TurnEnded {
+                            outcome: self.end_outcome(TurnOutcome::Failed {
+                                message: "Claude took this message but never started a turn for it. Send it again.".into(),
+                            }),
+                            park: false,
+                        });
                     }
                 } else if self.active.is_none()
                     && ["queued", "started"].contains(&lifecycle.state.as_str())
@@ -666,9 +694,19 @@ impl Codec {
             Frame::Assistant(assistant) => self.assistant(assistant, &mut events)?,
             Frame::Result(result) => {
                 if self.owns_result(&result) {
+                    let forbidden = result.api_error_status == Some(403);
+                    let outcome = if let Some(interrupt) = &self.interrupted {
+                        interrupt.outcome()
+                    } else if forbidden {
+                        TurnOutcome::Failed {
+                            message: crate::record::redact(&result.result, None),
+                        }
+                    } else {
+                        self.end_outcome(result.outcome())
+                    };
                     events.push(TurnEvent::TurnEnded {
-                        outcome: self.end_outcome(result.outcome()),
-                        park: self.error.as_ref().is_some_and(|error| error.park),
+                        outcome,
+                        park: !forbidden && self.error.as_ref().is_some_and(|error| error.park),
                     });
                 }
             }

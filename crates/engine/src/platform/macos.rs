@@ -12,6 +12,7 @@ use std::{
 };
 
 pub const SOCKET_PATH_MAX: usize = 103;
+pub const CLAUDE_MANAGED_MCP: &str = "/Library/Application Support/ClaudeCode/managed-mcp.json";
 pub const KNOWN_BIN_DIRS: &[&str] = &[
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -21,18 +22,18 @@ pub const KNOWN_BIN_DIRS: &[&str] = &[
     ".claude/local",
 ];
 
-pub fn login_shell_path() -> io::Result<std::ffi::OsString> {
+pub fn login_shell_path() -> io::Result<(std::ffi::OsString, Option<std::ffi::OsString>)> {
     let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
     bounded_shell_path(&shell, std::time::Duration::from_secs(2))
 }
 fn bounded_shell_path(
     shell: &std::ffi::OsStr,
     bound: std::time::Duration,
-) -> io::Result<std::ffi::OsString> {
+) -> io::Result<(std::ffi::OsString, Option<std::ffi::OsString>)> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let mut child = Command::new(shell)
-        .args(["-l", "-c", "printf '%s' \"$PATH\""])
+        .args(["-l", "-c", "printf '%s\\0%s' \"$PATH\" \"${__MISE_DIFF-}\""])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -68,7 +69,15 @@ fn bounded_shell_path(
             }
             if eof && let Some(status) = status {
                 return if status.success() {
-                    Ok(String::from_utf8_lossy(&bytes).trim().into())
+                    use std::os::unix::ffi::OsStringExt;
+                    let mut fields = bytes.splitn(2, |byte| *byte == 0);
+                    let path =
+                        std::ffi::OsString::from_vec(fields.next().unwrap_or_default().to_vec());
+                    let mise_diff = fields
+                        .next()
+                        .filter(|bytes| !bytes.is_empty())
+                        .map(|bytes| std::ffi::OsString::from_vec(bytes.to_vec()));
+                    Ok((path, mise_diff))
                 } else {
                     Err(io::Error::other("login shell could not read PATH"))
                 };

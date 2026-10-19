@@ -48,6 +48,7 @@ pub fn secret_shapes(text: &str) -> bool {
         || MATCHES.iter().any(|rule| {
             rule.expression.captures_iter(text).any(|capture| {
                 !auth_method_catalog(&capture)
+                    && &capture[rule.secret_group] != "none"
                     && !crate::fixture::wildcard(&capture[rule.secret_group])
             })
         })
@@ -141,7 +142,12 @@ mod capture {
             Value::Object(object) => Value::Object(
                 object
                     .into_iter()
-                    .map(|(key, value)| (key, mask_account(value)))
+                    .map(|(key, value)| {
+                        let safe = (["tokenSource", "apiKeySource"].contains(&key.as_str())
+                            && value == "none")
+                            || (key == "apiProvider" && value == "firstParty");
+                        (key, if safe { value } else { mask_account(value) })
+                    })
                     .collect(),
             ),
             Value::Array(array) => Value::Array(array.into_iter().map(mask_account).collect()),
@@ -364,6 +370,9 @@ mod capture {
                 return mask_account(value);
             }
             if key.is_some_and(credential_name) {
+                if value == "none" {
+                    return value;
+                }
                 return Value::String("<any>".into());
             }
             if let Value::Object(pair) = &value

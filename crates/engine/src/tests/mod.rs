@@ -3,6 +3,7 @@ mod codex;
 mod grants;
 mod multi_agent;
 mod perf;
+mod provider_options;
 mod recovery;
 mod requests;
 mod session_events;

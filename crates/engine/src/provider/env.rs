@@ -23,16 +23,19 @@ pub(crate) type Groups = Arc<Mutex<std::collections::BTreeSet<u32>>>;
 #[cfg(not(test))]
 struct LoginPath {
     path: OsString,
+    mise_diff: Option<OsString>,
     failure: Option<std::io::Error>,
 }
 #[cfg(not(test))]
 static LOGIN_PATH: LazyLock<LoginPath> = LazyLock::new(|| match platform::login_shell_path() {
-    Ok(path) => LoginPath {
+    Ok((path, mise_diff)) => LoginPath {
         path,
+        mise_diff,
         failure: None,
     },
     Err(error) => LoginPath {
         path: std::env::var_os("PATH").unwrap_or_default(),
+        mise_diff: std::env::var_os("__MISE_DIFF"),
         failure: Some(error),
     },
 });
@@ -99,6 +102,10 @@ impl ChildEnv {
             env.resolution = Resolution::Ambient;
             env.reaper_pids = None;
             env.path = LOGIN_PATH.path.clone();
+            if let Some(mise_diff) = &LOGIN_PATH.mise_diff {
+                env.variables
+                    .insert("__MISE_DIFF".into(), mise_diff.clone());
+            }
             env.home = std::env::var_os("HOME").map(PathBuf::from);
             if let Some(root) = std::env::var_os("CLAUDE_CONFIG_DIR") {
                 env.variables.insert("CLAUDE_CONFIG_DIR".into(), root);
@@ -160,6 +167,16 @@ impl ChildEnv {
             Self::load()
         }
     }
+    pub(crate) fn claude_managed_mcp(&self, cwd: &Path) -> PathBuf {
+        #[cfg(debug_assertions)]
+        if self.fixtures.is_some() {
+            return cwd.join("managed-mcp.json");
+        }
+        match self.resolution {
+            Resolution::Ambient => platform::CLAUDE_MANAGED_MCP.into(),
+            Resolution::Explicit(_) => cwd.join("managed-mcp.json"),
+        }
+    }
     pub fn with_binary(mut self, provider: ProviderKind, binary: PathBuf) -> Self {
         if matches!(self.resolution, Resolution::Ambient) {
             self.resolution = Resolution::Explicit(Default::default());
@@ -219,6 +236,14 @@ impl ChildEnv {
         variables.retain(|key, _| {
             let name = key.to_string_lossy();
             !name.starts_with("VEYRA_")
+                && !(matches!(self.resolution, Resolution::Explicit(_))
+                    && [
+                        "__MISE_DIFF",
+                        "CLAUDE_CODE_AUTO_CONNECT_IDE",
+                        "ENABLE_CLAUDEAI_MCP_SERVERS",
+                    ]
+                    .contains(&name.as_ref())
+                    && !self.variables.contains_key(key))
                 && ![
                     "CLAUDECODE",
                     "CLAUDE_CODE_ENTRYPOINT",
@@ -802,4 +827,16 @@ fn tui_env_sets_term_and_strips_host() {
             "inherited {key}"
         );
     }
+}
+
+#[cfg(all(test, debug_assertions))]
+#[test]
+fn claude_probe_replay_uses_owned_managed_policy_path() {
+    let mut env = ChildEnv::isolated();
+    env.resolution = Resolution::Ambient;
+    env.fixtures = Some("/owned/fixtures".into());
+    assert_eq!(
+        env.claude_managed_mcp(Path::new("/owned/probe")),
+        PathBuf::from("/owned/probe/managed-mcp.json")
+    );
 }

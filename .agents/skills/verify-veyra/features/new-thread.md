@@ -15,6 +15,11 @@ Status: passed, 2026-10-18, ec5469f, none
 Add a project with ⌘⇧O or the sidebar button.
 New thread or ⌘N opens the composer.
 Choose the provider, model, effort and permission chips.
+Claude and Codex offer Ask first, Accept edits and Full access.
+Grok offers Ask first and Full access, and its permission key cycle visits only those two.
+A new thread uses its provider’s run mode for the Settings default, so Grok starts and stores Ask first when that default is Accept edits.
+Settings continues to offer all three modes.
+A stored Grok thread in Accept edits keeps that value and shows Ask first.
 The provider menu marks Claude Code, Codex and Grok Ready, Not installed or Signed out.
 A missing Claude names `npm install -g @anthropic-ai/claude-code`; a signed-out Claude names `claude auth login`.
 Check again reaches `veyra::RecheckProviders`.
@@ -284,3 +289,7 @@ Check again may briefly show Checking; the helper polls that state at the same 5
 The checks do not run a Claude turn or mutate any committed fixture.
 The native folder picker and external keyboard delivery are manual entry points.
 Update Status from candidate acceptance.
+
+The permission chip’s visible menu is exposed by `composer.permission_picker_open`.
+`composer.offered_modes` reports the same provider list used to build that menu.
+In a Grok composer, open the permission chip through its focused button and capture the two entries, Ask first and Full access.

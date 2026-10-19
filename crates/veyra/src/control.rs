@@ -1,7 +1,9 @@
 #![cfg(debug_assertions)]
 
 use anyhow::{Context as _, bail};
-use gpui_kit::{App, Entity, Focusable, KeyDownEvent, Keystroke, PlatformInput, Window};
+use gpui_kit::{
+    App, Entity, Focusable, KeyDownEvent, KeyUpEvent, Keystroke, PlatformInput, Window,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -118,22 +120,8 @@ pub fn attach(
                             Ok(json!({"ok": true}))
                         }
                         Command::Keys { keystrokes } => {
-                            let keys = keystrokes
-                                .split_whitespace()
-                                .map(Keystroke::parse)
-                                .collect::<Result<Vec<_>, _>>()?;
-                            if keys.is_empty() {
-                                bail!("keys needs at least one keystroke");
-                            }
-                            for keystroke in keys {
-                                window.dispatch_event(
-                                    PlatformInput::KeyDown(KeyDownEvent {
-                                        keystroke,
-                                        is_held: false,
-                                        prefer_character_input: false,
-                                    }),
-                                    cx,
-                                );
+                            for event in key_events(&keystrokes)? {
+                                window.dispatch_event(event, cx);
                             }
                             Ok(json!({"ok": true}))
                         }
@@ -172,6 +160,29 @@ pub fn attach(
         })
         .detach();
     });
+}
+
+fn key_events(keystrokes: &str) -> anyhow::Result<Vec<PlatformInput>> {
+    let keys = keystrokes
+        .split_whitespace()
+        .map(Keystroke::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    if keys.is_empty() {
+        bail!("keys needs at least one keystroke");
+    }
+    Ok(keys
+        .into_iter()
+        .flat_map(|keystroke| {
+            [
+                PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: keystroke.clone(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                PlatformInput::KeyUp(KeyUpEvent { keystroke }),
+            ]
+        })
+        .collect())
 }
 
 pub(crate) fn text_keystrokes(text: &str) -> Vec<Keystroke> {
@@ -339,6 +350,41 @@ pub fn client() -> anyhow::Result<()> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keys_dispatches_down_then_up_per_keystroke() {
+        let events = super::key_events("a secondary-enter space").unwrap();
+        let observed: Vec<_> = events
+            .iter()
+            .map(|event| match event {
+                gpui_kit::PlatformInput::KeyDown(event) => {
+                    assert!(!event.is_held && !event.prefer_character_input);
+                    (
+                        "down",
+                        event.keystroke.key.as_str(),
+                        event.keystroke.modifiers.platform,
+                    )
+                }
+                gpui_kit::PlatformInput::KeyUp(event) => (
+                    "up",
+                    event.keystroke.key.as_str(),
+                    event.keystroke.modifiers.platform,
+                ),
+                _ => panic!("keys emitted an event other than key-down or key-up"),
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                ("down", "a", false),
+                ("up", "a", false),
+                ("down", "enter", true),
+                ("up", "enter", true),
+                ("down", "space", false),
+                ("up", "space", false),
+            ]
+        );
+        assert!(super::key_events("").is_err());
+    }
     use super::*;
     #[test]
     fn ctl_wait_exit_codes() {

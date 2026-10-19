@@ -1,15 +1,15 @@
 {"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.161.0", "scenario": "resume-relay-fallback", "source": "Veyra hand-written stable-schema scenario"}
-{"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}}}}
+{"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}, "capabilities": {"optOutNotificationMethods": ["turn/diff/updated"]}}}}
 {"type": "emit_inbound", "line": {"id": "<id:initialize>", "result": {"userAgent": "veyra/0.161.0"}}}
 {"type": "expect_outbound", "line": {"method": "initialized"}}
-{"type": "expect_outbound", "line": {"id": "<id:refused-0>", "method": "thread/resume", "params": {"cwd": "<cwd>", "model": "<any>", "approvalPolicy": "untrusted", "sandbox": "read-only", "approvalsReviewer": "user", "config": {"mcp_servers.veyra.command": "<id:mcp_command>", "mcp_servers.veyra.args": ["mcp"], "mcp_servers.veyra.env": "<id:mcp_env>"}, "threadId": "missing-native", "excludeTurns": true}}}
+{"type": "expect_outbound", "line": {"id": "<id:refused-0>", "method": "thread/resume", "params": {"cwd": "<cwd>", "model": "<any>", "approvalPolicy": "untrusted", "sandbox": "read-only", "approvalsReviewer": "user", "config": {"mcp_servers.veyra.command": "<id:mcp_command>", "mcp_servers.veyra.args": ["mcp"], "mcp_servers.veyra.env": "<id:mcp_env>", "mcp_optional_startup_grace_ms": 5000, "mcp_servers.veyra.tool_timeout_sec": 30}, "threadId": "missing-native", "excludeTurns": true}}}
 {"type": "mcp_start"}
 {"type": "record_relay_pid", "path": "refused-relay-0.pid"}
 {"type": "mcp_send", "line": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "veyra-codex-fixture", "version": "1"}}}}
 {"type": "mcp_expect", "line": {"jsonrpc": "2.0", "id": 1, "result": "<any>"}}
 {"type": "mcp_stop"}
 {"type": "emit_inbound", "line": {"id": "<id:refused-0>", "error": {"code": -32600, "message": "no rollout found for thread id missing-native"}}}
-{"type": "expect_outbound", "line": {"id": "<id:thread_request>", "method": "thread/start", "params": {"cwd": "<cwd>", "model": "<any>", "approvalPolicy": "untrusted", "sandbox": "read-only", "approvalsReviewer": "user", "config": {"mcp_servers.veyra.command": "<id:mcp_command>", "mcp_servers.veyra.args": ["mcp"], "mcp_servers.veyra.env": "<id:mcp_env>"}}}}
+{"type": "expect_outbound", "line": {"id": "<id:thread_request>", "method": "thread/start", "params": {"cwd": "<cwd>", "model": "<any>", "approvalPolicy": "untrusted", "sandbox": "read-only", "approvalsReviewer": "user", "config": {"mcp_servers.veyra.command": "<id:mcp_command>", "mcp_servers.veyra.args": ["mcp"], "mcp_servers.veyra.env": "<id:mcp_env>", "mcp_optional_startup_grace_ms": 5000, "mcp_servers.veyra.tool_timeout_sec": 30}}}}
 {"type": "emit_inbound", "line": {"id": "<id:thread_request>", "result": {"thread": {"id": "native-thread", "cliVersion": "0.161.0"}}}}
 {"type": "expect_outbound", "line": {"id": "<id:turn_request>", "method": "turn/start", "params": {"threadId": "<id:session>", "input": [{"type": "text", "text": "<any>", "text_elements": []}], "model": "<any>", "effort": "<any>", "summary": "auto", "approvalPolicy": "untrusted", "approvalsReviewer": "user", "sandboxPolicy": {"type": "readOnly", "networkAccess": true}}}}
 {"type": "emit_inbound", "line": {"id": "<id:turn_request>", "result": {"turn": {"id": "native-turn", "status": "inProgress", "items": [], "error": null}}}}

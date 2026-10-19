@@ -1,5 +1,5 @@
 {"type": "transcript_start", "provider": "codex", "protocol": "json-rpc", "cli_version": "0.161.0", "scenario": "elicitation", "source": "Veyra hand-written stable-schema scenario"}
-{"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}}}}
+{"type": "expect_outbound", "line": {"id": "<id:initialize>", "method": "initialize", "params": {"clientInfo": {"name": "veyra", "title": "Veyra", "version": "0.0.1"}, "capabilities": {"optOutNotificationMethods": ["turn/diff/updated"]}}}}
 {"type": "emit_inbound", "line": {"id": "<id:initialize>", "result": {"userAgent": "veyra/0.161.0"}}}
 {"type": "expect_outbound", "line": {"method": "initialized"}}
 {"type": "expect_outbound", "line": {"id": "<id:thread_request>", "method": "thread/start", "params": {"cwd": "<cwd>", "model": "<any>", "approvalPolicy": "untrusted", "sandbox": "read-only", "approvalsReviewer": "user"}}}

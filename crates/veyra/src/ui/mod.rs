@@ -675,6 +675,8 @@ pub struct Shell {
     branch: String,
     branch_task: tokio::task::JoinSet<()>,
     provider_picker: Option<Entity<PopupMenu>>,
+    #[cfg(debug_assertions)]
+    permission_picker_open: bool,
     thread_menu: Option<(ThreadId, Entity<PopupMenu>)>,
     #[cfg(debug_assertions)]
     provider_picker_labels: Vec<String>,
@@ -776,7 +778,8 @@ impl Shell {
                         if old_default != shell.state.settings.default_mode
                             && shell.view.chat().is_none()
                         {
-                            shell.config.mode = shell.state.settings.default_mode;
+                            shell.config.mode =
+                                shell.provider.run_mode(shell.state.settings.default_mode);
                         }
                         let count = shell
                             .view
@@ -877,6 +880,8 @@ impl Shell {
             branch: String::new(),
             branch_task: Default::default(),
             provider_picker: None,
+            #[cfg(debug_assertions)]
+            permission_picker_open: false,
             thread_menu: None,
             #[cfg(debug_assertions)]
             provider_picker_labels: vec![],
@@ -1672,7 +1677,7 @@ impl Shell {
     fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show(MainView::NewThread);
         self.provider_picker = None;
-        self.config.mode = self.state.settings.default_mode;
+        self.config.mode = self.provider.run_mode(self.state.settings.default_mode);
         self.notice = None;
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
@@ -1722,9 +1727,16 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mode = action
-            .mode
-            .unwrap_or_else(|| settings::next_mode(self.composer_config().mode));
+        let provider = self.chosen_provider();
+        let mode = action.mode.unwrap_or_else(|| {
+            if matches!(self.view, MainView::Settings { .. }) {
+                return settings::next_mode(self.state.settings.default_mode);
+            }
+            let modes = provider.offered_modes();
+            let current = provider.run_mode(self.composer_config().mode);
+            let index = modes.iter().position(|mode| *mode == current).unwrap();
+            modes[(index + 1) % modes.len()]
+        });
         if matches!(self.view, MainView::Settings { .. }) {
             self.send_command(Command::SetDefaultMode { mode }, window, cx);
         } else {
@@ -1901,7 +1913,9 @@ impl Shell {
     fn dump_composer(&self, cx: &App) -> serde_json::Value {
         let reason = self.disabled_reason();
         serde_json::json!({
-            "provider":self.chosen_provider(), "mode":self.composer_config().mode,
+            "provider":self.chosen_provider(), "mode":self.chosen_provider().run_mode(self.composer_config().mode),
+            "permission_picker_open":self.permission_picker_open,
+            "offered_modes":self.chosen_provider().offered_modes(),
             "model":self.composer_config().model, "effort":self.composer_config().effort,
             "send_enabled":reason.is_none(), "disabled_reason":reason,
             "provider_picker_open":self.provider_picker.is_some(),
@@ -2192,6 +2206,7 @@ impl Render for Shell {
                 shell.input.update(cx, |input, cx| input.focus(window, cx));
                 shell.config.model = None;
                 shell.config.effort = None;
+                shell.config.mode = shell.provider.run_mode(shell.state.settings.default_mode);
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, action: &PickModel, window, cx| {
@@ -5525,6 +5540,75 @@ mod tests {
             );
             assert!(cx.debug_bounds("caption-Default model").is_some());
             assert!(cx.debug_bounds("caption-Effort").is_some());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn chip_lists_offered_modes(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                shell.state.requests.clear();
+                shell.provider = ProviderKind::Grok;
+                shell.state.settings.default_mode = PermissionMode::AcceptEdits;
+                shell.new_thread(window, cx);
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.config.mode),
+                PermissionMode::AskFirst
+            );
+            assert!(cx.debug_bounds("caption-Ask first").is_some());
+            let button = cx.debug_bounds("composer-permission").unwrap().center();
+            cx.simulate_click(button, gpui::Modifiers::none());
+            draw(cx);
+            cx.simulate_keystrokes("down down enter");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.config.mode),
+                PermissionMode::FullAccess
+            );
+            shell.update_in(cx, |shell, window, cx| {
+                shell.pick_permission(&super::PickPermission { mode: None }, window, cx);
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.config.mode),
+                PermissionMode::AskFirst
+            );
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.state.settings.default_mode),
+                PermissionMode::AcceptEdits
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn permission_menu_opens_from_keyboard(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                shell.state.requests.clear();
+                shell.provider = ProviderKind::Grok;
+                shell.new_thread(window, cx);
+            });
+            draw(cx);
+            for index in 0..20 {
+                cx.update(|window, cx| window.focus_next(cx));
+                draw(cx);
+                cx.simulate_keystrokes("space");
+                draw(cx);
+                if shell.read_with(cx, |shell, _| shell.permission_picker_open) {
+                    println!("permission menu opened after {} tab steps", index + 1);
+                    return;
+                }
+                cx.simulate_keystrokes("escape");
+                draw(cx);
+            }
+            panic!(
+                "permission menu did not open; draft={:?}",
+                shell.read_with(cx, |shell, cx| shell.input.read(cx).value().to_string())
+            );
         });
     }
 

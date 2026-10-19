@@ -546,3 +546,45 @@ fn grok_auth_method_catalog_is_public_but_credentials_are_private() {
     assert_eq!(rows[1]["line"]["authMethods"][0]["id"], "cached_token");
     assert_eq!(rows[1]["line"]["authMethods"][0]["access_token"], "<any>");
 }
+
+#[test]
+fn capture_keeps_none_and_masks_other_account_values() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("account.jsonl");
+    let mut recorder = Recorder::create(
+        &path,
+        veyra_engine::provider::ProviderKind::Claude,
+        "2.1.296",
+        &scratch.0,
+        None,
+        None,
+    )
+    .unwrap();
+    for account in [
+        json!({"tokenSource":"none","apiKeySource":"none","apiProvider":"firstParty","email":"private-person","organization":"private-org"}),
+        json!({"tokenSource":"private-token-source","apiKeySource":"private-key-source","apiProvider":"bedrock","subscriptionType":"private-plan"}),
+    ] {
+        recorder
+            .line(
+                false,
+                json!({"type":"control_response","response":{"response":{"account":account}}}),
+            )
+            .unwrap();
+    }
+    let text = fs::read_to_string(&path).unwrap();
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows[1]["line"]["response"]["response"]["account"],
+        json!({"tokenSource":"none","apiKeySource":"none","apiProvider":"firstParty","email":"<any>","organization":"<any>"})
+    );
+    assert_eq!(
+        rows[2]["line"]["response"]["response"]["account"],
+        json!({"tokenSource":"<any>","apiKeySource":"<any>","apiProvider":"<any>","subscriptionType":"<any>"})
+    );
+    assert!(!text.contains("private-"));
+    assert!(!record::secret_shapes(&text));
+    assert!(record::secret_shapes(r#"{"tokenSource":"unsafe-literal"}"#));
+}

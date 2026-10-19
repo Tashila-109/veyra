@@ -860,6 +860,7 @@ pub(crate) struct McpConfig {
     epoch: u32,
     pid: u32,
     hashes: std::sync::Mutex<Vec<crate::mcp::TokenHash>>,
+    unsupported_codex_options: Mutex<std::collections::BTreeSet<&'static str>>,
 }
 impl McpConfig {
     pub(crate) fn new(
@@ -876,6 +877,7 @@ impl McpConfig {
             epoch,
             pid,
             hashes: Default::default(),
+            unsupported_codex_options: Default::default(),
         }
     }
     pub(crate) fn frame(&self, line: Value) -> Result<Outbound, ProviderError> {
@@ -892,7 +894,25 @@ impl McpConfig {
             command: self.server.command.clone(),
             socket: self.server.socket.clone(),
             token,
+            unsupported_codex_options: self.unsupported_codex_options.lock().unwrap().clone(),
         })))
+    }
+    pub(crate) fn reject_codex_option(&self, message: &str) -> bool {
+        let mut unsupported = self.unsupported_codex_options.lock().unwrap();
+        for key in [
+            "mcp_optional_startup_grace_ms",
+            "mcp_servers.veyra.tool_timeout_sec",
+        ] {
+            if message.contains(key) && unsupported.insert(key) {
+                self.revoke();
+                tracing::warn!(
+                    option = key,
+                    "Codex rejected optional MCP config; retrying without it"
+                );
+                return true;
+            }
+        }
+        false
     }
     pub(crate) fn sanitize(&self, value: &mut Value, replacement: &str) {
         for hash in self.hashes.lock().unwrap().iter() {
@@ -923,12 +943,19 @@ pub(crate) struct ThreadFrame {
     command: std::path::PathBuf,
     socket: std::path::PathBuf,
     token: crate::mcp::McpToken,
+    unsupported_codex_options: std::collections::BTreeSet<&'static str>,
 }
 impl ThreadFrame {
     fn config(&self, token: &str) -> Value {
-        json!({"mcp_servers.veyra.command":self.command,
+        let mut config = json!({"mcp_servers.veyra.command":self.command,
+            "mcp_optional_startup_grace_ms":5000,
+            "mcp_servers.veyra.tool_timeout_sec":30,
             "mcp_servers.veyra.args":["mcp"],
-            "mcp_servers.veyra.env":{"VEYRA_SOCKET":self.socket,"VEYRA_MCP_TOKEN":token}})
+            "mcp_servers.veyra.env":{"VEYRA_SOCKET":self.socket,"VEYRA_MCP_TOKEN":token}});
+        for key in &self.unsupported_codex_options {
+            config.as_object_mut().unwrap().remove(*key);
+        }
+        config
     }
     fn inject(&self, line: &mut Value, token: &str) {
         match self.wire {
@@ -967,6 +994,7 @@ mod credential_frame_tests {
             command: "/owned/veyra".into(),
             socket: "/owned/veyra.sock".into(),
             token: token.clone(),
+            unsupported_codex_options: Default::default(),
         }));
         let recorded = outbound.value();
         assert!(
@@ -990,6 +1018,7 @@ mod credential_frame_tests {
             command: "/owned/veyra".into(),
             socket: "/owned/veyra.sock".into(),
             token: token.clone(),
+            unsupported_codex_options: Default::default(),
         }));
         let recorded = outbound.value();
         assert_eq!(
@@ -1003,5 +1032,99 @@ mod credential_frame_tests {
             written["params"]["config"]["mcp_servers.veyra.env"]["VEYRA_MCP_TOKEN"].as_str()
                 == Some(token.expose())
         );
+    }
+}
+
+#[test]
+fn codex_root_config_sets_grace_and_tool_timeout() {
+    for method in ["thread/start", "thread/resume"] {
+        let frame = ThreadFrame {
+            wire: McpWire::Codex,
+            line: json!({"method":method,"params":{}}),
+            command: "/owned/veyra".into(),
+            socket: "/owned/socket".into(),
+            token: McpToken::new(),
+            unsupported_codex_options: Default::default(),
+        };
+        let wire = frame.value();
+        assert_eq!(
+            wire["params"]["config"]["mcp_optional_startup_grace_ms"],
+            5000
+        );
+        assert_eq!(
+            wire["params"]["config"]["mcp_servers.veyra.tool_timeout_sec"],
+            30
+        );
+        assert_eq!(
+            wire["params"]["config"]["mcp_servers.veyra.args"],
+            json!(["mcp"])
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_rejected_optional_keys_retry_independently() {
+    let root = std::path::Path::new("/tmp").join(format!("veyra-m8-options-{}", ThreadId::new()));
+    platform::private_dir(&root).unwrap();
+    let _scratch = crate::tests::Scratch(root.clone());
+    let (out, _rx) = mpsc::channel(256);
+    let server = Arc::new(Server::bind(&root, std::env::current_exe().unwrap(), out).unwrap());
+    let config = Arc::new(McpConfig::new(
+        server,
+        McpWire::Codex,
+        ThreadId::new(),
+        1,
+        std::process::id(),
+    ));
+    for resume in [false, true] {
+        let mut codec = crate::provider::codex::Codec::new(
+            crate::provider::SessionSpec {
+                thread: ThreadId::new(),
+                cwd: root.clone(),
+                config: crate::domain::ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+                native: resume.then(|| NativeSessionId("retained".into())),
+                import: None,
+                root: true,
+            },
+            std::process::id(),
+            Some(config.clone()),
+        );
+        codec.initialize();
+        let opened = codec.value(json!({"id":1,"result":{}})).unwrap();
+        let id = opened.controls[0].value()["id"].clone();
+        let rejected = codec.value(json!({"id":id,"error":{"code":-32602,"message":"unknown config mcp_optional_startup_grace_ms"}})).unwrap();
+        let first = rejected.controls[0].value();
+        assert!(
+            first["params"]["config"]
+                .get("mcp_optional_startup_grace_ms")
+                .is_none()
+        );
+        assert_eq!(
+            first["params"]["config"]["mcp_servers.veyra.tool_timeout_sec"],
+            30
+        );
+        let rejected = codec.value(json!({"id":first["id"],"error":{"code":-32602,"message":"unknown config mcp_servers.veyra.tool_timeout_sec"}})).unwrap();
+        let second = rejected.controls[0].value();
+        assert!(
+            second["params"]["config"]
+                .get("mcp_optional_startup_grace_ms")
+                .is_none()
+        );
+        assert!(
+            second["params"]["config"]
+                .get("mcp_servers.veyra.tool_timeout_sec")
+                .is_none()
+        );
+        let ready = codec
+            .value(json!({"id":second["id"],"result":{"thread":{"id":"usable"}}}))
+            .unwrap();
+        assert!(
+            matches!(ready.events.as_slice(), [crate::provider::ProviderEvent::Session(crate::provider::SessionEvent::Ready {native,..})] if native.0=="usable")
+        );
+        config.unsupported_codex_options.lock().unwrap().clear();
     }
 }

@@ -293,17 +293,27 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         }
         menu
     });
-    let permission_button = labelled_button("permission", settings::mode_label(config.mode), cx)
-        .debug_selector(|| "composer-permission".into())
-        .dropdown_menu(|mut menu, _, _| {
-            for mode in settings::MODES {
-                menu = menu.menu(
-                    settings::mode_label(mode),
-                    Box::new(PickPermission { mode: Some(mode) }),
-                );
-            }
-            menu
-        });
+    let provider = shell.chosen_provider();
+    let permission_button = labelled_button(
+        "permission",
+        settings::mode_label(provider.run_mode(config.mode)),
+        cx,
+    )
+    .debug_selector(|| "composer-permission".into())
+    .dropdown_menu(move |mut menu, _, _| {
+        for &mode in provider.offered_modes() {
+            menu = menu.menu(
+                settings::mode_label(mode),
+                Box::new(PickPermission { mode: Some(mode) }),
+            );
+        }
+        menu
+    });
+    #[cfg(debug_assertions)]
+    let permission_button = permission_button.on_open_change(cx.listener(|shell, open, _, cx| {
+        shell.permission_picker_open = *open;
+        cx.notify();
+    }));
     let reason = shell.disabled_reason();
     let thread = shell.view.chat();
     let stop_target = shell.shown_stop(cx);

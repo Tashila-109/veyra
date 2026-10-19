@@ -1304,3 +1304,66 @@ fn grok_cancellation_reason_uses_only_permission_rejected() {
         }
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn grok_turn_completed_ends_own_prompt_after_guard() {
+    use crate::{domain::*, provider::*};
+    use serde_json::json;
+    let mut codec = ready_codec();
+    let turn = TurnId::new();
+    codec.start(turn, "first".into()).unwrap();
+    codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first reply"}}}})).unwrap();
+    let completed = json!({"method":"_x.ai/session_notification","params":{"sessionId":"native","update":{"sessionUpdate":"turn_completed","prompt_id":turn.to_string(),"stop_reason":"end_turn"}}});
+    assert!(codec.value(completed.clone()).unwrap().events.is_empty());
+    tokio::time::advance(std::time::Duration::from_millis(1999)).await;
+    assert!(codec.completed_prompts().events.is_empty());
+    assert!(matches!(codec.active(), Some(ActiveTurn::Veyra(id)) if id == turn));
+    codec.value(completed).unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    let ended = codec.completed_prompts();
+    assert!(
+        matches!(ended.events.as_slice(), [ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,park:false}}] if *id==turn)
+    );
+    assert!(codec.completed_prompts().events.is_empty());
+    assert!(
+        codec
+            .value(json!({"id":3,"result":{"stopReason":"end_turn"}}))
+            .unwrap()
+            .events
+            .is_empty()
+    );
+}
+#[test]
+fn grok_old_tail_never_ends_next_prompt() {
+    use crate::{domain::*, provider::*};
+    use serde_json::json;
+    let mut codec = ready_codec();
+    let first = TurnId::new();
+    codec.start(first, "first".into()).unwrap();
+    codec
+        .value(json!({"id":3,"result":{"stopReason":"end_turn"}}))
+        .unwrap();
+    let untagged = |cancelled| json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","stopReason":if cancelled {"cancelled"} else {"end_turn"},"cancellationCategory":"PermissionRejected"}});
+    let second = TurnId::new();
+    codec.start(second, "second".into()).unwrap();
+    for cancelled in [false, true] {
+        assert!(codec.value(untagged(cancelled)).unwrap().events.is_empty());
+        assert!(matches!(codec.active(), Some(ActiveTurn::Veyra(id)) if id == second));
+    }
+    let reply = codec
+        .value(json!({"id":4,"result":{"stopReason":"end_turn"}}))
+        .unwrap();
+    assert!(
+        matches!(reply.events.last(), Some(ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,..}}) if *id==second)
+    );
+    let third = TurnId::new();
+    codec.start(third, "third".into()).unwrap();
+    assert!(codec.value(untagged(false)).unwrap().events.is_empty());
+    assert!(matches!(codec.active(), Some(ActiveTurn::Veyra(id)) if id == third));
+    let tagged = json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","promptId":third.to_string(),"stopReason":"end_turn"}});
+    let ended = codec.value(tagged.clone()).unwrap();
+    assert!(
+        matches!(ended.events.last(), Some(ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,..}}) if *id==third)
+    );
+    assert!(codec.value(tagged).unwrap().events.is_empty());
+}
