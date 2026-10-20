@@ -600,6 +600,8 @@ Root MCP config adds mcp_optional_startup_grace_ms 5000 and mcp_servers.veyra.to
 CodexOption owns both optional keys and their values.
 An open rejection naming one key revokes that attempt credential, logs its key without the error payload, and retries once without that key.
 Each key can be dropped once per root session; a repeated rejection fails, and children receive neither option.
+Codex 0.162.1 accepted both keys in the retained live run. The drop-key fallback is deliberate: a later CLI rejecting an optional key must not break every Codex root.
+The user’s own permissionRequest hooks run inside Codex before a request reaches Veyra and can delay a dock; the retained run recorded about 65 seconds. Whether tool_timeout_sec 30 includes the approval wait is not settled by that record; Veyra keeps the value at 30.
 Only the measured no rollout found for thread id text falls back to thread/start and a notice, retaining the same app-server.
 An active-writer refusal retries at 250 ms intervals for at most three seconds, then fails with Codex's message and keeps the native id for Retry.
 Other resume failures keep that id and fail without starting a replacement conversation.
@@ -626,6 +628,7 @@ Another thread's requests are refused without docking, and a start reply that ch
 The matching turn/completed ends that turn even before turn/started, and a completed native id cannot reopen work.
 Another native turn on this conversation can open a separately announced Provider turn; another thread id is filtered before turn routing.
 Thread status, token usage, hooks, startup status and unknown notifications do not mark work or add notices.
+A failed turn with the typed codexErrorInfo unauthorized uses Veyra’s sign-in instruction naming codex login. Missing or unknown error kinds, including unfamiliar object shapes, retain the redacted provider message or the existing generic failure when no message exists.
 Own-thread turn completion reconciles its typed item summary by native item key, supplying a final reply absent from individual frames without duplicating already completed or streamed items.
 Foreign-thread items and turn summaries are filtered before reconciliation.
 Parent collabAgentToolCall rows use a typed action to label wait, spawn, send, resume or stop in Veyra's words.
@@ -867,7 +870,7 @@ The token never enters argv, logs, evidence, fixture text or crash text.
 
 Actor::handle_inner sends every tool decision through tools::decide, the existing ChangeSet commit and the existing effects path.
 ProviderKind::ALL supplies the start_thread schema's provider choices.
-list_providers reads the shared readiness catalog and offers adapters with Ready and a resolved path, their models, the caller's mode ceiling and remaining fan-out.
+list_providers reads the shared readiness catalog and offers adapters with Ready and a resolved path, their models and offered_modes, the caller's mode_ceiling and remaining fan-out. The ceiling is the parent provider's effective run mode.
 start_thread accepts each provider whose probe has a resolved path and Ready status, including Grok.
 Probes populate that catalog and Engine::child_env shares it with the actor.
 start_thread creates a child lineage, first task turn and UUID-v5 task keyed by caller and start_thread:client_request_id.
@@ -986,6 +989,7 @@ The codecs hand the recorder typed native-id and version metadata decoded from t
 ChildEnv reads HOME once and supplies it to the recorder; `<home>` is a capture placeholder, not a matcher binding.
 It replaces credential fields, redacts secret-shaped text, replaces hook output with a placeholder and keeps account and plan keys with masked values.
 Typed ClaudeAccount fields preserve only tokenSource/apiKeySource none and apiProvider firstParty in masked account captures.
+Outside account objects, a credential-named field whose name contains token or key keeps the literal none; every other credential value becomes <any>.
 The fixture secret-shape sweep permits none only in token- or key-named fields, not Bearer credentials, passwords, auth, secrets or URL passwords.
 Grok initialize agent and instance ids and hostname are masked, and availableCommands retains its shape with every value masked, including names.
 The first initialize hostname is bound and replaced wherever it recurs, and email shapes are masked in text.
@@ -1089,7 +1093,7 @@ AppState::text_rows selects only a text-only pump batch's changed rows in the op
 Other batches still remeasure the list for structural, outcome and queue-label changes.
 The inline streaming caret remains part of the markdown source, so a growing assistant row still takes the kit's full-replacement parse path.
 Failed tools show their last nonempty output line, truncated to one row at its width.
-The window and dump share row_outcome, which annotates only each ended turn's final item.
+The window and dump share row_outcome, which annotates only each ended turn's final item. The failed banner's own turn is captioned Failed alone because the banner already shows its cause; historical failed turns retain the cause in their caption.
 A user scroll detaches following; new text, requests and tool rows preserve that state.
 Scrolling within text.read.line_height of the bottom or choosing Latest reattaches.
 Latest appears only while following is detached and content remains below.
@@ -1097,7 +1101,8 @@ Expanding a row remeasures it without moving its top anchor.
 Streamed text and tool input remain unbounded outside the 4 MiB wire-line cap.
 The failed view uses the latest nonqueued turn and shows its cause, Retry and Open Terminal on the project folder.
 It renders the provider’s failure cause and any next step in that cause without appending a generic sign-in footer.
-Claude and Grok sign-in failures already include their sign-in instruction, so it appears once; a 403’s own wording is never supplemented with login advice.
+Claude, Codex and Grok sign-in failures include their sign-in instruction in the cause, so it appears once; a 403’s own wording is never supplemented with login advice.
+header::status_text supplies the header, family card and sidebar tooltip with user-facing status words, including Needs you and In terminal; Status::words retains dump spellings.
 Retry probes again; once the thread's provider is Ready it clears any hold and resends the failed turn's own user item as a new turn.
 A newer queued message remains queued and is never reused as the Retry prompt.
 Send also clears a hold when the thread has no queued turn.
@@ -1108,7 +1113,7 @@ On New thread, OpenProviderPicker and its key open the provider menu through a c
 An open menu rebuilds its readiness labels when probing begins and when each reply arrives.
 Not-ready providers disable Send with their repair command.
 Codex and Grok use the same picker and composer, with model labels and effort choices read from their probes.
-Grok uses its initialize catalog, with Default-only model and effort menus when modelState is absent; switching providers clears both selections.
+Grok uses its initialize catalog, with Default-only model and effort menus when modelState is absent; switching providers clears both selections and resets the permission mode to the new provider’s run mode of the stored Settings default.
 Codex's commands, file changes, permissions, MCP approvals, questions and retry/limit notices use the existing dock, question card and transcript rows.
 A Claude root's Codex child uses the same task card, breadcrumb and family projection.
 CreateThread sends the draft configuration; subsequent Send targets the selected thread.
@@ -1216,7 +1221,7 @@ An incremental same-user sender can keep a line read occupied inside the per-rea
 A full queue rejects before enqueueing; a reply timeout does not cancel an action already queued.
 
 Action accepts optional JSON data, keys parses the entire sequence before dispatching a key-down then key-up for each keystroke, text uses the focused textarea's public input handler or dispatches character key events to the focused terminal, and quit dispatches ConfirmQuit.
-Buttons activate on key-up; terminal input listens only to key-down.
+The keys_dispatches_down_then_up_per_keystroke unit test guards that order. The native keyboard proof opens a composer chip through key release; terminal input handles key-down only, so adding key-up emits no extra terminal bytes.
 Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
 Each sidebar thread and selected thread includes lineage, and tasks includes each received task row with its state, delivery and optional report source.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
@@ -1255,16 +1260,21 @@ The following clarifications and remaining differences are checked against the c
 
 - Design 7.3’s Codex examples leave live output and error variants open. The codec prefers completed aggregatedOutput, accepts quoted tool names and a trailing question mark in MCP approval messages, and distinguishes resume-not-found, active-writer and no-active-turn refusals by text. Async-card choices stop active work before sending an ordinary user message; command thread grants require the exact project cwd (`provider/codex.rs`, `commands.rs`).
 - Design 7.4’s Grok catalog recipe calls grok models beside --version when a catalog exists. The implemented probe instead reads authMethods, bare _meta.agentVersion and optional modelState from one initialize, without authenticating or opening a session (`provider/grok.rs`).
-- Grok’s question wire is flat and needs no question or prompt id. Session/resume replies can omit the session id, and a session/load import collects replay before its reply. Restrictive sessions turn off settings-seeded auto/yolo, but preserve user allow rules and add no client hook gate. Exact-command grants accept only the recognized Bash input shape (`provider/grok.rs`).
+- Clarification of design 7.4: Grok’s question wire is flat and needs no question or prompt id. Session/resume replies can omit the session id, and a session/load import collects replay before its reply. Restrictive sessions turn off settings-seeded auto/yolo, but preserve user allow rules and add no client hook gate. Exact-command grants accept only the recognized Bash input shape (`provider/grok.rs`).
 - Design 7.1’s shell snapshot can supply no non-empty __MISE_DIFF. In that case ambient children retain any application-inherited value beside the shell PATH; failed shells retain both inherited values (`provider/env.rs`).
 - Design 8 leaves Codex’s TUI daemon behavior to a probe and uses user config in restrictive modes. The implemented arguments disable its daemon and update check and set mode-specific sandbox flags. Grok’s TUI explicitly selects default permission mode outside Full access (`provider/codex.rs`, `provider/grok.rs`).
 - Design 8’s Codex import uses thread/read with includeTurns. The implementation pages thread/turns/list without an earlier thread/resume. Claude imports its append-only session file, while Grok opens session/load itself and consumes marked replay (`provider/claude.rs`, `provider/codex.rs`, `provider/grok.rs`).
 - Design 8 and 6.5’s cursor is maintained at structured dispatch, behind a persistence fence, rather than captured at a switch. Import is display-only and never blocks later queued work after its outcome; import_pending is set after an actual TUI run. A switch requires a native session, terminal Quit has a one-second grace, and the two-second stdin grace belongs only to switching (`actor.rs`, `commands.rs`, `terminal.rs`, `provider/session.rs`).
-- Terminal focus keeps Command window actions while plain Command-Left/Right stay PTY input. An open terminal counts for Quit confirmation and does not retain keep-awake. Emulator query replies include colors and every PtyWrite; kitty keyboard mode stays disabled (`ui/actions.rs`, `ui/terminal_view.rs`, `terminal.rs`).
+- Clarification of design 8: Terminal focus keeps Command window actions while plain Command-Left/Right stay PTY input. An open terminal counts for Quit confirmation and does not retain keep-awake. Emulator query replies include colors and every PtyWrite; kitty keyboard mode stays disabled (`ui/actions.rs`, `ui/terminal_view.rs`, `terminal.rs`).
 - Design 11’s captures use collision-safe numbered names and additionally mask account metadata, Grok identity/hostname, commands, server connection details, URL paths and queries, and email shapes (`record.rs`).
-- Provider-text presentation distinguishes marked literal consent text from one-line projected labels. Chosen async option messages retain raw bytes, so a bidi override can still affect their user bubble. That rendering rule remains unresolved (`text.rs`, `ui/provider_text.rs`, `ui/transcript.rs`).
-- Dock layout keeps decision buttons visible, bounds outside-folder text to three lines, scrolls long details and question text independently, and never truncates option captions. A docked draft uses a fixed 48px input instead of growing into unused space (`ui/composer.rs`, `ui/provider_text.rs`, `ui/mod.rs`).
-- Ordinary tests use explicit isolated provider environments in debug and release; only ignored live tests resolve installed CLIs. Terminal throughput measurements must name their grid, which the debug launch override can fix (`provider/env.rs`, `ui/mod.rs`).
+- Clarification of design 9: Provider-text presentation distinguishes marked literal consent text from one-line projected labels. Chosen async option messages retain raw bytes, so a bidi override can still affect their user bubble. That rendering rule remains unresolved (`text.rs`, `ui/provider_text.rs`, `ui/transcript.rs`).
+- Clarification of design 9: Dock layout keeps decision buttons visible, bounds outside-folder text to three lines, scrolls long details and question text independently, and never truncates option captions. A docked draft uses a fixed 48px input instead of growing into unused space (`ui/composer.rs`, `ui/provider_text.rs`, `ui/mod.rs`).
+- Clarification of design 12: Ordinary tests use explicit isolated provider environments in debug and release; only ignored live tests resolve installed CLIs. Terminal throughput measurements must name their grid, which the debug launch override can fix (`provider/env.rs`, `ui/mod.rs`).
+
+- Design 7.2 asks for retry without a refused Claude probe flag. That fallback is not implemented: session::probe spawns once with claude::probe_args. If a later CLI refuses --settings or --strict-mcp-config and exits without initialize, readiness is Ready with no models after the probe error (`provider/session.rs`, `provider/claude.rs`, `provider/mod.rs`). A live check on 2026-10-20 recorded Claude 2.1.304 accepting both flags.
+- Design 7.2 also asks for retry without a refused --append-system-prompt. That fallback is not implemented: every Claude root receives the flag; refusal exits before initialize and fails the turn (`provider/claude.rs`, `provider/session.rs`). A live check on 2026-10-20 recorded Claude 2.1.304 accepting it.
+- Design 9.1 asks for a separate next-step line. The failed view shows each failure's own cause, Retry and Open Terminal, without a separate next-step line. The cause carries the next step when the provider supplies one (`ui/transcript.rs`).
+- Design 6.5 step 5 gives the Restarted hold to threads with running or queued work. Reconcile also gives that hold to every thread stored in Terminal view while returning it to Chat with import_pending (`reconcile.rs`).
 
 ## Source map
 
@@ -1282,6 +1292,17 @@ The following clarifications and remaining differences are checked against the c
 - [Driver](crates/veyra/src/control.rs), [name coverage](crates/veyra/src/verify_map.rs), [verification skill](.agents/skills/verify-veyra/SKILL.md).
 
 ## Verification
+
+The provider_options tests guard the repaired provider contract: offered_modes_and_run_mode, provider_mode_cycle_uses_only_offered_modes, list_providers_reports_offered_modes, ceiling_reads_parent_run_mode and child_requested_mode_is_checked_before_provider_run_mode cover the offered modes, requested child mode and parent's effective ceiling. claude_root_args_append_family_rules checks root-only family instructions; codex_initialize_opts_out_of_turn_diff checks both session and probe initialize.
+
+Claude's claude_probe_args_turn_off_hooks_and_mcp and claude_probe_args_skip_strict_mcp_beside_managed_file check both policy branches. claude_probe_replay_uses_owned_managed_policy_path checks the explicit-environment boundary; claude_probe_env_turns_off_ide_and_connectors checks its child environment. claude_account_presence_and_source_types_control_sign_out and the claude_probe_signed_out_needs_token_source_none, claude_probe_api_key_reads_ready, claude_probe_third_party_reads_ready and claude_probe_silent_account_reads_ready replays cover the narrow signed-out rule. Their Veyra-authored fixtures are probe-signed-out.jsonl, probe-api-key.jsonl, probe-third-party.jsonl and probe-no-account.jsonl. claude_403_shows_cli_text_and_keeps_session and claude_skipped_prompt_fails_turn replay result-403.jsonl and prompt-skipped.jsonl through following turns on the same process. login_shell_reads_mise_diff calls the platform function with a scripted shell; child_env_carries_mise_diff_with_path and failing_login_shell_keeps_inherited_path_and_mise_diff check the child snapshot and inherited fallback.
+
+codex_root_config_sets_grace_and_tool_timeout and codex_rejected_optional_keys_retry_independently guard both optional keys and independent drop-key retries. codex_sign_in_failure_names_login_once replays sign-in-required.jsonl, whose unauthorized error shape is from Codex 0.162.1's TurnCompletedNotification schema; its message is Veyra-authored, not a recorded authentication failure. codex_unknown_error_kinds_keep_the_failure_message guards forward-compatible fallback. grok_turn_completed_ends_own_prompt_after_guard and grok_old_tail_never_ends_next_prompt run turn-completed-only.jsonl through the session timer; codec_guard_waits_once_and_ignores_late_reply and codec_untagged_tail_never_ends_next_prompt guard adverse ordering. grok_approval_deny retains the denial ending.
+
+capture_keeps_none_and_masks_other_account_values and fixtures_hold_no_secret_shapes guard recording and fixture masking. keys_dispatches_down_then_up_per_keystroke guards the debug driver. chip_lists_offered_modes checks the composer. family_card_renders_user_status_words checks rendered card text; sidebar_tooltip_uses_shared_status_display is a GPUI wiring assertion that the tooltip uses the same display function, not a native tooltip capture. failed_banner_renders_own_cause_and_one_sign_in_instruction checks rendered causes and the absence/presence of sign-in text; failure_caption_defers_to_banner_and_preserves_history guards captions. actor_shutdown_during_missing_resume_spawns_no_replacement waits on marker and exit conditions with 30-second bounds, keeping its no-replacement and recovery assertions.
+
+A live check on 2026-10-20 recorded the shapes on Claude 2.1.304, codex-cli 0.162.1 and Grok 1.0.62; the 403 frame and Codex's rejection wording rest only on Veyra-authored fixtures. Its Claude lifecycle ran queued, started, result, completed, so completion without started remains fixture-only. Grok's tagged completion, prompt_complete and reply arrived within the guard, so expiry and reordered untagged tails remain fixture-only. Codex accepted both optional keys; no live rejection exercised their fallback.
+
 
 multi_agent tests exercise actor rules, idempotent tasks, guidance, shared status words, settlement, held and successor wakes, grants, uncertain-admission recovery and retained writes and recovery notices.
 mcp_socket uses the built relay and a fake CLI that records only its own argv, then checks foreign-peer refusal, the production relay with a wrong direct parent, a second relay from the same CLI reusing its token, private files and socket modes, RPC method fallback, instruction coverage and config cleanup.

@@ -169,7 +169,7 @@ PY
 ## Gotchas
 
 Settings retains all three defaults.
-A provider applies its offered modes when preparing a new composer; Grok maps Accept edits to Ask first.
+A provider applies its offered modes when preparing a new composer; see [stored Grok modes](permission-matrix.md#stored-grok-modes) for compatibility.
 The zero-thread default and offered-menu proof is in [new-thread](new-thread.md).
 
 Settings is not a second native window.

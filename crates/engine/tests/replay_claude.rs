@@ -2299,31 +2299,9 @@ fn claude_skipped_prompt_fails_turn() {
     );
 }
 
-fn shell_snapshot_case(test: &str, failing: bool) {
+fn shell_snapshot_case(test: &str, failing: bool, check: fn(bool)) {
     if std::env::var_os("VEYRA_LOGIN_SHELL_CHILD").is_some() {
-        let env = ChildEnv::load();
-        let result = Runtime::new().unwrap().block_on(async {
-            env.command(
-                Path::new("/bin/sh"),
-                &[
-                    "-c".into(),
-                    "printf '%s\\n%s\\n' \"$PATH\" \"$__MISE_DIFF\"".into(),
-                ],
-                Path::new("/tmp"),
-            )
-            .output()
-            .await
-            .unwrap()
-        });
-        assert!(result.status.success());
-        assert_eq!(
-            result.stdout,
-            if failing {
-                b"/inherited-path\ninherited-diff\n".as_slice()
-            } else {
-                b"/shell-path\nshell-diff\n".as_slice()
-            }
-        );
+        check(failing);
         return;
     }
     let (scratch, _) = environment("ok-reply", false);
@@ -2351,19 +2329,54 @@ fn shell_snapshot_case(test: &str, failing: bool) {
         )
     );
 }
+fn check_child_env_snapshot(failing: bool) {
+    let env = ChildEnv::load();
+    let result = Runtime::new().unwrap().block_on(async {
+        env.command(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "printf '%s\\n%s\\n' \"$PATH\" \"$__MISE_DIFF\"".into(),
+            ],
+            Path::new("/tmp"),
+        )
+        .output()
+        .await
+        .unwrap()
+    });
+    assert!(result.status.success());
+    assert_eq!(
+        result.stdout,
+        if failing {
+            b"/inherited-path\ninherited-diff\n".as_slice()
+        } else {
+            b"/shell-path\nshell-diff\n".as_slice()
+        }
+    );
+}
 #[test]
 fn login_shell_reads_mise_diff() {
-    shell_snapshot_case("login_shell_reads_mise_diff", false);
+    shell_snapshot_case("login_shell_reads_mise_diff", false, |_| {
+        assert_eq!(
+            veyra_engine::platform::login_shell_path().unwrap(),
+            ("/shell-path".into(), Some("shell-diff".into()))
+        );
+    });
 }
 #[test]
 fn failing_login_shell_keeps_inherited_path_and_mise_diff() {
     shell_snapshot_case(
         "failing_login_shell_keeps_inherited_path_and_mise_diff",
         true,
+        check_child_env_snapshot,
     );
 }
 
 #[test]
 fn child_env_carries_mise_diff_with_path() {
-    shell_snapshot_case("child_env_carries_mise_diff_with_path", false);
+    shell_snapshot_case(
+        "child_env_carries_mise_diff_with_path",
+        false,
+        check_child_env_snapshot,
+    );
 }

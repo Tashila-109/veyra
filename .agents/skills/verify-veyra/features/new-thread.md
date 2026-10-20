@@ -20,7 +20,7 @@ Grok offers Ask first and Full access, and its permission key cycle visits only 
 A new thread uses its provider’s run mode for the Settings default, so Grok shows Ask first when that default is Accept edits.
 The thread-creation and stored-mode checks live in [approvals-questions](approvals-questions.md).
 Settings continues to offer all three modes.
-A stored Grok thread in Accept edits keeps that value and shows Ask first.
+See [stored Grok modes](permission-matrix.md#stored-grok-modes) for compatibility with existing threads.
 The provider menu marks Claude Code, Codex and Grok Ready, Not installed or Signed out.
 A missing Claude names `npm install -g @anthropic-ai/claude-code`; a signed-out Claude names `claude auth login`.
 Check again reaches `veyra::RecheckProviders`.

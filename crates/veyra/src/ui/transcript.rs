@@ -530,7 +530,7 @@ fn family_card(shell: &Shell, parent: ThreadId, cx: &App) -> AnyElement {
                     div()
                         .text_size(t.text.meta.size)
                         .text_color(t.colors.text_muted)
-                        .child(status.words()),
+                        .child(super::header::status_text(&status)),
                 )
                 .child(
                     labelled_button(SharedString::from(format!("child-open-{id}")), "Open", cx)

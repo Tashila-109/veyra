@@ -62,6 +62,7 @@ Replay evidence never marks a live cell passed.
 ## Gotchas
 
 Grok follows your Claude and Grok permission settings, so Ask first asks only when they do not already allow the action.
+<a id="stored-grok-modes"></a>
 A Grok thread stored in Accept edits runs and shows Ask first without rewriting its stored mode.
 Veyra turns off Grok's settings-seeded auto mode in Ask first and Accept edits (`_meta.autoMode`/`yoloMode` false and `_x.ai/yolo_mode_changed`), so Grok asks for what its safe list and the user's allow rules do not cover.
 
@@ -111,15 +112,15 @@ Observed results below describe the preserved mode checks.
 ### Codex preserved live evidence
 
 Live run RUN `38bd20ba`, Codex 0.162.1, model the CLI default, 2026-10-14, checkout `daf400c`.
-The row is retained exactly from the authorized live permission run in `m5-lane-3.md`; the fake worker does not rerun it.
+The row preserves that authorized live RUN; the fake recipe does not rerun it.
 Codex's Accept edits workspace sandbox permits `/tmp` writes without asking, including targets outside the project folder.
 This is Codex's directory boundary; Claude's Accept edits outside write still docks.
 
 ### Grok preserved live evidence
 
 Ask first and Accept edits: live RUN `991af6f4`, Grok 1.0.60, CLI default model `grok-4.7` and effort `xhigh`, 2026-10-17, checkout `211741c`.
-Full access: live RUN `2816c861`, checkout `1489439`, retained from the first recheck.
-The live recheck records are `T/results/m6-live-recheck-2.md` and `T/results/m6-live-recheck.md`; proof is under their matching `T/evidence/m6/live-recheck-2/` and `T/evidence/m6/live-recheck/` roots.
+Full access: live RUN `2816c861`, Grok 1.0.60, 2026-10-17, checkout `1489439`.
+Each result is retained by its RUN id and date above.
 Ask first and Accept edits each docked both writes, with Allow once for the project write and Deny for the outside write; only the project file was written.
 Every Veyra reply followed a human dock decision; the outside Deny ended the turn cancelled with PermissionRejected, displayed as Interrupted.
 Full access ran Read, echo and both edits with no request and wrote both files.

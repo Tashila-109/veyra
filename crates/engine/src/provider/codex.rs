@@ -762,7 +762,12 @@ impl Codec {
                                 .turn
                                 .error
                                 .as_ref()
-                                .and_then(|error| error.message.as_deref())
+                                .and_then(|error| match error.codex_error_info {
+                                    Some(wire::ErrorKind::Unauthorized) => Some(
+                                        "Codex is signed out. Sign in from a terminal with `codex login`, then send again.",
+                                    ),
+                                    _ => error.message.as_deref(),
+                                })
                                 .unwrap_or("Codex could not finish this turn"),
                             None,
                         ),
@@ -1603,6 +1608,41 @@ mod tests {
         codec.value(json!({"id":1,"result":{}})).unwrap();
         codec
     }
+    #[test]
+    fn codex_unknown_error_kinds_keep_the_failure_message() {
+        for kind in [
+            json!("futureAuthError"),
+            json!({"httpConnectionFailed":{"httpStatusCode":401}}),
+            json!({"futureKind":true}),
+            json!(42),
+            Value::Null,
+        ] {
+            let mut codec = resumed();
+            codec
+                .value(json!({"id":2,"result":{"thread":{"id":"old-thread"}}}))
+                .unwrap();
+            let start = codec.start(TurnId::new(), "fail this turn".into()).unwrap();
+            codec
+                .value(json!({"id":start.controls[0].value()["id"],
+                "result":{"turn":{"id":"failed-turn"}}}))
+                .unwrap();
+            let decoded = codec
+                .value(json!({"method":"turn/completed","params":{
+                    "threadId":"old-thread","turn":{"id":"failed-turn","status":"failed",
+                    "error":{"message":"Keep this provider failure.","codexErrorInfo":kind}}
+                }}))
+                .unwrap();
+            assert!(
+                decoded.events.iter().any(|event| matches!(event,
+                    ProviderEvent::Turn { event: TurnEvent::TurnEnded {
+                        outcome: TurnOutcome::Failed {message}, ..}, ..}
+                        if message == "Keep this provider failure."
+                )),
+                "unknown kind lost the failure"
+            );
+        }
+    }
+
     #[test]
     fn dispatch_cursor_is_unknown_until_the_server_names_the_turn() {
         let mut codec = resumed();

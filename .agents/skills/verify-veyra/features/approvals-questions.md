@@ -550,7 +550,7 @@ Run this fake-only section after Codex.
 It uses the existing approval dock and question choices, including both Grok question method spellings.
 Grok's approval command writes through a redirect, `printf 'veyra\n' > veyra-check.txt`; bare touch is on Grok's built-in safe list.
 Grok offers Ask first and Full access.
-A legacy thread stored in Accept edits runs as Ask first and keeps that stored value.
+See [stored Grok modes](permission-matrix.md#stored-grok-modes) for legacy threads.
 Both the in-project and outside edit requests dock, and Veyra sends no edit answer until the human decides.
 The question params are flat sessionId, toolCallId, mode and questions, without a nested params object, question id or prompt id; multiSelect may be null.
 A lasting-only request keeps Allow once and the thread grant visible but disabled, explains why, and still permits Deny.

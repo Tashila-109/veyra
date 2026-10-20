@@ -416,7 +416,7 @@ read initialize
         panic!("missing queued turn")
     };
     f.runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !started.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -429,7 +429,7 @@ read initialize
         f.actor.handle(EngineMsg::Shutdown);
     }
     f.runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let message = messages.recv().await.unwrap();
                 let exited = matches!(

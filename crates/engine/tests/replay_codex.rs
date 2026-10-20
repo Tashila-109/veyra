@@ -67,6 +67,19 @@ fn requests(events: &[ProviderEvent]) -> Vec<&RequestKind> {
         })
         .collect()
 }
+
+#[test]
+fn codex_sign_in_failure_names_login_once() {
+    let events = standard("sign-in-required", Inputs::default());
+    assert_eq!(
+        outcomes(&events),
+        [TurnOutcome::Failed {
+            message:
+                "Codex is signed out. Sign in from a terminal with `codex login`, then send again."
+                    .into(),
+        }]
+    );
+}
 #[test]
 fn codex_ok_reply() {
     let e = standard("ok-reply", Inputs::default());

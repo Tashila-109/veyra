@@ -2588,28 +2588,35 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
-    fn failed_views_show_sign_in_help_only_for_sign_in(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, _, _| {
-            let (_, turn) = shell.update(cx, |shell, _| {
-                configure_dock_thread(shell, ProviderKind::Claude, false, false)
-            });
-            for (message, help) in [
-                (
-                    "Your organization cannot use this model. Choose another model and send again.",
-                    false,
-                ),
-                (
-                    "Claude took this message but never started a turn for it. Send it again.",
-                    false,
-                ),
-                ("Sign in with claude, then retry.", false),
-                (
-                    "Claude is signed out. Sign in from a terminal with `claude`, then send again.",
-                    false,
-                ),
-                ("Authentication failed", false),
-            ] {
-                shell.update(cx, |shell, cx| {
+    fn failed_banner_renders_own_cause_and_one_sign_in_instruction(cx: &mut gpui::TestAppContext) {
+        for (message, instruction) in [
+            (
+                "Your organization cannot use this model. Choose another model and send again.",
+                false,
+            ),
+            (
+                "Claude took this message but never started a turn for it. Send it again.",
+                false,
+            ),
+            (
+                "Claude is signed out. Sign in from a terminal with `claude`, then send again.",
+                true,
+            ),
+            (
+                "Codex is signed out. Sign in from a terminal with `codex login`, then send again.",
+                true,
+            ),
+        ] {
+            let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+            let mut test = gpui::TestAppContext::build_with_text_system(
+                cx.dispatcher.clone(),
+                None,
+                text.clone(),
+            );
+            with_docked_shell(&mut test, |shell, cx, _, _| {
+                shell.update(cx, |shell, _| {
+                    let (_, turn) =
+                        configure_dock_thread(shell, ProviderKind::Claude, false, false);
                     shell.state.requests.clear();
                     shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
                         at: 1,
@@ -2618,18 +2625,71 @@ mod tests {
                             message: message.into(),
                         },
                     };
-                    cx.notify();
                 });
                 draw(cx);
+                let lines = text.lines();
+                assert!(lines.contains(message), "banner lost its cause: {lines:?}");
+                assert!(
+                    lines.contains("The thread failed"),
+                    "banner was not rendered"
+                );
+                let instructions = lines
+                    .iter()
+                    .filter(|line| line.to_ascii_lowercase().contains("sign in"))
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
                 assert_eq!(
-                    cx.debug_bounds("failure-sign-in-help").is_some(),
-                    help,
-                    "{message}"
+                    instructions,
+                    if instruction { vec![message] } else { vec![] },
+                    "unexpected sign-in text: {lines:?}"
                 );
                 assert!(cx.debug_bounds("caption-Retry").is_some());
-                assert!(cx.debug_bounds("failure-cause").is_some());
-            }
-        });
+            });
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn family_card_renders_user_status_words(cx: &mut gpui::TestAppContext) {
+        for (status, expected, raw) in [
+            (Status::NeedsYou, "Needs you", "NeedsYou"),
+            (Status::InTerminal, "In terminal", "InTerminal"),
+        ] {
+            let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+            let mut test = gpui::TestAppContext::build_with_text_system(
+                cx.dispatcher.clone(),
+                None,
+                text.clone(),
+            );
+            with_docked_shell(&mut test, |shell, cx, _, _| {
+                shell.update(cx, |shell, cx| {
+                    let (parent, child, _) = add_family(shell, cx);
+                    shell.state.statuses.insert(child, status);
+                    shell.state.requests.clear();
+                    shell.show(super::MainView::Chat(parent));
+                });
+                draw(cx);
+                let lines = text.lines();
+                assert!(cx.debug_bounds("family-card").is_some());
+                assert!(
+                    lines.contains(expected) && !lines.contains(raw),
+                    "card words: {lines:?}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_tooltip_uses_shared_status_display(_: &mut gpui::TestAppContext) {
+        assert!(
+            include_str!("sidebar.rs").contains(".tooltip(super::header::status_text(&status))")
+        );
+        for (status, expected) in [
+            (Status::NeedsYou, "Needs you"),
+            (Status::InTerminal, "In terminal"),
+        ] {
+            assert_eq!(super::header::status_text(&status), expected);
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -4868,7 +4928,7 @@ mod tests {
     fn approval_height_matrix_keeps_fixed_controls_and_first_line(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
-            let typical = "/Users/someone/.t3/worktrees/veyra/v001-m5-review/crates/engine";
+            let typical = "/Users/someone/.t3/worktrees/veyra/feature-review/crates/engine";
             let folders = [
                 CommandCwd::ProjectFolder,
                 CommandCwd::NotVerified,

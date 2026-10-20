@@ -162,9 +162,24 @@ pub(super) enum TurnStatus {
     Unknown,
 }
 #[derive(Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub(super) struct Failure {
     pub message: Option<String>,
+    pub codex_error_info: Option<ErrorKind>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(from = "Value")]
+pub(super) enum ErrorKind {
+    Unauthorized,
+    Unknown,
+}
+impl From<Value> for ErrorKind {
+    fn from(value: Value) -> Self {
+        match value.as_str() {
+            Some("unauthorized") => Self::Unauthorized,
+            _ => Self::Unknown,
+        }
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(default)]

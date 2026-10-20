@@ -623,6 +623,7 @@ The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
 Use the same exported `RUN` in every fresh shell.
 `action NAME [JSON]` builds a registered gpui action.
+`action root::Tab` advances gpui-kit keyboard focus, including the composer's chip buttons.
 AllowOnce, AllowInThread and Deny accept a request id; AnswerQuestion accepts request, question index and option index.
 Stop accepts a target containing thread and turn ids; without a payload it uses the rendered running or pending-admission turn.
 Without a request payload, consent actions use the rendered dock target, as focused keyboard chords do.
@@ -664,12 +665,12 @@ Task and Wake rows carry turn_label and task_card text; report_delivered marks o
 `composer` includes the chosen provider and effective permission mode, plus Send's readiness and disabled reason.
 `composer.offered_modes` is the provider's menu and key-cycle list: three modes for Claude and Codex, Ask first and Full access for Grok.
 `composer.permission_picker_open` reports the visible permission menu.
-A stored unsupported mode remains in `selected_thread.config.mode` while `composer.mode` shows Ask first.
+For stored-mode compatibility, see [stored Grok modes](features/permission-matrix.md#stored-grok-modes); dump retains the stored configuration beside the effective composer mode.
 Settings keeps all three defaults; a new Grok composer applies Accept edits as Ask first.
 `providers` reports each probe's path, version, models, readiness and `account`, either `known` or `unknown`, with no account value.
 `transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
 `transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
-Items include `outcome`, queued `wait_reason`, a tool's `failed_last_line` and its rendered `tool_label`.
+Items include `outcome`, queued `wait_reason`, a tool's `failed_last_line` and its rendered `tool_label`. The failed banner's own turn has `outcome` `["Failed"]`; historical failed turns retain their cause in the caption.
 `selected_thread.hold` and `wait_reason` describe held work.
 `composer.discard_queued_visible` reports the held queue control.
 `composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.

@@ -233,7 +233,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                     .min_w_0()
                                     .justify_start()
                                     .selected(shell.view.chat() == Some(thread.id))
-                                    .tooltip(status.words())
+                                    .tooltip(super::header::status_text(&status))
                                     .on_click(move |_, window, cx| {
                                         window.dispatch_action(
                                             Box::new(SelectThread { thread: Some(id) }),
