@@ -187,7 +187,7 @@ The writer takes no gate and an already committed write can finish after closing
 
 ## Actor decisions, storage and recovery
 
-`Actor` owns the SQLite connection, projection rows, live-thread map, item-key map, accepted-turn id set, text buffers and per-thread event counters.
+`Actor` owns the SQLite connection, projection rows, live-thread map, item-key map, accepted-turn id set, text buffers, pending CLI versions and per-thread event counters.
 It receives typed messages through a 256-slot tokio channel.
 Engine::send returns a future that awaits mailbox space and then the command acknowledgement.
 The window awaits that future in its gpui task; tokio's FIFO permit queue preserves the order of waiting sends.
@@ -208,7 +208,7 @@ The actor completes buffered text for ended turns and finalizes newly settled ta
 It calls `store::apply`, commits, installs the changed rows/runtime, publishes numbered events, then dispatches effects.
 `ChangeSet::stores_nothing` owns an exhaustive check of its row and live-state fields; `Actor::write` skips the transaction when it returns true.
 The actor still installs text buffers and publishes events/effects, so pure streaming deltas do not open a SQLite transaction.
-A repeated Ready stores thread metadata only when it changed.
+A repeated Ready stores thread metadata only when it changed. Version-only Ready metadata waits in Actor::pending_versions for the next transaction that already changes a row; Actor::write adds the version to that same transaction and clears it only after commit. The existing two-second TextWrite timer also flushes pending versions if no other write arrives. Successful writes install the version and publish ThreadUpdated after commit; a failed write retains it for retry. Storage-blocked shutdown keeps its existing unpublished staging of retained changes.
 The live pid/group UPDATE affects only rows whose stored pair differs.
 Actor::write rolls back a transaction with no affected rows rather than committing or counting it; runtime changes and events still install.
 Row-bearing events resolve from the final changed rows rather than being patched individually.
@@ -1315,7 +1315,7 @@ Both fixture binary entrypoints call the engine fixture::run dispatcher, which r
 Engine-only fake-session tests resolve their helper beside the current test profile instead of a fixed target/debug path.
 No stale-binary timestamp guard or preparatory workspace build is required; the empty-target workspace test covers that ownership boundary.
 
-Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast.
+Workspace tests cover private paths and modes, launch locking, platform_boundary, command-table behavior, recovery, storage, sessions and theme contrast. claude_stream_keeps_seven_fixed_commits replays every stream-2000 frame through the codec and actor, checking four startup commits, three ending commits, five simulated two-second writes, retained version/text and the dispatch cursor acknowledgement. version_metadata_waits_for_a_successful_write_or_flush checks metadata coalescing, the TextWrite flush handler, storage retry, commit-before-publish and no redundant flush.
 replay_claude uses the real session task with the fake CLI for text and tools, prompt correlation, provider-turn completion, resume, crash and error outcomes, background replacement and readiness.
 It covers approvals, questions, unknown requests, Stop with a pending approval and late interrupts.
 It also checks assistant-error parking, interrupt outcomes and ladder cancellation, subagent isolation against the live Agent recording, notices and malformed-byte recovery.

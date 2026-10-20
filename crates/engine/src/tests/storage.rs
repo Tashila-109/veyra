@@ -64,10 +64,95 @@ fn provisional_ready_preserves_unknown_and_stored_versions() {
             pgid: 24,
             capabilities: vec![],
         }));
+        assert_eq!(f.loaded().threads[&f.thread].cli_version, stored);
+        {
+            let _entered = f.runtime.enter();
+            f.actor.handle(EngineMsg::TextWrite);
+        }
         assert_eq!(
             f.loaded().threads[&f.thread].cli_version.as_deref(),
             Some("new-version")
         );
+    }
+}
+
+#[test]
+fn version_metadata_waits_for_a_successful_write_or_flush() {
+    for flush in [false, true] {
+        let mut f = Fixture::new(LiveState::Idle);
+        let ready = |version| {
+            ProviderEvent::Session(SessionEvent::Ready {
+                native: NativeSessionId("metadata-session".into()),
+                cli_version: version,
+                pid: 9,
+                pgid: 9,
+                capabilities: vec![],
+            })
+        };
+        f.event(ready(None));
+        let before = f.actor.test_commits;
+        while f.events.try_recv().is_ok() {}
+        f.event(ready(Some("metadata-version".into())));
+        assert_eq!(f.actor.test_commits, before);
+        assert_eq!(f.loaded().threads[&f.thread].cli_version, None);
+        assert!(
+            std::iter::from_fn(|| f.events.try_recv().ok()).all(|event| !matches!(
+                event,
+                UiEvent::Change {
+                    event: Ev::NativeSessionBound {
+                        cli_version: Some(_),
+                        ..
+                    } | Ev::ThreadUpdated(_),
+                    ..
+                }
+            ))
+        );
+        f.actor.fail_write = true;
+        if flush {
+            let _entered = f.runtime.enter();
+            f.actor.handle(EngineMsg::TextWrite);
+        } else {
+            assert!(
+                f.command(Command::SetDefaultMode {
+                    mode: PermissionMode::AskFirst
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(f.loaded().threads[&f.thread].cli_version, None);
+        assert_eq!(f.actor.test_commits, before);
+        f.actor.fail_write = false;
+        if flush {
+            let _entered = f.runtime.enter();
+            f.actor.handle(EngineMsg::Tick);
+        } else {
+            f.command(Command::SetDefaultMode {
+                mode: PermissionMode::AskFirst,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            f.loaded().threads[&f.thread].cli_version.as_deref(),
+            Some("metadata-version")
+        );
+        assert_eq!(f.actor.test_commits, before + 1);
+        let mut published = false;
+        while let Ok(event) = f.events.try_recv() {
+            if let UiEvent::Change {
+                event: Ev::ThreadUpdated(row),
+                ..
+            } = event
+            {
+                assert_eq!(row.cli_version.as_deref(), Some("metadata-version"));
+                published = true;
+            }
+        }
+        assert!(published);
+        {
+            let _entered = f.runtime.enter();
+            f.actor.handle(EngineMsg::TextWrite);
+        }
+        assert_eq!(f.actor.test_commits, before + 1);
     }
 }
 #[test]

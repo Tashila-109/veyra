@@ -3,6 +3,139 @@ use crate::Engine;
 use std::time::Instant;
 
 #[test]
+fn claude_stream_keeps_seven_fixed_commits() {
+    let mut f = Fixture::new(LiveState::Starting);
+    let before = f.actor.test_commits;
+    let Ack::Turn(turn) = f
+        .command(Command::Send {
+            thread: f.thread,
+            text: "commit anatomy".into(),
+        })
+        .unwrap()
+    else {
+        panic!("missing turn")
+    };
+    let mut codec = claude::Codec::new(
+        NativeSessionId(f.thread.to_string()),
+        9,
+        std::path::Path::new("/tmp"),
+    );
+    let mut matcher = crate::fixture::Matcher::default();
+    for (name, value) in [
+        ("<id:initialize>", claude::INITIALIZE_ID.to_owned()),
+        ("<id:prompt>", turn.to_string()),
+        ("<id:session>", f.thread.to_string()),
+        ("<id:message>", "stream-message".into()),
+    ] {
+        matcher.bind(name, value.into());
+    }
+    let records = crate::fixture::load(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude/stream-2000.jsonl"),
+    )
+    .unwrap();
+    let mut deltas = 0_usize;
+    let mut text_writes = 0;
+    let mut before_end = None;
+    for record in records {
+        let mut decoded = match record {
+            crate::fixture::Record::ExpectOutbound { line } if line["type"] == "user" => {
+                assert_eq!(
+                    f.controls.try_recv().unwrap(),
+                    SessionControl::StartTurn {
+                        turn,
+                        text: "commit anatomy".into()
+                    }
+                );
+                codec.start(turn, "commit anatomy".into()).unwrap()
+            }
+            crate::fixture::Record::EmitInbound { line, .. } => {
+                codec.value(matcher.expand(line)).unwrap()
+            }
+            crate::fixture::Record::Exit { code: 0, .. } => Decoded {
+                events: vec![ProviderEvent::Session(SessionEvent::Exited { crash: None })],
+                ..Default::default()
+            },
+            _ => continue,
+        };
+        for event in decoded.events {
+            let text = matches!(
+                &event,
+                ProviderEvent::Turn {
+                    event: TurnEvent::TextDelta { .. },
+                    ..
+                }
+            );
+            let dispatched = matches!(
+                &event,
+                ProviderEvent::Session(SessionEvent::Dispatched { .. })
+            );
+            let commits = f.actor.test_commits;
+            {
+                let _entered = f.runtime.enter();
+                f.actor.handle(EngineMsg::Provider {
+                    thread: f.thread,
+                    epoch: 1,
+                    cursor: decoded.cursor.take(),
+                    event,
+                });
+            }
+            if dispatched {
+                assert_eq!(
+                    f.loaded().threads[&f.thread].native_cursor.as_deref(),
+                    Some(turn.to_string().as_str())
+                );
+                assert_eq!(
+                    f.controls.try_recv().unwrap(),
+                    SessionControl::DispatchCommitted { turn }
+                );
+            }
+            if text {
+                deltas += 1;
+                if deltas == 1 {
+                    println!("startup commits={}", f.actor.test_commits - before);
+                    assert_eq!(f.actor.test_commits - before, 4);
+                    assert_eq!(
+                        f.loaded().threads[&f.thread].cli_version.as_deref(),
+                        Some("2.1.294")
+                    );
+                } else {
+                    assert_eq!(f.actor.test_commits, commits, "buffer-only delta committed");
+                }
+                if deltas.is_multiple_of(400) {
+                    let commits = f.actor.test_commits;
+                    let _entered = f.runtime.enter();
+                    f.actor.handle(EngineMsg::TextWrite);
+                    text_writes += f.actor.test_commits - commits;
+                }
+                before_end = Some(f.actor.test_commits);
+            }
+        }
+    }
+    assert_eq!(deltas, 2000);
+    assert_eq!(text_writes, 5);
+    assert_eq!(f.actor.test_commits - before_end.unwrap(), 3);
+    assert_eq!(f.actor.test_commits - before - text_writes, 7);
+    let stored = f.loaded();
+    assert_eq!(
+        stored.threads[&f.thread].cli_version.as_deref(),
+        Some("2.1.294")
+    );
+    assert!(matches!(
+        stored.turns[&turn].state,
+        TurnState::Ended {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
+    assert!(stored.items_for(f.thread).any(|item| matches!(&item.body, ItemBody::AssistantText { text, done: true } if text == &"x".repeat(2000))));
+    println!(
+        "startup=4 ending=3 text_writes=5 total={}",
+        f.actor.test_commits - before
+    );
+}
+
+#[test]
 fn stream_pause_is_one_300ms_delay_after_1000_deltas() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude");
     let regular = crate::fixture::load(&root.join("stream-2000.jsonl")).unwrap();

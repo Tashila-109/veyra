@@ -98,6 +98,7 @@ pub struct Actor {
     counters: BTreeMap<ThreadId, u64>,
     pub(crate) accepted_turns: BTreeSet<TurnId>,
     buffers: BTreeMap<ItemId, TextBuffer>,
+    pending_versions: BTreeMap<ThreadId, String>,
     #[cfg(debug_assertions)]
     delta_counts: BTreeMap<ItemId, u64>,
     item_keys: BTreeMap<(ThreadId, u32, TurnId, NativeItemKey), ItemId>,
@@ -230,6 +231,7 @@ impl Actor {
             counters: BTreeMap::new(),
             accepted_turns: BTreeSet::new(),
             buffers: BTreeMap::new(),
+            pending_versions: BTreeMap::new(),
             #[cfg(debug_assertions)]
             delta_counts: BTreeMap::new(),
             item_keys: BTreeMap::new(),
@@ -270,7 +272,7 @@ impl Actor {
             }
         }
         actor.prepare_commit(&mut c);
-        actor.write(&c)?;
+        actor.write(&mut c)?;
         c.install(&mut actor.projection, &mut actor.live);
         actor.clear_storage_receipt();
         actor.publish_window_threads(actor.projection.threads.keys().copied().collect::<Vec<_>>());
@@ -432,7 +434,7 @@ impl Actor {
                 let result = commands::decide(&self.projection, &self.live, command, now())
                     .and_then(|(mut c, ack)| {
                         self.prepare_commit(&mut c);
-                        self.write(&c)?;
+                        self.write(&mut c)?;
                         #[cfg(test)]
                         if measure && let Spawner::Scripted(script) = &self.spawner {
                             script
@@ -552,7 +554,7 @@ impl Actor {
                 )
                 .and_then(|(mut c, value)| {
                     self.prepare_commit(&mut c);
-                    self.write(&c)?;
+                    self.write(&mut c)?;
                     self.install(c);
                     Ok(value)
                 });
@@ -659,7 +661,7 @@ impl Actor {
             EngineMsg::ShutdownDeadline => {}
         }
     }
-    fn write(&mut self, c: &ChangeSet) -> Result<(), StoreError> {
+    fn write(&mut self, c: &mut ChangeSet) -> Result<(), StoreError> {
         #[cfg(test)]
         if self.fail_write {
             return Err(StoreError::Invalid("injected storage failure".into()));
@@ -674,7 +676,23 @@ impl Actor {
             tx.rollback()?;
             return Ok(());
         }
+        let mut metadata = ChangeSet::default();
+        for (&thread, version) in &self.pending_versions {
+            if let Some(mut row) = c.thread(&self.projection, thread).cloned()
+                && row.cli_version.as_ref() != Some(version)
+            {
+                row.cli_version = Some(version.clone());
+                metadata.threads.insert(thread, row);
+            }
+        }
+        store::apply(&tx, &metadata, now())?;
         tx.commit()?;
+        c.threads.extend(metadata.threads);
+        self.pending_versions.retain(|thread, version| {
+            c.threads
+                .get(thread)
+                .is_none_or(|row| row.cli_version.as_ref() != Some(version))
+        });
         #[cfg(debug_assertions)]
         {
             self.state.counters.lock().unwrap().commits += 1;
@@ -687,7 +705,7 @@ impl Actor {
     }
     fn commit_event(&mut self, mut c: ChangeSet) {
         self.prepare_commit(&mut c);
-        if let Err(error) = self.write(&c) {
+        if let Err(error) = self.write(&mut c) {
             for live in self.live.values() {
                 if let Some(session) = live.live.session() {
                     let control =
@@ -718,7 +736,7 @@ impl Actor {
     }
     fn retry(&mut self) {
         let mut blocked = self.blocked.take().unwrap();
-        if let Err(e) = self.write(&blocked.changes) {
+        if let Err(e) = self.write(&mut blocked.changes) {
             blocked.error = e.to_string();
             self.blocked = Some(blocked);
             return;
@@ -1081,7 +1099,11 @@ impl Actor {
                 let mut t = c.thread(&self.projection, thread).unwrap().clone();
                 t.native = Some(native.clone());
                 if let Some(cli_version) = cli_version {
-                    t.cli_version = Some(cli_version);
+                    if t.cli_version.as_ref() == Some(&cli_version) {
+                        self.pending_versions.remove(&thread);
+                    } else {
+                        self.pending_versions.insert(thread, cli_version);
+                    }
                 }
                 let cli_version = t.cli_version.clone();
                 if t != self.projection.threads[&thread] {
@@ -1755,6 +1777,12 @@ impl Actor {
     }
     fn write_text(&mut self) {
         let mut c = ChangeSet::default();
+        for (&thread, version) in &self.pending_versions {
+            if let Some(mut row) = self.projection.threads.get(&thread).cloned() {
+                row.cli_version = Some(version.clone());
+                c.threads.insert(thread, row);
+            }
+        }
         for (&id, b) in &self.buffers {
             if b.unpersisted.is_empty() {
                 continue;
@@ -1764,7 +1792,7 @@ impl Actor {
                 c.items.insert(id, item);
             }
         }
-        if !c.items.is_empty() {
+        if !c.stores_nothing() {
             self.commit_event(c);
         }
     }
@@ -1778,7 +1806,10 @@ impl Actor {
                 let _ = out.send(EngineMsg::TextFlush).await;
             });
         }
-        if !self.write_scheduled && self.buffers.values().any(|b| !b.unpersisted.is_empty()) {
+        if !self.write_scheduled
+            && (!self.pending_versions.is_empty()
+                || self.buffers.values().any(|b| !b.unpersisted.is_empty()))
+        {
             self.write_scheduled = true;
             let out = self.out.clone();
             tokio::spawn(async move {
@@ -2098,7 +2129,7 @@ mod tests {
             };
             assert!(c.effects.iter().any(|e| matches!(e, Effect::Spawn { .. })));
             actor.prepare_commit(&mut c);
-            actor.write(&c).unwrap();
+            actor.write(&mut c).unwrap();
             if closing_before_dispatch {
                 actor.state.closing.close();
             }
