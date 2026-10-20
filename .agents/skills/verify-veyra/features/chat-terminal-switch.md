@@ -1,6 +1,6 @@
 # Chat and terminal switch
 
-Status: passed, 2026-10-18, ec5469f, live Codex, Claude and Grok in Lanes 3 and 4; page smoke at d91bb3e
+Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
 
 ## Sub-features
 
