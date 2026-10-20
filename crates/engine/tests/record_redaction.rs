@@ -588,3 +588,23 @@ fn capture_keeps_none_and_masks_other_account_values() {
     assert!(!record::secret_shapes(&text));
     assert!(record::secret_shapes(r#"{"tokenSource":"unsafe-literal"}"#));
 }
+
+#[test]
+fn none_is_safe_only_in_token_and_key_fields() {
+    for text in [
+        r#"{"tokenSource":"none"}"#,
+        r#"{"apiKeySource":"none"}"#,
+        r#"{"apiProvider":"firstParty"}"#,
+    ] {
+        assert!(!veyra_engine::record::secret_shapes(text), "{text}");
+    }
+    for text in [
+        "Bearer none",
+        "https://someone:none@example.test",
+        r#"{"password":"none"}"#,
+        r#"{"secret":"none"}"#,
+        r#"{"auth":"none"}"#,
+    ] {
+        assert!(veyra_engine::record::secret_shapes(text), "{text}");
+    }
+}

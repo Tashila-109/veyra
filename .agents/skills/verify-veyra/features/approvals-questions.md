@@ -549,7 +549,8 @@ PYCODEX
 Run this fake-only section after Codex.
 It uses the existing approval dock and question choices, including both Grok question method spellings.
 Grok's approval command writes through a redirect, `printf 'veyra\n' > veyra-check.txt`; bare touch is on Grok's built-in safe list.
-Grok has no Accept edits mode, so Accept edits asks as Ask first does.
+Grok offers Ask first and Full access.
+A legacy thread stored in Accept edits runs as Ask first and keeps that stored value.
 Both the in-project and outside edit requests dock, and Veyra sends no edit answer until the human decides.
 The question params are flat sessionId, toolCallId, mode and questions, without a nested params object, question id or prompt id; multiSelect may be null.
 A lasting-only request keeps Allow once and the thread grant visible but disabled, explains why, and still permits Deny.
@@ -590,6 +591,9 @@ before = int(sql('select count(*) from threads'))
 ctl('grok-accept-edits-send','keys','secondary-enter')
 selected = poll('grok-accept-edits-selected',lambda d:d['selected_thread'] is not None and int(sql('select count(*) from threads'))==before+1)
 thread = selected['selected_thread']['id']
+assert selected['selected_thread']['config']['mode']=='accept_edits'
+assert selected['composer']['mode']=='ask_first'
+assert selected['composer']['offered_modes']==['ask_first','full_access']
 dock = poll('grok-accept-edits-inside',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert json.loads(dock['request']['native'])=='edit-inside' and dock['action_text']=='Edit inside'
 assert json.loads(dock['preview'])['file_path']=='inside.txt'

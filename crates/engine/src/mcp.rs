@@ -853,6 +853,31 @@ pub(crate) enum McpWire {
     Codex,
     Grok,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CodexOption {
+    StartupGrace,
+    ToolTimeout,
+}
+impl CodexOption {
+    const ALL: [Self; 2] = [Self::StartupGrace, Self::ToolTimeout];
+    fn key(self) -> &'static str {
+        match self {
+            Self::StartupGrace => "mcp_optional_startup_grace_ms",
+            Self::ToolTimeout => "mcp_servers.veyra.tool_timeout_sec",
+        }
+    }
+    fn value(self) -> Value {
+        match self {
+            Self::StartupGrace => json!(5000),
+            Self::ToolTimeout => json!(30),
+        }
+    }
+    pub(crate) fn rejected_by(message: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|option| message.contains(option.key()))
+    }
+}
 pub(crate) struct McpConfig {
     server: std::sync::Arc<crate::mcp::Server>,
     wire: McpWire,
@@ -860,7 +885,7 @@ pub(crate) struct McpConfig {
     epoch: u32,
     pid: u32,
     hashes: std::sync::Mutex<Vec<crate::mcp::TokenHash>>,
-    unsupported_codex_options: Mutex<std::collections::BTreeSet<&'static str>>,
+    unsupported_codex_options: Mutex<std::collections::BTreeSet<CodexOption>>,
 }
 impl McpConfig {
     pub(crate) fn new(
@@ -897,22 +922,21 @@ impl McpConfig {
             unsupported_codex_options: self.unsupported_codex_options.lock().unwrap().clone(),
         })))
     }
-    pub(crate) fn reject_codex_option(&self, message: &str) -> bool {
-        let mut unsupported = self.unsupported_codex_options.lock().unwrap();
-        for key in [
-            "mcp_optional_startup_grace_ms",
-            "mcp_servers.veyra.tool_timeout_sec",
-        ] {
-            if message.contains(key) && unsupported.insert(key) {
-                self.revoke();
-                tracing::warn!(
-                    option = key,
-                    "Codex rejected optional MCP config; retrying without it"
-                );
-                return true;
-            }
+    pub(crate) fn reject_codex_option(&self, option: CodexOption) -> bool {
+        if !self
+            .unsupported_codex_options
+            .lock()
+            .unwrap()
+            .insert(option)
+        {
+            return false;
         }
-        false
+        self.revoke();
+        tracing::warn!(
+            option = option.key(),
+            "Codex rejected optional MCP config; retrying without it"
+        );
+        true
     }
     pub(crate) fn sanitize(&self, value: &mut Value, replacement: &str) {
         for hash in self.hashes.lock().unwrap().iter() {
@@ -943,17 +967,17 @@ pub(crate) struct ThreadFrame {
     command: std::path::PathBuf,
     socket: std::path::PathBuf,
     token: crate::mcp::McpToken,
-    unsupported_codex_options: std::collections::BTreeSet<&'static str>,
+    unsupported_codex_options: std::collections::BTreeSet<CodexOption>,
 }
 impl ThreadFrame {
     fn config(&self, token: &str) -> Value {
         let mut config = json!({"mcp_servers.veyra.command":self.command,
-            "mcp_optional_startup_grace_ms":5000,
-            "mcp_servers.veyra.tool_timeout_sec":30,
             "mcp_servers.veyra.args":["mcp"],
             "mcp_servers.veyra.env":{"VEYRA_SOCKET":self.socket,"VEYRA_MCP_TOKEN":token}});
-        for key in &self.unsupported_codex_options {
-            config.as_object_mut().unwrap().remove(*key);
+        for option in CodexOption::ALL {
+            if !self.unsupported_codex_options.contains(&option) {
+                config[option.key()] = option.value();
+            }
         }
         config
     }
@@ -1064,7 +1088,8 @@ fn codex_root_config_sets_grace_and_tool_timeout() {
 
 #[tokio::test]
 async fn codex_rejected_optional_keys_retry_independently() {
-    let root = std::path::Path::new("/tmp").join(format!("veyra-m8-options-{}", ThreadId::new()));
+    let root =
+        std::path::Path::new("/tmp").join(format!("veyra-provider-options-{}", ThreadId::new()));
     platform::private_dir(&root).unwrap();
     let _scratch = crate::tests::Scratch(root.clone());
     let (out, _rx) = mpsc::channel(256);

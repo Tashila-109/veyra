@@ -89,10 +89,12 @@ Ordinary unit-test `ChildEnv::load` calls and explicit isolated integration/wind
 `ChildEnv::isolated` starts with no provider paths, and `with_binary` adds only an explicit fake or missing path in either build profile.
 Ignored live tests use the production loader.
 The production loader keeps its login-shell PATH, debug overrides and unrestricted release reaper behavior.
-The login-shell PATH read runs synchronously before the window in its own process group.
+The login-shell environment read runs synchronously before the window in its own process group.
+One bounded shell command returns PATH and __MISE_DIFF separated by a NUL byte.
+ChildEnv retains a non-empty shell __MISE_DIFF beside that PATH; when the shell omits it, the production child environment still inherits any application __MISE_DIFF.
 `platform::login_shell_path` uses a private bounded helper whose two-second deadline covers shell exit and stdout EOF.
 Cleanup kills only the shell's group; an escaped descendant keeping the pipe open cannot extend the deadline.
-`ChildEnv` logs the error and falls back to inherited PATH.
+`ChildEnv` logs the error and falls back to inherited PATH and __MISE_DIFF together.
 `veyra.lock` is mode 0600 and its exclusive-lock retry lasts four seconds.
 Only the lock holder stamps its pid or removes a stale debug socket.
 A second launch refuses the folder and exits 1.
@@ -364,7 +366,9 @@ Its `Cli` variant sends Claude, Codex and Grok adapters to `session::spawn_provi
 `Spawner::terminal` starts the PTY worker with the provider, native conversation, thread cwd, configuration and current epoch.
 Scripted sessions exist only in engine tests and start no OS process.
 
-`ChildEnv` shares one login-shell PATH snapshot, with inherited PATH as fallback.
+`ChildEnv` shares one login-shell PATH and optional non-empty __MISE_DIFF snapshot, with both inherited values as fallback after a failed shell.
+A successful shell with no __MISE_DIFF supplies no override, so ambient children can retain an inherited value.
+Explicit isolated environments strip inherited __MISE_DIFF, CLAUDE_CODE_AUTO_CONNECT_IDE and ENABLE_CLAUDEAI_MCP_SERVERS unless the caller supplies them explicitly.
 It retains the shell failure and reports it on load, including UI readiness loads after the app installs tracing.
 Engine::start initializes it on the startup caller before launching the actor, so session dispatch never runs a blocking login shell on the actor.
 Resolution tries absolute entries from inherited PATH, that snapshot, then `KNOWN_BIN_DIRS`, returning a canonical absolute executable path.
@@ -372,7 +376,8 @@ Relative and empty search entries are ignored.
 Known home-relative folders include .grok/bin, so a Finder launch can resolve Grok without that directory in either PATH.
 Explicit isolated environments never fall through to home-relative install folders.
 Executable checks and process-group setup for structured and probe children are platform functions.
-Every structured provider, TUI and probe child has piped stdio, `kill_on_drop(true)`, its own process group and `VEYRA_PARENT_PID` naming the application.
+Structured providers and probes have piped stdio and kill_on_drop(true); the TUI uses its PTY and ChildGroup guard.
+Every path creates an owned process group and adds VEYRA_PARENT_PID naming the application.
 It strips CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SSE_PORT, CLAUDE_AGENT_SDK_VERSION and every inherited VEYRA_* variable before adding its own marker and optional replay fixture.
 Veyra inherits the user's hooks/MCP configuration and never edits it.
 The new-thread hint names that behavior.
@@ -446,6 +451,11 @@ Queued or started lifecycle frames for completed commands open no turn; genuinel
 The seen-command set is discarded with that CLI process's codec.
 Uncorrelated CLI work may open a Provider turn after the foreground turn completes.
 Assistant error words latch per prompt, and account-related classes park the process.
+A result carrying api_error_status 403 instead ends Failed with its own redacted result text and no park, so another turn can use the process.
+An active Stop retains precedence over that failure.
+LifecycleState parses queued, started, completed and unknown values at the wire boundary.
+A matching completed command without a preceding started command fails only that prompt, with the send-again message and no park.
+A root start or resume appends tools::instructions through --append-system-prompt; children do not receive that addition.
 An active Veyra interrupt overrides that error outcome and suppresses newly arriving diagnostic text, including streamed blocks.
 Streamed and final blocks share native keys so final frames do not duplicate delivered text.
 The codec supplies a provider-neutral input summary only for the Bash command.
@@ -583,8 +593,13 @@ TurnBinding distinguishes Idle, WaitingReply with an owner and optional provisio
 Each native turn maps to its owner and one Pending, Started or Ended state; binding describes admission and correlation, not another native lifecycle state.
 InterruptRequest models an unsent interrupt, its first send, the wait for turn/started and the one retry.
 next_deadline combines the shared ladder deadline with a resume retry without claiming every timer is an interrupt.
-A session runs one codex app-server process, initializes with Veyra clientInfo without experimental opt-in, then sends initialized and thread/start or thread/resume.
+A session runs one codex app-server process, initializes with Veyra clientInfo without experimental opt-in and opts out of turn/diff/updated, then sends initialized and thread/start or thread/resume.
+The readiness probe uses that same initialize shape.
 Both thread calls carry cwd, the current model, approvalsReviewer user and the mode's approvalPolicy and sandbox; resume also carries excludeTurns true.
+Root MCP config adds mcp_optional_startup_grace_ms 5000 and mcp_servers.veyra.tool_timeout_sec 30.
+CodexOption owns both optional keys and their values.
+An open rejection naming one key revokes that attempt credential, logs its key without the error payload, and retries once without that key.
+Each key can be dropped once per root session; a repeated rejection fails, and children receive neither option.
 Only the measured no rollout found for thread id text falls back to thread/start and a notice, retaining the same app-server.
 An active-writer refusal retries at 250 ms intervals for at most three seconds, then fails with Codex's message and keeps the native id for Retry.
 Other resume failures keep that id and fail without starting a replacement conversation.
@@ -693,7 +708,8 @@ The runtime notification requests clearing settings-seeded auto; user allow rule
 Full access sends neither override and keeps --always-approve.
 Grok follows the user's Claude and Grok permission settings, so Ask first asks only when they do not already allow the action.
 Veyra adds no client hook gate.
-Grok has no Accept edits mode, so Accept edits asks as Ask first does.
+Grok offers Ask first and Full access.
+A stored Accept edits value remains stored but runs as Ask first; it grants no automatic edit response.
 Model and effort are optional launch flags after agent, and Configure uses the existing respawn path.
 No model or effort values are invented when no catalog has been read.
 Initialize requests protocolVersion 1, disables filesystem and terminal client capabilities and declares _meta.clientType extension.
@@ -712,7 +728,10 @@ Only a recognized session-not-found error falls back to session/new with a notic
 Each session/prompt carries its Veyra turn id in _meta.promptId.
 The first frame tagged with that id emits Accepted, or a matching completion emits it immediately before the end when no tagged frame arrived.
 The matching prompt_complete notification or prompt RPC reply settles a Veyra-started turn once, whichever arrives first.
-A Grok-started prompt also ends on its own _x.ai/session_notification turn_completed update with prompt_id and stop_reason; that notification cannot settle a Veyra-started prompt.
+A Grok-started prompt also ends immediately on its own _x.ai/session_notification turn_completed update with prompt_id and stop_reason.
+For a Veyra-started prompt, its own tagged turn_completed instead arms a two-second completion guard once.
+A matching tagged prompt_complete or RPC reply can finish before that deadline; otherwise the session timer delivers the guarded outcome.
+Untagged prompt_complete notifications are logged without payload and dropped, so an old tail cannot end a later prompt.
 A prompt RPC error without acceptance fails without marking the prompt accepted.
 If no JSON line arrives within sixty seconds of building the prompt, Veyra's chosen bound, the session fails: the turn ends Failed with that message, the Grok group stops and the thread parks until the next send respawns it.
 Any parsed JSON frame clears that deadline, and there is no later silence timeout.
@@ -729,7 +748,8 @@ After the Veyra prompt ends, still-open foreign prompts immediately open one Pro
 That Provider row remains Running until every tracked foreign prompt has ended, so a second foreign prompt's completion cannot end the first prompt's row.
 After a stopped Veyra turn ends, unfinished foreign prompts still open a Provider row, and the session-wide cancellation ladder stays armed until that work ends or cleanup stops the group.
 A lone prompt_complete for an unknown prompt id is ignored.
-Every session-notification turn_completed with a prompt id records it as ended, including an unknown id, so later tagged content cannot reopen that prompt.
+A session-notification turn_completed records foreign or unknown prompt ids as ended immediately; an own prompt stays tracked until its completion guard or matching end settles it.
+A settled prompt id cannot reopen on later tagged content.
 Both x.ai and _x.ai task_backgrounded and task_completed spellings update the background task set.
 Task updates prefer update.task_snapshot.task_id and fall back to update.task_id; the recorded backgrounding frames carry the root task_id.
 The actor's existing background-work flag prevents Configure, SwitchView, parking and early task settlement while that set is nonempty.
@@ -758,7 +778,8 @@ The window's request_consent derives enabled allows, reason and caption only fro
 RequestKind::accepts rejects both allow decisions for DenyOnly and preserves Deny, including after stored action round trips.
 Existing stored approvals without consent deserialize as Once, and RequestKind moves an older outer grant_key into that consent.
 An older DenyOnly action discards any outer grant_key when loaded.
-The Grok new-thread hint says the CLI loads the user's hooks and MCP servers, follows their Claude and Grok permission settings, and asks as Ask first does in Accept edits.
+The Grok new-thread hint says the CLI loads the user's hooks and MCP servers and follows their Claude and Grok permission settings.
+It does not advertise an Accept edits choice.
 The window can start Grok threads; without a catalog, each model and effort menu offers only Default, which clears the corresponding configuration value.
 The model and effort action/key cycles return Default after the last advertised value; provider cycling still wraps to the first provider.
 With the no-catalog fallback, a new Grok picker thread keeps both values absent, so its launch line carries neither -m nor --reasoning-effort.
@@ -856,7 +877,8 @@ stop_thread uses the existing child stop and settlement helpers with Stopped by 
 Identity is supplied by the authenticated connection, never by a self argument.
 Ownership and a running-turn gate apply inside the actor before any tool decision commits.
 A child may not start a thread, and the store's lineage constraints independently refuse grandchildren.
-The derived permission order enforces child mode <= parent mode, with the parent's mode as default.
+The derived permission order compares the requested child mode unchanged against the parent provider's effective run mode, with that parent mode as the omitted-mode default.
+The child keeps the requested stored mode; its provider's run mode applies at launch.
 The fan-out cap counts distinct children with open tasks, with a limit of four on starts and follow-ups.
 A deduplicated retry or a message to a child already occupying a slot needs no extra slot.
 The family cap counts all rows sharing the root, including archived rows, with a limit of sixteen.
@@ -904,9 +926,14 @@ Shell generation numbers reject stale probe replies.
 Claude has no probe timeout; a hung Claude stays Checking while the other providers become Ready.
 Claude resolves its path, reads its version, launches stream-json in the private data folder with no session flag, sends initialize and matches the request_id without a turn.
 It reads models and optional account, then ends and waits for the probe process through the same group ladder.
+The initialize probe disables hooks through --settings, sets CLAUDE_CODE_AUTO_CONNECT_IDE=0 and ENABLE_CLAUDEAI_MCP_SERVERS=false, and adds --strict-mcp-config when no managed MCP policy file exists.
+The production managed-policy path is owned by platform/macos.rs; explicit tests and debug replays inspect only their owned temporary policy path.
+The probe adds no --mcp-config, and ordinary session launches retain the user’s hooks and MCP configuration.
 A missing binary is Not installed.
 Except for a missing binary or the captured signed-out signal, every probe failure or inconclusive reply reads Ready.
-An account with apiProvider and tokenSource but no signed-in identity fields reads Signed out, following Veyra's recorded Claude signal.
+ClaudeAccount owns the typed account fields.
+Signed out requires tokenSource exactly none, apiProvider absent or firstParty, apiKeySource absent or none, and no email, organization or subscriptionType field, including fields present as null.
+API-key and third-party accounts remain Ready, and an unknown source cannot establish sign-out.
 Missing or empty account remains unknown and Ready.
 Both version and initialize reads reuse capped byte lines, and stderr is drained so a chatty probe cannot block its stdout reply.
 Codex resolves its binary, initializes one app-server, sends initialized, account/read and model/list, and reads every advertised model page without starting a thread or turn.
@@ -958,6 +985,8 @@ The same hashes sanitize provider inbound values and stderr before UI, storage o
 The codecs hand the recorder typed native-id and version metadata decoded from their thread reply, system/init or session-open reply; recording protocol labels come from ProviderKind.
 ChildEnv reads HOME once and supplies it to the recorder; `<home>` is a capture placeholder, not a matcher binding.
 It replaces credential fields, redacts secret-shaped text, replaces hook output with a placeholder and keeps account and plan keys with masked values.
+Typed ClaudeAccount fields preserve only tokenSource/apiKeySource none and apiProvider firstParty in masked account captures.
+The fixture secret-shape sweep permits none only in token- or key-named fields, not Bearer credentials, passwords, auth, secrets or URL passwords.
 Grok initialize agent and instance ids and hostname are masked, and availableCommands retains its shape with every value masked, including names.
 The first initialize hostname is bound and replaced wherever it recurs, and email shapes are masked in text.
 Account masking includes user-prefixed, email-containing, login, username, display_name, plan-prefixed and billing-prefixed keys.
@@ -1011,6 +1040,8 @@ This joins the item snapshot and event stream without duplicated or missing text
 When the selected Chat thread becomes archived, both the event pump and acknowledgement path call leave_archived_thread to open New thread with the stored default mode and reset its draft, picker, notice and branch.
 
 The sidebar reads projects in creation order, then each root and its children on a one-pixel guide, with the root glyph derived from family_status.
+Project and thread rows do not shrink inside the scroll column.
+SidebarScroll retains the scroll handle and last revealed selection; a changed selection scrolls its immediate row into view during layout.
 An unarchived child whose root is archived becomes a top-level row and keeps its own status.
 OpenThreadMenu exposes Stop thread, Archive and, for a root with unarchived children, Archive, keep child threads.
 All resizing paths dispatch SetSidebarWidth.
@@ -1064,7 +1095,9 @@ Scrolling within text.read.line_height of the bottom or choosing Latest reattach
 Latest appears only while following is detached and content remains below.
 Expanding a row remeasures it without moving its top anchor.
 Streamed text and tool input remain unbounded outside the 4 MiB wire-line cap.
-The failed view uses the latest nonqueued turn and shows the cause, next step, Retry and Open Terminal on the project folder.
+The failed view uses the latest nonqueued turn and shows its cause, Retry and Open Terminal on the project folder.
+It renders the provider’s failure cause and any next step in that cause without appending a generic sign-in footer.
+Claude and Grok sign-in failures already include their sign-in instruction, so it appears once; a 403’s own wording is never supplemented with login advice.
 Retry probes again; once the thread's provider is Ready it clears any hold and resends the failed turn's own user item as a new turn.
 A newer queued message remains queued and is never reused as the Retry prompt.
 Send also clears a hold when the thread has no queued turn.
@@ -1081,7 +1114,10 @@ A Claude root's Codex child uses the same task card, breadcrumb and family proje
 CreateThread sends the draft configuration; subsequent Send targets the selected thread.
 On an open thread, model, effort and permission chips send Configure, which is refused while work runs and parks an idle session.
 Enter submits, Shift+Enter inserts a newline, and the textarea propagates Command+Enter to the bound Send action without a second subscription send.
-New thread resets text and reads the current stored default.
+ProviderKind owns offered_modes, run_mode and next_mode.
+Claude and Codex offer three modes; Grok offers Ask first and Full access.
+The composer renders the effective run mode and cycles only offered modes while preserving unsupported values on an existing stored thread.
+New thread resets text and applies the selected provider’s run mode to the current stored default.
 Settings occupies the main column, opens through OpenSettings/Menu/Command-comma and exposes one three-mode row.
 SetDefaultMode publishes SettingsChanged; Escape or thread/project selection leaves Settings.
 
@@ -1179,7 +1215,8 @@ The reply limit is Veyra's implementation choice to carry the 5,000-item snapsho
 An incremental same-user sender can keep a line read occupied inside the per-read timeout.
 A full queue rejects before enqueueing; a reply timeout does not cancel an action already queued.
 
-Action accepts optional JSON data, keys parses before dispatch, text uses the focused textarea's public input handler or dispatches character key events to the focused terminal, and quit dispatches ConfirmQuit.
+Action accepts optional JSON data, keys parses the entire sequence before dispatching a key-down then key-up for each keystroke, text uses the focused textarea's public input handler or dispatches character key events to the focused terminal, and quit dispatches ConfirmQuit.
+Buttons activate on key-up; terminal input listens only to key-down.
 Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
 Each sidebar thread and selected thread includes lineage, and tasks includes each received task row with its state, delivery and optional report source.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
@@ -1204,9 +1241,30 @@ All terminal repaint counters and flood measurement consumers are excluded from 
 mailbox_free is the command sender's unreserved channel capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
+The composer exposes offered_modes and permission_picker_open beside its effective mode; selected_thread.config retains the stored configuration.
+The terminal header renders In terminal while dump’s engine status key remains InTerminal.
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
 Its allow_once_enabled, allow_in_thread_enabled and consent_reason use the same typed consent as the rendered controls.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
+
+## Differences from design-6
+
+The runtime sections above own the implemented rules.
+The earlier follow-ups on writable Git roots, root family instructions and Grok’s two offered modes are already reflected in design-6 and are not differences.
+The following clarifications and remaining differences are checked against the code.
+
+- Design 7.3’s Codex examples leave live output and error variants open. The codec prefers completed aggregatedOutput, accepts quoted tool names and a trailing question mark in MCP approval messages, and distinguishes resume-not-found, active-writer and no-active-turn refusals by text. Async-card choices stop active work before sending an ordinary user message; command thread grants require the exact project cwd (`provider/codex.rs`, `commands.rs`).
+- Design 7.4’s Grok catalog recipe calls grok models beside --version when a catalog exists. The implemented probe instead reads authMethods, bare _meta.agentVersion and optional modelState from one initialize, without authenticating or opening a session (`provider/grok.rs`).
+- Grok’s question wire is flat and needs no question or prompt id. Session/resume replies can omit the session id, and a session/load import collects replay before its reply. Restrictive sessions turn off settings-seeded auto/yolo, but preserve user allow rules and add no client hook gate. Exact-command grants accept only the recognized Bash input shape (`provider/grok.rs`).
+- Design 7.1’s shell snapshot can supply no non-empty __MISE_DIFF. In that case ambient children retain any application-inherited value beside the shell PATH; failed shells retain both inherited values (`provider/env.rs`).
+- Design 8 leaves Codex’s TUI daemon behavior to a probe and uses user config in restrictive modes. The implemented arguments disable its daemon and update check and set mode-specific sandbox flags. Grok’s TUI explicitly selects default permission mode outside Full access (`provider/codex.rs`, `provider/grok.rs`).
+- Design 8’s Codex import uses thread/read with includeTurns. The implementation pages thread/turns/list without an earlier thread/resume. Claude imports its append-only session file, while Grok opens session/load itself and consumes marked replay (`provider/claude.rs`, `provider/codex.rs`, `provider/grok.rs`).
+- Design 8 and 6.5’s cursor is maintained at structured dispatch, behind a persistence fence, rather than captured at a switch. Import is display-only and never blocks later queued work after its outcome; import_pending is set after an actual TUI run. A switch requires a native session, terminal Quit has a one-second grace, and the two-second stdin grace belongs only to switching (`actor.rs`, `commands.rs`, `terminal.rs`, `provider/session.rs`).
+- Terminal focus keeps Command window actions while plain Command-Left/Right stay PTY input. An open terminal counts for Quit confirmation and does not retain keep-awake. Emulator query replies include colors and every PtyWrite; kitty keyboard mode stays disabled (`ui/actions.rs`, `ui/terminal_view.rs`, `terminal.rs`).
+- Design 11’s captures use collision-safe numbered names and additionally mask account metadata, Grok identity/hostname, commands, server connection details, URL paths and queries, and email shapes (`record.rs`).
+- Provider-text presentation distinguishes marked literal consent text from one-line projected labels. Chosen async option messages retain raw bytes, so a bidi override can still affect their user bubble. That rendering rule remains unresolved (`text.rs`, `ui/provider_text.rs`, `ui/transcript.rs`).
+- Dock layout keeps decision buttons visible, bounds outside-folder text to three lines, scrolls long details and question text independently, and never truncates option captions. A docked draft uses a fixed 48px input instead of growing into unused space (`ui/composer.rs`, `ui/provider_text.rs`, `ui/mod.rs`).
+- Ordinary tests use explicit isolated provider environments in debug and release; only ignored live tests resolve installed CLIs. Terminal throughput measurements must name their grid, which the debug launch override can fix (`provider/env.rs`, `ui/mod.rs`).
 
 ## Source map
 

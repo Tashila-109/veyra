@@ -1354,8 +1354,7 @@ fn grok_load_replay_import() {
     });
 }
 
-#[test]
-fn grok_guarded_fixture_keeps_three_turns_on_one_process() {
+fn guarded_completion_fixture() -> (Vec<ProviderEvent>, Duration) {
     let (scratch, env) = environment("turn-completed-only");
     let started = std::time::Instant::now();
     let events = Runtime::new().unwrap().block_on(async {
@@ -1422,7 +1421,7 @@ fn grok_guarded_fixture_keeps_three_turns_on_one_process() {
             TurnOutcome::Completed
         ]
     );
-    assert!(started.elapsed() >= Duration::from_secs(2));
+
     assert_eq!(text(&events), "First reply.Second reply.Third reply.");
     assert_eq!(
         events
@@ -1431,4 +1430,39 @@ fn grok_guarded_fixture_keeps_three_turns_on_one_process() {
             .count(),
         1
     );
+    (events, started.elapsed())
+}
+
+#[test]
+fn grok_turn_completed_ends_own_prompt_after_guard() {
+    let (events, elapsed) = guarded_completion_fixture();
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "completion guard ended early: {elapsed:?}"
+    );
+    assert_eq!(outcomes(&events)[0], TurnOutcome::Completed);
+}
+
+#[test]
+fn grok_old_tail_never_ends_next_prompt() {
+    let (events, _) = guarded_completion_fixture();
+    let mut replies = Vec::new();
+    let mut current = String::new();
+    for event in events {
+        match event {
+            ProviderEvent::Turn {
+                event: TurnEvent::TextDelta { text, .. },
+                ..
+            } => current.push_str(&text),
+            ProviderEvent::Turn {
+                event: TurnEvent::TurnEnded { outcome, .. },
+                ..
+            } => {
+                assert_eq!(outcome, TurnOutcome::Completed);
+                replies.push(std::mem::take(&mut current));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(replies, ["First reply.", "Second reply.", "Third reply."]);
 }

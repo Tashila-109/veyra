@@ -174,6 +174,16 @@ action('multi-quiet-card-stop','StopThread',{'thread':child})
 poll('multi-quiet-held',lambda d:d['selected_thread']['status']=='Held' and pending_wake(root))
 action('multi-quiet-continue','Continue')
 family_delivered('multi-quiet-delivered',root,task)
+rows = [row for row in ctl('sidebar-overflow-before','dump')['sidebar']['rows'] if row['kind']=='thread']
+while len(rows)<40:
+    thread = create('sidebar-overflow-'+str(len(rows)),'Sidebar overflow row')
+    ctl('sidebar-overflow-done-'+str(len(rows)),'wait',thread,'Done')
+    rows = [row for row in ctl('sidebar-overflow-count','dump')['sidebar']['rows'] if row['kind']=='thread']
+original = ctl('sidebar-overflow-original','dump')['selected_thread']['id']
+for label, thread in [('first',rows[0]['id']),('last',rows[-1]['id'])]:
+    select('sidebar-overflow-'+label,thread)
+    capture('sidebar-overflow-'+label)
+select('sidebar-overflow-restore',original)
 page_done('multi-agent')
 print('PASS tree, breadcrumbs, cards, parent attention, held wakes, both archives, labels, delivery and quiet hint')
 PY
@@ -328,6 +338,9 @@ done = ctl('grok-relay-done','wait',thread,'Done')
 reply = ''.join(item['text'] for item in done['transcript']['items'] if item['kind']=='assistant')
 result = json.loads(reply.removeprefix('Checking providers'))
 assert result['mode_ceiling']=='ask_first' and result['remaining_fan_out']==4
+offered = {provider['provider']:provider['offered_modes'] for provider in result['providers']}
+assert offered == {'claude':['ask_first','accept_edits','full_access'], 'codex':['ask_first','accept_edits','full_access'], 'grok':['ask_first','full_access']}
+
 assert any(provider['provider']=='grok' for provider in result['providers'])
 assert 'remaining_fan_out' in sql("select body_json from items where thread_id='"+thread+"' and kind='assistant_text'")
 log = (DATA/'logs/veyra.log').read_text()
@@ -345,6 +358,12 @@ PYGROK
 ```
 
 ## Observable success
+
+The overflow captures show the first and last selected thread rows inside a sidebar with at least forty threads.
+Thread rows keep the theme’s fixed height instead of shrinking as the list grows.
+
+The Grok relay result includes each provider’s offered modes, the parent’s run-mode ceiling and remaining fan-out.
+Root Claude start and resume append the engine’s family instructions; child sessions do not.
 
 `grok-relay-done.json`, `grok-relay.png` and SQLite contain the Grok root relay result with its permission ceiling and remaining fan-out.
 `grok-relay-log.txt` holds the same root thread id on the accepted connection and `list_providers` lines.

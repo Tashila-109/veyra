@@ -358,7 +358,7 @@ pub fn decide(
                 }
                 return Ok((c, json!({"task_id":task.id,"thread_id":task.child})));
             }
-            let mode = args.provider.run_mode(args.mode.unwrap_or(parent_mode));
+            let mode = args.mode.unwrap_or(parent_mode);
             if mode > parent_mode {
                 let ceiling = serde_json::to_value(parent_mode).unwrap();
                 return Err(invalid(format!(

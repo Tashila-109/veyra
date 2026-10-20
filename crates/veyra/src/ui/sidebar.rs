@@ -9,6 +9,11 @@ use gpui_kit::component::{StyledExt, popover::Popover};
 use gpui_kit::{prelude::*, *};
 use std::collections::BTreeMap;
 use veyra_engine::domain::{Status, ThreadId};
+#[derive(Default)]
+pub(super) struct SidebarScroll {
+    handle: ScrollHandle,
+    selected: std::cell::Cell<Option<ThreadId>>,
+}
 pub fn glyph(status: &Status) -> &'static str {
     match status {
         Status::Working { .. } | Status::InTerminal => "◔",
@@ -98,6 +103,7 @@ pub(super) fn can_keep_children(state: &super::AppState, root: ThreadId) -> bool
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     let mut rows = Vec::new();
+    let mut selected_row = None;
     for project in shell.state.projects.values() {
         let id = project.id;
         rows.push(
@@ -110,6 +116,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
             .justify_start()
             .child(div().flex_1())
             .h(t.layout.project_row)
+            .flex_none()
             .selected(shell.project == Some(project.id))
             .on_click(move |_, window, cx| {
                 window.dispatch_action(Box::new(SelectProject { project: Some(id) }), cx)
@@ -122,6 +129,9 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
             .filter(|thread| thread.project == project.id)
         {
             let id = thread.id;
+            if shell.view.chat() == Some(id) {
+                selected_row = Some(rows.len() + 1);
+            }
             let quiet = shell.state.quiet_minutes(id);
             let status = row_status(&shell.state, thread);
             let menu = shell
@@ -161,6 +171,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     .h_flex()
                     .items_center()
                     .h(t.layout.thread_row)
+                    .flex_none()
                     .gap(t.space.0[3])
                     .when(quiet.is_some(), |row| row.gap_0())
                     .when(nested(&shell.state, thread), |row| {
@@ -261,6 +272,13 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
             );
         }
     }
+    if let Some(index) = selected_row {
+        if shell.sidebar_scroll.selected.replace(shell.view.chat()) != shell.view.chat() {
+            shell.sidebar_scroll.handle.scroll_to_item(index);
+        }
+    } else if shell.view.chat().is_none() {
+        shell.sidebar_scroll.selected.set(None);
+    }
     div()
         .v_flex()
         .w(shell.sidebar_width)
@@ -271,13 +289,17 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         .child(
             div()
                 .id("sidebar-rows")
+                .debug_selector(|| "sidebar-rows".into())
+                .track_scroll(&shell.sidebar_scroll.handle)
                 .v_flex()
+                .min_h_0()
                 .flex_1()
                 .overflow_y_scroll()
                 .p(t.space.0[4])
                 .gap(t.space.0[3])
                 .child(
                     labelled_button("add-project", "+  Add project", cx)
+                        .flex_none()
                         .w_full()
                         .justify_start()
                         .child(div().flex_1())

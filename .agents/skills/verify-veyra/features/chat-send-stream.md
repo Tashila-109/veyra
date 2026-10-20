@@ -230,6 +230,7 @@ capture('chat-failed-tool-expanded')
 signed = create('chat-signed-out','Sign-in failure',scenario='assistant-error-signed-out')
 signed_dump = ctl('chat-signed-out-failed','wait',signed,'Failed')
 assert 'Claude is signed out. Sign in from a terminal' in signed_dump['selected_thread']['failure']
+assert [item['outcome'] for item in signed_dump['transcript']['items'] if item['outcome']] == ['Failed']
 capture('chat-signed-out')
 records = [json.loads(line) for line in (SOURCE/'assistant-error-signed-out.jsonl').read_text().splitlines()]
 records[4]['after_ms']=3000
@@ -258,6 +259,46 @@ for scenario, count in [('bad-lines',1),('notices',3)]:
     if scenario=='bad-lines': assert any(item['kind']=='assistant' and item['text']=='ok' for item in dump['transcript']['items'])
     capture('chat-'+scenario)
 poll('chat-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null') == '0')
+def retained(records, provider):
+    records = json.loads(json.dumps(records))
+    assert records[-1]['type'] == 'exit'
+    records.insert(-1, {'type':'emit_inbound','after_ms':60000,'line':
+        {'type':'system','subtype':'idle'} if provider=='claude' else {'jsonrpc':'2.0','method':'unknown/idle','params':{}}})
+    return records
+
+def send_next(label, thread, turns):
+    ctl(label+'-draft','text','Continue on this process')
+    action(label+'-send','Send')
+    poll(label+'-admitted',lambda d:int(sql("select count(*) from turns where thread_id='"+thread+"'"))==turns)
+    return ctl(label+'-done','wait',thread,'Done')
+
+for scenario, words in [
+    ('result-403','Your organization cannot use this model. Choose another model and send again.'),
+    ('prompt-skipped','Claude took this message but never started a turn for it. Send it again.'),
+]:
+    label = 'chat-claude-'+scenario
+    records = [json.loads(line) for line in (SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
+    stage_records(retained(records,'claude'))
+    action(label+'-new','NewThread')
+    action(label+'-provider','PickProvider',{'provider':'claude'})
+    action(label+'-mode','PickPermission',{'mode':'ask_first'})
+    ctl(label+'-draft','text','Check this message')
+    action(label+'-send','Send')
+    failed = poll(label+'-failed',lambda d:d['selected_thread'] is not None and d['selected_thread']['status']=='Failed' and words in json.dumps(d))
+    assert [item['outcome'] for item in failed['transcript']['items'] if item['outcome']] == ['Failed']
+    thread = failed['selected_thread']['id']
+    pid = sql("select live_pid from threads where id='"+thread+"'")
+    assert pid and pid != '0'
+    capture(label+'-failed')
+    send_next(label+'-next',thread,2)
+    assert sql("select live_pid from threads where id='"+thread+"'") == pid
+    assert sql("select count(*) from turns where thread_id='"+thread+"' and state='ended'") == '2'
+    save(label+'-same-process',{'thread':thread,'pid':int(pid),'turns':2})
+    capture(label+'-next-done')
+    action(label+'-close','PickPermission',{'mode':'ask_first'})
+    poll(label+'-closed',lambda d:sql("select live_pid from threads where id='"+thread+"'")=='' )
+
+
 page_done('chat-send-stream')
 print('PASS chat streamed o → ok, Working → Done; crash cause/tail; Retry; wait exits 0/1/2/3')
 PY
@@ -376,6 +417,7 @@ thread = create_grok('grok-signed-out',scenario='signed-out',prompt='Show an aut
 failed = ctl('grok-signed-out','wait',thread,'Failed')
 assert failed['view']=='failed_thread'
 assert 'Sign in with `grok login`' in failed['selected_thread']['failure']
+assert [item['outcome'] for item in failed['transcript']['items'] if item['outcome']] == ['Failed']
 assert 'grok login' in sql("select outcome_json from turns where thread_id='"+thread+"'")
 capture('grok-signed-out')
 records = grok_records('background-work')
@@ -403,12 +445,48 @@ capture('grok-tool-title')
 poll('grok-chat-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
 action('grok-chat-return-new','NewThread')
 action('grok-chat-return-claude','PickProvider',{'provider':'claude'})
+records = grok_records('turn-completed-only')
+records.insert(-1, {'type':'emit_inbound','after_ms':60000,'line':{'jsonrpc':'2.0','method':'unknown/idle','params':{}}})
+started = time.monotonic()
+thread = create_grok('grok-completion-grok-guard', records=records)
+working = poll('grok-completion-grok-guard-working',lambda d:d['selected_thread']['id']==thread and d['selected_thread']['status']=='Working')
+pid = sql("select live_pid from threads where id='"+thread+"'")
+capture('grok-completion-grok-guard-working')
+ctl('grok-completion-grok-guard-first-done','wait',thread,'Done')
+elapsed = time.monotonic()-started
+assert elapsed >= 1.8, elapsed
+capture('grok-completion-grok-guard-first-done')
+ctl('grok-completion-second-draft','text','Continue on this process')
+action('grok-completion-second-send','Send')
+poll('grok-completion-second-admitted',lambda d:int(sql("select count(*) from turns where thread_id='"+thread+"'"))==2)
+ctl('grok-completion-second-done','wait',thread,'Done')
+assert sql("select live_pid from threads where id='"+thread+"'") == pid
+ctl('grok-completion-third-draft','text','Continue on this process')
+action('grok-completion-third-send','Send')
+poll('grok-completion-third-admitted',lambda d:int(sql("select count(*) from turns where thread_id='"+thread+"'"))==3)
+ctl('grok-completion-third-done','wait',thread,'Done')
+assert sql("select live_pid from threads where id='"+thread+"'") == pid
+assert sql("select count(*) from turns where thread_id='"+thread+"' and state='ended'") == '3'
+final = ctl('grok-completion-final','dump')
+assert all(part in json.dumps(final) for part in ['First reply.','Second reply.','Third reply.'])
+save('grok-completion-grok-same-process',{'thread':thread,'pid':int(pid),'turns':3,'first_elapsed_seconds':elapsed})
+capture('grok-completion-grok-guard-third-done')
+
+action('grok-completion-close','PickPermission',{'mode':'ask_first'})
+poll('grok-completion-closed',lambda d:sql("select live_pid from threads where id='"+thread+"'")=='' )
+
 page_done('chat-send-stream-grok')
 print('PASS Grok streams ok; Default leaves both flags out; signed-out failure; background task and Provider turn end')
 PYGROK
 ```
 
 ## Observable success
+
+The Claude 403 and completed-without-started fixtures show their own failure cause with no sign-in instruction.
+Their next turn completes on the same saved process pid, with two ended turns in SQLite.
+The sign-in failure view shows the command already supplied by its cause only once.
+The Grok completion fixture waits for the own-prompt two-second guard, then completes three replies on one process despite reordered untagged tails.
+Inspect those failure, next-turn and guarded-completion PNGs.
 
 `grok-chat-working.png` shows the first streamed character and Stop; `grok-chat-done.png`, its dump and SQLite show one completed ok reply.
 `grok-launch-argv.json` proves neither model nor effort flag was sent to the fake CLI.

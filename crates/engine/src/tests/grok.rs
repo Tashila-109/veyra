@@ -1306,7 +1306,7 @@ fn grok_cancellation_reason_uses_only_permission_rejected() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn grok_turn_completed_ends_own_prompt_after_guard() {
+async fn codec_guard_waits_once_and_ignores_late_reply() {
     use crate::{domain::*, provider::*};
     use serde_json::json;
     let mut codec = ready_codec();
@@ -1334,7 +1334,7 @@ async fn grok_turn_completed_ends_own_prompt_after_guard() {
     );
 }
 #[test]
-fn grok_old_tail_never_ends_next_prompt() {
+fn codec_untagged_tail_never_ends_next_prompt() {
     use crate::{domain::*, provider::*};
     use serde_json::json;
     let mut codec = ready_codec();

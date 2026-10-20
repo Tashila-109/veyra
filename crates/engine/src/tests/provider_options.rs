@@ -61,7 +61,7 @@ fn claude_root_args_append_family_rules() {
 #[test]
 fn claude_probe_args_turn_off_hooks_and_mcp() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../../target/m8-probe-{}", ThreadId::new()));
+        .join(format!("../../target/provider-probe-{}", ThreadId::new()));
     assert!(!root.exists());
     let args = claude::probe_args(&root);
     let settings = args.iter().position(|arg| arg == "--settings").unwrap();
@@ -78,7 +78,7 @@ fn claude_probe_args_turn_off_hooks_and_mcp() {
 #[test]
 fn claude_probe_args_skip_strict_mcp_beside_managed_file() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../../target/m8-managed-{}", ThreadId::new()));
+        .join(format!("../../target/managed-policy-{}", ThreadId::new()));
     std::fs::create_dir_all(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let managed = root.join("managed.json");
@@ -196,4 +196,92 @@ fn ceiling_reads_parent_run_mode() {
         f.actor.projection.threads[&f.thread].config.mode,
         PermissionMode::AcceptEdits
     );
+}
+
+#[test]
+fn child_requested_mode_is_checked_before_provider_run_mode() {
+    for (parent_mode, refused) in [
+        (PermissionMode::AskFirst, true),
+        (PermissionMode::AcceptEdits, false),
+    ] {
+        let mut f = Fixture::new(LiveState::Running);
+        f.actor
+            .projection
+            .threads
+            .get_mut(&f.thread)
+            .unwrap()
+            .config
+            .mode = parent_mode;
+        let providers = [Probe {
+            provider: ProviderKind::Grok,
+            path: Some("/owned/fake".into()),
+            version: None,
+            readiness: Readiness::Ready,
+            models: vec![],
+            account: None,
+        }];
+        let result = crate::tools::decide(
+            &f.actor.projection,
+            &f.actor.live,
+            f.thread,
+            ToolCall {
+                name: "start_thread".into(),
+                arguments: json!({"provider":"grok","title":"Worker","prompt":"Check the files","mode":"accept_edits","client_request_id":"child-ceiling"}),
+                veyra_label: false,
+                input_summary: None,
+            },
+            &providers,
+            0,
+        );
+        if refused {
+            assert!(
+                matches!(result, Err(CommandError::Invalid(message)) if message.contains("ask_first ceiling"))
+            );
+        } else {
+            let (changes, _) = result.unwrap();
+            assert_eq!(
+                changes.threads.values().next().unwrap().config.mode,
+                PermissionMode::AcceptEdits
+            );
+        }
+    }
+}
+
+#[test]
+fn provider_mode_cycle_uses_only_offered_modes() {
+    use PermissionMode::*;
+    for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+        assert_eq!(provider.next_mode(AskFirst), AcceptEdits);
+        assert_eq!(provider.next_mode(AcceptEdits), FullAccess);
+        assert_eq!(provider.next_mode(FullAccess), AskFirst);
+    }
+    assert_eq!(ProviderKind::Grok.next_mode(AskFirst), FullAccess);
+    assert_eq!(ProviderKind::Grok.next_mode(AcceptEdits), FullAccess);
+    assert_eq!(ProviderKind::Grok.next_mode(FullAccess), AskFirst);
+}
+
+#[test]
+fn claude_account_presence_and_source_types_control_sign_out() {
+    for (value, expected) in [
+        (json!({"tokenSource":"none"}), true),
+        (
+            json!({"tokenSource":"none","apiProvider":"firstParty","apiKeySource":"none"}),
+            true,
+        ),
+        (json!({"tokenSource":"none","email":null}), false),
+        (json!({"tokenSource":null}), false),
+        (json!({"tokenSource":"none","apiKeySource":false}), false),
+        (
+            json!({"tokenSource":"none","apiProvider":"thirdParty"}),
+            false,
+        ),
+    ] {
+        let account = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            claude::signed_out_account(Some(&account)),
+            expected,
+            "{value}"
+        );
+        assert_eq!(serde_json::to_value(account).unwrap(), value);
+    }
 }

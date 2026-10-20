@@ -2,19 +2,19 @@
 {"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"veyra","version":"<any>"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"_meta":{"clientType":"extension"}}}}
 {"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":{"protocolVersion":1,"authMethods":[],"agentCapabilities":{},"_meta":{"agentVersion":"1.0.60"}}}}
 {"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:open>","method":"session/new","params":{"cwd":"<cwd>","mcpServers":"<any>","_meta":{"yoloMode":false,"autoMode":false}}}}
-{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:open>","result":{"sessionId":"wave-zero-session"}}}
-{"type":"expect_outbound","line":{"jsonrpc":"2.0","method":"_x.ai/yolo_mode_changed","params":{"sessionId":"wave-zero-session","yolo_mode":false,"auto_mode":false}}}
-{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc1>","method":"session/prompt","params":{"sessionId":"wave-zero-session","prompt":[{"type":"text","text":"<any>"}],"_meta":{"promptId":"<id:prompt1>"}}}}
-{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"wave-zero-session","_meta":{"promptId":"<id:prompt1>"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"First reply."}}}}}
-{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"wave-zero-session","update":{"sessionUpdate":"turn_completed","prompt_id":"<id:prompt1>","stop_reason":"end_turn"}}}}
-{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc2>","method":"session/prompt","params":{"sessionId":"wave-zero-session","prompt":[{"type":"text","text":"<any>"}],"_meta":{"promptId":"<id:prompt2>"}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:open>","result":{"sessionId":"guarded-session"}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","method":"_x.ai/yolo_mode_changed","params":{"sessionId":"guarded-session","yolo_mode":false,"auto_mode":false}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc1>","method":"session/prompt","params":{"sessionId":"guarded-session","prompt":[{"type":"text","text":"<any>"}],"_meta":{"promptId":"<id:prompt1>"}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"guarded-session","_meta":{"promptId":"<id:prompt1>"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"First reply."}}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"guarded-session","update":{"sessionUpdate":"turn_completed","prompt_id":"<id:prompt1>","stop_reason":"end_turn"}}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc2>","method":"session/prompt","params":{"sessionId":"guarded-session","prompt":[{"type":"text","text":"<any>"}],"_meta":{"promptId":"<id:prompt2>"}}}}
 {"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:rpc1>","result":{"stopReason":"cancelled"}}}
-{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"wave-zero-session","stopReason":"end_turn"}}}
-{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"wave-zero-session","stopReason":"cancelled","cancellationCategory":"PermissionRejected"}}}
-{"type":"emit_inbound","after_ms":200,"line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"wave-zero-session","_meta":{"promptId":"<id:prompt2>"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Second reply."}}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"guarded-session","stopReason":"end_turn"}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"guarded-session","stopReason":"cancelled","cancellationCategory":"PermissionRejected"}}}
+{"type":"emit_inbound","after_ms":200,"line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"guarded-session","_meta":{"promptId":"<id:prompt2>"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Second reply."}}}}}
 {"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:rpc2>","result":{"stopReason":"end_turn"}}}
-{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc3>","method":"session/prompt","params":{"sessionId":"wave-zero-session","prompt":[{"type":"text","text":"<any>"}],"_meta":{"promptId":"<id:prompt3>"}}}}
-{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"wave-zero-session","stopReason":"end_turn"}}}
-{"type":"emit_inbound","after_ms":200,"line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"wave-zero-session","_meta":{"promptId":"<id:prompt3>"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Third reply."}}}}}
-{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"wave-zero-session","promptId":"<id:prompt3>","stopReason":"end_turn"}}}
+{"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc3>","method":"session/prompt","params":{"sessionId":"guarded-session","prompt":[{"type":"text","text":"<any>"}],"_meta":{"promptId":"<id:prompt3>"}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"guarded-session","stopReason":"end_turn"}}}
+{"type":"emit_inbound","after_ms":200,"line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"guarded-session","_meta":{"promptId":"<id:prompt3>"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Third reply."}}}}}
+{"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"guarded-session","promptId":"<id:prompt3>","stopReason":"end_turn"}}}
 {"type":"exit","code":0}

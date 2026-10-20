@@ -17,7 +17,8 @@ New thread or ⌘N opens the composer.
 Choose the provider, model, effort and permission chips.
 Claude and Codex offer Ask first, Accept edits and Full access.
 Grok offers Ask first and Full access, and its permission key cycle visits only those two.
-A new thread uses its provider’s run mode for the Settings default, so Grok starts and stores Ask first when that default is Accept edits.
+A new thread uses its provider’s run mode for the Settings default, so Grok shows Ask first when that default is Accept edits.
+The thread-creation and stored-mode checks live in [approvals-questions](approvals-questions.md).
 Settings continues to offer all three modes.
 A stored Grok thread in Accept edits keeps that value and shows Ask first.
 The provider menu marks Claude Code, Codex and Grok Ready, Not installed or Signed out.
@@ -100,6 +101,14 @@ no_account = poll('new-thread-no-account',lambda d: d['providers'][0]['readiness
 assert no_account['composer']['send_enabled']
 assert no_account['providers'][0]['account'] == 'unknown'
 assert no_account['providers'][0]['models']
+for scenario, status in [('probe-signed-out','signed_out'),('probe-api-key','ready'),('probe-third-party','ready'),('probe-no-account','ready')]:
+    shutil.copy2(SOURCE/(scenario+'.jsonl'),FIXTURES/'probe.jsonl')
+    action('claude-source-'+scenario+'-recheck','RecheckProviders')
+    probe = poll('claude-source-'+scenario,lambda d:d['providers'][0]['readiness']==status)
+    assert probe['composer']['send_enabled'] == (status=='ready')
+    if status=='signed_out':
+        assert 'claude auth login' in probe['composer']['disabled_reason']
+    assert sql('select count(*) from threads')=='0'
 assert sql('select count(*) from threads') == '0'
 for provider in ['codex','grok','claude']:
     ctl('new-thread-provider-key-'+provider,'keys','secondary-alt-p')
@@ -247,6 +256,33 @@ for index,model in enumerate([entry['value'] for entry in models[position+1:]]+[
     ctl('grok-catalog-model-cycle-'+str(index),'keys','secondary-alt-m')
     assert ctl('grok-catalog-model-cycle-after-'+str(index),'dump')['composer']['model']==model
 capture('grok-model-default')
+action('grok-default-settings','OpenSettings')
+action('grok-default-accept-edits','SetDefaultMode',{'mode':'accept_edits'})
+poll('grok-default-setting-stored',lambda d:d['settings']['default_mode']=='accept_edits')
+action('grok-default-new','NewThread')
+action('grok-default-provider','PickProvider',{'provider':'grok'})
+mode = ctl('grok-mode-default','dump')
+assert mode['composer']['mode']=='ask_first'
+assert mode['composer']['offered_modes']==['ask_first','full_access']
+for index in range(16):
+    frame = ctl('grok-mode-frame-'+str(index),'dump')['perf']['repaints']
+    ctl('grok-mode-focus-'+str(index),'action','root::Tab')
+    poll('grok-mode-repaint-'+str(index),lambda d:d['perf']['repaints']>frame)
+    ctl('grok-mode-open-'+str(index),'keys','space')
+    if ctl('grok-mode-state-'+str(index),'dump')['composer']['permission_picker_open']: break
+    ctl('grok-mode-dismiss-'+str(index),'keys','escape')
+else:
+    raise AssertionError('permission chip could not be reached through window keys')
+capture('grok-mode-offered-menu')
+ctl('grok-mode-close','keys','escape')
+poll('grok-mode-closed',lambda d:not d['composer']['permission_picker_open'])
+for expected in ['full_access','ask_first']:
+    ctl('grok-mode-cycle-'+expected,'keys','secondary-alt-a')
+    assert ctl('grok-mode-cycle-after-'+expected,'dump')['composer']['mode']==expected
+action('grok-mode-settings-restore','OpenSettings')
+action('grok-mode-default-restore','SetDefaultMode',{'mode':'full_access'})
+poll('grok-mode-default-restored',lambda d:d['settings']['default_mode']=='full_access')
+action('grok-mode-new-restore','NewThread')
 assert sql('select count(*) from threads')=='0'
 shutil.copy2(GROK_SOURCE/'probe-grok.jsonl',FIXTURES/'probe-grok.jsonl')
 action('grok-default-probe-restore','RecheckProviders')
@@ -259,6 +295,10 @@ PYGROK
 ```
 
 ## Observable success
+
+The permission chip’s visible menu is exposed by `composer.permission_picker_open`.
+`composer.offered_modes` reports the same provider list used to build that menu.
+In a Grok composer, open the permission chip through its focused button and capture the two entries, Ask first and Full access.
 
 The Grok section preserves Ready and Signed out probes, bare version 1.0.60, advertised model names and each model's effort list, plus the catalog-free Default fallback.
 `grok-provider-menu-signed-out.png` shows the sign-in mark and `grok-new-thread-signed-out.png` shows Send disabled with `grok login`.
@@ -289,7 +329,3 @@ Check again may briefly show Checking; the helper polls that state at the same 5
 The checks do not run a Claude turn or mutate any committed fixture.
 The native folder picker and external keyboard delivery are manual entry points.
 Update Status from candidate acceptance.
-
-The permission chip’s visible menu is exposed by `composer.permission_picker_open`.
-`composer.offered_modes` reports the same provider list used to build that menu.
-In a Grok composer, open the permission chip through its focused button and capture the two entries, Ask first and Full access.

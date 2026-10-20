@@ -432,15 +432,21 @@ fn tool_output(tool: &ToolItem) -> Option<&str> {
         .and_then(|result| result.output_tail.as_deref())
         .or_else(|| (!tool.output_tail.is_empty()).then_some(tool.output_tail.as_str()))
 }
-pub fn row_outcome(
+pub(super) fn row_outcome(
     item: &Item,
     next: Option<&Item>,
-    turns: &std::collections::BTreeMap<TurnId, Turn>,
+    state: &super::AppState,
 ) -> Option<String> {
     if next.is_some_and(|next| next.turn == item.turn) {
         return None;
     }
-    turns.get(&item.turn).and_then(turn_outcome_line)
+    if state
+        .failed_turn(item.thread)
+        .is_some_and(|turn| turn.id == item.turn)
+    {
+        return Some("Failed".into());
+    }
+    state.turns.get(&item.turn).and_then(turn_outcome_line)
 }
 pub fn failed_tool_last_line(tool: &ToolItem) -> Option<&str> {
     let result = tool.result.as_ref().filter(|result| !result.ok)?;
@@ -641,7 +647,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
         let (cause, stderr) = message
             .split_once('\n')
             .map(|(cause, tail)| (cause.to_owned(), Some(tail.to_owned())))
-            .unwrap_or((message, None));
+            .unwrap_or((message.clone(), None));
         content =
             content.child(
                 div()
@@ -660,6 +666,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                         div()
                             .text_size(t.text.read.size)
                             .line_height(t.text.read.line_height)
+                            .debug_selector(|| "failure-cause".into())
                             .child(cause),
                     )
                     .when_some(stderr, |row, stderr| {
@@ -668,15 +675,6 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                             format!("~~~text\n{stderr}\n~~~"),
                         ))
                     })
-                    .child(
-                        div()
-                            .text_size(t.text.meta.size)
-                            .text_color(t.colors.text_muted)
-                            .child(format!(
-                                "Check the CLI installation and sign in with {}, then retry.",
-                                shell.chosen_provider().sign_in_command()
-                            )),
-                    )
                     .child(
                         div()
                             .h_flex()
@@ -717,7 +715,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                                 let next = thread.and_then(|thread| {
                                     shell.state.transcript_item(thread, index + 1)
                                 });
-                                let outcome = row_outcome(item, next, &shell.state.turns);
+                                let outcome = row_outcome(item, next, &shell.state);
                                 let first = index == 0
                                     || thread
                                         .and_then(|thread| {
@@ -1319,11 +1317,63 @@ mod tests {
                 body: ItemBody::UserText(text.into()),
             })
             .collect::<Vec<_>>();
-        let turns = [(turn.id, turn)].into_iter().collect();
-        assert_eq!(super::row_outcome(&items[0], items.get(1), &turns), None);
+        let state = super::super::AppState {
+            turns: [(turn.id, turn)].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(super::row_outcome(&items[0], items.get(1), &state), None);
         assert_eq!(
-            super::row_outcome(&items[1], items.get(2), &turns),
+            super::row_outcome(&items[1], items.get(2), &state),
             Some("Done in 2s".into())
+        );
+    }
+    #[test]
+    fn failure_caption_defers_to_banner_and_preserves_history() {
+        let thread = ThreadId::new();
+        let message =
+            "Claude is signed out. Sign in from a terminal with `claude`, then send again.";
+        let turn = Turn {
+            id: TurnId::new(),
+            thread,
+            ordinal: 1,
+            origin: TurnOrigin::Provider,
+            state: TurnState::Ended {
+                outcome: TurnOutcome::Failed {
+                    message: message.into(),
+                },
+                started: Some(1000),
+                at: 3000,
+            },
+        };
+        let item = Item {
+            id: ItemId::new(),
+            thread,
+            turn: turn.id,
+            seq: 0,
+            body: ItemBody::AssistantText {
+                text: "account error".into(),
+                done: true,
+            },
+        };
+        let mut state = super::super::AppState::default();
+        state.turns.insert(turn.id, turn);
+        assert_eq!(state.failure(thread), Some(message));
+        assert_eq!(
+            super::row_outcome(&item, None, &state),
+            Some("Failed".into())
+        );
+        let later = Turn {
+            id: TurnId::new(),
+            thread,
+            ordinal: 2,
+            origin: TurnOrigin::Provider,
+            state: TurnState::Running { since: 4000 },
+        };
+        state.turns.insert(later.id, later);
+        assert_eq!(state.failure(thread), None);
+        assert_eq!(
+            super::row_outcome(&item, None, &state),
+            Some(format!("Failed · {message}"))
         );
     }
     #[test]

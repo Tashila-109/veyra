@@ -789,6 +789,9 @@ fn tui_env_sets_term_and_strips_host() {
         "CLAUDE_CODE_ENTRYPOINT",
         "CLAUDE_CODE_SSE_PORT",
         "CLAUDE_AGENT_SDK_VERSION",
+        "__MISE_DIFF",
+        "CLAUDE_CODE_AUTO_CONNECT_IDE",
+        "ENABLE_CLAUDEAI_MCP_SERVERS",
     ];
     let mut parent: Vec<(OsString, OsString)> = stripped
         .iter()

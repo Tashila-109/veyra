@@ -572,18 +572,29 @@ impl AppState {
             _ => None,
         }
     }
-    fn failure(&self, thread: ThreadId) -> Option<&str> {
+    fn failed_turn(&self, thread: ThreadId) -> Option<&Turn> {
         self.turns
             .values()
             .filter(|turn| turn.thread == thread && turn.state != TurnState::Queued)
             .max_by_key(|turn| turn.recency())
-            .and_then(|turn| match &turn.state {
-                TurnState::Ended {
-                    outcome: TurnOutcome::Failed { message },
-                    ..
-                } => Some(message.as_str()),
-                _ => None,
+            .filter(|turn| {
+                matches!(
+                    turn.state,
+                    TurnState::Ended {
+                        outcome: TurnOutcome::Failed { .. },
+                        ..
+                    }
+                )
             })
+    }
+    fn failure(&self, thread: ThreadId) -> Option<&str> {
+        match &self.failed_turn(thread)?.state {
+            TurnState::Ended {
+                outcome: TurnOutcome::Failed { message },
+                ..
+            } => Some(message.as_str()),
+            _ => None,
+        }
     }
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -656,6 +667,7 @@ pub struct Shell {
     notifications_posted: u64,
     question_draft: Option<(RequestId, Vec<Answer>)>,
     sidebar_width: Pixels,
+    sidebar_scroll: sidebar::SidebarScroll,
     resizing: bool,
     notice: Option<SharedString>,
     engine: Engine,
@@ -778,8 +790,7 @@ impl Shell {
                         if old_default != shell.state.settings.default_mode
                             && shell.view.chat().is_none()
                         {
-                            shell.config.mode =
-                                shell.provider.run_mode(shell.state.settings.default_mode);
+                            shell.config.mode = shell.default_run_mode();
                         }
                         let count = shell
                             .view
@@ -857,6 +868,7 @@ impl Shell {
             #[cfg(test)]
             sent_archives: Vec::new(),
             sidebar_width: cx.global::<Theme>().layout.sidebar_default,
+            sidebar_scroll: Default::default(),
             resizing: false,
             notice: None,
             engine,
@@ -1674,10 +1686,13 @@ impl Shell {
                     .map(|thread| thread.id)
             })
     }
+    fn default_run_mode(&self) -> PermissionMode {
+        self.provider.run_mode(self.state.settings.default_mode)
+    }
     fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show(MainView::NewThread);
         self.provider_picker = None;
-        self.config.mode = self.provider.run_mode(self.state.settings.default_mode);
+        self.config.mode = self.default_run_mode();
         self.notice = None;
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
@@ -1732,10 +1747,7 @@ impl Shell {
             if matches!(self.view, MainView::Settings { .. }) {
                 return settings::next_mode(self.state.settings.default_mode);
             }
-            let modes = provider.offered_modes();
-            let current = provider.run_mode(self.composer_config().mode);
-            let index = modes.iter().position(|mode| *mode == current).unwrap();
-            modes[(index + 1) % modes.len()]
+            provider.next_mode(self.composer_config().mode)
         });
         if matches!(self.view, MainView::Settings { .. }) {
             self.send_command(Command::SetDefaultMode { mode }, window, cx);
@@ -1870,7 +1882,7 @@ impl Shell {
                     row["text"] = transcript::task_card_text(&self.state, task).into();
                 }
                 row["outcome"] =
-                    transcript::row_outcome(item, items.get(index + 1), &self.state.turns).into();
+                    transcript::row_outcome(item, items.get(index + 1), &self.state).into();
                 row["wait_reason"] = self
                     .state
                     .turns
@@ -2206,7 +2218,7 @@ impl Render for Shell {
                 shell.input.update(cx, |input, cx| input.focus(window, cx));
                 shell.config.model = None;
                 shell.config.effort = None;
-                shell.config.mode = shell.provider.run_mode(shell.state.settings.default_mode);
+                shell.config.mode = shell.default_run_mode();
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, action: &PickModel, window, cx| {
@@ -2573,6 +2585,103 @@ mod tests {
         events::{ChangeEvent, ThreadSnapshot, UiEvent},
         provider::{Probe, ProviderKind, Readiness},
     };
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn failed_views_show_sign_in_help_only_for_sign_in(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (_, turn) = shell.update(cx, |shell, _| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false)
+            });
+            for (message, help) in [
+                (
+                    "Your organization cannot use this model. Choose another model and send again.",
+                    false,
+                ),
+                (
+                    "Claude took this message but never started a turn for it. Send it again.",
+                    false,
+                ),
+                ("Sign in with claude, then retry.", false),
+                (
+                    "Claude is signed out. Sign in from a terminal with `claude`, then send again.",
+                    false,
+                ),
+                ("Authentication failed", false),
+            ] {
+                shell.update(cx, |shell, cx| {
+                    shell.state.requests.clear();
+                    shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
+                        at: 1,
+                        started: Some(0),
+                        outcome: TurnOutcome::Failed {
+                            message: message.into(),
+                        },
+                    };
+                    cx.notify();
+                });
+                draw(cx);
+                assert_eq!(
+                    cx.debug_bounds("failure-sign-in-help").is_some(),
+                    help,
+                    "{message}"
+                );
+                assert!(cx.debug_bounds("caption-Retry").is_some());
+                assert!(cx.debug_bounds("failure-cause").is_some());
+            }
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn sidebar_overflow_keeps_row_height_and_reveals_selection(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (first, last, row_height) = shell.update(cx, |shell, cx| {
+                let (first, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                let mut last = first;
+                let template = shell.state.threads[&first].clone();
+                for index in 0..80 {
+                    let mut row = template.clone();
+                    row.id = ThreadId::new();
+                    row.title = format!("Overflow {index}");
+                    last = row.id;
+                    shell.state.threads.insert(row.id, row);
+                }
+                cx.notify();
+                (first, last, cx.global::<super::Theme>().layout.thread_row)
+            });
+            draw(cx);
+            let row = cx.debug_bounds("sidebar-thread-row").unwrap();
+            assert_eq!(row.size.height, row_height);
+            for thread in [last, first] {
+                shell.update_in(cx, |shell, window, cx| {
+                    shell.select_thread(thread, window, cx)
+                });
+                draw(cx);
+                let title = if thread == last {
+                    "caption-Overflow 79"
+                } else {
+                    "caption-T"
+                };
+                let bounds = cx.debug_bounds(title).unwrap();
+                let viewport = cx.debug_bounds("sidebar-rows").unwrap();
+                assert!(
+                    bounds.top() >= viewport.top() && bounds.bottom() <= viewport.bottom(),
+                    "selected row is outside sidebar: {bounds:?}, {viewport:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_header_uses_display_words() {
+        assert_eq!(
+            super::header::status_text(&Status::InTerminal),
+            "In terminal"
+        );
+        assert_eq!(Status::InTerminal.words(), "InTerminal");
+    }
 
     fn draw(cx: &mut gpui::VisualTestContext) {
         for _ in 0..2 {

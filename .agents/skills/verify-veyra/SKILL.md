@@ -109,6 +109,8 @@ ENV['VEYRA_REAP_PIDS'] = ''
 for name in ['VEYRA_CLAUDE_BIN','VEYRA_CODEX_BIN','VEYRA_GROK_BIN','VEYRA_FAKE_FIXTURES','VEYRA_FAKE_FIXTURE','VEYRA_RECORD']:
     ENV.pop(name,None)
 if LANE == 'fake':
+    (DATA/'home').mkdir(exist_ok=True)
+    ENV['HOME'] = str(DATA/'home')
     ENV['CLAUDE_CONFIG_DIR'] = str(DATA/'claude-home')
     ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_CODEX_BIN=str(DATA/'fake-cli'),
         VEYRA_GROK_BIN=str(DATA/'fake-cli'),
@@ -423,6 +425,7 @@ def codex_records(scenario, slow=False, root=True):
         if root and record['type']=='expect_outbound' and method in ['thread/start','thread/resume']:
             wire['params'].setdefault('config',{
                 'mcp_servers.veyra.command':'<any>', 'mcp_servers.veyra.args':['mcp'],
+                'mcp_optional_startup_grace_ms':5000, 'mcp_servers.veyra.tool_timeout_sec':30,
                 'mcp_servers.veyra.env':{'VEYRA_SOCKET':'<any>','VEYRA_MCP_TOKEN':'<any>'}})
         if slow and method=='item/agentMessage/delta' and wire['params']['delta']=='ok':
             for text in ['o','k']:
@@ -625,7 +628,8 @@ Stop accepts a target containing thread and turn ids; without a payload it uses 
 Without a request payload, consent actions use the rendered dock target, as focused keyboard chords do.
 For an explicit AnswerQuestion request, supply its question index as well.
 Action and key replies acknowledge dispatch; poll `dump` for the resulting view or use `ctl wait` for a thread state.
-`keys KEYSTROKES` dispatches each key through the window.
+`keys KEYSTROKES` parses the whole sequence before dispatch, then sends key-down followed by key-up for each keystroke through the window.
+Buttons activate on key-up; terminal input consumes key-down only.
 `text STRING` uses the focused textarea's public input handler or dispatches character key events while Terminal has focus; Settings has no text handler.
 Enter or ⌘↵ sends through `veyra::Send`; Shift+Enter inserts a newline.
 `wait THREAD STATUS [SECONDS]` is a client-only loop over `dump`, polling every 50 ms for 30 seconds by default.
@@ -638,7 +642,7 @@ A timeout does not cancel an enqueued action; run Doctor before retrying.
 Commands remain bounded at 64 KiB; the client accepts replies up to 4 MiB so the seeded 5,000-item transcript can be measured without truncating its dump.
 After another Send on an existing thread, gate `wait Done` on the new turn row or a changed status so the preceding Done cannot satisfy it.
 
-The read-only dump reports `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
+The read-only dump reports `terminal`, `view_refusal`, `tasks`, `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
 `header_branch` is the branch text used by the header and is empty after leaving Chat.
 `view` is `new_thread`, `chat`, `terminal`, `failed_thread` or `settings`.
 `veyra::SwitchView` toggles the selected thread through the window-level ⌘⇧V binding; its optional terminal boolean selects Chat or Terminal.
@@ -657,7 +661,11 @@ The child breadcrumb includes its root title and whether its SelectThread link i
 Task and Wake rows carry turn_label and task_card text; report_delivered marks only the assistant row named by a Delivered task's source; a null source produces no badge.
 `selected_thread.quiet_minutes` and header_status share Quiet for N min without changing status.
 `selected_thread` includes its native id, configuration, failure cause and `header_status`, the rendered status with elapsed seconds.
-`composer` includes the chosen provider and permission mode, plus Send's readiness and disabled reason.
+`composer` includes the chosen provider and effective permission mode, plus Send's readiness and disabled reason.
+`composer.offered_modes` is the provider's menu and key-cycle list: three modes for Claude and Codex, Ask first and Full access for Grok.
+`composer.permission_picker_open` reports the visible permission menu.
+A stored unsupported mode remains in `selected_thread.config.mode` while `composer.mode` shows Ask first.
+Settings keeps all three defaults; a new Grok composer applies Accept edits as Ask first.
 `providers` reports each probe's path, version, models, readiness and `account`, either `known` or `unknown`, with no account value.
 `transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
 `transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.

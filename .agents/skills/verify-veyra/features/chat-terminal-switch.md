@@ -161,6 +161,7 @@ sql('CREATE TABLE terminal_cursor_audit (thread TEXT, old_cursor TEXT, new_curso
 opened = terminal_enter('terminal-open')
 assert opened['selected_thread']['native_id']==native
 assert opened['selected_thread']['status']=='InTerminal'
+assert opened['selected_thread']['header_status']=='In terminal'
 assert sql("select view from threads where id='"+thread+"'")=='terminal'
 capture('terminal-open')
 first = 'terminal window heron'
@@ -170,11 +171,15 @@ ctl('terminal-word-left','keys','alt-left')
 ctl('terminal-clear','keys','ctrl-l')
 ctl('terminal-escape','keys','escape')
 ctl('terminal-page-up','keys','pageup')
-def hex_seen(d):
-    grid = ' '.join(d['terminal']['grid']) if d['terminal'] else ''
-    return '1b 0d' in grid and '1b 62' in grid and '0c' in grid and '0c 1b 1b 5b 35 7e' in grid
-hex_dump = poll('terminal-hex',hex_seen)
+expected = [format(byte,'02x') for byte in first.encode()+b'\x1b\r\x1bb\x0c\x1b\x1b[5~']
+def echoes(d):
+    return [row.strip() for row in d['terminal']['grid'] if re.fullmatch(r'[0-9a-f]{2}',row.strip())] if d['terminal'] else []
+hex_dump = poll('terminal-hex',lambda d:echoes(d)==expected)
 assert hex_dump['terminal']['focused']
+time.sleep(.15)
+hex_dump = ctl('terminal-hex-settled','dump')
+assert echoes(hex_dump)==expected
+save('terminal-key-byte-audit',{'expected_bytes':expected,'observed_bytes':echoes(hex_dump),'extra_bytes':False})
 save('terminal-hex',hex_dump)
 end = time.monotonic()+5
 while not path.exists() or first not in path.read_text():
@@ -183,9 +188,9 @@ while not path.exists() or first not in path.read_text():
 grep = subprocess.run(['grep','-c',first,str(path)],capture_output=True,text=True,check=True)
 (PROOF/'terminal-history-grep.txt').write_text(grep.stdout)
 assert int(grep.stdout)>=1
-missing = subprocess.run(['ls',str(pathlib.Path.home()/'.claude/projects/veyra-fake')],capture_output=True,text=True)
+missing = subprocess.run(['ls',str(DATA/'home'/'.claude/projects/veyra-fake')],capture_output=True,text=True)
 assert missing.returncode != 0
-(PROOF/'terminal-real-home-absent.txt').write_text('PASS ls ~/.claude/projects/veyra-fake failed\n')
+(PROOF/'terminal-isolated-home-absent.txt').write_text('PASS isolated HOME fallback path absent; real home was not inspected\n')
 back = terminal_back('terminal-imported')
 spans = [item for item in back['transcript']['items'] if item['kind']=='terminal_span']
 assert sum(first in item['text'] for item in spans)==1
@@ -266,6 +271,7 @@ Top-level `view_refusal` names the header refusal.
 `selected_thread.native_id`, `native_cursor`, `view` and `import_pending` follow engine metadata.
 `transcript.items` and SQLite `items.body_json` each hold one terminal span per typed message.
 The SQLite audit records every cursor change and marks import completion separately from the next dispatched structured turn.
+`terminal-key-byte-audit.json` holds all 31 expected and observed byte echoes, including a settled repeat proving key-up adds no bytes.
 `terminal-hex.json` holds the fake byte echoes, and `terminal-history-grep.txt` holds grep's count.
 `perf.flood` holds `pty_bytes`, `elapsed_ms`, `repaints`, `median_repaint_gap_ms` and `max_repaint_gap_ms` after FLOOD_DONE.
 The one flood here checks measurement availability and payload size; the separate five-sample performance check owns the throughput and repaint-gap baseline.

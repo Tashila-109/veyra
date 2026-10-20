@@ -23,6 +23,7 @@ pub(super) fn status_text(status: &Status) -> String {
             }
         ),
         Status::NeedsYou => "Needs you".into(),
+        Status::InTerminal => "In terminal".into(),
         Status::Done { took } => format!("Done · {}s", took / 1000),
         _ => status.words().into(),
     }

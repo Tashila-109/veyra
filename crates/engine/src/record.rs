@@ -43,12 +43,29 @@ fn auth_method_catalog(capture: &Captures<'_>) -> bool {
         .get(2)
         .is_some_and(|value| value.as_str().starts_with('['))
 }
+fn token_or_key(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("token") || name.contains("key")
+}
+fn safe_empty_credential(capture: &Captures<'_>, secret_group: usize) -> bool {
+    &capture[secret_group] == "none"
+        && capture.get(1).is_some_and(|prefix| {
+            let prefix = prefix.as_str().trim_end().trim_end_matches('"').trim_end();
+            prefix.strip_suffix([':', '=']).is_some_and(|field| {
+                let field = field.trim_end_matches(['"', ' ']);
+                field
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+                    && token_or_key(field)
+            })
+        })
+}
 pub fn secret_shapes(text: &str) -> bool {
     HOME_PATH.is_match(text)
         || MATCHES.iter().any(|rule| {
             rule.expression.captures_iter(text).any(|capture| {
                 !auth_method_catalog(&capture)
-                    && &capture[rule.secret_group] != "none"
+                    && !safe_empty_credential(&capture, rule.secret_group)
                     && !crate::fixture::wildcard(&capture[rule.secret_group])
             })
         })
@@ -139,17 +156,19 @@ mod capture {
     }
     fn mask_account(value: Value) -> Value {
         match value {
-            Value::Object(object) => Value::Object(
-                object
+            Value::Object(object) => {
+                let safe = serde_json::from_value::<crate::provider::claude::ClaudeAccount>(
+                    Value::Object(object.clone()),
+                )
+                .map(|account| account.safe_recording_fields())
+                .unwrap_or_default();
+                let mut masked: serde_json::Map<String, Value> = object
                     .into_iter()
-                    .map(|(key, value)| {
-                        let safe = (["tokenSource", "apiKeySource"].contains(&key.as_str())
-                            && value == "none")
-                            || (key == "apiProvider" && value == "firstParty");
-                        (key, if safe { value } else { mask_account(value) })
-                    })
-                    .collect(),
-            ),
+                    .map(|(key, value)| (key, mask_account(value)))
+                    .collect();
+                masked.extend(safe);
+                Value::Object(masked)
+            }
             Value::Array(array) => Value::Array(array.into_iter().map(mask_account).collect()),
             _ => "<any>".into(),
         }
@@ -370,7 +389,7 @@ mod capture {
                 return mask_account(value);
             }
             if key.is_some_and(credential_name) {
-                if value == "none" {
+                if value == "none" && key.is_some_and(super::token_or_key) {
                     return value;
                 }
                 return Value::String("<any>".into());

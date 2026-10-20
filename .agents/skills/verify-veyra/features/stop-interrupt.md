@@ -171,6 +171,9 @@ The debug-only DebugStallUi action remains available for that lane.
 
 ## Gotchas
 
+Stop keeps queued messages under a hold.
+Stop thread discards its queued messages and stops a root’s children before stopping the root.
+
 `pmset` and `scripts/bundle-app.sh` run only on macOS.
 Posting counts gpui requests even outside an app bundle; OS delivery is a separate manual banner check.
 The debug-only veyra::DebugNotificationResponse action takes {"tag":"ROOT_ID"} and calls the native banner response handler.

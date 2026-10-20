@@ -418,7 +418,10 @@ impl Codec {
             Frame::Reply {
                 tag: Call::Thread,
                 result,
-            } => match result {
+            } => match result.map_err(|error| {
+                let option = crate::mcp::CodexOption::rejected_by(&error.message);
+                (error, option)
+            }) {
                 Ok(result) => {
                     let reply: wire::ThreadReply = decode(result, "thread reply")?;
                     #[cfg(debug_assertions)]
@@ -443,15 +446,13 @@ impl Codec {
                             capabilities: vec![],
                         }));
                 }
-                Err(error)
-                    if self
-                        .mcp
-                        .as_ref()
-                        .is_some_and(|mcp| mcp.reject_codex_option(&error.message)) =>
-                {
+                Err((error, Some(option))) if self.mcp.is_some() => {
+                    if !self.mcp.as_ref().unwrap().reject_codex_option(option) {
+                        return Err(jsonrpc::failure(error));
+                    }
                     self.queue_thread(&mut decoded)?;
                 }
-                Err(error) if self.native().is_some() && not_found(&error.message) => {
+                Err((error, _)) if self.native().is_some() && not_found(&error.message) => {
                     if let Some(mcp) = &self.mcp {
                         mcp.revoke();
                     }
@@ -464,7 +465,7 @@ impl Codec {
                     ));
                     self.queue_thread(&mut decoded)?;
                 }
-                Err(error)
+                Err((error, _))
                     if self.native().is_some()
                         && error.message.contains("already has an active writer") =>
                 {
@@ -484,7 +485,7 @@ impl Codec {
                     retry.next =
                         Some((Instant::now() + Duration::from_millis(250)).min(retry.until));
                 }
-                Err(error) => return Err(jsonrpc::failure(error)),
+                Err((error, _)) => return Err(jsonrpc::failure(error)),
             },
             Frame::Reply {
                 tag: Call::Start(turn),

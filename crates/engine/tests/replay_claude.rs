@@ -2112,6 +2112,34 @@ fn claude_probe_silent_account_reads_ready() {
 }
 #[test]
 fn claude_probe_env_turns_off_ide_and_connectors() {
+    if std::env::var_os("VEYRA_PROBE_ENV_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "claude_probe_env_turns_off_ide_and_connectors",
+                "--nocapture",
+            ])
+            .env("VEYRA_PROBE_ENV_CHILD", "1")
+            .env("CLAUDE_CODE_AUTO_CONNECT_IDE", "parent-ide")
+            .env("ENABLE_CLAUDEAI_MCP_SERVERS", "parent-connectors")
+            .env("__MISE_DIFF", "parent-diff")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for key in [
+        "CLAUDE_CODE_AUTO_CONNECT_IDE",
+        "ENABLE_CLAUDEAI_MCP_SERVERS",
+        "__MISE_DIFF",
+    ] {
+        assert!(std::env::var_os(key).is_some(), "{key} was not planted");
+    }
     let (scratch, mut env) = environment("ok-reply", false);
     let script = format!(
         r#"#!/bin/sh
@@ -2137,6 +2165,24 @@ printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","req
     let variables: std::collections::BTreeMap<_, _> = command.as_std().get_envs().collect();
     assert!(!variables.contains_key(std::ffi::OsStr::new("CLAUDE_CODE_AUTO_CONNECT_IDE")));
     assert!(!variables.contains_key(std::ffi::OsStr::new("ENABLE_CLAUDEAI_MCP_SERVERS")));
+    assert!(!variables.contains_key(std::ffi::OsStr::new("__MISE_DIFF")));
+    let explicit = env
+        .clone()
+        .with_variable("__MISE_DIFF", "explicit-diff")
+        .with_variable("CLAUDE_CODE_AUTO_CONNECT_IDE", "explicit-ide")
+        .with_variable("ENABLE_CLAUDEAI_MCP_SERVERS", "explicit-connectors");
+    let command = explicit.command(Path::new("/bin/sh"), &[], &scratch.0);
+    let variables: std::collections::BTreeMap<_, _> = command.as_std().get_envs().collect();
+    for (key, value) in [
+        ("__MISE_DIFF", "explicit-diff"),
+        ("CLAUDE_CODE_AUTO_CONNECT_IDE", "explicit-ide"),
+        ("ENABLE_CLAUDEAI_MCP_SERVERS", "explicit-connectors"),
+    ] {
+        assert_eq!(
+            variables[std::ffi::OsStr::new(key)],
+            Some(std::ffi::OsStr::new(value))
+        );
+    }
 }
 fn two_turns_on_one_process(name: &str, first: &str) {
     let (scratch, env) = environment(name, false);
@@ -2254,7 +2300,7 @@ fn claude_skipped_prompt_fails_turn() {
 }
 
 fn shell_snapshot_case(test: &str, failing: bool) {
-    if std::env::var_os("VEYRA_M8_SHELL_CHILD").is_some() {
+    if std::env::var_os("VEYRA_LOGIN_SHELL_CHILD").is_some() {
         let env = ChildEnv::load();
         let result = Runtime::new().unwrap().block_on(async {
             env.command(
@@ -2289,7 +2335,7 @@ fn shell_snapshot_case(test: &str, failing: bool) {
     let shell = stand_in(&scratch, "login-shell", script);
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"])
-        .env("VEYRA_M8_SHELL_CHILD", "1")
+        .env("VEYRA_LOGIN_SHELL_CHILD", "1")
         .env("SHELL", shell)
         .env("PATH", "/inherited-path")
         .env("__MISE_DIFF", "inherited-diff")
@@ -2310,6 +2356,14 @@ fn login_shell_reads_mise_diff() {
     shell_snapshot_case("login_shell_reads_mise_diff", false);
 }
 #[test]
+fn failing_login_shell_keeps_inherited_path_and_mise_diff() {
+    shell_snapshot_case(
+        "failing_login_shell_keeps_inherited_path_and_mise_diff",
+        true,
+    );
+}
+
+#[test]
 fn child_env_carries_mise_diff_with_path() {
-    shell_snapshot_case("child_env_carries_mise_diff_with_path", true);
+    shell_snapshot_case("child_env_carries_mise_diff_with_path", false);
 }

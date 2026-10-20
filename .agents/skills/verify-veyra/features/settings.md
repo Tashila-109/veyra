@@ -168,6 +168,10 @@ PY
 
 ## Gotchas
 
+Settings retains all three defaults.
+A provider applies its offered modes when preparing a new composer; Grok maps Accept edits to Ask first.
+The zero-thread default and offered-menu proof is in [new-thread](new-thread.md).
+
 Settings is not a second native window.
 The driver dispatches through the same OpenSettings action as the menu, but does not prove a native menu click.
 The helper waits for provider groups to finish before relaunch; it does not add provider reaping.

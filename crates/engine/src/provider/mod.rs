@@ -285,25 +285,6 @@ pub struct Probe {
     pub models: Vec<Model>,
     pub account: Option<serde_json::Value>,
 }
-pub(crate) fn signed_out_account(account: Option<&serde_json::Value>) -> bool {
-    account
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|account| {
-            account
-                .get("tokenSource")
-                .and_then(serde_json::Value::as_str)
-                == Some("none")
-                && account
-                    .get("apiProvider")
-                    .is_none_or(|value| value == "firstParty")
-                && account
-                    .get("apiKeySource")
-                    .is_none_or(|value| value == "none")
-                && !["email", "organization", "subscriptionType"]
-                    .iter()
-                    .any(|key| account.contains_key(*key))
-        })
-}
 impl Probe {
     pub fn account_presence(&self) -> &'static str {
         if self.account.as_ref().is_some_and(|account| match account {
@@ -334,6 +315,12 @@ impl ProviderKind {
         } else {
             PermissionMode::AskFirst
         }
+    }
+    pub fn next_mode(self, stored: PermissionMode) -> PermissionMode {
+        let modes = self.offered_modes();
+        let current = self.run_mode(stored);
+        let index = modes.iter().position(|mode| *mode == current).unwrap_or(0);
+        modes[(index + 1) % modes.len()]
     }
     pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Grok];
     pub fn binary(self) -> &'static str {

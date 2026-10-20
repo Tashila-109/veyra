@@ -1250,11 +1250,11 @@ pub async fn probe(
                         provider: ProviderKind::Claude,
                         path: Some(binary.clone()),
                         version: (!version.is_empty()).then_some(version),
-                        readiness: if super::signed_out_account(reply.account.as_ref()) {
+                        readiness: if claude::signed_out_account(reply.account.as_ref()) {
                             super::Readiness::SignedOut
                         } else { super::Readiness::Ready },
                         models: reply.models,
-                        account: reply.account,
+                        account: reply.account.map(|account| serde_json::to_value(account).unwrap()),
                     });
                 }
             }

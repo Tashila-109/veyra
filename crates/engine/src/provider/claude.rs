@@ -1,7 +1,7 @@
 use super::{ActiveTurn, Decoded, Outbound};
 use super::{Model, ProviderEvent, SessionEvent, SessionSpec, StopReason, TurnEvent};
 use crate::domain::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -163,7 +163,17 @@ struct ResultFrame {
 #[serde(default)]
 struct Lifecycle {
     command_uuid: String,
-    state: String,
+    state: LifecycleState,
+}
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum LifecycleState {
+    Queued,
+    Started,
+    Completed,
+    #[default]
+    #[serde(other)]
+    Other,
 }
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -178,11 +188,99 @@ struct Response {
     response: InitializeReply,
     error: String,
 }
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(untagged)]
+enum AccountField {
+    Text(String),
+    Other(Value),
+    #[default]
+    #[serde(skip)]
+    Missing,
+}
+impl AccountField {
+    fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+    fn is(&self, text: &str) -> bool {
+        matches!(self, Self::Text(value) if value == text)
+    }
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct AccountFields {
+    #[serde(skip_serializing_if = "AccountField::is_missing")]
+    token_source: AccountField,
+    #[serde(skip_serializing_if = "AccountField::is_missing")]
+    api_key_source: AccountField,
+    #[serde(skip_serializing_if = "AccountField::is_missing")]
+    api_provider: AccountField,
+    #[serde(skip_serializing_if = "AccountField::is_missing")]
+    email: AccountField,
+    #[serde(skip_serializing_if = "AccountField::is_missing")]
+    organization: AccountField,
+    #[serde(skip_serializing_if = "AccountField::is_missing")]
+    subscription_type: AccountField,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+impl AccountFields {
+    #[cfg(debug_assertions)]
+    pub(crate) fn safe_recording_fields(&self) -> serde_json::Map<String, Value> {
+        let fields = Self {
+            token_source: if self.token_source.is("none") {
+                self.token_source.clone()
+            } else {
+                AccountField::Missing
+            },
+            api_key_source: if self.api_key_source.is("none") {
+                self.api_key_source.clone()
+            } else {
+                AccountField::Missing
+            },
+            api_provider: if self.api_provider.is("firstParty") {
+                self.api_provider.clone()
+            } else {
+                AccountField::Missing
+            },
+            ..Self::default()
+        };
+        match serde_json::to_value(fields).unwrap() {
+            Value::Object(fields) => fields,
+            _ => unreachable!(),
+        }
+    }
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ClaudeAccount {
+    Fields(Box<AccountFields>),
+    Other(Value),
+}
+impl ClaudeAccount {
+    #[cfg(debug_assertions)]
+    pub(crate) fn safe_recording_fields(&self) -> serde_json::Map<String, Value> {
+        match self {
+            Self::Fields(account) => account.safe_recording_fields(),
+            Self::Other(_) => serde_json::Map::new(),
+        }
+    }
+}
+pub(crate) fn signed_out_account(account: Option<&ClaudeAccount>) -> bool {
+    let Some(ClaudeAccount::Fields(account)) = account else {
+        return false;
+    };
+    account.token_source.is("none")
+        && (account.api_provider.is_missing() || account.api_provider.is("firstParty"))
+        && (account.api_key_source.is_missing() || account.api_key_source.is("none"))
+        && account.email.is_missing()
+        && account.organization.is_missing()
+        && account.subscription_type.is_missing()
+}
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(crate) struct InitializeReply {
     pub models: Vec<Model>,
-    pub account: Option<Value>,
+    pub account: Option<ClaudeAccount>,
     pub capabilities: Vec<String>,
 }
 #[derive(Deserialize, Default)]
@@ -667,12 +765,12 @@ impl Codec {
                     .is_some_and(|turn| lifecycle.command_uuid == turn.to_string())
                 {
                     self.echo = EchoMode::Known;
-                    if lifecycle.state == "started" {
+                    if matches!(lifecycle.state, LifecycleState::Started) {
                         self.prompt_started = true;
                     }
-                    if ["queued", "started"].contains(&lifecycle.state.as_str()) {
+                    if matches!(lifecycle.state, LifecycleState::Queued | LifecycleState::Started) {
                         events.push(TurnEvent::Accepted);
-                    } else if lifecycle.state == "completed" && !self.prompt_started {
+                    } else if matches!(lifecycle.state, LifecycleState::Completed) && !self.prompt_started {
                         events.push(TurnEvent::TurnEnded {
                             outcome: self.end_outcome(TurnOutcome::Failed {
                                 message: "Claude took this message but never started a turn for it. Send it again.".into(),
@@ -681,7 +779,7 @@ impl Codec {
                         });
                     }
                 } else if self.active.is_none()
-                    && ["queued", "started"].contains(&lifecycle.state.as_str())
+                    && matches!(lifecycle.state, LifecycleState::Queued | LifecycleState::Started)
                     && self.seen_commands.insert(lifecycle.command_uuid)
                 {
                     events.push(TurnEvent::Started);
