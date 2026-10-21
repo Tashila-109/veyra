@@ -240,7 +240,21 @@ fn files_under(path: &Path) -> io::Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
-const PLANNING_ID_ALLOWLIST: &[(&str, &str, &str)] = &[];
+const SIGNED_FIXTURE: &str = "crates/engine/tests/fixtures/claude/interrupt-honoured.jsonl";
+const SIGNATURE_NOISE: &str = "Base64 noise inside Claude's recorded thinking signature";
+const PLANNING_ID_ALLOWLIST: &[(&str, &str, &str)] = &[
+    (
+        SIGNED_FIXTURE,
+        concat!("M", "4Bsi5UtffmEyJeUTDvyx"),
+        SIGNATURE_NOISE,
+    ),
+    (SIGNED_FIXTURE, concat!("m", "8tpax"), SIGNATURE_NOISE),
+    (
+        SIGNED_FIXTURE,
+        concat!("m", "9NaGF6TwHhtfTW5x5ZtxmSbknxAhVwZXOfnryXE4uiUXtM"),
+        SIGNATURE_NOISE,
+    ),
+];
 
 fn planning_id_violations(path: &str, source: &str) -> Vec<String> {
     let pattern = regex::Regex::new(concat!(
@@ -248,18 +262,10 @@ fn planning_id_violations(path: &str, source: &str) -> Vec<String> {
         r"lane[ _-]?[0-9]+|criterion[ _-]?[0-9]+|veyra-m[0-9]+\w*|c[0-9]+)"
     ))
     .unwrap();
-    let signatures =
-        regex::Regex::new(r#""signature"\s*:\s*"([A-Za-z0-9+/]{64,}={0,2})""#).unwrap();
     source
         .lines()
         .enumerate()
         .flat_map(|(index, line)| {
-            let signatures: Vec<_> = signatures
-                .captures_iter(line)
-                .filter(|_| path.ends_with(".jsonl") || path.ends_with(".json"))
-                .map(|capture| capture.get(1).unwrap())
-                .filter(|value| value.len() % 4 == 0)
-                .collect();
             pattern.find_iter(line).filter_map(move |found| {
                 let before = line[..found.start()].chars().next_back();
                 let after = line[found.end()..].chars().next();
@@ -270,15 +276,12 @@ fn planning_id_violations(path: &str, source: &str) -> Vec<String> {
                 if before.is_some_and(char::is_alphanumeric)
                     || after.is_some_and(char::is_alphanumeric)
                     || (criterion_prefix && after != Some('_'))
-                    || signatures
-                        .iter()
-                        .any(|value| value.start() <= found.start() && found.end() <= value.end())
                 {
                     return None;
                 }
                 let kept = PLANNING_ID_ALLOWLIST.iter().any(|&(file, text, reason)| {
                     assert!(!reason.is_empty());
-                    file == path && text == line
+                    file == path && text == found.as_str()
                 });
                 (!kept).then(|| format!("{path}:{}: {}", index + 1, found.as_str()))
             })
@@ -364,20 +367,21 @@ fn planning_ids_absent_self_test() {
         planning_id_violations("planted", &["clean\n", "M", "3"].concat())[0],
         ["planted:2: ", "M", "3"].concat()
     );
-    let identifier = ["M", "8perf"].concat();
-    let signature = "A".repeat(64) + "/" + &identifier + "A";
-    let encoded = format!(r#"{{"signature":"{signature}"}}"#);
-    assert!(planning_id_violations("fixture.jsonl", &encoded).is_empty());
-    assert!(planning_id_violations("fixture.json", &encoded).is_empty());
-    for source in [
-        encoded.replace("signature", "text"),
-        format!(r#"{{"signature":"{identifier}"}}"#),
-        format!(r#"{{"signature":"{signature} with notes"}}"#),
-        format!(r#"{{"signature":"{signature}","text":"{identifier}"}}"#),
-    ] {
-        assert_eq!(planning_id_violations("fixture.jsonl", &source).len(), 1);
+    let ids = (3..=8)
+        .map(|n| format!("{}{n}/", "M"))
+        .collect::<String>()
+        .repeat(4);
+    let encoded = format!(r#"{{"signature":"{ids}"}}"#);
+    assert_eq!(planning_id_violations("fixture.jsonl", &encoded).len(), 24);
+    assert!(!PLANNING_ID_ALLOWLIST.is_empty());
+    for &(file, kept, reason) in PLANNING_ID_ALLOWLIST {
+        assert!(!reason.is_empty());
+        let line = format!(r#"{{"signature":"AAAA+{kept}+AAAA"}}"#);
+        assert!(planning_id_violations(file, &line).is_empty(), "{kept}");
+        assert_eq!(planning_id_violations("other.jsonl", &line).len(), 1);
+        let other = format!(r#"{{"signature":"AAAA+{kept}+{}{}+AAAA"}}"#, "M", 3);
+        assert_eq!(planning_id_violations(file, &other).len(), 1);
     }
-    assert_eq!(planning_id_violations("source.rs", &encoded).len(), 1);
 }
 
 fn long_rust_lines(path: &str, source: &str) -> Vec<String> {
