@@ -19,13 +19,18 @@ External Accessibility input is not granted here; driver keys prove gpui dispatc
 The pages are the [feature map](features/README.md)'s links in order, then any other `features/*.md` by name, so a new page joins the full run when its file exists.
 It waits in Launch's gate, gives each section a fresh `bash -c` with only `RUN` carried forward, times every section into `DIR/ATTEMPT/sections.json` and hard-links the kept proof to `DIR/ATTEMPT/run` after Cleanup.
 Everything from Launch on runs inside one `try`, and its `finally` runs Cleanup before anything else.
+SIGTERM, SIGHUP and SIGINT raise into that `try`, so an interrupted run still runs Cleanup; a signal that arrives once Cleanup has started is recorded and does not stop it.
 After a failed section, still inside that `try`, it takes one `failure` capture, unless human input caused the failure or the deadline stopped it, and records the capture's exit, error or timeout in `DIR/ATTEMPT/failure-capture.json`.
-Every receipt, `attempt.json` included, records its own write error in the attempt's `problems` instead of raising, so no diagnostic can stop Cleanup.
-A failed attempt is classified by the observation `observe_failure` recorded in `focus-failure.json` during the failed section:
-- A failed Cleanup, scratch left behind or a changed tree ends FAILED, and reaching the deadline, or any other failure in its last minute, ends BLOCKED.
-- With human input since launch, any observed failure gets a new attempt after 60 seconds, not counted.
-- A `capture` failure with no human input gets a new attempt after 60 seconds, and the third such failure in a run ends BLOCKED.
-- A `focus-timeout` failure with no human input, such as a dock-focus regression, and any failure with no observation end FAILED.
+Each write records its own error in the attempt's `problems` instead of raising, so no write can stop Cleanup.
+After Cleanup, one verdict decides the attempt, and it is the only place a run can become DONE:
+- DONE needs every planned section passed, Cleanup exit 0, an unchanged tree and the required evidence kept: the proof copy in `DIR/ATTEMPT/run` and an `attempt.json` that reads back.
+- An interruption, a failed Cleanup, scratch left behind, required evidence that was not kept or a changed tree ends FAILED, and the recorded errors stay in `problems`.
+- The failure capture, the transcript, `sections.json` and `plan.json` are diagnostics: a write error there is listed in `problems` and changes nothing else.
+- Otherwise a failed section is classified by the observation `observe_failure` recorded in `focus-failure.json` during it, and a corrupt `focus-failure.json` counts as no observation:
+  - Reaching the deadline, or any other failure in its last minute, ends BLOCKED.
+  - With human input since launch, any observed failure gets a new attempt after 60 seconds, not counted.
+  - A `capture` failure with no human input gets a new attempt after 60 seconds, and the third such failure in a run ends BLOCKED.
+  - A `focus-timeout` failure with no human input, such as a dock-focus regression, and any failure with no observation end FAILED.
 
 `DIR/outcome.json` holds the status, every attempt and the gate wait apart from the recipe time.
 
@@ -46,7 +51,7 @@ Launch, Doctor, app-launch's first section, Evidence and Cleanup always run; a s
 `--real-quiet` makes multi-agent wait for the real ten-minute quiet clock, which a phase gate runs once when `ui/header.rs`, `ui/sidebar.rs` or a `ui/mod.rs` line naming `last_activity`, `quiet_minutes` or `cadence_due` changed.
 `--expect-head SHA` refuses a checkout at another commit, `--deadline EPOCH` bounds the whole run, and `--scratch PREFIX` sets the scratch prefix, `/tmp/veyra-verify-` by default.
 The tree's identity, its HEAD, `git status --short`, the diff's SHA-256 and each untracked file's SHA-256, is saved at the start and checked after Launch's build and after Cleanup.
-`--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, checks that Launch calls `gate()` before its first `start()`, checks that the Cleanup drain, relaunch refusal and capture guards are still present, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers, failing if that self-test runs past 30 seconds.
+`--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, and checks that Launch calls `gate()` before its first `start()`. It reads `start()`'s relaunch refusal (`foreign = foreign_veyra()` then `assert not foreign`, before the launch) and Cleanup's `assert not other_markers` and `retry_exiting=True` calls as Python structure, and checks only that the 30 s drain, stale-screenshot and covered-window guard texts are present. It tables the verdict, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers, failing if that self-test runs past 30 seconds.
 
 ## Selection
 

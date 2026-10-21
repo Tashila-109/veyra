@@ -15,6 +15,15 @@ FIRST = ('app-launch','Driving it with veyra ctl')
 RELEASE = ('app-launch','Release check')
 PERF_ONLY = {('multi-agent','Probe smoke measurements')}
 LIVE_PAGES = pages.LIVE
+INTERRUPT = {'signal':None,'armed':False}
+
+class Interrupted(BaseException):
+    """SIGTERM, SIGHUP or SIGINT, raised into attempt()'s try so its finally runs Cleanup; keep() cannot swallow it."""
+
+def interrupted(number, frame):
+    INTERRUPT['signal'] = signal.Signals(number).name
+    if INTERRUPT['armed']: raise Interrupted(INTERRUPT['signal'])
+
 HEREDOC = re.compile(r"<<'(?P<end>PY[A-Z_]*)'\n(?P<body>.*?)\n(?P=end)(?:\n|$)",re.S)
 
 def page_names():
@@ -77,13 +86,22 @@ def gate_check():
         shutil.rmtree(root)
 
 def verdict(record, counted, late=False):
-    """The run's status after one attempt, or None for another; counted is the capture failures so far, and late
-    means the deadline is under a minute away."""
+    """The only place a run's status is decided, after Cleanup has run. None asks for another attempt.
+
+    DONE needs every planned section passed, Cleanup exit 0, an unchanged tree and the required evidence kept: the
+    proof copy under ATTEMPT/run, once Launch named a RUN, and a readable attempt.json. counted is the capture failures
+    so far, and late means the deadline is under a minute away.
+    """
     failed, seen = record['failed'], record.get('observed') or {}
-    if not failed and record['cleanup_exit'] == 0 and record['identity_unchanged']: return 'DONE',counted
+    if record.get('interrupted'): return 'FAILED: interrupted by '+record['interrupted'],counted
     if record.get('cleanup_exit') not in (0,None) or record.get('scratch_left'):
         return 'FAILED: Cleanup did not pass',counted
+    missing = [name for name,kept in record.get('evidence',{'evidence check':False}).items() if not kept]
+    if missing: return 'FAILED: required evidence was not kept: '+', '.join(missing)+'; see problems',counted
     if not record['identity_unchanged']: return 'FAILED: the tree changed during the run',counted
+    if not failed:
+        if record.get('all_passed') and record['cleanup_exit'] == 0: return 'DONE',counted
+        return 'FAILED: not every planned section passed',counted
     if failed.get('deadline') or late: return 'BLOCKED: wall-time limit',counted
     if seen.get('human_input'): return None,counted
     if seen.get('kind') == 'capture':
@@ -93,11 +111,16 @@ def verdict(record, counted, late=False):
     return 'FAILED: '+failed['section']+' failed'+cause+' with no human input',counted
 
 def verdict_check():
-    done = {'failed':None,'cleanup_exit':0,'identity_unchanged':True}
-    bad = dict(done,failed={'section':'page/section','exit':1,'deadline':False})
+    done = {'failed':None,'cleanup_exit':0,'identity_unchanged':True,'all_passed':True,
+        'evidence':{'run':True,'attempt.json':True}}
+    bad = dict(done,failed={'section':'page/section','exit':1,'deadline':False},all_passed=False)
     def seen(kind, human): return dict(bad,observed={'failure':'step','kind':kind,'human_input':human})
-    cases = [(done,0,'DONE'),(dict(bad,cleanup_exit=1),0,'FAILED: Cleanup'),(dict(bad,scratch_left=['x']),0,'FAILED'),
-        (dict(bad,identity_unchanged=False),0,'FAILED: the tree'),
+    cases = [(done,0,'DONE'),(dict(done,evidence={'run':False,'attempt.json':True}),0,'FAILED: required evidence'),
+        (dict(done,evidence={'run':True,'attempt.json':False}),0,'FAILED: required evidence'),
+        ({key:value for key,value in done.items() if key != 'evidence'},0,'FAILED: required evidence'),
+        (dict(done,all_passed=False),0,'FAILED: not every'),(dict(done,cleanup_exit=None),0,'FAILED'),
+        (dict(done,interrupted='SIGTERM'),0,'FAILED: interrupted'),(dict(bad,cleanup_exit=1),0,'FAILED: Cleanup'),
+        (dict(bad,scratch_left=['x']),0,'FAILED'),(dict(bad,identity_unchanged=False),0,'FAILED: the tree'),
         (dict(bad,failed=dict(bad['failed'],deadline=True)),0,'BLOCKED'),(dict(bad,late=True),0,'BLOCKED'),
         (seen('focus-timeout',True),5,None),(seen('capture',True),5,None),(seen('capture',False),1,None),
         (seen('capture',False),2,'BLOCKED'),(seen('focus-timeout',False),0,'FAILED'),(bad,0,'FAILED')]
@@ -105,15 +128,35 @@ def verdict_check():
         status,_ = verdict(record,counted,record.get('late',False))
         assert (status is None) if expected is None else (status or '').startswith(expected),(record,counted,status)
 
-def guards_present(found):
-    """A presence check only: each guard's text must still be there; the runs that pass through it prove it works."""
-    cleanup, driver = found[('SKILL','Cleanup')], (SKILL/'bin/driver.py').read_text()
-    capture = (SKILL/'bin/capture-window.swift').read_text()
-    for where,text,needle in [('Cleanup',cleanup,'assert not other_markers'),('Cleanup',cleanup,'retry_exiting=True'),
-            ('Cleanup',cleanup,'time.monotonic()-started >= 30'),('bin/driver.py',driver,'foreign_veyra()'),
+def guards_in_place(found):
+    """start()'s relaunch refusal and Cleanup's drain are read as Python structure; the stale-screenshot assert and the
+    Swift covered-window guard are checked for presence of their text only."""
+    def refuses(body, name):
+        return any(isinstance(node,ast.Assert) and isinstance(node.test,ast.UnaryOp)
+            and isinstance(node.test.op,ast.Not) and isinstance(node.test.operand,ast.Name)
+            and node.test.operand.id == name for node in body)
+    def retries(call):
+        return any(word.arg == 'retry_exiting' and isinstance(word.value,ast.Constant) and word.value.value is True
+            for word in call.keywords)
+    cleanup = [ast.parse(match['body']) for match in HEREDOC.finditer(found[('SKILL','Cleanup')])]
+    assert any(refuses(tree.body,'other_markers') for tree in cleanup), 'Cleanup no longer asserts not other_markers'
+    calls = [node for tree in cleanup for node in ast.walk(tree)
+        if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id == 'marked_processes']
+    assert calls and all(map(retries,calls)), 'a Cleanup marked_processes call lost retry_exiting=True'
+    driver = (SKILL/'bin/driver.py').read_text()
+    start = next(node for node in ast.parse(driver).body if isinstance(node,ast.FunctionDef) and node.name == 'start')
+    launch = next(index for index,node in enumerate(start.body) if any(isinstance(item,ast.Call)
+        and isinstance(item.func,ast.Attribute) and item.func.attr == 'Popen' for item in ast.walk(node)))
+    before = start.body[:launch]
+    reads = any(isinstance(node,ast.Assign) and [getattr(target,'id',None) for target in node.targets] == ['foreign']
+        and isinstance(node.value,ast.Call) and getattr(node.value.func,'id',None) == 'foreign_veyra'
+        for node in before)
+    assert reads and refuses(before,'foreign'), 'start() no longer refuses a foreign veyra before it launches'
+    swift = (SKILL/'bin/capture-window.swift').read_text()
+    for where,text,needle in [('Cleanup',found[('SKILL','Cleanup')],'time.monotonic()-started >= 30'),
             ('bin/driver.py',driver,"'stale screenshot after state change: '"),
-            ('bin/capture-window.swift',capture,'fail("owned window is covered')]:
-        assert needle in text, where+' no longer contains its guard '+needle
+            ('bin/capture-window.swift',swift,'fail("owned window is covered')]:
+        assert needle in text, where+' no longer contains the text of its guard '+needle
 
 def checks(found):
     """Everything --check-only proves; a run repeats it before Launch."""
@@ -126,11 +169,12 @@ def checks(found):
     compile((SKILL/'bin/driver.py').read_text(),'bin/driver.py','exec')
     check_map(found)
     launch_gates(found)
-    guards_present(found)
+    guards_in_place(found)
     verdict_check()
     return (f'{len(found)} shell blocks and {blocks} Python heredocs compile across {len(page_names())} pages; '
-        'the fixed sections exist; Launch calls gate() before start(); the Cleanup drain, relaunch refusal and '
-        'capture guards are present; the retry rule holds; '+gate_check())
+        'the fixed sections exist; Launch calls gate() before start(); start() asserts its relaunch refusal and '
+        'Cleanup its drain; the 30 s drain, stale-screenshot and covered-window guard texts are present; the verdict '
+        'holds; '+gate_check())
 
 def identity():
     status = subprocess.check_output(['git','status','--short','--untracked-files=all'],cwd=REPO,text=True)
@@ -174,6 +218,7 @@ def failure_capture(env, out):
         result = {'exit':process.returncode,'output':output[-4000:]}
     except Exception as error:
         result = {'error':f'{type(error).__name__}: {error}'}
+    finally:
         if process is not None and process.poll() is None:
             try: os.killpg(process.pid,signal.SIGKILL)
             except ProcessLookupError: pass
@@ -183,17 +228,24 @@ def failure_capture(env, out):
     return result
 
 def attempt(found, plan, out, env, deadline, expected):
-    """One Launch through Cleanup. Returns (exit, record).
+    """One Launch through Cleanup. Returns the attempt's record for verdict().
 
-    Every step from Launch on runs inside one try, and its finally runs Cleanup before anything else. Each receipt
-    and diagnostic write goes through keep(), which records its own error instead of raising.
+    Every step from Launch on runs inside one try, and its finally runs Cleanup before anything else. A signal raises
+    Interrupted into that try; once Cleanup starts, a later signal is only noted. Each write goes through keep(),
+    which records its own error in problems instead of raising; verdict() then refuses DONE when the proof copy or
+    attempt.json was not kept.
     """
     out.mkdir(parents=True)
-    timings, problems = [], []
-    record = {'run':None,'failed':None,'cleanup_exit':None,'problems':problems}
+    timings, problems, current = [], [], [None]
+    record = {'run':None,'failed':None,'interrupted':None,'cleanup_exit':None,'problems':problems}
+    INTERRUPT.update(signal=None,armed=True)
     def keep(label, write):
-        try: write()
-        except Exception as error: problems.append(f'{label}: {type(error).__name__}: {error}')
+        try:
+            write()
+            return True
+        except Exception as error:
+            problems.append(f'{label}: {type(error).__name__}: {error}')
+            return False
     def note(text):
         def append():
             with (out/'fresh-shell.txt').open('a') as transcript: transcript.write(text)
@@ -239,6 +291,7 @@ def attempt(found, plan, out, env, deadline, expected):
     keep('plan.json',lambda: (out/'plan.json').write_text(json.dumps(plan,indent=1)+'\n'))
     try:
         for key in plan:
+            current[0] = '/'.join(key)
             code,text = execute(key)
             record['run'] = env.get('RUN')
             if key == ('SKILL','Launch') and not code and identity() != expected:
@@ -250,17 +303,26 @@ def attempt(found, plan, out, env, deadline, expected):
         failed, run = record['failed'], record['run']
         if failed and run:
             receipt = REPO/'target/verify-veyra'/run/'focus-failure.json'
-            clock = json.loads(receipt.read_text()) if receipt.exists() else {}
+            try: clock = json.loads(receipt.read_text()) if receipt.exists() else {}
+            except (OSError,ValueError) as error:
+                problems.append(f'focus-failure.json: {type(error).__name__}: {error}')
+                clock = {}
             start = timings[-1]['start_epoch'] if timings else 0
             record['focus'] = clock
             record['observed'] = clock if clock.get('failure') and clock.get('failure_epoch',0) >= start else None
             owed = (REPO/'target/verify-veyra'/run/'pid').exists() and not failed['deadline']
             if owed and not (record['observed'] or {}).get('human_input'):
-                record['failure_capture'] = failure_capture(env,out)
+                record['failure_capture'] = capture = failure_capture(env,out)
+                if 'write_error' in capture: problems.append('failure-capture.json: '+capture['write_error'])
+    except (Interrupted,KeyboardInterrupt) as stop:
+        record['interrupted'] = str(stop) or 'SIGINT'
+        record['failed'] = {'section':current[0] or 'runner','exit':None,'deadline':False,
+            'interrupted':record['interrupted']}
     except Exception as error:
         problems.append(f'runner: {type(error).__name__}: {error}')
         record['failed'] = record['failed'] or {'section':'runner','exit':None,'deadline':False}
     finally:
+        INTERRUPT['armed'] = False
         run = record['run'] = env.get('RUN')
         try:
             if run and (REPO/'target/verify-veyra'/run/'pid').exists():
@@ -278,7 +340,7 @@ def attempt(found, plan, out, env, deadline, expected):
             record['scratch_left'] = [path for path in [scratch,scratch+'-rel'] if os.path.exists(path)]
             if record['scratch_left']: record['cleanup_exit'] = record['cleanup_exit'] or 1
             proof = REPO/'target/verify-veyra'/run
-            keep('run copy',lambda: shutil.copytree(proof,out/'run',copy_function=os.link))
+            copied = keep('run copy',lambda: shutil.copytree(proof,out/'run',copy_function=os.link))
             def gate_wait():
                 gate = proof/'input-idle-launch.json'
                 if gate.exists(): record['gate_wait_seconds'] = json.loads(gate.read_text())['gate_seconds']
@@ -289,12 +351,20 @@ def attempt(found, plan, out, env, deadline, expected):
         except Exception as error:
             problems.append(f'identity: {type(error).__name__}: {error}')
             record['identity_unchanged'] = False
+        record['interrupted'] = record['interrupted'] or INTERRUPT['signal']
+        passed = {row['section'] for row in timings if row['exit'] == 0}
+        record['all_passed'] = all('/'.join(key) in passed for key in plan)
         record['recipe_seconds'] = sum(row['seconds'] for row in timings)
-        keep('attempt.json',lambda: (out/'attempt.json').write_text(json.dumps(record,indent=2)+'\n'))
-    ok = not record['failed'] and record['cleanup_exit'] == 0 and record['identity_unchanged']
-    return (0 if ok else 1),record
+        wrote = keep('attempt.json',lambda: (out/'attempt.json').write_text(json.dumps(record,indent=2)+'\n'))
+        def read_back():
+            kept = json.loads((out/'attempt.json').read_text())
+            assert (kept['run'],kept['failed']) == (record['run'],record['failed']), 'attempt.json holds another run'
+        record['evidence'] = {'attempt.json':wrote and keep('attempt.json read back',read_back)}
+        if run: record['evidence']['run'] = copied and (out/'run').is_dir()
+    return record
 
 def main():
+    for number in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT): signal.signal(number,interrupted)
     parser = argparse.ArgumentParser()
     parser.add_argument('--evidence',type=pathlib.Path)
     parser.add_argument('--base')
@@ -345,11 +415,20 @@ def main():
     attempts, counted, status = [], 0, None
     while status is None:
         label = f'attempt-{len(attempts)+1}'
-        _,record = attempt(found,plan,args.evidence/label,dict(env),args.deadline,expected)
+        try: record = attempt(found,plan,args.evidence/label,dict(env),args.deadline,expected)
+        except Interrupted as stop:
+            # A signal inside an except clause leaves attempt() after its finally has run Cleanup.
+            record = {'failed':{'section':'runner','exit':None,'deadline':False},'interrupted':str(stop)}
         record['label'] = label
         attempts.append(record)
         status,counted = verdict(record,counted,time.time() >= args.deadline-60)
-        if status is None: time.sleep(min(60,max(0,args.deadline-time.time())))
+        record['verdict'] = status or 'another attempt'
+        if status is None:
+            # A signal between attempts finds no app running: Cleanup already ran in the attempt's finally.
+            INTERRUPT['armed'] = True
+            try: time.sleep(min(60,max(0,args.deadline-time.time())))
+            except Interrupted as stop: status = 'FAILED: interrupted by '+str(stop)
+            INTERRUPT['armed'] = False
     outcome = {'status':status,'plan':['/'.join(key) for key in plan],'attempts':attempts,
         'finished_epoch':time.time()}
     (args.evidence/'outcome.json').write_text(json.dumps(outcome,indent=2)+'\n')
