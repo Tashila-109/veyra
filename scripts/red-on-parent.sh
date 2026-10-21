@@ -12,6 +12,9 @@ import sys
 import tarfile
 import tempfile
 
+COMPILE_LIMIT = 'Known limit: a passing test that shares a target with a changed file that cannot compile on BASE reads red.'
+USAGE = 'usage: scripts/red-on-parent.sh BASE [EXPECT_PASS_FILE] | --self-test\n'+COMPILE_LIMIT
+
 def test_file(name):
     return re.fullmatch(r'crates/[^/]+/tests/.+|crates/engine/src/tests/.+', name) is not None
 
@@ -139,14 +142,15 @@ def changed_tests(before, after):
 def verdict(test, code, output, expected):
     results = re.findall(r'(?m)^test '+re.escape(test)+r' \.\.\. (ok|FAILED|ignored)\b', output)
     passed = 'ok' in results
+    compile_failed = not results and code != 0 and re.search(r'(?m)^error: could not compile ', output)
+    notice = '\nNOTICE '+COMPILE_LIMIT+' Affected test: '+test if compile_failed else ''
     if test in expected:
-        return (passed, 'EXPECTED PASS: '+test+'; '+expected[test] if passed
-            else 'FAIL stale expected-pass entry did not pass: '+test)
+        return (passed, ('EXPECTED PASS: '+test+'; '+expected[test] if passed
+            else 'FAIL stale expected-pass entry did not pass: '+test)+notice)
     if passed:
         return False, 'FAIL test passes on parent: '+test
-    if results == ['FAILED'] or (not results and code != 0
-        and re.search(r'(?m)^error: could not compile ', output)):
-        return True, 'RED target test failed or its Cargo target could not compile: '+test
+    if results == ['FAILED'] or compile_failed:
+        return True, 'RED target test failed or its Cargo target could not compile: '+test+notice
     return False, 'FAIL no conclusive target result: '+test
 
 def isolation_self_test():
@@ -208,8 +212,11 @@ def isolation_self_test():
         (package/'src/tests/mod.rs').write_text(modules)
         (root/'scripts').mkdir()
         shutil.copyfile('scripts/red-on-parent.sh',root/'scripts/red-on-parent.sh')
+        git_env = os.environ.copy()
+        git_env.update(GIT_AUTHOR_NAME='Veyra Toy Probe',GIT_COMMITTER_NAME='Veyra Toy Probe',
+            GIT_AUTHOR_EMAIL='toy@example.invalid',GIT_COMMITTER_EMAIL='toy@example.invalid')
         def git(*args):
-            return subprocess.check_output(['git',*args],cwd=root,text=True,stderr=subprocess.STDOUT).strip()
+            return subprocess.check_output(['git',*args],cwd=root,env=git_env,text=True,stderr=subprocess.STDOUT).strip()
         git('init','-q')
         git('config','user.name','Veyra Toy Probe')
         git('config','user.email','toy@example.invalid')
@@ -217,23 +224,61 @@ def isolation_self_test():
         git('add','Cargo.toml','crates','scripts')
         git('commit','-qm','Seed toy repository')
         base = git('rev-parse','HEAD')
-        (package/'src/lib.rs').write_text('pub fn new_only_api() {}\n#[cfg(test)]\nmod tests;\n')
-        (package/'src/tests/stop.rs').write_text('#[test] fn review_probe_unit_passes() {}\n')
-        (package/'src/tests/awake.rs').write_text('#[test] fn needs_new_api() { crate::new_only_api(); }\n')
+        (package/'src/tests/stop.rs').write_text(passing+sibling)
         result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
         output = result.stdout+result.stderr
         assert result.returncode == 1, output
-        assert 'FAIL test passes on parent: tests::stop::review_probe_unit_passes' in output, output
-        assert 'RED target test failed or its Cargo target could not compile: tests::awake::needs_new_api' in output, output
-        print('PASS isolation self-test: shared unit target passing file rejected; new-API sibling independently RED',flush=True)
+        assert 'FAIL test passes on parent: tests::stop::restart' in output, output
+        assert 'test tests::stop::restart_recovers ... FAILED' in output, output
+        assert COMPILE_LIMIT not in output, output
+        print('PASS repository self-test: passing exact-name test rejected beside failing sibling',flush=True)
         expected = root/'expected.txt'
-        expected.write_text('tests::stop::review_probe_unit_passes planted passing control\n')
+        expected.write_text('tests::stop::restart planted passing control\n')
         result = subprocess.run(['bash','scripts/red-on-parent.sh',base,str(expected)],cwd=root,capture_output=True,text=True)
         assert result.returncode == 0 and 'EXPECTED PASS:' in result.stdout, result.stdout+result.stderr
         expected.write_text('absent stale control\n')
         result = subprocess.run(['bash','scripts/red-on-parent.sh',base,str(expected)],cwd=root,capture_output=True,text=True)
         assert result.returncode != 0 and 'stale expected-pass entries not in diff' in result.stderr, result.stdout+result.stderr
         print('PASS isolation self-test: listed passing test accepted; stale listed entry rejected',flush=True)
+        (package/'src/tests/mod.rs').write_text(modules+'fn new_helper() -> bool { true }\n')
+        (package/'src/tests/stop.rs').write_text('#[test] fn helper_passes() { assert!(super::new_helper()); }\n')
+        result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
+        assert result.returncode == 1 and 'test tests::stop::helper_passes ... ok' in result.stdout, result.stdout+result.stderr
+        assert COMPILE_LIMIT not in result.stdout, result.stdout
+        print('PASS repository self-test: changed unit helper copied; passing test rejected',flush=True)
+        (package/'src/tests/mod.rs').write_text(modules)
+        (package/'src/tests/stop.rs').write_text('')
+        (package/'tests/common').mkdir()
+        (package/'tests/common/mod.rs').write_text('pub fn new_helper() -> bool { true }\n')
+        (package/'tests/helper.rs').write_text('mod common;\n#[test] fn helper_passes() { assert!(common::new_helper()); }\n')
+        result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
+        assert result.returncode == 1 and 'test helper_passes ... ok' in result.stdout, result.stdout+result.stderr
+        assert COMPILE_LIMIT not in result.stdout, result.stdout
+        print('PASS repository self-test: added integration helper copied; passing test rejected',flush=True)
+        (package/'tests/helper.rs').unlink()
+        (package/'tests/common/mod.rs').unlink()
+        (package/'src/tests/mod.rs').write_text(modules+'mod fresh_api;\n')
+        for value in ['true','false']:
+            (package/'src/tests/fresh_api.rs').write_text('#[test] fn fresh() { assert!('+value+'); }\n')
+            result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
+            output = result.stdout+result.stderr
+            status,code = ('ok',1) if value == 'true' else ('FAILED',0)
+            assert result.returncode == code and 'test tests::fresh_api::fresh ... '+status in output, output
+            assert COMPILE_LIMIT not in output, output
+        print('PASS repository self-test: new registered unit file runs; passing rejected, failing RED',flush=True)
+        (package/'src/tests/fresh_api.rs').unlink()
+        (package/'src/tests/mod.rs').write_text(modules)
+        (package/'src/lib.rs').write_text('pub fn new_only_api() {}\n#[cfg(test)]\nmod tests;\n')
+        (package/'src/tests/stop.rs').write_text('#[test] fn review_probe_unit_passes() {}\n')
+        (package/'src/tests/awake.rs').write_text('#[test] fn needs_new_api() { crate::new_only_api(); }\n')
+        result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
+        output = result.stdout+result.stderr
+        assert result.returncode == 0, output
+        for name in ['tests::awake::needs_new_api','tests::stop::review_probe_unit_passes']:
+            assert 'NOTICE '+COMPILE_LIMIT+' Affected test: '+name in output, output
+        help_result = subprocess.run(['bash','scripts/red-on-parent.sh','--help'],cwd=root,capture_output=True,text=True)
+        assert help_result.returncode == 0 and COMPILE_LIMIT in help_result.stdout, help_result.stdout+help_result.stderr
+        print('PASS repository self-test: shared compile failure reads RED with known-limit notice naming both affected tests; usage repeats limit',flush=True)
         (package/'src/lib.rs').write_text('#[cfg(test)]\nmod tests;\n')
         for name in ['stop','awake']:
             (package/f'src/tests/{name}.rs').write_text('')
@@ -250,12 +295,13 @@ def isolation_self_test():
         (root/renamed).write_text((root/renamed).read_text().replace('changed fixture','new fixture'))
         (root/fixture).write_bytes(b'new fixture\n')
         (package/'src/tests/stop.rs').write_text('#[test]\n#[ignore]\nfn ignored_unit() { crate::new_only_api(); }\n')
-        (package/'tests/live_probe.rs').write_text('#[test]\n#[ignore = "operator only"]\nfn ignored_live() { crate::new_only_api(); }\n')
+        (package/'tests/live_probe.rs').write_text('#[test]\n#[ignore = "operator only"]\nfn ignored_live() { crate::new_only_api(); }\n#[test]\nfn live_requires_operator() { crate::new_only_api(); }\n')
         result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
         assert result.returncode == 0, result.stdout+result.stderr
         assert result.stdout.count('MANUAL RED RECEIPT required: ignored test') == 2, result.stdout
+        assert result.stdout.count('MANUAL RED RECEIPT required: live test') == 1, result.stdout
         assert 'isolated_target=' not in result.stdout, result.stdout
-        print('PASS isolation self-test: ignored unit and live tests require hand-written receipts without compiling or running',flush=True)
+        print('PASS repository self-test: ignored unit/live and unignored live tests require hand-written receipts without compiling or running',flush=True)
 
 
 def diff_command(base):
@@ -292,8 +338,11 @@ self_test()
 if sys.argv[1:] == ['--self-test']:
     isolation_self_test()
     sys.exit(0)
+if sys.argv[1:] == ['--help']:
+    print(USAGE)
+    sys.exit(0)
 if len(sys.argv) not in (2,3):
-    sys.exit('usage: scripts/red-on-parent.sh BASE [EXPECT_PASS_FILE] | --self-test')
+    sys.exit(USAGE)
 expected = {}
 if len(sys.argv) == 3:
     for line in pathlib.Path(sys.argv[2]).read_text().splitlines():
@@ -311,8 +360,11 @@ for name in files:
     old = subprocess.run(['git','show',base+':'+name],capture_output=True,text=True)
     after = pathlib.Path(name).read_text()
     for test in changed_tests(old.stdout if old.returncode == 0 else '', after):
-        if tests(after)[test][2]:
-            print(f'MANUAL RED RECEIPT required: ignored test {name}::{test}',flush=True)
+        ignored = tests(after)[test][2]
+        live = pathlib.Path(name).name.startswith('live_') or test.split('::')[-1].startswith('live_')
+        if ignored or live:
+            reason = 'ignored test' if ignored else 'live test'
+            print(f'MANUAL RED RECEIPT required: {reason} {name}::{test}',flush=True)
         else:
             selected.append((name,test))
 if not selected:
@@ -327,28 +379,25 @@ stale = expected.keys() - {test for _,test,*_ in selected}
 if stale:
     sys.exit('FAIL stale expected-pass entries not in diff: '+', '.join(sorted(stale)))
 failed = False
-fixtures = [name for name in files if not name.endswith('.rs')]
-for name in sorted({name for name,*_ in selected}):
-    with tempfile.TemporaryDirectory(prefix='veyra-speed-red-parent-',dir='/tmp') as folder:
-        root = pathlib.Path(folder)
-        archive = root/'base.tar'
-        with archive.open('wb') as output:
-            subprocess.run(['git','archive',base],stdout=output,check=True)
-        with tarfile.open(archive) as source:
-            source.extractall(root,filter='data')
-        archive.unlink()
-        copy_test_files(pathlib.Path.cwd(),root,[name,*fixtures])
-        env = os.environ.copy()
-        env['CARGO_TARGET_DIR'] = str(root/'target')
-        for file,full_name,package,kind,target in selected:
-            if file != name: continue
-            print(f'BASE={base} file={name} target={package}/{kind}/{target} test={full_name} isolated_target={env["CARGO_TARGET_DIR"]}',flush=True)
-            result = subprocess.run(cargo_command(package,kind,target,full_name),cwd=root,env=env,capture_output=True,text=True)
-            output = result.stdout+result.stderr
-            ok,message = verdict(full_name,result.returncode,output,expected)
-            print(output,flush=True)
-            print(message,flush=True)
-            failed |= not ok
+with tempfile.TemporaryDirectory(prefix='veyra-speed-red-parent-',dir='/tmp') as folder:
+    root = pathlib.Path(folder)
+    archive = root/'base.tar'
+    with archive.open('wb') as output:
+        subprocess.run(['git','archive',base],stdout=output,check=True)
+    with tarfile.open(archive) as source:
+        source.extractall(root,filter='data')
+    archive.unlink()
+    copy_test_files(pathlib.Path.cwd(),root,files)
+    env = os.environ.copy()
+    env['CARGO_TARGET_DIR'] = str(root/'target')
+    for name,full_name,package,kind,target in selected:
+        print(f'BASE={base} file={name} target={package}/{kind}/{target} test={full_name} isolated_target={env["CARGO_TARGET_DIR"]}',flush=True)
+        result = subprocess.run(cargo_command(package,kind,target,full_name),cwd=root,env=env,capture_output=True,text=True)
+        output = result.stdout+result.stderr
+        ok,message = verdict(full_name,result.returncode,output,expected)
+        print(output,flush=True)
+        print(message,flush=True)
+        failed |= not ok
 if failed: sys.exit(1)
-print('PASS selected tests were red or explicitly expected to pass; isolated file trees removed')
+print('PASS selected tests were red or explicitly expected to pass; shared parent tree removed')
 PY

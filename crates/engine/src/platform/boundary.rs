@@ -244,14 +244,22 @@ const PLANNING_ID_ALLOWLIST: &[(&str, &str, &str)] = &[];
 
 fn planning_id_violations(path: &str, source: &str) -> Vec<String> {
     let pattern = regex::Regex::new(concat!(
-        r"(?i)(M[0-9]+([sr][0-9]+)?|SC[0-9]+|SF[0-9]+|wave[ _-]?(0|zero)|",
-        r"lane[ _-]?[0-9]+|criterion[ _-]?[0-9]+|veyra-m[0-9]+([sr][0-9]+)?|c[0-9]+)"
+        r"(?i)(M[0-9]+\w*|SC[0-9]+|SF[0-9]+|wave[ _-]?(0|zero)|",
+        r"lane[ _-]?[0-9]+|criterion[ _-]?[0-9]+|veyra-m[0-9]+\w*|c[0-9]+)"
     ))
     .unwrap();
+    let signatures =
+        regex::Regex::new(r#""signature"\s*:\s*"([A-Za-z0-9+/]{64,}={0,2})""#).unwrap();
     source
         .lines()
         .enumerate()
         .flat_map(|(index, line)| {
+            let signatures: Vec<_> = signatures
+                .captures_iter(line)
+                .filter(|_| path.ends_with(".jsonl") || path.ends_with(".json"))
+                .map(|capture| capture.get(1).unwrap())
+                .filter(|value| value.len() % 4 == 0)
+                .collect();
             pattern.find_iter(line).filter_map(move |found| {
                 let before = line[..found.start()].chars().next_back();
                 let after = line[found.end()..].chars().next();
@@ -262,6 +270,9 @@ fn planning_id_violations(path: &str, source: &str) -> Vec<String> {
                 if before.is_some_and(char::is_alphanumeric)
                     || after.is_some_and(char::is_alphanumeric)
                     || (criterion_prefix && after != Some('_'))
+                    || signatures
+                        .iter()
+                        .any(|value| value.start() <= found.start() && found.end() <= value.end())
                 {
                     return None;
                 }
@@ -338,6 +349,9 @@ fn planning_ids_absent_self_test() {
         ["veyra-m", "8", "r1-scratch"],
         ["VEYRA_M", "9", "_POLISH"],
         ["M", "123", "r2"],
+        ["veyra-m", "8speed", "-scratch"],
+        ["M", "8", "perf"],
+        ["m", "8", "review"],
     ] {
         let planted = parts.concat();
         assert!(
@@ -350,6 +364,20 @@ fn planning_ids_absent_self_test() {
         planning_id_violations("planted", &["clean\n", "M", "3"].concat())[0],
         ["planted:2: ", "M", "3"].concat()
     );
+    let identifier = ["M", "8perf"].concat();
+    let signature = "A".repeat(64) + "/" + &identifier + "A";
+    let encoded = format!(r#"{{"signature":"{signature}"}}"#);
+    assert!(planning_id_violations("fixture.jsonl", &encoded).is_empty());
+    assert!(planning_id_violations("fixture.json", &encoded).is_empty());
+    for source in [
+        encoded.replace("signature", "text"),
+        format!(r#"{{"signature":"{identifier}"}}"#),
+        format!(r#"{{"signature":"{signature} with notes"}}"#),
+        format!(r#"{{"signature":"{signature}","text":"{identifier}"}}"#),
+    ] {
+        assert_eq!(planning_id_violations("fixture.jsonl", &source).len(), 1);
+    }
+    assert_eq!(planning_id_violations("source.rs", &encoded).len(), 1);
 }
 
 fn long_rust_lines(path: &str, source: &str) -> Vec<String> {
