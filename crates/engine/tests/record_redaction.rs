@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Redaction tests inspect arbitrary captured wire JSON.
 #![cfg(debug_assertions)]
 use serde_json::json;
 use std::{
@@ -37,12 +38,22 @@ fn grok_capture_masks_signed_in_frame_privacy() {
     )
     .unwrap();
     for wire in [
-        json!({"id":1,"result":{"_meta":{"agentVersion":"1.0.60","agentId":"private-agent","agentInstanceId":"private-instance","hostname":"private-host","availableCommands":[{"name":"private-skill","description":"private-description","prompt":"private-instructions"}]},"authMethods":[{"id":"cached_token"},{"id":"grok.com"}]}}),
-        json!({"id":2,"result":{"_meta":{"email":"private-person@example.invalid","team_id":"private-team","team_name":"private-team-name","organization_id":"private-org","user_id":"private-user","account_id":"private-account","subscription_tier":"private-tier","plan_name":"private-plan"}}}),
+        json!({"id":1,"result":{"_meta":{"agentVersion":"1.0.60","agentId":"private-agent","agentInstanceId":"p\
+            rivate-instance","hostname":"private-host","availableCommands":[{"name":"private-skill","descriptio\
+                n":"private-description","prompt":"private-instructions"}]},"authMethods":[{"id":"cached_token\
+                    "},{"id":"grok.com"}]}}),
+        json!({"id":2,"result":{"_meta":{"email":"private-person@example.invalid","team_id":"private-team","tea\
+            m_name":"private-team-name","organization_id":"private-org","user_id":"private-user","account_id":"\
+                private-account","subscription_tier":"private-tier","plan_name":"private-plan"}}}),
         json!({"method":"_x.ai/settings/update","params":{"subscription_tier_display":"private-plan-display"}}),
-        json!({"method":"_x.ai/mcp/servers_updated","params":{"mcpServers":[{"name":"example-server","source":"user","type":"stdio","command":"private-command","args":["private-arg"],"env":{"VALUE":"private-env"},"headers":{"Value":"private-header"}},{"name":"example-http","source":"user","type":"http","url":"https://example.invalid/private-mcp?private-query=yes"}]}}),
-        json!({"text":"Visit https://example.invalid/private-path?private-query=yes and http://example.invalid?private-only-query=yes"}),
-        json!({"text":"https://private-user:private-password@example.invalid/private-path?private-query=yes https://private-user:private-password@example.invalid"}),
+        json!({"method":"_x.ai/mcp/servers_updated","params":{"mcpServers":[{"name":"example-server","source":"\
+            user","type":"stdio","command":"private-command","args":["private-arg"],"env":{"VALUE":"private-env\
+                "},"headers":{"Value":"private-header"}},{"name":"example-http","source":"user","type":"http","\
+                    url":"https://example.invalid/private-mcp?private-query=yes"}]}}),
+        json!({"text":"Visit https://example.invalid/private-path?private-query=yes and http://example.invalid?\
+            private-only-query=yes"}),
+        json!({"text":"https://private-user:private-password@example.invalid/private-path?private-query=yes htt\
+            ps://private-user:private-password@example.invalid"}),
     ] {
         recorder.line(false, wire).unwrap();
     }
@@ -70,9 +81,27 @@ fn grok_capture_masks_near_account_variants_and_other_sessions() {
         None,
     )
     .unwrap();
-    recorder.line(false,json!({"id":1,"result":{"_meta":{"hostname":"private-host.invalid","availableCommands":[{"name":"private-command"}]}}})).unwrap();
-    recorder.line(false,json!({"text":"Signed in as private-person@example.invalid on private-host.invalid; contact another+person@sub.example.invalid and owner@private-host.invalid."})).unwrap();
-    recorder.line(false,json!({"method":"_x.ai/mcp/server_status","params":{"name":"example-server","status":"ready","detail":"Loaded private-command"}})).unwrap();
+    recorder
+        .line(
+            false,
+            json!({"id":1,"result":{"_meta":{"hostname":"private-host.invalid","availableCommands\
+        ":[{"name":"private-command"}]}}}),
+        )
+        .unwrap();
+    recorder
+        .line(
+            false,
+            json!({"text":"Signed in as private-person@example.invalid on private-host.invalid; con\
+        tact another+person@sub.example.invalid and owner@private-host.invalid."}),
+        )
+        .unwrap();
+    recorder
+        .line(
+            false,
+            json!({"method":"_x.ai/mcp/server_status","params":{"name":"example-server","status":"r\
+        eady","detail":"Loaded private-command"}}),
+        )
+        .unwrap();
     let account = [
         "user_email",
         "userEmail",
@@ -95,7 +124,8 @@ fn grok_capture_masks_near_account_variants_and_other_sessions() {
     for method in ["_x.ai/sessions/changed", "x.ai/sessions/changed"] {
         recorder.line(false,json!({"method":method,"params":{"upserted":[
             {"sessionId":"current","title":"Project work","cwd":scratch.0,"activity":"working"},
-            {"sessionId":"private-session","title":"private-title","cwd":"/private-other-folder","activity":"working","origin":{"kind":"local"}}
+            {"sessionId":"private-session","title":"private-title","cwd":"/private-other-folder","activity":"wo\
+                rking","origin":{"kind":"local"}}
         ],"removed":[]}})).unwrap();
     }
     let rows: Vec<serde_json::Value> = fs::read_to_string(&path)
@@ -537,7 +567,13 @@ fn grok_auth_method_catalog_is_public_but_credentials_are_private() {
         None,
     )
     .unwrap();
-    recorder.line(false,json!({"authMethods":[{"id":"cached_token","name":"Saved sign-in","access_token":"synthetic-private-value"}]})).unwrap();
+    recorder
+        .line(
+            false,
+            json!({"authMethods":[{"id":"cached_token","name":"Saved sign-in","access_token":"synth\
+        etic-private-value"}]}),
+        )
+        .unwrap();
     let rows: Vec<serde_json::Value> = fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -561,8 +597,10 @@ fn capture_keeps_none_and_masks_other_account_values() {
     )
     .unwrap();
     for account in [
-        json!({"tokenSource":"none","apiKeySource":"none","apiProvider":"firstParty","email":"private-person","organization":"private-org"}),
-        json!({"tokenSource":"private-token-source","apiKeySource":"private-key-source","apiProvider":"bedrock","subscriptionType":"private-plan"}),
+        json!({"tokenSource":"none","apiKeySource":"none","apiProvider":"firstParty","email":"private-person","\
+            organization":"private-org"}),
+        json!({"tokenSource":"private-token-source","apiKeySource":"private-key-source","apiProvider":"bedrock\
+            ","subscriptionType":"private-plan"}),
     ] {
         recorder
             .line(
@@ -578,7 +616,8 @@ fn capture_keeps_none_and_masks_other_account_values() {
         .collect();
     assert_eq!(
         rows[1]["line"]["response"]["response"]["account"],
-        json!({"tokenSource":"none","apiKeySource":"none","apiProvider":"firstParty","email":"<any>","organization":"<any>"})
+        json!({"tokenSource":"none","apiKeySource":"none","apiProvider":"firstParty","email":"<any>","organizat\
+            ion":"<any>"})
     );
     assert_eq!(
         rows[2]["line"]["response"]["response"]["account"],

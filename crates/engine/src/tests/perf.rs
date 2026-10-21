@@ -128,7 +128,10 @@ fn claude_stream_keeps_seven_fixed_commits() {
             ..
         }
     ));
-    assert!(stored.items_for(f.thread).any(|item| matches!(&item.body, ItemBody::AssistantText { text, done: true } if text == &"x".repeat(2000))));
+    assert!(stored.items_for(f.thread).any(
+        |item| matches!(&item.body, ItemBody::AssistantText { text, done:
+        true } if text == &"x".repeat(2000))
+    ));
     println!(
         "startup=4 ending=3 text_writes=5 total={}",
         f.actor.test_commits - before

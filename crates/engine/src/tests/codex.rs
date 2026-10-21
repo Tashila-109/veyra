@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Codec tests construct and inspect provider wire envelopes.
 use super::*;
 use serde_json::json;
 
@@ -113,11 +114,14 @@ fn codex_params_per_mode() {
         };
         assert_eq!(
             codex::thread_params(&spec),
-            json!({"cwd":"/project","model":"a-current-model","approvalPolicy":approval,"sandbox":sandbox,"approvalsReviewer":"user","threadId":"native","excludeTurns":true})
+            json!({"cwd":"/project","model":"a-current-model","approvalPolicy":approval,"sandbox":sandbox,"appr\
+                ovalsReviewer":"user","threadId":"native","excludeTurns":true})
         );
         assert_eq!(
             codex::turn_params("native", &config, "hello".into()),
-            json!({"threadId":"native","input":[{"type":"text","text":"hello","text_elements":[]}],"model":"a-current-model","effort":"a-cli-effort","summary":"auto","approvalPolicy":approval,"approvalsReviewer":"user","sandboxPolicy":policy})
+            json!({"threadId":"native","input":[{"type":"text","text":"hello","text_elements":[]}],"model":"a-c\
+                urrent-model","effort":"a-cli-effort","summary":"auto","approvalPolicy":approval,"approvalsRevi\
+                    ewer":"user","sandboxPolicy":policy})
         );
     }
 }

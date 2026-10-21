@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // The shutdown stand-in exchanges scripted provider wire frames.
 #![cfg(debug_assertions)]
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, time::Duration};

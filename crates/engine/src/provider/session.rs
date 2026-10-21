@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Session I/O decodes, records and dispatches provider wire envelopes.
 use super::{
     ActiveTurn, Decoded, Outbound, ProviderError, ProviderEvent, ProviderKind, SessionControl,
     SessionEvent, SessionHandle, SessionSpec, StopReason, TurnEvent, claude, codex, env::ChildEnv,
@@ -833,7 +834,8 @@ async fn run_one(
                     }
                     *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
                     for event in std::mem::take(&mut dispatched.events) {
-                        if out.send(EngineMsg::Provider { thread, epoch, cursor: dispatched.cursor.take(), event }).await.is_err() {
+                        if out.send(EngineMsg::Provider { thread, epoch, cursor: dispatched.cursor.take(),
+                            event }).await.is_err() {
                             consumer_gone = true;
                             break;
                         }
@@ -867,7 +869,8 @@ async fn run_one(
                     }
                     if matches!(shutdown, SessionControl::ShutdownForTerminal) && !control.closing.is_closing() {
                         while tokio::time::Instant::now() < deadline {
-                            if process.child.child.as_mut().is_none_or(|child| child.try_wait().ok().flatten().is_some()) { break; }
+                            if process.child.child.as_mut().is_none_or(|child| child.try_wait().ok().flatten(
+                                ).is_some()) { break; }
                             if control.closing.is_closing() { break; }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
@@ -920,7 +923,8 @@ async fn run_one(
                     None => std::future::pending().await,
                 }
             } => {
-                let mut decoded = match codec.timer() { Ok(decoded) => decoded, Err(error) => { failure = Some(error.to_string()); break; } };
+                let mut decoded = match codec.timer() { Ok(decoded) => decoded, Err(error) => { failure = Some(
+                    error.to_string()); break; } };
                 *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
                 for line in decoded.take_outbound() {
                     if let Err(error) = process.send(&writer, line) { failure = Some(error.to_string()); break; }
@@ -948,7 +952,8 @@ async fn run_one(
                         Ok(wire) => wire,
                         Err(error) => {
                             tracing::info!(length = line.len(), "skipped non-JSON provider line");
-                            if profile.reject_non_json { rejected = Some(format!("{} protocol: {error}", provider.name())); }
+                            if profile.reject_non_json { rejected = Some(format!("{} protocol: {error}",
+                                provider.name())); }
                             continue;
                         }
                     };
@@ -957,24 +962,31 @@ async fn run_one(
                         Ok(mut decoded) => {
                             *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
                             for line in decoded.take_outbound() {
-                                if let Err(error) = process.send(&writer, line) { failure = Some(error.to_string()); break; }
+                                if let Err(error) = process.send(&writer, line) { failure = Some(
+                                    error.to_string()); break; }
                             }
                             if failure.is_some() { break; }
                             if let Some(provider_turn) = decoded.provider_turn {
                                 let event = ProviderEvent::Session(SessionEvent::ProviderTurnStarted { provider_turn });
-                                let sent = if let Some(cursor) = decoded.cursor.take() { out.send(EngineMsg::Provider { thread, epoch, cursor: Some(cursor), event }).await.is_ok() } else { emit(out, thread, epoch, event).await };
+                                let sent = if let Some(cursor) = decoded.cursor.take() { out.send(
+                                    EngineMsg::Provider { thread, epoch, cursor: Some(cursor), event
+                                        }).await.is_ok() } else { emit(out, thread, epoch, event).await };
                                 if !sent { consumer_gone = true; break; }
                             }
                             if let Some(history) = decoded.history.take() && let Some(native) = codec.native()
-                                && !emit(out, thread, epoch, ProviderEvent::Session(SessionEvent::History { native: native.clone(), history })).await { consumer_gone = true; break; }
-                            let provider_cursor = decoded.events.iter().any(|event| matches!(event, ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })));
+                                && !emit(out, thread, epoch, ProviderEvent::Session(SessionEvent::History {
+                                    native: native.clone(), history })).await { consumer_gone = true; break; }
+                            let provider_cursor = decoded.events.iter().any(|event| matches!(event,
+                                ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })));
                             for event in decoded.events {
                                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                                     ready = true;
                                 }
-                                let cursor = if !provider_cursor || matches!(&event, ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })) { decoded.cursor.take() } else { None };
+                                let cursor = if !provider_cursor || matches!(&event, ProviderEvent::Session(
+                                    SessionEvent::ProviderTurnStarted { .. })) { decoded.cursor.take() } else { None };
                                 let sent = if let Some(cursor) = cursor {
-                                    out.send(EngineMsg::Provider { thread, epoch, cursor: Some(cursor), event }).await.is_ok()
+                                    out.send(EngineMsg::Provider { thread, epoch, cursor: Some(cursor), event
+                                        }).await.is_ok()
                                 } else { emit(out, thread, epoch, event).await };
                                 if !sent { consumer_gone = true; break; }
                             }
@@ -1492,7 +1504,8 @@ async fn probe_version(
         _ = cancelled => Err(ProviderError::Cancelled),
         result = async {
             if let Some(timeout) = rules.timeout {
-                tokio::time::timeout(timeout, read).await.unwrap_or_else(|_| Err(ProviderError::Protocol(rules.error.into())))
+                tokio::time::timeout(timeout, read).await.unwrap_or_else(|_| Err(ProviderError::Protocol(
+                    rules.error.into())))
             } else { read.await }
         } => result,
     };
@@ -1537,7 +1550,8 @@ pub async fn probe_grok(
     ));
     let result = tokio::select! {
         _ = &mut cancelled => Err(ProviderError::Cancelled),
-        result = tokio::time::timeout(Duration::from_secs(4), grok::probe_exchange(&mut reader, &writer, binary, env.xai_api_key_set)) => {
+        result = tokio::time::timeout(Duration::from_secs(4), grok::probe_exchange(&mut reader, &writer,
+            binary, env.xai_api_key_set)) => {
             result.unwrap_or_else(|_|Err(ProviderError::Protocol("Grok probe timed out".into())))
         }
     };
@@ -2932,7 +2946,12 @@ mod mcp_record_tests {
             .unwrap();
         let first =
             String::from_utf8(first.take_outbound().pop().unwrap().into_bytes().unwrap()).unwrap();
-        let mut next = codec.value(serde_json::json!({"id":2,"error":{"code":-32600,"message":"no rollout found for thread id lost-native"}})).unwrap();
+        let mut next = codec
+            .value(
+                serde_json::json!({"id":2,"error":{"code":-32600,"message":"no rollout foun\
+            d for thread id lost-native"}}),
+            )
+            .unwrap();
         let next =
             String::from_utf8(next.take_outbound().pop().unwrap().into_bytes().unwrap()).unwrap();
         let mcp = RootMcp::Rpc(config);
@@ -2992,7 +3011,8 @@ mod mcp_record_tests {
                     .unwrap(),
             ),
         );
-        let wire = serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":format!("prefix {} suffix",token.expose())}]}});
+        let wire = serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text\
+            ","text":format!("prefix {} suffix",token.expose())}]}});
         let decoded = process.io.record_inbound(wire, &mut process.codec).unwrap();
         let texts: Vec<_> = decoded
             .events
@@ -3096,7 +3116,8 @@ mod recorder_tests {
             .io
             .record_inbound(known, &mut process.codec)
             .unwrap();
-        let unrelated = serde_json::json!({"id":999,"result":{"thread":{"id":"unrelated-native","cliVersion":"unrelated-version"}}});
+        let unrelated = serde_json::json!({"id":999,"result":{"thread":{"id":"unrelated-native","cliVersion":"u\
+            nrelated-version"}}});
         process
             .io
             .record_inbound(unrelated, &mut process.codec)

@@ -1,11 +1,7 @@
 fn main() {
     let rev = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=VEYRA_BUILD_REV={rev}");
-    let mut refs = vec![
-        "HEAD".to_owned(),
-        "logs/HEAD".to_owned(),
-        "packed-refs".to_owned(),
-    ];
+    let mut refs = vec!["HEAD".to_owned(), "logs/HEAD".to_owned()];
     if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
         refs.push(branch);
     }

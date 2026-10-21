@@ -142,6 +142,16 @@ pub struct DebugStallUi {
 #[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
 #[schemars(crate = "::gpui::private::schemars")]
 #[action(namespace = veyra)]
+pub struct DebugAgeQuiet {
+    #[schemars(with = "String")]
+    pub thread: ThreadId,
+    pub minutes: u64,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
 pub struct DebugScrollTranscript {
     pub pixels: f32,
 }

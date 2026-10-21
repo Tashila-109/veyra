@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Debug dump methods serialize the window projection to wire JSON.
 pub mod actions;
 mod composer;
 mod header;
@@ -1829,7 +1830,8 @@ impl Shell {
                     "cli_version":thread.cli_version, "config":thread.config,
                     "status":status.words(), "header_status":self.state.header_status(thread.id),
                     "quiet_minutes":self.state.quiet_minutes(thread.id),
-                    "breadcrumb":self.state.parent(thread.id).map(|parent| serde_json::json!({"thread":parent.id,"title":parent.title,"linked":!parent.archived})),
+                    "breadcrumb":self.state.parent(thread.id).map(|parent| serde_json::json!({"thread\
+                        ":parent.id,"title":parent.title,"linked":!parent.archived})),
                     "parent_attention":header::parent_attention(&self.state,thread.id),
                     "failure":self.state.failure(thread.id), "hold":thread.hold,
                     "native_cursor":thread.native_cursor, "import_pending":thread.import_pending, "view":thread.view,
@@ -1949,11 +1951,14 @@ impl Shell {
                     "allow_once_enabled":consent.allow_once,
                     "allow_in_thread_enabled":consent.allow_in_thread,
                     "consent_reason":consent.reason,
-                    "provider_text":approval.map(|action| composer::approval_quotes(action, self.chosen_provider().label())).unwrap_or_default(),
+                    "provider_text":approval.map(|action| composer::approval_quotes(action,
+                        self.chosen_provider().label())).unwrap_or_default(),
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
                     "question_index":target.question});
                 if self.approval_scroll.request == Some(request.id) {
-                    dock["details_scroll"] = serde_json::json!({"offset_y":f32::from(self.approval_scroll.handle.offset().y), "max_offset_y":f32::from(self.approval_scroll.handle.max_offset().y)});
+                    dock["details_scroll"] = serde_json::json!({"offset_y":f32::from(
+                        self.approval_scroll.handle.offset().y), "max_offset_y":f32::from(
+                            self.approval_scroll.handle.max_offset().y)});
                 }
                 dock
             }))
@@ -1965,7 +1970,8 @@ impl Shell {
         let mut transcript = self.scroller.read(cx).dump();
         transcript["items"] = serde_json::json!(self.dump_transcript());
         transcript["family_card"] = self.view.chat().filter(|thread|self.state.family_offset(*thread)>0)
-            .map(|thread|serde_json::json!({"title":transcript::family_title(transcript::family_children(&self.state,thread).len()),
+            .map(|thread|serde_json::json!({"title":transcript::family_title(transcript::family_children(
+                &self.state,thread).len()),
                 "rows":transcript::family_children(&self.state,thread).into_iter().map(|child|serde_json::json!({
                     "thread":child.id,"title":child.title,"glyph":sidebar::glyph(&self.state.status(child.id)),
                     "status":self.state.status(child.id).words(),"open_action":"veyra::SelectThread",
@@ -1976,13 +1982,15 @@ impl Shell {
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
             "header_branch":self.branch, "view_refusal":self.view_refusal,
             "terminal":self.terminal.as_ref().map(|(_,view)|view.read(cx).dump()),
-            "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows(), "menu_thread":self.thread_menu.as_ref().map(|(id,_)|id)},
+            "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows(), "menu_thread\
+                ":self.thread_menu.as_ref().map(|(id,_)|id)},
             "selected_thread":self.dump_selected(), "transcript":transcript,
             "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(cx),
             "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
             "awake":self.engine.awake(), "processes":self.engine.processes(),
             "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.gap.maximum_ms,
-                "visible":{"thread":self.state.visible_perf.thread,"applied_batches":self.state.visible_perf.applied_batches,
+                "visible":{"thread":self.state.visible_perf.thread,"applied_batches\
+                    ":self.state.visible_perf.applied_batches,
                     "max_batch_gap_ms":self.state.visible_perf.gap.maximum_ms},
                 "transcript_open_ms":self.state.transcript_open.as_ref().and_then(|open|open.milliseconds),
                 "mailbox_free":perf.mailbox_free,
@@ -2464,6 +2472,21 @@ impl Render for Shell {
             cx.defer_in(window, move |_, _, _| {
                 std::thread::sleep(std::time::Duration::from_millis(milliseconds));
             });
+        }));
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|shell, action: &DebugAgeQuiet, _, cx| {
+            if let Status::Working { since } = shell.state.status(action.thread) {
+                let elapsed = i64::try_from(action.minutes)
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(60_000);
+                let activity = shell
+                    .state
+                    .last_activity
+                    .entry(action.thread)
+                    .or_insert(since);
+                *activity = activity.saturating_sub(elapsed);
+                cx.notify();
+            }
         }));
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(
@@ -3049,6 +3072,54 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn debug_age_quiet_moves_only_the_quiet_clock(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, child, turn, activity) = shell.update(cx, |shell, cx| {
+                let (root, child, turn) = add_family(shell, cx);
+                let activity = veyra_engine::actor::now();
+                shell.state.last_activity.insert(root, activity);
+                shell.state.last_activity.insert(child, activity);
+                assert_eq!(shell.state.quiet_minutes(child), None);
+                (root, child, turn, activity)
+            });
+            cx.update(|window, cx| {
+                let action = cx
+                    .build_action(
+                        "veyra::DebugAgeQuiet",
+                        Some(serde_json::json!({"thread":child,"minutes":10})),
+                    )
+                    .unwrap();
+                window.dispatch_action(action, cx);
+            });
+            draw(cx);
+            shell.update(cx, |shell, _| {
+                assert_eq!(shell.state.quiet_minutes(child), Some(10));
+                assert_eq!(shell.state.quiet_minutes(root), None);
+                assert_eq!(shell.state.last_activity[&root], activity);
+                assert_eq!(shell.state.status(child), Status::Working { since: 1 });
+                assert_eq!(
+                    shell.state.turns[&turn].state,
+                    TurnState::Running { since: 1 }
+                );
+                shell.state.apply(UiEvent::TextAppended {
+                    thread: child,
+                    item: ItemId::new(),
+                    text: "Still working".into(),
+                    counter: 1,
+                    delta_count: 1,
+                });
+                assert_eq!(shell.state.quiet_minutes(child), None);
+                assert_eq!(shell.state.status(child), Status::Working { since: 1 });
+                assert_eq!(
+                    shell.state.turns[&turn].state,
+                    TurnState::Running { since: 1 }
+                );
+            });
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn sidebar_titles_stay_left_and_quiet_controls_stay_on_one_line(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| super::theme::register_fonts(cx).unwrap());
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -3360,11 +3431,13 @@ mod tests {
         with_docked_shell(cx, |shell, cx, _, _| {
             shell.update(cx, |shell, cx| {
                 let (_, child, _) = add_family(shell, cx);
-                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["transcript"]["family_card"]["title"], "Started 1 agent");
+                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["transcript"]["family_card"]["title"],
+                    "Started 1 agent");
                 let mut second = shell.state.threads[&child].clone();
                 second.id = ThreadId::new();
                 shell.state.threads.insert(second.id, second);
-                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["transcript"]["family_card"]["title"], "Started 2 agents");
+                assert_eq!(shell.dump(std::path::Path::new("/tmp"), cx)["transcript"]["family_card"]["title"],
+                    "Started 2 agents");
             });
         });
     }
@@ -3588,7 +3661,8 @@ mod tests {
                 shell.state.apply_all(text_batch(thread));
                 std::thread::sleep(std::time::Duration::from_millis(120));
                 shell.state.apply_all(text_batch(thread));
-                assert!(shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"]["max_batch_gap_ms"].as_f64().unwrap() >= 100.);
+                assert!(shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"]["max_batch_gap_ms\
+                    "].as_f64().unwrap() >= 100.);
                 shell.show(super::MainView::Chat(other));
                 let visible = &shell.dump(std::path::Path::new("/tmp"), cx)["perf"]["visible"];
                 assert_eq!(visible["thread"], serde_json::json!(other));
@@ -4449,7 +4523,8 @@ mod tests {
                             .collect(),
                     };
                     cases.push(Case {
-                        name: format!("question count={count} realistic={realistic} long={long} multi={question_index}"),
+                        name: format!("question count={count} realistic={realistic} long={long} multi={question\
+                            _index}"),
                         kind: Some(RequestKind::Question {
                             questions: vec![question; if question_index == 0 { 1 } else { 2 }],
                         }),
@@ -5844,7 +5919,8 @@ mod tests {
                 shell.new_thread(window, cx);
                 shell.provider = ProviderKind::Grok;
                 shell.providers[0].models = serde_json::from_value(serde_json::json!([
-                    {"value":"grok-4.7","displayName":"Grok 4.7","supportedEffortLevels":["high","xhigh","medium","low"]},
+                    {"value":"grok-4.7","displayName":"Grok 4.7","supportedEffortLevels":["high","xhigh","mediu\
+                        m","low"]},
                     {"value":"grok-4.5","displayName":"Grok 4.5","supportedEffortLevels":["high","medium","low"]}
                 ])).unwrap();
                 shell.config.model = Some("grok-4.7".into());

@@ -238,7 +238,8 @@ pub fn question(provider: ProviderKind) {
         provider,
         PermissionMode::FullAccess,
         &[
-            "Ask me whether to use Violet or Blue using request_user_input, then repeat my choice. Make no file changes.",
+            "Ask me whether to use Violet or Blue using request_user_input, then repeat my choice. Make no fil\
+                e changes.",
         ],
         &[Decision::Answers(vec![Answer {
             text: "Violet".into(),
@@ -260,7 +261,8 @@ pub fn question(provider: ProviderKind) {
         })
         .count();
     eprintln!(
-        "{}_native_user_question_requests={count}; this question path needs a live record of the supported mode when this is zero",
+        "{}_native_user_question_requests={count}; this question path needs a live record of the supported mod\
+            e when this is zero",
         provider.binary()
     );
     assert!(events.iter().any(|e| matches!(

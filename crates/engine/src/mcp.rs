@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // MCP envelopes, schemas and provider configuration are wire JSON.
 use crate::{
     actor::EngineMsg,
     domain::*,
@@ -267,7 +268,8 @@ impl Server {
                     Some(entry.clone())
                 }
                 entry => {
-                    tracing::warn!(thread=%entry.map(|entry|entry.thread.to_string()).unwrap_or_else(||"unknown".into()),reason="peer, token, or single-connection rule","MCP connection refused");
+                    tracing::warn!(thread=%entry.map(|entry|entry.thread.to_string()).unwrap_or_else(||"unknown\
+                        ".into()),reason="peer, token, or single-connection rule","MCP connection refused");
                     None
                 }
             }
@@ -291,7 +293,8 @@ impl Server {
         });
         let _reader = ConnectionRead(reader.abort_handle());
         loop {
-            let line = tokio::select! {result=frames.recv()=>match result {Some(line)=>line,None=>break},_=out.closed()=>break};
+            let line = tokio::select! {result=frames.recv()=>match result {Some(line)=>line,None=>break},
+            _=out.closed()=>break};
             if !self.active(&hash) {
                 break;
             }
@@ -303,7 +306,8 @@ impl Server {
                             biased;
                             _ = &mut ended => break,
                             _ = out.closed() => break,
-                            result = write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}\n") => result,
+                            result = write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32\
+                                700,\"message\":\"Parse error\"}}\n") => result,
                         };
                         if written.is_err() {
                             break;
@@ -366,7 +370,9 @@ async fn response_for(
     let id = value.get("id")?.clone();
     let result = match value.get("method").and_then(Value::as_str) {
         Some("initialize") => {
-            json!({"protocolVersion":value["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"veyra","version":env!("CARGO_PKG_VERSION")},"instructions":tools::instructions()})
+            json!({"protocolVersion":value["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),"capab\
+                ilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"veyra","version":env!("CARGO_PKG\
+                    _VERSION")},"instructions":tools::instructions()})
         }
         Some("ping") => json!({}),
         Some("tools/list") => json!({"tools":tools::list()}),
@@ -446,7 +452,8 @@ impl Configuration {
         )?;
         serde_json::to_writer(
             &mut file,
-            &json!({"mcpServers":{"veyra":{"command":command,"args":["mcp"],"env":{"VEYRA_SOCKET":socket,"VEYRA_MCP_TOKEN":token.expose()}}}}),
+            &json!({"mcpServers":{"veyra":{"command":command,"args":["mcp"],"env":{"VEYRA_SOCKET":socket,"VEYRA\
+                _MCP_TOKEN":token.expose()}}}}),
         )?;
         Ok(config)
     }
@@ -661,7 +668,8 @@ mod eof_tests {
             json!({"jsonrpc":"2.0","id":1,"result":{}})
         );
         drop(response);
-        socket.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_providers\",\"arguments\":{}}}\n").await.unwrap();
+        socket.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_\
+            providers\",\"arguments\":{}}}\n").await.unwrap();
         let EngineMsg::Tool { reply, .. } =
             tokio::time::timeout(Duration::from_secs(2), messages.recv())
                 .await
@@ -719,7 +727,8 @@ async fn full_frame_queue_closes_and_revokes_pending_call() {
         socket.write_all(b"\n").await.unwrap();
         authentication.clear();
         drop(authentication);
-        socket.write_all(b"{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"list_providers\",\"arguments\":{}}}\n").await.unwrap();
+        socket.write_all(b"{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"list_providers\",\"argume\
+            nts\":{}}}\n").await.unwrap();
         let held = tokio::time::timeout(Duration::from_secs(2), messages.recv())
             .await
             .unwrap()
@@ -1023,7 +1032,8 @@ mod credential_frame_tests {
         let recorded = outbound.value();
         assert!(
             recorded["params"]["mcpServers"]
-                == json!([{"name":"veyra","command":"/owned/veyra","args":["mcp"],"env":[{"name":"VEYRA_SOCKET","value":"/owned/veyra.sock"},{"name":"VEYRA_MCP_TOKEN","value":"<id:token>"}]}])
+                == json!([{"name":"veyra","command":"/owned/veyra","args":["mcp"],"env":[{"name":"VEYRA_SOCKET\
+                    ","value":"/owned/veyra.sock"},{"name":"VEYRA_MCP_TOKEN","value":"<id:token>"}]}])
         );
         assert!(recorded["params"]["config"] == json!({"user":"kept"}));
         assert!(!recorded.to_string().contains(token.expose()));
@@ -1121,7 +1131,12 @@ async fn codex_rejected_optional_keys_retry_independently() {
         codec.initialize();
         let opened = codec.value(json!({"id":1,"result":{}})).unwrap();
         let id = opened.controls[0].value()["id"].clone();
-        let rejected = codec.value(json!({"id":id,"error":{"code":-32602,"message":"unknown config mcp_optional_startup_grace_ms"}})).unwrap();
+        let rejected = codec
+            .value(
+                json!({"id":id,"error":{"code":-32602,"message":"unknown config mcp_optional\
+            _startup_grace_ms"}}),
+            )
+            .unwrap();
         let first = rejected.controls[0].value();
         assert!(
             first["params"]["config"]
@@ -1132,7 +1147,12 @@ async fn codex_rejected_optional_keys_retry_independently() {
             first["params"]["config"]["mcp_servers.veyra.tool_timeout_sec"],
             30
         );
-        let rejected = codec.value(json!({"id":first["id"],"error":{"code":-32602,"message":"unknown config mcp_servers.veyra.tool_timeout_sec"}})).unwrap();
+        let rejected = codec
+            .value(
+                json!({"id":first["id"],"error":{"code":-32602,"message":"unknown config mcp\
+            _servers.veyra.tool_timeout_sec"}}),
+            )
+            .unwrap();
         let second = rejected.controls[0].value();
         assert!(
             second["params"]["config"]
@@ -1148,7 +1168,8 @@ async fn codex_rejected_optional_keys_retry_independently() {
             .value(json!({"id":second["id"],"result":{"thread":{"id":"usable"}}}))
             .unwrap();
         assert!(
-            matches!(ready.events.as_slice(), [crate::provider::ProviderEvent::Session(crate::provider::SessionEvent::Ready {native,..})] if native.0=="usable")
+            matches!(ready.events.as_slice(), [crate::provider::ProviderEvent::Session(
+                crate::provider::SessionEvent::Ready {native,..})] if native.0=="usable")
         );
         config.unsupported_codex_options.lock().unwrap().clear();
     }

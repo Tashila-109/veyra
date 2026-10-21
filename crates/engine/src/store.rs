@@ -13,42 +13,43 @@ pub enum StoreError {
     Invalid(String),
 }
 pub const MIGRATIONS: &[&str] = &[
-    r#"
-CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at INTEGER NOT NULL);
-CREATE TABLE threads (
- id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL,
- parent_thread_id TEXT, relationship TEXT, root_thread_id TEXT NOT NULL, provider TEXT NOT NULL,
- config_json TEXT NOT NULL, cwd TEXT NOT NULL, native_id TEXT, native_cursor TEXT, cli_version TEXT,
- hold_reason TEXT CHECK (hold_reason IN ('interrupted','stopped','restarted','child_report')),
- view TEXT NOT NULL, import_pending INTEGER NOT NULL, live_pid INTEGER, live_pgid INTEGER,
- created_at INTEGER NOT NULL, archived_at INTEGER,
- CHECK ((parent_thread_id IS NULL) = (relationship IS NULL)),
- CHECK ((parent_thread_id IS NULL AND root_thread_id = id) OR
-        (parent_thread_id IS NOT NULL AND parent_thread_id = root_thread_id AND parent_thread_id <> id)),
- UNIQUE (id, root_thread_id),
- FOREIGN KEY (parent_thread_id, root_thread_id) REFERENCES threads(id, root_thread_id));
-CREATE TABLE turns (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id), ordinal INTEGER NOT NULL,
- origin_json TEXT NOT NULL, state TEXT NOT NULL, outcome_json TEXT, queued_at INTEGER NOT NULL,
-  started_at INTEGER, ended_at INTEGER,
- UNIQUE(thread_id,ordinal));
-CREATE TABLE items (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id),
-  turn_id TEXT NOT NULL REFERENCES turns(id),
- seq INTEGER NOT NULL, kind TEXT NOT NULL, body_json TEXT NOT NULL, done INTEGER NOT NULL, UNIQUE(thread_id,seq));
-CREATE TABLE requests (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENCES threads(id),
-  turn_id TEXT NOT NULL REFERENCES turns(id),
- kind TEXT NOT NULL, body_json TEXT NOT NULL, state TEXT NOT NULL, decision_json TEXT);
-CREATE TABLE grants (thread_id TEXT NOT NULL REFERENCES threads(id), tool TEXT NOT NULL,
-  command TEXT NOT NULL, created_at INTEGER NOT NULL,
- PRIMARY KEY(thread_id,tool,command));
-CREATE TABLE tasks (id TEXT PRIMARY KEY, parent_thread_id TEXT NOT NULL REFERENCES threads(id),
-  child_thread_id TEXT NOT NULL REFERENCES threads(id),
- turn_id TEXT NOT NULL REFERENCES turns(id), request_key TEXT NOT NULL, state TEXT NOT NULL,
-  outcome_json TEXT, summary TEXT,
- delivery TEXT, wake_turn TEXT REFERENCES turns(id), UNIQUE(parent_thread_id,request_key));
-CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), default_mode TEXT NOT NULL DEFAULT 'full_access'
- CHECK (default_mode IN ('ask_first','accept_edits','full_access')));
-INSERT INTO settings(id) VALUES(1);
-"#,
+    "\nCREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at IN\
+        TEGER NOT NULL);\nCREATE TABLE threads (\n id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES pro\
+            jects(id), title TEXT NOT NULL,\n parent_thread_id TEXT, relationship TEXT, root_thread_id TEXT NO\
+                T NULL, provider TEXT NOT NULL,\n config_json TEXT NOT NULL, cwd TEXT NOT NULL, native_id TEXT\
+                    , native_cursor TEXT, cli_version TEXT,\n hold_reason TEXT CHECK (hold_reason IN ('interrup\
+                        ted','stopped','restarted','child_report')),\n view TEXT NOT NULL, import_pending INTEG\
+                            ER NOT NULL, live_pid INTEGER, live_pgid INTEGER,\n created_at INTEGER NOT NULL, ar\
+                                chived_at INTEGER,\n CHECK ((parent_thread_id IS NULL) = (relationship IS NULL)\
+                                    ),\n CHECK ((parent_thread_id IS NULL AND root_thread_id = id) OR\n        \
+                                        (parent_thread_id IS NOT NULL AND parent_thread_id = root_thread_id AN\
+                                            D parent_thread_id <> id)),\n UNIQUE (id, root_thread_id),\n FOREIG\
+                                                N KEY (parent_thread_id, root_thread_id) REFERENCES threads(id\
+                                                , root_thread_id));\nCREATE TABLE turns (id TEXT PRIMARY KEY, t\
+                                                hread_id TEXT NOT NULL REFERENCES threads(id), ordinal INTEGER \
+                                                NOT NULL,\n origin_json TEXT NOT NULL, state TEXT NOT NULL, out\
+                                                come_json TEXT, queued_at INTEGER NOT NULL,\n  started_at INTEG\
+                                                ER, ended_at INTEGER,\n UNIQUE(thread_id,ordinal));\nCREATE TAB\
+                                                LE items (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL REFERENC\
+                                                ES threads(id),\n  turn_id TEXT NOT NULL REFERENCES turns(id),\
+                                                \n seq INTEGER NOT NULL, kind TEXT NOT NULL, body_json TEXT NO\
+                                                T NULL, done INTEGER NOT NULL, UNIQUE(thread_id,seq));\nCREATE \
+                                                TABLE requests (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL RE\
+                                                FERENCES threads(id),\n  turn_id TEXT NOT NULL REFERENCES turns\
+                                                (id),\n kind TEXT NOT NULL, body_json TEXT NOT NULL, state TEX\
+                                                T NOT NULL, decision_json TEXT);\nCREATE TABLE grants (thread_i\
+                                                d TEXT NOT NULL REFERENCES threads(id), tool TEXT NOT NULL,\n  \
+                                                command TEXT NOT NULL, created_at INTEGER NOT NULL,\n PRIMARY K\
+                                                EY(thread_id,tool,command));\nCREATE TABLE tasks (id TEXT PRIMA\
+                                                RY KEY, parent_thread_id TEXT NOT NULL REFERENCES threads(id),\
+                                                \n  child_thread_id TEXT NOT NULL REFERENCES threads(id),\n tur\
+                                                n_id TEXT NOT NULL REFERENCES turns(id), request_key TEXT NOT N\
+                                                ULL, state TEXT NOT NULL,\n  outcome_json TEXT, summary TEXT,\
+                                                \n delivery TEXT, wake_turn TEXT REFERENCES turns(id), UNIQUE(p\
+                                                arent_thread_id,request_key));\nCREATE TABLE settings (id INTEG\
+                                                ER PRIMARY KEY CHECK (id = 1), default_mode TEXT NOT NULL DEFAU\
+                                                LT 'full_access'\n CHECK (default_mode IN ('ask_first','accept_\
+                                                edits','full_access')));\nINSERT INTO settings(id) VALUES(1);\n",
     "UPDATE threads SET cli_version=NULL WHERE cli_version='';",
     "ALTER TABLE tasks ADD COLUMN source_item_id TEXT REFERENCES items(id);",
 ];
@@ -161,8 +162,10 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         tx.execute(
             "INSERT INTO turns(id,thread_id,ordinal,origin_json,state,outcome_json,queued_at,
              started_at,ended_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal,origin_json=excluded.origin_json,state=excluded.state,
-             outcome_json=excluded.outcome_json,started_at=CASE WHEN excluded.state='queued' THEN turns.started_at ELSE excluded.started_at END,
+             ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal,origin_json=excluded.origin_json,state=excl\
+                 uded.state,
+             outcome_json=excluded.outcome_json,started_at=CASE WHEN excluded.state='queued' THEN turns.started\
+                 _at ELSE excluded.started_at END,
              ended_at=excluded.ended_at",
             params![
                 t.id.to_string(),

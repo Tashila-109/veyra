@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Replays inspect provider and recording wire envelopes.
 #![cfg(debug_assertions)]
 use std::{
     fs,
@@ -1563,32 +1564,23 @@ fn queued_prompt_with_followup(followup: bool) {
         Scratch(std::env::temp_dir().join(format!("veyra-start-followup-{}", ThreadId::new())));
     fs::create_dir(&scratch.0).unwrap();
     let script = format!(
-        r#"#!/usr/bin/env python3
-import json, sys, time
-followup = {}
-users = 0
-for line in sys.stdin:
-    wire = json.loads(line)
-    if wire.get('request', {{}}).get('subtype') == 'initialize':
-        print(json.dumps({{'type':'control_response','response':{{'subtype':'success',
-            'request_id':wire['request_id'],'response':{{}}}}}}), flush=True)
-    if wire.get('type') == 'user':
-        users += 1
-        if users == 1:
-            print(json.dumps({{'type':'result','subtype':'success','is_error':False,
-                'user_message_uuid':wire['uuid']}}), flush=True)
-            if followup:
-                print(json.dumps({{'type':'assistant','message':{{'id':'followup','content':[
-                    {{'type':'text','text':'provider followup'}}]}}}}), flush=True)
-                time.sleep(.5)
-                print(json.dumps({{'type':'result','subtype':'success','is_error':False}}), flush=True)
-        else:
-            print(json.dumps({{'type':'assistant','message':{{'id':'next-user','content':[
-                {{'type':'text','text':'actual queued reply'}}]}}}}), flush=True)
-            print(json.dumps({{'type':'result','subtype':'success','is_error':False,
-                'user_message_uuid':wire['uuid']}}), flush=True)
-            break
-"#,
+        "#!/usr/bin/env python3\nimport json, sys, time\nfollowup = {}\nusers = 0\nfor line in sys.stdin:\n    \
+            wire = json.loads(line)\n    if wire.get('request', {{}}).get('subtype') == 'initialize':\n        \
+                print(json.dumps({{'type':'control_response','response':{{'subtype':'success',\n            're\
+                    quest_id':wire['request_id'],'response':{{}}}}}}), flush=True)\n    if wire.get('type') == \
+                        'user':\n        users += 1\n        if users == 1:\n            print(json.dumps({{'ty\
+                            pe':'result','subtype':'success','is_error':False,\n                'user_message_u\
+                                uid':wire['uuid']}}), flush=True)\n            if followup:\n                pr\
+                                    int(json.dumps({{'type':'assistant','message':{{'id':'followup','content':[\
+                                        \n                    {{'type':'text','text':'provider followup'}}]}}}}\
+                                            ), flush=True)\n                time.sleep(.5)\n                pri\
+                                                nt(json.dumps({{'type':'result','subtype':'success','is_error':\
+                                                False}}), flush=True)\n        else:\n            print(json.du\
+                                                mps({{'type':'assistant','message':{{'id':'next-user','content'\
+                                                :[\n                {{'type':'text','text':'actual queued reply\
+                                                '}}]}}}}), flush=True)\n            print(json.dumps({{'type':'\
+                                                result','subtype':'success','is_error':False,\n                \
+                                                'user_message_uuid':wire['uuid']}}), flush=True)\n            break\n",
         if followup { "True" } else { "False" }
     );
     let binary = stand_in(&scratch, "owned-followup-stand-in", &script);
@@ -1746,47 +1738,33 @@ fn blocked_interrupt_probe(stop: bool) {
     let binary = stand_in(
         &scratch,
         "owned-blocked-writer",
-        r#"#!/usr/bin/env python3
-import json, os, pathlib, select, sys, time
-buffer = b''
-def read_line(timeout=5):
-    global buffer
-    deadline = time.monotonic() + timeout
-    while b'\n' not in buffer:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or not select.select([0], [], [], remaining)[0]: return None
-        data = os.read(0, 65536)
-        if not data: return None
-        buffer += data
-    line, buffer = buffer.split(b'\n', 1)
-    return json.loads(line)
-def emit(value): print(json.dumps(value), flush=True)
-def wait_file(name):
-    deadline = time.monotonic() + 10
-    while not pathlib.Path(name).exists():
-        if time.monotonic() >= deadline: raise RuntimeError(name)
-        time.sleep(.01)
-wire = read_line()
-emit({'type':'control_response','response':{'subtype':'success','request_id':wire['request_id'],'response':{}}})
-user = read_line()
-emit({'type':'assistant','message':{'id':'first','content':[{'type':'text','text':'first turn'}]}})
-emit({'type':'control_request','request_id':'x' * (1024*1024),'request':{'subtype':'unsupported'}})
-time.sleep(.2)
-pathlib.Path('writer-blocked').touch()
-wait_file('finish-a')
-emit({'type':'result','subtype':'success','is_error':False,'user_message_uuid':user['uuid']})
-emit({'type':'assistant','message':{'id':'later','content':[{'type':'text','text':'provider B'}]}})
-wait_file('read-stdin')
-reply = read_line()
-assert reply['type'] == 'control_response'
-interrupt = read_line(1)
-if interrupt and interrupt.get('request',{}).get('subtype') == 'interrupt':
-    pathlib.Path('interrupt-delivered-to-b').touch()
-    emit({'type':'result','subtype':'error_during_execution','is_error':False,'terminal_reason':'aborted_streaming'})
-else:
-    emit({'type':'result','subtype':'success','is_error':False})
-while read_line(5) is not None: pass
-"#,
+        "#!/usr/bin/env python3\nimport json, os, pathlib, select, sys, time\nbuffer = b''\ndef read_line(timeo\
+            ut=5):\n    global buffer\n    deadline = time.monotonic() + timeout\n    while b'\\n' not in buffe\
+                r:\n        remaining = deadline - time.monotonic()\n        if remaining <= 0 or not select.se\
+                    lect([0], [], [], remaining)[0]: return None\n        data = os.read(0, 65536)\n        if \
+                        not data: return None\n        buffer += data\n    line, buffer = buffer.split(b'\\n', \
+                            1)\n    return json.loads(line)\ndef emit(value): print(json.dumps(value), flush=Tr\
+                                ue)\ndef wait_file(name):\n    deadline = time.monotonic() + 10\n    while not \
+                                    pathlib.Path(name).exists():\n        if time.monotonic() >= deadline: rais\
+                                        e RuntimeError(name)\n        time.sleep(.01)\nwire = read_line()\nemit\
+                                            ({'type':'control_response','response':{'subtype':'success','reques\
+                                                t_id':wire['request_id'],'response':{}}})\nuser = read_line()\n\
+                                                emit({'type':'assistant','message':{'id':'first','content':[{'t\
+                                                ype':'text','text':'first turn'}]}})\nemit({'type':'control_req\
+                                                uest','request_id':'x' * (1024*1024),'request':{'subtype':'unsu\
+                                                pported'}})\ntime.sleep(.2)\npathlib.Path('writer-blocked').tou\
+                                                ch()\nwait_file('finish-a')\nemit({'type':'result','subtype':'s\
+                                                uccess','is_error':False,'user_message_uuid':user['uuid']})\nem\
+                                                it({'type':'assistant','message':{'id':'later','content':[{'typ\
+                                                e':'text','text':'provider B'}]}})\nwait_file('read-stdin')\nre\
+                                                ply = read_line()\nassert reply['type'] == 'control_response'\n\
+                                                interrupt = read_line(1)\nif interrupt and interrupt.get('reque\
+                                                st',{}).get('subtype') == 'interrupt':\n    pathlib.Path('inter\
+                                                rupt-delivered-to-b').touch()\n    emit({'type':'result','subty\
+                                                pe':'error_during_execution','is_error':False,'terminal_reason'\
+                                                :'aborted_streaming'})\nelse:\n    emit({'type':'result','subty\
+                                                pe':'success','is_error':False})\nwhile read_line(5) is not Non\
+                                                e: pass\n",
     );
     let mut env = ChildEnv::isolated();
     env.claude_bin = Some(binary);
@@ -1921,8 +1899,10 @@ fn claude_import_precedes_ready() {
     )
     .unwrap();
     let records = [
-        serde_json::json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
-        serde_json::json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}),
+        serde_json::json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","\
+            request":{"subtype":"initialize"}}}),
+        serde_json::json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"succe\
+            ss","request_id":"<id:init>","response":{}}}}),
         serde_json::json!({"type":"spin","ms":200}),
         serde_json::json!({"type":"exit","code":0}),
     ];
@@ -2019,8 +1999,10 @@ fn fake_claude_tui_requires_isolated_config() {
 
 fn claude_history_from_config_env(root: &Path, request: &HistoryRequest) -> History {
     let records = [
-        serde_json::json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
-        serde_json::json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}),
+        serde_json::json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","\
+            request":{"subtype":"initialize"}}}),
+        serde_json::json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"succe\
+            ss","request_id":"<id:init>","response":{}}}}),
         serde_json::json!({"type":"spin","ms":10000}),
     ];
     fs::write(
@@ -2142,13 +2124,10 @@ fn claude_probe_env_turns_off_ide_and_connectors() {
     }
     let (scratch, mut env) = environment("ok-reply", false);
     let script = format!(
-        r#"#!/bin/sh
-if [ "$1" = --version ]; then printf '2.1.296\n'; exit; fi
-printf '%s\n' "$@" > '{0}/probe-args'
-printf '%s\n' "$CLAUDE_CODE_AUTO_CONNECT_IDE" "$ENABLE_CLAUDEAI_MCP_SERVERS" > '{0}/probe-env'
-read -r initialize
-printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"veyra-initialize","response":{{}}}}}}'
-"#,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '2.1.296\\n'; exit; fi\nprintf '%s\\n' \"$@\" > '{0}\
+            /probe-args'\nprintf '%s\\n' \"$CLAUDE_CODE_AUTO_CONNECT_IDE\" \"$ENABLE_CLAUDEAI_MCP_SERVERS\" > '\
+                {0}/probe-env'\nread -r initialize\nprintf '%s\\n' '{{\"type\":\"control_response\",\"response\
+                    \":{{\"subtype\":\"success\",\"request_id\":\"veyra-initialize\",\"response\":{{}}}}}}'\n",
         scratch.0.display()
     );
     env.claude_bin = Some(stand_in(&scratch, "probe-stand-in", &script));

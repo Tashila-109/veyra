@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Replays inspect provider and recording wire envelopes.
 #![cfg(debug_assertions)]
 use std::{
     fs,
@@ -106,13 +107,17 @@ fn codex_shell_echo() {
         text(&e),
         "I’ll run the command and report its output.veyra-probe"
     );
-    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Turn{event:TurnEvent::ToolFinished{ok:true,output_tail:Some(output),..},..} if output=="veyra-probe\n")));
+    assert!(e.iter().any(
+        |e| matches!(e,ProviderEvent::Turn{event:TurnEvent::ToolFinished{ok:true,
+        output_tail:Some(output),..},..} if output=="veyra-probe\n")
+    ));
 }
 #[test]
 fn codex_command_approval() {
     let e = standard("approval-command", Inputs::answers([Decision::AllowOnce]));
     assert!(
-        matches!(requests(&e).as_slice(),[RequestKind::Approval {action:ProposedAction{target:ApprovalTarget::Command{command,..},..},..}] if command=="touch veyra-check.txt")
+        matches!(requests(&e).as_slice(),[RequestKind::Approval {action:ProposedAction{
+            target:ApprovalTarget::Command{command,..},..},..}] if command=="touch veyra-check.txt")
     );
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
@@ -120,7 +125,8 @@ fn codex_command_approval() {
 fn codex_file_change_approval() {
     let e = standard("approval-file-change", Inputs::answers([Decision::Deny]));
     assert!(
-        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,consent:ApprovalConsent::Once{grant:None},..}}] if tool=="File change")
+        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,
+            consent:ApprovalConsent::Once{grant:None},..}}] if tool=="File change")
     );
     assert_eq!(text(&e), "ok");
 }
@@ -128,7 +134,8 @@ fn codex_file_change_approval() {
 fn codex_permissions_deny_grants_nothing() {
     let e = standard("permissions", Inputs::answers([Decision::Deny]));
     assert!(
-        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,consent:ApprovalConsent::Once{grant:None},..}}] if tool=="Permissions")
+        matches!(requests(&e).as_slice(),[RequestKind::Approval{action:ProposedAction{tool,
+            consent:ApprovalConsent::Once{grant:None},..}}] if tool=="Permissions")
     );
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
@@ -136,7 +143,10 @@ fn codex_permissions_deny_grants_nothing() {
 fn codex_elicitation_declined() {
     let e = standard("elicitation", Inputs::default());
     assert_eq!(requests(&e).len(), 0);
-    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="Codex requested an MCP form that Veyra cannot display; it was declined.")));
+    assert!(e.iter().any(
+        |e| matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="Codex reque\
+        sted an MCP form that Veyra cannot display; it was declined.")
+    ));
     assert_eq!(text(&e), "ok");
 }
 #[test]
@@ -173,7 +183,10 @@ fn codex_resume_not_found_falls_back() {
         true,
         Inputs::default(),
     );
-    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="The earlier conversation could not be resumed; this is a new session")));
+    assert!(e.iter().any(
+        |e| matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="The earlie\
+        r conversation could not be resumed; this is a new session")
+    ));
     assert_eq!(text(&e), "ok");
 }
 #[test]
@@ -188,7 +201,10 @@ fn codex_other_turn_id_is_cli_work() {
         e,
         ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })
     )));
-    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Turn{turn:None,event:TurnEvent::TextDelta{text,..}} if text=="CLI work")));
+    assert!(e.iter().any(
+        |e| matches!(e,ProviderEvent::Turn{turn:None,event:TurnEvent::TextDelta{text,..}} if
+        text=="CLI work")
+    ));
 }
 #[test]
 fn codex_stop_cancels_pending_request() {
@@ -286,7 +302,8 @@ fn codex_mcp_tool_approval_docks() {
     assert_eq!(requests(&e).len(), 2);
     for r in requests(&e) {
         assert!(
-            matches!(r,RequestKind::Approval{action:ProposedAction{tool,consent:ApprovalConsent::Once{grant:None},..}} if tool=="veyra / list_providers")
+            matches!(r,RequestKind::Approval{action:ProposedAction{tool,consent:ApprovalConsent::Once{
+                grant:None},..}} if tool=="veyra / list_providers")
         );
     }
     assert!(
@@ -340,7 +357,10 @@ fn codex_retry_and_limit_notices() {
 #[test]
 fn codex_command_output_falls_back_to_deltas() {
     let e = standard("output-null", Inputs::answers([Decision::AllowOnce]));
-    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Turn{event:TurnEvent::ToolFinished{ok:true,output_tail:Some(output),..},..} if output=="veyra-probe\n")));
+    assert!(e.iter().any(
+        |e| matches!(e,ProviderEvent::Turn{event:TurnEvent::ToolFinished{ok:true,
+        output_tail:Some(output),..},..} if output=="veyra-probe\n")
+    ));
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
 }
 #[test]
@@ -1118,7 +1138,14 @@ fn codex_subagent_live_shows_one_started_and_finished_activity() {
         1,
         "the live capture's subagent start disappeared"
     );
-    assert_eq!(events.iter().filter(|event| matches!(event, ProviderEvent::Turn { event: TurnEvent::ToolFinished { key, ok: true, .. }, .. } if key == &starts[0])).count(), 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ProviderEvent::Turn { event:
+        TurnEvent::ToolFinished { key, ok: true, .. }, .. } if key == &starts[0]))
+            .count(),
+        1
+    );
     assert_eq!(outcomes(&events), [TurnOutcome::Completed]);
 }
 #[test]
@@ -1198,42 +1225,80 @@ fn codex_untagged_elicitation_expires_without_an_extra_reply() {
         "elicitation-without-turn-completes",
         |engine, thread, events, runtime| {
             runtime.block_on(async {
-            use veyra_engine::{commands::Command, events::{ChangeEvent, UiEvent}};
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let (mut opened, mut expired, mut ended) = (None, false, 0);
-                while let Some(event) = events.recv().await {
-                    match event {
-                        UiEvent::Change { event: ChangeEvent::RequestOpened(request), .. } => {
-                            assert_eq!(request.thread, thread);
-                            assert_eq!(request.state, RequestState::Pending);
-                            opened = Some((request.id, request.turn));
-                        }
-                        UiEvent::Change { event: ChangeEvent::RequestClosed(request), .. } => {
-                            assert_eq!(opened, Some((request.id, request.turn)));
-                            assert!(matches!(request.state, RequestState::Expired { .. }));
-                            expired = true;
-                        }
-                        UiEvent::Change { event: ChangeEvent::TurnEnded(turn), .. } => {
-                            assert_eq!(turn.thread, thread);
-                            assert!(matches!(turn.state, TurnState::Ended { outcome: TurnOutcome::Completed, .. }), "{turn:?}");
-                            ended += 1;
-                            if ended == 1 {
-                                assert_eq!(opened.map(|(_, turn)| turn), Some(turn.id));
-                                assert!(expired);
-                                engine.send(Command::Send { thread, text: "second".into() }).await.unwrap().unwrap();
-                            } else {
-                                assert!(engine.child_env().fixtures.unwrap().join("no-extra-reply-checked").exists());
-                                let snapshot = engine.snapshot(thread).await.unwrap();
-                                assert!(snapshot.items.iter().any(|item| matches!(&item.body, ItemBody::AssistantText { text, .. } if text == "second")));
-                                return;
+                use veyra_engine::{
+                    commands::Command,
+                    events::{ChangeEvent, UiEvent},
+                };
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let (mut opened, mut expired, mut ended) = (None, false, 0);
+                    while let Some(event) = events.recv().await {
+                        match event {
+                            UiEvent::Change {
+                                event: ChangeEvent::RequestOpened(request),
+                                ..
+                            } => {
+                                assert_eq!(request.thread, thread);
+                                assert_eq!(request.state, RequestState::Pending);
+                                opened = Some((request.id, request.turn));
                             }
+                            UiEvent::Change {
+                                event: ChangeEvent::RequestClosed(request),
+                                ..
+                            } => {
+                                assert_eq!(opened, Some((request.id, request.turn)));
+                                assert!(matches!(request.state, RequestState::Expired { .. }));
+                                expired = true;
+                            }
+                            UiEvent::Change {
+                                event: ChangeEvent::TurnEnded(turn),
+                                ..
+                            } => {
+                                assert_eq!(turn.thread, thread);
+                                assert!(
+                                    matches!(
+                                        turn.state,
+                                        TurnState::Ended {
+                                            outcome: TurnOutcome::Completed,
+                                            ..
+                                        }
+                                    ),
+                                    "{turn:?}"
+                                );
+                                ended += 1;
+                                if ended == 1 {
+                                    assert_eq!(opened.map(|(_, turn)| turn), Some(turn.id));
+                                    assert!(expired);
+                                    engine
+                                        .send(Command::Send {
+                                            thread,
+                                            text: "second".into(),
+                                        })
+                                        .await
+                                        .unwrap()
+                                        .unwrap();
+                                } else {
+                                    assert!(
+                                        engine
+                                            .child_env()
+                                            .fixtures
+                                            .unwrap()
+                                            .join("no-extra-reply-checked")
+                                            .exists()
+                                    );
+                                    let snapshot = engine.snapshot(thread).await.unwrap();
+                                    assert!(snapshot.items.iter().any(|item| matches!(&item.body,
+                                    ItemBody::AssistantText { text, .. } if text == "second")));
+                                    return;
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                panic!("the next prompt did not follow the expired elicitation");
-            }).await.unwrap();
-        })
+                    panic!("the next prompt did not follow the expired elicitation");
+                })
+                .await
+                .unwrap();
+            })
         },
     );
 }

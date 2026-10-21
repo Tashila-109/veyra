@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Session tests inspect provider recording wire envelopes.
 use super::*;
 use crate::events::ChangeEvent as Ev;
 

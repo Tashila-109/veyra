@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // ACP envelopes and tolerant catalog fields are provider wire JSON.
 use super::{
     ActiveTurn, Decoded, Outbound, ProviderError, ProviderEvent, SessionEvent, SessionSpec,
     StopReason, TurnEvent,
@@ -1669,7 +1670,8 @@ fn grok_replay_ignores_arrays_outside_message_chunks() {
         .unwrap(),
     ];
     for kind in ["tool_call", "tool_call_update", "plan", "future_update"] {
-        frames.push(serde_json::from_value::<ReplayFrame>(raw(json!({"sessionUpdate":kind,"toolCallId":"native-tool","content":[{"type":"content","content":{"type":"text","text":"tool-only output"}}]}))).unwrap());
+        frames.push(serde_json::from_value::<ReplayFrame>(raw(json!({"sessionUpdate":kind,"toolCallId":"native-\
+            tool","content":[{"type":"content","content":{"type":"text","text":"tool-only output"}}]}))).unwrap());
     }
     for update in [
         json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"window prompt"}}),
@@ -1728,8 +1730,15 @@ fn grok_overlap_cursor_does_not_reimport_displayed_tail() {
     else {
         panic!("prompt outbound");
     };
-    let message = |id: &str, text: &str| json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":native.0,"_meta":{"promptId":id},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}});
-    let complete = |id: &str| json!({"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":native.0,"promptId":id,"stopReason":"end_turn"}});
+    let message = |id: &str, text: &str| {
+        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId\
+        ":native.0,"_meta":{"promptId":id},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"t\
+            ext","text":text}}}})
+    };
+    let complete = |id: &str| {
+        json!({"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessio\
+        nId":native.0,"promptId":id,"stopReason":"end_turn"}})
+    };
     codec
         .value(message("foreign-first", "skip before promotion"))
         .unwrap();
@@ -1757,7 +1766,8 @@ fn grok_overlap_cursor_does_not_reimport_displayed_tail() {
             cursor = decoded.cursor.and_then(super::CursorUpdate::value);
         }
         let params = if wire["method"] == "_x.ai/session/prompt_complete" {
-            json!({"sessionId":native.0,"update":{"sessionUpdate":"turn_completed","prompt_id":wire["params"]["promptId"]}})
+            json!({"sessionId":native.0,"update":{"sessionUpdate":"turn_completed","prompt_id":wire["params"]["\
+                promptId"]}})
         } else {
             wire["params"].clone()
         };

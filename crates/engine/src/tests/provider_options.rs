@@ -174,7 +174,8 @@ fn ceiling_reads_parent_run_mode() {
         f.thread,
         call(
             "start_thread",
-            json!({"provider":"claude","title":"Worker","prompt":"Check the files","mode":"accept_edits","client_request_id":"ceiling"}),
+            json!({"provider":"claude","title":"Worker","prompt":"Check the files","mode":"accept_edits","clien\
+                t_request_id":"ceiling"}),
         ),
         &providers,
         0,
@@ -226,7 +227,8 @@ fn child_requested_mode_is_checked_before_provider_run_mode() {
             f.thread,
             ToolCall {
                 name: "start_thread".into(),
-                arguments: json!({"provider":"grok","title":"Worker","prompt":"Check the files","mode":"accept_edits","client_request_id":"child-ceiling"}),
+                arguments: json!({"provider":"grok","title":"Worker","prompt":"Check the files","mode":"accept_\
+                    edits","client_request_id":"child-ceiling"}),
                 veyra_label: false,
                 input_summary: None,
             },

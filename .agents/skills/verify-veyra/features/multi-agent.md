@@ -27,6 +27,7 @@ The breadcrumb and card Open use SelectThread; card Stop uses StopThread.
 Run Launch, Doctor, new-thread and restart-recovery first.
 This fake lane uses the real relay, socket authentication and actor tool path.
 The quiet check waits for the actual ten-minute clock while the child is unselected.
+The debug action `veyra::DebugAgeQuiet` accepts `thread` (the dump id) and `minutes`, aging only that thread's quiet clock until its next activity.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH

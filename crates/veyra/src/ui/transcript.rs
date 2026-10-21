@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Debug transcript dump methods serialize item wire JSON.
 use super::{
     Shell,
     actions::*,
@@ -269,7 +270,8 @@ fn row(
                         div()
                             .text_size(t.text.label.size)
                             .text_color(t.colors.text_muted)
-                            .child("Choosing sends this option as a message, stops current work first and continues queued messages."),
+                            .child("Choosing sends this option as a message, stops current work first and conti\
+                                nues queued messages."),
                     );
                 for (option_index, _) in question.options.iter().enumerate() {
                     let action = ChooseAsyncOption {
@@ -834,7 +836,8 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
         ItemBody::TerminalSpan(span) => ("terminal_span", span.text.clone(), true),
         _ => ("other", String::new(), true),
     };
-    let mut value = serde_json::json!({"id":item.id,"turn":item.turn,"kind":kind,"text":text,"done":done,"body":item.body});
+    let mut value = serde_json::json!({"id":item.id,"turn":item.turn,"kind":kind,"text":text,"done":done,"body\
+        ":item.body});
     if let ItemBody::Tool(tool) = &item.body {
         value["tool_label"] = serde_json::json!(tool_label(&tool.call));
     }

@@ -13,6 +13,7 @@ Homebrew rustup is keg-only on this Mac.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 cargo build --workspace
 cargo run -p veyra
 cargo test --workspace

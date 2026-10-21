@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // MCP tool schemas, arguments and results cross the wire boundary.
 use crate::{
     commands::{self, CommandError},
     domain::*,
@@ -29,7 +30,8 @@ fn grouped(value: usize) -> String {
 }
 pub static CHILD_GUIDANCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "Your last message is your report to the parent; Veyra delivers up to {} characters after its current turn ends. You cannot start child threads.\n\n",
+        "Your last message is your report to the parent; Veyra delivers up to {} characters after its current t\
+            urn ends. You cannot start child threads.\n\n",
         grouped(REPORT_CHARS)
     )
 });
@@ -64,19 +66,25 @@ impl Tool {
     fn base_description(self) -> &'static str {
         match self {
             Self::ListProviders => {
-                "Read available providers, models, your permission ceiling and remaining child slots before delegating. A refusal explains the fix."
+                "Read available providers, models, your permission ceiling and remaining child slots before del\
+                    egating. A refusal explains the fix."
             }
             Self::StartThread => {
-                "Start a child only when the user's request needs one, using a fresh client_request_id. Children inherit your mode unless you choose a narrower one and cannot delegate. A refusal explains the fix."
+                "Start a child only when the user's request needs one, using a fresh client_request_id. Childre\
+                    n inherit your mode unless you choose a narrower one and cannot delegate. A refusal explain\
+                        s the fix."
             }
             Self::GetTask => {
-                "Read one of your tasks when you need its status or report. Reports arrive in a new turn after your current turn ends; do not poll for them. A refusal explains the fix."
+                "Read one of your tasks when you need its status or report. Reports arrive in a new turn after \
+                    your current turn ends; do not poll for them. A refusal explains the fix."
             }
             Self::MessageThread => {
-                "Send a follow-up to your own child with a fresh client_request_id. Read delivery and waits_for: queued work must not be resent. A refusal explains the fix."
+                "Send a follow-up to your own child with a fresh client_request_id. Read delivery and waits_for\
+                    : queued work must not be resent. A refusal explains the fix."
             }
             Self::StopThread => {
-                "Stop your own child when its work is no longer needed. Its report arrives after your current turn ends. A refusal explains the fix."
+                "Stop your own child when its work is no longer needed. Its report arrives after your current t\
+                    urn ends. A refusal explains the fix."
             }
         }
     }
@@ -93,7 +101,9 @@ impl Tool {
         let (properties, required) = match self {
             Self::ListProviders => (json!({}), json!([])),
             Self::StartThread => (
-                json!({"provider":{"type":"string","enum":ProviderKind::ALL},"model":{"type":"string"},"mode":{"type":"string","enum":["ask_first","accept_edits","full_access"]},"title":{"type":"string"},"prompt":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
+                json!({"provider":{"type":"string","enum":ProviderKind::ALL},"model":{"type":"string"},"mode":{
+                    "type":"string","enum":["ask_first","accept_edits","full_access"]},"title":{"type":"string\
+                        "},"prompt":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
                 json!(["provider", "title", "prompt", "client_request_id"]),
             ),
             Self::GetTask => (
@@ -101,7 +111,8 @@ impl Tool {
                 json!(["task_id"]),
             ),
             Self::MessageThread => (
-                json!({"thread_id":{"type":"string","format":"uuid"},"text":{"type":"string"},"client_request_id":{"type":"string","minLength":1}}),
+                json!({"thread_id":{"type":"string","format":"uuid"},"text":{"type":"string"},"client_request_i\
+                    d":{"type":"string","minLength":1}}),
                 json!(["thread_id", "text", "client_request_id"]),
             ),
             Self::StopThread => (
@@ -109,12 +120,20 @@ impl Tool {
                 json!(["thread_id"]),
             ),
         };
-        json!({"name":self.name(),"description":self.description(),"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
+        json!({"name":self.name(),"description":self.description(),"inputSchema":{"type":"object","properties\
+            ":properties,"required":required,"additionalProperties":false}})
     }
 }
 fn first_call_rules() -> String {
     format!(
-        "Only a running root may delegate, and you may read or control only your own tasks and children. Depth is 1. At most {} children may have open tasks and a family may have {} threads in total, including archived threads. Children default to your mode and may never use a broader mode: ask_first < accept_edits < full_access. Prompts and follow-ups may contain at most {} characters. Use a client_request_id for start_thread and message_thread; retry the same key only with the same provider, target and text. Child reports carry up to {} characters and arrive as a wake after your turn ends, so do not poll. Every refusal names the rule, its limit when applicable, and the next tool and ids needed to fix it.",
+        "Only a running root may delegate, and you may read or control only your own tasks and children. Depth \
+            is 1. At most {} children may have open tasks and a family may have {} threads in total, including \
+                archived threads. Children default to your mode and may never use a broader mode: ask_first < a\
+                    ccept_edits < full_access. Prompts and follow-ups may contain at most {} characters. Use a \
+                        client_request_id for start_thread and message_thread; retry the same key only with th\
+                            e same provider, target and text. Child reports carry up to {} characters and arriv\
+                                e as a wake after your turn ends, so do not poll. Every refusal names the rule\
+                                    , its limit when applicable, and the next tool and ids needed to fix it.",
         OPEN_CHILD_LIMIT,
         FAMILY_LIMIT,
         grouped(PROMPT_CHARS),
@@ -141,7 +160,8 @@ pub(crate) fn storage_recovery(call: &ToolCall) -> String {
         .map(|tool| (tool.name(), call.arguments.clone()))
         .unwrap_or((Tool::ListProviders.name(), json!({})));
     format!(
-        "When storage recovers and this root has a running turn, retry {name} with {args}, keeping the same client_request_id for a task request"
+        "When storage recovers and this root has a running turn, retry {name} with {args}, keeping the same cli\
+            ent_request_id for a task request"
     )
 }
 fn open_children(p: &Projection, parent: ThreadId) -> BTreeSet<ThreadId> {
@@ -161,7 +181,8 @@ fn check_child_slot(
         return Ok(());
     }
     Err(invalid(format!(
-        "this parent has {} child threads with open tasks against the limit {}; wait for a report or call stop_thread with one of these thread_id values: {}",
+        "this parent has {} child threads with open tasks against the limit {}; wait for a report or call stop_\
+            thread with one of these thread_id values: {}",
         open.len(),
         OPEN_CHILD_LIMIT,
         open.iter()
@@ -213,7 +234,8 @@ fn prompt_cap(text: &str, tool: Tool) -> Result<(), CommandError> {
     let count = text.chars().count();
     if count > PROMPT_CHARS {
         return Err(invalid(format!(
-            "prompt has {count} characters against the {PROMPT_CHARS} character limit; shorten it and call {tool} with a new client_request_id"
+            "prompt has {count} characters against the {PROMPT_CHARS} character limit; shorten it and call {too\
+                l} with a new client_request_id"
         )));
     }
     Ok(())
@@ -228,7 +250,18 @@ fn request_key(tool: Tool, id: &str) -> Result<String, CommandError> {
     Ok(format!("{tool}:{id}"))
 }
 fn owned_child(p: &Projection, caller: ThreadId, child: ThreadId) -> Result<&Thread, CommandError> {
-    p.threads.get(&child).filter(|row| matches!(row.lineage,Lineage::Child{parent,..} if parent==caller)).ok_or_else(|| invalid(format!("thread {child} is not your own child; call get_task with one of your task ids to find its thread_id")))
+    p.threads
+        .get(&child)
+        .filter(|row| {
+            matches!(row.lineage,Lineage::Child{parent,..} if
+        parent==caller)
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "thread {child} is not your own child; call get_task wit\
+            h one of your task ids to find its thread_id"
+            ))
+        })
 }
 fn prior_task<'a>(p: &'a Projection, caller: ThreadId, key: &str) -> Option<&'a Task> {
     p.tasks
@@ -304,7 +337,8 @@ fn message_result(
         .unwrap();
     let running = matches!(turn.state, TurnState::Running { .. });
     let view = c.view(p, l, task.child).unwrap();
-    json!({"task_id":task.id,"delivery":if running {"started"}else{"queued"},"waits_for":if running {None}else{wait_reason(&view).map(|reason|reason.to_string())}})
+    json!({"task_id":task.id,"delivery":if running {"started"}else{"queued"},"waits_for":if running {None}else{
+        wait_reason(&view).map(|reason|reason.to_string())}})
 }
 pub fn decide(
     p: &Projection,
@@ -326,9 +360,19 @@ pub fn decide(
             .view(p, l, caller)
             .is_some_and(|view| view.running.is_some())
     {
-        return Err(invalid("tools require a running turn; finish this call and call list_providers in your next running turn".into()));
+        return Err(invalid(
+            "tools require a running turn; finish this call and call list_providers in your nex\
+            t running turn"
+                .into(),
+        ));
     }
-    let tool=Tool::from_name(&call.name).ok_or_else(||invalid("unknown tool; call list_providers with {} or inspect tools/list for the supported tools".into()))?;
+    let tool = Tool::from_name(&call.name).ok_or_else(|| {
+        invalid(
+            "unknown tool; call list_providers with {} or ins\
+        pect tools/list for the supported tools"
+                .into(),
+        )
+    })?;
     let result = match tool {
         Tool::ListProviders => {
             let args: BTreeMap<String, Value> = parse(call.arguments, tool)?;
@@ -338,12 +382,19 @@ pub fn decide(
                 ));
             }
             let open = open_children(p, caller);
-            json!({"providers":providers.iter().filter(|probe|probe.readiness==Readiness::Ready && probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models,"offered_modes":probe.provider.offered_modes()})).collect::<Vec<_>>(),"mode_ceiling":parent_mode,"remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
+            json!({"providers":providers.iter().filter(|probe|probe.readiness==Readiness::Ready &&
+                probe.path.is_some()).map(|probe|json!({"provider":probe.provider,"models":probe.models,"offere\
+                    d_modes":probe.provider.offered_modes()})).collect::<Vec<_>>(),"mode_ceiling":parent_mode,"\
+                        remaining_fan_out":OPEN_CHILD_LIMIT.saturating_sub(open.len())})
         }
         Tool::StartThread => {
             let args: Start = parse(call.arguments, tool)?;
             if !matches!(parent.lineage, Lineage::Root) {
-                return Err(invalid("depth limit is 1: a child cannot start threads; report to your parent, which can call get_task with its task_id".into()));
+                return Err(invalid(
+                    "depth limit is 1: a child cannot start threads; report to your parent, whic\
+                    h can call get_task with its task_id"
+                        .into(),
+                ));
             }
             prompt_cap(&args.prompt, tool)?;
             let key = request_key(tool, &args.client_request_id)?;
@@ -352,7 +403,8 @@ pub fn decide(
                     || prior_text(p, task, Tool::StartThread) != Some(&args.prompt)
                 {
                     return Err(invalid(format!(
-                        "request key {key} already names a different provider or prompt; call get_task with task_id {} or start_thread with a new client_request_id",
+                        "request key {key} already names a different provider or prompt; call get_task with tas\
+                            k_id {} or start_thread with a new client_request_id",
                         task.id
                     )));
                 }
@@ -371,7 +423,11 @@ pub fn decide(
                     && probe.readiness == Readiness::Ready
                     && probe.path.is_some()
             }) {
-                return Err(invalid("provider is not installed and ready; call list_providers with {} and choose an available provider".into()));
+                return Err(invalid(
+                    "provider is not installed and ready; call list_providers with {} and choos\
+                    e an available provider"
+                        .into(),
+                ));
             }
             check_child_slot(p, caller, None)?;
             let family = p
@@ -381,7 +437,8 @@ pub fn decide(
                 .count();
             if family >= FAMILY_LIMIT {
                 return Err(invalid(format!(
-                    "family has {family} threads against the limit {FAMILY_LIMIT}, including archived threads; call message_thread with an existing child thread_id, text and a new client_request_id"
+                    "family has {family} threads against the limit {FAMILY_LIMIT}, including archived threads; \
+                        call message_thread with an existing child thread_id, text and a new client_request_id"
                 )));
             }
             let child = Thread {
@@ -424,9 +481,12 @@ pub fn decide(
         }
         Tool::GetTask => {
             let args: Get = parse(call.arguments, tool)?;
-            let task=p.tasks.get(&args.task_id).filter(|task|task.parent==caller).ok_or_else(||invalid(format!("task {} is not your own task; call get_task with a task_id returned to this thread by start_thread or message_thread",args.task_id)))?;
+            let task=p.tasks.get(&args.task_id).filter(|task|task.parent==caller).ok_or_else(||invalid(format!(
+                "task {} is not your own task; call get_task with a task_id returned to this thread by start_th\
+                    read or message_thread",args.task_id)))?;
             let view = c.view(p, l, task.child).unwrap();
-            json!({"task_id":task.id,"thread_id":task.child,"status":thread_status(&view).words(),"summary":match &task.state {TaskState::Running=>None,TaskState::Settled{summary,..}=>Some(summary)}})
+            json!({"task_id":task.id,"thread_id":task.child,"status":thread_status(&view).words(),"summary\
+                ":match &task.state {TaskState::Running=>None,TaskState::Settled{summary,..}=>Some(summary)}})
         }
         Tool::MessageThread => {
             let args: Message = parse(call.arguments, tool)?;
@@ -438,7 +498,8 @@ pub fn decide(
                     || prior_text(p, task, Tool::MessageThread) != Some(&args.text)
                 {
                     return Err(invalid(format!(
-                        "request key {key} already names different text or a different child than requested {}; call get_task with task_id {} or message_thread with a new client_request_id",
+                        "request key {key} already names different text or a different child than requested {}\
+                            ; call get_task with task_id {} or message_thread with a new client_request_id",
                         args.thread_id, task.id
                     )));
                 }
@@ -446,7 +507,8 @@ pub fn decide(
             }
             if child.archived {
                 return Err(invalid(format!(
-                    "child {} is archived; call get_task with its task_id to read its report or start_thread with a new client_request_id",
+                    "child {} is archived; call get_task with its task_id to read its report or start_thread wi\
+                        th a new client_request_id",
                     child.id
                 )));
             }

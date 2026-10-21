@@ -666,7 +666,11 @@ mod tests {
         );
         let query = b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;196;?\x07\x1b[?2026$p\x1b[6n\x1b[c";
         let reply = emulator.feed(query, query.len() as u64);
-        assert_eq!(reply, b"\x1b]10;rgb:0101/0202/0303\x07\x1b]11;rgb:0404/0505/0606\x07\x1b]4;196;rgb:ffff/0000/0000\x07\x1b[?2026;2$y\x1b[1;1R\x1b[?6c");
+        assert_eq!(
+            reply,
+            b"\x1b]10;rgb:0101/0202/0303\x07\x1b]11;rgb:0404/0505/0606\x07\x1b]4;196;rgb:ffff/000\
+            0/0000\x07\x1b[?2026;2$y\x1b[1;1R\x1b[?6c"
+        );
         assert!(
             !emulator
                 .term

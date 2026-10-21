@@ -168,18 +168,23 @@ impl Actor {
             .map(|root| root.join("run/storage-blocked.json"));
         let mut recovery_notice = None;
         let lost=storage_receipt.as_ref().and_then(|path| {
-            let result=crate::platform::optional_text(path).and_then(|text|text.map(|text|serde_json::from_str::<BTreeMap<ThreadId,String>>(&text)
+            let result=crate::platform::optional_text(path).and_then(|text|text.map(
+                |text|serde_json::from_str::<BTreeMap<ThreadId,String>>(&text)
                 .map_err(std::io::Error::other)).transpose());
             match result {
                 Ok(rows)=>rows,
                 Err(error)=> {
-                    let destination = path.with_file_name(format!("storage-blocked-lost-{}.json", uuid::Uuid::now_v7()));
+                    let destination = path.with_file_name(format!("storage-blocked-lost-{}.json",
+                        uuid::Uuid::now_v7()));
                     let kept=crate::platform::quarantine_file(path, &destination).map(|_|destination);
                     match kept {
-                        Ok(path)=>tracing::warn!(error_kind=?error.kind(),path=%path.display(),"lost storage receipt kept privately"),
-                        Err(keep_error)=>tracing::warn!(error_kind=?error.kind(),%keep_error,"could not preserve lost storage receipt"),
+                        Ok(path)=>tracing::warn!(error_kind=?error.kind(),path=%path.display(),"lost storage \
+                            receipt kept privately"),
+                        Err(keep_error)=>tracing::warn!(error_kind=?error.kind(),%keep_error,"could not \
+                            preserve lost storage receipt"),
                     }
-                    recovery_notice=Some("Veyra could not read its storage recovery receipt. A private copy was kept when possible. Check the provider conversations before sending more work.".into());
+                    recovery_notice=Some("Veyra could not read its storage recovery receipt. A private copy \
+                        was kept when possible. Check the provider conversations before sending more work.".into());
                     None
                 }
             }
@@ -263,7 +268,8 @@ impl Actor {
                             seq: 0,
                             body: ItemBody::Notice(Notice {
                                 text: format!(
-                                    "Veyra closed while storage was blocked. Thread {thread} may have lost {what}. Check the provider conversation before sending more work."
+                                    "Veyra closed while storage was blocked. Thread {thread} may have lost \
+                                        {what}. Check the provider conversation before sending more work."
                                 ),
                             }),
                         },
@@ -381,7 +387,8 @@ impl Actor {
                 }
                 EngineMsg::ShutdownDeadline => {
                     if let Some(blocked) = &self.blocked {
-                        tracing::error!(changes=%Self::lost_changes(&blocked.changes),"quit deadline reached with storage changes unwritten");
+                        tracing::error!(changes=%Self::lost_changes(&blocked.changes),"quit deadline reached \
+                            with storage changes unwritten");
                     }
                     return;
                 }
@@ -532,7 +539,14 @@ impl Actor {
                     },
                 };
                 if !current {
-                    let _=reply.send(ToolResult{ok:false,output_tail:Some("the calling session ended or was replaced; call list_providers from the current root session's running turn".into())});
+                    let _ = reply.send(ToolResult {
+                        ok: false,
+                        output_tail: Some(
+                            "the calling session ended or was \
+                        replaced; call list_providers from the current root session's running turn"
+                                .into(),
+                        ),
+                    });
                     return;
                 }
                 let providers = self

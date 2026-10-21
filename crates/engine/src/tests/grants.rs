@@ -334,7 +334,8 @@ fn codex_approval(
     cwd: &str,
 ) -> RequestId {
     let decoded = codec.value(json!({"id":id,"method":"item/commandExecution/requestApproval",
-        "params":{"threadId":"codex-thread","turnId":"native-turn","itemId":id,"command":"rm -rf build","cwd":cwd}})).unwrap();
+        "params":{"threadId":"codex-thread","turnId":"native-turn","itemId":id,"command":"rm -rf build","cwd\
+            ":cwd}})).unwrap();
     for event in decoded.events {
         f.event(event);
     }
@@ -370,7 +371,12 @@ fn codex_grant_other_cwd_always_docks() {
         f.controls.try_recv().is_err(),
         "another cwd was automatically allowed"
     );
-    assert!(f.drain().iter().any(|e| matches!(e, UiEvent::Change { event: crate::events::ChangeEvent::RequestOpened(r), .. } if r.id == other)));
+    assert!(
+        f.drain()
+            .iter()
+            .any(|e| matches!(e, UiEvent::Change { event:
+        crate::events::ChangeEvent::RequestOpened(r), .. } if r.id == other))
+    );
 }
 #[test]
 fn codex_grant_same_command_and_cwd_is_automatic() {

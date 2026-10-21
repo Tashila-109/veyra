@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Fixture records and matching represent arbitrary provider wire JSON.
 pub mod cli;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -147,13 +148,28 @@ fn append_tui_history(path: &Path, native: &str, text: &str) -> io::Result<()> {
     let user = uuid::Uuid::now_v7().to_string();
     let attachment = uuid::Uuid::now_v7().to_string();
     let assistant = uuid::Uuid::now_v7().to_string();
-    let common = serde_json::json!({"sessionId":native,"isSidechain":false,"entrypoint":"cli","userType":"external","cwd":std::env::current_dir()?,"version":"2.1.302","timestamp":"2026-10-17T00:00:00Z","gitBranch":""});
+    let common = serde_json::json!({"sessionId":native,"isSidechain":false,"entrypoint":"cli",
+        "userType":"external","cwd":std::env::current_dir()?,"version":"2.1.302",
+            "timestamp":"2026-10-17T00:00:00Z","gitBranch":""});
     let mut user_entry = common.clone();
-    for (key,value) in serde_json::json!({"uuid":user,"parentUuid":parent,"promptId":uuid::Uuid::now_v7().to_string(),"type":"user","message":{"role":"user","content":text},"promptSource":"typed","turnOrigin":"human","origin":{"kind":"human"},"turnPosition":{"promptIndex":0,"turnIndex":1},"permissionMode":"default"}).as_object().unwrap() { user_entry[key] = value.clone(); }
+    for (key,value) in serde_json::json!({"uuid":user,"parentUuid":parent,"promptId":uuid::Uuid::now_v7(
+        ).to_string(),"type":"user","message":{"role":"user","content":text},"promptSource":"typed",
+            "turnOrigin":"human","origin":{"kind":"human"},"turnPosition":{"promptIndex":0,"turnIndex":1},
+                "permissionMode":"default"}).as_object().unwrap() { user_entry[key] = value.clone(); }
     let mut attachment_entry = common.clone();
-    for (key,value) in serde_json::json!({"uuid":attachment,"parentUuid":user,"type":"attachment","attachment":{"type":"environment"},"rendered":[],"renderedRole":"system"}).as_object().unwrap() { attachment_entry[key] = value.clone(); }
+    for (key, value) in serde_json::json!({"uuid":attachment,"parentUuid":user,"type":"attachment",
+        "attachment":{"type":"environment"},"rendered":[],"renderedRole":"system"})
+    .as_object()
+    .unwrap()
+    {
+        attachment_entry[key] = value.clone();
+    }
     let mut assistant_entry = common;
-    for (key,value) in serde_json::json!({"uuid":assistant,"parentUuid":attachment,"type":"assistant","message":{"role":"assistant","model":"veyra-fake","id":uuid::Uuid::now_v7().to_string(),"content":[{"type":"text","text":format!("fake reply: {text}")}],"stop_reason":"end_turn","usage":{}},"apiBlockIndex":0,"requestId":uuid::Uuid::now_v7().to_string(),"requestedModel":"veyra-fake","effort":"default"}).as_object().unwrap() { assistant_entry[key] = value.clone(); }
+    for (key,value) in serde_json::json!({"uuid":assistant,"parentUuid":attachment,"type":"assistant",
+        "message":{"role":"assistant","model":"veyra-fake","id":uuid::Uuid::now_v7().to_string(),"content":[{
+            "type":"text","text":format!("fake reply: {text}")}],"stop_reason":"end_turn","usage":{}},
+                "apiBlockIndex":0,"requestId":uuid::Uuid::now_v7().to_string(),"requestedModel":"veyra-fake",
+                    "effort":"default"}).as_object().unwrap() { assistant_entry[key] = value.clone(); }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

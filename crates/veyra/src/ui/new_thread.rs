@@ -30,7 +30,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         .line_height(t.text.meta.line_height)
                         .text_color(t.colors.text_faint)
                         .child(if shell.chosen_provider() == super::ProviderKind::Grok {
-                            "The CLI loads your own hooks and MCP servers. Grok follows your Claude and Grok permission settings, so Ask first asks only when they do not already allow the action."
+                            "The CLI loads your own hooks and MCP servers. Grok follows your Claude and Grok pe\
+                                rmission settings, so Ask first asks only when they do not already allow the action."
                         } else {
                             "The CLI loads your own hooks and MCP servers."
                         }),

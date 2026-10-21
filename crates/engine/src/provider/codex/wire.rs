@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Forward-compatible provider wire fields can carry arbitrary JSON.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;

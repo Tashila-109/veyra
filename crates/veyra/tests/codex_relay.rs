@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Relay tests inspect MCP tool-result wire JSON.
 #![cfg(debug_assertions)]
 use std::{fs, path::PathBuf, time::Duration};
 use tokio::runtime::Runtime;
@@ -239,9 +240,12 @@ fn codex_root_reaches_real_relay() {
             ..
         }
     )));
-    assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Tool(tool) if tool.result.as_ref().and_then(|r|r.output_tail.as_ref()).is_some_and(|text|text.contains("codex") && text.contains("remaining_fan_out")))));
+    assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Tool(tool) if tool.result.as_ref(
+        ).and_then(|r|r.output_tail.as_ref()).is_some_and(|text|text.contains("codex") && text.contains("remain\
+            ing_fan_out")))));
     println!(
-        "Codex root completed one turn through the production relay, socket, peer check and list_providers; recorder uses <id:token>; no config file or process group remains."
+        "Codex root completed one turn through the production relay, socket, peer check and list_providers; rec\
+            order uses <id:token>; no config file or process group remains."
     );
 }
 #[test]

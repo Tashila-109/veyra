@@ -171,7 +171,10 @@ fn grok_foreign_prompt_id_is_cli_work() {
         e,
         ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })
     )));
-    assert!(e.iter().any(|e|matches!(e,ProviderEvent::Turn {turn:None,event:TurnEvent::TextDelta {text,..}} if text=="background reply")));
+    assert!(e.iter().any(
+        |e| matches!(e,ProviderEvent::Turn {turn:None,event:TurnEvent::TextDelta {text,..}} if
+        text=="background reply")
+    ));
 }
 #[test]
 fn grok_auth_retries_once() {
@@ -192,7 +195,8 @@ fn grok_resume_uses_session_resume() {
     .0;
     assert_eq!(text(&e), "ok");
     assert_eq!(outcomes(&e), [TurnOutcome::Completed]);
-    assert!(e.iter().any(|event| matches!(event, ProviderEvent::Session(SessionEvent::Ready { native, cli_version, .. }) if native.0 == "retained-session" && cli_version.as_deref() == Some("1.0.60"))));
+    assert!(e.iter().any(|event| matches!(event, ProviderEvent::Session(SessionEvent::Ready { native,
+        cli_version, .. }) if native.0 == "retained-session" && cli_version.as_deref() == Some("1.0.60"))));
 }
 #[test]
 fn grok_stop_cancels_pending_permission() {
@@ -590,7 +594,10 @@ fn grok_stream_2000() {
 #[test]
 fn grok_foreign_prompt_overlap_keeps_stop_target() {
     let (events, _) = replay("foreign-prompt-overlap", Inputs::stop_request());
-    assert!(outcomes(&events).iter().any(|outcome| matches!(outcome, TurnOutcome::Interrupted { reason } if reason == "Stopped by you")));
+    assert!(outcomes(&events).iter().any(
+        |outcome| matches!(outcome, TurnOutcome::Interrupted { reason } if
+        reason == "Stopped by you")
+    ));
 }
 #[test]
 fn grok_isolated_auth_ignores_ambient_api_key() {
@@ -636,34 +643,71 @@ fn grok_foreign_question_docks_in_veyra_turn() {
 fn foreign_request_ends(name: &str, stop: bool) {
     engine_replay(name, |engine, thread, events, runtime| {
         runtime.block_on(async {
-        use veyra_engine::{commands::Command, events::{ChangeEvent, UiEvent}};
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let (mut opened,mut expired)=(None,false);
-            while let Some(event)=events.recv().await {
-                match event {
-                    UiEvent::Change { event:ChangeEvent::RequestOpened(request),.. } => {
-                        opened=Some(request.id);
-                        if stop {engine.send(Command::StopThread { thread }).await.unwrap().unwrap();}
+            use veyra_engine::{
+                commands::Command,
+                events::{ChangeEvent, UiEvent},
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut opened, mut expired) = (None, false);
+                while let Some(event) = events.recv().await {
+                    match event {
+                        UiEvent::Change {
+                            event: ChangeEvent::RequestOpened(request),
+                            ..
+                        } => {
+                            opened = Some(request.id);
+                            if stop {
+                                engine
+                                    .send(Command::StopThread { thread })
+                                    .await
+                                    .unwrap()
+                                    .unwrap();
+                            }
+                        }
+                        UiEvent::Change {
+                            event: ChangeEvent::RequestClosed(request),
+                            ..
+                        } => {
+                            assert_eq!(Some(request.id), opened);
+                            assert!(matches!(request.state, RequestState::Expired { .. }));
+                            expired = true;
+                        }
+                        UiEvent::Change {
+                            event: ChangeEvent::TurnEnded(turn),
+                            ..
+                        } if turn.origin != TurnOrigin::Provider => {
+                            assert!(
+                                opened.is_some() && expired,
+                                "foreign request was not persisted and expired"
+                            );
+                            assert!(
+                                matches!(
+                                    turn.state,
+                                    TurnState::Ended {
+                                        outcome: TurnOutcome::Interrupted { .. },
+                                        ..
+                                    }
+                                ) == stop
+                            );
+                            let snapshot = engine.snapshot(thread).await.unwrap();
+                            assert!(
+                                snapshot
+                                    .items
+                                    .iter()
+                                    .any(|item| matches!(&item.body,ItemBody::AssistantText {
+                            text,..} if text=="working"))
+                            );
+                            native_replies_checked(engine).await;
+                            return;
+                        }
+                        _ => {}
                     }
-                    UiEvent::Change { event:ChangeEvent::RequestClosed(request),.. } => {
-                        assert_eq!(Some(request.id),opened);
-                        assert!(matches!(request.state,RequestState::Expired {..}));
-                        expired=true;
-                    }
-                    UiEvent::Change { event:ChangeEvent::TurnEnded(turn),.. } if turn.origin!=TurnOrigin::Provider => {
-                        assert!(opened.is_some() && expired,"foreign request was not persisted and expired");
-                        assert!(matches!(turn.state,TurnState::Ended { outcome:TurnOutcome::Interrupted {..},..}) == stop);
-                        let snapshot=engine.snapshot(thread).await.unwrap();
-                        assert!(snapshot.items.iter().any(|item|matches!(&item.body,ItemBody::AssistantText {text,..} if text=="working")));
-                        native_replies_checked(engine).await;
-                        return;
-                    }
-                    _=>{}
                 }
-            }
-            panic!("foreign request never expired");
-        }).await.unwrap();
-    })
+                panic!("foreign request never expired");
+            })
+            .await
+            .unwrap();
+        })
     });
 }
 #[test]
@@ -1093,7 +1137,9 @@ fn grok_foreign_tool_keeps_start_metadata_after_promotion() {
         assert_eq!(*owner, None);
         assert_eq!(call.name, name);
         assert_eq!(call.arguments, arguments);
-        assert_eq!(events.iter().filter(|event| matches!(event, ProviderEvent::Turn { turn: None, event: TurnEvent::ToolFinished { key: finished, ok: true, output_tail: Some(output) } } if finished == key && output == tail)).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(event, ProviderEvent::Turn { turn: None, event:
+            TurnEvent::ToolFinished { key: finished, ok: true, output_tail: Some(output) } } if finished ==
+                key && output == tail)).count(), 1);
     }
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -1122,34 +1168,70 @@ fn grok_tool_title_updates_one_persisted_row() {
                 let mut completions = 0;
                 while let Some(event) = events.recv().await {
                     match event {
-                        UiEvent::Change {event:ChangeEvent::ItemAdded(item) | ChangeEvent::ItemCompleted(item),..} => {
+                        UiEvent::Change {
+                            event: ChangeEvent::ItemAdded(item) | ChangeEvent::ItemCompleted(item),
+                            ..
+                        } => {
                             if let ItemBody::Tool(tool) = item.body {
-                                ids.insert((item.id,item.seq));
-                                if tool.result.is_some() { completions += 1; }
+                                ids.insert((item.id, item.seq));
+                                if tool.result.is_some() {
+                                    completions += 1;
+                                }
                                 titles.push(tool.call.name);
                             }
                         }
-                        UiEvent::Change {event:ChangeEvent::TurnEnded(_),..} => {
+                        UiEvent::Change {
+                            event: ChangeEvent::TurnEnded(_),
+                            ..
+                        } => {
                             let snapshot = engine.snapshot(thread).await.unwrap();
-                            let tools = snapshot.items.iter().filter_map(|item|match &item.body {ItemBody::Tool(tool)=>Some(tool),_=>None}).collect::<Vec<_>>();
-                            assert_eq!(tools.len(),1);
-                            assert_eq!(ids.len(),1);
-                            assert!(titles.iter().any(|title|title=="Running pwd"));
-                            assert_eq!(completions,1);
-                            assert_eq!(tools[0].call.name,"Execute `pwd`");
-                            assert_eq!(tools[0].call.arguments,serde_json::json!({"variant":"Bash","command":"pwd"}));
-                            assert_eq!(tools[0].result.as_ref().unwrap().output_tail.as_deref(),Some("/project\n"));
-                            let db = rusqlite::Connection::open(engine.child_env().fixtures.unwrap().join("data/veyra.db")).unwrap();
-                            let (count,body):(i64,String) = db.query_row("select count(*),body_json from items where thread_id=?1 and kind='tool'",[thread.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
-                            assert_eq!(count,1);
+                            let tools = snapshot
+                                .items
+                                .iter()
+                                .filter_map(|item| match &item.body {
+                                    ItemBody::Tool(tool) => Some(tool),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(tools.len(), 1);
+                            assert_eq!(ids.len(), 1);
+                            assert!(titles.iter().any(|title| title == "Running pwd"));
+                            assert_eq!(completions, 1);
+                            assert_eq!(tools[0].call.name, "Execute `pwd`");
+                            assert_eq!(
+                                tools[0].call.arguments,
+                                serde_json::json!({"variant":"Bash","command":"pwd"})
+                            );
+                            assert_eq!(
+                                tools[0].result.as_ref().unwrap().output_tail.as_deref(),
+                                Some("/project\n")
+                            );
+                            let db = rusqlite::Connection::open(
+                                engine.child_env().fixtures.unwrap().join(
+                                    "data\
+                                /veyra.db",
+                                ),
+                            )
+                            .unwrap();
+                            let (count, body): (i64, String) = db
+                                .query_row(
+                                    "select count(*),body_json from items \
+                                where thread_id=?1 and kind='tool'",
+                                    [thread.to_string()],
+                                    |row| Ok((row.get(0)?, row.get(1)?)),
+                                )
+                                .unwrap();
+                            assert_eq!(count, 1);
                             assert!(body.contains("Execute `pwd`"));
                             return;
                         }
-                        _=>{}
+                        _ => {}
                     }
                 }
                 panic!("tool turn did not end");
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         });
     });
 }

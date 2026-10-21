@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // The JSON-RPC peer transports envelopes before provider decoding.
 use super::{
     ProviderError,
     lines::{ByteLines, Line},

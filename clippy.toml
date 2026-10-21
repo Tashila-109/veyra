@@ -1,0 +1,1 @@
+disallowed-types = [{ path = "serde_json::Value", reason = "Use typed data outside wire-format boundaries." }]

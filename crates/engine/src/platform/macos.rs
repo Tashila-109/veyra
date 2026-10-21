@@ -675,7 +675,14 @@ mod tests {
         let binary = env::current_exe().unwrap();
         let quoted_binary = binary.to_string_lossy().replace('\'', "'\"'\"'");
         let quoted_root = root.to_string_lossy().replace('\'', "'\"'\"'");
-        fs::write(&shell, format!("#!/bin/sh\nexport VEYRA_TEST_SHELL_PIPE_ROOT='{quoted_root}'\nexec '{quoted_binary}' --exact platform::macos::tests::shell_pipe_child --ignored --nocapture\n")).unwrap();
+        fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\nexport VEYRA_TEST_SHELL_PIPE_ROOT='{quoted_root}'\nexec '{quoted_\
+            binary}' --exact platform::macos::tests::shell_pipe_child --ignored --nocapture\n"
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
         let start = std::time::Instant::now();
         let result = bounded_shell_path(shell.as_os_str(), std::time::Duration::from_secs(2));

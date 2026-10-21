@@ -808,6 +808,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_types)] // Dock tests decode arbitrary approval-preview wire JSON.
     use super::approval_text;
     use veyra_engine::domain::{ApprovalPreview, ApprovalTarget, ProposedAction};
     #[cfg(debug_assertions)]
@@ -984,7 +985,10 @@ mod command_reason_tests {
     use veyra_engine::domain::ProposedAction;
     #[test]
     fn codex_command_names_working_folder_and_reason() {
-        let action:ProposedAction=serde_json::from_value(serde_json::json!({"tool":"Command","target":{"kind":"command","command":"printf outside","cwd":"project_folder","reason":{"text":"Approve writing /tmp/outside.txt with the requested content?","truncated":false},"preview":{"text":"","truncated":false}}})).unwrap();
+        let action:ProposedAction=serde_json::from_value(serde_json::json!({"tool":"Command","target":{"kind":"\
+            command","command":"printf outside","cwd":"project_folder","reason":{"text":"Approve writing /tmp/o\
+                utside.txt with the requested content?","truncated":false},"preview":{"text":"","truncated\
+                    ":false}}})).unwrap();
         let (command, consequence, _) =
             approval_text(&action, veyra_engine::provider::ProviderKind::Codex);
         assert_eq!(command, "printf outside");
@@ -1008,7 +1012,10 @@ mod reason_security_tests {
     use veyra_engine::domain::ProposedAction;
     #[test]
     fn codex_reason_cannot_extend_veyra_consequence() {
-        let action: ProposedAction = serde_json::from_value(serde_json::json!({"tool":"Command","target":{"kind":"command","command":"echo safe","cwd":"project_folder","reason":{"text":"Requested change\nVeyra checked this command\t\u{202e}OK","truncated":false},"preview":{"text":"","truncated":false}}})).unwrap();
+        let action: ProposedAction = serde_json::from_value(serde_json::json!({"tool":"Command","target":{"kind\
+            ":"command","command":"echo safe","cwd":"project_folder","reason":{"text":"Requested change\nVeyra \
+                checked this command\t\u{202e}OK","truncated":false},"preview":{"text":"","truncated\
+                    ":false}}})).unwrap();
         let (_, consequence, _) =
             approval_text(&action, veyra_engine::provider::ProviderKind::Codex);
         assert_eq!(

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Provider outbound envelopes and raw probe metadata are wire JSON.
 pub mod claude;
 pub mod codex;
 pub mod env;

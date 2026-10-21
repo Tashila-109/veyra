@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // The fake CLI reads fixture and relay wire envelopes.
 use crate::fixture::{self, Matcher, Record};
 use std::{
     io::{self, BufRead, Write},

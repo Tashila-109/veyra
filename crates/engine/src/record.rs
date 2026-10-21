@@ -99,6 +99,7 @@ pub(crate) struct Metadata {
 
 #[cfg(debug_assertions)]
 mod capture {
+    #![allow(clippy::disallowed_types)] // Recording redacts arbitrary provider wire JSON before writing it.
     use super::redact;
     use crate::{fixture::Record, platform};
     use regex::Regex;
@@ -113,7 +114,8 @@ mod capture {
     };
     static ACCOUNT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-        r"(?i)^(account.*|.*_?account_?id|user.*|.*username|.*email.*|login|display_name|team.*|org.*|plan.*|billing.*|tier|subscription.*)$"
+        "(?i)^(account.*|.*_?account_?id|user.*|.*username|.*email.*|login|display_name|team.*|org.*|plan.*|bil\
+            ling.*|tier|subscription.*)$"
     ).expect("account fields")
     });
     static EMAIL: LazyLock<Regex> = LazyLock::new(|| {

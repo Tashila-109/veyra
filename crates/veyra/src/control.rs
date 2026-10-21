@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // The debug driver transports action payloads and dump JSON.
 #![cfg(debug_assertions)]
 
 use anyhow::{Context as _, bail};

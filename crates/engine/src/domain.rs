@@ -210,12 +210,15 @@ pub struct AsyncQuestion {
     pub options: Vec<String>,
     pub selected: Option<usize>,
 }
+#[allow(clippy::disallowed_types)] // Provider wire arguments retain arbitrary JSON for display.
+pub type ToolArguments = serde_json::Value;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,
     #[serde(default)]
     pub veyra_label: bool,
-    pub arguments: serde_json::Value,
+    pub arguments: ToolArguments,
     #[serde(default)]
     pub input_summary: Option<String>,
 }
@@ -447,6 +450,7 @@ impl ApprovalPreview {
     }
 }
 impl<'de> Deserialize<'de> for ProposedAction {
+    #[allow(clippy::disallowed_types)] // Legacy stored approval input is decoded only at this compatibility boundary.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -786,7 +790,8 @@ pub fn wait_reason(v: &ThreadView<'_>) -> Option<WaitReason> {
 }
 
 pub fn async_question_active<'a>(item: &Item, items: impl IntoIterator<Item = &'a Item>) -> bool {
-    matches!(&item.body, ItemBody::AsyncQuestions { questions, .. } if questions.iter().any(|question| question.selected.is_none()))
+    matches!(&item.body, ItemBody::AsyncQuestions { questions, .. } if questions.iter().any(|question|
+        question.selected.is_none()))
         && !items.into_iter().any(|later| {
             later.thread == item.thread
                 && later.seq > item.seq

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Request tests construct provider wire input and tool output.
 use super::grants::approval;
 use super::*;
 use crate::provider::claude::Codec;
@@ -364,7 +365,8 @@ fn async_choice_precedes_queued_messages_and_persists_once() {
             .any(|i| i.turn == answer && i.body == ItemBody::UserText("Violet".into()))
     );
     assert!(
-        matches!(&p.items[&item].body, ItemBody::AsyncQuestions { text, questions } if text == "Which colour should Veyra use?" && questions[0].selected == Some(0))
+        matches!(&p.items[&item].body, ItemBody::AsyncQuestions { text, questions } if text == "Which colour sh\
+            ould Veyra use?" && questions[0].selected == Some(0))
     );
     assert!(
         std::iter::from_fn(|| f.controls.try_recv().ok()).any(|control| matches!(

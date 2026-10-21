@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Socket tests construct and inspect MCP and configuration wire JSON.
 use serde_json::{Value, json};
 use std::{
     io::Write,
@@ -49,14 +50,17 @@ fn relay() -> PathBuf {
 fn fixture(run: &Run) -> PathBuf {
     let path = run.root.join("fixture.jsonl");
     let records = [
-        json!({"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"fake","scenario":"socket authentication","source":"handwritten"}),
+        json!({"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"fake","sce\
+            nario":"socket authentication","source":"handwritten"}),
         json!({"type":"record_argv","path":"argv.json"}),
         json!({"type":"expect_outbound","line":{"go":true}}),
         json!({"type":"mcp_start"}),
         json!({"type":"mcp_send","line":{"jsonrpc":"2.0","id":1,"method":"server/discover"}}),
-        json!({"type":"mcp_expect","line":{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}}),
+        json!({"type":"mcp_expect","line":{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not \
+            found"}}}),
         json!({"type":"mcp_send","line":{"jsonrpc":"2.0","method":"notifications/initialized"}}),
-        json!({"type":"mcp_send","line":{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}}),
+        json!({"type":"mcp_send","line":{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersio\
+            n":"2024-11-05"}}}),
         json!({"type":"mcp_expect","line":{"jsonrpc":"2.0","id":2,"result":"<any>"}}),
         json!({"type":"touch","path":"connected"}),
         json!({"type":"expect_outbound","line":{"finish":true}}),
@@ -187,7 +191,8 @@ async fn token_never_in_argv() {
     );
     let config = run.config.as_ref().unwrap();
     assert!(platform::is_private(&config.path).unwrap());
-    config.system_init(&json!({"type":"system","subtype":"init","mcp_servers":[{"name":"veyra","status":"connected","source":"dynamic"}]})).unwrap();
+    config.system_init(&json!({"type":"system","subtype":"init","mcp_servers":[{"name":"veyra","status":"connec\
+        ted","source":"dynamic"}]})).unwrap();
     assert!(
         !config.path.exists(),
         "system/init left the credential file behind"
@@ -309,9 +314,15 @@ fn mcp_config_is_unlinked_for_every_reported_status() {
         assert!(config.path.is_file());
         assert!(platform::is_private(&config.path).unwrap());
         assert!(platform::is_private(config.path.parent().unwrap()).unwrap());
-        config.system_init(&json!({"type":"system","subtype":"init","mcp_servers":[{"name":"other","status":"connected"}]})).unwrap();
+        config.system_init(&json!({"type":"system","subtype":"init","mcp_servers":[{"name":"other","status":"co\
+            nnected"}]})).unwrap();
         assert!(config.path.is_file());
-        config.system_init(&json!({"type":"system","subtype":"init","mcp_servers":[{"name":"veyra","status":status,"source":"dynamic"}]})).unwrap();
+        config
+            .system_init(
+                &json!({"type":"system","subtype":"init","mcp_servers":[{"name":"veyra","status\
+            ":status,"source":"dynamic"}]}),
+            )
+            .unwrap();
         assert!(
             !config.path.exists(),
             "reported server left its config on disk"
@@ -510,7 +521,8 @@ async fn child_spawn_has_no_tool_server() {
 fn session_hash_redacts_token_in_nested_values_and_hex_neighbors() {
     let token = McpToken::new();
     let hash = veyra_engine::mcp::TokenHash(token.hash());
-    let mut value = json!({token.expose():[format!("a{}b",token.expose()), {"content":format!("prefix {} suffix",token.expose())}]});
+    let mut value = json!({token.expose():[format!("a{}b",token.expose()), {"content":format!("prefix {} suffix\
+        ",token.expose())}]});
     hash.sanitize(&mut value, "<id:token>");
     assert!(
         !value.to_string().contains(token.expose()),

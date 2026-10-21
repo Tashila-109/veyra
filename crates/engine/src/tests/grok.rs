@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Codec tests construct and inspect provider wire envelopes.
 #[test]
 fn grok_args_per_mode() {
     use crate::{domain::*, provider::grok};
@@ -108,11 +109,14 @@ fn grok_probe_without_catalog_offers_default() {
 fn grok_initialize_probe(auth: &[&str], catalog: bool, api_key: bool) -> crate::provider::Probe {
     use serde_json::json;
     let mut result = json!({"protocolVersion":1,"authMethods":auth.iter().map(|id|json!({"id":id})).collect::<Vec<_>>(),
-        "agentCapabilities":{"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"_meta":{"agentVersion":"1.0.60"}});
+        "agentCapabilities":{"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"_met\
+            a":{"agentVersion":"1.0.60"}});
     if catalog {
         result["_meta"]["modelState"] = json!({"currentModelId":"grok-4.7","availableModels":[
-            {"modelId":"grok-4.5","name":"Grok 4.5","_meta":{"reasoningEfforts":[{"value":"high","default":true},{"value":"medium"},{"value":"low"}]}},
-            {"modelId":"grok-4.7","name":"Grok 4.7","_meta":{"reasoningEfforts":[{"value":"xhigh"},{"value":"high","default":true},{"value":"medium"},{"value":"low"}]}}
+            {"modelId":"grok-4.5","name":"Grok 4.5","_meta":{"reasoningEfforts":[{"value":"high","default\
+                ":true},{"value":"medium"},{"value":"low"}]}},
+            {"modelId":"grok-4.7","name":"Grok 4.7","_meta":{"reasoningEfforts":[{"value":"xhigh"},{"value":"hi\
+                gh","default":true},{"value":"medium"},{"value":"low"}]}}
         ]});
     }
     grok_probe_result(result, api_key)
@@ -127,8 +131,10 @@ fn grok_probe_result(result: serde_json::Value, api_key: bool) -> crate::provide
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("private-project-file"), "unrelated project data").unwrap();
     let records = [
-        json!({"type":"transcript_start","provider":"grok","protocol":"json-rpc","cli_version":"1.0.60","scenario":"probe-grok","source":"hand-written"}),
-        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":grok::initialize()}}),
+        json!({"type":"transcript_start","provider":"grok","protocol":"json-rpc","cli_version":"1.0.60","scenar\
+            io":"probe-grok","source":"hand-written"}),
+        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params\
+            ":grok::initialize()}}),
         json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":result}}),
         json!({"type":"spin","ms":60000}),
     ];
@@ -276,7 +282,8 @@ fn grok_flat_question_docks_and_accepts_labels() {
         let decoded = codec.value(json!({"id":0,"method":method,"params":{
             "sessionId":"native","toolCallId":"choose","mode":"default",
             "questions":[{"question":"Which check?","multiSelect":null,
-                "options":[{"label":"Tests","description":"Run tests","preview":"preview"},{"label":"Build","description":"Build"}]}]
+                "options":[{"label":"Tests","description":"Run tests","preview":"preview"},{"label":"Build","de\
+                    scription":"Build"}]}]
         }})).unwrap();
         let request = decoded
             .events
@@ -290,7 +297,8 @@ fn grok_flat_question_docks_and_accepts_labels() {
             })
             .expect("flat question must dock under the running turn");
         assert!(
-            matches!(request.1, RequestKind::Question { questions } if questions[0].text == "Which check?" && questions[0].options == ["Tests", "Build"])
+            matches!(request.1, RequestKind::Question { questions } if questions[0].text == "Which check?" &&
+                questions[0].options == ["Tests", "Build"])
         );
         assert_eq!(
             codec.answer(
@@ -311,7 +319,12 @@ fn grok_live_task_snapshot_clears_background_work() {
     use crate::provider::*;
     use serde_json::json;
     let mut codec = ready_codec();
-    let backgrounded = codec.value(json!({"method":"_x.ai/task_backgrounded","params":{"sessionId":"native","update":{"sessionUpdate":"task_backgrounded","task_id":"task"}}})).unwrap();
+    let backgrounded = codec
+        .value(
+            json!({"method":"_x.ai/task_backgrounded","params":{"sessionId":"native","up\
+        date":{"sessionUpdate":"task_backgrounded","task_id":"task"}}}),
+        )
+        .unwrap();
     assert!(matches!(
         backgrounded.events.as_slice(),
         [ProviderEvent::Session(SessionEvent::BackgroundWork {
@@ -322,7 +335,12 @@ fn grok_live_task_snapshot_clears_background_work() {
         json!({"sessionUpdate":"task_completed","task_snapshot":{"task_id":"task"},"will_wake":true}),
         json!({"task_id":"task"}),
     ] {
-        let completed = codec.value(json!({"method":"_x.ai/task_completed","params":{"sessionId":"native","update":update}})).unwrap();
+        let completed = codec
+            .value(
+                json!({"method":"_x.ai/task_completed","params":{"sessionId":"native","upda\
+            te":update}}),
+            )
+            .unwrap();
         assert!(matches!(
             completed.events.as_slice(),
             [ProviderEvent::Session(SessionEvent::BackgroundWork {
@@ -339,7 +357,10 @@ fn grok_provider_turn_ends_on_its_own_notification_once() {
     let mut codec = ready_codec();
     let own = TurnId::new();
     codec.start(own, "work".into()).unwrap();
-    let complete = |id: &str| json!({"method":"_x.ai/session_notification","params":{"sessionId":"native","update":{"sessionUpdate":"turn_completed","prompt_id":id,"stop_reason":"end_turn"}}});
+    let complete = |id: &str| {
+        json!({"method":"_x.ai/session_notification","params":{"sessionId":"native","upda\
+        te":{"sessionUpdate":"turn_completed","prompt_id":id,"stop_reason":"end_turn"}}})
+    };
     assert!(
         codec
             .value(complete(&own.to_string()))
@@ -350,7 +371,9 @@ fn grok_provider_turn_ends_on_its_own_notification_once() {
     codec
         .value(json!({"id":3,"result":{"stopReason":"end_turn"}}))
         .unwrap();
-    let started = codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"task-completed-task"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"report"}}}})).unwrap();
+    let started = codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptI\
+        d":"task-completed-task"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","tex\
+            t":"report"}}}})).unwrap();
     assert!(started.provider_turn.is_some());
     assert!(
         codec
@@ -383,12 +406,25 @@ fn grok_provider_turn_ends_on_its_own_notification_once() {
 #[test]
 fn grok_lone_foreign_completion_opens_no_provider_turn() {
     let mut codec = ready_codec();
-    let decoded=codec.value(serde_json::json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","promptId":"never-started","stopReason":"end_turn"}})).unwrap();
+    let decoded = codec
+        .value(
+            serde_json::json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"\
+        native","promptId":"never-started","stopReason":"end_turn"}}),
+        )
+        .unwrap();
     assert!(decoded.events.is_empty());
     assert!(decoded.provider_turn.is_none());
-    let started=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"task-completed-fresh"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"report"}}}})).unwrap();
+    let started=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_meta\
+        ":{"promptId":"task-completed-fresh"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type\
+            ":"text","text":"report"}}}})).unwrap();
     assert!(started.provider_turn.is_some());
-    assert!(started.events.iter().any(|e|matches!(e,crate::provider::ProviderEvent::Turn {event:crate::provider::TurnEvent::TextDelta {text,..},..} if text=="report")));
+    assert!(
+        started
+            .events
+            .iter()
+            .any(|e| matches!(e,crate::provider::ProviderEvent::Turn {
+        event:crate::provider::TurnEvent::TextDelta {text,..},..} if text=="report"))
+    );
 }
 #[test]
 fn grok_cumulative_tool_output_is_emitted_once() {
@@ -404,7 +440,9 @@ fn grok_cumulative_tool_output_is_emitted_once() {
         ("completed", "abc"),
         ("completed", "abc"),
     ] {
-        let decoded=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"tool_call_update","toolCallId":"tool","title":"Bash","rawInput":{"command":"echo abc"},"status":status,"rawOutput":text}}})).unwrap();
+        let decoded=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_m\
+            eta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"tool_call_update","toolCallId":"tool\
+                ","title":"Bash","rawInput":{"command":"echo abc"},"status":status,"rawOutput":text}}})).unwrap();
         for event in decoded.events {
             match event {
                 ProviderEvent::Turn {
@@ -504,7 +542,8 @@ fn grok_first_tagged_unknown_frame_accepts_prompt_once() {
     let mut codec = ready_codec();
     let turn = TurnId::new();
     codec.start(turn, "work".into()).unwrap();
-    let frame = serde_json::json!({"method":"x.ai/new_progress_kind","params":{"sessionId":"native","_meta":{"promptId":turn.to_string()}}});
+    let frame = serde_json::json!({"method":"x.ai/new_progress_kind","params":{"sessionId":"native","_meta":{"p\
+        romptId":turn.to_string()}}});
     let decoded = codec.value(frame.clone()).unwrap();
     assert!(
         matches!(decoded.events.as_slice(),[ProviderEvent::Turn {turn:Some(id),event:TurnEvent::Accepted}] if *id==turn)
@@ -514,7 +553,8 @@ fn grok_first_tagged_unknown_frame_accepts_prompt_once() {
         .value(serde_json::json!({"id":3,"result":{"stopReason":"end_turn"}}))
         .unwrap();
     assert!(
-        matches!(end.events.as_slice(),[ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,..}}] if *id==turn)
+        matches!(end.events.as_slice(),[ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {
+            outcome:TurnOutcome::Completed,..}}] if *id==turn)
     );
 }
 
@@ -523,7 +563,12 @@ fn grok_unknown_notification_logs_only_method() {
     let logs = super::logs::CapturedLogs::default();
     tracing::subscriber::with_default(logs.clone(), || {
         let mut codec = ready_codec();
-        let decoded = codec.value(serde_json::json!({"method":"x.ai/unknown_method","params":{"sessionId":"native","payload":"private-payload"}})).unwrap();
+        let decoded = codec
+            .value(
+                serde_json::json!({"method":"x.ai/unknown_method","params":{"sessionId":"nati\
+            ve","payload":"private-payload"}}),
+            )
+            .unwrap();
         assert!(decoded.events.is_empty());
     });
     let entries = logs.0.lock().unwrap();
@@ -539,7 +584,12 @@ fn grok_unknown_update_kind_is_logged_and_skipped() {
     let logs = super::logs::CapturedLogs::default();
     tracing::subscriber::with_default(logs.clone(), || {
         let mut codec = ready_codec();
-        let decoded = codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","update":{"sessionUpdate":"future_update","payload":"private-payload"}}})).unwrap();
+        let decoded = codec
+            .value(
+                serde_json::json!({"method":"session/update","params":{"sessionId":"native","\
+            update":{"sessionUpdate":"future_update","payload":"private-payload"}}}),
+            )
+            .unwrap();
         assert!(decoded.events.is_empty());
         assert!(decoded.provider_turn.is_none());
     });
@@ -588,8 +638,13 @@ fn grok_tool_delta_keeps_text_before_actor_tail() {
     let turn = TurnId::new();
     codec.start(turn, "work".into()).unwrap();
     let output = "x".repeat(TOOL_OUTPUT_CHARS + 1);
-    let decoded = codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"in_progress","rawOutput":output}}})).unwrap();
-    assert!(decoded.events.iter().any(|e| matches!(e, ProviderEvent::Turn { event: TurnEvent::ToolOutput {text,..}, .. } if text.len() == TOOL_OUTPUT_CHARS + 1)));
+    let decoded = codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_met\
+        a":{"promptId":turn.to_string()},"update":{"sessionUpdate":"tool_call_update","toolCallId":"tool","stat\
+            us":"in_progress","rawOutput":output}}})).unwrap();
+    assert!(decoded.events.iter().any(
+        |e| matches!(e, ProviderEvent::Turn { event: TurnEvent::ToolOutput {text,
+        ..}, .. } if text.len() == TOOL_OUTPUT_CHARS + 1)
+    ));
 }
 
 #[test]
@@ -597,7 +652,12 @@ fn grok_auth_uses_captured_api_key_presence() {
     for (present, method) in [(true, "xai.api_key"), (false, "cached_token")] {
         let mut codec = initial_codec(present);
         codec.initialize();
-        let decoded = codec.value(serde_json::json!({"id":1,"result":{"authMethods":[{"id":"xai.api_key"},{"id":"cached_token"}]}})).unwrap();
+        let decoded = codec
+            .value(
+                serde_json::json!({"id":1,"result":{"authMethods":[{"id":"xai.api_key"},{"id\
+            ":"cached_token"}]}}),
+            )
+            .unwrap();
         assert_eq!(decoded.replies[0]["params"]["methodId"], method);
     }
 }
@@ -608,8 +668,14 @@ fn grok_error_completion_keeps_failure_with_nontext_result() {
     let mut codec = ready_codec();
     let turn = TurnId::new();
     codec.start(turn, "work".into()).unwrap();
-    let decoded = codec.value(serde_json::json!({"id":3,"result":{"stopReason":"error","agentResult":{"detail":"unfamiliar metadata"}}})).unwrap();
-    assert!(decoded.events.iter().any(|e| matches!(e, ProviderEvent::Turn { event: TurnEvent::TurnEnded { outcome:TurnOutcome::Failed {message},..}, .. } if message == "Grok could not complete the turn")));
+    let decoded = codec
+        .value(
+            serde_json::json!({"id":3,"result":{"stopReason":"error","agentResult":{"detail\
+        ":"unfamiliar metadata"}}}),
+        )
+        .unwrap();
+    assert!(decoded.events.iter().any(|e| matches!(e, ProviderEvent::Turn { event: TurnEvent::TurnEnded {
+        outcome:TurnOutcome::Failed {message},..}, .. } if message == "Grok could not complete the turn")));
 }
 #[test]
 fn grok_malformed_notifications_log_only_the_method() {
@@ -618,8 +684,10 @@ fn grok_malformed_notifications_log_only_the_method() {
         let mut codec = ready_codec();
         for params in [
             serde_json::json!({"sessionId":"native","update":{"private":"private-payload"}}),
-            serde_json::json!({"sessionId":"native","update":{"sessionUpdate":"tool_call","title":null,"rawInput":"private-payload"}}),
-            serde_json::json!({"sessionId":"native","_meta":{"promptId":12},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"private-payload"}}}),
+            serde_json::json!({"sessionId":"native","update":{"sessionUpdate":"tool_call","title":null,"rawInpu\
+                t":"private-payload"}}),
+            serde_json::json!({"sessionId":"native","_meta":{"promptId":12},"update":{"sessionUpdate":"agent_me\
+                ssage_chunk","content":{"type":"text","text":"private-payload"}}}),
             serde_json::json!({"sessionId":"native","_meta":null,"private":"private-payload"}),
         ] {
             let decoded = codec
@@ -647,7 +715,9 @@ fn grok_wrong_session_notification_cannot_accept_veyra_prompt() {
     let mut codec = ready_codec();
     let turn = TurnId::new();
     codec.start(turn, "work".into()).unwrap();
-    let wrong=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"another-session","_meta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"wrong session"}}}})).unwrap();
+    let wrong=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"another-session",
+        "_meta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"agent_message_chunk","content":{"type\
+            ":"text","text":"wrong session"}}}})).unwrap();
     assert!(wrong.events.is_empty());
     let done = codec
         .value(serde_json::json!({"id":3,"result":{"stopReason":"end_turn"}}))
@@ -663,7 +733,9 @@ fn grok_replay_notification_cannot_accept_veyra_prompt() {
     let mut codec = ready_codec();
     let turn = TurnId::new();
     codec.start(turn, "work".into()).unwrap();
-    let replay=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":turn.to_string(),"isReplay":true},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old text"}}}})).unwrap();
+    let replay=codec.value(serde_json::json!({"method":"session/update","params":{"sessionId":"native","_meta\
+        ":{"promptId":turn.to_string(),"isReplay":true},"update":{"sessionUpdate":"agent_message_chunk","conten\
+            t":{"type":"text","text":"old text"}}}})).unwrap();
     assert!(replay.events.is_empty());
     let done = codec
         .value(serde_json::json!({"id":3,"result":{"stopReason":"end_turn"}}))
@@ -686,7 +758,8 @@ fn grok_child_foreign_content_does_not_replace_its_report() {
         session: None,
         call: ToolCall {
             name: "start_thread".into(),
-            arguments: json!({"provider":"grok","title":"Reporter","prompt":"Report on the files","client_request_id":"reporter"}),
+            arguments: json!({"provider":"grok","title":"Reporter","prompt":"Report on the files","client_reque\
+                st_id":"reporter"}),
             input_summary: None,
             veyra_label: false,
         },
@@ -775,7 +848,9 @@ fn grok_child_foreign_content_does_not_replace_its_report() {
         panic!("task was not delivered")
     };
     assert_eq!(summary, "Own child report");
-    assert!(loaded.items_for(child).any(|item| item.id == *source && matches!(&item.body, ItemBody::AssistantText { text, .. } if text == "Own child report")));
+    assert!(loaded.items_for(child).any(|item| item.id == *source
+        && matches!(&item.body,
+        ItemBody::AssistantText { text, .. } if text == "Own child report")));
     assert_eq!(
         delivered_text.unwrap(),
         format!(
@@ -795,22 +870,53 @@ fn grok_foreign_content_is_logged_and_dropped_only_during_veyra_work() {
         let updates = [
             json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"private-payload"}}),
             json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"private-payload"}}),
-            json!({"sessionUpdate":"tool_call","toolCallId":"tool","title":"private-payload","rawInput":{"text":"private-payload"},"status":"in_progress"}),
+            json!({"sessionUpdate":"tool_call","toolCallId":"tool","title":"private-payload","rawInput":{"text\
+                ":"private-payload"},"status":"in_progress"}),
             json!({"sessionUpdate":"plan","entries":[{"content":"private-payload","status":"pending"}]}),
         ];
         for update in &updates {
-            let decoded = codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"foreign"},"update":update}})).unwrap();
+            let decoded = codec
+                .value(
+                    json!({"method":"session/update","params":{"sessionId":"native","_meta":{
+                "promptId":"foreign"},"update":update}}),
+                )
+                .unwrap();
             assert!(decoded.events.is_empty());
         }
-        codec.value(json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","promptId":turn.to_string(),"stopReason":"end_turn"}})).unwrap();
+        codec.value(json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","promptId\
+            ":turn.to_string(),"stopReason":"end_turn"}})).unwrap();
         let mut shown = Vec::new();
         for update in &updates {
-            shown.extend(codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"foreign"},"update":update}})).unwrap().events);
+            shown.extend(
+                codec
+                    .value(
+                        json!({"method":"session/update","params":{"sessionId":"native","_meta":{"\
+                promptId":"foreign"},"update":update}}),
+                    )
+                    .unwrap()
+                    .events,
+            );
         }
-        assert!(shown.iter().any(|e| matches!(e, ProviderEvent::Turn { turn: None, event: TurnEvent::TextDelta { text, .. } } if text == "private-payload")));
-        assert!(shown.iter().any(|e| matches!(e, ProviderEvent::Turn { turn: None, event: TurnEvent::ReasoningDelta { text, .. } } if text == "private-payload")));
-        assert!(shown.iter().any(|e| matches!(e, ProviderEvent::Turn { turn: None, event: TurnEvent::ToolStarted { call, .. } } if call.name == "private-payload")));
-        assert!(shown.iter().any(|e| matches!(e, ProviderEvent::Turn { turn: None, event: TurnEvent::Plan(steps) } if steps.len() == 1 && steps[0].text == "private-payload")));
+        assert!(shown.iter().any(
+            |e| matches!(e, ProviderEvent::Turn { turn: None, event: TurnEvent::TextDelta
+            { text, .. } } if text == "private-payload")
+        ));
+        assert!(
+            shown
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Turn { turn: None, event:
+            TurnEvent::ReasoningDelta { text, .. } } if text == "private-payload"))
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Turn { turn: None, event:
+            TurnEvent::ToolStarted { call, .. } } if call.name == "private-payload"))
+        );
+        assert!(shown.iter().any(
+            |e| matches!(e, ProviderEvent::Turn { turn: None, event: TurnEvent::Plan(
+            steps) } if steps.len() == 1 && steps[0].text == "private-payload")
+        ));
     });
     let logs = logs.0.lock().unwrap();
     assert_eq!(
@@ -834,8 +940,13 @@ fn grok_completion_defaults_reason_but_validates_scope() {
         Some(json!(17)),
     ] {
         let mut codec = ready_codec();
-        let started = codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"foreign"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"report"}}}})).unwrap();
-        assert!(started.events.iter().any(|e| matches!(e, ProviderEvent::Turn { event: TurnEvent::TextDelta { text, .. }, .. } if text == "report")));
+        let started = codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"pro\
+            mptId":"foreign"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"\
+                report"}}}})).unwrap();
+        assert!(started.events.iter().any(
+            |e| matches!(e, ProviderEvent::Turn { event: TurnEvent::TextDelta {
+            text, .. }, .. } if text == "report")
+        ));
         let active = codec.active().unwrap();
         for params in [
             json!({"sessionId":"native","promptId":17,"stopReason":"end_turn"}),
@@ -880,12 +991,14 @@ fn grok_bash_variant_grants_only_the_exact_command_shape() {
     ] {
         let mut codec = ready_codec();
         codec.start(TurnId::new(), "work".into()).unwrap();
-        let mut input = json!({"variant":variant,"command":"pwd","description":"Check folder","is_background":false,"timeout":1000});
+        let mut input = json!({"variant":variant,"command":"pwd","description":"Check folder","is_background\
+            ":false,"timeout":1000});
         if extra {
             input["cwd"] = json!("/elsewhere");
         }
         let decoded = codec.value(json!({"id":"permission","method":"session/request_permission","params":{
-            "sessionId":"native","toolCall":{"toolCallId":"tool","title":"Execute `pwd`","kind":"execute","rawInput":input},
+            "sessionId":"native","toolCall":{"toolCallId":"tool","title":"Execute `pwd`","kind":"execute","rawI\
+                nput":input},
             "options":[{"optionId":"once","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]
         }})).unwrap();
         let action = decoded
@@ -990,7 +1103,8 @@ fn grok_accept_edits_docks_every_permission_without_reply() {
                     codec.interrupt_active(StopReason::User);
                 }
                 let decoded = codec.value(json!({"id":0,"method":"session/request_permission","params":{
-                    "sessionId":"native","toolCall":{"toolCallId":"edit","title":"Edit file","kind":"edit","locations":locations,"rawInput":{"file_path":path}},
+                    "sessionId":"native","toolCall":{"toolCallId":"edit","title":"Edit file","kind":"edit","loc\
+                        ations":locations,"rawInput":{"file_path":path}},
                     "options":[{"optionId":"once","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]
                 }})).unwrap();
                 assert!(
@@ -1029,7 +1143,9 @@ fn grok_accept_edits_docks_every_permission_without_reply() {
 fn grok_initialize_odd_catalog_values_keep_authentication_and_sign_in() {
     use crate::provider::*;
     use serde_json::json;
-    let base = json!({"authMethods":[{"id":"cached_token"}],"_meta":{"agentVersion":"1.0.60","modelState":{"currentModelId":"grok-4.7","availableModels":[{"modelId":"grok-4.7","name":"Grok 4.7","_meta":{"reasoningEfforts":[{"value":"high","default":true}]}}]}}});
+    let base = json!({"authMethods":[{"id":"cached_token"}],"_meta":{"agentVersion":"1.0.60","modelState":{"cur\
+        rentModelId":"grok-4.7","availableModels":[{"modelId":"grok-4.7","name":"Grok 4.7","_meta":{"reasoningE\
+            fforts":[{"value":"high","default":true}]}}]}}});
     let mut failures = Vec::new();
     for (path, value) in [
         (
@@ -1084,9 +1200,13 @@ fn grok_provider_permission_without_prompt_docks_and_answers() {
     use crate::{domain::*, provider::*};
     use serde_json::json;
     let mut codec = ready_codec();
-    let started=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"task-completed-permission"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"report"}}}})).unwrap();
+    let started=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId\
+        ":"task-completed-permission"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text\
+            ","text":"report"}}}})).unwrap();
     assert!(started.provider_turn.is_some());
-    let decoded=codec.value(json!({"id":0,"method":"session/request_permission","params":{"sessionId":"native","toolCall":{"toolCallId":"tool","title":"Execute `pwd`","rawInput":{"variant":"Bash","command":"pwd"}},"options":[{"optionId":"once","kind":"allow_once"}]}})).unwrap();
+    let decoded=codec.value(json!({"id":0,"method":"session/request_permission","params":{"sessionId":"native",
+        "toolCall":{"toolCallId":"tool","title":"Execute `pwd`","rawInput":{"variant":"Bash","command":"pwd"}},
+            "options":[{"optionId":"once","kind":"allow_once"}]}})).unwrap();
     assert!(decoded.replies.is_empty());
     let native = decoded
         .events
@@ -1109,7 +1229,9 @@ fn grok_provider_permission_without_prompt_docks_and_answers() {
             json!({"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"once"}}})
         )
     );
-    let ended=codec.value(json!({"method":"_x.ai/session_notification","params":{"sessionId":"native","update":{"sessionUpdate":"turn_completed","prompt_id":"task-completed-permission","stop_reason":"end_turn"}}})).unwrap();
+    let ended=codec.value(json!({"method":"_x.ai/session_notification","params":{"sessionId":"native","update\
+        ":{"sessionUpdate":"turn_completed","prompt_id":"task-completed-permission","stop_reason":"end_turn\
+            "}}})).unwrap();
     assert!(matches!(
         ended.events.as_slice(),
         [ProviderEvent::Turn {
@@ -1129,15 +1251,27 @@ fn grok_early_turn_completed_prevents_late_prompt_reopening() {
     use serde_json::json;
     let mut codec = ready_codec();
     for method in ["_x.ai/session_notification", "x.ai/session_notification"] {
-        let completed=codec.value(json!({"method":method,"params":{"sessionId":"native","update":{"sessionUpdate":"turn_completed","prompt_id":"task-completed-early","stop_reason":"end_turn"}}})).unwrap();
+        let completed = codec
+            .value(
+                json!({"method":method,"params":{"sessionId":"native","update":{"sessionUpdat\
+            e":"turn_completed","prompt_id":"task-completed-early","stop_reason":"end_turn"}}}),
+            )
+            .unwrap();
         assert!(completed.events.is_empty());
-        let late=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"task-completed-early"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"late"}}}})).unwrap();
+        let late=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId\
+            ":"task-completed-early"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text",
+                "text":"late"}}}})).unwrap();
         assert!(late.events.is_empty() && late.provider_turn.is_none());
         assert!(codec.active().is_none());
     }
-    let fresh=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"task-completed-fresh"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh"}}}})).unwrap();
+    let fresh=codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":"\
+        task-completed-fresh"},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text\
+            ":"fresh"}}}})).unwrap();
     assert!(fresh.provider_turn.is_some());
-    assert!(fresh.events.iter().any(|e|matches!(e,ProviderEvent::Turn {event:TurnEvent::TextDelta {text,..},..} if text=="fresh")));
+    assert!(fresh.events.iter().any(
+        |e| matches!(e,ProviderEvent::Turn {event:TurnEvent::TextDelta {text,..},
+        ..} if text=="fresh")
+    ));
 }
 
 #[test]
@@ -1159,7 +1293,12 @@ fn grok_ordinary_session_notifications_log_nothing() {
                 "auto_compact_completed",
                 "turn_completed",
             ] {
-                let decoded=codec.value(json!({"method":method,"params":{"sessionId":"native","update":{"sessionUpdate":update}}})).unwrap();
+                let decoded = codec
+                    .value(
+                        json!({"method":method,"params":{"sessionId":"native","update":{"sessio\
+                    nUpdate":update}}}),
+                    )
+                    .unwrap();
                 assert!(decoded.events.is_empty() && decoded.provider_turn.is_none());
             }
         }
@@ -1207,7 +1346,12 @@ fn grok_non_full_access_disables_auto_on_every_open() {
                 false,
             );
             codec.initialize();
-            let init=codec.value(json!({"id":1,"result":{"authMethods":[{"id":"cached_token"}],"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}})).unwrap();
+            let init = codec
+                .value(
+                    json!({"id":1,"result":{"authMethods":[{"id":"cached_token"}],"agentCapabiliti\
+                es":{"sessionCapabilities":{"resume":{}}}}}),
+                )
+                .unwrap();
             assert_eq!(init.replies[0]["method"], "authenticate");
             let auth = codec.value(json!({"id":2,"result":{}})).unwrap();
             let open = auth.controls[0].value();
@@ -1233,7 +1377,8 @@ fn grok_non_full_access_disables_auto_on_every_open() {
                 "retained-session"
             };
             assert!(
-                matches!(opened.events.as_slice(),[ProviderEvent::Session(SessionEvent::Ready {native:NativeSessionId(id),..})] if id==native)
+                matches!(opened.events.as_slice(),[ProviderEvent::Session(SessionEvent::Ready {
+                    native:NativeSessionId(id),..})] if id==native)
             );
             if mode == PermissionMode::FullAccess {
                 assert!(opened.replies.is_empty());
@@ -1241,7 +1386,8 @@ fn grok_non_full_access_disables_auto_on_every_open() {
                 assert_eq!(
                     opened.replies,
                     [
-                        json!({"jsonrpc":"2.0","method":"_x.ai/yolo_mode_changed","params":{"sessionId":native,"yolo_mode":false,"auto_mode":false}})
+                        json!({"jsonrpc":"2.0","method":"_x.ai/yolo_mode_changed","params":{"sessionId":native,
+                            "yolo_mode":false,"auto_mode":false}})
                     ]
                 );
             }
@@ -1312,8 +1458,11 @@ async fn codec_guard_waits_once_and_ignores_late_reply() {
     let mut codec = ready_codec();
     let turn = TurnId::new();
     codec.start(turn, "first".into()).unwrap();
-    codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId":turn.to_string()},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first reply"}}}})).unwrap();
-    let completed = json!({"method":"_x.ai/session_notification","params":{"sessionId":"native","update":{"sessionUpdate":"turn_completed","prompt_id":turn.to_string(),"stop_reason":"end_turn"}}});
+    codec.value(json!({"method":"session/update","params":{"sessionId":"native","_meta":{"promptId\
+        ":turn.to_string()},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fi\
+            rst reply"}}}})).unwrap();
+    let completed = json!({"method":"_x.ai/session_notification","params":{"sessionId":"native","update":{"sess\
+        ionUpdate":"turn_completed","prompt_id":turn.to_string(),"stop_reason":"end_turn"}}});
     assert!(codec.value(completed.clone()).unwrap().events.is_empty());
     tokio::time::advance(std::time::Duration::from_millis(1999)).await;
     assert!(codec.completed_prompts().events.is_empty());
@@ -1322,7 +1471,8 @@ async fn codec_guard_waits_once_and_ignores_late_reply() {
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
     let ended = codec.completed_prompts();
     assert!(
-        matches!(ended.events.as_slice(), [ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,park:false}}] if *id==turn)
+        matches!(ended.events.as_slice(), [ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {
+            outcome:TurnOutcome::Completed,park:false}}] if *id==turn)
     );
     assert!(codec.completed_prompts().events.is_empty());
     assert!(
@@ -1343,7 +1493,10 @@ fn codec_untagged_tail_never_ends_next_prompt() {
     codec
         .value(json!({"id":3,"result":{"stopReason":"end_turn"}}))
         .unwrap();
-    let untagged = |cancelled| json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","stopReason":if cancelled {"cancelled"} else {"end_turn"},"cancellationCategory":"PermissionRejected"}});
+    let untagged = |cancelled| {
+        json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","\
+        stopReason":if cancelled {"cancelled"} else {"end_turn"},"cancellationCategory":"PermissionRejected"}})
+    };
     let second = TurnId::new();
     codec.start(second, "second".into()).unwrap();
     for cancelled in [false, true] {
@@ -1354,16 +1507,19 @@ fn codec_untagged_tail_never_ends_next_prompt() {
         .value(json!({"id":4,"result":{"stopReason":"end_turn"}}))
         .unwrap();
     assert!(
-        matches!(reply.events.last(), Some(ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,..}}) if *id==second)
+        matches!(reply.events.last(), Some(ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {
+            outcome:TurnOutcome::Completed,..}}) if *id==second)
     );
     let third = TurnId::new();
     codec.start(third, "third".into()).unwrap();
     assert!(codec.value(untagged(false)).unwrap().events.is_empty());
     assert!(matches!(codec.active(), Some(ActiveTurn::Veyra(id)) if id == third));
-    let tagged = json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","promptId":third.to_string(),"stopReason":"end_turn"}});
+    let tagged = json!({"method":"_x.ai/session/prompt_complete","params":{"sessionId":"native","promptId\
+        ":third.to_string(),"stopReason":"end_turn"}});
     let ended = codec.value(tagged.clone()).unwrap();
     assert!(
-        matches!(ended.events.last(), Some(ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {outcome:TurnOutcome::Completed,..}}) if *id==third)
+        matches!(ended.events.last(), Some(ProviderEvent::Turn {turn:Some(id),event:TurnEvent::TurnEnded {
+            outcome:TurnOutcome::Completed,..}}) if *id==third)
     );
     assert!(codec.value(tagged).unwrap().events.is_empty());
 }

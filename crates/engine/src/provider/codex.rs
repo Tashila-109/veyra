@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Codex app-server JSON is decoded and encoded at this provider boundary.
 use super::{
     ActiveTurn, Decoded, Outbound, ProviderError, ProviderEvent, SessionEvent, SessionSpec,
     StopReason, TurnEvent,
@@ -61,7 +62,8 @@ pub fn turn_params(native: &str, config: &ThreadConfig, text: String) -> Value {
     })
 }
 pub fn initialize() -> Value {
-    json!({"clientInfo":{"name":"veyra","title":"Veyra","version":env!("CARGO_PKG_VERSION")},"capabilities":{"optOutNotificationMethods":["turn/diff/updated"]}})
+    json!({"clientInfo":{"name":"veyra","title":"Veyra","version":env!("CARGO_PKG_VERSION")},"capabilities":{"o\
+        ptOutNotificationMethods":["turn/diff/updated"]}})
 }
 #[derive(Clone, Copy)]
 enum Call {
@@ -304,7 +306,12 @@ impl Codec {
         });
     }
     fn history_page(&mut self, cursor: Option<&str>) -> Value {
-        self.peer.send(Call::History, "thread/turns/list", json!({"threadId":self.native().unwrap().0,"cursor":cursor,"limit":100,"sortDirection":"desc"}))
+        self.peer.send(
+            Call::History,
+            "thread/turns/list",
+            json!({"threadId":self.native().unwrap().0,"cursor\
+            ":cursor,"limit":100,"sortDirection":"desc"}),
+        )
     }
     fn open_thread(&mut self) -> Result<Outbound, ProviderError> {
         let mut spec = self.spec.clone();
@@ -764,7 +771,8 @@ impl Codec {
                                 .as_ref()
                                 .and_then(|error| match error.codex_error_info {
                                     Some(wire::ErrorKind::Unauthorized) => Some(
-                                        "Codex is signed out. Sign in from a terminal with `codex login`, then send again.",
+                                        "Codex is signed out. Sign in from a terminal with `codex login`, then \
+                                            send again.",
                                     ),
                                     _ => error.message.as_deref(),
                                 })
@@ -1653,12 +1661,24 @@ mod tests {
         let dispatched = codec.start(turn, "cursor probe".into()).unwrap();
         assert_eq!(dispatched.cursor, Some(super::super::CursorUpdate::Unknown));
         assert!(
-            matches!(dispatched.events.as_slice(), [ProviderEvent::Session(SessionEvent::Dispatched { turn: owner })] if *owner == turn)
+            matches!(dispatched.events.as_slice(), [ProviderEvent::Session(SessionEvent::Dispatched { turn:
+                owner })] if *owner == turn)
         );
-        let decoded = codec.value(json!({"id":dispatched.controls[0].value()["id"],"result":{"turn":{"id":"server-turn"}}})).unwrap();
+        let decoded = codec
+            .value(
+                json!({"id":dispatched.controls[0].value()["id"],"result":{"turn":{"id":"serv\
+            er-turn"}}}),
+            )
+            .unwrap();
         assert_eq!(decoded.cursor, Some("server-turn".into()));
-        codec.value(json!({"method":"turn/completed","params":{"threadId":"old-thread","turn":{"id":"server-turn","status":"completed"}}})).unwrap();
-        let decoded = codec.value(json!({"method":"turn/started","params":{"threadId":"old-thread","turn":{"id":"cli-turn"}}})).unwrap();
+        codec.value(json!({"method":"turn/completed","params":{"threadId":"old-thread","turn":{"id":"server-tur\
+            n","status":"completed"}}})).unwrap();
+        let decoded = codec
+            .value(
+                json!({"method":"turn/started","params":{"threadId":"old-thread","turn":{"id\
+            ":"cli-turn"}}}),
+            )
+            .unwrap();
         assert_eq!(decoded.cursor, Some("cli-turn".into()));
     }
 
@@ -1678,7 +1698,8 @@ mod tests {
             Some(NativeSessionId("old-thread".into()))
         );
         let mut codec = resumed();
-        let d=codec.value(json!({"id":2,"error":{"code":-32600,"message":"no rollout found for thread id old-thread"}})).unwrap();
+        let d=codec.value(json!({"id":2,"error":{"code":-32600,"message":"no rollout found for thread id old-th\
+            read"}})).unwrap();
         assert_eq!(d.replies[0]["method"], "thread/start");
         assert_eq!(codec.native().cloned(), None);
     }
@@ -1688,7 +1709,10 @@ mod tests {
         let start = Instant::now();
         let mut id = 2;
         loop {
-            let result=codec.value(json!({"id":id,"error":{"code":-32600,"message":"thread old-thread already has an active writer"}}));
+            let result = codec.value(
+                json!({"id":id,"error":{"code":-32600,"message":"thread old-thread already h\
+                as an active writer"}}),
+            );
             if let Err(error) = result {
                 assert_eq!(
                     error.to_string(),
@@ -1726,11 +1750,13 @@ mod tests {
             "thread/status/changed",
             "veyra/future",
         ] {
-            let d=codec.value(json!({"method":method,"params":{"threadId":"old-thread","turnId":"stray-turn","status":{"type":"active"}},"emittedAtMs":1})).unwrap();
+            let d=codec.value(json!({"method":method,"params":{"threadId":"old-thread","turnId":"stray-turn","s\
+                tatus":{"type":"active"}},"emittedAtMs":1})).unwrap();
             assert!(d.events.is_empty());
             assert!(d.provider_turn.is_none());
         }
-        let d=codec.value(json!({"method":"turn/started","params":{"threadId":"old-thread","turn":{"id":"cli-turn"}}})).unwrap();
+        let d=codec.value(json!({"method":"turn/started","params":{"threadId":"old-thread","turn":{"id":"cli-tu\
+            rn"}}})).unwrap();
         assert!(d.provider_turn.is_some());
         assert!(matches!(
             d.events.as_slice(),
@@ -1753,7 +1779,11 @@ mod tests {
             ] {
                 assert_eq!(
                     elicitation_tool(
-                        &serde_json::from_value(json!({"serverName":"veyra","message":message,"mode":"form","_meta":meta})).unwrap()
+                        &serde_json::from_value(
+                            json!({"serverName":"veyra","message":message,"mode":"form","_m\
+                            eta":meta})
+                        )
+                        .unwrap()
                     ),
                     Some("list_providers".into())
                 );
@@ -1792,7 +1822,8 @@ mod tests {
         .enumerate()
         {
             let item: wire::Item = serde_json::from_value(json!({
-                "type":kind,"id":format!("item-{index}"),"tool":if kind == "collabAgentToolCall" { "spawnAgent" } else { "named_tool" },
+                "type":kind,"id":format!("item-{index}"),"tool":if kind == "collabAgentToolCall" { "spawnAgent\
+                    " } else { "named_tool" },
                 "server":"remote","action":"spawnAgent","kind":"started",
                 "agentThreadId":"child","agentPath":"child"
             }))
@@ -1844,7 +1875,8 @@ mod tests {
     }
     fn early_approval(turn: &str) -> Value {
         json!({"id":0,"method":"item/commandExecution/requestApproval",
-            "params":{"threadId":"old-thread","turnId":turn,"itemId":"command","command":"touch test-file","cwd":"/project"}})
+            "params":{"threadId":"old-thread","turnId":turn,"itemId":"command","command":"touch test-file","cwd\
+                ":"/project"}})
     }
     fn request_count(decoded: &Decoded) -> usize {
         decoded
@@ -1872,7 +1904,13 @@ mod tests {
             1,
             "a provider waiting for consent before its start reply must progress"
         );
-        assert!(opened.events.iter().any(|e| matches!(e,ProviderEvent::Turn {turn:Some(id),event:TurnEvent::RequestOpened{..}} if *id==turn)));
+        assert!(
+            opened
+                .events
+                .iter()
+                .any(|e| matches!(e,ProviderEvent::Turn {turn:Some(id),
+            event:TurnEvent::RequestOpened{..}} if *id==turn))
+        );
         assert_eq!(
             codec
                 .answer(NativeRequestRef("0".into()), Decision::Deny)
@@ -1923,9 +1961,16 @@ mod tests {
         let turn = TurnId::new();
         codec.start(turn, "work".into()).unwrap();
         let opened=codec.value(json!({"id":0,"method":"mcpServer/elicitation/request",
-            "params":{"threadId":"old-thread","serverName":"veyra","message":"Allow the veyra MCP server to run tool list_providers"}})).unwrap();
+            "params":{"threadId":"old-thread","serverName":"veyra","message":"Allow the veyra MCP server to ru\
+                n tool list_providers"}})).unwrap();
         assert_eq!(request_count(&opened), 1);
-        assert!(opened.events.iter().any(|e|matches!(e,ProviderEvent::Turn {turn:Some(id),event:TurnEvent::RequestOpened{..}} if *id==turn)));
+        assert!(
+            opened
+                .events
+                .iter()
+                .any(|e| matches!(e,ProviderEvent::Turn {turn:Some(id),
+            event:TurnEvent::RequestOpened{..}} if *id==turn))
+        );
         assert_eq!(
             codec
                 .answer(NativeRequestRef("0".into()), Decision::AllowOnce)
@@ -1985,7 +2030,8 @@ mod limit_tests {
             assert_eq!(
                 texts(
                     &mut codec(),
-                    json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"rateLimitReachedType":kind,"primary":{"usedPercent":1}}}})
+                    json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"rateLimitReachedType\
+                        ":kind,"primary":{"usedPercent":1}}}})
                 ),
                 Vec::<String>::new()
             );
@@ -1996,18 +2042,21 @@ mod limit_tests {
         for (limits, expected) in [
             (
                 json!({"secondary":{"usedPercent":95,"windowDurationMins":300,"resetsAt":1792472736}}),
-                "Codex is near its usage limit: secondary window (5 hours), 95% used. Resets at 2026-10-20 05:05:36 UTC.",
+                "Codex is near its usage limit: secondary window (5 hours), 95% used. Resets at 2026-10-20 05:0\
+                    5:36 UTC.",
             ),
             (
                 json!({"primary":{"usedPercent":100,"windowDurationMins":30,"resetsAt":1792472736}}),
-                "Codex reached its usage limit: primary window (30 minutes), 100% used. Resets at 2026-10-20 05:05:36 UTC.",
+                "Codex reached its usage limit: primary window (30 minutes), 100% used. Resets at 2026-10-20 05\
+                    :05:36 UTC.",
             ),
             (
                 json!({"secondary":{"usedPercent":90}}),
                 "Codex is near its usage limit: secondary window, 90% used.",
             ),
             (
-                json!({"spendControlReached":true,"individualLimit":{"limit":"100","used":"100","remainingPercent":0,"resetsAt":1792472736}}),
+                json!({"spendControlReached":true,"individualLimit":{"limit":"100","used":"100","remainingPerce\
+                    nt":0,"resetsAt":1792472736}}),
                 "Codex reached its spend limit. Resets at 2026-10-20 05:05:36 UTC.",
             ),
             (
@@ -2129,7 +2178,9 @@ mod collaboration_tests {
             codec
                 .value(json!({"id":3,"result":{"turn":{"id":"native-turn"}}}))
                 .unwrap();
-            let decoded=codec.value(json!({"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"collabAgentToolCall","id":"agent-call","tool":action,"status":"inProgress"}}})).unwrap();
+            let decoded=codec.value(json!({"method":"item/started","params":{"threadId":"native-thread","turnId\
+                ":"native-turn","item":{"type":"collabAgentToolCall","id":"agent-call","tool":action,"status":"\
+                    inProgress"}}})).unwrap();
             let name = decoded.events.iter().find_map(|event| match event {
                 ProviderEvent::Turn {
                     event: TurnEvent::ToolStarted { call, .. },

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Import tests construct native history and provider wire envelopes.
 use super::*;
 
 #[cfg(debug_assertions)]
@@ -47,24 +48,18 @@ fn cancel_held_prompt(cancellation: HeldCancellation) {
     let binary = scratch.0.join("provider");
     fs::write(
         &binary,
-        r#"#!/usr/bin/python3
-import json,pathlib,sys
-root=pathlib.Path.cwd()
-history=root/'projects/fixture/native.jsonl'
-active=None
-for raw in sys.stdin:
-    wire=json.loads(raw)
-    with (root/'stdin.jsonl').open('a') as out: out.write(raw)
-    if wire.get('type')=='user':
-        active=wire['uuid']
-        with history.open('a') as out:
-            out.write(json.dumps({'type':'user','entrypoint':'sdk-cli','sessionId':'native','uuid':active,'message':wire['message']})+'\n')
-    elif wire.get('request',{}).get('subtype')=='initialize':
-        print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':wire['request_id'],'response':{}}}),flush=True)
-    elif wire.get('request',{}).get('subtype')=='interrupt' and active:
-        print(json.dumps({'type':'result','subtype':'error_during_execution','session_id':'native','is_error':True,'uuid':'result','result':'interrupted'}),flush=True)
-        active=None
-"#,
+        "#!/usr/bin/python3\nimport json,pathlib,sys\nroot=pathlib.Path.cwd()\nhistory=root/'projects/fixture/n\
+            ative.jsonl'\nactive=None\nfor raw in sys.stdin:\n    wire=json.loads(raw)\n    with (root/'stdin.j\
+                sonl').open('a') as out: out.write(raw)\n    if wire.get('type')=='user':\n        active=wire[\
+                    'uuid']\n        with history.open('a') as out:\n            out.write(json.dumps({'type':'\
+                        user','entrypoint':'sdk-cli','sessionId':'native','uuid':active,'message':wire['message\
+                            ']})+'\\n')\n    elif wire.get('request',{}).get('subtype')=='initialize':\
+                                \n        print(json.dumps({'type':'control_response','response':{'subtype':'su\
+                                    ccess','request_id':wire['request_id'],'response':{}}}),flush=True)\n    el\
+                                        if wire.get('request',{}).get('subtype')=='interrupt' and active:\
+                                            \n        print(json.dumps({'type':'result','subtype':'error_during\
+                                                _execution','session_id':'native','is_error':True,'uuid':'resul\
+                                                t','result':'interrupted'}),flush=True)\n        active=None\n",
     )
     .unwrap();
     assert!(
@@ -77,7 +72,15 @@ for raw in sys.stdin:
     );
     let native = NativeSessionId("native".into());
     let history_path = scratch.0.join("projects/fixture/native.jsonl");
-    fs::write(&history_path, format!("{}\n", json!({"type":"user","entrypoint":"sdk-cli","sessionId":"native","uuid":"previous","message":{"content":"already shown"}}))).unwrap();
+    fs::write(
+        &history_path,
+        format!(
+            "{}\n",
+            json!({"type":"user","entrypoint":"sdk-cli","sessionId":"native","\
+        uuid":"previous","message":{"content":"already shown"}})
+        ),
+    )
+    .unwrap();
     let mut f = Fixture::new(LiveState::Idle);
     let mut changes = ChangeSet::default();
     let mut row = f.loaded().threads[&f.thread].clone();
@@ -141,7 +144,8 @@ for raw in sys.stdin:
             .unwrap()
     });
     assert!(
-        matches!(&dispatched, EngineMsg::Provider { event: ProviderEvent::Session(SessionEvent::Dispatched { turn: id }), .. } if *id == turn)
+        matches!(&dispatched, EngineMsg::Provider { event: ProviderEvent::Session(SessionEvent::Dispatched {
+            turn: id }), .. } if *id == turn)
     );
     let started = std::time::Instant::now();
     match cancellation {
@@ -236,8 +240,10 @@ for raw in sys.stdin:
         .open(&history_path)
         .unwrap();
     for entry in [
-        json!({"type":"user","entrypoint":"cli","sessionId":"native","uuid":"terminal-user","message":{"content":"typed in terminal"}}),
-        json!({"type":"assistant","entrypoint":"cli","sessionId":"native","uuid":"terminal-reply","message":{"content":[{"type":"text","text":"terminal reply"}]}}),
+        json!({"type":"user","entrypoint":"cli","sessionId":"native","uuid":"terminal-user","message":{"content\
+            ":"typed in terminal"}}),
+        json!({"type":"assistant","entrypoint":"cli","sessionId":"native","uuid":"terminal-reply","message":{"c\
+            ontent":[{"type":"text","text":"terminal reply"}]}}),
     ] {
         writeln!(history_file, "{entry}").unwrap();
     }
@@ -251,7 +257,8 @@ for raw in sys.stdin:
     )
     .unwrap();
     eprintln!(
-        "{cancellation:?}: stdin={order:?} elapsed={elapsed:?} end={ended:?} kept_process={kept_process} cursor={cursor:?} import={history:?}"
+        "{cancellation:?}: stdin={order:?} elapsed={elapsed:?} end={ended:?} kept_process={kept_process} cursor\
+            ={cursor:?} import={history:?}"
     );
     assert_eq!(order, ["initialize", "user", "interrupt"]);
     assert_eq!(wires[1]["uuid"], turn.to_string());
@@ -610,9 +617,12 @@ fn switch_idle_closes_stdin_before_ladder() {
     std::fs::create_dir(&root).unwrap();
     let _scratch = Scratch(root.clone());
     let records = [
-        json!({"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"fake","scenario":"graceful close","source":"Veyra authored"}),
-        json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:initialize>","request":{"subtype":"initialize"}}}),
-        json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:initialize>","response":{}}}}),
+        json!({"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"fake","sce\
+            nario":"graceful close","source":"Veyra authored"}),
+        json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:initialize>","reques\
+            t":{"subtype":"initialize"}}}),
+        json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request\
+            _id":"<id:initialize>","response":{}}}}),
         json!({"type":"spin","ms":1600}),
         json!({"type":"touch","path":"graceful-exit"}),
         json!({"type":"exit","code":0}),
@@ -734,7 +744,16 @@ fn import_takes_only_turns_after_cursor() {
         Some("new-user")
     );
     assert!(!p.threads[&f.thread].import_pending);
-    assert_eq!(p.items.values().filter(|item| matches!(&item.body, ItemBody::TerminalSpan(span) if span.text == "second\nreply second")).count(), 1);
+    assert_eq!(
+        p.items
+            .values()
+            .filter(
+                |item| matches!(&item.body, ItemBody::TerminalSpan(span) if span.text
+        == "second\nreply second")
+            )
+            .count(),
+        1
+    );
     f.event(ProviderEvent::Session(SessionEvent::History {
         native,
         history,
@@ -756,7 +775,9 @@ fn switch_back_imports_once() {
     let config_root = root.join("claude-config");
     fs::create_dir_all(config_root.join("projects/veyra-fake")).unwrap();
     let history_path = config_root.join(format!("projects/veyra-fake/{}.jsonl", native.0));
-    fs::write(&history_path, format!("{}\n", json!({"sessionId":native.0,"uuid":"sdk-anchor","parentUuid":null,"isSidechain":false,"type":"user","entrypoint":"sdk-cli","message":{"content":[{"type":"text","text":"already in chat"}]}}))).unwrap();
+    fs::write(&history_path, format!("{}\n", json!({"sessionId":native.0,"uuid":"sdk-anchor","parentUuid":null,
+        "isSidechain":false,"type":"user","entrypoint":"sdk-cli","message":{"content":[{"type":"text","text":"a\
+            lready in chat"}]}}))).unwrap();
     let db_path = root.join("test.db");
     let mut db = store::open(&db_path).unwrap();
     let mut c = ChangeSet {
@@ -771,12 +792,17 @@ fn switch_back_imports_once() {
     let tx = db.transaction().unwrap();
     store::apply(&tx, &c, now()).unwrap();
     tx.commit().unwrap();
-    db.execute_batch("CREATE TABLE cursor_updates (value TEXT); CREATE TRIGGER count_cursor AFTER UPDATE OF native_cursor ON threads WHEN OLD.native_cursor IS NOT NEW.native_cursor BEGIN INSERT INTO cursor_updates VALUES (NEW.native_cursor); END;").unwrap();
-    let header = json!({"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"fake","scenario":"round trip","source":"Veyra authored"});
+    db.execute_batch("CREATE TABLE cursor_updates (value TEXT); CREATE TRIGGER count_cursor AFTER UPDATE OF nat\
+        ive_cursor ON threads WHEN OLD.native_cursor IS NOT NEW.native_cursor BEGIN INSERT INTO cursor_updates \
+            VALUES (NEW.native_cursor); END;").unwrap();
+    let header = json!({"type":"transcript_start","provider":"claude","protocol":"stream-json","cli_version":"f\
+        ake","scenario":"round trip","source":"Veyra authored"});
     let init = [
         header.clone(),
-        json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
-        json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}),
+        json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"s\
+            ubtype":"initialize"}}}),
+        json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request\
+            _id":"<id:init>","response":{}}}}),
     ];
     let write = |name: &str, records: Vec<serde_json::Value>| {
         fs::write(
@@ -800,8 +826,10 @@ fn switch_back_imports_once() {
         write(&format!("t1-s{spawn}.jsonl"), records);
     }
     let mut resume = init.to_vec();
-    resume.push(json!({"type":"expect_outbound","line":{"type":"user","uuid":"<id:prompt>","session_id":"<id:session>","parent_tool_use_id":null,"message":{"role":"user","content":"after recovery"}}}));
-    resume.push(json!({"type":"emit_inbound","line":{"type":"result","subtype":"success","session_id":"<id:session>","is_error":false,"result":"ok","uuid":"result"}}));
+    resume.push(json!({"type":"expect_outbound","line":{"type":"user","uuid":"<id:prompt>","session_id":"<id:se\
+        ssion>","parent_tool_use_id":null,"message":{"role":"user","content":"after recovery"}}}));
+    resume.push(json!({"type":"emit_inbound","line":{"type":"result","subtype":"success","session_id":"<id:sess\
+        ion>","is_error":false,"result":"ok","uuid":"result"}}));
     resume.push(json!({"type":"exit","code":0}));
     fs::create_dir(root.join("recovered")).unwrap();
     fs::write(
@@ -1052,7 +1080,8 @@ fn switch_back_imports_once() {
     });
     drop(scratch);
     eprintln!(
-        "Claude round trip: raw ESC+CR echoed, one span/one cursor update, native retained; empty repeat added nothing; quit recovery imported before first turn"
+        "Claude round trip: raw ESC+CR echoed, one span/one cursor update, native retained; empty repeat added \
+            nothing; quit recovery imported before first turn"
     );
 }
 
@@ -1072,7 +1101,15 @@ fn switch_stalled_sync_flushes_fake_tui_without_more_bytes() {
     c.threads.insert(f.thread, row);
     f.save(c);
     let bytes = b"\x1b[?2026hSYNC_STALLED\r\n";
-    std::fs::write(root.join("t1-s1.jsonl"),format!("{}\n",json!({"type":"emit_raw","base64":base64::engine::general_purpose::STANDARD.encode(bytes)}))).unwrap();
+    std::fs::write(
+        root.join("t1-s1.jsonl"),
+        format!(
+            "{}\n",
+            json!({"type":"emit_raw","base64\
+        ":base64::engine::general_purpose::STANDARD.encode(bytes)})
+        ),
+    )
+    .unwrap();
     let mut env = env::ChildEnv::isolated()
         .with_binary(ProviderKind::Claude, fake_binary())
         .with_variable("CLAUDE_CONFIG_DIR", root.join("config"));
@@ -1141,7 +1178,10 @@ fn import_failure_before_ready_clears_pending_and_starts_queued_work() {
         Live::Structured { .. }
     ));
     assert!(!f.loaded().threads[&f.thread].import_pending);
-    assert!(f.loaded().items.values().any(|item| matches!(&item.body, ItemBody::Notice(text) if text.text == crate::provider::IMPORT_NOTICE)));
+    assert!(f.loaded().items.values().any(
+        |item| matches!(&item.body, ItemBody::Notice(text) if text.text ==
+        crate::provider::IMPORT_NOTICE)
+    ));
 }
 
 #[test]
@@ -1307,7 +1347,10 @@ fn large_paste_keeps_reader_moving() {
     use base64::Engine;
     use serde_json::json;
     use std::time::{Duration, Instant};
-    let raw = |bytes: &[u8]| json!({"type":"emit_raw","base64":base64::engine::general_purpose::STANDARD.encode(bytes)});
+    let raw = |bytes: &[u8]| {
+        json!({"type":"emit_raw","base64\
+        ":base64::engine::general_purpose::STANDARD.encode(bytes)})
+    };
     let (f, _scratch, env) = terminal_fixture(
         ProviderKind::Claude,
         &[
@@ -1366,11 +1409,40 @@ fn failed_terminal_shows_reason_without_import() {
     let (f, _scratch, mut env) = terminal_fixture(ProviderKind::Grok, &[]);
     env = env.with_binary(ProviderKind::Grok, "/nonexistent/terminal-test".into());
     f.runtime.block_on(async {
-        let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();
-        engine.send(Command::SwitchView {thread:f.thread,to:View::Terminal}).await.unwrap().unwrap();
-        let result=tokio::time::timeout(std::time::Duration::from_secs(3),async {loop {if engine.terminal(f.thread).is_none() {return engine.snapshot(f.thread).await.unwrap();}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}}).await;
-        engine.shutdown_wait().await;let snapshot=result.unwrap();
-        assert!(!store::load(&Connection::open(_scratch.0.join("test.db")).unwrap()).unwrap().threads[&f.thread].import_pending);assert!(snapshot.items.iter().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("not installed"))));
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        engine
+            .send(Command::SwitchView {
+                thread: f.thread,
+                to: View::Terminal,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if engine.terminal(f.thread).is_none() {
+                    return engine.snapshot(f.thread).await.unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        engine.shutdown_wait().await;
+        let snapshot = result.unwrap();
+        assert!(
+            !store::load(&Connection::open(_scratch.0.join("test.db")).unwrap())
+                .unwrap()
+                .threads[&f.thread]
+                .import_pending
+        );
+        assert!(snapshot.items.iter().any(|item| matches!(&item.body,
+                ItemBody::Notice(notice) if notice.text.contains("not installed"))));
     });
 }
 #[cfg(debug_assertions)]
@@ -1383,9 +1455,45 @@ fn signed_out_terminal_keeps_sign_in_reason() {
         ],
     );
     f.runtime.block_on(async {
-        let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();engine.send(Command::SwitchView {thread:f.thread,to:View::Terminal}).await.unwrap().unwrap();
-        let result=tokio::time::timeout(std::time::Duration::from_secs(3),async {loop {if engine.terminal(f.thread).is_none() {return engine.snapshot(f.thread).await.unwrap();}tokio::time::sleep(std::time::Duration::from_millis(5)).await;}}).await;
-        engine.shutdown_wait().await;let snapshot=result.unwrap();assert!(store::load(&Connection::open(_scratch.0.join("test.db")).unwrap()).unwrap().threads[&f.thread].import_pending);assert!(snapshot.items.iter().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("Sign in to Grok"))));
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        engine
+            .send(Command::SwitchView {
+                thread: f.thread,
+                to: View::Terminal,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if engine.terminal(f.thread).is_none() {
+                    return engine.snapshot(f.thread).await.unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        engine.shutdown_wait().await;
+        let snapshot = result.unwrap();
+        assert!(
+            store::load(&Connection::open(_scratch.0.join("test.db")).unwrap())
+                .unwrap()
+                .threads[&f.thread]
+                .import_pending
+        );
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .any(|item| matches!(&item.body,ItemBody::Notice(notice) if
+                    notice.text.contains("Sign in to Grok")))
+        );
     });
 }
 #[cfg(debug_assertions)]
@@ -1612,13 +1720,23 @@ fn grok_not_found_import_runs_queued_work() {
         false,
     );
     let init = codec.initialize();
-    let mut open = codec.value(json!({"jsonrpc":"2.0","id":init["id"],"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{}}})).unwrap();
+    let mut open = codec
+        .value(
+            json!({"jsonrpc":"2.0","id":init["id"],"result":{"protocolVersion":1,"agentCapab\
+        ilities":{},"agentInfo":{}}}),
+        )
+        .unwrap();
     let open = open.take_outbound();
     let crate::provider::Outbound::Message(load) = &open[0] else {
         panic!("load message")
     };
     assert_eq!(load["method"], "session/load");
-    let mut fallback = codec.value(json!({"jsonrpc":"2.0","id":load["id"],"error":{"code":-32602,"message":"Session not found"}})).unwrap();
+    let mut fallback = codec
+        .value(
+            json!({"jsonrpc":"2.0","id":load["id"],"error":{"code":-32602,"message":"Ses\
+        sion not found"}}),
+        )
+        .unwrap();
     let fallback = fallback.take_outbound();
     let crate::provider::Outbound::Message(new) = &fallback[0] else {
         panic!("new message")
@@ -1637,7 +1755,10 @@ fn grok_not_found_import_runs_queued_work() {
         "replacement"
     );
     assert!(matches!(p.turns[&turn].state, TurnState::Running { .. }));
-    assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("CLI still has them"))));
+    assert!(p.items.values().any(
+        |item| matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("CL\
+        I still has them"))
+    ));
     assert!(
         matches!(f.controls.try_recv().unwrap(),SessionControl::StartTurn {turn:id,..} if id==turn)
     );
@@ -1668,7 +1789,10 @@ fn codex_bad_page_still_resumes() {
         .iter()
         .find(|reply| reply["method"] == "thread/turns/list")
         .unwrap();
-    let result=codec.value(json!({"id":page["id"],"result":{"data":[{"id":"newest","items":[{"type":"userMessage","content":"invalid"}]}],"nextCursor":null}}));
+    let result = codec.value(
+        json!({"id":page["id"],"result":{"data":[{"id":"newest","items":[{"type":"userMessag\
+        e","content":"invalid"}]}],"nextCursor":null}}),
+    );
     assert!(result.is_ok(), "bad display history blocked resume");
     let decoded = result.unwrap();
     assert!(
@@ -1684,7 +1808,12 @@ fn codex_bad_page_still_resumes() {
 fn hangup_ignoring_terminal_fixture() -> (Fixture, Scratch, env::ChildEnv) {
     let (f, scratch, mut env) = terminal_fixture(ProviderKind::Claude, &[]);
     let script = scratch.0.join("terminal-fixture");
-    std::fs::write(&script,"#!/usr/bin/python3\nimport signal,time\nsignal.signal(signal.SIGHUP,signal.SIG_IGN)\nprint('VEYRA_TUI_READY',flush=True)\nwhile True: time.sleep(1)\n").unwrap();
+    std::fs::write(
+        &script,
+        "#!/usr/bin/python3\nimport signal,time\nsignal.signal(signal.SIGHUP,signal.SIG_IGN)\
+        \nprint('VEYRA_TUI_READY',flush=True)\nwhile True: time.sleep(1)\n",
+    )
+    .unwrap();
     assert!(
         std::process::Command::new("/bin/chmod")
             .env_clear()
@@ -1742,7 +1871,8 @@ fn codex_import_before_resume(bad_history: bool) {
         .0
         .clone();
     let mut records = vec![
-        json!({"type":"transcript_start","provider":"codex","protocol":"json-rpc","cli_version":"fake","scenario":"structured cursor and failed display history","source":"Veyra authored"}),
+        json!({"type":"transcript_start","provider":"codex","protocol":"json-rpc","cli_version":"fake","scenari\
+            o":"structured cursor and failed display history","source":"Veyra authored"}),
         json!({"type":"expect_outbound","line":{"id":"<id:init>","method":"initialize","params":"<id:params>"}}),
         json!({"type":"emit_inbound","line":{"id":"<id:init>","result":{}}}),
         json!({"type":"expect_outbound","line":{"method":"initialized"}}),
@@ -1753,9 +1883,21 @@ fn codex_import_before_resume(bad_history: bool) {
         row.import_pending = true;
         c.threads.insert(f.thread, row);
         f.save(c);
-        records.extend([json!({"type":"expect_outbound","line":{"id":"<id:page>","method":"thread/turns/list","params":"<id:page-params>"}}),json!({"type":"emit_inbound","line":{"id":"<id:page>","result":{"data":[{"id":"newest","items":[{"type":"userMessage","content":"invalid"}]}]}}})]);
+        records.extend([
+            json!({"type":"expect_outbound","line":{"id":"<id:page>","method":"thread/turns/list","\
+            params":"<id:page-params>"}}),
+            json!({"type":"emit_inbound","line":{"id":"<id:page>","result":{"data\
+                ":[{"id":"newest","items":[{"type":"userMessage","content":"invalid"}]}]}}}),
+        ]);
     }
-    records.extend([json!({"type":"expect_outbound","line":{"id":"<id:resume>","method":"thread/resume","params":"<id:resume-params>"}}),json!({"type":"emit_inbound","line":{"id":"<id:resume>","result":{"thread":{"id":native}}}}),json!({"type":"expect_outbound","line":{"id":"<id:turn>","method":"turn/start","params":"<id:turn-params>"}}),json!({"type":"emit_inbound","line":{"id":"<id:turn>","result":{"turn":{"id":"server-turn","status":"inProgress","items":[]}}}}),json!({"type":"emit_inbound","line":{"method":"turn/completed","params":{"threadId":native,"turn":{"id":"server-turn","status":"completed","items":[]}}}}),json!({"type":"spin","ms":200}),json!({"type":"exit","code":0})]);
+    records.extend([json!({"type":"expect_outbound","line":{"id":"<id:resume>","method":"thread/resume","params\
+        ":"<id:resume-params>"}}),json!({"type":"emit_inbound","line":{"id":"<id:resume>","result":{"thread":{"\
+            id":native}}}}),json!({"type":"expect_outbound","line":{"id":"<id:turn>","method":"turn/start","par\
+                ams":"<id:turn-params>"}}),json!({"type":"emit_inbound","line":{"id":"<id:turn>","result":{"tur\
+                    n":{"id":"server-turn","status":"inProgress","items":[]}}}}),json!({"type":"emit_inbound","\
+                        line":{"method":"turn/completed","params":{"threadId":native,"turn":{"id":"server-turn\
+                            ","status":"completed","items":[]}}}}),json!({"type":"spin","ms":200}),json!({"type\
+                                ":"exit","code":0})]);
     std::fs::write(
         scratch.0.join("t1-s1.jsonl"),
         records
@@ -1766,11 +1908,58 @@ fn codex_import_before_resume(bad_history: bool) {
     )
     .unwrap();
     f.runtime.block_on(async {
-        let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();let Ack::Turn(turn)=engine.send(Command::Send {thread:f.thread,text:"queued work".into()}).await.unwrap().unwrap() else {panic!("turn")};
-        let result=tokio::time::timeout(Duration::from_secs(5),async {loop {let p=store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();if matches!(p.turns[&turn].state,TurnState::Ended {..}) {return p;}tokio::time::sleep(Duration::from_millis(5)).await;}}).await;engine.shutdown_wait().await;let p=result.unwrap();
-        assert!(matches!(p.turns[&turn].state,TurnState::Ended {outcome:TurnOutcome::Completed,..}));assert!(!p.threads[&f.thread].import_pending);
-        if bad_history {assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("CLI still has them"))));}
-        assert_eq!(p.threads[&f.thread].native_cursor.as_deref(),Some("server-turn"));
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        let Ack::Turn(turn) = engine
+            .send(Command::Send {
+                thread: f.thread,
+                text: "queued wo\
+                rk"
+                .into(),
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("turn")
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let p = store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
+                if matches!(p.turns[&turn].state, TurnState::Ended { .. }) {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        engine.shutdown_wait().await;
+        let p = result.unwrap();
+        assert!(matches!(
+            p.turns[&turn].state,
+            TurnState::Ended {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ));
+        assert!(!p.threads[&f.thread].import_pending);
+        if bad_history {
+            assert!(
+                p.items
+                    .values()
+                    .any(|item| matches!(&item.body,ItemBody::Notice(notice) if
+            notice.text.contains("CLI still has them")))
+            );
+        }
+        assert_eq!(
+            p.threads[&f.thread].native_cursor.as_deref(),
+            Some("server-turn")
+        );
         assert!(engine.inner.groups.lock().unwrap().is_empty());
     });
 }
@@ -1793,8 +1982,10 @@ fn plain_shutdown_has_no_switch_grace() {
     let (f, scratch, env) = terminal_fixture(
         ProviderKind::Claude,
         &[
-            json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
-            json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}),
+            json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request\
+                ":{"subtype":"initialize"}}}),
+            json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","req\
+                uest_id":"<id:init>","response":{}}}}),
             json!({"type":"spin","ms":1600}),
             json!({"type":"touch","path":"graceful-exit"}),
             json!({"type":"exit","code":0}),
@@ -1882,14 +2073,25 @@ fn grok_promoted_overlap_keeps_last_completed_cursor() {
         .unwrap()
         .0
         .clone();
-    let message = |id: &str, text: &str| json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":native,"_meta":{"promptId":id},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}}});
-    let complete = |id: &str| json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":native,"promptId":id,"stopReason":"end_turn"}}});
+    let message = |id: &str, text: &str| {
+        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"session\
+        /update","params":{"sessionId":native,"_meta":{"promptId":id},"update":{"sessionUpdate":"agent_message_\
+            chunk","content":{"type":"text","text":text}}}}})
+    };
+    let complete = |id: &str| {
+        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","method":"_x.ai/session/prom\
+        pt_complete","params":{"sessionId":native,"promptId":id,"stopReason":"end_turn"}}})
+    };
     let records = [
-        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params":"<id:initparams>"}}),
-        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":true}},"agentInfo":{}}}}),
-        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:resume>","method":"session/resume","params":"<id:resumeparams>"}}),
+        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:init>","method":"initialize","params\
+            ":"<id:initparams>"}}),
+        json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:init>","result":{"protocolVersion":1,"ag\
+            entCapabilities":{"sessionCapabilities":{"resume":true}},"agentInfo":{}}}}),
+        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:resume>","method":"session/resume","p\
+            arams":"<id:resumeparams>"}}),
         json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:resume>","result":{"sessionId":native}}}),
-        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc>","method":"session/prompt","params":"<id:promptparams>"}}),
+        json!({"type":"expect_outbound","line":{"jsonrpc":"2.0","id":"<id:rpc>","method":"session/prompt","para\
+            ms":"<id:promptparams>"}}),
         message("foreign-first", "skip before promotion"),
         message("foreign-newest", "skip before promotion"),
         json!({"type":"emit_inbound","line":{"jsonrpc":"2.0","id":"<id:rpc>","result":{"stopReason":"end_turn"}}}),
@@ -2012,7 +2214,10 @@ fn worker_setup_error_before_handle_is_visible() {
     let p = f.loaded();
     assert_eq!(p.threads[&f.thread].view, View::Chat);
     assert!(!p.threads[&f.thread].import_pending);
-    assert!(p.items.values().any(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text=="PTY worker could not start")));
+    assert!(p.items.values().any(
+        |item| matches!(&item.body,ItemBody::Notice(notice) if notice.text=="PTY worke\
+        r could not start")
+    ));
 }
 
 #[test]
@@ -2090,16 +2295,51 @@ fn native_quit_hangup_creates_no_failed_turn_or_crash_notice() {
     for _ in 0..5 {
         let (f, scratch, env) = terminal_fixture(ProviderKind::Claude, &[]);
         f.runtime.block_on(async {
-            let engine=crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();
-            engine.send(Command::SwitchView {thread:f.thread,to:View::Terminal}).await.unwrap().unwrap();
-            terminal_grid_containing(&engine,f.thread,"VEYRA_TUI_READY").await;
+            let engine = crate::Engine::launch(
+                &tokio::runtime::Handle::current(),
+                f.actor.db,
+                Spawner::Cli(Box::new(env)),
+                None,
+            )
+            .unwrap();
+            engine
+                .send(Command::SwitchView {
+                    thread: f.thread,
+                    to: View::Terminal,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            terminal_grid_containing(&engine, f.thread, "VEYRA_TUI_READY").await;
             engine.on_app_quit().await;
             engine.shutdown_wait().await;
-            let loaded=store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
+            let loaded =
+                store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
             assert!(loaded.threads[&f.thread].import_pending);
-            assert_eq!(loaded.threads[&f.thread].view,View::Chat);
-            assert_eq!(loaded.turns.values().filter(|turn|matches!(turn.state,TurnState::Ended {outcome:TurnOutcome::Failed {..},..})).count(),0);
-            assert_eq!(loaded.items.values().filter(|item|matches!(&item.body,ItemBody::Notice(notice) if notice.text.contains("terminal exited"))).count(),0);
+            assert_eq!(loaded.threads[&f.thread].view, View::Chat);
+            assert_eq!(
+                loaded
+                    .turns
+                    .values()
+                    .filter(|turn| matches!(
+                        turn.state,
+                        TurnState::Ended {
+                            outcome: TurnOutcome::Failed { .. },
+                            ..
+                        }
+                    ))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                loaded
+                    .items
+                    .values()
+                    .filter(|item| matches!(&item.body,ItemBody::Notice(notice) if
+                notice.text.contains("terminal exited")))
+                    .count(),
+                0
+            );
             assert!(engine.inner.groups.lock().unwrap().is_empty());
         });
     }
@@ -2132,7 +2372,17 @@ fn unknown_import_cursor_notifies_and_starts_queued_work() {
             },
         }));
         let p = f.loaded();
-        assert_eq!(p.items.values().filter(|item| matches!(&item.body, ItemBody::Notice(notice) if notice.text == crate::provider::IMPORT_NOTICE)).count(), 1, "{provider:?}");
+        assert_eq!(
+            p.items
+                .values()
+                .filter(
+                    |item| matches!(&item.body, ItemBody::Notice(notice) if notice.text
+            == crate::provider::IMPORT_NOTICE)
+                )
+                .count(),
+            1,
+            "{provider:?}"
+        );
         assert!(
             !p.items
                 .values()
@@ -2157,7 +2407,8 @@ fn unknown_import_cursor_notifies_and_starts_queued_work() {
             TurnState::Running { .. }
         ));
         assert!(
-            matches!(f.controls.try_recv().unwrap(), SessionControl::StartTurn {turn,text,..} if turn == queued && text == "continue after unknown cursor")
+            matches!(f.controls.try_recv().unwrap(), SessionControl::StartTurn {turn,text,..} if turn ==
+                queued && text == "continue after unknown cursor")
         );
     }
 }
@@ -2172,7 +2423,13 @@ fn streamed_cursor_writes_thread_only_when_it_changes() {
     row.native_cursor = Some("previous-turn".into());
     c.threads.insert(f.thread, row);
     f.save(c);
-    f.actor.db.execute_batch("CREATE TABLE thread_writes (value TEXT); CREATE TRIGGER count_thread_write AFTER UPDATE ON threads BEGIN INSERT INTO thread_writes VALUES (NEW.native_cursor); END;").unwrap();
+    f.actor
+        .db
+        .execute_batch(
+            "CREATE TABLE thread_writes (value TEXT); CREATE TRIGGER count_thread_write AFTER \
+        UPDATE ON threads BEGIN INSERT INTO thread_writes VALUES (NEW.native_cursor); END;",
+        )
+        .unwrap();
     for _ in 0..20 {
         let _entered = f.runtime.enter();
         f.actor.handle(EngineMsg::Provider {
@@ -2223,7 +2480,15 @@ fn streamed_cursor_writes_thread_only_when_it_changes() {
         p.threads[&f.thread].native_cursor.as_deref(),
         Some("next-turn")
     );
-    assert_eq!(p.items_for(f.thread).filter(|item| matches!(&item.body, ItemBody::AssistantText {text,..} if text == "xxxxxxxxxxxxxxxxxxxxz")).count(), 1);
+    assert_eq!(
+        p.items_for(f.thread)
+            .filter(
+                |item| matches!(&item.body, ItemBody::AssistantText {text,..} if
+        text == "xxxxxxxxxxxxxxxxxxxxz")
+            )
+            .count(),
+        1
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -2432,7 +2697,13 @@ fn pending_terminal_import_survives_a_failed_launch() {
             },
         }),
     );
-    assert!(f.loaded().items.values().any(|item| matches!(&item.body, ItemBody::TerminalSpan(span) if span.text == "earlier terminal message")));
+    assert!(
+        f.loaded()
+            .items
+            .values()
+            .any(|item| matches!(&item.body, ItemBody::TerminalSpan(span) if
+        span.text == "earlier terminal message"))
+    );
     assert!(!f.loaded().threads[&f.thread].import_pending);
 }
 
@@ -2524,7 +2795,10 @@ fn claude_history_skips_malformed_typed_entries_and_accepts_unknown_kinds() {
     let scratch =
         Scratch(std::path::Path::new("/tmp").join(format!("veyra-term-typed-{}", ThreadId::new())));
     std::fs::create_dir_all(scratch.0.join("projects/fixture")).unwrap();
-    let entry = |id: &str, content| json!({"sessionId":"typed-native","uuid":id,"parentUuid":null,"isSidechain":false,"type":"user","entrypoint":"cli","message":{"content":content}});
+    let entry = |id: &str, content| {
+        json!({"sessionId":"typed-native","uuid":id,"parentUuid":null,"isSidechain\
+        ":false,"type":"user","entrypoint":"cli","message":{"content":content}})
+    };
     let mut malformed = entry(
         "bad",
         json!([{"type":"text","text":17},{"type":"text","text":"must skip whole invalid entry"}]),
@@ -2752,36 +3026,31 @@ fn escaped_pty_holder(closing: bool) {
     let (f, scratch, mut env) = terminal_fixture(
         ProviderKind::Claude,
         &[
-            json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request":{"subtype":"initialize"}}}),
-            json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","request_id":"<id:init>","response":{}}}}),
+            json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request\
+                ":{"subtype":"initialize"}}}),
+            json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","req\
+                uest_id":"<id:init>","response":{}}}}),
             json!({"type":"spin","ms":10000}),
         ],
     );
     let native = f.loaded().threads[&f.thread].native.clone().unwrap();
     let history = scratch.0.join("config/projects/fixture");
     std::fs::create_dir_all(&history).unwrap();
-    std::fs::write(history.join(format!("{}.jsonl",native.0)), json!({"sessionId":native.0,"uuid":"anchor","parentUuid":null,"isSidechain":false,"type":"user","entrypoint":"sdk-cli","message":{"content":"old"}}).to_string()+"\n").unwrap();
+    std::fs::write(history.join(format!("{}.jsonl",native.0)), json!({"sessionId":native.0,"uuid":"anchor","par\
+        entUuid":null,"isSidechain":false,"type":"user","entrypoint":"sdk-cli","message":{"content":"old\
+            "}}).to_string()+"\n").unwrap();
     let script = scratch.0.join("terminal-holder-fixture");
-    std::fs::write(&script, r#"#!/usr/bin/python3
-import json,os,pathlib,signal,sys,time
-if '-p' in sys.argv:
-    os.execv(os.environ['OWN_FAKE_BINARY'],[os.environ['OWN_FAKE_BINARY']]+sys.argv[1:])
-native=sys.argv[sys.argv.index('--resume')+1]
-path=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'projects/fixture'/(native+'.jsonl')
-with path.open('a') as out:
-    out.write(json.dumps({'sessionId':native,'uuid':'terminal-child-message','parentUuid':'anchor','isSidechain':False,'type':'user','entrypoint':'cli','message':{'content':'typed before escaped child'}})+'\n')
-gate=os.pipe()
-child=os.fork()
-if child==0:
-    os.read(gate[0],1)
-    os.setsid()
-    signal.signal(signal.SIGHUP,signal.SIG_IGN)
-    print('VEYRA_TUI_READY',flush=True)
-    while True: time.sleep(1)
-pathlib.Path('holder.pid').write_text(str(child))
-os.write(gate[1],b'1')
-while True: time.sleep(1)
-"#).unwrap();
+    std::fs::write(&script, "#!/usr/bin/python3\nimport json,os,pathlib,signal,sys,time\nif '-p' in sys.argv:\
+        \n    os.execv(os.environ['OWN_FAKE_BINARY'],[os.environ['OWN_FAKE_BINARY']]+sys.argv[1:])\nnative=sys.\
+            argv[sys.argv.index('--resume')+1]\npath=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'projects/fi\
+                xture'/(native+'.jsonl')\nwith path.open('a') as out:\n    out.write(json.dumps({'sessionId':na\
+                    tive,'uuid':'terminal-child-message','parentUuid':'anchor','isSidechain':False,'type':'user\
+                        ','entrypoint':'cli','message':{'content':'typed before escaped child'}})+'\\n')\ngate=\
+                            os.pipe()\nchild=os.fork()\nif child==0:\n    os.read(gate[0],1)\n    os.setsid()\
+                                \n    signal.signal(signal.SIGHUP,signal.SIG_IGN)\n    print('VEYRA_TUI_READY',\
+                                    flush=True)\n    while True: time.sleep(1)\npathlib.Path('holder.pid').writ\
+                                        e_text(str(child))\nos.write(gate[1],b'1')\nwhile True: time.sleep(1)\n\
+                                            ").unwrap();
     assert!(
         std::process::Command::new("/bin/chmod")
             .env_clear()
@@ -2804,10 +3073,26 @@ while True: time.sleep(1)
     env.terminal_controlling_tty = false;
     let thread = f.thread;
     f.runtime.block_on(async {
-        let engine = crate::Engine::launch(&tokio::runtime::Handle::current(),f.actor.db,Spawner::Cli(Box::new(env)),None).unwrap();
-        engine.send(Command::SwitchView {thread,to:View::Terminal}).await.unwrap().unwrap();
-        terminal_grid_containing(&engine,thread,"VEYRA_TUI_READY").await;
-        eprintln!("owned_escaped_holder_pid={}", std::fs::read_to_string(&cleanup.path).unwrap().trim());
+        let engine = crate::Engine::launch(
+            &tokio::runtime::Handle::current(),
+            f.actor.db,
+            Spawner::Cli(Box::new(env)),
+            None,
+        )
+        .unwrap();
+        engine
+            .send(Command::SwitchView {
+                thread,
+                to: View::Terminal,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        terminal_grid_containing(&engine, thread, "VEYRA_TUI_READY").await;
+        eprintln!(
+            "owned_escaped_holder_pid={}",
+            std::fs::read_to_string(&cleanup.path).unwrap().trim()
+        );
         let start = Instant::now();
         if closing {
             engine.on_app_quit().await;
@@ -2815,28 +3100,61 @@ while True: time.sleep(1)
             let elapsed = start.elapsed();
             let cleaned = cleanup.stop();
             let p = store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
-            assert!(cleaned, "escaped terminal fixture survived native quit cleanup");
-            assert!(elapsed < Duration::from_millis(1600), "native quit waited for terminal reader: {elapsed:?}");
+            assert!(
+                cleaned,
+                "escaped terminal fixture survived native quit cleanup"
+            );
+            assert!(
+                elapsed < Duration::from_millis(1600),
+                "native quit waited for terminal reader: {elapsed:?}"
+            );
             assert!(p.threads[&thread].import_pending);
-            assert_eq!(p.threads[&thread].view,View::Chat);
-            assert!(!p.turns.values().any(|turn| matches!(turn.state,TurnState::Ended {outcome:TurnOutcome::Failed {..},..})));
+            assert_eq!(p.threads[&thread].view, View::Chat);
+            assert!(!p.turns.values().any(|turn| matches!(
+                turn.state,
+                TurnState::Ended {
+                    outcome: TurnOutcome::Failed { .. },
+                    ..
+                }
+            )));
             return;
         }
-        engine.send(Command::SwitchView {thread,to:View::Chat}).await.unwrap().unwrap();
+        engine
+            .send(Command::SwitchView {
+                thread,
+                to: View::Chat,
+            })
+            .await
+            .unwrap()
+            .unwrap();
         let imported = tokio::time::timeout(Duration::from_secs(4), async {
             loop {
                 let p = store::load(&Connection::open(scratch.0.join("test.db")).unwrap()).unwrap();
-                if !p.threads[&thread].import_pending && p.items.values().any(|item| matches!(&item.body,ItemBody::TerminalSpan(span) if span.text == "typed before escaped child")) { break; }
+                if !p.threads[&thread].import_pending
+                    && p.items.values().any(|item| {
+                        matches!(&item.body,
+                    ItemBody::TerminalSpan(span) if span.text == "typed before escaped child")
+                    })
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await;
+        })
+        .await;
         let elapsed = start.elapsed();
         eprintln!("terminal_exit_import_elapsed_ms={}", elapsed.as_millis());
         let cleaned = cleanup.stop();
         engine.shutdown_wait().await;
         assert!(cleaned, "escaped terminal fixture survived cleanup");
-        assert!(imported.is_ok(), "escaped child kept Exited and import waiting beyond the ladder");
-        assert!(elapsed < Duration::from_millis(3600), "switch back took {elapsed:?}");
+        assert!(
+            imported.is_ok(),
+            "escaped child kept Exited and import waiting beyond the ladder"
+        );
+        assert!(
+            elapsed < Duration::from_millis(3600),
+            "switch back took {elapsed:?}"
+        );
     });
 }
 
@@ -2880,7 +3198,10 @@ fn claude_history_tolerates_optional_field_and_block_variants() {
         std::path::Path::new("/tmp").join(format!("veyra-term-optional-{}", ThreadId::new())),
     );
     std::fs::create_dir_all(scratch.0.join("projects/fixture")).unwrap();
-    let entry = |id: &str, kind: &str, text: &str| json!({"sessionId":"optional-native","uuid":id,"parentUuid":null,"isSidechain":false,"type":kind,"entrypoint":"cli","message":{"content":[{"type":"text","text":text}]}});
+    let entry = |id: &str, kind: &str, text: &str| {
+        json!({"sessionId":"optional-native","uuid":id,"parentUuid\
+        ":null,"isSidechain":false,"type":kind,"entrypoint":"cli","message":{"content":[{"type":"text","text":text}]}})
+    };
     let mut variants = Vec::new();
     for field in ["turnOrigin", "entrypoint", "sessionId", "isSidechain"] {
         for value in [
@@ -2998,7 +3319,12 @@ fn dispatch_cursor_commits_before_prompt_delivery() {
     );
     std::fs::create_dir(&scratch.0).unwrap();
     let binary = scratch.0.join("owned-cli");
-    std::fs::write(&binary, "#!/bin/sh\nread initialize\nprintf ready > initialized\nread prompt\nprintf '%s' \"$prompt\" > delivered\nwhile read ignored; do :; done\n").unwrap();
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\nread initialize\nprintf ready > initialized\nread prompt\nprintf '%s' \
+        \"$prompt\" > delivered\nwhile read ignored; do :; done\n",
+    )
+    .unwrap();
     assert!(
         std::process::Command::new("/bin/chmod")
             .args(["700"])
@@ -3048,7 +3374,8 @@ fn dispatch_cursor_commits_before_prompt_delivery() {
         runtime.block_on(async {
         handle.control.send(SessionControl::StartTurn {turn,text:"dispatch payload".into()}).unwrap();
         let message = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
-        assert!(matches!(&message, EngineMsg::Provider {event:ProviderEvent::Session(SessionEvent::Dispatched {turn:owner}),..} if *owner==turn));
+        assert!(matches!(&message, EngineMsg::Provider {event:ProviderEvent::Session(SessionEvent::Dispatched {
+            turn:owner}),..} if *owner==turn));
         tokio::time::timeout(Duration::from_secs(3), async {
             while !scratch.0.join("initialized").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
         }).await.unwrap();
@@ -3059,9 +3386,11 @@ fn dispatch_cursor_commits_before_prompt_delivery() {
         tokio::time::timeout(Duration::from_secs(3), async {
             while !scratch.0.join("delivered").exists() {tokio::time::sleep(Duration::from_millis(5)).await;}
         }).await.unwrap();
-        let delivered:serde_json::Value = serde_json::from_str(&std::fs::read_to_string(scratch.0.join("delivered")).unwrap()).unwrap();
+        let delivered:serde_json::Value = serde_json::from_str(&std::fs::read_to_string(scratch.0.join("deliver\
+            ed")).unwrap()).unwrap();
         assert_eq!(delivered["message"]["content"], "dispatch payload");
-        assert!(!delivered_before_commit, "fake CLI received the prompt before the actor committed its dispatch cursor");
+        assert!(!delivered_before_commit, "fake CLI received the prompt before the actor committed its dispatc\
+            h cursor");
     })
     }));
     let _ = handle.control.send(SessionControl::Shutdown);

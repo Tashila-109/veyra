@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Debug terminal dump methods serialize grid and perf wire JSON.
 use super::{actions::SwitchView, theme::Theme};
 use gpui_kit::component::StyledExt;
 use gpui_kit::{prelude::*, *};
@@ -399,7 +400,8 @@ impl TerminalView {
             .and_then(|handle| handle.emulator())
             .map(|emulator| emulator.lock().text())
             .unwrap_or_default();
-        serde_json::json!({"grid":grid,"focused":self.focused,"columns":self.resize.map(|s|s.0),"rows":self.resize.map(|s|s.1),"repaints":self.perf.repaints})
+        serde_json::json!({"grid":grid,"focused":self.focused,"columns":self.resize.map(|s|s.0),"rows\
+            ":self.resize.map(|s|s.1),"repaints":self.perf.repaints})
     }
     #[cfg(debug_assertions)]
     pub fn flood(&self) -> Option<serde_json::Value> {
@@ -791,7 +793,8 @@ mod tests {
         );
         assert_eq!(
             perf.dump().unwrap(),
-            serde_json::json!({"pty_bytes":50000020_u64,"elapsed_ms":100.,"repaints":3,"median_repaint_gap_ms":35.,"max_repaint_gap_ms":50.})
+            serde_json::json!({"pty_bytes":50000020_u64,"elapsed_ms":100.,"repaints":3,"median_repaint_gap_ms\
+                ":35.,"max_repaint_gap_ms":50.})
         );
     }
 }
@@ -867,22 +870,77 @@ mod window_tests {
             )
             .unwrap();
             let handle = runtime.block_on(async {
-                let Ack::Project(project) = engine.send(Command::AddProject {path: scratch.0.join("project")}).await.unwrap().unwrap() else { panic!("project acknowledgement"); };
-                let Ack::Thread(thread) = engine.send(Command::CreateThread {project, provider: ProviderKind::Claude, config: ThreadConfig {model: None, effort: None, mode: PermissionMode::AskFirst}, text: "warm up".into()}).await.unwrap().unwrap() else { panic!("thread acknowledgement"); };
+                let Ack::Project(project) = engine
+                    .send(Command::AddProject {
+                        path: scratch.0.join(
+                            "project\
+                    ",
+                        ),
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap()
+                else {
+                    panic!("project acknowledgement");
+                };
+                let Ack::Thread(thread) = engine
+                    .send(Command::CreateThread {
+                        project,
+                        provider: ProviderKind::Claude,
+                        config: ThreadConfig {
+                            model: None,
+                            effort: None,
+                            mode: PermissionMode::AskFirst,
+                        },
+                        text: "warm up".into(),
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap()
+                else {
+                    panic!("thread acknowledgement");
+                };
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         let snapshot = engine.snapshot(thread).await.unwrap();
-                        if snapshot.items.iter().any(|item| matches!(&item.body, ItemBody::AssistantText { text, done: true } if text == "ok")) && !engine.window_threads()[&thread].busy { break; }
+                        if snapshot.items.iter().any(|item| {
+                            matches!(&item.body, ItemBody::AssistantText {
+                            text, done: true } if text == "ok")
+                        }) && !engine.window_threads()[&thread].busy
+                        {
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                }).await.unwrap();
-                engine.send(Command::SwitchView {thread, to: View::Terminal}).await.unwrap().unwrap();
+                })
+                .await
+                .unwrap();
+                engine
+                    .send(Command::SwitchView {
+                        thread,
+                        to: View::Terminal,
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
-                        if let Some(handle) = engine.terminal(thread) && handle.emulator().unwrap().lock().text().iter().any(|line| line == "VEYRA_TUI_READY") { break handle; }
+                        if let Some(handle) = engine.terminal(thread)
+                            && handle
+                                .emulator()
+                                .unwrap()
+                                .lock()
+                                .text()
+                                .iter()
+                                .any(|line| line == "VEYRA_TUI_READY")
+                        {
+                            break handle;
+                        }
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                }).await.unwrap()
+                })
+                .await
+                .unwrap()
             });
             Self {
                 engine,

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)] // Claude stream-json is decoded and encoded at this provider boundary.
 use super::{ActiveTurn, Decoded, Outbound};
 use super::{Model, ProviderEvent, SessionEvent, SessionSpec, StopReason, TurnEvent};
 use crate::domain::*;
@@ -773,7 +774,8 @@ impl Codec {
                     } else if matches!(lifecycle.state, LifecycleState::Completed) && !self.prompt_started {
                         events.push(TurnEvent::TurnEnded {
                             outcome: self.end_outcome(TurnOutcome::Failed {
-                                message: "Claude took this message but never started a turn for it. Send it again.".into(),
+                                message: "Claude took this message but never started a turn for it. Send it aga\
+                                    in.".into(),
                             }),
                             park: false,
                         });
