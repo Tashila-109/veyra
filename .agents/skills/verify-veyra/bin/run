@@ -65,9 +65,12 @@ def gate_check():
         (root/'crates/veyra/Cargo.toml').write_text('')
         (root/'target/verify-veyra/gatecheck').mkdir(parents=True)
         (root/'target/verify-veyra/gatecheck/lane').write_text('live\n')
-        result = subprocess.run([sys.executable,'-c','import driver; driver.gate_self_test()'],cwd=root,
-            capture_output=True,text=True,env=dict(os.environ,RUN='gatecheck',PYTHONPATH=str(SKILL/'bin'),
-            PYTHONDONTWRITEBYTECODE='1',VEYRA_VERIFY_TMP=str(root)+'/data-'))
+        try:
+            result = subprocess.run([sys.executable,'-c','import driver; driver.gate_self_test()'],cwd=root,
+                capture_output=True,text=True,timeout=30,env=dict(os.environ,RUN='gatecheck',
+                PYTHONPATH=str(SKILL/'bin'),PYTHONDONTWRITEBYTECODE='1',VEYRA_VERIFY_TMP=str(root)+'/data-'))
+        except subprocess.TimeoutExpired:
+            raise AssertionError('gate self-test did not finish in 30 s; gate() can hold past its deadline') from None
         assert result.returncode == 0, 'gate self-test failed:\n'+result.stdout+result.stderr
         return result.stdout.strip()
     finally:
@@ -102,6 +105,16 @@ def verdict_check():
         status,_ = verdict(record,counted,record.get('late',False))
         assert (status is None) if expected is None else (status or '').startswith(expected),(record,counted,status)
 
+def guards_present(found):
+    """A presence check only: each guard's text must still be there; the runs that pass through it prove it works."""
+    cleanup, driver = found[('SKILL','Cleanup')], (SKILL/'bin/driver.py').read_text()
+    capture = (SKILL/'bin/capture-window.swift').read_text()
+    for where,text,needle in [('Cleanup',cleanup,'assert not other_markers'),('Cleanup',cleanup,'retry_exiting=True'),
+            ('Cleanup',cleanup,'time.monotonic()-started >= 30'),('bin/driver.py',driver,'foreign_veyra()'),
+            ('bin/driver.py',driver,"'stale screenshot after state change: '"),
+            ('bin/capture-window.swift',capture,'fail("owned window is covered')]:
+        assert needle in text, where+' no longer contains its guard '+needle
+
 def checks(found):
     """Everything --check-only proves; a run repeats it before Launch."""
     blocks = 0
@@ -113,9 +126,11 @@ def checks(found):
     compile((SKILL/'bin/driver.py').read_text(),'bin/driver.py','exec')
     check_map(found)
     launch_gates(found)
+    guards_present(found)
     verdict_check()
     return (f'{len(found)} shell blocks and {blocks} Python heredocs compile across {len(page_names())} pages; '
-        'the fixed sections exist; Launch calls gate() before start(); the retry rule holds; '+gate_check())
+        'the fixed sections exist; Launch calls gate() before start(); the Cleanup drain, relaunch refusal and '
+        'capture guards are present; the retry rule holds; '+gate_check())
 
 def identity():
     status = subprocess.check_output(['git','status','--short','--untracked-files=all'],cwd=REPO,text=True)
@@ -146,8 +161,11 @@ def plan_for(found, tokens, explicit):
     return plan+[('SKILL','Doctor'),('SKILL','Evidence')]
 
 def failure_capture(env, out):
-    """One best-effort screenshot of the failed state; its timeout or error is recorded and never stops Cleanup."""
-    process = None
+    """One best-effort screenshot of the failed state, taken inside attempt()'s try so Cleanup follows whatever it does.
+
+    It returns what happened, its own write error included, and never raises.
+    """
+    process, result = None, {}
     try:
         process = subprocess.Popen(['python3','-c',"from driver import *; capture('failure')"],cwd=REPO,
             env=dict(env,PYTHONPATH=str(SKILL/'bin')),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
@@ -160,37 +178,29 @@ def failure_capture(env, out):
             try: os.killpg(process.pid,signal.SIGKILL)
             except ProcessLookupError: pass
             process.wait()
-    (out/'failure-capture.json').write_text(json.dumps(result,indent=2)+'\n')
+    try: (out/'failure-capture.json').write_text(json.dumps(result,indent=2)+'\n')
+    except Exception as error: result['write_error'] = f'{type(error).__name__}: {error}'
     return result
 
-def finish(env, out, run, failed, failed_start, execute):
-    """Capture the failure if one is owed, run Cleanup whatever the capture did, then keep the proof."""
-    proof = REPO/'target/verify-veyra'/run
-    try: clock = json.loads((proof/'focus-failure.json').read_text())
-    except (OSError,ValueError): clock = {}
-    observed = clock if failed and clock.get('failure') and clock.get('failure_epoch',0) >= failed_start else None
-    scratch = env['VEYRA_VERIFY_TMP']+run
-    if (proof/'pid').exists():
-        if failed and not (observed or {}).get('human_input') and not failed['deadline']: failure_capture(env,out)
-        cleanup,_ = execute(('SKILL','Cleanup'))
-    else:
-        # Launch stopped before starting an app, so no process exists; only the scratch folder remains.
-        assert scratch.startswith('/tmp/veyra-')
-        shutil.rmtree(scratch,ignore_errors=True)
-        cleanup = 0
-    shutil.copytree(proof,out/'run',copy_function=os.link)
-    left = [path for path in [scratch,scratch+'-rel'] if os.path.exists(path)]
-    return {'cleanup_exit':(cleanup or 1) if left else cleanup,'scratch_left':left,'focus':clock,'observed':observed}
-
 def attempt(found, plan, out, env, deadline, expected):
-    """One Launch through Cleanup. Returns (exit, record)."""
+    """One Launch through Cleanup. Returns (exit, record).
+
+    Every step from Launch on runs inside one try, and its finally runs Cleanup before anything else. Each receipt
+    and diagnostic write goes through keep(), which records its own error instead of raising.
+    """
     out.mkdir(parents=True)
-    (out/'plan.json').write_text(json.dumps(plan,indent=1)+'\n')
-    timings, run, failed = [], None, None
+    timings, problems = [], []
+    record = {'run':None,'failed':None,'cleanup_exit':None,'problems':problems}
+    def keep(label, write):
+        try: write()
+        except Exception as error: problems.append(f'{label}: {type(error).__name__}: {error}')
+    def note(text):
+        def append():
+            with (out/'fresh-shell.txt').open('a') as transcript: transcript.write(text)
+        keep('fresh-shell.txt',append)
     def execute(key):
         title = '/'.join(key)
-        with (out/'fresh-shell.txt').open('a') as transcript:
-            transcript.write(f'\n## {title}. Separate bash -c; only exported RUN carries run identity.\n')
+        note(f'\n## {title}. Separate bash -c; only exported RUN carries run identity.\n')
         started = time.time()
         process = subprocess.Popen(['bash','-c',found[key]],cwd=REPO,env=env,stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,text=True,start_new_session=True)
@@ -206,42 +216,81 @@ def attempt(found, plan, out, env, deadline, expected):
                 stdout,stderr = process.communicate()
             stderr += '\nWall-time limit reached; section group stopped; Cleanup follows.\n'
             code = 124
+        except BaseException:
+            # Anything else interrupting the wait stops this section's own group before Cleanup runs.
+            try: os.killpg(process.pid,signal.SIGKILL)
+            except ProcessLookupError: pass
+            process.wait()
+            raise
+        exported = ''
+        if key == ('SKILL','Launch'):
+            found_run = re.findall(r'^RUN=([0-9a-f]{8})$',stdout,re.M)
+            if found_run:
+                env['RUN'] = found_run[-1]
+                exported = 'runner exports RUN='+found_run[-1]+'\n'
         timings.append({'section':title,'start_epoch':started,'end_epoch':time.time(),
             'seconds':time.time()-started,'exit':code})
-        (out/'sections.json').write_text(json.dumps(timings,indent=2)+'\n')
-        with (out/'fresh-shell.txt').open('a') as transcript:
-            transcript.write(stdout+stderr+f'{title} exit={code}\n')
-            if key == ('SKILL','Launch'):
-                found_run = re.findall(r'^RUN=([0-9a-f]{8})$',stdout,re.M)
-                if found_run:
-                    env['RUN'] = found_run[-1]
-                    transcript.write('runner exports RUN='+found_run[-1]+'\n')
-        print(title,'exit='+str(code),f'{time.time()-started:.1f}s',flush=True)
-        if code: print('\n'.join(line[:300] for line in (stdout+stderr).splitlines()[-12:]),flush=True)
+        keep('sections.json',lambda: (out/'sections.json').write_text(json.dumps(timings,indent=2)+'\n'))
+        note(stdout+stderr+f'{title} exit={code}\n'+exported)
+        keep('progress line',lambda: print(title,'exit='+str(code),f'{time.time()-started:.1f}s',flush=True))
+        if code: keep('failure tail',lambda: print('\n'.join(line[:300]
+            for line in (stdout+stderr).splitlines()[-12:]),flush=True))
         return code,stdout+stderr
+    keep('plan.json',lambda: (out/'plan.json').write_text(json.dumps(plan,indent=1)+'\n'))
     try:
         for key in plan:
             code,text = execute(key)
-            run = env.get('RUN')
+            record['run'] = env.get('RUN')
             if key == ('SKILL','Launch') and not code and identity() != expected:
-                failed = {'section':'tree identity after Launch','exit':None,'deadline':False}
+                record['failed'] = {'section':'tree identity after Launch','exit':None,'deadline':False}
                 break
             if code:
-                failed = {'section':'/'.join(key),'exit':code,'deadline':'Wall-time limit reached' in text}
+                record['failed'] = {'section':'/'.join(key),'exit':code,'deadline':'Wall-time limit reached' in text}
                 break
+        failed, run = record['failed'], record['run']
+        if failed and run:
+            receipt = REPO/'target/verify-veyra'/run/'focus-failure.json'
+            clock = json.loads(receipt.read_text()) if receipt.exists() else {}
+            start = timings[-1]['start_epoch'] if timings else 0
+            record['focus'] = clock
+            record['observed'] = clock if clock.get('failure') and clock.get('failure_epoch',0) >= start else None
+            owed = (REPO/'target/verify-veyra'/run/'pid').exists() and not failed['deadline']
+            if owed and not (record['observed'] or {}).get('human_input'):
+                record['failure_capture'] = failure_capture(env,out)
+    except Exception as error:
+        problems.append(f'runner: {type(error).__name__}: {error}')
+        record['failed'] = record['failed'] or {'section':'runner','exit':None,'deadline':False}
     finally:
-        record = {'run':run,'failed':failed,'cleanup_exit':None}
+        run = record['run'] = env.get('RUN')
+        try:
+            if run and (REPO/'target/verify-veyra'/run/'pid').exists():
+                record['cleanup_exit'] = execute(('SKILL','Cleanup'))[0]
+            elif run:
+                # Launch stopped before starting an app, so no process exists; only the scratch folder remains.
+                assert env['VEYRA_VERIFY_TMP'].startswith('/tmp/veyra-')
+                shutil.rmtree(env['VEYRA_VERIFY_TMP']+run,ignore_errors=True)
+                record['cleanup_exit'] = 0
+        except Exception as error:
+            problems.append(f'Cleanup: {type(error).__name__}: {error}')
+            record['cleanup_exit'] = 1
         if run:
-            try: record.update(finish(env,out,run,failed,timings[-1]['start_epoch'] if timings else 0,execute))
-            except Exception as error:
-                record.update(cleanup_exit=1,finish_error=f'{type(error).__name__}: {error}')
+            scratch = env['VEYRA_VERIFY_TMP']+run
+            record['scratch_left'] = [path for path in [scratch,scratch+'-rel'] if os.path.exists(path)]
+            if record['scratch_left']: record['cleanup_exit'] = record['cleanup_exit'] or 1
+            proof = REPO/'target/verify-veyra'/run
+            keep('run copy',lambda: shutil.copytree(proof,out/'run',copy_function=os.link))
+            def gate_wait():
+                gate = proof/'input-idle-launch.json'
+                if gate.exists(): record['gate_wait_seconds'] = json.loads(gate.read_text())['gate_seconds']
+            keep('gate wait',gate_wait)
         else:
-            record['failed'] = failed or {'section':'SKILL/Launch','exit':None,'deadline':False}
-        record['identity_unchanged'] = identity() == expected
+            record['failed'] = record['failed'] or {'section':'SKILL/Launch','exit':None,'deadline':False}
+        try: record['identity_unchanged'] = identity() == expected
+        except Exception as error:
+            problems.append(f'identity: {type(error).__name__}: {error}')
+            record['identity_unchanged'] = False
         record['recipe_seconds'] = sum(row['seconds'] for row in timings)
-        gate = REPO/'target/verify-veyra'/str(run)/'input-idle-launch.json'
-        if run and gate.exists(): record['gate_wait_seconds'] = json.loads(gate.read_text())['gate_seconds']
-        (out/'attempt.json').write_text(json.dumps(record,indent=2)+'\n')
+        keep('attempt.json',lambda: (out/'attempt.json').write_text(json.dumps(record,indent=2)+'\n'))
     ok = not record['failed'] and record['cleanup_exit'] == 0 and record['identity_unchanged']
     return (0 if ok else 1),record
 

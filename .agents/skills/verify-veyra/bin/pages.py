@@ -19,7 +19,10 @@ def rule_lists(text):
     lists, name = {}, None
     for row in block[1].splitlines():
         if row[:1].isspace() and name: lists[name] += row.split()
-        elif row.strip(): name,*globs = row.split(); lists[name] = globs
+        elif row.strip():
+            name,*globs = row.split()
+            assert name not in lists, 'Selection block repeats the list '+name
+            lists[name] = globs
     missing = {'shared','no-page','codex','grok','provider','release'}-set(lists)
     assert not missing, 'Selection block lacks '+', '.join(sorted(missing))
     return lists
@@ -27,8 +30,6 @@ def rule_lists(text):
 LISTS = rule_lists((pathlib.Path(__file__).resolve().parent.parent/'SKILL.md').read_text())
 SHARED, NO_PAGE, CODEX, GROK, PROVIDER_SHARED, RELEASE = (LISTS[name] for name in
     ['shared','no-page','codex','grok','provider','release'])
-SUFFIX = r'[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*'
-VERSION = r'(?<![\d.])\d+(?:\.\d+)+(?:-'+SUFFIX+r')?(?:\+'+SUFFIX+r')?(?![\d+-]|\.\d)'
 SECTIONS = {'codex':re.compile(r'^### Codex$',re.M),'grok':re.compile(r'^### Grok$',re.M)}
 
 def git(repo, *args, data=False):
@@ -150,14 +151,18 @@ def fresh(repo, head, versions=None):
         if versions is None: continue
         known = dict(row.split(':',1) for row in pathlib.Path(versions).read_text().splitlines() if ':' in row)
         for provider in ['Claude','Codex','Grok']:
-            cell = re.search(provider+' ('+VERSION+')',text)
-            if cell and cell[1] in versions_in(known.get(provider.lower(),'')):
+            recorded = recorded_version(text,provider)
+            if recorded and recorded in known.get(provider.lower(),'').split():
                 rows.append(f'{name}/{provider.lower()} {status[0]}')
     return rows
 
-def versions_in(text):
-    """Every whole version token on a line: a dotted number with its -prerelease and +build suffixes."""
-    return {match[0] for match in re.finditer(VERSION,text)}
+def recorded_version(text, provider):
+    """The whitespace token after the page's first PROVIDER mention that starts with a digit, less one trailing
+    comma, semicolon or full stop of its sentence; fresh() compares it exactly with versions.txt's tokens."""
+    words = text.split()
+    for word,after in zip(words,words[1:]):
+        if word == provider and after[:1].isdigit(): return after[:-1] if after[-1] in ',;.' else after
+    return None
 
 def self_test():
     root = pathlib.Path(tempfile.mkdtemp(prefix='veyra-pages-'))
@@ -235,6 +240,8 @@ def self_test():
             'permission-matrix/grok passed'], live_rows(stamped,same)
         assert live_rows(stamped,'claude: 2.1.0-alpha.1\ncodex: codex-cli 0.9.1\ngrok: grok 1.0.62\n') == [], \
             'a prerelease, a longer version or a dropped suffix kept a live row fresh'
+        assert live_rows(stamped,'claude: 2.1.0.\ncodex: codex-cli 0.9.\ngrok: grok 1.0.62-beta.2X--1\n') == [], \
+            'a trailing dot or a longer suffix on the versions line kept a live row fresh'
         assert not [row for row in fresh(root,stamped) if row.startswith('permission-matrix')]
         write('Cargo.lock','two\n')
         assert live_rows(commit('shared change'),same) == [], 'a shared change kept the live rows fresh'

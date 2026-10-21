@@ -18,9 +18,11 @@ External Accessibility input is not granted here; driver keys prove gpui dispatc
 `bin/run --evidence DIR` runs a gated fake-CLI run: every page's sections in map order, then Doctor and Evidence, and Cleanup last whatever failed.
 The pages are the [feature map](features/README.md)'s links in order, then any other `features/*.md` by name, so a new page joins the full run when its file exists.
 It waits in Launch's gate, gives each section a fresh `bash -c` with only `RUN` carried forward, times every section into `DIR/ATTEMPT/sections.json` and hard-links the kept proof to `DIR/ATTEMPT/run` after Cleanup.
-After a failed section it takes one best-effort `failure` capture, unless human input caused the failure or the deadline stopped it; the capture's exit, error or timeout goes to `DIR/ATTEMPT/failure-capture.json`, and Cleanup runs and `DIR/ATTEMPT/attempt.json` is written whatever the capture did.
+Everything from Launch on runs inside one `try`, and its `finally` runs Cleanup before anything else.
+After a failed section, still inside that `try`, it takes one `failure` capture, unless human input caused the failure or the deadline stopped it, and records the capture's exit, error or timeout in `DIR/ATTEMPT/failure-capture.json`.
+Every receipt, `attempt.json` included, records its own write error in the attempt's `problems` instead of raising, so no diagnostic can stop Cleanup.
 A failed attempt is classified by the observation `observe_failure` recorded in `focus-failure.json` during the failed section:
-- A failed Cleanup, scratch left behind or a changed tree ends FAILED, and reaching the deadline ends BLOCKED.
+- A failed Cleanup, scratch left behind or a changed tree ends FAILED, and reaching the deadline, or any other failure in its last minute, ends BLOCKED.
 - With human input since launch, any observed failure gets a new attempt after 60 seconds, not counted.
 - A `capture` failure with no human input gets a new attempt after 60 seconds, and the third such failure in a run ends BLOCKED.
 - A `focus-timeout` failure with no human input, such as a dock-focus regression, and any failure with no observation end FAILED.
@@ -44,7 +46,7 @@ Launch, Doctor, app-launch's first section, Evidence and Cleanup always run; a s
 `--real-quiet` makes multi-agent wait for the real ten-minute quiet clock, which a phase gate runs once when `ui/header.rs`, `ui/sidebar.rs` or a `ui/mod.rs` line naming `last_activity`, `quiet_minutes` or `cadence_due` changed.
 `--expect-head SHA` refuses a checkout at another commit, `--deadline EPOCH` bounds the whole run, and `--scratch PREFIX` sets the scratch prefix, `/tmp/veyra-verify-` by default.
 The tree's identity, its HEAD, `git status --short`, the diff's SHA-256 and each untracked file's SHA-256, is saved at the start and checked after Launch's build and after Cleanup.
-`--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, checks that Launch calls `gate()` before its first `start()`, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers.
+`--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, checks that Launch calls `gate()` before its first `start()`, checks that the Cleanup drain, relaunch refusal and capture guards are still present, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers, failing if that self-test runs past 30 seconds.
 
 ## Selection
 
@@ -66,7 +68,7 @@ release   crates/veyra/src/control.rs crates/veyra/src/main.rs crates/veyra/buil
 ```
 
 A `shared` file selects every page and provider section, `permission-matrix` included.
-A `no-page` file selects nothing, because it cannot change the window: test-only files, `ARCHITECTURE.md`, `AGENTS.md`, `clippy.toml`, `scripts/` and the feature index.
+A `no-page` file selects nothing, because it cannot change the window.
 A page's own feature file selects that page unless only its Status line changed.
 Any other file selects each page whose `Covers:` globs match it, and a file no page covers selects every page and provider section, `permission-matrix` included.
 Within a matched page, a `codex` file selects only its Codex section, a `grok` file only its Grok section, a `provider` file all of its sections, and any other file its own sections.
@@ -74,8 +76,8 @@ Within a matched page, a `codex` file selects only its Codex section, a `grok` f
 A selected `permission-matrix` says its live grid is due; driving it still needs a consented live lane.
 
 `bin/fresh-pages HEAD [--versions FILE]` prints `PAGE STATE` for each page whose Status FINGERPRINT still equals the page's fingerprint at HEAD and which `select-pages COMMIT HEAD` does not select, so a shared or uncovered change since the Status COMMIT makes every page stale, the live rows included.
-With `--versions`, a file of `provider: version` lines, it also prints `permission-matrix/PROVIDER STATE` for each live row whose version token, read from the page's first `Claude`, `Codex` or `Grok` mention, equals a whole version token on that provider's line.
-A version token is the dotted number with any `-prerelease` and `+build` suffix, and no digit or dot may touch either end, so `0.162.1-alpha.1` does not match `0.162.1` and `0.9` does not match `0.9.1`.
+With `--versions`, a file of `provider: version` lines, it also prints `permission-matrix/PROVIDER STATE` for each live row whose recorded version equals one whitespace-separated token of that provider's line exactly.
+The recorded version is the whitespace token after the page's first `Claude`, `Codex` or `Grok` that starts with a digit, less one trailing comma, semicolon or full stop of its sentence; the line's tokens are compared as they are, so `0.9` matches neither `0.9.` nor `0.9.1`.
 `bin/fresh-pages --print COMMIT` prints each page's fingerprint at COMMIT, for the Status line.
 A FINGERPRINT is the SHA-256 over `BLOB PATH` lines, sorted by path, for the files `git ls-tree -r COMMIT` lists under the page's `Covers:` globs, plus the page's own file, whose blob id is computed without its Status line.
 So a docs-only status commit leaves every fingerprint as it was.
