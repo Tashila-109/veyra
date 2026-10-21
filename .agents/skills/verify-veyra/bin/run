@@ -19,9 +19,10 @@ SIGNALS = {signal.SIGTERM,signal.SIGHUP,signal.SIGINT}
 INTERRUPT = {'signal':None}
 
 class Interrupted(BaseException):
-    """SIGTERM, SIGHUP or SIGINT. The handler always raises it, and keep() cannot swallow it."""
+    """SIGTERM, SIGHUP or SIGINT. The handler blocks all three and raises it, and keep() cannot swallow it."""
 
 def interrupted(number, frame):
+    signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
     INTERRUPT['signal'] = INTERRUPT['signal'] or signal.Signals(number).name
     raise Interrupted(signal.Signals(number).name)
 
@@ -29,13 +30,23 @@ def pending():
     """The interrupting signals that arrived while they were blocked."""
     return sorted(signal.Signals(number).name for number in signal.sigpending() if number in SIGNALS)
 
-def block():
-    """Block the interrupting signals. One raised before the mask takes hold is already in INTERRUPT['signal']."""
-    while True:
-        try:
-            signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
-            return
-        except Interrupted: pass
+def take_pending():
+    """Take the pending interrupting signals, so each one counts once: sigwait returns at once for a pending one."""
+    names = pending()
+    for _ in names: signal.sigwait(SIGNALS)
+    return names
+
+def start_owned(args, **options):
+    """Start a process in its own session with the interrupting signals blocked across the fork, so no signal lands
+    between its start and the caller's try. The child unblocks them itself. Returns it and the mask to restore first
+    thing inside that try."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
+    try:
+        return subprocess.Popen(args,start_new_session=True,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS),**options),previous
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK,previous)
+        raise
 
 HEREDOC = re.compile(r"<<'(?P<end>PY[A-Z_]*)'\n(?P<body>.*?)\n(?P=end)(?:\n|$)",re.S)
 
@@ -101,13 +112,13 @@ def gate_check():
 def verdict(record, counted, late=False):
     """The only place a run's status is decided, after Cleanup has run. None asks for another attempt.
 
-    DONE needs every planned section passed, Cleanup exit 0, an unchanged tree, the required evidence kept (the proof
-    copy under ATTEMPT/run and an attempt.json that reads back) and no interrupting signal, recorded or still pending.
-    A pending signal is recorded in the record. counted is the capture failures so far, and late means the deadline
-    is under a minute away.
+    DONE needs every planned section passed, Cleanup exit 0, an unchanged tree, the proof copy kept under ATTEMPT/run
+    and no interrupting signal. A pending signal counts for every outcome and is recorded in the record, which main()
+    then writes once as attempt.json. counted is the capture failures so far, and late means the deadline is under a
+    minute away.
     """
     failed, seen = record['failed'], record.get('observed') or {}
-    record['interrupted'] = record.get('interrupted') or (pending() or [None])[0]
+    record['interrupted'] = record.get('interrupted') or (take_pending() or [None])[0]
     if record['interrupted']: return 'FAILED: interrupted by '+record['interrupted'],counted
     if record.get('cleanup_exit') not in (0,None) or record.get('scratch_left'):
         return 'FAILED: Cleanup did not pass',counted
@@ -126,12 +137,10 @@ def verdict(record, counted, late=False):
     return 'FAILED: '+failed['section']+' failed'+cause+' with no human input',counted
 
 def verdict_check():
-    done = {'failed':None,'cleanup_exit':0,'identity_unchanged':True,'all_passed':True,
-        'evidence':{'run':True,'attempt.json':True}}
+    done = {'failed':None,'cleanup_exit':0,'identity_unchanged':True,'all_passed':True,'evidence':{'run':True}}
     bad = dict(done,failed={'section':'page/section','exit':1,'deadline':False},all_passed=False)
     def seen(kind, human): return dict(bad,observed={'failure':'step','kind':kind,'human_input':human})
-    cases = [(done,0,'DONE'),(dict(done,evidence={'run':False,'attempt.json':True}),0,'FAILED: required evidence'),
-        (dict(done,evidence={'run':True,'attempt.json':False}),0,'FAILED: required evidence'),
+    cases = [(done,0,'DONE'),(dict(done,evidence={'run':False}),0,'FAILED: required evidence'),
         ({key:value for key,value in done.items() if key != 'evidence'},0,'FAILED: required evidence'),
         (dict(done,all_passed=False),0,'FAILED: not every'),(dict(done,cleanup_exit=None),0,'FAILED'),
         (dict(done,interrupted='SIGTERM'),0,'FAILED: interrupted'),(dict(bad,cleanup_exit=1),0,'FAILED: Cleanup'),
@@ -226,9 +235,9 @@ def failure_capture(env, out):
     """
     process, result = None, {}
     try:
-        process = subprocess.Popen(['python3','-c',"from driver import *; capture('failure')"],cwd=REPO,
-            env=dict(env,PYTHONPATH=str(SKILL/'bin')),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
-            start_new_session=True)
+        process,previous = start_owned(['python3','-c',"from driver import *; capture('failure')"],cwd=REPO,
+            env=dict(env,PYTHONPATH=str(SKILL/'bin')),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+        signal.pthread_sigmask(signal.SIG_SETMASK,previous)
         output,_ = process.communicate(timeout=60)
         result = {'exit':process.returncode,'output':output[-4000:]}
     except Exception as error:
@@ -246,10 +255,10 @@ def attempt(found, plan, out, env, deadline, expected, record):
     """One Launch through Cleanup, filling record, which main() made with the attempt's RUN already chosen.
 
     main() calls it with the interrupting signals blocked. The try unblocks them, so a signal during Launch or a later
-    section raises Interrupted there, and the finally blocks them again before Cleanup. The receipts here and
-    verdict() in main() then run with any later signal pending, so it is read, not lost. Each write goes through
-    keep(), which records its own error in problems instead of raising; verdict() then refuses DONE when the proof copy
-    or attempt.json was not kept.
+    section raises Interrupted there; each section starts with them blocked across its fork. The finally blocks them
+    before Cleanup and returns with them blocked, so verdict() in main() reads any that arrived since. Each write here
+    goes through keep(), which records its own error in problems instead of raising; verdict() refuses DONE when the
+    proof copy was not kept, and main() writes attempt.json once, after the verdict.
     """
     run, problems = record['run'], record['problems']
     timings, current = [], [None]
@@ -269,10 +278,11 @@ def attempt(found, plan, out, env, deadline, expected, record):
         title = '/'.join(key)
         note(f'\n## {title}. Separate bash -c; only exported RUN carries run identity.\n')
         started = time.time()
-        process = subprocess.Popen(['bash','-c',found[key]],cwd=REPO,env=env,stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,text=True,start_new_session=True)
+        process,previous = start_owned(['bash','-c',found[key]],cwd=REPO,env=env,stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,text=True)
         budget = 90 if key == ('SKILL','Cleanup') else max(.01,deadline-time.time())
         try:
+            signal.pthread_sigmask(signal.SIG_SETMASK,previous)
             stdout,stderr = process.communicate(timeout=budget)
             code = process.returncode
         except subprocess.TimeoutExpired:
@@ -330,8 +340,10 @@ def attempt(found, plan, out, env, deadline, expected, record):
         problems.append(f'runner: {type(error).__name__}: {error}')
         record['failed'] = record['failed'] or {'section':'runner','exit':None,'deadline':False}
     finally:
-        block()
-        # A signal raised inside an except clause, or while blocking, reaches here only through INTERRUPT.
+        # Inline, not a call, so no function entry lies between the finally and this try. A signal here has already
+        # blocked the signals and set INTERRUPT, as has one raised inside an except clause.
+        try: signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
+        except Interrupted: pass
         record['interrupted'] = record['interrupted'] or INTERRUPT['signal']
         if record['interrupted'] and not record['failed']:
             record['failed'] = {'section':current[0] or 'runner','exit':None,'deadline':False}
@@ -358,16 +370,11 @@ def attempt(found, plan, out, env, deadline, expected, record):
         except Exception as error:
             problems.append(f'identity: {type(error).__name__}: {error}')
             record['identity_unchanged'] = False
-        record['interrupted'] = record['interrupted'] or INTERRUPT['signal'] or (pending() or [None])[0]
+        record['interrupted'] = record['interrupted'] or INTERRUPT['signal'] or (take_pending() or [None])[0]
         passed = {row['section'] for row in timings if row['exit'] == 0}
         record['all_passed'] = all('/'.join(key) in passed for key in plan)
         record['recipe_seconds'] = sum(row['seconds'] for row in timings)
-        wrote = keep('attempt.json',lambda: (out/'attempt.json').write_text(json.dumps(record,indent=2)+'\n'))
-        def read_back():
-            kept = json.loads((out/'attempt.json').read_text())
-            assert (kept['run'],kept['failed']) == (record['run'],record['failed']), 'attempt.json holds another run'
-        record['evidence'] = {'attempt.json':wrote and keep('attempt.json read back',read_back),
-            'run':copied and (out/'run').is_dir()}
+        record['evidence'] = {'run':copied and (out/'run').is_dir()}
 
 def new_run(scratch):
     """A fresh RUN, eight lowercase hex characters, whose proof and scratch folders do not exist yet."""
@@ -375,12 +382,16 @@ def new_run(scratch):
         run = secrets.token_hex(4)
         if not (REPO/'target/verify-veyra'/run).exists() and not os.path.exists(scratch+run): return run
 
-def rewrite(path, data, problems):
-    """Replace a receipt atomically, so a failed rewrite leaves any earlier copy whole; the error goes to problems."""
+def kept(path, data):
+    """Write a required receipt once and read it back. Returns None when it holds data, else the error, which goes to
+    stderr because the receipt that would hold it was not kept."""
     try:
-        path.with_name(path.name+'.new').write_text(json.dumps(data,indent=2)+'\n')
-        os.replace(path.with_name(path.name+'.new'),path)
-    except Exception as error: problems.append(f'{path.name}: {type(error).__name__}: {error}')
+        path.write_text(json.dumps(data,indent=2)+'\n')
+        if json.loads(path.read_text()) == json.loads(json.dumps(data)): return None
+        error = 'it does not read back as written'
+    except Exception as failure: error = f'{type(failure).__name__}: {failure}'
+    print(f'{path} was not kept: {error}',file=sys.stderr,flush=True)
+    return error
 
 def prepare():
     """Everything before the first attempt: options, checks, selection and the tree's identity. Nothing is owned yet,
@@ -442,9 +453,10 @@ def main():
         return 128+signal.Signals[str(stop)].value
     if isinstance(setup,int): return setup
     found,plan,args,env,expected = setup
-    attempts, counted, status = [], 0, None
+    attempts, counted, status, lost = [], 0, None, []
     while status is None:
-        block()
+        try: signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
+        except Interrupted: pass
         if INTERRUPT['signal']:
             status = 'FAILED: interrupted by '+INTERRUPT['signal']+' between attempts'
             break
@@ -454,30 +466,34 @@ def main():
         attempts.append(record)
         try: attempt(found,plan,args.evidence/label,dict(env,RUN=record['run']),args.deadline,expected,record)
         except Interrupted: pass  # raised in an except clause; the finally already ran Cleanup and filled record
+        # Cleanup has run and the signals are blocked: the verdict comes first, then the one write of attempt.json.
         status,counted = verdict(record,counted,time.time() >= args.deadline-60)
         record['verdict'] = status or 'another attempt'
-        rewrite(args.evidence/label/'attempt.json',record,record['problems'])
+        error = kept(args.evidence/label/'attempt.json',record)
+        if error:
+            lost.append('attempt.json')
+            status = 'FAILED: attempt.json was not kept: '+error
         if status is None:
             try:
                 signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
                 time.sleep(min(60,max(0,args.deadline-time.time())))
             except Interrupted as stop: status = 'FAILED: interrupted by '+str(stop)+' between attempts'
-    block()
-    outcome = {'status':status,'plan':['/'.join(key) for key in plan],'attempts':attempts}
-    problems = attempts[-1]['problems'] if attempts else []
-    rewrite(args.evidence/'outcome.json',dict(outcome,finished_epoch=time.time()),problems)
-    if status == 'DONE':
-        # A signal that arrived after the verdict, during the receipts above, is still pending and ends FAILED.
-        status,_ = verdict(attempts[-1],counted)
-        if status != 'DONE':
-            attempts[-1]['verdict'] = status
-            rewrite(args.evidence/attempts[-1]['label']/'attempt.json',attempts[-1],problems)
-            rewrite(args.evidence/'outcome.json',dict(outcome,status=status,finished_epoch=time.time()),problems)
-    print(status,'evidence='+str(args.evidence),flush=True)
-    # The verdict is final: discard anything still pending, then restore the mask.
+    try: signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
+    except Interrupted: pass
+    if kept(args.evidence/'outcome.json',{'status':status,'plan':['/'.join(key) for key in plan],
+            'attempts':attempts,'finished_epoch':time.time()}): lost.append('outcome.json')
+    late = pending()
+    final = status
+    if late:
+        final = f'FAILED: interrupted by {late[0]} after the verdict, as the receipts were written; they keep {status}'
+        print(final,file=sys.stderr,flush=True)
+    if lost: final = 'FAILED: '+' and '.join(lost)+' not kept, so the run cannot be DONE'
+    print(final,'evidence='+str(args.evidence),flush=True)
+    # The verdict and receipts are final: discard what is pending, then restore the mask.
     for number in SIGNALS: signal.signal(number,signal.SIG_IGN)
     signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
-    return 0 if status == 'DONE' else 1
+    if late: return 128+signal.Signals[late[0]].value
+    return 0 if status == 'DONE' and not lost else 1
 
 if __name__ == '__main__':
     sys.exit(main() or 0)

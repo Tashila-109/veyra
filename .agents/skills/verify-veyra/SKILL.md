@@ -20,17 +20,17 @@ The pages are the [feature map](features/README.md)'s links in order, then any o
 It waits in Launch's gate, gives each section a fresh `bash -c` with only `RUN` carried forward, times every section into `DIR/ATTEMPT/sections.json` and hard-links the kept proof to `DIR/ATTEMPT/run` after Cleanup.
 The runner chooses each attempt's `RUN` before Launch and passes it in, so the attempt's Cleanup knows its `RUN` even when Launch is interrupted.
 Everything from Launch on runs inside one `try`, and its `finally` runs Cleanup before anything else.
-SIGTERM, SIGHUP and SIGINT always raise.
+SIGTERM, SIGHUP and SIGINT always raise, and the handler blocks all three before it raises.
 Before the first attempt, nothing is owned yet, so a signal ends the runner at once with exit 128 plus the signal number.
-During an attempt, a signal raises into that `try`. Its `finally` blocks the three signals before Cleanup and keeps them blocked through the receipts and the verdict, so a signal arriving then stays pending.
-The verdict reads pending signals with `sigpending()`, and a pending signal ends the attempt FAILED (interrupted) and is recorded in `attempt.json`.
-Between attempts, the 60-second wait is unblocked, and a signal there ends the run FAILED.
-After the last receipt is written the runner checks pending signals once more, so DONE survives only if none arrived; then it discards what is pending and exits with the verdict's code.
+During an attempt, a signal raises into that `try`.
+Each section's process starts with the three signals blocked across its fork, and they are unblocked as the first step inside the `try` that stops that section's group; the process unblocks them for itself.
+The `finally` runs with the signals blocked, so one that arrives during Cleanup, the proof copy or the verdict stays pending.
 After a failed section, still inside that `try`, it takes one `failure` capture, unless human input caused the failure or the deadline stopped it, and records the capture's exit, error or timeout in `DIR/ATTEMPT/failure-capture.json`.
-Each write records its own error in the attempt's `problems` instead of raising, so no write can stop Cleanup.
+Each write during the attempt records its own error in the attempt's `problems` instead of raising, so no write can stop Cleanup.
 After Cleanup, one verdict decides the attempt, and it is the only place a run can become DONE:
-- DONE needs every planned section passed, Cleanup exit 0, an unchanged tree, the required evidence kept (the proof copy in `DIR/ATTEMPT/run` and an `attempt.json` that reads back) and no interrupting signal, recorded or pending.
-- An interruption, a failed Cleanup, scratch left behind, required evidence that was not kept or a changed tree ends FAILED, and the recorded errors stay in `problems`.
+- The verdict reads pending signals with `sigpending()` for every outcome, and an interruption ends the attempt FAILED (interrupted) and is recorded in the attempt's record.
+- DONE needs every planned section passed, Cleanup exit 0, an unchanged tree, the proof copy kept in `DIR/ATTEMPT/run` and no interrupting signal.
+- An interruption, a failed Cleanup, scratch left behind, a proof copy that was not kept or a changed tree ends FAILED, and the recorded errors stay in `problems`.
 - The failure capture, the transcript, `sections.json` and `plan.json` are diagnostics: a write error there is listed in `problems` and changes nothing else.
 - Otherwise a failed section is classified by the observation `observe_failure` recorded in `focus-failure.json` during it, and a corrupt `focus-failure.json` counts as no observation:
   - Reaching the deadline, or any other failure in its last minute, ends BLOCKED.
@@ -38,7 +38,12 @@ After Cleanup, one verdict decides the attempt, and it is the only place a run c
   - A `capture` failure with no human input gets a new attempt after 60 seconds, and the third such failure in a run ends BLOCKED.
   - A `focus-timeout` failure with no human input, such as a dock-focus regression, and any failure with no observation end FAILED.
 
-`DIR/outcome.json` holds the status, every attempt and the gate wait apart from the recipe time.
+After the verdict, `DIR/ATTEMPT/attempt.json` is written once, with the verdict, and read back.
+Between attempts, the 60-second wait is unblocked, and a signal there ends the run FAILED.
+After the last attempt, `DIR/outcome.json` is written once, with the status, every attempt and the gate wait apart from the recipe time, and read back.
+A receipt that fails to write or read back ends the run FAILED with exit 1, and its error goes to stderr, because the receipt that would hold it was not kept.
+A signal that arrives after the verdict, while the receipts are written, cannot be recorded in them, so it ends the run with exit 128 plus its number and the reason on stderr.
+The run exits 0 and prints DONE only when the verdict was DONE, both receipts were written and read back, and no signal arrived after the verdict.
 
 ```text
 .agents/skills/verify-veyra/bin/run --evidence DIR                     # every page, the full run
@@ -424,20 +429,10 @@ case "$DATA" in /tmp/veyra-*) ;; *) exit 1 ;; esac
 PID=$(<"$PROOF/pid")
 PGID=$(<"$PROOF/pgid")
 test "$PID" = "$PGID"
-sqlite3 "$DATA/veyra.db" 'select live_pgid from threads where live_pgid is not null' >"$PROOF/provider-groups.txt"
-sqlite3 "$DATA/veyra.db" 'select live_pid from threads where live_pid is not null' >"$PROOF/provider-pids.txt"
-test ! -f "$DATA/logs/veyra.log" || cp "$DATA/logs/veyra.log" "$PROOF/veyra.log"
 if kill -0 "$PID" 2>/dev/null; then
     test "$(ps -o pgid= -p "$PID" | tr -d ' ')" = "$PGID"
     VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl quit >"$PROOF/quit.json" 2>"$PROOF/quit.stderr" || true
 fi
-while read -r group; do
-    test -z "$group" || kill -TERM -- "-$group" 2>/dev/null || true
-done <"$PROOF/provider-groups.txt"
-sleep 1
-while read -r group; do
-    test -z "$group" || kill -KILL -- "-$group" 2>/dev/null || true
-done <"$PROOF/provider-groups.txt"
 for attempt in $(seq 1 50); do
     kill -0 "$PID" 2>/dev/null || break
     sleep .1
@@ -448,6 +443,21 @@ for attempt in $(seq 1 50); do
     sleep .1
 done
 ! kill -0 "$PID" 2>/dev/null
+: >"$PROOF/provider-groups.txt"
+: >"$PROOF/provider-pids.txt"
+if test -f "$DATA/veyra.db" &&
+    test "$(sqlite3 "$DATA/veyra.db" "select count(*) from sqlite_master where type='table' and name='threads'")" = 1; then
+    sqlite3 "$DATA/veyra.db" 'select live_pgid from threads where live_pgid is not null' >"$PROOF/provider-groups.txt"
+    sqlite3 "$DATA/veyra.db" 'select live_pid from threads where live_pid is not null' >"$PROOF/provider-pids.txt"
+fi
+test ! -f "$DATA/logs/veyra.log" || cp "$DATA/logs/veyra.log" "$PROOF/veyra.log"
+while read -r group; do
+    test -z "$group" || kill -TERM -- "-$group" 2>/dev/null || true
+done <"$PROOF/provider-groups.txt"
+sleep 1
+while read -r group; do
+    test -z "$group" || kill -KILL -- "-$group" 2>/dev/null || true
+done <"$PROOF/provider-groups.txt"
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - "$PROOF" <<'PY'
 import ctypes, errno, json, os, pathlib, struct, subprocess, sys, time
 proof = pathlib.Path(sys.argv[1])
@@ -492,7 +502,8 @@ printf 'PASS cleanup PID=%s gone DATA=%s removed PROOF=%s kept\n' "$PID" "$DATA"
 ```
 
 Cleanup leaves `target/verify-veyra/$RUN` intact.
-If Launch failed before the database exists, record that failure and stop only its recorded app group; do not claim the normal marker/database cleanup passed.
+Cleanup stops the saved app first, with `ctl quit` and then its group, before it reads the database.
+It reads the provider groups and pids only when `veyra.db` and its `threads` table exist, so an app that was interrupted before its database exists is still stopped and DATA is removed.
 Never kill by name.
 
 ### Gotchas
