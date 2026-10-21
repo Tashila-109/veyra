@@ -21,42 +21,127 @@ const NEEDLES: &[&str] = &[
     "\"cmd-",
 ];
 
-fn blank_comments(source: &str) -> String {
-    let mut bytes = source.as_bytes().to_vec();
+#[derive(Clone, Copy)]
+enum SourceKind {
+    Comment,
+    Literal,
+}
+
+struct SourceSpan {
+    start: usize,
+    end: usize,
+    kind: SourceKind,
+}
+
+fn source_spans(source: &str) -> Vec<SourceSpan> {
+    let bytes = source.as_bytes();
+    let mut spans = Vec::new();
     let mut index = 0;
-    let mut block_depth = 0;
-    let mut line_comment = false;
     while index < bytes.len() {
-        let pair = source.as_bytes().get(index..index + 2);
-        let width = if line_comment {
-            if bytes[index] == b'\n' {
-                line_comment = false;
-            }
-            1
-        } else if pair == Some(b"/*") {
-            block_depth += 1;
-            2
-        } else if block_depth > 0 && pair == Some(b"*/") {
-            block_depth -= 1;
-            bytes[index..index + 2].fill(b' ');
+        let start = index;
+        let rest = &bytes[index..];
+        let kind = if rest.starts_with(b"//") {
+            index += rest
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .unwrap_or(rest.len());
+            Some(SourceKind::Comment)
+        } else if rest.starts_with(b"/*") {
             index += 2;
-            continue;
-        } else if block_depth == 0 && pair == Some(b"//") {
-            line_comment = true;
-            2
+            let mut depth = 1;
+            while index < bytes.len() && depth > 0 {
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            Some(SourceKind::Comment)
         } else {
-            1
+            let prefix = usize::from(matches!(bytes[index], b'b' | b'c'));
+            let quote = index + prefix;
+            let raw = quote + usize::from(bytes.get(quote) == Some(&b'r'));
+            let mut opening = raw;
+            while bytes.get(opening) == Some(&b'#') {
+                opening += 1;
+            }
+            if raw > quote && bytes.get(opening) == Some(&b'"') {
+                let closing = format!("\"{}", "#".repeat(opening - raw));
+                index = source[opening + 1..]
+                    .find(&closing)
+                    .map_or(bytes.len(), |offset| opening + 1 + offset + closing.len());
+                Some(SourceKind::Literal)
+            } else if bytes.get(quote) == Some(&b'"') {
+                index = quote + 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index = (index + 2).min(bytes.len()),
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+                Some(SourceKind::Literal)
+            } else if bytes.get(quote) == Some(&b'\'') {
+                let value = quote + 1;
+                let end = if bytes.get(value) == Some(&b'\\') {
+                    match bytes.get(value + 1) {
+                        Some(b'u') => source[value..].find('}').map(|offset| value + offset + 1),
+                        Some(b'x') => Some(value + 4),
+                        Some(_) => Some(value + 2),
+                        None => None,
+                    }
+                } else {
+                    source[value..]
+                        .chars()
+                        .next()
+                        .map(|value_char| value + value_char.len_utf8())
+                };
+                if let Some(end) = end.filter(|&end| bytes.get(end) == Some(&b'\'')) {
+                    index = end + 1;
+                    Some(SourceKind::Literal)
+                } else {
+                    index += 1;
+                    None
+                }
+            } else {
+                index += 1;
+                None
+            }
         };
-        if line_comment || block_depth > 0 {
-            for byte in &mut bytes[index..index + width] {
-                if *byte != b'\n' && *byte != b'\r' {
+        if let Some(kind) = kind {
+            spans.push(SourceSpan {
+                start,
+                end: index,
+                kind,
+            });
+        }
+    }
+    spans
+}
+
+fn blank_source(source: &str, literals: bool) -> String {
+    let mut bytes = source.as_bytes().to_vec();
+    for span in source_spans(source) {
+        if literals || matches!(span.kind, SourceKind::Comment) {
+            for byte in &mut bytes[span.start..span.end] {
+                if !matches!(*byte, b'\n' | b'\r') {
                     *byte = b' ';
                 }
             }
         }
-        index += width;
     }
-    String::from_utf8(bytes).expect("comment blanking preserves UTF-8")
+    String::from_utf8(bytes).expect("source blanking preserves UTF-8")
+}
+
+fn blank_comments(source: &str) -> String {
+    blank_source(source, false)
 }
 
 fn matches(source: &str) -> Vec<(usize, &'static str)> {
@@ -158,15 +243,28 @@ fn files_under(path: &Path) -> io::Result<Vec<std::path::PathBuf>> {
 const PLANNING_ID_ALLOWLIST: &[(&str, &str, &str)] = &[];
 
 fn planning_id_violations(path: &str, source: &str) -> Vec<String> {
-    let pattern = regex::Regex::new(
-        r"\b([M][0-8](s[0-9])?|SC[0-9]+|SF[0-9]+|wave ?(0|zero)|[Ll]ane [0-9]|criterion [0-9]+|veyra-m[0-9])\b",
-    )
+    let pattern = regex::Regex::new(concat!(
+        r"(?i)([M][0-8](s[0-9]+)?|SC[0-9]+|SF[0-9]+|wave[ -]?(0|zero)|",
+        r"lane [0-9]+|criterion [0-9]+|veyra-m[0-9](s[0-9]+)?|c[0-9]+)"
+    ))
     .unwrap();
     source
         .lines()
         .enumerate()
         .flat_map(|(index, line)| {
             pattern.find_iter(line).filter_map(move |found| {
+                let before = line[..found.start()].chars().next_back();
+                let after = line[found.end()..].chars().next();
+                let criterion_prefix = found.as_str().to_ascii_lowercase().starts_with('c')
+                    && found.as_str()[1..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit());
+                if before.is_some_and(char::is_alphanumeric)
+                    || after.is_some_and(char::is_alphanumeric)
+                    || (criterion_prefix && after != Some('_'))
+                {
+                    return None;
+                }
                 let kept = PLANNING_ID_ALLOWLIST.iter().any(|&(file, text, reason)| {
                     assert!(!reason.is_empty());
                     file == path && text == line
@@ -213,10 +311,31 @@ fn planning_ids_absent_self_test() {
         ["Lane", " 2"],
         ["lane", " 3"],
         ["criterion", " 12"],
-        ["veyra-", "m8"],
+        ["veyra-m", "8"],
     ] {
         let planted = parts.concat();
         assert_eq!(planning_id_violations("planted", &planted).len(), 1);
+    }
+    for parts in [
+        ["verify_m", "3", "_nested_dump_names"],
+        ["M", "3", "_INITIAL_TOKEN_CALLS"],
+        ["VEYRA_M", "6", "_RELAY"],
+        ["veyra-m", "6", "s1-scratch"],
+        ["veyra-m", "7", "s1-scratch"],
+        ["wave", "0", "_probe"],
+        ["VEYRA_M", "8", "_SHELL_CHILD"],
+        ["m", "8", "-lanes"],
+        ["wave-", "zero", "-session"],
+        ["c", "1", "_fan_out"],
+        ["", "M", "3"],
+        ["VERIFY_M", "3", "_NESTED_DUMP_NAMES"],
+        ["Wave-", "ZeRo", "-session"],
+    ] {
+        let planted = parts.concat();
+        assert!(
+            !planning_id_violations("planted", &planted).is_empty(),
+            "{planted}"
+        );
     }
     assert!(planning_id_violations("clean", "SM0 SCHEMA SFoo waveform lane width").is_empty());
     assert_eq!(
@@ -282,17 +401,63 @@ fn hermetic_violations(path: &str, source: &str) -> Vec<String> {
     {
         return Vec::new();
     }
-    let source = blank_comments(source);
+    let code = blank_source(source, true);
+    let visible_literals = blank_comments(source);
     let calls = regex::Regex::new(
-        r##"\b(?:ChildEnv\s*::\s*load\s*\(|Command\s*::\s*new\s*\(\s*(?:r#*)?"(?:claude|codex|grok)")"##,
+        r"\b(?:ChildEnv\s*::\s*load|Command\s*::\s*new|Engine\s*::\s*(?:start|start_with_processes))\s*\(",
     )
     .unwrap();
     let functions = regex::Regex::new(r"\bfn\s+([A-Za-z_][A-Za-z_0-9]*)\s*\(").unwrap();
+    let identifiers = regex::Regex::new(r"\b[A-Za-z_][A-Za-z_0-9]*\b").unwrap();
+    let bindings =
+        regex::Regex::new(r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z_0-9]*)\s*(?::[^=;]+)?=").unwrap();
+    let provider = |text: &str| {
+        let text = text.to_ascii_lowercase();
+        ["claude", "codex", "grok"]
+            .iter()
+            .any(|name| text.contains(name))
+    };
+    let literals: Vec<_> = source_spans(source)
+        .into_iter()
+        .filter(|span| matches!(span.kind, SourceKind::Literal))
+        .collect();
+    let provider_variables: std::collections::BTreeSet<_> = bindings
+        .captures_iter(&code)
+        .filter(|binding| {
+            let start = binding.get(0).unwrap().end();
+            let value = start + visible_literals[start..].len()
+                - visible_literals[start..].trim_start().len();
+            literals
+                .iter()
+                .any(|span| span.start == value && provider(&source[span.start..span.end]))
+        })
+        .map(|binding| binding[1].to_owned())
+        .collect();
     let mut kept = std::collections::BTreeSet::new();
     calls
-        .find_iter(&source)
+        .find_iter(&code)
+        .filter(|call| {
+            if !call.as_str().starts_with("Command") {
+                return true;
+            }
+            let mut depth = 1;
+            let end = code[call.end()..]
+                .char_indices()
+                .find_map(|(offset, character)| {
+                    depth += i32::from(character == '(') - i32::from(character == ')');
+                    (depth == 0).then_some(call.end() + offset)
+                })
+                .unwrap_or(code.len());
+            literals.iter().any(|span| {
+                span.start >= call.end()
+                    && span.end <= end
+                    && provider(&source[span.start..span.end])
+            }) || identifiers
+                .find_iter(&code[call.end()..end])
+                .any(|name| provider_variables.contains(name.as_str()))
+        })
         .filter_map(|call| {
-            let function = functions.captures_iter(&source[..call.start()]).last();
+            let function = functions.captures_iter(&code[..call.start()]).last();
             let allowed =
                 HERMETIC_ALLOWLIST
                     .iter()
@@ -350,6 +515,18 @@ fn tests_stay_hermetic() {
 #[test]
 fn tests_stay_hermetic_self_test() {
     for source in [
+        "fn ordinary() { let marker = \"/*\";\nChildEnv::load(); }",
+        "fn ordinary() { let url = \"https://example.test\"; ChildEnv::load(); }",
+        "fn ordinary() { let url = \"https://example.test\"; Command::new(\"codex\"); }",
+        "fn ordinary() { let marker = r#\"/*\"#; ChildEnv::load(); }",
+        "fn ordinary() { let marker = b\"/*\"; ChildEnv::load(); }",
+        "fn ordinary() { let marker = br#\"/*\"#; ChildEnv::load(); }",
+        "fn ordinary() { let marker = '/'; let star = '*'; ChildEnv::load(); }",
+        "fn ordinary() { Command::new(\"/opt/homebrew/bin/claude\"); }",
+        "fn ordinary() { let cli = \"codex\"; Command::new(cli); }",
+        "fn ordinary() { let cli = /* marker */ \"grok\"; Command::new(cli); }",
+        "fn ordinary() { Engine::start(path); }",
+        "fn ordinary() { Engine::start_with_processes(path, processes); }",
         "fn ordinary() { ChildEnv::load(); }",
         "fn ordinary() { ChildEnv :: load (); }",
         "fn ordinary() { std::process::Command::new(\"codex\"); }",
@@ -362,6 +539,13 @@ fn tests_stay_hermetic_self_test() {
         );
         assert!(hermetic_violations("engine/tests/live_probe.rs", source).is_empty());
         assert!(hermetic_violations("engine/tests/common/live.rs", source).is_empty());
+    }
+    for source in [
+        r##"fn clean() { let text = r#"ChildEnv::load(); Command::new("codex");"#; }"##,
+        r#"fn clean() { let slash = '/'; let quote = '\''; let byte = b'/'; }"#,
+        r#"fn clean() { /* nested /* ChildEnv::load(); */ Engine::start(path); */ }"#,
+    ] {
+        assert!(hermetic_violations("engine/tests/clean.rs", source).is_empty());
     }
     let allowed = "fn check_child_env_snapshot() { ChildEnv::load(); }";
     assert!(hermetic_violations("engine/tests/replay_claude.rs", allowed).is_empty());

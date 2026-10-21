@@ -1251,7 +1251,8 @@ The terminal header renders In terminal while dump’s engine status key remains
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
 Its allow_once_enabled, allow_in_thread_enabled and consent_reason use the same typed consent as the rendered controls.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
-The debug-only `veyra::DebugAgeQuiet` action accepts a thread id and minutes, subtracts those minutes from that Working thread's quiet activity timestamp, and repaints; the next activity event replaces it with the real timestamp. It changes no engine status or turn timing, and `header::quiet_for` remains the display rule.
+The debug-only `veyra::DebugAgeQuiet` action accepts a thread id and minutes, subtracts those minutes from that Working thread's quiet activity timestamp, and repaints; the next activity event replaces it with the real timestamp.
+It changes no engine status or turn timing, and `header::quiet_for` remains the display rule.
 
 ## Differences from design-6
 
@@ -1381,7 +1382,13 @@ Shell tests inject an isolated provider environment and admit no process to thei
 Their current-thread runtimes do not drive readiness tasks before replacing the probes, so their startup probes start no provider check.
 recheck_after_confirm_quit_launches_no_provider deliberately checks an owned stand-in as its positive control, without running a real provider.
 Clippy with -D warnings and cargo fmt --check check source quality.
-The platform boundary tests also scan source text for planning identifiers, Rust lines over 120 characters and host-dependent integration tests, each with planted-text self-tests. The hermeticity scan exempts live tests and one named scripted-shell helper. Clippy disallows arbitrary JSON values outside documented wire-format allowances; tool arguments retain their existing wire JSON through a narrowly allowed alias used only by that field. `scripts/red-on-parent.sh BASE [EXPECT_PASS_FILE]` copies changed test-only files into an isolated archive of BASE and runs their changed tests there. A passing test fails the check unless the supplied evidence file names its reason; an absent or failing listed test makes that entry stale and fails the check. Tests inside production source files retain manual red receipts.
+The platform boundary tests also scan source text for planning identifiers, Rust lines over 120 characters and host-dependent integration tests, each with planted-text self-tests.
+The hermeticity scan exempts live tests and one named scripted-shell helper.
+Its lexer preserves literal boundaries while excluding comments, and it rejects installed-provider command arguments and host-loading engine constructors.
+Clippy disallows arbitrary JSON values outside documented wire-format allowances; tool arguments retain their existing wire JSON through a private narrowly allowed alias used only by that field.
+`scripts/red-on-parent.sh BASE [EXPECT_PASS_FILE]` copies every changed test-only file, including fixtures and renamed paths, into an isolated archive of BASE and runs their changed tests by fully qualified name with exact matching in their own Cargo target.
+A passing test fails the check unless the supplied evidence file names its reason; an absent or failing listed test makes that entry stale and fails the check.
+Tests inside production source files retain manual red receipts.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence, header-branch clearing and cleanup.
 App-launch's release check proves that release has no driver, using string scans with a debug positive control, ctl refusal and socket checks.
 Its macOS sandbox allows only the release Veyra executable and denies every child executable, including installed-provider probes; an unavailable sandbox, invalid profile or missing exec-denial receipt fails the check.

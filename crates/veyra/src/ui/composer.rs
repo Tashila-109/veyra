@@ -1093,6 +1093,7 @@ mod round_trip_display_tests {
     use super::approval_text;
     use veyra_engine::{domain::*, provider::ProviderKind};
     #[test]
+    #[allow(clippy::disallowed_types)] // This test decodes the rendered approval wire JSON.
     fn approval_preview_keeps_pretty_json_line_breaks() {
         let arguments = serde_json::json!({"message":"first\nsecond", "control":"\u{202e}"});
         let preview = serde_json::to_string_pretty(&arguments).unwrap();

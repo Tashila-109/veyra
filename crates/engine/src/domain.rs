@@ -211,7 +211,7 @@ pub struct AsyncQuestion {
     pub selected: Option<usize>,
 }
 #[allow(clippy::disallowed_types)] // Provider wire arguments retain arbitrary JSON for display.
-pub type ToolArguments = serde_json::Value;
+type ToolArguments = serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {

@@ -1,4 +1,5 @@
-#![allow(clippy::disallowed_types)] // Debug dump methods serialize the window projection to wire JSON.
+#[allow(clippy::disallowed_types)]
+// Gpui actions deserialize JSON payloads at the action wire boundary.
 pub mod actions;
 mod composer;
 mod header;
@@ -1665,7 +1666,7 @@ impl Shell {
         }
     }
     fn notification_response(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Ok(root) = serde_json::from_value::<ThreadId>(serde_json::Value::String(tag.into()))
+        if let Ok(root) = tag.parse().map(ThreadId)
             && let Some(thread) = self.banner_target(root)
         {
             cx.activate(true);
@@ -1789,6 +1790,7 @@ impl Shell {
         Ok(())
     }
     #[cfg(debug_assertions)]
+    #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
     fn dump_rows(&self) -> Vec<serde_json::Value> {
         let mut rows = Vec::new();
         for project in self.state.projects.values() {
@@ -1818,6 +1820,7 @@ impl Shell {
         rows
     }
     #[cfg(debug_assertions)]
+    #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
     fn dump_selected(&self) -> Option<serde_json::Value> {
         self.view
             .selected()
@@ -1841,6 +1844,7 @@ impl Shell {
             })
     }
     #[cfg(debug_assertions)]
+    #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
     fn dump_providers(&self) -> Vec<serde_json::Value> {
         ProviderKind::ALL
             .into_iter()
@@ -1858,6 +1862,7 @@ impl Shell {
             .collect()
     }
     #[cfg(debug_assertions)]
+    #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
     fn dump_transcript(&self) -> Vec<serde_json::Value> {
         let items = self
             .view
@@ -1924,6 +1929,7 @@ impl Shell {
             .collect()
     }
     #[cfg(debug_assertions)]
+    #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
     fn dump_composer(&self, cx: &App) -> serde_json::Value {
         let reason = self.disabled_reason();
         serde_json::json!({
@@ -1965,6 +1971,7 @@ impl Shell {
         })
     }
     #[cfg(debug_assertions)]
+    #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
     pub fn dump(&self, data_dir: &std::path::Path, cx: &App) -> serde_json::Value {
         let perf = self.engine.perf();
         let mut transcript = self.scroller.read(cx).dump();
@@ -2595,6 +2602,7 @@ pub fn run(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)] // UI tests inspect debug dump and provider wire JSON.
 mod tests {
     use super::{AppState, provider_rows};
     use crate::tests::Scratch;

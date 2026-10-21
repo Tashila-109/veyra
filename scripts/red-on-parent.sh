@@ -13,7 +13,7 @@ import tarfile
 import tempfile
 
 def test_file(name):
-    return re.fullmatch(r'crates/[^/]+/tests/.+\.rs|crates/engine/src/tests/.+\.rs', name) is not None
+    return re.fullmatch(r'crates/[^/]+/tests/.+|crates/engine/src/tests/.+', name) is not None
 
 def mask(source):
     pattern = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|(?:br|cr|r)(?P<hash>\#*)"[\s\S]*?"(?P=hash)|(?:b|c)?"(?:\\[\s\S]|[^"\\])*"|b?'(?:\\.|[^'\\])' ''',re.X)
@@ -48,9 +48,25 @@ def canonical(source):
     result.extend(re.findall(r'\w+|::|->|=>|\.\.=|\.\.|==|!=|<=|>=|&&|\|\||<<|>>|[^\s]', source[end:]))
     return result
 
+def closing_brace(hidden, opening):
+    depth, end = 1, opening+1
+    while depth:
+        assert end < len(hidden), 'unclosed Rust block'
+        depth += (hidden[end] == '{') - (hidden[end] == '}')
+        end += 1
+    return end
+
+def module_scopes(hidden):
+    return [(match[1], match.end()-1, closing_brace(hidden, match.end()-1))
+        for match in re.finditer(r'\bmod\s+(\w+)\s*\{', hidden)]
+
+def enclosing_modules(scopes, position):
+    return tuple(name for name,start,end in scopes if start < position < end)
+
 def tests(source):
     hidden = mask(source)
-    declarations = re.compile(r'(?m)^[ \t]*(?:pub(?:\([^\n]*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*\(')
+    scopes = module_scopes(hidden)
+    declarations = re.compile(r'\b(?:pub(?:\([^\n]*\))?\s+)?(?:async\s+)?fn\s+(\w+)\s*\(')
     result = {}
     for match in declarations.finditer(hidden):
         attributes = re.search(r'((?:#\[[^\]]*\]\s*)+)$',hidden[:match.start()])
@@ -58,26 +74,138 @@ def tests(source):
             continue
         opening = hidden.find('{', match.end())
         assert opening >= 0, match[1]
-        depth, end = 1, opening+1
-        while depth:
-            assert end < len(hidden), match[1]
-            depth += (hidden[end] == '{') - (hidden[end] == '}')
-            end += 1
-        result[match[1]] = (attributes.start(), end)
+        name = '::'.join((*enclosing_modules(scopes, match.start()), match[1]))
+        assert name not in result, 'duplicate test: '+name
+        result[name] = (attributes.start(), closing_brace(hidden, opening))
     return result
+
+def module_files(path, prefix=(), crate_root=True, seen=None):
+    seen = set() if seen is None else seen
+    path = path.resolve()
+    if path in seen:
+        return {}
+    seen.add(path)
+    result = {path: prefix}
+    source = path.read_text()
+    hidden = mask(source)
+    scopes = module_scopes(hidden)
+    base = path.parent if crate_root or path.name == 'mod.rs' else path.with_suffix('')
+    for match in re.finditer(r'\bmod\s+(\w+)\s*;', hidden):
+        parents = enclosing_modules(scopes, match.start())
+        attributes = re.search(r'((?:#\[[^\]]*\]\s*)+)$',hidden[:match.start()])
+        explicit = re.search(r'#\[path\s*=\s*"([^"]+)"\]',source[attributes.start():match.start()]) if attributes else None
+        candidates = [path.parent/explicit[1]] if explicit else [
+            base.joinpath(*parents, match[1]+'.rs'), base.joinpath(*parents, match[1], 'mod.rs')]
+        for child in candidates:
+            if child.is_file():
+                result.update(module_files(child, (*prefix, *parents, match[1]), False, seen))
+                break
+    return result
+
+def cargo_targets(root, files):
+    metadata = subprocess.check_output(['cargo','metadata','--no-deps','--format-version','1'],cwd=root,text=True)
+    import json
+    found = {name: [] for name in files}
+    for package in json.loads(metadata)['packages']:
+        for target in package['targets']:
+            kind = next((kind for kind in ['test','lib','bin'] if kind in target['kind']), None)
+            if kind is None:
+                continue
+            modules = module_files(pathlib.Path(target['src_path']))
+            for name in files:
+                prefix = modules.get((root/name).resolve())
+                if prefix is not None:
+                    found[name].append((package['name'], kind, target['name'], prefix))
+    for name in files:
+        assert found[name], 'Cannot resolve the Cargo test target for '+name
+    return found
+
+def cargo_command(package, kind, target, test):
+    selection = ['--lib'] if kind == 'lib' else ['--'+kind, target]
+    return ['cargo','test','-p',package,*selection,'--',test,'--exact','--nocapture']
+
+def copy_test_files(source, root, files):
+    for name in files:
+        target = root/name
+        target.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copyfile(source/name,target)
 
 def changed_tests(before, after):
     previous = tests(before)
     return sorted(name for name,(start,end) in tests(after).items()
         if name not in previous or canonical(before[slice(*previous[name])]) != canonical(after[start:end]))
 
-def verdict(test, passed, ran, expected):
+def verdict(test, code, output, expected):
+    results = re.findall(r'(?m)^test '+re.escape(test)+r' \.\.\. (ok|FAILED|ignored)\b', output)
+    passed = 'ok' in results
     if test in expected:
-        return (passed and ran, 'EXPECTED PASS: '+test+'; '+expected[test] if passed and ran
+        return (passed, 'EXPECTED PASS: '+test+'; '+expected[test] if passed
             else 'FAIL stale expected-pass entry did not pass: '+test)
     if passed:
-        return False, 'FAIL test passes on parent: '+test if ran else 'FAIL test filter executed no named test: '+test
-    return True, 'RED test failed or could not compile on parent: '+test
+        return False, 'FAIL test passes on parent: '+test
+    if results == ['FAILED'] or (not results and code != 0
+        and re.search(r'(?m)^error: could not compile ', output)):
+        return True, 'RED target test failed or its Cargo target could not compile: '+test
+    return False, 'FAIL no conclusive target result: '+test
+
+def isolation_self_test():
+    with tempfile.TemporaryDirectory(prefix='veyra-speed-parent-self-test-',dir='/tmp') as folder:
+        root = pathlib.Path(folder)
+        package = root/'crates/probe'
+        (package/'src').mkdir(parents=True)
+        (package/'tests').mkdir()
+        (root/'Cargo.toml').write_text('[workspace]\nmembers=["crates/probe"]\nresolver="3"\n')
+        (package/'Cargo.toml').write_text('[package]\nname="parent-probe"\nversion="0.0.0"\nedition="2024"\n')
+        (package/'src/lib.rs').write_text('')
+        passing = '#[test]\nfn restart() { assert!(true); }\n'
+        sibling = '#[test]\nfn restart_recovers() { assert!(false); }\n'
+        (package/'tests/matching.rs').write_text(passing+sibling)
+        for case in ['substring sibling fails','other copied file fails compilation','passing target alone']:
+            if case.startswith('other'):
+                (package/'tests/broken.rs').write_text('fn broken(\n')
+            if case.endswith('alone'):
+                (package/'tests/matching.rs').write_text(passing)
+                (package/'tests/broken.rs').unlink()
+            command = cargo_command('parent-probe','test','matching','restart')
+            result = subprocess.run(command,cwd=root,capture_output=True,text=True)
+            output = result.stdout+result.stderr
+            assert result.returncode == 0 and 'test restart ... ok' in output, (case,output)
+            assert 'test restart_recovers ...' not in output
+            assert not verdict('restart',result.returncode,output,{})[0], case
+            print('PASS isolation self-test: '+case+' cannot hide passing target',flush=True)
+        source = root/'candidate'
+        fixture = 'crates/probe/tests/fixtures/new.txt'
+        renamed = 'crates/probe/tests/renamed.rs'
+        (source/fixture).parent.mkdir(parents=True)
+        (source/fixture).write_bytes(b'new fixture\n')
+        (source/renamed).write_text('mod nested {\n#[test]\nfn restart() { assert_eq!(include_str!("fixtures/new.txt"), "new fixture\\n"); }\n}\n')
+        copy_test_files(source,root,[fixture,renamed])
+        assert (root/fixture).read_bytes() == b'new fixture\n'
+        assert test_file(renamed) and changed_tests('',(source/renamed).read_text()) == ['nested::restart']
+        assert '--no-renames' in diff_command('BASE')
+        owner, = cargo_targets(root,{renamed})[renamed]
+        result = subprocess.run(cargo_command(*owner[:3],'nested::restart'),cwd=root,capture_output=True,text=True)
+        output = result.stdout+result.stderr
+        assert result.returncode == 0 and 'test nested::restart ... ok' in output, output
+        assert not verdict('nested::restart',result.returncode,output,{})[0]
+        print('PASS isolation self-test: renamed nested test resolves exactly; new fixture is copied and used',flush=True)
+        (package/'src/lib.rs').write_text('#[cfg(test)]\nmod tests;\n')
+        (package/'src/tests').mkdir()
+        (package/'src/tests/mod.rs').write_text('mod part;\n')
+        unit = 'crates/probe/src/tests/part.rs'
+        (root/unit).write_text(passing)
+        owner, = cargo_targets(root,{unit})[unit]
+        full_name = '::'.join((*owner[3],'restart'))
+        assert full_name == 'tests::part::restart'
+        result = subprocess.run(cargo_command(*owner[:3],full_name),cwd=root,capture_output=True,text=True)
+        output = result.stdout+result.stderr
+        assert result.returncode == 0 and 'test tests::part::restart ... ok' in output, output
+        assert not verdict(full_name,result.returncode,output,{})[0]
+        print('PASS isolation self-test: external unit modules resolve to their fully qualified test name',flush=True)
+
+
+def diff_command(base):
+    return ['git','diff','--no-renames','--name-only','--diff-filter=AM',base,'--','crates']
 
 def self_test():
     before = '#[test]\nfn existing() { assert!(false); }\n'
@@ -97,13 +225,18 @@ def self_test():
     assert test_file('crates/engine/src/tests/probe.rs')
     assert not test_file('crates/engine/src/actor.rs')
     assert set(tests('#[test]\nfn quoted() { let text = r#"}"#; }\n')) == {'quoted'}
-    assert not verdict('planted',True,True,{})[0]
-    assert verdict('planted',True,True,{'planted':'formatting only'})[0]
-    assert not verdict('planted',False,False,{'planted':'formatting only'})[0]
+    assert not verdict('planted',0,'test planted ... ok',{})[0]
+    assert verdict('planted',0,'test planted ... ok',{'planted':'formatting only'})[0]
+    assert not verdict('planted',101,'test planted ... FAILED',{'planted':'formatting only'})[0]
+    assert not verdict('restart',101,'test restart ... ok\ntest restart_recovers ... FAILED',{})[0]
+    assert not verdict('restart',101,'unrelated infrastructure failure',{})[0]
+    assert verdict('restart',101,'error: could not compile `parent-probe` (test \"matching\")',{})[0]
+    assert set(tests('mod nested {\n#[test]\nfn check() {}\n}')) == {'nested::check'}
     print('PASS self-test: wrapped-only test skipped; token/string changes selected; planted pass rejected; listed pass accepted; stale listed failure rejected', flush=True)
 
 self_test()
 if sys.argv[1:] == ['--self-test']:
+    isolation_self_test()
     sys.exit(0)
 if len(sys.argv) not in (2,3):
     sys.exit('usage: scripts/red-on-parent.sh BASE [EXPECT_PASS_FILE] | --self-test')
@@ -115,19 +248,25 @@ if len(sys.argv) == 3:
         assert name not in expected and reason.strip(), 'Expected-pass entries need unique names and reasons'
         expected[name] = reason
 base = subprocess.check_output(['git','rev-parse','--verify',sys.argv[1]+'^{commit}'],text=True).strip()
-names = subprocess.check_output(['git','diff','--name-only','--diff-filter=AM',base,'--','crates'],text=True).splitlines()
+names = subprocess.check_output(diff_command(base),text=True).splitlines()
 names += subprocess.check_output(['git','ls-files','--others','--exclude-standard','--','crates'],text=True).splitlines()
 files = sorted({name for name in names if test_file(name)})
 selected = []
 for name in files:
+    if not name.endswith('.rs'): continue
     old = subprocess.run(['git','show',base+':'+name],capture_output=True,text=True)
     selected.extend((name,test) for test in changed_tests(old.stdout if old.returncode == 0 else '', pathlib.Path(name).read_text()))
-stale = expected.keys() - {test for _,test in selected}
-if stale:
-    sys.exit('FAIL stale expected-pass entries not in diff: '+', '.join(sorted(stale)))
 if not selected:
+    if expected:
+        sys.exit('FAIL stale expected-pass entries not in diff: '+', '.join(sorted(expected)))
     print('PASS no added or changed tests in test-only files; source-file tests need manual red receipts')
     sys.exit(0)
+selected_targets = cargo_targets(pathlib.Path.cwd(),{name for name,_ in selected})
+selected = [(name,'::'.join((*prefix,test)),package,kind,target)
+    for name,test in selected for package,kind,target,prefix in selected_targets[name]]
+stale = expected.keys() - {test for _,test,*_ in selected}
+if stale:
+    sys.exit('FAIL stale expected-pass entries not in diff: '+', '.join(sorted(stale)))
 with tempfile.TemporaryDirectory(prefix='veyra-speed-red-parent-',dir='/tmp') as folder:
     root = pathlib.Path(folder)
     archive = root/'base.tar'
@@ -136,19 +275,15 @@ with tempfile.TemporaryDirectory(prefix='veyra-speed-red-parent-',dir='/tmp') as
     with tarfile.open(archive) as source:
         source.extractall(root,filter='data')
     archive.unlink()
-    for name in files:
-        target = root/name
-        target.parent.mkdir(parents=True,exist_ok=True)
-        shutil.copyfile(name,target)
+    copy_test_files(pathlib.Path.cwd(),root,files)
     env = os.environ.copy()
     env['CARGO_TARGET_DIR'] = str(root/'target')
     failed = False
-    for name,test in selected:
-        print(f'BASE={base} file={name} test={test} isolated_target={env["CARGO_TARGET_DIR"]}',flush=True)
-        result = subprocess.run(['cargo','test','--workspace','--',test,'--nocapture'],cwd=root,env=env,capture_output=True,text=True)
+    for name,full_name,package,kind,target in selected:
+        print(f'BASE={base} file={name} target={package}/{kind}/{target} test={full_name} isolated_target={env["CARGO_TARGET_DIR"]}',flush=True)
+        result = subprocess.run(cargo_command(package,kind,target,full_name),cwd=root,env=env,capture_output=True,text=True)
         output = result.stdout+result.stderr
-        ran = re.search(r'(?m)^test (?:\S*::)?'+re.escape(test)+r' \.\.\. ok$',output) is not None
-        ok,message = verdict(test,result.returncode == 0,ran,expected)
+        ok,message = verdict(full_name,result.returncode,output,expected)
         print(output,flush=True)
         print(message,flush=True)
         failed |= not ok
