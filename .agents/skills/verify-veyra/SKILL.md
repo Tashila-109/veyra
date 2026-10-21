@@ -7,7 +7,7 @@ description: Verify Veyra's native macOS window and CLI after UI, launch, loggin
 
 Read [the feature map](features/README.md) before choosing a recipe.
 Run every section in a fresh `bash -c` from this checkout, or let [`bin/run`](#run) run them.
-Launch prints `RUN=`; export that `RUN` into every later shell.
+Export one fresh `RUN` of eight lowercase hex characters into Launch and every later shell, as `bin/run` does for each attempt; by hand, `export RUN=$(uuidgen | cut -c1-8 | tr A-Z a-z)`.
 Each section recovers its records from `target/verify-veyra/$RUN`.
 Never drive an instance this run did not start.
 Screen Recording must be granted to the host running `screencapture`.
@@ -18,12 +18,18 @@ External Accessibility input is not granted here; driver keys prove gpui dispatc
 `bin/run --evidence DIR` runs a gated fake-CLI run: every page's sections in map order, then Doctor and Evidence, and Cleanup last whatever failed.
 The pages are the [feature map](features/README.md)'s links in order, then any other `features/*.md` by name, so a new page joins the full run when its file exists.
 It waits in Launch's gate, gives each section a fresh `bash -c` with only `RUN` carried forward, times every section into `DIR/ATTEMPT/sections.json` and hard-links the kept proof to `DIR/ATTEMPT/run` after Cleanup.
+The runner chooses each attempt's `RUN` before Launch and passes it in, so the attempt's Cleanup knows its `RUN` even when Launch is interrupted.
 Everything from Launch on runs inside one `try`, and its `finally` runs Cleanup before anything else.
-SIGTERM, SIGHUP and SIGINT raise into that `try`, so an interrupted run still runs Cleanup; a signal that arrives once Cleanup has started is recorded and does not stop it.
+SIGTERM, SIGHUP and SIGINT always raise.
+Before the first attempt, nothing is owned yet, so a signal ends the runner at once with exit 128 plus the signal number.
+During an attempt, a signal raises into that `try`. Its `finally` blocks the three signals before Cleanup and keeps them blocked through the receipts and the verdict, so a signal arriving then stays pending.
+The verdict reads pending signals with `sigpending()`, and a pending signal ends the attempt FAILED (interrupted) and is recorded in `attempt.json`.
+Between attempts, the 60-second wait is unblocked, and a signal there ends the run FAILED.
+After the last receipt is written the runner checks pending signals once more, so DONE survives only if none arrived; then it discards what is pending and exits with the verdict's code.
 After a failed section, still inside that `try`, it takes one `failure` capture, unless human input caused the failure or the deadline stopped it, and records the capture's exit, error or timeout in `DIR/ATTEMPT/failure-capture.json`.
 Each write records its own error in the attempt's `problems` instead of raising, so no write can stop Cleanup.
 After Cleanup, one verdict decides the attempt, and it is the only place a run can become DONE:
-- DONE needs every planned section passed, Cleanup exit 0, an unchanged tree and the required evidence kept: the proof copy in `DIR/ATTEMPT/run` and an `attempt.json` that reads back.
+- DONE needs every planned section passed, Cleanup exit 0, an unchanged tree, the required evidence kept (the proof copy in `DIR/ATTEMPT/run` and an `attempt.json` that reads back) and no interrupting signal, recorded or pending.
 - An interruption, a failed Cleanup, scratch left behind, required evidence that was not kept or a changed tree ends FAILED, and the recorded errors stay in `problems`.
 - The failure capture, the transcript, `sections.json` and `plan.json` are diagnostics: a write error there is listed in `problems` and changes nothing else.
 - Otherwise a failed section is classified by the observation `observe_failure` recorded in `focus-failure.json` during it, and a corrupt `focus-failure.json` counts as no observation:
@@ -114,7 +120,8 @@ Every app launch runs from `$DATA/appcwd`; probes run in Veyra's private data fo
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
-RUN=$(uuidgen | cut -c1-8 | tr A-Z a-z)
+RUN=${RUN:?export a fresh RUN of eight lowercase hex characters first}
+printf '%s\n' "$RUN" | grep -Eqx '[0-9a-f]{8}'
 DATA=${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN
 PROOF=target/verify-veyra/$RUN
 BIN=.agents/skills/verify-veyra/bin

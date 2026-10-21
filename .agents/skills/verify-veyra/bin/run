@@ -3,7 +3,7 @@
 
 See SKILL.md, section Run, for the options and the retry rule.
 """
-import argparse, ast, hashlib, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time
+import argparse, ast, hashlib, json, os, pathlib, re, secrets, shutil, signal, subprocess, sys, tempfile, time
 
 SKILL = pathlib.Path(__file__).resolve().parent.parent
 REPO = SKILL.parent.parent.parent
@@ -15,14 +15,27 @@ FIRST = ('app-launch','Driving it with veyra ctl')
 RELEASE = ('app-launch','Release check')
 PERF_ONLY = {('multi-agent','Probe smoke measurements')}
 LIVE_PAGES = pages.LIVE
-INTERRUPT = {'signal':None,'armed':False}
+SIGNALS = {signal.SIGTERM,signal.SIGHUP,signal.SIGINT}
+INTERRUPT = {'signal':None}
 
 class Interrupted(BaseException):
-    """SIGTERM, SIGHUP or SIGINT, raised into attempt()'s try so its finally runs Cleanup; keep() cannot swallow it."""
+    """SIGTERM, SIGHUP or SIGINT. The handler always raises it, and keep() cannot swallow it."""
 
 def interrupted(number, frame):
-    INTERRUPT['signal'] = signal.Signals(number).name
-    if INTERRUPT['armed']: raise Interrupted(INTERRUPT['signal'])
+    INTERRUPT['signal'] = INTERRUPT['signal'] or signal.Signals(number).name
+    raise Interrupted(signal.Signals(number).name)
+
+def pending():
+    """The interrupting signals that arrived while they were blocked."""
+    return sorted(signal.Signals(number).name for number in signal.sigpending() if number in SIGNALS)
+
+def block():
+    """Block the interrupting signals. One raised before the mask takes hold is already in INTERRUPT['signal']."""
+    while True:
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
+            return
+        except Interrupted: pass
 
 HEREDOC = re.compile(r"<<'(?P<end>PY[A-Z_]*)'\n(?P<body>.*?)\n(?P=end)(?:\n|$)",re.S)
 
@@ -88,12 +101,14 @@ def gate_check():
 def verdict(record, counted, late=False):
     """The only place a run's status is decided, after Cleanup has run. None asks for another attempt.
 
-    DONE needs every planned section passed, Cleanup exit 0, an unchanged tree and the required evidence kept: the
-    proof copy under ATTEMPT/run, once Launch named a RUN, and a readable attempt.json. counted is the capture failures
-    so far, and late means the deadline is under a minute away.
+    DONE needs every planned section passed, Cleanup exit 0, an unchanged tree, the required evidence kept (the proof
+    copy under ATTEMPT/run and an attempt.json that reads back) and no interrupting signal, recorded or still pending.
+    A pending signal is recorded in the record. counted is the capture failures so far, and late means the deadline
+    is under a minute away.
     """
     failed, seen = record['failed'], record.get('observed') or {}
-    if record.get('interrupted'): return 'FAILED: interrupted by '+record['interrupted'],counted
+    record['interrupted'] = record.get('interrupted') or (pending() or [None])[0]
+    if record['interrupted']: return 'FAILED: interrupted by '+record['interrupted'],counted
     if record.get('cleanup_exit') not in (0,None) or record.get('scratch_left'):
         return 'FAILED: Cleanup did not pass',counted
     missing = [name for name,kept in record.get('evidence',{'evidence check':False}).items() if not kept]
@@ -227,18 +242,18 @@ def failure_capture(env, out):
     except Exception as error: result['write_error'] = f'{type(error).__name__}: {error}'
     return result
 
-def attempt(found, plan, out, env, deadline, expected):
-    """One Launch through Cleanup. Returns the attempt's record for verdict().
+def attempt(found, plan, out, env, deadline, expected, record):
+    """One Launch through Cleanup, filling record, which main() made with the attempt's RUN already chosen.
 
-    Every step from Launch on runs inside one try, and its finally runs Cleanup before anything else. A signal raises
-    Interrupted into that try; once Cleanup starts, a later signal is only noted. Each write goes through keep(),
-    which records its own error in problems instead of raising; verdict() then refuses DONE when the proof copy or
-    attempt.json was not kept.
+    main() calls it with the interrupting signals blocked. The try unblocks them, so a signal during Launch or a later
+    section raises Interrupted there, and the finally blocks them again before Cleanup. The receipts here and
+    verdict() in main() then run with any later signal pending, so it is read, not lost. Each write goes through
+    keep(), which records its own error in problems instead of raising; verdict() then refuses DONE when the proof copy
+    or attempt.json was not kept.
     """
-    out.mkdir(parents=True)
-    timings, problems, current = [], [], [None]
-    record = {'run':None,'failed':None,'interrupted':None,'cleanup_exit':None,'problems':problems}
-    INTERRUPT.update(signal=None,armed=True)
+    run, problems = record['run'], record['problems']
+    timings, current = [], [None]
+    proof = REPO/'target/verify-veyra'/run
     def keep(label, write):
         try:
             write()
@@ -274,35 +289,30 @@ def attempt(found, plan, out, env, deadline, expected):
             except ProcessLookupError: pass
             process.wait()
             raise
-        exported = ''
-        if key == ('SKILL','Launch'):
-            found_run = re.findall(r'^RUN=([0-9a-f]{8})$',stdout,re.M)
-            if found_run:
-                env['RUN'] = found_run[-1]
-                exported = 'runner exports RUN='+found_run[-1]+'\n'
         timings.append({'section':title,'start_epoch':started,'end_epoch':time.time(),
             'seconds':time.time()-started,'exit':code})
         keep('sections.json',lambda: (out/'sections.json').write_text(json.dumps(timings,indent=2)+'\n'))
-        note(stdout+stderr+f'{title} exit={code}\n'+exported)
+        note(stdout+stderr+f'{title} exit={code}\n')
         keep('progress line',lambda: print(title,'exit='+str(code),f'{time.time()-started:.1f}s',flush=True))
         if code: keep('failure tail',lambda: print('\n'.join(line[:300]
             for line in (stdout+stderr).splitlines()[-12:]),flush=True))
         return code,stdout+stderr
-    keep('plan.json',lambda: (out/'plan.json').write_text(json.dumps(plan,indent=1)+'\n'))
     try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
+        out.mkdir(parents=True,exist_ok=True)
+        keep('plan.json',lambda: (out/'plan.json').write_text(json.dumps(plan,indent=1)+'\n'))
         for key in plan:
             current[0] = '/'.join(key)
             code,text = execute(key)
-            record['run'] = env.get('RUN')
             if key == ('SKILL','Launch') and not code and identity() != expected:
                 record['failed'] = {'section':'tree identity after Launch','exit':None,'deadline':False}
                 break
             if code:
                 record['failed'] = {'section':'/'.join(key),'exit':code,'deadline':'Wall-time limit reached' in text}
                 break
-        failed, run = record['failed'], record['run']
-        if failed and run:
-            receipt = REPO/'target/verify-veyra'/run/'focus-failure.json'
+        failed = record['failed']
+        if failed:
+            receipt = proof/'focus-failure.json'
             try: clock = json.loads(receipt.read_text()) if receipt.exists() else {}
             except (OSError,ValueError) as error:
                 problems.append(f'focus-failure.json: {type(error).__name__}: {error}')
@@ -310,48 +320,45 @@ def attempt(found, plan, out, env, deadline, expected):
             start = timings[-1]['start_epoch'] if timings else 0
             record['focus'] = clock
             record['observed'] = clock if clock.get('failure') and clock.get('failure_epoch',0) >= start else None
-            owed = (REPO/'target/verify-veyra'/run/'pid').exists() and not failed['deadline']
+            owed = (proof/'pid').exists() and not failed['deadline']
             if owed and not (record['observed'] or {}).get('human_input'):
                 record['failure_capture'] = capture = failure_capture(env,out)
                 if 'write_error' in capture: problems.append('failure-capture.json: '+capture['write_error'])
     except (Interrupted,KeyboardInterrupt) as stop:
-        record['interrupted'] = str(stop) or 'SIGINT'
-        record['failed'] = {'section':current[0] or 'runner','exit':None,'deadline':False,
-            'interrupted':record['interrupted']}
+        record['interrupted'] = record['interrupted'] or str(stop) or 'SIGINT'
     except Exception as error:
         problems.append(f'runner: {type(error).__name__}: {error}')
         record['failed'] = record['failed'] or {'section':'runner','exit':None,'deadline':False}
     finally:
-        INTERRUPT['armed'] = False
-        run = record['run'] = env.get('RUN')
+        block()
+        # A signal raised inside an except clause, or while blocking, reaches here only through INTERRUPT.
+        record['interrupted'] = record['interrupted'] or INTERRUPT['signal']
+        if record['interrupted'] and not record['failed']:
+            record['failed'] = {'section':current[0] or 'runner','exit':None,'deadline':False}
+        if record['interrupted']: record['failed']['interrupted'] = record['interrupted']
         try:
-            if run and (REPO/'target/verify-veyra'/run/'pid').exists():
-                record['cleanup_exit'] = execute(('SKILL','Cleanup'))[0]
-            elif run:
-                # Launch stopped before starting an app, so no process exists; only the scratch folder remains.
+            if (proof/'pid').exists(): record['cleanup_exit'] = execute(('SKILL','Cleanup'))[0]
+            else:
+                # Launch had not started an app, so only the scratch folder of this RUN can exist.
                 assert env['VEYRA_VERIFY_TMP'].startswith('/tmp/veyra-')
                 shutil.rmtree(env['VEYRA_VERIFY_TMP']+run,ignore_errors=True)
                 record['cleanup_exit'] = 0
         except Exception as error:
             problems.append(f'Cleanup: {type(error).__name__}: {error}')
             record['cleanup_exit'] = 1
-        if run:
-            scratch = env['VEYRA_VERIFY_TMP']+run
-            record['scratch_left'] = [path for path in [scratch,scratch+'-rel'] if os.path.exists(path)]
-            if record['scratch_left']: record['cleanup_exit'] = record['cleanup_exit'] or 1
-            proof = REPO/'target/verify-veyra'/run
-            copied = keep('run copy',lambda: shutil.copytree(proof,out/'run',copy_function=os.link))
-            def gate_wait():
-                gate = proof/'input-idle-launch.json'
-                if gate.exists(): record['gate_wait_seconds'] = json.loads(gate.read_text())['gate_seconds']
-            keep('gate wait',gate_wait)
-        else:
-            record['failed'] = record['failed'] or {'section':'SKILL/Launch','exit':None,'deadline':False}
+        scratch = env['VEYRA_VERIFY_TMP']+run
+        record['scratch_left'] = [path for path in [scratch,scratch+'-rel'] if os.path.exists(path)]
+        if record['scratch_left']: record['cleanup_exit'] = record['cleanup_exit'] or 1
+        copied = keep('run copy',lambda: shutil.copytree(proof,out/'run',copy_function=os.link))
+        def gate_wait():
+            gate = proof/'input-idle-launch.json'
+            if gate.exists(): record['gate_wait_seconds'] = json.loads(gate.read_text())['gate_seconds']
+        keep('gate wait',gate_wait)
         try: record['identity_unchanged'] = identity() == expected
         except Exception as error:
             problems.append(f'identity: {type(error).__name__}: {error}')
             record['identity_unchanged'] = False
-        record['interrupted'] = record['interrupted'] or INTERRUPT['signal']
+        record['interrupted'] = record['interrupted'] or INTERRUPT['signal'] or (pending() or [None])[0]
         passed = {row['section'] for row in timings if row['exit'] == 0}
         record['all_passed'] = all('/'.join(key) in passed for key in plan)
         record['recipe_seconds'] = sum(row['seconds'] for row in timings)
@@ -359,12 +366,25 @@ def attempt(found, plan, out, env, deadline, expected):
         def read_back():
             kept = json.loads((out/'attempt.json').read_text())
             assert (kept['run'],kept['failed']) == (record['run'],record['failed']), 'attempt.json holds another run'
-        record['evidence'] = {'attempt.json':wrote and keep('attempt.json read back',read_back)}
-        if run: record['evidence']['run'] = copied and (out/'run').is_dir()
-    return record
+        record['evidence'] = {'attempt.json':wrote and keep('attempt.json read back',read_back),
+            'run':copied and (out/'run').is_dir()}
 
-def main():
-    for number in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT): signal.signal(number,interrupted)
+def new_run(scratch):
+    """A fresh RUN, eight lowercase hex characters, whose proof and scratch folders do not exist yet."""
+    while True:
+        run = secrets.token_hex(4)
+        if not (REPO/'target/verify-veyra'/run).exists() and not os.path.exists(scratch+run): return run
+
+def rewrite(path, data, problems):
+    """Replace a receipt atomically, so a failed rewrite leaves any earlier copy whole; the error goes to problems."""
+    try:
+        path.with_name(path.name+'.new').write_text(json.dumps(data,indent=2)+'\n')
+        os.replace(path.with_name(path.name+'.new'),path)
+    except Exception as error: problems.append(f'{path.name}: {type(error).__name__}: {error}')
+
+def prepare():
+    """Everything before the first attempt: options, checks, selection and the tree's identity. Nothing is owned yet,
+    so an interrupting signal here simply ends the runner. Returns an exit code, or what the attempts need."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--evidence',type=pathlib.Path)
     parser.add_argument('--base')
@@ -412,27 +432,51 @@ def main():
         VEYRA_VERIFY_TMP=args.scratch,VEYRA_VERIFY_DEADLINE=str(args.deadline))
     if args.real_quiet: env['VEYRA_VERIFY_REAL_QUIET'] = '1'
     if shutil.which('sccache'): env['RUSTC_WRAPPER'] = 'sccache'
+    return found,plan,args,env,expected
+
+def main():
+    for number in SIGNALS: signal.signal(number,interrupted)
+    try: setup = prepare()
+    except Interrupted as stop:
+        print(f'interrupted by {stop} before any attempt began; nothing was launched',file=sys.stderr,flush=True)
+        return 128+signal.Signals[str(stop)].value
+    if isinstance(setup,int): return setup
+    found,plan,args,env,expected = setup
     attempts, counted, status = [], 0, None
     while status is None:
+        block()
+        if INTERRUPT['signal']:
+            status = 'FAILED: interrupted by '+INTERRUPT['signal']+' between attempts'
+            break
         label = f'attempt-{len(attempts)+1}'
-        try: record = attempt(found,plan,args.evidence/label,dict(env),args.deadline,expected)
-        except Interrupted as stop:
-            # A signal inside an except clause leaves attempt() after its finally has run Cleanup.
-            record = {'failed':{'section':'runner','exit':None,'deadline':False},'interrupted':str(stop)}
-        record['label'] = label
+        record = {'label':label,'run':new_run(args.scratch),'failed':None,'interrupted':None,'cleanup_exit':None,
+            'problems':[]}
         attempts.append(record)
+        try: attempt(found,plan,args.evidence/label,dict(env,RUN=record['run']),args.deadline,expected,record)
+        except Interrupted: pass  # raised in an except clause; the finally already ran Cleanup and filled record
         status,counted = verdict(record,counted,time.time() >= args.deadline-60)
         record['verdict'] = status or 'another attempt'
+        rewrite(args.evidence/label/'attempt.json',record,record['problems'])
         if status is None:
-            # A signal between attempts finds no app running: Cleanup already ran in the attempt's finally.
-            INTERRUPT['armed'] = True
-            try: time.sleep(min(60,max(0,args.deadline-time.time())))
-            except Interrupted as stop: status = 'FAILED: interrupted by '+str(stop)
-            INTERRUPT['armed'] = False
-    outcome = {'status':status,'plan':['/'.join(key) for key in plan],'attempts':attempts,
-        'finished_epoch':time.time()}
-    (args.evidence/'outcome.json').write_text(json.dumps(outcome,indent=2)+'\n')
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
+                time.sleep(min(60,max(0,args.deadline-time.time())))
+            except Interrupted as stop: status = 'FAILED: interrupted by '+str(stop)+' between attempts'
+    block()
+    outcome = {'status':status,'plan':['/'.join(key) for key in plan],'attempts':attempts}
+    problems = attempts[-1]['problems'] if attempts else []
+    rewrite(args.evidence/'outcome.json',dict(outcome,finished_epoch=time.time()),problems)
+    if status == 'DONE':
+        # A signal that arrived after the verdict, during the receipts above, is still pending and ends FAILED.
+        status,_ = verdict(attempts[-1],counted)
+        if status != 'DONE':
+            attempts[-1]['verdict'] = status
+            rewrite(args.evidence/attempts[-1]['label']/'attempt.json',attempts[-1],problems)
+            rewrite(args.evidence/'outcome.json',dict(outcome,status=status,finished_epoch=time.time()),problems)
     print(status,'evidence='+str(args.evidence),flush=True)
+    # The verdict is final: discard anything still pending, then restore the mask.
+    for number in SIGNALS: signal.signal(number,signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
     return 0 if status == 'DONE' else 1
 
 if __name__ == '__main__':

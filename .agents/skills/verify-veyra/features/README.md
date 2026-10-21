@@ -15,7 +15,7 @@
 ## Preconditions
 
 - Run Launch and Doctor in [verify-veyra](../SKILL.md).
-- Launch prints a fresh short `RUN` and uses `/tmp/veyra-verify-$RUN`, or `$VEYRA_VERIFY_TMP$RUN` when that prefix is set.
+- Launch takes the exported `RUN`, eight lowercase hex characters that `bin/run` chooses for each attempt, prints it and uses `/tmp/veyra-verify-$RUN`, or `$VEYRA_VERIFY_TMP$RUN` when that prefix is set.
 - Each later section recovers run, process, and window records in a fresh bash process.
 Every later section needs that `RUN` exported, as [SKILL.md](../SKILL.md) says.
 - Drive only the pid this run started.
