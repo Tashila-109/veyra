@@ -1,6 +1,7 @@
 # App launch
 
 Status: passed, 2026-10-20, 2b45067, none
+Covers: crates/engine/src/data_dir.rs crates/veyra/src/ui/new_thread.rs
 
 ## Sub-features
 
@@ -8,7 +9,7 @@ Status: passed, 2026-10-20, 2b45067, none
 - `launch-ready`: exact ready line with this run's pid and data folder.
 - `launch-identity`: live pid, build revision, data folder, schema_version and system appearance.
 - `launch-database`: migration 3, WAL, eight tables and Full access default.
-- `launch-recovery`: the project written before quit survives quit and crash relaunches in the same database.
+- `launch-recovery`: the project written before the schema-2 relaunch survives it in the same database; [restart-recovery](restart-recovery.md) checks the quit and crash relaunches.
 - `launch-lock`: a second process refuses the same folder while the first still answers.
 - `launch-controls`: live width and notice transitions through actions and individual keys.
 - `launch-log`: the ready line and rejected Send notice reach the application log.
@@ -38,7 +39,7 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 pid = identity()
 dump = ctl('dump-before','dump')
@@ -86,6 +87,7 @@ log = (DATA/'logs/veyra.log').read_text()
 assert f'veyra ready pid={pid} data_dir={DATA}' in log
 assert 'window notice' in log and 'Add a project to start a thread' in log
 print('PASS app-launch ready line and rejected Send notice logged')
+page_done('app-launch-main')
 print('PASS app-launch actions, individual keys, input handler and width clamps')
 PY
 ```
@@ -95,15 +97,16 @@ PY
 The project write is the pre-quit value.
 The helper uses one expected table list in SKILL.md.
 The migration check seeds a stopped schema-2 database with a settled report, then verifies schema 3 adds a null source without inferring a badge; it removes only those fixture rows while stopped.
-A missing or lost WAL row fails the project equality after either relaunch.
+A missing or lost WAL row fails the project equality after the relaunch.
 Relaunch updates the pid, group and window records before Doctor or Evidence.
+The quit and crash relaunches, with the same WAL, inode, project-row and schema checks, run in [restart-recovery](restart-recovery.md).
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 identity()
 action('persistent-project','AddProject',{'path':str(DATA/'project')})
@@ -160,12 +163,6 @@ assert sql('select count(*) from threads') == '0'
 assert sql('select id,path,name from projects order by id') == row
 assert (PROOF/'after-migration-inode.txt').read_text() == (PROOF/'initial-inode.txt').read_text()
 print('PASS app-launch schema-2 task migrated with null source, no inferred badge and rows preserved')
-for label,crash in [('after-quit',False),('after-crash',True)]:
-    restart(label,crash)
-    database(label,'full_access')
-    assert sql('select id,path,name from projects order by id') == row, label
-    assert (PROOF/(label+'-inode.txt')).read_text() == (PROOF/'initial-inode.txt').read_text(), label
-    print(f'PASS {label} project row, migration, WAL and inode kept')
 page_done('app-launch')
 PY
 ```
@@ -173,6 +170,8 @@ PY
 ### Release check
 
 Do not run it while another verification run is in restart-recovery's crash step.
+A run selects this section through `release` (see [Selection](../SKILL.md#selection)), and every full run includes it.
+After the debug app stops, the release launch refuses any running `veyra`.
 
 Use a disposable HOME and a restricted PATH, then launch through macOS sandbox-exec with only the release Veyra executable allowed.
 The profile denies every child executable, so release probes cannot start an installed provider even when its known install path exists.
@@ -191,7 +190,7 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-REL_DATA=/tmp/veyra-rel-$RUN
+REL_DATA=${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN-rel
 REL_PROOF=$PROOF/release
 test ! -e "$REL_DATA"
 mkdir -p "$REL_PROOF"
@@ -224,7 +223,7 @@ if /usr/bin/sandbox-exec -f "$REL_PROOF/no-child-exec.sb" target/release/veyra c
 printf 'exit=%s\n' "$rc" >>"$REL_PROOF/profile-load.txt"
 test "$rc" = 2
 grep -qx 'usage: veyra \[mcp\]' "$REL_PROOF/profile-load.txt"
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 stop('before-release')
 PY
@@ -233,13 +232,15 @@ if kill -0 "$DEBUG_PID" 2>/dev/null; then
     printf 'debug app is still running before release launch\n' >&2
     exit 1
 fi
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 orphans = marked_processes()
 (PROOF/'release'/'orphan-preflight.txt').write_text(f'marked orphan count={len(orphans)}\n')
 print(f'marked orphan count={len(orphans)}')
 assert not orphans, 'release launch refused: marked orphan processes exist'
 PY
+test "$(ioreg -n Root -d1 -a | grep -c CGSSessionScreenIsLocked || true)" = 0
+! pgrep -x veyra >/dev/null
 mkdir -p "$REL_DATA/home"
 set -m
 HOME="$REL_DATA/home" SHELL=/usr/bin/false PATH=/usr/bin:/bin:/usr/sbin:/sbin VEYRA_DATA_DIR="$REL_DATA" \
@@ -259,7 +260,7 @@ stop_release() {
     for attempt in $(seq 1 50); do kill -0 "$REL_PID" 2>/dev/null || break; sleep .1; done
     ! kill -0 "$REL_PID" 2>/dev/null || return 1
     test ! -f "$REL_DATA/logs/veyra.log" || cp "$REL_DATA/logs/veyra.log" "$REL_PROOF/veyra.log"
-    test "$REL_DATA" = "/tmp/veyra-rel-$RUN" || return 1
+    test "$REL_DATA" = "${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN-rel" || return 1
     rm -rf "$REL_DATA"
     printf 'PASS release cleanup PID=%s DATA=%s\n' "$REL_PID" "$REL_DATA"
 }
@@ -287,7 +288,7 @@ if grep -q 'reaper signalled orphan group' "$REL_PROOF/veyra.log"; then
     printf 'release check failed: startup signalled an orphan group\n' >&2
     exit 1
 fi
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 import re
 release = PROOF/'release'
@@ -302,6 +303,7 @@ if any(metadata.values()): assert denied, 'installed provider exec was not denie
 (release/'provider-probes.txt').write_text('\n'.join(probes)+'\n')
 print('PASS release sandbox loaded; installed-provider exec denied; no provider version received')
 start('after-release')
+page_done('app-launch-release')
 print('PASS debug relaunched after release window ended')
 PY
 ```
@@ -314,7 +316,7 @@ PY
 - Controls: `drive.log` records exit codes and all asserted width, text and notice transitions.
 - Log: `veyra.log` retains the asserted ready line and rejected Send notice.
 - Migration: `migration-task-loaded.json` retains the delivered summary with a null source; `migration-unlinked-report.png` shows the legacy reply without a delivery badge after the schema-2 to schema-3 launch.
-- Recovery: `persisted-project.txt` matches the SQLite row after both relaunches; migration, WAL, tables, mode and inode are asserted every time.
+- Recovery: `persisted-project.txt` matches the SQLite row after the schema-2 relaunch and its fixture cleanup; migration, WAL, tables, mode and inode are asserted.
 - Release: `release/strings.txt` has zero release counts and positive debug controls for every driver and override name, `ctl.txt` exits 2 and `data-listing.txt` has no driver socket.
 - Release: `release/provider-paths.json` records each known provider path, including `/opt/homebrew/bin/codex`; `profile-load.txt` proves the sandbox loaded.
 - Release: `release/veyra.log` contains no `reaper signalled orphan group` line; `provider-probes.txt` shows failed execs and no provider version.

@@ -6,22 +6,65 @@ description: Verify Veyra's native macOS window and CLI after UI, launch, loggin
 # Verify Veyra
 
 Read [the feature map](features/README.md) before choosing a recipe.
-Run every section in a fresh `bash -c` from this checkout.
+Run every section in a fresh `bash -c` from this checkout, or let [`bin/run`](#run) run them.
 Launch prints `RUN=`; export that `RUN` into every later shell.
 Each section recovers its records from `target/verify-veyra/$RUN`.
 Never drive an instance this run did not start.
 Screen Recording must be granted to the host running `screencapture`.
 External Accessibility input is not granted here; driver keys prove gpui dispatch, not native keyboard delivery.
 
+## Run
+
+`bin/run --evidence DIR` runs a gated fake-CLI run: every page's sections in map order, then Doctor and Evidence, and Cleanup last whatever failed.
+It waits in Launch's gate, gives each section a fresh `bash -c` with only `RUN` carried forward, times every section into `DIR/ATTEMPT/sections.json` and hard-links the kept proof to `DIR/ATTEMPT/run` after Cleanup.
+A capture or focus failure with no human input since launch gets a new attempt after 60 seconds, at most three in a row; any other failure, a failed Cleanup or a changed tree ends the run.
+`DIR/outcome.json` holds the status, every attempt and the gate wait apart from the recipe time.
+
+```text
+.agents/skills/verify-veyra/bin/run --evidence DIR                     # every page, the full run
+.agents/skills/verify-veyra/bin/run --evidence DIR --pages $(.agents/skills/verify-veyra/bin/select-pages BASE)
+.agents/skills/verify-veyra/bin/run --evidence DIR --pages multi-agent # one page alone
+.agents/skills/verify-veyra/bin/run --evidence DIR --sections 'SKILL/Doctor' 'multi-agent/Probe smoke measurements'
+.agents/skills/verify-veyra/bin/run --check-only                       # syntax of every block; no launch
+```
+
+`--pages` takes the tokens `select-pages` prints: `PAGE` for a page's own sections, `PAGE:codex` and `PAGE:grok` for its provider sections, and `release` for app-launch's release check.
+Launch, Doctor, app-launch's first section, Evidence and Cleanup always run; `permission-matrix` is reported and never driven, because it needs a consented live lane.
+`--sections PAGE/HEADING ...` runs exactly those sections between Launch and Cleanup, as a perf or live plan needs.
+`--real-quiet` makes multi-agent wait for the real ten-minute quiet clock, which a phase gate runs once when `ui/header.rs`, `ui/sidebar.rs` or a `ui/mod.rs` line naming `last_activity`, `quiet_minutes` or `cadence_due` changed.
+`--expect-head SHA` refuses a checkout at another commit, `--deadline EPOCH` bounds the whole run, and `--scratch PREFIX` sets the scratch prefix, `/tmp/veyra-verify-` by default.
+The tree's identity, its HEAD, `git status --short`, the diff's SHA-256 and each untracked file's SHA-256, is saved at the start and checked after Launch's build and after Cleanup.
+
+## Selection
+
+`bin/select-pages BASE [HEAD]` prints the tokens a change from BASE selects, one per line; without HEAD it reads the working tree, untracked files included.
+A file on the shared list selects every page and provider section: `Cargo.toml`, `Cargo.lock`, `crates/veyra/src/ui/mod.rs`, `crates/engine/src/actor.rs`, and this skill's `SKILL.md` and `bin/`.
+A file on the no-page list selects nothing, because it cannot change the window: test-only files (`crates/*/tests/*.rs`, `crates/*/tests/common/**`, `crates/engine/src/tests/**`, `crates/veyra/src/tests.rs`, `crates/veyra/src/verify_map.rs`, `crates/engine/src/platform/boundary.rs`, `crates/engine/src/provider/scripted.rs`), `ARCHITECTURE.md`, `AGENTS.md`, `clippy.toml`, `scripts/**` and `features/README.md`.
+A page's own feature file selects that page unless only its Status line changed.
+Any other file selects each page whose `Covers:` globs match it; a file no page covers selects every page and provider section.
+Within a matched page, a Codex file (`crates/engine/src/provider/codex.rs`, `crates/engine/src/provider/codex/**`, `crates/engine/tests/fixtures/codex/**`) selects only its Codex section, a Grok file (`crates/engine/src/provider/grok.rs`, `crates/engine/tests/fixtures/grok/**`) only its Grok section, a shared provider file (`crates/engine/src/provider/{mod,session,env,lines,jsonrpc}.rs`, `crates/engine/src/{mcp,tools}.rs`, `crates/veyra/src/relay.rs`) all of its sections, and any other file its own sections.
+`release` follows `crates/veyra/src/control.rs`, `crates/veyra/src/main.rs`, `crates/veyra/build.rs`, a changed line naming `cfg(debug_assertions)` and a changed `[profile` section of `Cargo.toml`; a phase gate runs it too.
+`permission-matrix` follows only its own file and its `Covers:` globs; the shared list and uncovered files leave the live grid to its own rule.
+
+`bin/fresh-pages HEAD [--versions FILE]` prints `PAGE STATE` for each page whose Status FINGERPRINT still equals the page's fingerprint at HEAD and which `select-pages COMMIT HEAD` does not select, so a shared or uncovered change since the Status COMMIT also makes it stale.
+With `--versions`, a file of `provider: version` lines, it also prints `permission-matrix/PROVIDER STATE` for each live row whose CLI version, read from the page's first `Claude N`, `Codex N` or `Grok N` mention, appears on that provider's line.
+`bin/fresh-pages --print COMMIT` prints each page's fingerprint at COMMIT, for the Status line.
+A FINGERPRINT is the SHA-256 over `BLOB PATH` lines, sorted by path, for the files `git ls-tree -r COMMIT` lists under the page's `Covers:` globs, plus the page's own file, whose blob id is computed without its Status line.
+So a docs-only status commit leaves every fingerprint as it was.
+`python3 .agents/skills/verify-veyra/bin/pages.py self-test` checks every selection rule and the fingerprint in a scratch repository.
+
 ## Launch
 
 The default verification lane uses only the fake CLI.
 Its binary path deliberately starts missing, so [new-thread](features/new-thread.md) can prove installation and Check again.
-The launch writes a small driver helper into the proof folder so the feature pages share logging, bounded polling and the one expected database-table list.
-The helper does not set application state; its writes are fixture copies, screenshots and proof.
+Every section imports [`bin/driver.py`](bin/driver.py), which shares logging, bounded polling, fixture staging and the one expected database-table list.
+The driver does not set application state; its writes are fixture copies, screenshots and proof.
 For an authorized live lane, export `VEYRA_VERIFY_LANE=live` before Launch.
 Launch then removes replay overrides, records to `$PROOF/rec`, and the new-thread and chat pages use their live branches.
 A live lane needs separate human authorization because it runs the installed CLI and spends its quota.
+The first launch waits in the driver's `gate()` until the screen is unlocked, the HID idle time is between 120 and 9,000 seconds and no `veyra` process has run for 10 seconds; it records the idle time in `input-idle-launch.json`.
+Every later relaunch through `start()` refuses a running `veyra` this run did not start: one that is neither an owned app pid nor marked with an owned app's `VEYRA_PARENT_PID`.
+Each fake-lane launch records to its own `rec/NN-LABEL` folder, named in `rec-current`.
 The debug-only VEYRA_REAP_PIDS filter restricts startup reaping to the run's saved provider pids, including after a crash.
 An empty list permits no startup signals.
 The debug-only VEYRA_DEBUG_TERMINAL_GRID=COLSxROWS override is read once at window-app launch; decimal columns 2–1000 and rows 1–1000 fix the PTY/emulator grid at the terminal area’s top left, clipped to that area.
@@ -29,551 +72,42 @@ An absent or invalid value uses layout sizing; release contains neither the vari
 The release check refuses to launch while any same-user marked process names a dead parent.
 Its preflight and Cleanup share an in-memory marker reader and report counts only.
 Both lanes remove the caller's Claude session variables while keeping `CLAUDE_CODE_USE_*` user configuration.
+The fake lane puts a run-owned `git` first on the app's PATH; it answers `git branch --show-current` with `fixture-branch` only while `$DATA/branch-on` exists, and otherwise runs the real `git`.
 Every app launch runs from `$DATA/appcwd`; probes run in Veyra's private data folder.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=$(uuidgen | cut -c1-8 | tr A-Z a-z)
-DATA=/tmp/veyra-verify-$RUN
+DATA=${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN
 PROOF=target/verify-veyra/$RUN
+BIN=.agents/skills/verify-veyra/bin
+case "$DATA" in /tmp/veyra-*) ;; *) exit 1 ;; esac
 test ! -e "$DATA"
 test ! -e "$PROOF"
-test "$(ioreg -n Root -d1 -a | grep -c CGSSessionScreenIsLocked || true)" = 0
-for attempt in $(seq 1 100); do
-    if pgrep -x veyra >/dev/null; then sleep .1; else break; fi
-done
-! pgrep -x veyra >/dev/null
-sleep 10
-! pgrep -x veyra >/dev/null
 cargo build --workspace
 mkdir -p "$PROOF/fixtures" "$DATA/project" "$DATA/appcwd"
 printf '%s\n' "${VEYRA_VERIFY_LANE:-fake}" >"$PROOF/lane"
 : >"$PROOF/pages-run"
-cat >"$PROOF/capture-window.swift" <<'SWIFT'
-import AppKit
-import CoreGraphics
-import Foundation
-let args = Array(CommandLine.arguments.dropFirst())
-guard args.count == 2, let pid = Int32(args[0]), let id = UInt32(args[1]) else { exit(2) }
-func fail(_ text: String) -> Never {
-    fputs(text + ". Veyra must stay frontmost during captures.\n", stderr)
-    exit(1)
-}
-guard NSRunningApplication(processIdentifier: pid) != nil else { fail("owned app is gone") }
-let end = Date().addingTimeInterval(2)
-while NSWorkspace.shared.frontmostApplication?.processIdentifier != pid && Date() < end {
-    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-}
-guard let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]],
-      let window = windows.first(where: {
-          ($0[kCGWindowNumber as String] as? UInt32) == id &&
-          ($0[kCGWindowOwnerPID as String] as? Int32) == pid &&
-          ($0[kCGWindowLayer as String] as? Int) == 0
-      }), let bounds = window[kCGWindowBounds as String] as? [String: NSNumber],
-      let x = bounds["X"], let y = bounds["Y"], let width = bounds["Width"], let height = bounds["Height"]
-else { fail("owned window is off-screen") }
-let frame = CGRect(x: x.doubleValue, y: y.doubleValue, width: width.doubleValue, height: height.doubleValue)
-var count: UInt32 = 0
-CGGetActiveDisplayList(0, nil, &count)
-var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
-CGGetActiveDisplayList(count, &displays, &count)
-guard displays.contains(where: { frame.intersects(CGDisplayBounds($0)) })
-else { fail("owned window is outside the active displays") }
-guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
-else { fail("owned window is covered by another application") }
-SWIFT
-swiftc -O "$PROOF/capture-window.swift" -o "$PROOF/capture-window"
+swiftc -O "$BIN/capture-window.swift" -o "$PROOF/capture-window"
+swiftc -O "$BIN/winid.swift" -o "$PROOF/winid"
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
 cp crates/engine/tests/fixtures/codex/probe-ready.jsonl "$PROOF/fixtures/probe-codex.jsonl"
 cp crates/engine/tests/fixtures/grok/probe-grok.jsonl "$PROOF/fixtures/probe-grok.jsonl"
 printf 'RUN=%s\n' "$RUN"
-cat >"$PROOF/driver.py" <<'PY'
-import ctypes, errno, hashlib, json, os, pathlib, re, shutil, signal, sqlite3, struct, subprocess, sys, time
-PROOF = pathlib.Path(__file__).resolve().parent
-RUN = os.environ['RUN']
-DATA = pathlib.Path('/tmp/veyra-verify-' + RUN)
-DB = DATA / 'veyra.db'
-FIXTURES = PROOF / 'fixtures'
-SOURCE = pathlib.Path('crates/engine/tests/fixtures/claude')
-CODEX_SOURCE = pathlib.Path('crates/engine/tests/fixtures/codex')
-GROK_SOURCE = pathlib.Path('crates/engine/tests/fixtures/grok')
-TABLES = 'grants items projects requests settings tasks threads turns'.split()
-LANE = (PROOF/'lane').read_text().strip()
-assert LANE in ['fake','live'], LANE
-ENV = {key:value for key,value in os.environ.items() if not (
-    (key.startswith('CLAUDE_CODE_') and not key.startswith('CLAUDE_CODE_USE_'))
-    or key in ['CLAUDE_PID','CLAUDE_EFFORT','CLAUDECODE','CLAUDE_AGENT_SDK_VERSION'])}
-ENV['VEYRA_DATA_DIR'] = str(DATA)
-ENV['VEYRA_REAP_PIDS'] = ''
-for name in ['VEYRA_CLAUDE_BIN','VEYRA_CODEX_BIN','VEYRA_GROK_BIN','VEYRA_FAKE_FIXTURES','VEYRA_FAKE_FIXTURE','VEYRA_RECORD']:
-    ENV.pop(name,None)
-if LANE == 'fake':
-    (DATA/'home').mkdir(exist_ok=True)
-    ENV['HOME'] = str(DATA/'home')
-    ENV['CLAUDE_CONFIG_DIR'] = str(DATA/'claude-home')
-    ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_CODEX_BIN=str(DATA/'fake-cli'),
-        VEYRA_GROK_BIN=str(DATA/'fake-cli'),
-        VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()),
-        VEYRA_RECORD=str(PROOF.resolve()/'rec'))
-else:
-    ENV.pop('CLAUDE_CONFIG_DIR',None)
-    ENV['VEYRA_RECORD'] = str(PROOF.resolve()/'rec')
-lib = ctypes.CDLL(None,use_errno=True)
-lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,
-    ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t]
-def no_environment(pid):
-    status = subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
-    return not status or status.startswith('Z')
-def marked_processes(parents=None, retry_exiting=False):
-    remaining = []
-    rows = subprocess.check_output(['ps','-axo','pid=,uid=,stat='],text=True).splitlines()
-    for row in rows:
-        text,uid,status = row.split()
-        if int(uid) != os.geteuid() or status.startswith('Z'): continue
-        pid = int(text)
-        mib = (ctypes.c_int*3)(1,49,pid)
-        size = ctypes.c_size_t()
-        if lib.sysctl(mib,3,None,ctypes.byref(size),None,0) != 0:
-            error = ctypes.get_errno()
-            if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
-            if error == errno.EINVAL or (retry_exiting and error == errno.EIO):
-                remaining.append(pid)
-                continue
-            raise OSError(error,f'marker size read failed for pid {pid}')
-        if size.value == 0: continue
-        buffer = ctypes.create_string_buffer(size.value)
-        if lib.sysctl(mib,3,buffer,ctypes.byref(size),None,0) != 0:
-            error = ctypes.get_errno()
-            if error == errno.ESRCH or (error == errno.EINVAL and no_environment(pid)): continue
-            if error == errno.EINVAL or (retry_exiting and error == errno.EIO):
-                remaining.append(pid)
-                continue
-            raise OSError(error,f'marker read failed for pid {pid}')
-        raw = buffer.raw[:size.value]
-        if not raw: continue
-        try:
-            argc = struct.unpack_from('i',raw)[0]
-            if argc < 0: raise ValueError('invalid argument count')
-            offset = raw.index(b'\0',4)+1
-            while offset < len(raw) and raw[offset] == 0: offset += 1
-            for _ in range(argc): offset = raw.index(b'\0',offset)+1
-        except (ValueError,struct.error):
-            if not no_environment(pid): remaining.append(pid)
-            continue
-        markers = [value.split(b'=',1)[1] for value in raw[offset:].split(b'\0')
-            if value.startswith(b'VEYRA_PARENT_PID=')]
-        for value in markers:
-            if not value.isdigit() or int(value) <= 0: continue
-            parent = int(value)
-            if parents is not None:
-                orphan = parent in parents
-            else:
-                try: os.kill(parent,0)
-                except ProcessLookupError: orphan = True
-                else: orphan = False
-            if orphan:
-                remaining.append(pid)
-                break
-    return remaining
-def saved_marked_processes(marked, pids, groups):
-    owned = []
-    for pid in marked:
-        try: group = os.getpgid(pid)
-        except ProcessLookupError: continue
-        if pid in pids or group in groups: owned.append(pid)
-    return owned
-def page_done(name):
-    with (PROOF/'pages-run').open('a') as out: out.write(name+'\n')
-def save(name, value):
-    (PROOF / (name + '.json')).write_text(json.dumps(value, indent=2) + '\n')
-    return value
-def ctl(name, *args, expected=0, stderr_contains=None):
-    result = subprocess.run(['target/debug/veyra', 'ctl', *args], env=ENV, capture_output=True, text=True)
-    with (PROOF/'drive.log').open('a') as log:
-        log.write('$ veyra ctl ' + ' '.join(args) + '\n'
-            + result.stdout + result.stderr + f'exit={result.returncode}\n')
-    (PROOF/(name+'.json')).write_text(result.stdout)
-    (PROOF/(name+'.stderr')).write_text(result.stderr)
-    assert result.returncode == expected, (name, expected, result.returncode, result.stdout, result.stderr)
-    if expected == 1: assert stderr_contains, 'exit 1 needs a named stderr expectation'
-    if stderr_contains: assert stderr_contains in result.stderr, (name,result.stderr,stderr_contains)
-    return json.loads(result.stdout) if result.stdout.startswith('{') else None
-def poll(name, predicate):
-    end = time.monotonic() + 30
-    while time.monotonic() < end:
-        dump = ctl(name, 'dump')
-        if predicate(dump): return dump
-        time.sleep(.05)
-    raise AssertionError(name + ' timed out')
-def action(name, operation, data=None):
-    args = ['action', 'veyra::' + operation]
-    if data is not None: args.append(json.dumps(data))
-    assert ctl(name, *args) == {'ok': True}
-def identity():
-    pid = int((PROOF/'pid').read_text())
-    pgid = int((PROOF/'pgid').read_text())
-    assert os.getpgid(pid) == pgid == pid
-    assert (DATA/'veyra.lock').read_text().strip() == str(pid)
-    dump = ctl('identity', 'dump')
-    assert dump['pid'] == pid and dump['data_dir'] == str(DATA)
-    assert dump['build_rev'] == subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
-    return pid
-def window_id(pid):
-    end = time.monotonic() + 30
-    while time.monotonic() < end:
-        found = subprocess.run(['swift','.agents/skills/verify-veyra/bin/winid.swift',str(pid)],
-            capture_output=True,text=True)
-        if found.returncode == 0: return found.stdout.strip()
-        time.sleep(.05)
-    raise AssertionError('no on-screen window for owned pid '+str(pid))
-def capture(name):
-    assert subprocess.run(['ioreg','-n','Root','-d1','-a'],capture_output=True,text=True).stdout.count('CGSSessionScreenIsLocked') == 0
-    window = (PROOF/'window-id').read_text().strip()
-    pid = (PROOF/'pid').read_text().strip()
-    helper = str((PROOF/'capture-window').resolve())
-    for step in range(2):
-        frame = ctl(name+'-before-frame-'+str(step),'dump')['perf']['repaints']
-        action(name+'-activate-'+str(step),'ActivateWindow')
-        poll(name+'-rendered-'+str(step),lambda d: d['perf']['repaints'] > frame)
-    time.sleep(.1)
-    subprocess.run([helper,pid,window],check=True)
-    dump = ctl(name+'-capture-state','dump')
-    visible = {key:dump[key] for key in ['view','sidebar','selected_thread','transcript','composer_text',
-        'composer','settings','notice','quit_sheet','view_refusal']}
-    visible['terminal'] = None if dump['terminal'] is None else {key:dump['terminal'][key] for key in ['grid','focused','columns','rows']}
-    visible['providers'] = [probe['readiness'] for probe in dump['providers']]
-    state = json.dumps(visible,sort_keys=True)
-    target = PROOF/(name+'.png')
-    subprocess.run(['screencapture','-x','-o','-l',window,str(target)],check=True)
-    subprocess.run([helper,pid,window],check=True)
-    digest = hashlib.sha256(target.read_bytes()).hexdigest()
-    previous = PROOF/'capture-last.json'
-    if previous.exists():
-        old = json.loads(previous.read_text())
-        assert state == old['state'] or digest != old['digest'], 'stale screenshot after state change: '+name
-    previous.write_text(json.dumps({'state':state,'digest':digest,'name':name})+'\n')
-def foreground_ended(name, thread):
-    query = "select count(*) from turns where thread_id='"+thread+"' and state='ended'"
-    end = time.monotonic()+30
-    while time.monotonic()<end:
-        if sql(query)=='1': return
-        time.sleep(.05)
-    raise AssertionError(name+' foreground did not end')
-def background_working(name, thread):
-    foreground_ended(name,thread)
-    ctl(name+'-not-done','wait',thread,'Done','1',expected=1,stderr_contains='veyra ctl wait timed out:')
-    busy = ctl(name,'dump')
-    assert busy['selected_thread']['id']==thread and busy['selected_thread']['status']=='Working'
-    return busy
-def sql(query):
-    value = subprocess.check_output(['sqlite3',str(DB),query],text=True).strip()
-    with (PROOF/'sql.log').open('a') as log: log.write(query+'\n'+value+'\n')
-    return value
-def database(label, mode):
-    values = [sql('pragma user_version'),sql('pragma journal_mode'),
-        *sql('.tables').split(),sql('select default_mode from settings')]
-    assert values == ['3','wal',*TABLES,mode], (label,values)
-    (PROOF/(label+'-database.txt')).write_text('\n'.join(values)+'\n')
-    (PROOF/(label+'-inode.txt')).write_text(str(DB.stat().st_ino)+'\n')
-    save(label,ctl(label+'-dump','dump'))
-def wait_gone(pid):
-    end = time.monotonic() + 5
-    while time.monotonic() < end:
-        try: os.waitpid(pid,os.WNOHANG)
-        except ChildProcessError: pass
-        try: os.kill(pid,0)
-        except ProcessLookupError: return
-        time.sleep(.05)
-    raise AssertionError(f'owned pid {pid} did not exit')
-def stop(label, crash=False):
-    pid = identity()
-    live = sql('select count(*) from threads where live_pgid is not null')
-    assert live == '0', 'finish provider turns before relaunch'
-    if crash: os.kill(pid,signal.SIGKILL)
-    else: ctl(label+'-quit','quit')
-    wait_gone(pid)
-def start(label):
-    assert subprocess.run(['ioreg','-n','Root','-d1','-a'],capture_output=True,text=True).stdout.count('CGSSessionScreenIsLocked') == 0
-    quiet = time.monotonic()
-    deadline = quiet + 30
-    while time.monotonic()-quiet < 10:
-        assert time.monotonic() < deadline, "another Veyra prevents a quiet launch"
-        if subprocess.run(['pgrep','-x','veyra'],capture_output=True).returncode == 0:
-            quiet = time.monotonic()
-        time.sleep(.1)
-    ENV['VEYRA_REAP_PIDS'] = ','.join(sql('select live_pid from threads where live_pid is not null').split())
-    app = subprocess.Popen([str(pathlib.Path('target/debug/veyra').resolve())],cwd=DATA/'appcwd',env=ENV,
-        stdout=(PROOF/(label+'.stdout')).open('w'),stderr=(PROOF/(label+'.stderr')).open('w'),
-        start_new_session=True)
-    pid = app.pid
-    (PROOF/'pid').write_text(str(pid)+'\n')
-    (PROOF/'pgid').write_text(str(os.getpgid(pid))+'\n')
-    with (PROOF/'owned-app-pids').open('a') as out: out.write(str(pid)+'\n')
-    end = time.monotonic() + 30
-    ready = f'veyra ready pid={pid} data_dir={DATA}'
-    while time.monotonic() < end:
-        assert app.poll() is None, (label,app.returncode)
-        if ready in (PROOF/(label+'.stderr')).read_text(): break
-        time.sleep(.05)
-    assert ready in (PROOF/(label+'.stderr')).read_text()
-    with (PROOF/'stderr.log').open('a') as out: out.write((PROOF/(label+'.stderr')).read_text())
-    window = window_id(pid)
-    assert window
-    (PROOF/'window-id').write_text(window+'\n')
-    identity()
-    return pid
-def restart(label, crash=False):
-    stop(label,crash)
-    return start(label)
-def terminal_seed(thread):
-    assert LANE == 'fake'
-    native = sql("select native_id from threads where id='"+thread+"'")
-    cursor = sql("select native_cursor from threads where id='"+thread+"'")
-    assert native and cursor
-    path = DATA/'claude-home'/'projects'/'veyra-fake'/(native+'.jsonl')
-    path.parent.mkdir(parents=True,exist_ok=True)
-    if not path.exists():
-        entry = {'sessionId':native,'uuid':cursor,'parentUuid':None,'isSidechain':False,
-            'type':'user','entrypoint':'sdk-cli','message':{'role':'user','content':'Already shown in chat'}}
-        path.write_text(json.dumps(entry)+'\n')
-    return native,path
-def terminal_enter(name, fixture='echo'):
-    source = pathlib.Path('crates/engine/tests/fixtures/tui')/(fixture+'.jsonl')
-    stage_records([json.loads(line) for line in source.read_text().splitlines()])
-    ctl(name+'-switch','keys','cmd-shift-v')
-    return poll(name,lambda d:d['view']=='terminal' and d['terminal']['focused']
-        and 'VEYRA_TUI_READY' in ''.join(d['terminal']['grid']))
-def terminal_back(name, scenario='ok-reply'):
-    stage(scenario)
-    ctl(name+'-switch','keys','cmd-shift-v')
-    return poll(name,lambda d:d['view']=='chat' and not d['selected_thread']['import_pending'])
-def fixture_source(records):
-    text = '\n'.join(json.dumps(record) for record in records)+'\n'
-    folder = FIXTURES/'records'
-    folder.mkdir(exist_ok=True)
-    source = folder/(hashlib.sha256(text.encode()).hexdigest()+'.jsonl')
-    if not source.exists(): source.write_text(text)
-    return source
-def link_fixture(name, source):
-    target = FIXTURES/name
-    if target.exists() and target.samefile(source): return
-    pending = target.with_name(target.name+'.next')
-    pending.unlink(missing_ok=True)
-    os.link(source,pending)
-    os.replace(pending,target)
-def stage_records(records):
-    source = fixture_source(records)
-    rows = sql('select threads.id,count(turns.id) from threads left join turns on turns.thread_id=threads.id group by threads.id order by threads.id')
-    turns = [int(row.split('|')[1]) for row in rows.splitlines()]+[0]
-    observed = {}
-    pid_file = PROOF/'pid'
-    try: os.kill(int(pid_file.read_text()),0)
-    except ProcessLookupError: pass
-    else:
-        for path in (PROOF/'rec').rglob('t*-s*.jsonl'):
-            match = re.fullmatch(r't(\d+)-s(\d+)(?:-\d+)?\.jsonl',path.name)
-            if match and path.stat().st_mtime_ns >= pid_file.stat().st_mtime_ns:
-                lane,epoch = map(int,match.groups())
-                observed[lane] = max(observed.get(lane,0),epoch)
-    for lane,count in enumerate(turns,1):
-        last = observed.get(lane,0)
-        for epoch in range(last+1,max(last,count)+9):
-            link_fixture(f't{lane}-s{epoch}.jsonl',source)
-def stage(scenario, slow=False, turns=1):
-    records = [json.loads(line) for line in (SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
-    if slow:
-        expanded = []
-        for record in records:
-            wire = record.get('line',{})
-            if wire.get('event',{}).get('delta',{}).get('text') == 'ok':
-                for text in ['o','k']:
-                    part = json.loads(json.dumps(record))
-                    part['line']['event']['delta']['text'] = text
-                    part['after_ms'] = 500
-                    expanded.append(part)
-            else:
-                if wire.get('type') == 'result': record['after_ms'] = 500
-                expanded.append(record)
-        records = expanded
-    if scenario == 'background-tasks':
-        for record in records:
-            wire = record.get('line',{})
-            ambient_only = wire.get('tasks') == [{'id':'ambient-work','ambient':True}]
-            if wire.get('subtype') == 'background_tasks_changed' and ambient_only:
-                record['after_ms'] = 3000
-            if wire.get('subtype') == 'background_tasks_changed' and wire.get('tasks') == []:
-                record['after_ms'] = 3000
-    if turns > 1:
-        assert scenario == 'ok-reply'
-        start = next(i for i,record in enumerate(records) if record.get('type')=='expect_outbound'
-            and record.get('line',{}).get('type')=='user')
-        repeat = records[start:-1]
-        ending = records[-1]
-        records = records[:-1]
-        for turn in range(2,turns+1):
-            text = json.dumps(repeat).replace('<id:prompt>', '<id:prompt'+str(turn)+'>')
-            records.extend(json.loads(text))
-        records.append(ending)
-    stage_records(records)
-def codex_records(scenario, slow=False, root=True):
-    records = [json.loads(line) for line in (CODEX_SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
-    expanded = []
-    for record in records:
-        wire = record.get('line',{})
-        method = wire.get('method','')
-        if root and record['type']=='expect_outbound' and method in ['thread/start','thread/resume']:
-            wire['params'].setdefault('config',{
-                'mcp_servers.veyra.command':'<any>', 'mcp_servers.veyra.args':['mcp'],
-                'mcp_optional_startup_grace_ms':5000, 'mcp_servers.veyra.tool_timeout_sec':30,
-                'mcp_servers.veyra.env':{'VEYRA_SOCKET':'<any>','VEYRA_MCP_TOKEN':'<any>'}})
-        if slow and method=='item/agentMessage/delta' and wire['params']['delta']=='ok':
-            for text in ['o','k']:
-                part = json.loads(json.dumps(record))
-                part['line']['params']['delta'] = text
-                part['after_ms'] = 500
-                expanded.append(part)
-        else:
-            if slow and method=='turn/completed': record['after_ms'] = 1000
-            expanded.append(record)
-    return expanded
-def create_codex(name, scenario='ok-reply', slow=False, records=None, prompt='reply with the word ok'):
-    assert LANE == 'fake'
-    stage_records(codex_records(scenario,slow) if records is None else records)
-    action(name+'-new','NewThread')
-    action(name+'-provider','PickProvider',{'provider':'codex'})
-    action(name+'-mode','PickPermission',{'mode':'ask_first'})
-    ctl(name+'-text','text',prompt)
-    before = int(sql('select count(*) from threads'))
-    ctl(name+'-send','keys','secondary-enter')
-    dump = poll(name+'-selected',lambda d: d['selected_thread'] is not None
-        and int(sql('select count(*) from threads'))==before+1)
-    assert dump['composer']['provider']=='codex'
-    return dump['selected_thread']['id']
-def grok_records(scenario, slow=False):
-    records = [json.loads(line) for line in (GROK_SOURCE/(scenario+'.jsonl')).read_text().splitlines()]
-    expanded = []
-    for record in records:
-        wire = record.get('line',{})
-        if slow and wire.get('method')=='session/update' and wire['params']['update'].get('content',{}).get('text')=='ok':
-            for text in ['o','k']:
-                part = json.loads(json.dumps(record))
-                part['line']['params']['update']['content']['text'] = text
-                part['after_ms'] = 500
-                expanded.append(part)
-        else:
-            if slow and wire.get('method')=='_x.ai/session/prompt_complete': record['after_ms'] = 1000
-            expanded.append(record)
-    return expanded
-def create_grok(name, scenario='ok-reply', slow=False, records=None, prompt='reply with the word ok'):
-    assert LANE == 'fake'
-    stage_records(grok_records(scenario,slow) if records is None else records)
-    action(name+'-new','NewThread')
-    action(name+'-provider','PickProvider',{'provider':'grok'})
-    action(name+'-mode','PickPermission',{'mode':'ask_first'})
-    ctl(name+'-text','text',prompt)
-    before = int(sql('select count(*) from threads'))
-    ctl(name+'-send','keys','secondary-enter')
-    dump = poll(name+'-selected',lambda d: d['selected_thread'] is not None
-        and int(sql('select count(*) from threads'))==before+1)
-    assert dump['composer']['provider']=='grok'
-    return dump['selected_thread']['id']
-def create(name, prompt, slow=False, scenario='ok-reply'):
-    if LANE == 'fake' and scenario is not None: stage(scenario,slow)
-    action(name+'-new','NewThread')
-    assert ctl(name+'-text','text',prompt) == {'ok':True}
-    before = int(sql('select count(*) from threads'))
-    ctl(name+'-send','keys','secondary-enter')
-    dump = poll(name+'-selected',lambda d: d['selected_thread'] is not None
-        and int(sql('select count(*) from threads')) == before+1)
-    return dump['selected_thread']['id']
-def stage_family(parent='waiting', child='complete'):
-    pid = identity()
-    counter = PROOF/'family-lanes.json'
-    lanes = json.loads(counter.read_text()) if counter.exists() else {}
-    number = lanes.get('next',1) if lanes.get('pid') == pid else 1
-    counter.write_text(json.dumps({'pid':pid,'next':number+2})+'\n')
-    records = [json.loads(line) for line in (SOURCE/'parent-start-thread.jsonl').read_text().splitlines()]
-    first = next(i for i,record in enumerate(records) if record.get('line',{}).get('type') == 'result')
-    if parent == 'running':
-        records.insert(first, {'type':'expect_outbound','line':{'type':'control_request','request_id':'veyra-interrupt','request':{'subtype':'interrupt'}}})
-        records[first+1]['after_ms'] = 0
-        records[first+1]['line']['subtype'] = 'error_during_execution'
-    elif parent == 'attention':
-        approval = [json.loads(line) for line in (SOURCE/'approval-deny.jsonl').read_text().splitlines()]
-        insertion = next(i for i,record in enumerate(records) if record.get('type') == 'mcp_expect' and record.get('line',{}).get('id') == 3)+1
-        records[insertion:insertion] = approval[4:6]
-    else:
-        assert parent == 'waiting'
-    if child == 'complete':
-        child_records = [json.loads(line) for line in (SOURCE/'child-task.jsonl').read_text().splitlines()]
-        for record in child_records:
-            wire = record.get('line',{})
-            if wire.get('type') == 'assistant':
-                record['after_ms'] = 2000
-                wire['message']['content'][0]['text'] = 'First report line\n**Second report line**\nThird report line\n\n- A list item\n- Another item\n\n~~~text\ncode line one\ncode line two\n~~~'
-            if wire.get('type') == 'result': record['after_ms'] = 30000
-    else:
-        assert child == 'running'
-        child_records = [json.loads(line) for line in (SOURCE/'long-reply.jsonl').read_text().splitlines()]
-    def write(lane,epoch,records):
-        link_fixture(f't{lane}-s{epoch}.jsonl',fixture_source(records))
-    write(number,1,records)
-    write(number+1,1,child_records)
-    resumed = [json.loads(line) for line in (SOURCE/'parent-wake.jsonl').read_text().splitlines()]
-    for epoch in [2,3]: write(number,epoch,resumed)
-    return number
-def create_family(name, parent='waiting', child='complete'):
-    stage_family(parent,child)
-    action(name+'-new','NewThread')
-    ctl(name+'-text','text',name)
-    before = int(sql('select count(*) from threads'))
-    ctl(name+'-send','keys','secondary-enter')
-    dump = poll(name+'-root',lambda d:d['selected_thread'] is not None
-        and d['selected_thread']['lineage']=='Root' and d['selected_thread']['title']==name
-        and int(sql('select count(*) from threads'))>=before+1)
-    root = dump['selected_thread']['id']
-    poll(name+'-task',lambda d:any(task['parent']==root for task in d['tasks']))
-    row = sql("select child_thread_id||'|'||id from tasks where parent_thread_id='"+root+"'").split('|')
-    assert len(row)==2
-    return root,row[0],row[1]
-def select(name, thread):
-    action(name+'-select','SelectThread',{'thread':thread})
-    return poll(name,lambda d:d['selected_thread'] is not None and d['selected_thread']['id']==thread
-        and len(d['transcript']['items'])>0)
-def family_delivered(name, root, task):
-    return poll(name,lambda d:sql("select delivery from tasks where id='"+task+"'")=='delivered'
-        and any(row['id']==root and row['status']=='Done' for row in d['sidebar']['rows'] if row['kind']=='thread'))
-def pending_wake(root):
-    return sql("select count(*) from tasks where parent_thread_id='"+root+"' and delivery='pending'")=='1'
-PY
-RUN="$RUN" PYTHONPATH="$PROOF" python3 - <<'PY'
+RUN="$RUN" PYTHONPATH="$BIN" python3 - <<'PY'
 from driver import *
-app = subprocess.Popen([str(pathlib.Path('target/debug/veyra').resolve())],cwd=DATA/'appcwd',env=ENV,
-    stdout=(PROOF/'stdout.log').open('w'),stderr=(PROOF/'stderr.log').open('w'),start_new_session=True)
-pid = app.pid
-(PROOF/'pid').write_text(str(pid)+'\n')
-(PROOF/'pgid').write_text(str(os.getpgid(pid))+'\n')
-(PROOF/'owned-app-pids').write_text(str(pid)+'\n')
+gate()
+if LANE == 'fake': make_git_shim()
+pid = start('launch')
+print(f"PASS launch RUN={RUN} PID={pid} PGID={(PROOF/'pgid').read_text().strip()} ID={(PROOF/'window-id').read_text().strip()}")
 PY
-PID=$(<"$PROOF/pid")
-PGID=$(<"$PROOF/pgid")
-test "$PID" = "$PGID"
-for attempt in $(seq 1 100); do
-    grep -q "^veyra ready pid=$PID data_dir=$DATA$" "$PROOF/stderr.log" && break
-    kill -0 "$PID" 2>/dev/null || break
-    sleep .1
-done
-grep -q "^veyra ready pid=$PID data_dir=$DATA$" "$PROOF/stderr.log"
-ID=$(RUN="$RUN" PYTHONPATH="$PROOF" python3 -c 'from driver import *; print(window_id(int((PROOF/"pid").read_text())))')
-test -n "$ID"
-printf '%s\n' "$ID" >"$PROOF/window-id"
-printf 'PASS launch RUN=%s PID=%s PGID=%s ID=%s\n' "$RUN" "$PID" "$PGID" "$ID"
 ```
 
 The block must exit 0.
 A failed launch may still own a process: run Cleanup before reporting.
-Relaunches use `start_new_session=True`, preserving the same pid-equals-group invariant without a previous shell's job table.
+Launches use `start_new_session=True`, so the app's pid is its process group.
 The slowed `ok` fixture uses 500 ms, the design's stderr-wait bound, between its two text deltas and before the result.
 The background proof uses three-second intervals, the design's interrupt grace, before ambient-only and empty lists.
 The family proof delays its child reply by two seconds so selection precedes the text batch and the visible counter can observe it.
@@ -593,7 +127,7 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 start = time.monotonic()
 pid = identity()
@@ -617,6 +151,7 @@ PY
 Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.md), [chat-send-stream](features/chat-send-stream.md) and [settings](features/settings.md).
 Also run [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
 Run each page's Codex and Grok sections in the fake lane after its existing drive.
+Every section after new-thread's first starts with the driver's `prepare()`, which adds the project, installs the fake CLI and waits for Ready only when no earlier page did, then opens a new Claude composer, so a page can run alone after Launch, Doctor and app-launch's first section, or after any earlier section without a relaunch.
 Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
 Run [chat-terminal-switch](features/chat-terminal-switch.md) for the fake TUI, recovery import and one flood.
 The fake lane runs those pages without a provider login.
@@ -721,7 +256,7 @@ A dump proves state, not layout; inspect each PNG.
 ## Evidence
 
 Run this after the chosen pages and the final Doctor.
-Each passed page records its name in `pages-run`; Evidence checks only those pages.
+Each passed section records its name in `pages-run`; Evidence checks only those sections.
 The required files enforce the relaunch, release and feature proofs.
 
 ```sh
@@ -729,7 +264,7 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 identity()
 ctl('dump-after','dump')
@@ -741,9 +276,11 @@ shutil.copy2(DATA/'logs/veyra.log',PROOF/'veyra.log')
 (PROOF/'git-identity.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True)
     +subprocess.check_output(['git','status','--short'],text=True))
 required = {
-    'app-launch':['window-launch.png','dump-before.json','second-launch.txt','initial-database.txt',
-        'after-quit-database.txt','after-crash-database.txt','persisted-project.txt','release/ctl.txt',
-        'release/strings.txt','release/data-listing.txt'],
+    'app-launch-main':['window-launch.png','dump-before.json','second-launch.txt'],
+    'app-launch':['initial-database.txt','after-migration-database.txt','persisted-project.txt',
+        'migration-unlinked-report.png'],
+    'app-launch-release':['release/ctl.txt','release/strings.txt','release/data-listing.txt',
+        'release/provider-probes.txt'],
     'new-thread':['new-thread-missing.json','new-thread-ready.json','new-thread-no-account.json',
         'new-thread-provider-menu.png','new-thread-provider-menu-ready.png','new-thread-ready.png','new-thread.png'],
     'chat-send-stream':['chat-working.json','chat-working.png','chat-done.json','chat-done.png',
@@ -757,11 +294,13 @@ required = {
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json',
-        'restart-child-interrupted.png','restart-child-parent-held.png','restart-child-delivered.json'],
+        'restart-child-interrupted.png','restart-child-parent-held.png','restart-child-delivered.json',
+        'restart-after-ctl-database.txt','restart-after-crash-database.txt','restart-database-kept.json'],
     'multi-agent':['multi-tree-working.png','multi-child-task.png','multi-family-done.png','multi-report-delivered.png',
         'multi-child-parent-needs.png','multi-menu.png','multi-child-stop-held.png','multi-parent-stop-held.png',
         'multi-child-archive-held.json','multi-child-archive-held.png',
-        'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png'],
+        'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png',
+        'multi-stopped-child-wake-received.json'],
     'chat-terminal-switch':['terminal-open.png','terminal-imported.png','terminal-recovered.png',
         'terminal-hex.json','terminal-empty-repeat.json','terminal-cursor-updates.json','terminal-history-grep.txt','terminal-flood.json','terminal-flood.png'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
@@ -771,7 +310,7 @@ required = {
     'chat-send-stream-codex':['codex-chat-working.json','codex-chat-working.png','codex-chat-done.json',
         'codex-chat-done.png','codex-other-thread-done.json','codex-other-thread.png','codex-notices-done.json','codex-notices.png'],
     'approvals-questions-codex':['codex-command.json','codex-command.png','codex-command-other-cwd.png',
-        'codex-file.png','codex-permissions.png','codex-question.png','codex-question-four.png','codex-question-nine.png','codex-mcp-first.png','codex-mcp-second.png',
+        'codex-file.png','codex-permissions.png','codex-question.png','codex-mcp-first.png','codex-mcp-second.png',
         'codex-async-question.png','codex-async-question-chosen.png','codex-async-question-typed-closed.png','codex-card-done.json','codex-reason-quoted.png',
         'codex-long-working-folder.png','codex-long-working-folder-end.png'],
     'multi-agent-codex':['codex-relay-done.json','codex-relay.png','codex-relay-log.txt',
@@ -788,7 +327,7 @@ assert pages <= required.keys(), pages
 for name in ['drive.log','sql.log',*(name for page in pages for name in required[page])]:
     assert (PROOF/name).stat().st_size > 0, name
 if 'app-launch' in pages:
-    assert len({(PROOF/(label+'-inode.txt')).read_text() for label in ['initial','after-quit','after-crash']}) == 1
+    assert len({(PROOF/(label+'-inode.txt')).read_text() for label in ['initial','after-migration']}) == 1
 for pid in (PROOF/'owned-app-pids').read_text().split():
     assert f'veyra ready pid={pid} data_dir={DATA}' in (PROOF/'veyra.log').read_text()
 pairs = {
@@ -837,8 +376,9 @@ A failed database read, group check or marker check leaves DATA for diagnosis.
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
-DATA=/tmp/veyra-verify-$RUN
+DATA=${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN
 PROOF=target/verify-veyra/$RUN
+case "$DATA" in /tmp/veyra-*) ;; *) exit 1 ;; esac
 PID=$(<"$PROOF/pid")
 PGID=$(<"$PROOF/pgid")
 test "$PID" = "$PGID"
@@ -866,7 +406,7 @@ for attempt in $(seq 1 50); do
     sleep .1
 done
 ! kill -0 "$PID" 2>/dev/null
-PYTHONPATH="$PROOF" python3 - "$PROOF" <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - "$PROOF" <<'PY'
 import ctypes, errno, json, os, pathlib, struct, subprocess, sys, time
 proof = pathlib.Path(sys.argv[1])
 parents = {int(pid) for pid in (proof/'owned-app-pids').read_text().split()}
@@ -902,7 +442,7 @@ assert not other_markers, f'{len(other_markers)} marked processes remain after t
 (proof/'marker-check.txt').write_text(f'PASS no saved owned pids or provider groups for app pids {sorted(parents)}\n')
 print('PASS saved owned pids, provider groups and marker check; other marker drain seconds='+str(round(time.monotonic()-started,3)))
 PY
-test "$DATA" = "/tmp/veyra-verify-$RUN"
+test "$DATA" = "${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN"
 rm -rf "$DATA"
 test ! -e "$DATA"
 /bin/ls -la "$PROOF" >"$PROOF/cleanup-listing.txt"
@@ -922,12 +462,17 @@ It does not signal an unrecorded group.
 
 ## Helpers
 
-`bin/winid.swift PID` finds the on-screen window by owner pid and normal window layer.
-Add `--bounds` to get `x,y,w,h`.
-A socket path permits 103 usable bytes; keep RUN short.
+- `bin/run` is the gated runner described in [Run](#run).
+- `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
+- `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.
+- `bin/select-pages`, `bin/fresh-pages` and `bin/pages.py` are described in [Selection](#selection).
+
+A socket path permits 103 usable bytes; keep RUN and the scratch prefix short.
 
 ## Maintain the map
 
 Update the matching feature page when actions, commands or dump fields change.
 `verify_map_names` checks exact action names, ctl verbs and top-level dump keys.
-Update the `Status: STATE, DATE, COMMIT, MISSING` values from candidate acceptance in a docs-only change after the candidate commit.
+Each page's line under its title is `Status: STATE, DATE, COMMIT, MISSING, FINGERPRINT`, and a `Covers:` line of path globs follows it.
+Set them from the gated run that proved the page, in a docs-only change after the candidate commit, with FINGERPRINT from `bin/fresh-pages --print COMMIT`.
+Name in `Covers:` each source path whose change could change the page's result, and leave a file every page depends on uncovered, so it selects every page.

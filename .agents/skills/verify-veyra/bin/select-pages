@@ -1,0 +1,3 @@
+#!/bin/sh
+# Print the verify-veyra tokens a change from BASE selects; see SKILL.md, section Selection.
+exec python3 "$(dirname "$0")/pages.py" select "$@"

@@ -1,6 +1,7 @@
 # Approvals and questions
 
 Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Covers: crates/veyra/src/ui/provider_text.rs crates/veyra/src/ui/terminal_view.rs crates/engine/src/terminal.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/** crates/engine/tests/fixtures/tui/**
 
 ## Sub-features
 
@@ -31,7 +32,7 @@ NextNeedsYou uses ⌘⇧J pending the operator's chord decision.
 
 ## Driving it with veyra ctl
 
-Run Launch, Doctor and new-thread first, using the fake lane.
+Run Launch and Doctor first, using the fake lane; each section calls `prepare()`.
 All added wires below are proof copies of Veyra's own fixtures.
 
 ```sh
@@ -39,9 +40,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
 check = DATA/'project'/'veyra-check.txt'
 check.unlink(missing_ok=True)
@@ -290,9 +291,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PYCODEX'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYCODEX'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
 thread = create_codex('codex-command',scenario='approval-command')
 dump = poll('codex-command',lambda d:d['composer']['dock'] is not None)
@@ -351,40 +352,6 @@ done = ctl('codex-question-done','wait',thread,'Done')
 assert done['composer']['dock'] is None
 assert any(item['kind']=='user' and 'Violet' in item['text'] for item in done['transcript']['items'])
 assert 'Violet' in sql("select decision_json from requests where thread_id='"+thread+"'")
-records = codex_records('question')
-index = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/tool/requestUserInput')
-labels = ['Use PostgreSQL (Recommended)', 'Keep SQLite for now', 'Add the migration later', 'Ask me after the tests pass']
-question_wire = records[index]['line']['params']['questions'][0]
-question_wire['question'] = 'Which database should the service use?'
-question_wire['options'] = [{'label':label, 'description':'Database route'} for label in labels]
-records[index+1]['line']['result']['answers']['color']['answers'] = [labels[3]]
-thread = create_codex('codex-question-four',records=records,prompt='Choose a database route')
-dock = poll('codex-question-four',lambda d:d['composer']['dock'] is not None)['composer']['dock']
-assert dock['request']['kind']['Question']['questions'][0]['options']==labels
-capture('codex-question-four')
-action('codex-question-four-focus','FocusDock')
-ctl('codex-question-four-choice','keys','4')
-done = ctl('codex-question-four-done','wait',thread,'Done')
-assert done['composer']['dock'] is None
-assert any(item['kind']=='user' and labels[3] in item['text'] for item in done['transcript']['items'])
-records = codex_records('question')
-index = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/tool/requestUserInput')
-question_text = ('Which route should the agent take? ' * 20)[:400]
-question_wire = records[index]['line']['params']['questions'][0]
-question_wire['question'] = question_text
-labels = [f'Route {i + 1}: use PostgreSQL and keep the migration history' for i in range(9)]
-question_wire['options'] = [{'label':label,'description':f'Route {i}'} for i,label in enumerate(labels)]
-records[index+1]['line']['result']['answers']['color']['answers'] = [labels[8]]
-thread = create_codex('codex-question-nine',records=records,prompt='Choose among nine routes')
-dock = poll('codex-question-nine',lambda d:d['composer']['dock'] is not None)['composer']['dock']
-assert len(dock['request']['kind']['Question']['questions'][0]['options'])==9
-ctl('codex-question-nine-draft','text','draft line\n'*40)
-capture('codex-question-nine')
-action('codex-question-nine-focus','FocusDock')
-ctl('codex-question-nine-choice','keys','9')
-done = ctl('codex-question-nine-done','wait',thread,'Done')
-assert done['composer']['dock'] is None
-assert any(item['kind']=='user' and labels[8] in item['text'] for item in done['transcript']['items'])
 thread = create_codex('codex-mcp',scenario='mcp-tool-approval')
 for label,decision in [('first','AllowOnce'),('second','Deny')]:
     dock = poll('codex-mcp-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
@@ -561,9 +528,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PYGROK'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYGROK'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
 check = DATA/'project/veyra-check.txt'
 check.unlink(missing_ok=True)
@@ -681,9 +648,11 @@ The two question PNGs dock the flat live shape under the running turn and cover 
 `grok-question-expired.json` and SQLite retain the question as Expired after Stop, and its PNG shows Interrupted with the dock removed.
 
 `question.png`, `question-focused.png` and `codex-question.png` show two-option docks with text clear of the controls.
-`question-four.png` and `codex-question-four.png` show the four realistic database labels in one column.
-`question-nine.png` and `codex-question-nine.png` show every long route label wrapped in three columns below the 400-character question, with a tall draft retained in the fixed 48px message input.
-The digit-9 replies preserve the ninth route label as the answer in both providers' strict fixtures and stored user text.
+`question-four.png` shows the four realistic database labels in one column.
+`question-nine.png` shows every long route label wrapped in three columns below the 400-character question, with a tall draft retained in the fixed 48px message input.
+The digit-9 reply preserves the ninth route label as the answer in the strict fixture and stored user text.
+The dock renders the typed request, not provider wire, so Codex's four- and nine-option questions share Claude's layout.
+`every_dock_kind_has_disjoint_regions_and_controls_in_window` checks that layout for every dock kind, and `codex_question_answered` (`crates/engine/tests/replay_codex.rs`) replays Codex's question wire to its answer, so this page drives those two Codex docks no longer.
 The dock-region matrix also includes Grok and the Deny-only reason and disabled buttons.
 The GPUI matrices also check disjoint visible regions, contained text for every region, the docked editor inside its input viewport and every dock/composer button inside both theme window sizes for every dock kind (scrolling choices are clipped to their viewport).
 One held-and-queued case per theme window size and provider checks Discard queued alongside Continue.

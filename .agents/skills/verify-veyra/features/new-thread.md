@@ -1,12 +1,14 @@
 # New thread
 
 Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Covers: crates/veyra/src/ui/new_thread.rs crates/veyra/src/ui/settings.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
 
 ## Sub-features
 
 - `provider-readiness`: missing Claude disables Send and names the installation command.
 - `provider-recheck`: Check again discovers the newly linked fake binary without a relaunch or thread.
 - `provider-no-account`: an initialize reply without account stays Ready, not Signed out.
+- `provider-signed-out`: a signed-out probe disables Send and names `claude auth login`.
 - `composer-pickers`: provider, model, effort and permission choices change the live composer through actions and keys.
 - `new-thread-layout`: question, pickers, textarea and hooks/MCP hint in the upper third.
 
@@ -35,6 +37,7 @@ This page stops before Send so its readiness proofs must leave zero threads.
 ## Driving it with veyra ctl
 
 Launch and Doctor first.
+Run this page before any other page that creates a thread or installs the fake CLI; its Codex and Grok sections call `prepare()` and can run alone.
 The default fake branch covers installation, Check again and choices.
 The authorized live branch covers startup readiness and leaves zero threads without replay overrides.
 The fixture binary path must still be missing and the database must contain zero threads.
@@ -46,7 +49,7 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 identity()
 if LANE == 'live':
@@ -101,7 +104,7 @@ no_account = poll('new-thread-no-account',lambda d: d['providers'][0]['readiness
 assert no_account['composer']['send_enabled']
 assert no_account['providers'][0]['account'] == 'unknown'
 assert no_account['providers'][0]['models']
-for scenario, status in [('probe-signed-out','signed_out'),('probe-api-key','ready'),('probe-third-party','ready'),('probe-no-account','ready')]:
+for scenario, status in [('probe-signed-out','signed_out'),('probe-no-account','ready')]:
     shutil.copy2(SOURCE/(scenario+'.jsonl'),FIXTURES/'probe.jsonl')
     action('claude-source-'+scenario+'-recheck','RecheckProviders')
     probe = poll('claude-source-'+scenario,lambda d:d['providers'][0]['readiness']==status)
@@ -153,9 +156,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PYCODEX'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYCODEX'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
 assert sql('select count(*) from threads')=='0'
 (DATA/'fake-cli').unlink()
@@ -202,9 +205,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PYGROK'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYGROK'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
 assert sql('select count(*) from threads')=='0'
 action('grok-new-thread-open','NewThread')
@@ -312,6 +315,8 @@ Its SQLite thread count remains zero, and its PNGs show the disabled reason and 
 - `new-thread-missing.json`: Claude `not_installed`, Send disabled, installation command visible; inspect its PNG.
 - `new-thread-ready.json`: Claude `ready`, models present, Send enabled after RecheckProviders.
 - `new-thread-no-account.json`: account presence changes from `known` to `unknown`, models stay non-empty and Claude stays `ready` on the account-free probe; every readiness phase asserts `select count(*) from threads` is 0.
+- `claude-source-probe-signed-out.json`: the signed-out probe reads `signed_out`, disables Send and names `claude auth login`.
+  The API-key, third-party and silent-account probes read Ready in `claude_probe_api_key_reads_ready`, `claude_probe_third_party_reads_ready` and `claude_probe_silent_account_reads_ready` (`crates/engine/tests/replay_claude.rs`), which replay the same fixtures through the real probe code, so this page no longer drives them.
 - `composer.provider`, `model`, `effort` and `mode` assert every choice; `composer_text` asserts typing and NewThread's reset.
 - `new-thread-provider-menu.png` shows Not installed; `new-thread-provider-menu-ready.png` shows Ready after a probe completes while the menu remains open.
 - `composer.provider_picker_labels` holds the labels used to build the open menu; its key opens the same menu.

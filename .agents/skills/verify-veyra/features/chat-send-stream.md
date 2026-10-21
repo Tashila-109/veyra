@@ -1,6 +1,7 @@
 # Chat send and stream
 
 Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Covers: crates/veyra/src/ui/provider_text.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
 
 ## Sub-features
 
@@ -8,7 +9,7 @@ Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RU
 - `chat-stream`: the textarea clears, a user bubble and streamed assistant text appear, with Working then Done.
 - `chat-failure`: mid-turn exit shows Failed, Veyra's crash cause and the last stderr lines.
 - `chat-retry`: Retry probes again and completes the failed prompt on a new turn.
-- `chat-wait`: client exit codes distinguish completion, timeout, bad usage and a missing thread.
+- `chat-wait`: `ctl wait` returns the state it waited for and times out with exit 1 and its named stderr line.
 - `chat-tools`: captured Bash wires render a collapsed tool row whose detail toggles through the action and key.
 
 ## How to get to it (user POV)
@@ -36,9 +37,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
-identity()
+prepare()
 before = ctl('chat-before','dump')
 if LANE == 'live':
     thread = create('live-chat','reply with the word ok')
@@ -90,9 +91,7 @@ assert sql("select json_extract(body_json,'$.AssistantText.text')||'|'||done fro
     +thread+"' and kind='assistant_text'") == 'ok|1'
 assert re.fullmatch(r'Done · [1-9][0-9]*s',done['selected_thread']['header_status'])
 capture('chat-done')
-ctl('chat-wait-missing','wait','missing-thread','Done',expected=3)
 ctl('chat-wait-timeout','wait',thread,'Working','0',expected=1,stderr_contains='veyra ctl wait timed out:')
-ctl('chat-wait-bad-usage','wait',thread,'unknown-status',expected=2)
 failed = create('chat-crash','reply with the word ok',scenario='crash-mid-turn')
 crash = ctl('chat-wait-failed','wait',failed,'Failed')
 save('chat-failed',crash)
@@ -317,9 +316,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PYCODEX'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYCODEX'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
 thread = create_codex('codex-chat',slow=True)
 stream = poll('codex-chat-working',lambda d:any(item['kind']=='assistant' and item['text']=='o' and not item['done'] for item in d['transcript']['items']))
@@ -390,9 +389,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PYGROK'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYGROK'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
 records = grok_records('ok-reply',slow=True)
 records.insert(1,{'type':'record_argv','path':'grok-launch-argv.json'})
@@ -510,7 +509,8 @@ The Codex PNGs show Working, Done and both notices.
 - The CLI-started turn stores exactly one completed assistant reply and no empty reasoning; `sql.log` and the dump assert the exact items.
 - `chat-failed.json` has `view: failed_thread`, Failed and the crash cause with both fixture stderr lines; its PNG shows the cause, next step, Retry and Open Terminal.
 - `chat-retried.json` has Done with the retried completed `ok`.
-- `drive.log` records wait exit 0 for each state, 1 for the zero-second timeout, 2 for bad usage and 3 for a missing thread.
+- `drive.log` records wait exit 0 for each state and 1 with `veyra ctl wait timed out:` for the zero-second timeout.
+  Exit 2 for bad usage and 3 for a missing or archived thread are proven by `ctl_wait_exit_codes` (`crates/veyra/src/control.rs`), so this page no longer drives them.
 - `chat-tool-done.json` has a completed collapsed tool with captured output `veyra-probe`; the action and key assert its expanded state, with collapsed/expanded PNGs.
 - Thread selection and transcript loading use the snapshot fence, not a UI database read.
 

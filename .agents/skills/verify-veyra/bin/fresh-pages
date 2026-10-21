@@ -1,0 +1,4 @@
+#!/bin/sh
+# Print the verify-veyra pages whose Status FINGERPRINT still matches; see SKILL.md, section Selection.
+if [ "$1" = --print ]; then shift; exec python3 "$(dirname "$0")/pages.py" print "$@"; fi
+exec python3 "$(dirname "$0")/pages.py" fresh "$@"

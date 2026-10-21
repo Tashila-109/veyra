@@ -1,6 +1,7 @@
 # Settings
 
 Status: passed, 2026-10-20, 2b45067, none
+Covers: crates/veyra/src/ui/settings.rs crates/veyra/src/ui/new_thread.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
 
 ## Sub-features
 
@@ -24,10 +25,11 @@ It does not reconfigure existing threads or open a second window.
 
 ## Driving it with veyra ctl
 
-Run Launch, Doctor and new-thread first.
-This page can run alone on a fresh DATA after those prerequisites, or after chat-send-stream on the same initially fresh DATA.
+Run Launch and Doctor first, in the fake lane.
+This page can run alone after them, or after new-thread and chat-send-stream on the same DATA.
 The initial stored default must still be Full access.
 It creates a Full access thread, chooses Ask first, creates an Ask first thread and relaunches.
+It turns on Launch's run-owned git shim by creating `$DATA/branch-on` and removes it at the end, so no relaunch is needed to change PATH.
 Use ctl wait for both completed turns.
 
 ```sh
@@ -35,25 +37,13 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
-import shlex
-identity()
+assert LANE == 'fake'
+prepare()
 assert sql('select default_mode from settings') == 'full_access'
-branch_bin = DATA/'branch-bin'
-branch_bin.mkdir()
-git = branch_bin/'git'
-git.write_text('#!/bin/sh\n'
-    'test "$1" = branch && test "$2" = --show-current || exit 1\n'
-    'touch '+shlex.quote(str(DATA/'branch-started'))+'\n'
-    'sleep 0.5\n'
-    'touch '+shlex.quote(str(DATA/'branch-finished'))+'\n'
-    "printf '%s\\n' fixture-branch\n")
-git.chmod(0o700)
-ENV['PATH'] = str(branch_bin)+os.pathsep+ENV['PATH']
-poll('settings-before-branch-restart',lambda d: sql('select count(*) from threads where live_pgid is not null')=='0')
-restart('settings-branch-restart')
-poll('settings-branch-ready',lambda d: d['providers'][0]['readiness']=='ready')
+for marker in ['branch-started','branch-finished']: (DATA/marker).unlink(missing_ok=True)
+(DATA/'branch-on').touch()
 action('settings-initial-new','NewThread')
 assert ctl('settings-initial-chip','dump')['composer']['mode'] == 'full_access'
 first = create('settings-full','reply with the word ok')
@@ -143,6 +133,7 @@ for command,argument in [('action','veyra::NewThread'),('keys','secondary-n')]:
 capture('settings-relaunch')
 action('settings-final-open','OpenSettings')
 assert poll('settings-final',lambda d: d['view']=='settings')['view'] == 'settings'
+(DATA/'branch-on').unlink()
 page_done('settings')
 print('PASS default persistence: fresh Full access; stored Ask first; old thread Full access; '
     'new thread Ask first; relaunch keeps all three')
@@ -176,5 +167,5 @@ Settings is not a second native window.
 The driver dispatches through the same OpenSettings action as the menu, but does not prove a native menu click.
 The helper waits for provider groups to finish before relaunch; it does not add provider reaping.
 The default is stored, not a process-local preference.
-The run-owned git shim answers only the branch read and disappears with DATA during Cleanup.
+The run-owned git shim answers only the branch read, only while `branch-on` exists, and disappears with DATA during Cleanup.
 Update Status from candidate acceptance.

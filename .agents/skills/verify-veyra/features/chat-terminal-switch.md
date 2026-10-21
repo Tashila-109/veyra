@@ -1,6 +1,7 @@
 # Chat and terminal switch
 
 Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Covers: crates/veyra/src/ui/terminal_view.rs crates/engine/src/terminal.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/tui/**
 
 ## Sub-features
 
@@ -23,7 +24,7 @@ The optional `SwitchView` action payload `{"terminal":true}` selects Terminal; f
 
 ## Driving it with veyra ctl
 
-Run Launch, Doctor and new-thread first in the fake lane.
+Run Launch and Doctor first in the fake lane; the fake branch calls `prepare()`.
 For an authorized live drive, select an idle existing provider thread first and use the same block.
 The live drive waits for the provider’s own history and prompt glyphs, reads Claude’s highlighted folder trust choice before accepting it, and leaves CLI home resolution to the user’s environment without CLAUDE_CONFIG_DIR.
 When checking a thread grant, establish the exact `touch veyra-grant.txt` grant in that disposable project before the block; its final request checks that command runs without docking after the round trips.
@@ -37,7 +38,7 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 identity()
 if LANE == 'live':
@@ -151,6 +152,7 @@ if LANE == 'live':
     print('PASS live native screen, terminal spans, quit recovery and retained grants')
     raise SystemExit(0)
 assert LANE == 'fake'
+prepare()
 action('terminal-provider','NewThread')
 action('terminal-claude','PickProvider',{'provider':'claude'})
 thread = create('terminal-chat','reply with the word ok')

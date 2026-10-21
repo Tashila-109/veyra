@@ -1,6 +1,7 @@
 # Restart and recovery
 
 Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Covers: crates/engine/src/data_dir.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/veyra/src/relay.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
 
 ## Sub-features
 
@@ -10,6 +11,7 @@ Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RU
 - A crash expires pending requests and holds queued work without resending it.
 - An idle Quit exits immediately.
 - A crashed child shows Interrupted with Continue, settles its task on Continue, and leaves a held parent wake until Continue there.
+- The `ctl quit` and crash relaunches keep the project row, schema 3, WAL, the eight tables, the stored default mode and the database inode.
 
 ## How to get to it (user POV)
 
@@ -23,8 +25,9 @@ After ConfirmQuit begins, Escape keeps the quit sheet visible until the app exit
 
 ## Driving it with veyra ctl
 
-Run Launch, Doctor and new-thread first, with fake CLI only.
+Run Launch and Doctor first, with fake CLI only; the section calls `prepare()`.
 The final section adds a child task through the production relay, then crashes and relaunches the owned app.
+The `ctl quit` and crash relaunches also run app-launch's database checks against this page's starting project row and inode.
 Its post-relaunch marker check uses Cleanup's exiting-process retry and chooses a separate thirty-second window to let session-end hooks drain; remaining unreadable or marked pids fail the check without signalling unrecorded groups.
 
 ```sh
@@ -32,10 +35,19 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
+project_row = sql('select id,path,name from projects order by id')
+inode = DB.stat().st_ino
+mode = sql('select default_mode from settings')
+def database_kept(label):
+    database(label,mode)
+    assert sql('select id,path,name from projects order by id') == project_row, label
+    assert DB.stat().st_ino == inode, label
+    return {'label':label,'mode':mode,'inode':inode,'project':project_row}
+database_rows = []
 def owned_groups_gone(groups):
     end = time.monotonic()+5
     while time.monotonic()<end:
@@ -108,6 +120,7 @@ wait_gone(pid)
 owned_groups_gone(groups)
 assert sql("select json_extract(decision_json,'$') from requests where thread_id='"+pending+"'")=='Veyra is closing'
 start('restart-after-ctl')
+database_rows.append(database_kept('restart-after-ctl'))
 poll('restart-ready-again',lambda d: d['providers'][0]['readiness']=='ready')
 action('restart-select-pending','SelectThread',{'thread':pending})
 expired = poll('restart-expired',lambda d: d['selected_thread']['id']==pending
@@ -125,6 +138,7 @@ os.kill(pid,signal.SIGKILL)
 wait_gone(pid)
 start('restart-after-crash')
 owned_groups_gone(groups)
+database_rows.append(database_kept('restart-after-crash'))
 action('restart-select-crashed','SelectThread',{'thread':crashed})
 recovered = poll('restart-crash-held',lambda d: d['selected_thread']['id']==crashed
     and d['selected_thread']['status']=='Held')
@@ -180,7 +194,7 @@ capture('restart-child-delivered')
 poll('restart-child-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
 action('restart-archive-recovered','Archive',{'thread':root})
 poll('restart-archive-hidden',lambda d:all(row.get('id') not in [root,child] for row in d['sidebar']['rows']))
-restart('restart-final-family-idle')
+save('restart-database-kept',database_rows)
 page_done('restart-recovery')
 print('PASS quit sheet, Cancel, ConfirmQuit, ctl quit, Interrupted/Restarted holds, crash and idle quit')
 PY
@@ -195,6 +209,7 @@ The process checks show every owned provider group gone before orderly relaunch.
 `restart-expired.json` has no dock; SQLite retains Veyra is closing.
 `restart-crash-held.json` and its PNG show the same hold after a crash, without starting the queued turn.
 `restart-child-interrupted.png` shows the recovered child and Continue, `restart-child-parent-held.png` shows its pending held wake, and `restart-child-delivered.json` agrees with SQLite delivered.
+`restart-after-ctl-database.txt`, `restart-after-crash-database.txt` and `restart-database-kept.json` hold schema 3, WAL, the eight tables and the stored mode after each relaunch, with the page's starting project row and database inode.
 Both Archive and ArchiveKeepChildren and the top-level tasks key are named here; the archive choices are exercised on multi-agent.
 
 ## Gotchas

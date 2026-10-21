@@ -1,6 +1,7 @@
 # Stop and interrupt
 
 Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Covers: crates/veyra/src/ui/notify.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
 
 ## Sub-features
 
@@ -22,7 +23,7 @@ When Veyra is inactive, a Needs you, Done or Failed family posts a title-and-sta
 
 ## Driving it with veyra ctl
 
-Run Launch, Doctor and new-thread first, using the fake lane.
+Run Launch and Doctor first, using the fake lane; the section calls `prepare()`.
 The background proof lists work before result and keeps the agent task pending after result.
 Those are proof-copy wires; the committed fixture is unchanged.
 
@@ -31,9 +32,9 @@ export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
-PYTHONPATH="$PROOF" python3 - <<'PY'
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
-identity()
+prepare()
 assert LANE == 'fake'
 thread = create('stop','A long reply',scenario='long-reply')
 working = poll('stop-working',lambda d: d['composer']['stop_visible'] and d['awake'])

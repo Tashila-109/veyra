@@ -15,7 +15,7 @@
 ## Preconditions
 
 - Run Launch and Doctor in [verify-veyra](../SKILL.md).
-- Launch prints a fresh short `RUN` and uses `/tmp/veyra-verify-$RUN`.
+- Launch prints a fresh short `RUN` and uses `/tmp/veyra-verify-$RUN`, or `$VEYRA_VERIFY_TMP$RUN` when that prefix is set.
 - Each later section recovers run, process, and window records in a fresh bash process.
 Every later section needs that `RUN` exported, as [SKILL.md](../SKILL.md) says.
 - Drive only the pid this run started.
@@ -38,14 +38,18 @@ Inspect the 44 px header and the composer capped at 784 px in the PNG.
 
 ## Entry contract
 
-Each feature starts with `Status: STATE, DATE, COMMIT, MISSING` directly under its title.
+Each feature starts with `Status: STATE, DATE, COMMIT, MISSING, FINGERPRINT` directly under its title, and a `Covers:` line of space-separated path globs follows it.
 STATE is `passed`, `failed`, `blocked`, or `not run`.
 DATE is the last run's date.
-COMMIT is the short SHA of the candidate commit the lanes ran.
+COMMIT is the short SHA of the candidate commit whose gated run proved the page.
 MISSING lists every sub-feature that run did not prove, or `none` when all passed.
+FINGERPRINT is the page's fingerprint at COMMIT from `bin/fresh-pages --print COMMIT`; see [Selection](../SKILL.md#selection).
 A partial run never counts as passed.
 Fill the values from preserved verification results.
-Fill COMMIT in a docs-only commit after the candidate commit, since a commit cannot contain its own SHA.
+Fill COMMIT and FINGERPRINT in a docs-only commit after the candidate commit, since a commit cannot contain its own SHA.
+`Covers:` names the source paths a page's result depends on beyond its own file, so `bin/select-pages` selects it and its fingerprint changes when they change.
+A file every page depends on stays out of every `Covers:` line, so it selects every page.
+A live cell keeps the commit, CLI versions and RUN of the consented live run that proved it; no fake-CLI run sets it.
 
 Each feature has five H2 sections.
 They are `Sub-features`, `How to get to it (user POV)`, `Driving it with veyra ctl`, `Observable success`, and `Gotchas`.
