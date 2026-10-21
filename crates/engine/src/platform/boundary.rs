@@ -244,8 +244,8 @@ const PLANNING_ID_ALLOWLIST: &[(&str, &str, &str)] = &[];
 
 fn planning_id_violations(path: &str, source: &str) -> Vec<String> {
     let pattern = regex::Regex::new(concat!(
-        r"(?i)([M][0-8](s[0-9]+)?|SC[0-9]+|SF[0-9]+|wave[ -]?(0|zero)|",
-        r"lane [0-9]+|criterion [0-9]+|veyra-m[0-9](s[0-9]+)?|c[0-9]+)"
+        r"(?i)(M[0-9]+([sr][0-9]+)?|SC[0-9]+|SF[0-9]+|wave[ _-]?(0|zero)|",
+        r"lane[ _-]?[0-9]+|criterion[ _-]?[0-9]+|veyra-m[0-9]+([sr][0-9]+)?|c[0-9]+)"
     ))
     .unwrap();
     source
@@ -330,6 +330,14 @@ fn planning_ids_absent_self_test() {
         ["", "M", "3"],
         ["VERIFY_M", "3", "_NESTED_DUMP_NAMES"],
         ["Wave-", "ZeRo", "-session"],
+        ["lane", "-", "2"],
+        ["lane", "_", "2"],
+        ["wave", "_zero", "_probe"],
+        ["WAVE", "_", "0"],
+        ["criterion", "_", "3"],
+        ["veyra-m", "8", "r1-scratch"],
+        ["VEYRA_M", "9", "_POLISH"],
+        ["M", "123", "r2"],
     ] {
         let planted = parts.concat();
         assert!(
@@ -402,20 +410,21 @@ fn hermetic_violations(path: &str, source: &str) -> Vec<String> {
         return Vec::new();
     }
     let code = blank_source(source, true);
-    let visible_literals = blank_comments(source);
     let calls = regex::Regex::new(
         r"\b(?:ChildEnv\s*::\s*load|Command\s*::\s*new|Engine\s*::\s*(?:start|start_with_processes))\s*\(",
     )
     .unwrap();
     let functions = regex::Regex::new(r"\bfn\s+([A-Za-z_][A-Za-z_0-9]*)\s*\(").unwrap();
     let identifiers = regex::Regex::new(r"\b[A-Za-z_][A-Za-z_0-9]*\b").unwrap();
-    let bindings =
-        regex::Regex::new(r"\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z_0-9]*)\s*(?::[^=;]+)?=").unwrap();
+    let bindings = regex::Regex::new(
+        r"\b(?:let|const|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z_0-9]*)\s*(?::[^=;]+)?=",
+    )
+    .unwrap();
+    let provider_names =
+        crate::provider::ProviderKind::ALL.map(crate::provider::ProviderKind::binary);
     let provider = |text: &str| {
         let text = text.to_ascii_lowercase();
-        ["claude", "codex", "grok"]
-            .iter()
-            .any(|name| text.contains(name))
+        provider_names.iter().any(|name| text.contains(name))
     };
     let literals: Vec<_> = source_spans(source)
         .into_iter()
@@ -425,11 +434,12 @@ fn hermetic_violations(path: &str, source: &str) -> Vec<String> {
         .captures_iter(&code)
         .filter(|binding| {
             let start = binding.get(0).unwrap().end();
-            let value = start + visible_literals[start..].len()
-                - visible_literals[start..].trim_start().len();
-            literals
-                .iter()
-                .any(|span| span.start == value && provider(&source[span.start..span.end]))
+            let end = code[start..]
+                .find(';')
+                .map_or(code.len(), |offset| start + offset);
+            literals.iter().any(|span| {
+                span.start >= start && span.end <= end && provider(&source[span.start..span.end])
+            })
         })
         .map(|binding| binding[1].to_owned())
         .collect();
@@ -452,9 +462,20 @@ fn hermetic_violations(path: &str, source: &str) -> Vec<String> {
                 span.start >= call.end()
                     && span.end <= end
                     && provider(&source[span.start..span.end])
-            }) || identifiers
-                .find_iter(&code[call.end()..end])
-                .any(|name| provider_variables.contains(name.as_str()))
+            }) || identifiers.find_iter(&code[call.end()..end]).any(|name| {
+                let before = code[call.end()..call.end() + name.start()].trim_end();
+                let after = code[call.end() + name.end()..end].trim_start();
+                let field = after.strip_prefix('.').is_some_and(|tail| {
+                    identifiers
+                        .find(tail)
+                        .is_some_and(|field| !tail[field.end()..].trim_start().starts_with('('))
+                });
+                provider_variables.contains(name.as_str())
+                    && !before.ends_with('.')
+                    && !after.starts_with("::")
+                    && !after.starts_with('!')
+                    && !field
+            })
         })
         .filter_map(|call| {
             let function = functions.captures_iter(&code[..call.start()]).last();
@@ -525,6 +546,10 @@ fn tests_stay_hermetic_self_test() {
         "fn ordinary() { Command::new(\"/opt/homebrew/bin/claude\"); }",
         "fn ordinary() { let cli = \"codex\"; Command::new(cli); }",
         "fn ordinary() { let cli = /* marker */ \"grok\"; Command::new(cli); }",
+        "fn ordinary() { const CLI: &str = \"codex\"; Command::new(CLI); }",
+        "fn ordinary() { static CLI: &str = \"claude\"; Command::new(CLI); }",
+        "fn ordinary() { let cli = String::from(\"codex\"); Command::new(cli); }",
+        "fn ordinary() { let cli = PathBuf::from(\"/opt/homebrew/bin/claude\"); Command::new(cli); }",
         "fn ordinary() { Engine::start(path); }",
         "fn ordinary() { Engine::start_with_processes(path, processes); }",
         "fn ordinary() { ChildEnv::load(); }",
@@ -544,6 +569,9 @@ fn tests_stay_hermetic_self_test() {
         r##"fn clean() { let text = r#"ChildEnv::load(); Command::new("codex");"#; }"##,
         r#"fn clean() { let slash = '/'; let quote = '\''; let byte = b'/'; }"#,
         r#"fn clean() { /* nested /* ChildEnv::load(); */ Engine::start(path); */ }"#,
+        r#"fn clean() { let env = "codex"; Command::new(std::env::current_exe()); }"#,
+        r#"fn clean() { let env = "codex"; Command::new(env!("CARGO_BIN_EXE_veyra-fake-cli")); }"#,
+        r#"fn clean() { let env = "codex"; Command::new(env.claude_bin.as_ref().unwrap()); }"#,
     ] {
         assert!(hermetic_violations("engine/tests/clean.rs", source).is_empty());
     }

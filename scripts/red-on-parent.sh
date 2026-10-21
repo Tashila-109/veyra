@@ -76,7 +76,8 @@ def tests(source):
         assert opening >= 0, match[1]
         name = '::'.join((*enclosing_modules(scopes, match.start()), match[1]))
         assert name not in result, 'duplicate test: '+name
-        result[name] = (attributes.start(), closing_brace(hidden, opening))
+        ignored = re.search(r'#\[ignore\b', attributes[0]) is not None
+        result[name] = (attributes.start(), closing_brace(hidden, opening), ignored)
     return result
 
 def module_files(path, prefix=(), crate_root=True, seen=None):
@@ -132,8 +133,8 @@ def copy_test_files(source, root, files):
 
 def changed_tests(before, after):
     previous = tests(before)
-    return sorted(name for name,(start,end) in tests(after).items()
-        if name not in previous or canonical(before[slice(*previous[name])]) != canonical(after[start:end]))
+    return sorted(name for name,(start,end,_) in tests(after).items()
+        if name not in previous or canonical(before[slice(*previous[name][:2])]) != canonical(after[start:end]))
 
 def verdict(test, code, output, expected):
     results = re.findall(r'(?m)^test '+re.escape(test)+r' \.\.\. (ok|FAILED|ignored)\b', output)
@@ -151,10 +152,10 @@ def verdict(test, code, output, expected):
 def isolation_self_test():
     with tempfile.TemporaryDirectory(prefix='veyra-speed-parent-self-test-',dir='/tmp') as folder:
         root = pathlib.Path(folder)
-        package = root/'crates/probe'
+        package = root/'crates/engine'
         (package/'src').mkdir(parents=True)
         (package/'tests').mkdir()
-        (root/'Cargo.toml').write_text('[workspace]\nmembers=["crates/probe"]\nresolver="3"\n')
+        (root/'Cargo.toml').write_text('[workspace]\nmembers=["crates/engine"]\nresolver="3"\n')
         (package/'Cargo.toml').write_text('[package]\nname="parent-probe"\nversion="0.0.0"\nedition="2024"\n')
         (package/'src/lib.rs').write_text('')
         passing = '#[test]\nfn restart() { assert!(true); }\n'
@@ -174,15 +175,14 @@ def isolation_self_test():
             assert not verdict('restart',result.returncode,output,{})[0], case
             print('PASS isolation self-test: '+case+' cannot hide passing target',flush=True)
         source = root/'candidate'
-        fixture = 'crates/probe/tests/fixtures/new.txt'
-        renamed = 'crates/probe/tests/renamed.rs'
+        fixture = 'crates/engine/tests/fixtures/new.txt'
+        renamed = 'crates/engine/tests/renamed.rs'
         (source/fixture).parent.mkdir(parents=True)
         (source/fixture).write_bytes(b'new fixture\n')
         (source/renamed).write_text('mod nested {\n#[test]\nfn restart() { assert_eq!(include_str!("fixtures/new.txt"), "new fixture\\n"); }\n}\n')
         copy_test_files(source,root,[fixture,renamed])
         assert (root/fixture).read_bytes() == b'new fixture\n'
         assert test_file(renamed) and changed_tests('',(source/renamed).read_text()) == ['nested::restart']
-        assert '--no-renames' in diff_command('BASE')
         owner, = cargo_targets(root,{renamed})[renamed]
         result = subprocess.run(cargo_command(*owner[:3],'nested::restart'),cwd=root,capture_output=True,text=True)
         output = result.stdout+result.stderr
@@ -192,7 +192,7 @@ def isolation_self_test():
         (package/'src/lib.rs').write_text('#[cfg(test)]\nmod tests;\n')
         (package/'src/tests').mkdir()
         (package/'src/tests/mod.rs').write_text('mod part;\n')
-        unit = 'crates/probe/src/tests/part.rs'
+        unit = 'crates/engine/src/tests/part.rs'
         (root/unit).write_text(passing)
         owner, = cargo_targets(root,{unit})[unit]
         full_name = '::'.join((*owner[3],'restart'))
@@ -202,6 +202,60 @@ def isolation_self_test():
         assert result.returncode == 0 and 'test tests::part::restart ... ok' in output, output
         assert not verdict(full_name,result.returncode,output,{})[0]
         print('PASS isolation self-test: external unit modules resolve to their fully qualified test name',flush=True)
+        for name in ['stop','awake']:
+            (package/f'src/tests/{name}.rs').write_text('')
+        modules = 'mod part;\nmod stop;\nmod awake;\n'
+        (package/'src/tests/mod.rs').write_text(modules)
+        (root/'scripts').mkdir()
+        shutil.copyfile('scripts/red-on-parent.sh',root/'scripts/red-on-parent.sh')
+        def git(*args):
+            return subprocess.check_output(['git',*args],cwd=root,text=True,stderr=subprocess.STDOUT).strip()
+        git('init','-q')
+        git('config','user.name','Veyra Toy Probe')
+        git('config','user.email','toy@example.invalid')
+        git('config','commit.gpgsign','false')
+        git('add','Cargo.toml','crates','scripts')
+        git('commit','-qm','Seed toy repository')
+        base = git('rev-parse','HEAD')
+        (package/'src/lib.rs').write_text('pub fn new_only_api() {}\n#[cfg(test)]\nmod tests;\n')
+        (package/'src/tests/stop.rs').write_text('#[test] fn review_probe_unit_passes() {}\n')
+        (package/'src/tests/awake.rs').write_text('#[test] fn needs_new_api() { crate::new_only_api(); }\n')
+        result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
+        output = result.stdout+result.stderr
+        assert result.returncode == 1, output
+        assert 'FAIL test passes on parent: tests::stop::review_probe_unit_passes' in output, output
+        assert 'RED target test failed or its Cargo target could not compile: tests::awake::needs_new_api' in output, output
+        print('PASS isolation self-test: shared unit target passing file rejected; new-API sibling independently RED',flush=True)
+        expected = root/'expected.txt'
+        expected.write_text('tests::stop::review_probe_unit_passes planted passing control\n')
+        result = subprocess.run(['bash','scripts/red-on-parent.sh',base,str(expected)],cwd=root,capture_output=True,text=True)
+        assert result.returncode == 0 and 'EXPECTED PASS:' in result.stdout, result.stdout+result.stderr
+        expected.write_text('absent stale control\n')
+        result = subprocess.run(['bash','scripts/red-on-parent.sh',base,str(expected)],cwd=root,capture_output=True,text=True)
+        assert result.returncode != 0 and 'stale expected-pass entries not in diff' in result.stderr, result.stdout+result.stderr
+        print('PASS isolation self-test: listed passing test accepted; stale listed entry rejected',flush=True)
+        (package/'src/lib.rs').write_text('#[cfg(test)]\nmod tests;\n')
+        for name in ['stop','awake']:
+            (package/f'src/tests/{name}.rs').write_text('')
+        destination = 'crates/engine/tests/destination.rs'
+        git('mv',renamed,destination)
+        added = subprocess.check_output(diff_command(base),cwd=root,text=True).splitlines()
+        assert destination in added and renamed not in added, added
+        (root/fixture).write_bytes(b'changed fixture\n')
+        (root/destination).write_text((root/destination).read_text().replace('new fixture','changed fixture'))
+        result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
+        assert result.returncode == 1 and 'test nested::restart ... ok' in result.stdout, result.stdout+result.stderr
+        print('PASS isolation self-test: real git mv destination selected as added; changed fixture copied and used',flush=True)
+        git('mv',destination,renamed)
+        (root/renamed).write_text((root/renamed).read_text().replace('changed fixture','new fixture'))
+        (root/fixture).write_bytes(b'new fixture\n')
+        (package/'src/tests/stop.rs').write_text('#[test]\n#[ignore]\nfn ignored_unit() { crate::new_only_api(); }\n')
+        (package/'tests/live_probe.rs').write_text('#[test]\n#[ignore = "operator only"]\nfn ignored_live() { crate::new_only_api(); }\n')
+        result = subprocess.run(['bash','scripts/red-on-parent.sh',base],cwd=root,capture_output=True,text=True)
+        assert result.returncode == 0, result.stdout+result.stderr
+        assert result.stdout.count('MANUAL RED RECEIPT required: ignored test') == 2, result.stdout
+        assert 'isolated_target=' not in result.stdout, result.stdout
+        print('PASS isolation self-test: ignored unit and live tests require hand-written receipts without compiling or running',flush=True)
 
 
 def diff_command(base):
@@ -255,7 +309,12 @@ selected = []
 for name in files:
     if not name.endswith('.rs'): continue
     old = subprocess.run(['git','show',base+':'+name],capture_output=True,text=True)
-    selected.extend((name,test) for test in changed_tests(old.stdout if old.returncode == 0 else '', pathlib.Path(name).read_text()))
+    after = pathlib.Path(name).read_text()
+    for test in changed_tests(old.stdout if old.returncode == 0 else '', after):
+        if tests(after)[test][2]:
+            print(f'MANUAL RED RECEIPT required: ignored test {name}::{test}',flush=True)
+        else:
+            selected.append((name,test))
 if not selected:
     if expected:
         sys.exit('FAIL stale expected-pass entries not in diff: '+', '.join(sorted(expected)))
@@ -267,26 +326,29 @@ selected = [(name,'::'.join((*prefix,test)),package,kind,target)
 stale = expected.keys() - {test for _,test,*_ in selected}
 if stale:
     sys.exit('FAIL stale expected-pass entries not in diff: '+', '.join(sorted(stale)))
-with tempfile.TemporaryDirectory(prefix='veyra-speed-red-parent-',dir='/tmp') as folder:
-    root = pathlib.Path(folder)
-    archive = root/'base.tar'
-    with archive.open('wb') as output:
-        subprocess.run(['git','archive',base],stdout=output,check=True)
-    with tarfile.open(archive) as source:
-        source.extractall(root,filter='data')
-    archive.unlink()
-    copy_test_files(pathlib.Path.cwd(),root,files)
-    env = os.environ.copy()
-    env['CARGO_TARGET_DIR'] = str(root/'target')
-    failed = False
-    for name,full_name,package,kind,target in selected:
-        print(f'BASE={base} file={name} target={package}/{kind}/{target} test={full_name} isolated_target={env["CARGO_TARGET_DIR"]}',flush=True)
-        result = subprocess.run(cargo_command(package,kind,target,full_name),cwd=root,env=env,capture_output=True,text=True)
-        output = result.stdout+result.stderr
-        ok,message = verdict(full_name,result.returncode,output,expected)
-        print(output,flush=True)
-        print(message,flush=True)
-        failed |= not ok
-    if failed: sys.exit(1)
-print('PASS selected tests were red or explicitly expected to pass; isolated tree removed')
+failed = False
+fixtures = [name for name in files if not name.endswith('.rs')]
+for name in sorted({name for name,*_ in selected}):
+    with tempfile.TemporaryDirectory(prefix='veyra-speed-red-parent-',dir='/tmp') as folder:
+        root = pathlib.Path(folder)
+        archive = root/'base.tar'
+        with archive.open('wb') as output:
+            subprocess.run(['git','archive',base],stdout=output,check=True)
+        with tarfile.open(archive) as source:
+            source.extractall(root,filter='data')
+        archive.unlink()
+        copy_test_files(pathlib.Path.cwd(),root,[name,*fixtures])
+        env = os.environ.copy()
+        env['CARGO_TARGET_DIR'] = str(root/'target')
+        for file,full_name,package,kind,target in selected:
+            if file != name: continue
+            print(f'BASE={base} file={name} target={package}/{kind}/{target} test={full_name} isolated_target={env["CARGO_TARGET_DIR"]}',flush=True)
+            result = subprocess.run(cargo_command(package,kind,target,full_name),cwd=root,env=env,capture_output=True,text=True)
+            output = result.stdout+result.stderr
+            ok,message = verdict(full_name,result.returncode,output,expected)
+            print(output,flush=True)
+            print(message,flush=True)
+            failed |= not ok
+if failed: sys.exit(1)
+print('PASS selected tests were red or explicitly expected to pass; isolated file trees removed')
 PY
