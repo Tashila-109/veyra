@@ -16,42 +16,70 @@ External Accessibility input is not granted here; driver keys prove gpui dispatc
 ## Run
 
 `bin/run --evidence DIR` runs a gated fake-CLI run: every page's sections in map order, then Doctor and Evidence, and Cleanup last whatever failed.
+The pages are the [feature map](features/README.md)'s links in order, then any other `features/*.md` by name, so a new page joins the full run when its file exists.
 It waits in Launch's gate, gives each section a fresh `bash -c` with only `RUN` carried forward, times every section into `DIR/ATTEMPT/sections.json` and hard-links the kept proof to `DIR/ATTEMPT/run` after Cleanup.
-A capture or focus failure with no human input since launch gets a new attempt after 60 seconds, at most three in a row; any other failure, a failed Cleanup or a changed tree ends the run.
+After a failed section it takes one best-effort `failure` capture, unless human input caused the failure or the deadline stopped it; the capture's exit, error or timeout goes to `DIR/ATTEMPT/failure-capture.json`, and Cleanup runs and `DIR/ATTEMPT/attempt.json` is written whatever the capture did.
+A failed attempt is classified by the observation `observe_failure` recorded in `focus-failure.json` during the failed section:
+- A failed Cleanup, scratch left behind or a changed tree ends FAILED, and reaching the deadline ends BLOCKED.
+- With human input since launch, any observed failure gets a new attempt after 60 seconds, not counted.
+- A `capture` failure with no human input gets a new attempt after 60 seconds, and the third such failure in a run ends BLOCKED.
+- A `focus-timeout` failure with no human input, such as a dock-focus regression, and any failure with no observation end FAILED.
+
 `DIR/outcome.json` holds the status, every attempt and the gate wait apart from the recipe time.
 
 ```text
 .agents/skills/verify-veyra/bin/run --evidence DIR                     # every page, the full run
-.agents/skills/verify-veyra/bin/run --evidence DIR --pages $(.agents/skills/verify-veyra/bin/select-pages BASE)
+.agents/skills/verify-veyra/bin/run --evidence DIR --base BASE         # the pages a change from BASE selects
 .agents/skills/verify-veyra/bin/run --evidence DIR --pages multi-agent # one page alone
 .agents/skills/verify-veyra/bin/run --evidence DIR --sections 'SKILL/Doctor' 'multi-agent/Probe smoke measurements'
-.agents/skills/verify-veyra/bin/run --check-only                       # syntax of every block; no launch
+.agents/skills/verify-veyra/bin/run --check-only                       # every block, the map and the gate; no launch
 ```
 
+`--base BASE` runs [Selection](#selection) from BASE to the working tree itself.
+A selection error ends the run with exit 2 before Launch.
+A selection with no fake-CLI token exits 0 without launching and says so, and otherwise the run drives the selected tokens.
 `--pages` takes the tokens `select-pages` prints: `PAGE` for a page's own sections, `PAGE:codex` and `PAGE:grok` for its provider sections, and `release` for app-launch's release check.
-Launch, Doctor, app-launch's first section, Evidence and Cleanup always run; `permission-matrix` is reported and never driven, because it needs a consented live lane.
+Launch, Doctor, app-launch's first section, Evidence and Cleanup always run; a selected `permission-matrix` is reported as due and never driven, because it needs a consented live lane.
 `--sections PAGE/HEADING ...` runs exactly those sections between Launch and Cleanup, as a perf or live plan needs.
 `--real-quiet` makes multi-agent wait for the real ten-minute quiet clock, which a phase gate runs once when `ui/header.rs`, `ui/sidebar.rs` or a `ui/mod.rs` line naming `last_activity`, `quiet_minutes` or `cadence_due` changed.
 `--expect-head SHA` refuses a checkout at another commit, `--deadline EPOCH` bounds the whole run, and `--scratch PREFIX` sets the scratch prefix, `/tmp/veyra-verify-` by default.
 The tree's identity, its HEAD, `git status --short`, the diff's SHA-256 and each untracked file's SHA-256, is saved at the start and checked after Launch's build and after Cleanup.
+`--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, checks that Launch calls `gate()` before its first `start()`, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers.
 
 ## Selection
 
 `bin/select-pages BASE [HEAD]` prints the tokens a change from BASE selects, one per line; without HEAD it reads the working tree, untracked files included.
-A file on the shared list selects every page and provider section: `Cargo.toml`, `Cargo.lock`, `crates/veyra/src/ui/mod.rs`, `crates/engine/src/actor.rs`, and this skill's `SKILL.md` and `bin/`.
-A file on the no-page list selects nothing, because it cannot change the window: test-only files (`crates/*/tests/*.rs`, `crates/*/tests/common/**`, `crates/engine/src/tests/**`, `crates/veyra/src/tests.rs`, `crates/veyra/src/verify_map.rs`, `crates/engine/src/platform/boundary.rs`, `crates/engine/src/provider/scripted.rs`), `ARCHITECTURE.md`, `AGENTS.md`, `clippy.toml`, `scripts/**` and `features/README.md`.
-A page's own feature file selects that page unless only its Status line changed.
-Any other file selects each page whose `Covers:` globs match it; a file no page covers selects every page and provider section.
-Within a matched page, a Codex file (`crates/engine/src/provider/codex.rs`, `crates/engine/src/provider/codex/**`, `crates/engine/tests/fixtures/codex/**`) selects only its Codex section, a Grok file (`crates/engine/src/provider/grok.rs`, `crates/engine/tests/fixtures/grok/**`) only its Grok section, a shared provider file (`crates/engine/src/provider/{mod,session,env,lines,jsonrpc}.rs`, `crates/engine/src/{mcp,tools}.rs`, `crates/veyra/src/relay.rs`) all of its sections, and any other file its own sections.
-`release` follows `crates/veyra/src/control.rs`, `crates/veyra/src/main.rs`, `crates/veyra/build.rs`, a changed line naming `cfg(debug_assertions)` and a changed `[profile` section of `Cargo.toml`; a phase gate runs it too.
-`permission-matrix` follows only its own file and its `Covers:` globs; the shared list and uncovered files leave the live grid to its own rule.
+`bin/pages.py` reads its lists from this block, so the block is their one owner:
 
-`bin/fresh-pages HEAD [--versions FILE]` prints `PAGE STATE` for each page whose Status FINGERPRINT still equals the page's fingerprint at HEAD and which `select-pages COMMIT HEAD` does not select, so a shared or uncovered change since the Status COMMIT also makes it stale.
-With `--versions`, a file of `provider: version` lines, it also prints `permission-matrix/PROVIDER STATE` for each live row whose CLI version, read from the page's first `Claude N`, `Codex N` or `Grok N` mention, appears on that provider's line.
+```text
+shared    Cargo.toml Cargo.lock crates/veyra/src/ui/mod.rs crates/engine/src/actor.rs
+          .agents/skills/verify-veyra/SKILL.md .agents/skills/verify-veyra/bin/**
+no-page   crates/*/tests/*.rs crates/*/tests/common/** crates/engine/src/tests/** crates/veyra/src/tests.rs
+          crates/veyra/src/verify_map.rs crates/engine/src/platform/boundary.rs crates/engine/src/provider/scripted.rs
+          ARCHITECTURE.md AGENTS.md clippy.toml scripts/** .agents/skills/verify-veyra/features/README.md
+codex     crates/engine/src/provider/codex.rs crates/engine/src/provider/codex/** crates/engine/tests/fixtures/codex/**
+grok      crates/engine/src/provider/grok.rs crates/engine/tests/fixtures/grok/**
+provider  crates/engine/src/provider/mod.rs crates/engine/src/provider/session.rs crates/engine/src/provider/env.rs
+          crates/engine/src/provider/lines.rs crates/engine/src/provider/jsonrpc.rs crates/engine/src/mcp.rs
+          crates/engine/src/tools.rs crates/veyra/src/relay.rs
+release   crates/veyra/src/control.rs crates/veyra/src/main.rs crates/veyra/build.rs
+```
+
+A `shared` file selects every page and provider section, `permission-matrix` included.
+A `no-page` file selects nothing, because it cannot change the window: test-only files, `ARCHITECTURE.md`, `AGENTS.md`, `clippy.toml`, `scripts/` and the feature index.
+A page's own feature file selects that page unless only its Status line changed.
+Any other file selects each page whose `Covers:` globs match it, and a file no page covers selects every page and provider section, `permission-matrix` included.
+Within a matched page, a `codex` file selects only its Codex section, a `grok` file only its Grok section, a `provider` file all of its sections, and any other file its own sections.
+`release` follows the `release` files, a changed line naming `cfg(debug_assertions)` and a changed `[profile` section of `Cargo.toml`; a phase gate runs it too.
+A selected `permission-matrix` says its live grid is due; driving it still needs a consented live lane.
+
+`bin/fresh-pages HEAD [--versions FILE]` prints `PAGE STATE` for each page whose Status FINGERPRINT still equals the page's fingerprint at HEAD and which `select-pages COMMIT HEAD` does not select, so a shared or uncovered change since the Status COMMIT makes every page stale, the live rows included.
+With `--versions`, a file of `provider: version` lines, it also prints `permission-matrix/PROVIDER STATE` for each live row whose version token, read from the page's first `Claude`, `Codex` or `Grok` mention, equals a whole version token on that provider's line.
+A version token is the dotted number with any `-prerelease` and `+build` suffix, and no digit or dot may touch either end, so `0.162.1-alpha.1` does not match `0.162.1` and `0.9` does not match `0.9.1`.
 `bin/fresh-pages --print COMMIT` prints each page's fingerprint at COMMIT, for the Status line.
 A FINGERPRINT is the SHA-256 over `BLOB PATH` lines, sorted by path, for the files `git ls-tree -r COMMIT` lists under the page's `Covers:` globs, plus the page's own file, whose blob id is computed without its Status line.
 So a docs-only status commit leaves every fingerprint as it was.
-`python3 .agents/skills/verify-veyra/bin/pages.py self-test` checks every selection rule and the fingerprint in a scratch repository.
+`python3 .agents/skills/verify-veyra/bin/pages.py self-test` checks every selection rule, the fingerprint and the version match in a scratch repository.
 
 ## Launch
 
@@ -476,3 +504,5 @@ Update the matching feature page when actions, commands or dump fields change.
 Each page's line under its title is `Status: STATE, DATE, COMMIT, MISSING, FINGERPRINT`, and a `Covers:` line of path globs follows it.
 Set them from the gated run that proved the page, in a docs-only change after the candidate commit, with FINGERPRINT from `bin/fresh-pages --print COMMIT`.
 Name in `Covers:` each source path whose change could change the page's result, and leave a file every page depends on uncovered, so it selects every page.
+A new page joins the full run as soon as its file exists; link it in [the feature map](features/README.md) to place it in map order.
+`bin/run` names app-launch's `Driving it with veyra ctl` and `Release check` and multi-agent's `Probe smoke measurements`, so renaming one fails `--check-only` until `bin/run` follows.

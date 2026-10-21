@@ -9,17 +9,26 @@
 import hashlib, os, pathlib, re, shutil, subprocess, sys, tempfile
 
 SKILL = '.agents/skills/verify-veyra'
-SHARED = ['Cargo.toml','Cargo.lock','crates/veyra/src/ui/mod.rs','crates/engine/src/actor.rs',
-    SKILL+'/SKILL.md',SKILL+'/bin/**']
-NO_PAGE = ['crates/*/tests/*.rs','crates/*/tests/common/**','crates/engine/src/tests/**','crates/veyra/src/tests.rs',
-    'crates/veyra/src/verify_map.rs','crates/engine/src/platform/boundary.rs','crates/engine/src/provider/scripted.rs',
-    'ARCHITECTURE.md','AGENTS.md','clippy.toml','scripts/**',SKILL+'/features/README.md']
-CODEX = ['crates/engine/src/provider/codex.rs','crates/engine/src/provider/codex/**','crates/engine/tests/fixtures/codex/**']
-GROK = ['crates/engine/src/provider/grok.rs','crates/engine/tests/fixtures/grok/**']
-PROVIDER_SHARED = [f'crates/engine/src/provider/{name}.rs' for name in ['mod','session','env','lines','jsonrpc']]+[
-    'crates/engine/src/mcp.rs','crates/engine/src/tools.rs','crates/veyra/src/relay.rs']
-RELEASE = ['crates/veyra/src/control.rs','crates/veyra/src/main.rs','crates/veyra/build.rs']
 LIVE = {'permission-matrix'}
+
+def rule_lists(text):
+    """The glob lists of SKILL.md's Selection block, their one owner; an indented row continues the list above it."""
+    section = re.search(r'^## Selection\n(.*?)(?=^## |\Z)',text,re.S|re.M)
+    block = re.search(r'^```text\n(.*?)^```',section[1] if section else '',re.S|re.M)
+    assert block, 'SKILL.md has no Selection block of glob lists'
+    lists, name = {}, None
+    for row in block[1].splitlines():
+        if row[:1].isspace() and name: lists[name] += row.split()
+        elif row.strip(): name,*globs = row.split(); lists[name] = globs
+    missing = {'shared','no-page','codex','grok','provider','release'}-set(lists)
+    assert not missing, 'Selection block lacks '+', '.join(sorted(missing))
+    return lists
+
+LISTS = rule_lists((pathlib.Path(__file__).resolve().parent.parent/'SKILL.md').read_text())
+SHARED, NO_PAGE, CODEX, GROK, PROVIDER_SHARED, RELEASE = (LISTS[name] for name in
+    ['shared','no-page','codex','grok','provider','release'])
+SUFFIX = r'[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*'
+VERSION = r'(?<![\d.])\d+(?:\.\d+)+(?:-'+SUFFIX+r')?(?:\+'+SUFFIX+r')?(?![\d+-]|\.\d)'
 SECTIONS = {'codex':re.compile(r'^### Codex$',re.M),'grok':re.compile(r'^### Grok$',re.M)}
 
 def git(repo, *args, data=False):
@@ -88,8 +97,7 @@ def release_change(repo, base, head, files):
 def select(repo, base, head=None):
     files = changed(repo,base,head)
     texts = pages(repo,head)
-    fake = [name for name in texts if name not in LIVE]
-    every = {name for name in fake}|{f'{name}:{kind}' for name in fake for kind,heading in SECTIONS.items()
+    every = set(texts)|{f'{name}:{kind}' for name in texts if name not in LIVE for kind,heading in SECTIONS.items()
         if heading.search(texts[name])}
     chosen = set()
     def page(name, kinds):
@@ -105,7 +113,7 @@ def select(repo, base, head=None):
                 page(own[1],['main','codex','grok'])
             continue
         hits = [page_name for page_name,text in texts.items() if matches(name,covers(text))]
-        if not [hit for hit in hits if hit not in LIVE]: chosen |= every
+        if not hits: chosen |= every
         kinds = (['codex'] if matches(name,CODEX) else ['grok'] if matches(name,GROK)
             else ['main','codex','grok'] if matches(name,PROVIDER_SHARED) else ['main'])
         for hit in hits: page(hit,['main'] if hit in LIVE else kinds)
@@ -142,10 +150,14 @@ def fresh(repo, head, versions=None):
         if versions is None: continue
         known = dict(row.split(':',1) for row in pathlib.Path(versions).read_text().splitlines() if ':' in row)
         for provider in ['Claude','Codex','Grok']:
-            cell = re.search(provider+r' (\d+(?:\.\d+)+)',text)
-            if cell and re.search(r'\b'+re.escape(cell[1])+r'\b',known.get(provider.lower(),'')):
+            cell = re.search(provider+' ('+VERSION+')',text)
+            if cell and cell[1] in versions_in(known.get(provider.lower(),'')):
                 rows.append(f'{name}/{provider.lower()} {status[0]}')
     return rows
+
+def versions_in(text):
+    """Every whole version token on a line: a dotted number with its -prerelease and +build suffixes."""
+    return {match[0] for match in re.finditer(VERSION,text)}
 
 def self_test():
     root = pathlib.Path(tempfile.mkdtemp(prefix='veyra-pages-'))
@@ -173,7 +185,7 @@ def self_test():
         page('permission-matrix','passed, 2026-01-01, abc1234, live cells with Claude 2.1.0, Codex 0.9.0',
             'crates/engine/src/provider/**','\n### Codex preserved live evidence\n')
         base = commit('base')
-        every = ['alpha','alpha:codex','beta']
+        every = ['alpha','alpha:codex','beta','permission-matrix']
         def case(label, change, expected):
             change()
             head = commit(label)
@@ -211,19 +223,26 @@ def self_test():
         write('src/alpha.rs','two\n')
         assert fingerprint(root,commit('uncovered by beta'),'beta') == fingerprint(root,moved,'beta')
         live = fingerprint(root,moved,'permission-matrix')
-        page('permission-matrix','passed, 2026-01-01, '+moved[:7]+', live cells with Claude 2.1.0, Codex 0.9.0, '+live,
-            'crates/engine/src/provider/**','\n### Codex preserved live evidence\n')
+        page('permission-matrix','passed, 2026-01-01, '+moved[:7]+', live cells with Claude 2.1.0, Codex 0.9, '
+            'Grok 1.0.62-beta.2, '+live,'crates/engine/src/provider/**','\n### Codex preserved live evidence\n')
         stamped = commit('live fingerprint')
-        versions = root/'versions.txt'
-        versions.write_text('claude: 2.1.0 (Claude Code)\ncodex: codex-cli 0.9.1\n')
-        rows = fresh(root,stamped,versions)
-        assert 'permission-matrix/claude passed' in rows and 'permission-matrix/codex passed' not in rows, rows
+        versions = root/'.git'/'versions.txt'
+        same = 'claude: 2.1.0 (Claude Code)\ncodex: codex-cli 0.9\ngrok: grok 1.0.62-beta.2 (abc123) [stable]\n'
+        def live_rows(head, lines):
+            versions.write_text(lines)
+            return [row for row in fresh(root,head,versions) if row.startswith('permission-matrix')]
+        assert live_rows(stamped,same) == ['permission-matrix/claude passed','permission-matrix/codex passed',
+            'permission-matrix/grok passed'], live_rows(stamped,same)
+        assert live_rows(stamped,'claude: 2.1.0-alpha.1\ncodex: codex-cli 0.9.1\ngrok: grok 1.0.62\n') == [], \
+            'a prerelease, a longer version or a dropped suffix kept a live row fresh'
         assert not [row for row in fresh(root,stamped) if row.startswith('permission-matrix')]
+        write('Cargo.lock','two\n')
+        assert live_rows(commit('shared change'),same) == [], 'a shared change kept the live rows fresh'
     finally:
         shutil.rmtree(root)
-    print('PASS select-pages: one page, shared, uncovered, no-page, Status-only, own page, provider, release and '
-        'working tree; fingerprint: Status-blind, covered change, uncovered change; fresh: pages, a selecting '
-        'change since COMMIT and live versions')
+    print('PASS select-pages: one page, shared and uncovered with the live page, no-page, Status-only, own page, '
+        'provider, release and working tree; fingerprint: Status-blind, covered change, uncovered change; fresh: '
+        'pages, a selecting change since COMMIT, a shared change for the live rows and whole version tokens')
 
 def main(argv):
     repo = pathlib.Path(__file__).resolve().parents[4]

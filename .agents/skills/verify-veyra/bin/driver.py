@@ -255,6 +255,37 @@ def gate():
         'failure':None}
     save('input-idle-launch',clock)
     save('focus-failure',clock)
+def gate_self_test():
+    """Drive gate() on a virtual clock with stubbed idle, lock and pgrep readers; each bound and reader must hold it."""
+    global input_idle_seconds, locked, veyra_pids, time
+    readers = input_idle_seconds, locked, veyra_pids, time
+    class Clock:
+        now = 0.0
+        def monotonic(self): return self.now
+        def time(self): return 1e9+self.now
+        def sleep(self, seconds): self.now += seconds
+    def released(idle=200, lock=False, busy_until=-1.0):
+        """The virtual second gate() let the launch go, or None when it held until the two-minute deadline."""
+        global input_idle_seconds, locked, veyra_pids, time
+        clock = time = Clock()
+        input_idle_seconds, locked = (lambda: idle), (lambda: lock)
+        veyra_pids = lambda: {1} if clock.now < busy_until else set()
+        os.environ['VEYRA_VERIFY_DEADLINE'] = str(1e9+120)
+        try: gate()
+        except AssertionError as error:
+            assert 'deadline' in str(error), error
+            return None
+        return clock.now
+    try:
+        assert released(idle=119) is None, 'gate() released at 119 s of idle'
+        assert released(idle=9001) is None, 'gate() released at 9,001 s of idle'
+        assert released(lock=True) is None, 'gate() released while the screen was locked'
+        for idle in [120,9000]:
+            assert 10 <= (released(idle=idle) or -1) < 11, f'gate() did not release 10 s into {idle} s of idle'
+        assert 29 <= (released(busy_until=20) or -1) < 31, 'gate() did not wait 10 s after the last running veyra'
+    finally:
+        input_idle_seconds, locked, veyra_pids, time = readers
+    print('PASS gate() holds below 120 s and above 9,000 s of idle, while locked, and until 10 s after the last veyra')
 def observe_failure(step, kind):
     """Record whether human input came after launch, so a supervisor retries only a failure no person caused."""
     path = PROOF/'input-idle-launch.json'

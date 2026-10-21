@@ -3,23 +3,30 @@
 
 See SKILL.md, section Run, for the options and the retry rule.
 """
-import argparse, hashlib, json, os, pathlib, re, shutil, signal, subprocess, sys, time
+import argparse, ast, hashlib, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time
 
 SKILL = pathlib.Path(__file__).resolve().parent.parent
 REPO = SKILL.parent.parent.parent
-PAGES = ['app-launch','new-thread','chat-send-stream','settings','approvals-questions','stop-interrupt',
-    'restart-recovery','multi-agent','chat-terminal-switch']
+sys.path.insert(0,str(SKILL/'bin'))
+sys.dont_write_bytecode = True
+import pages
 PROVIDERS = {'Codex':'codex','Grok':'grok'}
+FIRST = ('app-launch','Driving it with veyra ctl')
 RELEASE = ('app-launch','Release check')
 PERF_ONLY = {('multi-agent','Probe smoke measurements')}
-LIVE_PAGES = {'permission-matrix'}
-SCREEN = ['owned window is covered','owned window is off-screen','outside the active displays',
-    'CGSSessionScreenIsLocked','focused timed out','focus-key timed out']
+LIVE_PAGES = pages.LIVE
+HEREDOC = re.compile(r"<<'(?P<end>PY[A-Z_]*)'\n(?P<body>.*?)\n(?P=end)(?:\n|$)",re.S)
+
+def page_names():
+    """The feature map's page links in order, then any other features/*.md by name, so no page is left out."""
+    linked = re.findall(r'^\[[^]]+\]\(([a-z0-9-]+)\.md\)',(SKILL/'features/README.md').read_text(),re.M)
+    files = sorted(path.stem for path in (SKILL/'features').glob('*.md') if path.name != 'README.md')
+    return [name for name in dict.fromkeys(linked) if name in files]+[name for name in files if name not in linked]
 
 def sections():
     """Map (page, heading) to its one sh block, in file order, for SKILL.md and every page."""
     found = {}
-    for path in [SKILL/'SKILL.md',*(SKILL/'features'/(name+'.md') for name in PAGES)]:
+    for path in [SKILL/'SKILL.md',*(SKILL/'features'/(name+'.md') for name in page_names())]:
         source = path.read_text()
         headings = list(re.finditer(r'^##+ (.+)$',source,re.M))
         for index,heading in enumerate(headings):
@@ -29,35 +36,86 @@ def sections():
             if blocks: found[(path.stem,heading[1])] = blocks[0]
     return found
 
-def guard_text(found):
-    """The gates and guards the runner relies on must still be in the committed text."""
-    cleanup, launch = found[('SKILL','Cleanup')], found[('SKILL','Launch')]
-    for needle in ['assert not other_markers','retry_exiting=True','time.monotonic()-started >= 30']:
-        assert needle in cleanup, 'Cleanup lost its drain guard: '+needle
-    assert 'gate()' in launch, 'Launch lost its gate'
-    driver = (SKILL/'bin/driver.py').read_text()
-    for needle in ['120 <= idle <= 9000','time.monotonic()-quiet >= 10','not locked()','foreign_veyra()',
-            "'stale screenshot after state change: '","fail(\"owned window is covered"]:
-        assert needle in driver+(SKILL/'bin/capture-window.swift').read_text(), 'guard missing: '+needle
+def check_map(found):
+    """The plan's fixed sections must exist, so a renamed heading fails loudly instead of dropping its step."""
+    for key in [('SKILL','Launch'),('SKILL','Doctor'),('SKILL','Evidence'),('SKILL','Cleanup'),FIRST,RELEASE,
+            *sorted(PERF_ONLY)]:
+        assert key in found, 'no section '+'/'.join(key)+'; rename it in bin/run too'
 
-def plan_for(found, tokens, explicit):
-    if explicit:
-        steps = [tuple(item.split('/',1)) for item in explicit]
-        for step in steps: assert step in found, step
-        return [('SKILL','Launch'),*steps]
-    selected = None if tokens is None else set(tokens)
-    plan = [('SKILL','Launch'),('SKILL','Doctor')]
-    for page in PAGES:
-        for key in [key for key in found if key[0] == page]:
-            if key in PERF_ONLY: continue
-            if key == RELEASE: wanted = selected is None or 'release' in selected
-            elif key[1] in PROVIDERS: wanted = selected is None or page+':'+PROVIDERS[key[1]] in selected
-            elif key == ('app-launch','Driving it with veyra ctl'): wanted = True
-            else: wanted = selected is None or page in selected
-            if wanted:
-                if key == RELEASE: plan.append(('SKILL','Doctor'))
-                plan.append(key)
-    return plan+[('SKILL','Doctor'),('SKILL','Evidence')]
+def launch_gates(found):
+    """Launch's Python calls gate() as a top-level statement before the first statement that calls start()."""
+    def calls(node, name):
+        return any(isinstance(item,ast.Call) and isinstance(item.func,ast.Name) and item.func.id == name
+            for item in ast.walk(node))
+    for match in HEREDOC.finditer(found[('SKILL','Launch')]):
+        body = ast.parse(match['body']).body
+        starts = [index for index,node in enumerate(body) if calls(node,'start')]
+        if not starts: continue
+        gates = [node for node in body[:starts[0]] if isinstance(node,ast.Expr) and isinstance(node.value,ast.Call)
+            and isinstance(node.value.func,ast.Name) and node.value.func.id == 'gate']
+        assert gates, 'Launch calls start() without first calling gate()'
+        return
+    raise AssertionError('Launch never calls start()')
+
+def gate_check():
+    """Run driver.gate_self_test() in a scratch checkout, because the driver reads a run's records at import."""
+    root = pathlib.Path(tempfile.mkdtemp(prefix='veyra-gate-',dir='/tmp'))
+    try:
+        (root/'crates/veyra').mkdir(parents=True)
+        (root/'crates/veyra/Cargo.toml').write_text('')
+        (root/'target/verify-veyra/gatecheck').mkdir(parents=True)
+        (root/'target/verify-veyra/gatecheck/lane').write_text('live\n')
+        result = subprocess.run([sys.executable,'-c','import driver; driver.gate_self_test()'],cwd=root,
+            capture_output=True,text=True,env=dict(os.environ,RUN='gatecheck',PYTHONPATH=str(SKILL/'bin'),
+            PYTHONDONTWRITEBYTECODE='1',VEYRA_VERIFY_TMP=str(root)+'/data-'))
+        assert result.returncode == 0, 'gate self-test failed:\n'+result.stdout+result.stderr
+        return result.stdout.strip()
+    finally:
+        shutil.rmtree(root)
+
+def verdict(record, counted, late=False):
+    """The run's status after one attempt, or None for another; counted is the capture failures so far, and late
+    means the deadline is under a minute away."""
+    failed, seen = record['failed'], record.get('observed') or {}
+    if not failed and record['cleanup_exit'] == 0 and record['identity_unchanged']: return 'DONE',counted
+    if record.get('cleanup_exit') not in (0,None) or record.get('scratch_left'):
+        return 'FAILED: Cleanup did not pass',counted
+    if not record['identity_unchanged']: return 'FAILED: the tree changed during the run',counted
+    if failed.get('deadline') or late: return 'BLOCKED: wall-time limit',counted
+    if seen.get('human_input'): return None,counted
+    if seen.get('kind') == 'capture':
+        if counted+1 >= 3: return 'BLOCKED: a third capture failure with no human input',counted+1
+        return None,counted+1
+    cause = ' at '+seen['kind'] if seen.get('kind') else ''
+    return 'FAILED: '+failed['section']+' failed'+cause+' with no human input',counted
+
+def verdict_check():
+    done = {'failed':None,'cleanup_exit':0,'identity_unchanged':True}
+    bad = dict(done,failed={'section':'page/section','exit':1,'deadline':False})
+    def seen(kind, human): return dict(bad,observed={'failure':'step','kind':kind,'human_input':human})
+    cases = [(done,0,'DONE'),(dict(bad,cleanup_exit=1),0,'FAILED: Cleanup'),(dict(bad,scratch_left=['x']),0,'FAILED'),
+        (dict(bad,identity_unchanged=False),0,'FAILED: the tree'),
+        (dict(bad,failed=dict(bad['failed'],deadline=True)),0,'BLOCKED'),(dict(bad,late=True),0,'BLOCKED'),
+        (seen('focus-timeout',True),5,None),(seen('capture',True),5,None),(seen('capture',False),1,None),
+        (seen('capture',False),2,'BLOCKED'),(seen('focus-timeout',False),0,'FAILED'),(bad,0,'FAILED')]
+    for record,counted,expected in cases:
+        status,_ = verdict(record,counted,record.get('late',False))
+        assert (status is None) if expected is None else (status or '').startswith(expected),(record,counted,status)
+
+def checks(found):
+    """Everything --check-only proves; a run repeats it before Launch."""
+    blocks = 0
+    for key,block in found.items():
+        subprocess.run(['bash','-n'],input=block,text=True,check=True)
+        for match in HEREDOC.finditer(block):
+            compile(match['body'],'/'.join(key),'exec')
+            blocks += 1
+    compile((SKILL/'bin/driver.py').read_text(),'bin/driver.py','exec')
+    check_map(found)
+    launch_gates(found)
+    verdict_check()
+    return (f'{len(found)} shell blocks and {blocks} Python heredocs compile across {len(page_names())} pages; '
+        'the fixed sections exist; Launch calls gate() before start(); the retry rule holds; '+gate_check())
 
 def identity():
     status = subprocess.check_output(['git','status','--short','--untracked-files=all'],cwd=REPO,text=True)
@@ -67,16 +125,62 @@ def identity():
         'diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff','HEAD'],cwd=REPO)).hexdigest(),
         'untracked_sha256':untracked}
 
-def check_only(found):
-    checked = 0
-    for key,block in found.items():
-        subprocess.run(['bash','-n'],input=block,text=True,check=True)
-        for match in re.finditer(r"<<'(?P<end>PY[A-Z_]*)'\n(?P<body>.*?)\n(?P=end)(?:\n|$)",block,re.S):
-            compile(match['body'],'/'.join(key),'exec')
-            checked += 1
-    compile((SKILL/'bin/driver.py').read_text(),'bin/driver.py','exec')
-    guard_text(found)
-    print(f'PASS {len(found)} shell blocks and {checked} Python heredocs compile; gate, capture and Cleanup guards present; no launch')
+def plan_for(found, tokens, explicit):
+    if explicit:
+        steps = [tuple(item.split('/',1)) for item in explicit]
+        for step in steps: assert step in found, step
+        return [('SKILL','Launch'),*steps]
+    selected = None if tokens is None else set(tokens)
+    plan = [('SKILL','Launch'),('SKILL','Doctor')]
+    for page in page_names():
+        if page in LIVE_PAGES: continue
+        for key in [key for key in found if key[0] == page]:
+            if key in PERF_ONLY: continue
+            if key == RELEASE: wanted = selected is None or 'release' in selected
+            elif key[1] in PROVIDERS: wanted = selected is None or page+':'+PROVIDERS[key[1]] in selected
+            elif key == FIRST: wanted = True
+            else: wanted = selected is None or page in selected
+            if wanted:
+                if key == RELEASE: plan.append(('SKILL','Doctor'))
+                plan.append(key)
+    return plan+[('SKILL','Doctor'),('SKILL','Evidence')]
+
+def failure_capture(env, out):
+    """One best-effort screenshot of the failed state; its timeout or error is recorded and never stops Cleanup."""
+    process = None
+    try:
+        process = subprocess.Popen(['python3','-c',"from driver import *; capture('failure')"],cwd=REPO,
+            env=dict(env,PYTHONPATH=str(SKILL/'bin')),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,
+            start_new_session=True)
+        output,_ = process.communicate(timeout=60)
+        result = {'exit':process.returncode,'output':output[-4000:]}
+    except Exception as error:
+        result = {'error':f'{type(error).__name__}: {error}'}
+        if process is not None and process.poll() is None:
+            try: os.killpg(process.pid,signal.SIGKILL)
+            except ProcessLookupError: pass
+            process.wait()
+    (out/'failure-capture.json').write_text(json.dumps(result,indent=2)+'\n')
+    return result
+
+def finish(env, out, run, failed, failed_start, execute):
+    """Capture the failure if one is owed, run Cleanup whatever the capture did, then keep the proof."""
+    proof = REPO/'target/verify-veyra'/run
+    try: clock = json.loads((proof/'focus-failure.json').read_text())
+    except (OSError,ValueError): clock = {}
+    observed = clock if failed and clock.get('failure') and clock.get('failure_epoch',0) >= failed_start else None
+    scratch = env['VEYRA_VERIFY_TMP']+run
+    if (proof/'pid').exists():
+        if failed and not (observed or {}).get('human_input') and not failed['deadline']: failure_capture(env,out)
+        cleanup,_ = execute(('SKILL','Cleanup'))
+    else:
+        # Launch stopped before starting an app, so no process exists; only the scratch folder remains.
+        assert scratch.startswith('/tmp/veyra-')
+        shutil.rmtree(scratch,ignore_errors=True)
+        cleanup = 0
+    shutil.copytree(proof,out/'run',copy_function=os.link)
+    left = [path for path in [scratch,scratch+'-rel'] if os.path.exists(path)]
+    return {'cleanup_exit':(cleanup or 1) if left else cleanup,'scratch_left':left,'focus':clock,'observed':observed}
 
 def attempt(found, plan, out, env, deadline, expected):
     """One Launch through Cleanup. Returns (exit, record)."""
@@ -116,51 +220,35 @@ def attempt(found, plan, out, env, deadline, expected):
         if code: print('\n'.join(line[:300] for line in (stdout+stderr).splitlines()[-12:]),flush=True)
         return code,stdout+stderr
     try:
-        for index,key in enumerate(plan):
+        for key in plan:
             code,text = execute(key)
             run = env.get('RUN')
             if key == ('SKILL','Launch') and not code and identity() != expected:
-                failed = {'section':'tree identity after Launch','exit':None,'screen':False,'deadline':False}
+                failed = {'section':'tree identity after Launch','exit':None,'deadline':False}
                 break
             if code:
-                failed = {'section':'/'.join(key),'exit':code,'screen':any(s in text for s in SCREEN),
-                    'deadline':'Wall-time limit reached' in text}
+                failed = {'section':'/'.join(key),'exit':code,'deadline':'Wall-time limit reached' in text}
                 break
     finally:
-        cleanup = None
+        record = {'run':run,'failed':failed,'cleanup_exit':None}
         if run:
-            proof = REPO/'target/verify-veyra'/run
-            receipt = proof/'focus-failure.json'
-            clock = json.loads(receipt.read_text()) if receipt.exists() else {}
-            scratch = env['VEYRA_VERIFY_TMP']+run
-            if (proof/'pid').exists():
-                if failed and not clock.get('human_input') and not failed['deadline']:
-                    subprocess.run(['python3','-c',"from driver import *; capture('failure')"],cwd=REPO,
-                        env=dict(env,PYTHONPATH=str(SKILL/'bin')),timeout=60,capture_output=True)
-                cleanup,_ = execute(('SKILL','Cleanup'))
-            else:
-                # Launch stopped before starting an app, so no process exists; only the scratch folder remains.
-                assert scratch.startswith('/tmp/veyra-')
-                shutil.rmtree(scratch,ignore_errors=True)
-                cleanup = 0
-            shutil.copytree(proof,out/'run',copy_function=os.link)
-            left = [path for path in [scratch,scratch+'-rel'] if os.path.exists(path)]
-            if left: cleanup = cleanup or 1
-            record = {'run':run,'failed':failed,'cleanup_exit':cleanup,'scratch_left':left,'focus':clock}
+            try: record.update(finish(env,out,run,failed,timings[-1]['start_epoch'] if timings else 0,execute))
+            except Exception as error:
+                record.update(cleanup_exit=1,finish_error=f'{type(error).__name__}: {error}')
         else:
-            record = {'run':None,'failed':failed or {'section':'SKILL/Launch','exit':None},'cleanup_exit':None}
-    record['identity_unchanged'] = identity() == expected
-    record['recipe_seconds'] = sum(row['seconds'] for row in timings)
-    gate = REPO/'target/verify-veyra'/str(run)/'input-idle-launch.json'
-    if run and gate.exists():
-        record['gate_wait_seconds'] = json.loads(gate.read_text())['gate_seconds']
-    (out/'attempt.json').write_text(json.dumps(record,indent=2)+'\n')
-    ok = not failed and cleanup == 0 and record['identity_unchanged']
+            record['failed'] = failed or {'section':'SKILL/Launch','exit':None,'deadline':False}
+        record['identity_unchanged'] = identity() == expected
+        record['recipe_seconds'] = sum(row['seconds'] for row in timings)
+        gate = REPO/'target/verify-veyra'/str(run)/'input-idle-launch.json'
+        if run and gate.exists(): record['gate_wait_seconds'] = json.loads(gate.read_text())['gate_seconds']
+        (out/'attempt.json').write_text(json.dumps(record,indent=2)+'\n')
+    ok = not record['failed'] and record['cleanup_exit'] == 0 and record['identity_unchanged']
     return (0 if ok else 1),record
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--evidence',type=pathlib.Path)
+    parser.add_argument('--base')
     parser.add_argument('--pages',nargs='*')
     parser.add_argument('--sections',nargs='*')
     parser.add_argument('--real-quiet',action='store_true')
@@ -170,15 +258,29 @@ def main():
     parser.add_argument('--check-only',action='store_true')
     args = parser.parse_args()
     found = sections()
-    if args.check_only: return check_only(found)
+    proven = checks(found)
+    if args.check_only:
+        print('PASS '+proven+'; no launch')
+        return 0
+    if args.base is not None:
+        assert args.pages is None and args.sections is None, '--base replaces --pages and --sections'
+        try: args.pages = pages.select(REPO,args.base)
+        except subprocess.CalledProcessError as error:
+            print('selection from '+args.base+' failed, so nothing ran: '+error.stderr.decode().strip(),file=sys.stderr)
+            return 2
+        print('selected since '+args.base+': '+(' '.join(args.pages) or 'nothing'),flush=True)
+        if not set(args.pages)-LIVE_PAGES:
+            for token in sorted(set(args.pages)&LIVE_PAGES):
+                print(token+' is due and needs a consented live lane; a fake-CLI run does not drive it',flush=True)
+            print('no fake-CLI page is selected since '+args.base+', so nothing launched',flush=True)
+            return 0
     assert args.evidence, 'pass --evidence DIR'
     assert args.scratch.startswith('/tmp/veyra-'), 'scratch must start with /tmp/veyra-'
-    guard_text(found)
     if args.pages is not None:
         for token in args.pages:
-            assert token == 'release' or token.split(':')[0] in PAGES+sorted(LIVE_PAGES), token
-        for token in sorted(set(args.pages) & LIVE_PAGES):
-            print(token+' needs a consented live lane; this fake-CLI run does not drive it',flush=True)
+            assert token == 'release' or token.split(':')[0] in page_names(), token
+        for token in sorted(set(args.pages)&LIVE_PAGES):
+            print(token+' is due and needs a consented live lane; this fake-CLI run does not drive it',flush=True)
     plan = plan_for(found,args.pages,args.sections)
     expected = identity()
     if args.expect_head: assert expected['head'] == args.expect_head, 'checkout is not at '+args.expect_head
@@ -191,23 +293,14 @@ def main():
         VEYRA_VERIFY_TMP=args.scratch,VEYRA_VERIFY_DEADLINE=str(args.deadline))
     if args.real_quiet: env['VEYRA_VERIFY_REAL_QUIET'] = '1'
     if shutil.which('sccache'): env['RUSTC_WRAPPER'] = 'sccache'
-    attempts, consecutive, status = [], 0, None
+    attempts, counted, status = [], 0, None
     while status is None:
         label = f'attempt-{len(attempts)+1}'
-        code,record = attempt(found,plan,args.evidence/label,dict(env),args.deadline,expected)
+        _,record = attempt(found,plan,args.evidence/label,dict(env),args.deadline,expected)
         record['label'] = label
         attempts.append(record)
-        failed = record['failed']
-        if code == 0: status = 'DONE'
-        elif record.get('cleanup_exit') not in (0,None) or record.get('scratch_left'): status = 'FAILED: Cleanup did not pass'
-        elif not record['identity_unchanged']: status = 'FAILED: the tree changed during the run'
-        elif failed['deadline'] or time.time() >= args.deadline-60: status = 'BLOCKED: wall-time limit'
-        elif not failed['screen'] and not (record.get('focus') or {}).get('human_input'):
-            status = 'FAILED: '+failed['section']+' failed with no screen cause; assertions kept'
-        else:
-            if not (record.get('focus') or {}).get('human_input'): consecutive += 1
-            if consecutive >= 3: status = 'BLOCKED: three focus or capture failures in a row with no human input'
-            else: time.sleep(min(60,max(0,args.deadline-time.time())))
+        status,counted = verdict(record,counted,time.time() >= args.deadline-60)
+        if status is None: time.sleep(min(60,max(0,args.deadline-time.time())))
     outcome = {'status':status,'plan':['/'.join(key) for key in plan],'attempts':attempts,
         'finished_epoch':time.time()}
     (args.evidence/'outcome.json').write_text(json.dumps(outcome,indent=2)+'\n')
