@@ -483,7 +483,10 @@ def main():
     except Interrupted: pass
     if receipt_error(args.evidence/'outcome.json',{'status':status,'plan':['/'.join(key) for key in plan],
             'attempts':attempts,'finished_epoch':time.time()}): lost.append('outcome.json')
-    final = 'FAILED: '+' and '.join(lost)+' not kept, so the run cannot be DONE' if lost else status
+    late = pending()
+    final = status
+    if late: final = f'FAILED: interrupted by {late[0]} after the verdict; the receipts keep {status}'
+    if lost: final = 'FAILED: '+' and '.join(lost)+' not kept, so the run cannot be DONE'
     print(final,'evidence='+str(args.evidence),flush=True)
     # The last check comes after the final line, so a signal while it is written also counts.
     late = pending()

@@ -42,8 +42,8 @@ After the verdict, `DIR/ATTEMPT/attempt.json` is written once, with the verdict,
 Between attempts, the 60-second wait is unblocked, and a signal there ends the run FAILED.
 After the last attempt, `DIR/outcome.json` is written once, with the status, every attempt and the gate wait apart from the recipe time, and read back.
 A receipt that fails to write or read back ends the run FAILED with exit 1, and its error goes to stderr, because the receipt that would hold it was not kept.
-The runner prints the final line, then checks once more for pending signals.
-A signal still pending at that check, which arrived after the verdict while the receipts or the final line were written, cannot be recorded in the receipts, so it ends the run with exit 128 plus its number and the reason on stderr.
+The runner checks for pending signals before it prints the final line, which then says FAILED (interrupted), and once more after it.
+A signal still pending at the last check, which arrived after the verdict while the receipts or the final line were written, cannot be recorded in the receipts, so it ends the run with exit 128 plus its number and the reason on stderr.
 The run exits 0 only when the verdict was DONE, both receipts were written and read back, and no signal was pending at that last check.
 
 ```text
@@ -405,8 +405,9 @@ Do not count native typing, pointer dragging, IME or a manual theme change as dr
 
 ## Cleanup
 
-Read `live_pgid` and `live_pid` first, before quitting or removing anything; a missing `veyra.db` or `threads` table leaves both lists empty, and a read that fails is recorded as unreadable.
-Quit the app and stop its saved group, then send SIGTERM to the saved provider groups and SIGKILL one second later, and SIGKILL the saved app group again, so a member that outlived its leader is stopped too.
+Read `live_pgid` and `live_pid` into memory first, before quitting or removing anything; a missing `veyra.db` or `threads` table leaves both lists empty, and a read that fails is marked unreadable.
+A proof write that fails is marked too, and Cleanup still makes every stop.
+Quit the app and SIGKILL its group, then SIGTERM the provider groups and SIGKILL them one second later, so a member that outlived its leader is stopped too.
 Signal only groups saved in this run's database and the app group this run started.
 The leftover checks retry for five seconds and fail only for saved run-owned pids or groups.
 Other processes carrying the parent marker are allowed up to thirty seconds to drain; any remaining marker then fails Cleanup, regardless of its group, with counts and pids only.
@@ -418,7 +419,7 @@ ESRCH or an empty argument block after either sysctl read means the process is g
 EINVAL or an incomplete block from a still-listed process keeps it in the leftover count and retries within the same five-second window.
 During Cleanup, EIO also keeps a still-listed process in the count for another read within the five-second owned-leftover window or the thirty-second other-marker drain; an unreadable process remaining at that window's deadline fails with its pid.
 The startup marker check still refuses EIO immediately.
-A failed database read, group check or marker check leaves DATA for diagnosis.
+A failed database read, proof write, group check or marker check leaves DATA for diagnosis.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -430,19 +431,20 @@ case "$DATA" in /tmp/veyra-*) ;; *) exit 1 ;; esac
 PID=$(<"$PROOF/pid")
 PGID=$(<"$PROOF/pgid")
 test "$PID" = "$PGID"
-: >"$PROOF/provider-groups.txt"
-: >"$PROOF/provider-pids.txt"
+groups=
+pids=
 tables=none
 if test -f "$DATA/veyra.db"; then
     tables=$(sqlite3 "$DATA/veyra.db" "select count(*) from sqlite_master where type='table' and name='threads'") ||
         tables=unreadable
 fi
 if test "$tables" = 1; then
-    sqlite3 "$DATA/veyra.db" 'select live_pgid from threads where live_pgid is not null' >"$PROOF/provider-groups.txt" ||
-        tables=unreadable
-    sqlite3 "$DATA/veyra.db" 'select live_pid from threads where live_pid is not null' >"$PROOF/provider-pids.txt" ||
-        tables=unreadable
+    groups=$(sqlite3 "$DATA/veyra.db" 'select live_pgid from threads where live_pgid is not null') || tables=unreadable
+    pids=$(sqlite3 "$DATA/veyra.db" 'select live_pid from threads where live_pid is not null') || tables=unreadable
 fi
+written=yes
+printf '%s\n' "$groups" >"$PROOF/provider-groups.txt" || written=no
+printf '%s\n' "$pids" >"$PROOF/provider-pids.txt" || written=no
 if kill -0 "$PID" 2>/dev/null; then
     test "$(ps -o pgid= -p "$PID" | tr -d ' ')" = "$PGID"
     VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl quit >"$PROOF/quit.json" 2>"$PROOF/quit.stderr" || true
@@ -457,20 +459,16 @@ for attempt in $(seq 1 50); do
     sleep .1
 done
 ! kill -0 "$PID" 2>/dev/null
-test ! -f "$DATA/logs/veyra.log" || cp "$DATA/logs/veyra.log" "$PROOF/veyra.log"
+test ! -f "$DATA/logs/veyra.log" || cp "$DATA/logs/veyra.log" "$PROOF/veyra.log" || written=no
 kill -KILL -- "-$PGID" 2>/dev/null || true
-while read -r group; do
-    test -z "$group" || kill -TERM -- "-$group" 2>/dev/null || true
-done <"$PROOF/provider-groups.txt"
+for group in $groups; do kill -TERM -- "-$group" 2>/dev/null || true; done
 sleep 1
-while read -r group; do
-    test -z "$group" || kill -KILL -- "-$group" 2>/dev/null || true
-done <"$PROOF/provider-groups.txt"
-PYTHONPATH=.agents/skills/verify-veyra/bin python3 - "$PROOF" <<'PY'
+for group in $groups; do kill -KILL -- "-$group" 2>/dev/null || true; done
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - "$PROOF" "$groups" "$pids" <<'PY'
 import ctypes, errno, json, os, pathlib, struct, subprocess, sys, time
 proof = pathlib.Path(sys.argv[1])
 parents = {int(pid) for pid in (proof/'owned-app-pids').read_text().split()}
-groups = {int(group) for group in (proof/'provider-groups.txt').read_text().split()}
+groups = {int(group) for group in sys.argv[2].split()}
 def groups_gone():
     remaining = []
     for group in groups:
@@ -479,7 +477,7 @@ def groups_gone():
         remaining.append(group)
     return remaining
 from driver import marked_processes, saved_marked_processes
-pids = parents | {int(pid) for pid in (proof/'provider-pids.txt').read_text().split()}
+pids = parents | {int(pid) for pid in sys.argv[3].split()}
 end = time.monotonic()+5
 while True:
     remaining_groups = groups_gone()
@@ -503,6 +501,7 @@ assert not other_markers, f'{len(other_markers)} marked processes remain after t
 print('PASS saved owned pids, provider groups and marker check; other marker drain seconds='+str(round(time.monotonic()-started,3)))
 PY
 test "$tables" != unreadable
+test "$written" = yes
 test "$DATA" = "${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN"
 rm -rf "$DATA"
 test ! -e "$DATA"
@@ -512,7 +511,7 @@ printf 'PASS cleanup PID=%s gone DATA=%s removed PROOF=%s kept\n' "$PID" "$DATA"
 
 Cleanup leaves `target/verify-veyra/$RUN` intact.
 An app interrupted before its database exists is still stopped, and DATA is removed.
-An unreadable database still lets Cleanup stop the app and every saved group; Cleanup then fails before it removes DATA, which stays for diagnosis.
+An unreadable database still lets Cleanup stop the app and its group; provider groups it cannot read are left to the marker check.
 Never kill by name.
 
 ### Gotchas
