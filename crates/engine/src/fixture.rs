@@ -71,10 +71,12 @@ fn run_tui() -> io::Result<i32> {
     crate::platform::raw_terminal_input()?;
     let mut output = std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout().lock());
     let mut job = None;
+    let mut paste_record = false;
     if let Some(path) = std::env::var_os("VEYRA_FAKE_FIXTURE") {
         for record in load(Path::new(&path))? {
             match record {
                 Record::TranscriptStart { scenario, .. } => {
+                    paste_record |= scenario == "shell-paste-record";
                     if scenario == "shell-background-job" {
                         job = Some(crate::platform::shell_fixture_job()?);
                     }
@@ -107,7 +109,24 @@ fn run_tui() -> io::Result<i32> {
     output.flush()?;
     let mut input = std::io::stdin().lock();
     let mut bytes = [0; 1];
+    let mut paste = Vec::new();
     while input.read(&mut bytes)? != 0 {
+        if paste_record {
+            if paste.len() == 4096 {
+                return Err(io::Error::other("Paste fixture input exceeded its bound"));
+            }
+            paste.push(bytes[0]);
+            if paste.ends_with(b"\x1b[201~") {
+                write!(output, "PASTE:")?;
+                for byte in &paste {
+                    write!(output, "{byte:02x}")?;
+                }
+                output.write_all(b"\r\n")?;
+                output.flush()?;
+                paste.clear();
+            }
+            continue;
+        }
         if bytes[0] == 3 {
             drop(job.take());
         }

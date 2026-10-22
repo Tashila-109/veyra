@@ -88,15 +88,34 @@ for name,key,expected in [('return','enter',['0d']),('control','ctrl-c',['03']),
     poll('drawer-byte-'+name+'-echo',lambda d:[line.strip() for line in d['drawer']['terminal']['grid']
         if re.fullmatch('[0-9a-f]{2}',line.strip())][-len(expected):] == expected)
 assert ctl('drawer-live-return-pid','dump')['drawer']['tabs'][0]['pid']==first_pid
-clipboard = subprocess.check_output(['pbpaste'])
+paste_records = [dict(type='transcript_start',provider='shell',protocol='terminal',cli_version='fixture',
+    scenario='shell-paste-record',source='scripted'),dict(type='emit_raw',base64='G1s/MjAwNGg=')]
+link_fixture('drawer.jsonl',fixture_source(paste_records))
+drawer_keys('drawer-paste-tab','cmd-t','drawer','drawer')
+remember(poll('drawer-paste-ready',lambda d:'VEYRA_TUI_READY' in ''.join(d['drawer']['terminal']['grid'])))
+pasteboard_helper = PROOF/'pasteboard'
+subprocess.run(['swiftc','-O','.agents/skills/verify-veyra/bin/pasteboard.swift','-o',str(pasteboard_helper)],check=True)
+pasteboard = subprocess.Popen([str(pasteboard_helper),'--plant'],stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+save('drawer-pasteboard-helper',{'pid':pasteboard.pid,'pgid':pasteboard.pid})
 try:
-    subprocess.run(['pbcopy'],input=b'Q\x1b[201~\x1b[200~\0\x03\x07',check=True)
+    ready = json.loads(pasteboard.stdout.readline())
+    assert ready['phase']=='ready', ready
     drawer_keys('drawer-paste','cmd-v','drawer','drawer')
-    expected = [f'{byte:02x}' for byte in b'\x1b[200~Q[201~[200~\x1b[201~']
-    poll('drawer-paste-echo',lambda d:[line.strip() for line in d['drawer']['terminal']['grid']
-        if re.fullmatch('[0-9a-f]{2}',line.strip())][-len(expected):] == expected)
+    expected = b'\x1b[200~Q[201~[200~\x1b[201~'.hex()
+    poll('drawer-paste-echo',lambda d:''.join(line.strip() for line in d['drawer']['terminal']['grid'])
+        .split('PASTE:')[1:] == [expected])
     capture('drawer-paste')
-finally: subprocess.run(['pbcopy'],input=clipboard,check=True)
+finally:
+    pasteboard.stdin.close()
+    pasteboard.stdin = None
+    output, error = pasteboard.communicate(timeout=10)
+    restored = json.loads(output)
+    save('drawer-pasteboard-restored',restored)
+    assert pasteboard.returncode==0 and restored['phase']=='restored' and restored['matches'], restored
+    assert restored['original_restored'] and restored['before']==restored['after'], restored
+drawer_keys('drawer-paste-close','cmd-w','drawer','drawer')
+drawer_fixture()
 save('drawer-keys',ctl('drawer-key-state','dump'))
 drawer_keys('drawer-hide','cmd-j','drawer','composer',draft='',caret=0)
 ctl('drawer-draft-text','text','keep this draft')
@@ -265,7 +284,7 @@ PY
 
 `drawer` reports open, height, active_tab, tab pids, running process paths and exit codes; its nested terminal reports grid, focused, columns and rows.
 `focus` and `composer_caret` accompany every key receipt.
-The native recipe checks exact fake byte echoes, both close decisions, independent thread state, a same-tab restart, missing-folder refusal, archive confirmation, orderly shutdown and crash hangup.
+The paste fixture records all received bytes as one compact hexadecimal record, so all 23 bracketed-paste bytes are checked exactly and in order at layout sizing, including a nine-row drawer. No grid override is needed. The native recipe checks exact fake byte echoes, both close decisions, independent thread state, a same-tab restart, missing-folder refusal, archive confirmation, orderly shutdown and crash hangup.
 `drawer-hidden.json` checks that hidden output adds no terminal frame_requests or repaints, then verifies the parsed text on show. The global window counter includes composer caret blinks and is not a terminal wake counter.
 `drawer-flood.json` includes the active grid and `perf.flood` fields pty_bytes, elapsed_ms, repaints, median_repaint_gap_ms and max_repaint_gap_ms.
 Read the drawer, resize, paste, header, close-sheet, ended-tab, restarted-tab, missing-folder, archive, quit-sheet and flood PNGs at original size.
@@ -273,6 +292,6 @@ Read the drawer, resize, paste, header, close-sheet, ended-tab, restarted-tab, m
 ## Gotchas
 
 Native pointer delivery, selection dragging and IME are not established by the control driver. Window tests cover the click focus and emulator selection wiring; IME remains unsupported.
-The temporary clipboard value is restored from memory without logging or retaining the user's original clipboard.
+The pasteboard helper snapshots every item and every declared type into memory before staging the fixture text. It runs in its own session and restores on pipe EOF, including when the driving process exits. It refuses an incomplete or changing snapshot before touching the board. The planted check uses two items containing PNG, binary, rich text and plain text; only their types and hashes are recorded. The original clipboard's contents and hashes are never logged or stored.
 The shell fixture's background-job scenario starts only an owned sleep child; Control-C ends it, and normal group hangup reaches it.
 The shell and terminal paths never launch an installed agent CLI. Never replace the owned fixture with the human's shell during verification.
