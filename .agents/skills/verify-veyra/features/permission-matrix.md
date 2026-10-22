@@ -1,6 +1,6 @@
 # Provider permission matrix
 
-Status: passed, 2026-10-20, 2b45067, all nine cells from live RUN 8d22e59d
+Status: passed, 2026-10-20, 2b45067, all nine cells from live RUN 8d22e59d, fe52f31d89a0e9f01636e4541ddb297e6129b3fb7623b36687d66a58a225e012
 Covers: crates/engine/src/provider/** crates/engine/src/mcp.rs crates/engine/src/tools.rs
 
 ## Sub-features

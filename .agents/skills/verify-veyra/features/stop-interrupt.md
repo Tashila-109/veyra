@@ -1,6 +1,6 @@
 # Stop and interrupt
 
-Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Status: passed, 2026-10-22, d27c4e4, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 4ce1e41a), 325deb48cdae6886e778d2ede2fafb1e5629aa162e60189b7c476cc141ad67ff
 Covers: crates/veyra/src/ui/notify.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
 
 ## Sub-features

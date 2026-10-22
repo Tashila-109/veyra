@@ -1,6 +1,6 @@
 # Chat send and stream
 
-Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Status: passed, 2026-10-22, d27c4e4, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 4ce1e41a), 815e9972ecf4615f91daa594f8f422da9d07b129c9d7364c80d24634bd5b4b37
 Covers: crates/veyra/src/ui/provider_text.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
 
 ## Sub-features

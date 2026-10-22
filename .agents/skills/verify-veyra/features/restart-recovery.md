@@ -1,6 +1,6 @@
 # Restart and recovery
 
-Status: passed, 2026-10-20, 2b45067, live RUN 8d22e59d (fake branch: full run RUN 0e84dcd9 at 098d054)
+Status: passed, 2026-10-22, d27c4e4, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 4ce1e41a), ed2066614f61c9ca4873440466224c551f1b35985d191bd2e51912dd47d2d6d1
 Covers: crates/engine/src/data_dir.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/veyra/src/relay.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
 
 ## Sub-features
