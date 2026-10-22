@@ -2311,6 +2311,7 @@ fn shell_snapshot_case(test: &str, failing: bool, check: fn(bool)) {
 fn check_child_env_snapshot(failing: bool) {
     let env = ChildEnv::load();
     let result = Runtime::new().unwrap().block_on(async {
+        let env = env.wait_for_login_path().await;
         env.command(
             Path::new("/bin/sh"),
             &[

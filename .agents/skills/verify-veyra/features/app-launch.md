@@ -6,7 +6,7 @@ Covers: crates/engine/src/data_dir.rs crates/veyra/src/ui/new_thread.rs
 ## Sub-features
 
 - `launch-window`: one native window, Geist, sidebar, header and upper-third new-thread composer.
-- `launch-ready`: exact ready line with this run's pid and data folder.
+- `launch-ready`: exact ready line with this run's pid and data folder while `login_path` is still `pending` in the fake lane.
 - `launch-identity`: live pid, build revision, data folder, schema_version and system appearance.
 - `launch-database`: migration 3, WAL, eight tables and Full access default.
 - `launch-recovery`: the project written before the schema-2 relaunch survives it in the same database; [restart-recovery](restart-recovery.md) checks the quit and crash relaunches.
@@ -43,6 +43,12 @@ PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 pid = identity()
 dump = ctl('dump-before','dump')
+launch = json.loads((PROOF/'launch-login-path.json').read_text())
+assert launch['pid'] == pid and launch['data_dir'] == str(DATA)
+assert f'veyra ready pid={pid} data_dir={DATA}' in (PROOF/'launch.stderr').read_text()
+if LANE == 'fake':
+    assert launch['login_path'] == 'pending'
+assert dump['login_path'] in ['pending','loaded','fallback']
 assert dump['sidebar']['width'] == 240 and dump['sidebar']['rows'] == []
 assert dump['notice'] is None and dump['view'] == 'new_thread'
 capture('window-launch')

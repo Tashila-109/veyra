@@ -178,6 +178,7 @@ impl Engine {
         env: provider::env::ChildEnv,
     ) -> Result<Self, StartError> {
         let lock = data.lock()?;
+        env.start_login_path();
         platform::private_file(
             &data.path().join("veyra.db"),
             OpenOptions::new()
@@ -315,6 +316,10 @@ impl Engine {
         env.groups = self.inner.groups.clone();
         env.catalog = self.inner.state.catalog.clone();
         env
+    }
+    #[cfg(debug_assertions)]
+    pub fn login_path_status(&self) -> &'static str {
+        self.inner.environment.login_path_status()
     }
     pub fn set_terminal_colors(&self, colors: terminal::Colors) {
         *self.inner.state.terminal_colors.lock().unwrap() = colors;

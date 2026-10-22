@@ -121,6 +121,7 @@ Its preflight and Cleanup share an in-memory marker reader and report counts onl
 Both lanes remove the caller's Claude session variables while keeping `CLAUDE_CODE_USE_*` user configuration.
 The fake lane puts a run-owned `git` first on the app's PATH; it answers `git branch --show-current` with `fixture-branch` only while `$DATA/branch-on` exists, and otherwise runs the real `git`.
 Every app launch runs from `$DATA/appcwd`; probes run in Veyra's private data folder.
+The fake lane uses an owned login-shell script with a 1.5 s delay, so the first ready line and dump prove the window opens while `login_path` is `pending`.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -148,7 +149,16 @@ RUN="$RUN" PYTHONPATH="$BIN" python3 - <<'PY'
 from driver import *
 gate()
 if LANE == 'fake': make_git_shim()
+if LANE == 'fake':
+    shell = DATA/'login-shell'
+    shell.write_text('#!/bin/sh\n/bin/sleep 1.5\nexec /bin/sh "$@"\n')
+    shell.chmod(0o700)
+    ENV['SHELL'] = str(shell)
 pid = start('launch')
+pending = ctl('launch-login-path','dump')
+assert pending['login_path'] in ['pending','loaded','fallback']
+if LANE == 'fake': assert pending['login_path'] == 'pending', pending['login_path']
+assert f'veyra ready pid={pid} data_dir={DATA}' in (PROOF/'launch.stderr').read_text()
 print(f"PASS launch RUN={RUN} PID={pid} PGID={(PROOF/'pgid').read_text().strip()} ID={(PROOF/'window-id').read_text().strip()}")
 PY
 ```
@@ -188,6 +198,7 @@ expected = 'dark' if style.returncode == 0 and style.stdout.strip().lower() == '
 assert dump['appearance'] == expected, (dump['appearance'],expected)
 window = window_id(pid)
 assert window == (PROOF/'window-id').read_text().strip()
+poll('doctor-login-path',lambda d:d['login_path'] != 'pending')
 bounds = subprocess.check_output(['swift','.agents/skills/verify-veyra/bin/winid.swift',str(pid),'--bounds'],text=True)
 (PROOF/'bounds.txt').write_text(bounds)
 print(f'PASS doctor pid={pid} appearance={expected} seconds={seconds:.3f} window={window}')
@@ -200,6 +211,7 @@ Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.
 Also run [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
 Run each page's Codex and Grok sections in the fake lane after its existing drive.
 Every section after new-thread's first starts with the driver's `prepare()`, which adds the project, installs the fake CLI and waits for Ready only when no earlier page did, then opens a new Claude composer, so a page can run alone after Launch, Doctor and app-launch's first section, or after any earlier section without a relaunch.
+Before any provider drive, wait with `poll('login-path-ready', lambda d: d['login_path'] != 'pending')`; Doctor performs this wait for the first launch. After a relaunch, wait again before checking providers. `login_path` reads `pending`, `loaded` or `fallback`; Checking remains until the first probe answers.
 Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
 Run [chat-terminal-switch](features/chat-terminal-switch.md) for the fake TUI, recovery import and one flood.
 The fake lane runs those pages without a provider login.
@@ -226,7 +238,7 @@ A timeout does not cancel an enqueued action; run Doctor before retrying.
 Commands remain bounded at 64 KiB; the client accepts replies up to 4 MiB so the seeded 5,000-item transcript can be measured without truncating its dump.
 After another Send on an existing thread, gate `wait Done` on the new turn row or a changed status so the preceding Done cannot satisfy it.
 
-The read-only dump reports `terminal`, `view_refusal`, `tasks`, `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
+The read-only dump reports `login_path`, `terminal`, `view_refusal`, `tasks`, `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
 `header_branch` is the branch text used by the header and is empty after leaving Chat.
 `view` is `new_thread`, `chat`, `terminal`, `failed_thread` or `settings`.
 `veyra::SwitchView` toggles the selected thread through the window-level ⌘⇧V binding; its optional terminal boolean selects Chat or Terminal.
@@ -526,6 +538,7 @@ It does not signal an unrecorded group.
 - `bin/run` is the gated runner described in [Run](#run).
 - `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
 - `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.
+- `bin/backdrop.swift` draws its own black and white stripes and sharp text across every display, using one borderless window per screen in one process. `--coarse` uses approximately 400 pt blocks and 160 pt text to reveal soft gradients and blurred letters through a translucent window; `--invert` swaps black and white to distinguish backdrop-dependent blur from a flat fill, and combines with `--coarse`. It prints each window number and screen frame, then one ready line, and SIGTERM to its own pid closes every window.
 - `bin/select-pages`, `bin/fresh-pages` and `bin/pages.py` are described in [Selection](#selection).
 
 A socket path permits 103 usable bytes; keep RUN and the scratch prefix short.

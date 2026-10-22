@@ -26,7 +26,7 @@ pub fn login_shell_path() -> io::Result<(std::ffi::OsString, Option<std::ffi::Os
     let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
     bounded_shell_path(&shell, std::time::Duration::from_secs(2))
 }
-fn bounded_shell_path(
+pub(crate) fn bounded_shell_path(
     shell: &std::ffi::OsStr,
     bound: std::time::Duration,
 ) -> io::Result<(std::ffi::OsString, Option<std::ffi::OsString>)> {

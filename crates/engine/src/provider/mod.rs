@@ -121,6 +121,9 @@ pub enum SessionEvent {
     BackgroundWork {
         pending: bool,
     },
+    ResolutionFailed {
+        error: String,
+    },
     Exited {
         crash: Option<String>,
     },

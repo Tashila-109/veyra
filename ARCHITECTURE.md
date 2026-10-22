@@ -82,17 +82,17 @@ Debug builds validate the longer `control.sock` path; release builds validate `v
 File-backed Engine startup binds veyra.sock in both builds; command-path, private-folder, stale-config removal and bind failures refuse startup.
 Before binding, mcp::remove_stale_configs removes stale mcp.json files in UUID-named run folders, including configs left by a crash; a sweep error refuses startup.
 
-`Engine::start` loads the production provider environment, then locks the folder, opens `veyra.db` through a private 0600 file, migrates, reaps stored orphan groups, reconciles stored work and consumes the storage recovery receipt, removes stale run configs, binds veyra.sock, then starts the actor on a dedicated `std::thread`.
+`Engine::start` creates the production provider environment without waiting for its login shell, then locks the folder, starts the shared PATH loader thread, opens `veyra.db` through a private 0600 file, migrates, reaps stored orphan groups, reconciles stored work and consumes the storage recovery receipt, removes stale run configs, binds veyra.sock, then starts the actor on a dedicated `std::thread`.
 The actor keeps the lock file alive.
 `Engine::start_with_env` accepts a prepared environment for isolated tests; the handle retains its resolution policy without owning another MCP server reference.
 Ordinary unit-test `ChildEnv::load` calls and explicit isolated integration/window test environments never search for installed provider binaries.
 `ChildEnv::isolated` starts with no provider paths, and `with_binary` adds only an explicit fake or missing path in either build profile.
 Ignored live tests use the production loader.
 The production loader keeps its login-shell PATH, debug overrides and unrestricted release reaper behavior.
-The login-shell environment read runs synchronously before the window in its own process group.
+The login-shell environment read runs on one dedicated thread in its own process group, after the instance lock, without delaying the window or its first-frame ready line.
 One bounded shell command returns PATH and __MISE_DIFF separated by a NUL byte.
 ChildEnv retains a non-empty shell __MISE_DIFF beside that PATH; when the shell omits it, the production child environment still inherits any application __MISE_DIFF.
-`platform::login_shell_path` uses a private bounded helper whose two-second deadline covers shell exit and stdout EOF.
+`platform::login_shell_path` uses a bounded helper whose two-second deadline covers shell exit and stdout EOF.
 Cleanup kills only the shell's group; an escaped descendant keeping the pipe open cannot extend the deadline.
 `ChildEnv` logs the error and falls back to inherited PATH and __MISE_DIFF together.
 `veyra.lock` is mode 0600 and its exclusive-lock retry lasts four seconds.
@@ -220,7 +220,7 @@ The send-to-reply path is ordered as follows.
 2. The Spawn effect starts the session on its own process group.
 While the thread is still Starting, an exit before Ready fails the oldest queued turn.
 A session that started adds a Stopped hold only if another turn remains queued, preserving any earlier hold; without queued work it adds no hold.
-A failed spawn with no session retains the Stopped hold.
+A failed spawn with no session retains the Stopped hold. An asynchronous binary-resolution failure reports ResolutionFailed and retains the same hold while Starting; provider crashes and sign-out still follow the ordinary Exited rule.
 3. Claude publishes Ready on a matched initialize reply or system/init; Codex publishes it on a successful thread/start or thread/resume reply, with the returned thread id and cliVersion, after any not-found fallback or active-writer retry.
 Grok publishes Ready on a successful session/new, session/resume or session/load reply with its native session id and initialize version.
 Ready changes Starting to Structured.
@@ -366,11 +366,12 @@ Its `Cli` variant sends Claude, Codex and Grok adapters to `session::spawn_provi
 `Spawner::terminal` starts the PTY worker with the provider, native conversation, thread cwd, configuration and current epoch.
 Scripted sessions exist only in engine tests and start no OS process.
 
-`ChildEnv` shares one login-shell PATH and optional non-empty __MISE_DIFF snapshot, with both inherited values as fallback after a failed shell.
-A successful shell with no __MISE_DIFF supplies no override, so ambient children can retain an inherited value.
+`ChildEnv` shares one asynchronously filled login-shell PATH and optional non-empty __MISE_DIFF cell, with both inherited values as fallback after a failed shell or loader-thread creation.
+A successful shell with no __MISE_DIFF retains the application-inherited value in the cell.
 Explicit isolated environments strip inherited __MISE_DIFF, CLAUDE_CODE_AUTO_CONNECT_IDE and ENABLE_CLAUDEAI_MCP_SERVERS unless the caller supplies them explicitly.
-It retains the shell failure and reports it on load, including UI readiness loads after the app installs tracing.
-Engine::start initializes it on the startup caller before launching the actor, so session dispatch never runs a blocking login shell on the actor.
+The loader logs shell failure and fills the fallback once; later readiness checks reuse that cell.
+Engine::start starts the loader immediately after the instance lock. Session tasks and all three probe tasks await the cell before resolving a binary, so neither the actor nor the main thread waits for the shell. Check again and Retry use the same wait.
+The picker stays Checking until a probe answers, a session awaiting PATH stays Starting, and the debug dump's login_path reports pending, loaded or fallback.
 Resolution tries absolute entries from inherited PATH, that snapshot, then `KNOWN_BIN_DIRS`, returning a canonical absolute executable path.
 Relative and empty search entries are ignored.
 Known home-relative folders include .grok/bin, so a Finder launch can resolve Grok without that directory in either PATH.

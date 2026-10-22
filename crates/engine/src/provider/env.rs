@@ -14,31 +14,77 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Once},
 };
 use tokio::process::Command;
 
 pub(crate) type Groups = Arc<Mutex<std::collections::BTreeSet<u32>>>;
 
-#[cfg(not(test))]
+#[derive(Clone, Debug)]
 struct LoginPath {
     path: OsString,
     mise_diff: Option<OsString>,
-    failure: Option<std::io::Error>,
+    fallback: bool,
+}
+
+#[derive(Debug)]
+struct LoginPathCell {
+    started: Once,
+    value: tokio::sync::watch::Sender<Option<LoginPath>>,
+    inherited: LoginPath,
+    #[cfg(test)]
+    shell: Option<OsString>,
+}
+impl LoginPathCell {
+    fn new() -> Self {
+        Self {
+            started: Once::new(),
+            value: tokio::sync::watch::channel(None).0,
+            inherited: LoginPath {
+                path: std::env::var_os("PATH").unwrap_or_default(),
+                mise_diff: std::env::var_os("__MISE_DIFF"),
+                fallback: true,
+            },
+            #[cfg(test)]
+            shell: None,
+        }
+    }
+    fn start(self: &Arc<Self>) {
+        self.started.call_once(|| {
+            let cell = self.clone();
+            let result = std::thread::Builder::new()
+                .name("veyra-login-path".into())
+                .spawn(move || {
+                    #[cfg(test)]
+                    let result = if let Some(shell) = &cell.shell {
+                        platform::bounded_shell_path(shell, std::time::Duration::from_secs(2))
+                    } else {
+                        platform::login_shell_path()
+                    };
+                    #[cfg(not(test))]
+                    let result = platform::login_shell_path();
+                    let value = match result {
+                        Ok((path, mise_diff)) => LoginPath {
+                            path,
+                            mise_diff: mise_diff.or_else(|| cell.inherited.mise_diff.clone()),
+                            fallback: false,
+                        },
+                        Err(error) => {
+                            tracing::warn!(%error, "login shell PATH unavailable; using inherited PATH");
+                            cell.inherited.clone()
+                        }
+                    };
+                    cell.value.send_replace(Some(value));
+                });
+            if let Err(error) = result {
+                tracing::warn!(%error, "login shell thread unavailable; using inherited PATH");
+                self.value.send_replace(Some(self.inherited.clone()));
+            }
+        });
+    }
 }
 #[cfg(not(test))]
-static LOGIN_PATH: LazyLock<LoginPath> = LazyLock::new(|| match platform::login_shell_path() {
-    Ok((path, mise_diff)) => LoginPath {
-        path,
-        mise_diff,
-        failure: None,
-    },
-    Err(error) => LoginPath {
-        path: std::env::var_os("PATH").unwrap_or_default(),
-        mise_diff: std::env::var_os("__MISE_DIFF"),
-        failure: Some(error),
-    },
-});
+static LOGIN_PATH: LazyLock<Arc<LoginPathCell>> = LazyLock::new(|| Arc::new(LoginPathCell::new()));
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -69,6 +115,7 @@ pub struct ChildEnv {
     #[cfg(test)]
     pub(crate) close_before_user_write: Arc<AtomicBool>,
     resolution: Resolution,
+    login_path: Option<Arc<LoginPathCell>>,
     variables: std::collections::BTreeMap<OsString, OsString>,
     pub path: OsString,
     pub home: Option<PathBuf>,
@@ -95,17 +142,10 @@ impl ChildEnv {
         }
         #[cfg(not(test))]
         {
-            if let Some(error) = &LOGIN_PATH.failure {
-                tracing::warn!(%error, "login shell PATH unavailable; using inherited PATH");
-            }
             let mut env = Self::isolated();
             env.resolution = Resolution::Ambient;
+            env.login_path = Some(LOGIN_PATH.clone());
             env.reaper_pids = None;
-            env.path = LOGIN_PATH.path.clone();
-            if let Some(mise_diff) = &LOGIN_PATH.mise_diff {
-                env.variables
-                    .insert("__MISE_DIFF".into(), mise_diff.clone());
-            }
             env.home = std::env::var_os("HOME").map(PathBuf::from);
             if let Some(root) = std::env::var_os("CLAUDE_CONFIG_DIR") {
                 env.variables.insert("CLAUDE_CONFIG_DIR".into(), root);
@@ -141,6 +181,7 @@ impl ChildEnv {
             #[cfg(test)]
             close_before_user_write: Default::default(),
             resolution: Resolution::Explicit(Default::default()),
+            login_path: None,
             variables: Default::default(),
             path: std::env::var_os("PATH").unwrap_or_default(),
             home: None,
@@ -158,6 +199,39 @@ impl ChildEnv {
             #[cfg(debug_assertions)]
             record: None,
             reaper_pids: Some(Default::default()),
+        }
+    }
+    pub(crate) fn start_login_path(&self) {
+        if let Some(cell) = &self.login_path {
+            cell.start();
+        }
+    }
+    pub async fn wait_for_login_path(&self) -> Self {
+        let mut env = self.clone();
+        if let Some(cell) = &self.login_path {
+            cell.start();
+            let mut receiver = cell.value.subscribe();
+            let value = receiver
+                .wait_for(Option::is_some)
+                .await
+                .expect("login PATH cell retains its sender")
+                .clone()
+                .unwrap();
+            env.path = value.path;
+            if let Some(mise_diff) = value.mise_diff {
+                env.variables.insert("__MISE_DIFF".into(), mise_diff);
+            }
+        }
+        env
+    }
+    pub fn login_path_status(&self) -> &'static str {
+        match self.login_path.as_ref().map(|cell| cell.value.borrow()) {
+            Some(value) => match value.as_ref() {
+                None => "pending",
+                Some(value) if value.fallback => "fallback",
+                Some(_) => "loaded",
+            },
+            None => "loaded",
         }
     }
     pub(crate) fn for_probe(&self) -> Self {
@@ -233,6 +307,16 @@ impl ChildEnv {
     ) -> std::collections::BTreeMap<OsString, OsString> {
         let mut variables: std::collections::BTreeMap<_, _> = parent.into_iter().collect();
         variables.extend(self.variables.clone());
+        let login = self
+            .login_path
+            .as_ref()
+            .and_then(|cell| cell.value.borrow().clone());
+        if let Some(login) = &login {
+            variables.remove(std::ffi::OsStr::new("__MISE_DIFF"));
+            if let Some(mise_diff) = &login.mise_diff {
+                variables.insert("__MISE_DIFF".into(), mise_diff.clone());
+            }
+        }
         variables.retain(|key, _| {
             let name = key.to_string_lossy();
             !name.starts_with("VEYRA_")
@@ -255,7 +339,10 @@ impl ChildEnv {
         if !self.xai_api_key_set {
             variables.remove(std::ffi::OsStr::new("XAI_API_KEY"));
         }
-        variables.insert("PATH".into(), self.path.clone());
+        variables.insert(
+            "PATH".into(),
+            login.map_or_else(|| self.path.clone(), |login| login.path),
+        );
         variables.insert(
             "VEYRA_PARENT_PID".into(),
             std::process::id().to_string().into(),
@@ -279,6 +366,11 @@ impl ChildEnv {
                 .ok_or_else(|| ProviderError::NotInstalled(provider.binary().into()));
         }
         let name = provider.binary();
+        let login = self
+            .login_path
+            .as_ref()
+            .and_then(|cell| cell.value.borrow().clone());
+        let path = login.as_ref().map_or(&self.path, |login| &login.path);
         let gui = std::env::var_os("PATH").unwrap_or_default();
         let known = platform::KNOWN_BIN_DIRS.iter().map(|dir| {
             if dir.starts_with('.') {
@@ -290,7 +382,7 @@ impl ChildEnv {
         resolve_from_dirs(
             name,
             std::env::split_paths(&gui)
-                .chain(std::env::split_paths(&self.path))
+                .chain(std::env::split_paths(path))
                 .chain(known),
         )
         .ok_or_else(|| ProviderError::NotInstalled(name.into()))
@@ -842,4 +934,224 @@ fn claude_probe_replay_uses_owned_managed_policy_path() {
         env.claude_managed_mcp(Path::new("/owned/probe")),
         PathBuf::from("/owned/probe/managed-mcp.json")
     );
+}
+
+#[cfg(test)]
+mod login_path_tests {
+    use super::*;
+    use crate::domain::{PermissionMode, ThreadConfig, ThreadId};
+    use std::time::{Duration, Instant};
+
+    fn delayed_environment(failing: bool) -> (crate::tests::Scratch, ChildEnv) {
+        let root = PathBuf::from("/tmp").join(format!("veyra-path-{}", ThreadId::new()));
+        std::fs::create_dir(&root).unwrap();
+        let scratch = crate::tests::Scratch(root.clone());
+        let shell = root.join("shell");
+        let binary = root.join("provider");
+        let script = if failing {
+            "#!/bin/sh\n/bin/sleep 1.5\nexit 7\n".to_owned()
+        } else {
+            format!(
+                "#!/bin/sh\n/bin/sleep 1.5\n/bin/ln -s /bin/cat '{}'\nprintf '%s\\0%s' /loaded-path loaded-diff\n",
+                binary.display()
+            )
+        };
+        let script = script.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif [ \"$1\" = --warmup ]; then exit 0; fi\n",
+            1,
+        );
+        std::fs::write(&shell, script).unwrap();
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("700")
+                .arg(&shell)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new(&shell)
+                .arg("--warmup")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut cell = LoginPathCell::new();
+        cell.shell = Some(shell.into_os_string());
+        cell.inherited.path = "/gui-path".into();
+        cell.inherited.mise_diff = Some("gui-diff".into());
+        let mut env = ChildEnv::isolated();
+        for provider in ProviderKind::ALL {
+            env = env.with_binary(provider, binary.clone());
+        }
+        env.path = "/gui-path".into();
+        env.login_path = Some(Arc::new(cell));
+        (scratch, env)
+    }
+
+    #[tokio::test]
+    async fn launch_does_not_wait_for_login_shell() {
+        let (scratch, env) = delayed_environment(false);
+        let status = env.clone();
+        let data = crate::data_dir::DataDir::at(scratch.0.join("data")).unwrap();
+        let start = Instant::now();
+        let engine =
+            crate::Engine::start_with_env(&tokio::runtime::Handle::current(), data, env).unwrap();
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(status.login_path_status(), "pending");
+        assert_eq!(engine.child_env().login_path_status(), "pending");
+        let loaded = status.wait_for_login_path().await;
+        assert!(start.elapsed() >= Duration::from_millis(1400));
+        assert_eq!(loaded.path, OsString::from("/loaded-path"));
+        assert_eq!(loaded.login_path_status(), "loaded");
+        engine.shutdown_wait().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_waits_for_login_path() {
+        let (_scratch, env) = delayed_environment(false);
+        let (out, mut events) = tokio::sync::mpsc::channel(256);
+        let start = Instant::now();
+        let handle = super::super::session::spawn(
+            super::super::SessionSpec {
+                thread: ThreadId::new(),
+                cwd: std::env::temp_dir(),
+                config: ThreadConfig {
+                    mode: PermissionMode::AskFirst,
+                    model: None,
+                    effort: None,
+                },
+                native: None,
+                import: None,
+                root: false,
+            },
+            env.clone(),
+            out,
+            1,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(env.launches.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(events.try_recv().is_err());
+        let loaded = env.wait_for_login_path().await;
+        assert_eq!(loaded.path, OsString::from("/loaded-path"));
+        assert!(loaded.resolve(ProviderKind::Claude).is_ok());
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while env.launches.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(1400));
+        assert_eq!(env.login_path_status(), "loaded");
+        let _ = handle.control.send(super::super::SessionControl::Shutdown);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while let Some(crate::actor::EngineMsg::Provider { event, .. }) = events.recv().await {
+                if matches!(
+                    event,
+                    super::super::ProviderEvent::Session(super::super::SessionEvent::Exited { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(env.groups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_waits_for_login_path() {
+        let (_scratch, env) = delayed_environment(false);
+        let mut tasks = Vec::new();
+        let mut cancels = Vec::new();
+        let start = Instant::now();
+        for provider in ProviderKind::ALL {
+            let (cancel, cancelled) = tokio::sync::oneshot::channel();
+            cancels.push(cancel);
+            let env = env.clone();
+            tasks.push(tokio::spawn(async move {
+                let cwd = std::env::temp_dir();
+                match provider {
+                    ProviderKind::Claude => {
+                        super::super::session::probe(&env, &cwd, cancelled).await
+                    }
+                    ProviderKind::Codex => {
+                        super::super::session::probe_codex(&env, &cwd, cancelled).await
+                    }
+                    ProviderKind::Grok => {
+                        super::super::session::probe_grok(&env, &cwd, cancelled).await
+                    }
+                }
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(tasks.iter().all(|task| !task.is_finished()));
+        assert_eq!(env.launches.load(std::sync::atomic::Ordering::Acquire), 0);
+        let loaded = env.wait_for_login_path().await;
+        assert_eq!(loaded.path, OsString::from("/loaded-path"));
+        assert!(loaded.resolve(ProviderKind::Claude).is_ok());
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while env.launches.load(std::sync::atomic::Ordering::Acquire) < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(1400));
+        for cancel in cancels {
+            let _ = cancel.send(());
+        }
+        for task in tasks {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(4), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        assert!(env.groups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_login_shell_fills_gui_path() {
+        for timeout in [false, true] {
+            let (_scratch, env) = delayed_environment(true);
+            if timeout {
+                let shell = env.login_path.as_ref().unwrap().shell.as_ref().unwrap();
+                std::fs::write(
+                    shell,
+                    "#!/bin/sh\nif [ \"$1\" = --warmup ]; then exit 0; fi\n\
+                     /bin/sleep 1.5\n/bin/sleep 1.5\n",
+                )
+                .unwrap();
+                assert!(
+                    std::process::Command::new(shell)
+                        .arg("--warmup")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let start = Instant::now();
+            let loaded = env.wait_for_login_path().await;
+            assert!(start.elapsed() >= Duration::from_millis(1400));
+            assert_eq!(loaded.login_path_status(), "fallback");
+            let variables = loaded.environment([
+                ("PATH".into(), "/wrong-path".into()),
+                ("__MISE_DIFF".into(), "wrong-diff".into()),
+            ]);
+            assert_eq!(
+                variables.get(std::ffi::OsStr::new("PATH")),
+                Some(&OsString::from("/gui-path"))
+            );
+            assert_eq!(
+                variables.get(std::ffi::OsStr::new("__MISE_DIFF")),
+                Some(&OsString::from("gui-diff"))
+            );
+        }
+    }
 }

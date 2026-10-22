@@ -356,7 +356,10 @@ impl Actor {
                     cursor: None,
                     thread,
                     epoch,
-                    event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                    event:
+                        ProviderEvent::Session(
+                            SessionEvent::Exited { .. } | SessionEvent::ResolutionFailed { .. },
+                        ),
                 } if self.blocked.is_some() => {
                     if let Some(live) = self
                         .live
@@ -375,6 +378,16 @@ impl Actor {
                     event: ProviderEvent::Session(SessionEvent::Exited { crash }),
                 } if self.current(thread, epoch) => {
                     let c = self.exited(thread, crash);
+                    self.commit_event(c);
+                    return;
+                }
+                EngineMsg::Provider {
+                    cursor: None,
+                    thread,
+                    epoch,
+                    event: ProviderEvent::Session(SessionEvent::ResolutionFailed { error }),
+                } if self.current(thread, epoch) => {
+                    let c = self.resolution_failed(thread, error);
                     self.commit_event(c);
                     return;
                 }
@@ -1168,6 +1181,9 @@ impl Actor {
             ProviderEvent::Session(SessionEvent::Exited { crash }) => {
                 return Some(self.exited(thread, crash));
             }
+            ProviderEvent::Session(SessionEvent::ResolutionFailed { error }) => {
+                return Some(self.resolution_failed(thread, error));
+            }
             ProviderEvent::Turn { turn, event } => {
                 if !matches!(self.live[&thread].live, Live::Structured { .. }) {
                     tracing::debug!(%thread,"dropped turn outside structured session");
@@ -1541,6 +1557,13 @@ impl Actor {
         }
         if !self.state.closing.is_closing() {
             commands::start_changed(&self.projection, &self.live, &mut c, now());
+        }
+        c
+    }
+    fn resolution_failed(&self, thread: ThreadId, error: String) -> ChangeSet {
+        let mut c = self.exited(thread, Some(error));
+        if matches!(self.live[&thread].live, Live::Starting { .. }) {
+            commands::set_hold(&self.projection, &mut c, thread, Some(HoldReason::Stopped));
         }
         c
     }
@@ -2101,6 +2124,53 @@ fn tool_tail(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resolution_failure_keeps_stopped_hold() {
+        let mut db = Connection::open_in_memory().unwrap();
+        store::initialize(&mut db).unwrap();
+        let (out, _messages) = mpsc::channel(256);
+        let mut actor = Actor::new(db, out, Spawner::Scripted(Default::default())).unwrap();
+        let mut command = |command| {
+            let (reply, mut ack) = oneshot::channel();
+            actor.handle(EngineMsg::Command { command, reply });
+            ack.try_recv().unwrap().unwrap()
+        };
+        let Ack::Project(project) = command(Command::AddProject {
+            path: "/tmp".into(),
+        }) else {
+            panic!("missing project");
+        };
+        let Ack::Thread(thread) = command(Command::CreateThread {
+            project,
+            provider: ProviderKind::Claude,
+            config: ThreadConfig {
+                model: None,
+                effort: None,
+                mode: PermissionMode::AskFirst,
+            },
+            text: "awaiting resolution".into(),
+        }) else {
+            panic!("missing thread");
+        };
+        assert!(matches!(
+            actor.live[&thread].live,
+            Live::Starting { session: Some(_) }
+        ));
+        actor.handle(EngineMsg::Provider {
+            cursor: None,
+            thread,
+            epoch: actor.live[&thread].epoch,
+            event: ProviderEvent::Session(SessionEvent::ResolutionFailed {
+                error: "claude is not installed".into(),
+            }),
+        });
+        assert_eq!(
+            actor.projection.threads[&thread].hold,
+            Some(HoldReason::Stopped)
+        );
+        assert!(matches!(actor.live[&thread].live, Live::Parked));
+    }
 
     #[test]
     fn quit_between_decision_and_dispatch_still_ends_promptly() {

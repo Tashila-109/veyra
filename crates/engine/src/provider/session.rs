@@ -492,7 +492,6 @@ pub fn spawn_provider(
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
 ) -> Result<SessionHandle, ProviderError> {
-    env.resolve(provider)?;
     Ok(start_provider_task(provider, None, spec, env, out, epoch))
 }
 
@@ -519,6 +518,23 @@ fn start_provider_task(
     let thread = spec.thread;
     let supervisor_out = out.clone();
     let task = tokio::spawn(async move {
+        let env = tokio::select! {
+            env = env.wait_for_login_path() => env,
+            _ = out.closed() => return false,
+        };
+        if process.is_none()
+            && let Err(error) = env.resolve(provider)
+        {
+            return emit(
+                &out,
+                thread,
+                epoch,
+                ProviderEvent::Session(SessionEvent::ResolutionFailed {
+                    error: record::redact(&error.to_string(), None),
+                }),
+            )
+            .await;
+        }
         let mut spec = spec;
         let mut receiver = SessionControls::new(receiver, env.closing.clone());
         #[cfg(test)]
@@ -1178,13 +1194,23 @@ pub(super) fn check_cancelled(cancelled: &mut oneshot::Receiver<()>) -> Result<(
         Ok(()) | Err(oneshot::error::TryRecvError::Closed) => Err(ProviderError::Cancelled),
     }
 }
+async fn probe_environment(
+    env: &ChildEnv,
+    cancelled: &mut oneshot::Receiver<()>,
+) -> Result<ChildEnv, ProviderError> {
+    tokio::select! {
+        biased;
+        _ = cancelled => Err(ProviderError::Cancelled),
+        env = env.wait_for_login_path() => Ok(env),
+    }
+}
 pub async fn probe(
     env: &ChildEnv,
     cwd: &std::path::Path,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<super::Probe, ProviderError> {
-    let env = &env
-        .clone()
+    let env = &probe_environment(env, &mut cancelled)
+        .await?
         .with_variable("CLAUDE_CODE_AUTO_CONNECT_IDE", "0")
         .with_variable("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
     let binary = env.resolve(ProviderKind::Claude)?;
@@ -1520,6 +1546,7 @@ pub async fn probe_grok(
     cwd: &std::path::Path,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<super::Probe, ProviderError> {
+    let env = &probe_environment(env, &mut cancelled).await?;
     let binary = env.resolve(ProviderKind::Grok)?;
     #[cfg(debug_assertions)]
     let fixture = env
@@ -1577,6 +1604,7 @@ pub async fn probe_codex(
     cwd: &std::path::Path,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<super::Probe, ProviderError> {
+    let env = &probe_environment(env, &mut cancelled).await?;
     let binary = env.resolve(ProviderKind::Codex)?;
     #[cfg(debug_assertions)]
     let fixture = env

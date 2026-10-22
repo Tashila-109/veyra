@@ -1986,6 +1986,7 @@ impl Shell {
                 })).collect::<Vec<_>>()})).into();
         serde_json::json!({
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
+            "login_path":self.engine.login_path_status(),
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
             "header_branch":self.branch, "view_refusal":self.view_refusal,
             "terminal":self.terminal.as_ref().map(|(_,view)|view.read(cx).dump()),
