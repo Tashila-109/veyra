@@ -1,6 +1,6 @@
 # Chat and terminal switch
 
-Status: passed, 2026-10-22, d27c4e4, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 4ce1e41a), ba1d68ded6115eb44ede465eaeb2ed2631fdb1470686d279298b4f9af2d83266
+Status: passed, 2026-10-22, 2bd80b1, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 476fc61a), e48d05feb7d742ba350f45bd5250ec5295ef260dfe4d0ebd6524c1d759a3e6e8
 Covers: crates/veyra/src/ui/terminal_view.rs crates/engine/src/terminal.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/tui/**
 
 ## Sub-features
