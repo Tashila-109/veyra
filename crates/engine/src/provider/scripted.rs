@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 pub struct Scripted {
     pub events: Arc<Mutex<Vec<ProviderEvent>>>,
     pub controls: Arc<Mutex<Vec<SessionControl>>>,
-    pub terminals: Arc<Mutex<Vec<TerminalControl>>>,
     pub timings: Arc<Mutex<Vec<u128>>>,
     pub auto_ready: bool,
     pub auto_complete: bool,
@@ -21,7 +20,6 @@ impl Scripted {
         let this = self.clone();
         tokio::spawn(async move {
             let emit = |event| EngineMsg::Provider {
-                cursor: None,
                 thread: spec.thread,
                 epoch,
                 event,
@@ -46,7 +44,7 @@ impl Scripted {
             while let Some(c) = rx.recv().await {
                 this.controls.lock().unwrap().push(c.clone());
                 match c {
-                    SessionControl::Shutdown | SessionControl::ShutdownForTerminal => {
+                    SessionControl::Shutdown => {
                         let _ = out
                             .send(emit(ProviderEvent::Session(SessionEvent::Exited {
                                 crash: None,
@@ -83,18 +81,5 @@ impl Scripted {
             }
         });
         SessionHandle { control }
-    }
-    pub fn terminal(&self) -> TerminalHandle {
-        let (control, mut rx) = mpsc::unbounded_channel();
-        let records = self.terminals.clone();
-        tokio::spawn(async move {
-            while let Some(c) = rx.recv().await {
-                records.lock().unwrap().push(c);
-            }
-        });
-        TerminalHandle {
-            control,
-            terminal: None,
-        }
     }
 }

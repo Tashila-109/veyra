@@ -1,6 +1,6 @@
 use crate::{
     domain::{Millis, ThreadView, Turn, TurnId, TurnState, wait_reason},
-    provider::{SessionHandle, TerminalHandle},
+    provider::SessionHandle,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -41,10 +41,6 @@ pub enum Live {
         pgid: u32,
         draining: Option<TurnId>,
     },
-    Terminal {
-        term: TerminalHandle,
-        pid: Option<u32>,
-    },
     Stopping {
         then: AfterStop,
     },
@@ -52,8 +48,6 @@ pub enum Live {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AfterStop {
     Park,
-    StartStructured { import: bool },
-    StartTerminal,
 }
 impl Live {
     pub fn session(&self) -> Option<&SessionHandle> {

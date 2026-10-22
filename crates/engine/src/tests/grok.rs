@@ -252,8 +252,6 @@ fn initial_codec(api_key_set: bool) -> crate::provider::grok::Codec {
             },
             native: None,
             root: false,
-
-            import: None,
         },
         1,
         None,
@@ -773,7 +771,6 @@ fn grok_child_foreign_content_does_not_replace_its_report() {
     let turn = f.loaded().tasks[&task].turn;
     let epoch = f.actor.live[&child].epoch;
     f.actor.handle(EngineMsg::Provider {
-        cursor: None,
         thread: child,
         epoch,
         event: ProviderEvent::Session(SessionEvent::Ready {
@@ -803,7 +800,6 @@ fn grok_child_foreign_content_does_not_replace_its_report() {
         let decoded = codec.value(line.clone()).unwrap();
         if let Some(provider_turn) = decoded.provider_turn {
             f.actor.handle(EngineMsg::Provider {
-                cursor: None,
                 thread: child,
                 epoch,
                 event: ProviderEvent::Session(SessionEvent::ProviderTurnStarted { provider_turn }),
@@ -811,7 +807,6 @@ fn grok_child_foreign_content_does_not_replace_its_report() {
         }
         for event in decoded.events {
             f.actor.handle(EngineMsg::Provider {
-                cursor: None,
                 thread: child,
                 epoch,
                 event,
@@ -1085,8 +1080,6 @@ fn grok_accept_edits_docks_every_permission_without_reply() {
                         },
                         native: None,
                         root: false,
-
-                        import: None,
                     },
                     1,
                     None,
@@ -1338,8 +1331,6 @@ fn grok_non_full_access_disables_auto_on_every_open() {
                     },
                     native: retained,
                     root: false,
-
-                    import: (method == "session/load").then_some(Default::default()),
                 },
                 1,
                 None,
@@ -1349,7 +1340,7 @@ fn grok_non_full_access_disables_auto_on_every_open() {
             let init = codec
                 .value(
                     json!({"id":1,"result":{"authMethods":[{"id":"cached_token"}],"agentCapabiliti\
-                es":{"sessionCapabilities":{"resume":{}}}}}),
+                es":{"sessionCapabilities":if method == "session/load" { json!({}) } else { json!({"resume":{}}) }}}}),
                 )
                 .unwrap();
             assert_eq!(init.replies[0]["method"], "authenticate");

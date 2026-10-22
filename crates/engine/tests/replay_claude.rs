@@ -79,14 +79,12 @@ fn replay(name: &str, resume: bool) -> Vec<ProviderEvent> {
                 },
                 native: resume.then(|| NativeSessionId("missing-native".into())),
 
-                import: None,
                 root: false,
             },
             env,
             out,
             1,
-        )
-        .unwrap();
+        );
         tokio::time::timeout(Duration::from_secs(30), async {
             let mut sent = false;
             let mut events = Vec::new();
@@ -617,14 +615,12 @@ fn controlled_replay_with(
                 },
                 native: None,
 
-                import: None,
                 root: false,
             },
             env,
             out,
             1,
-        )
-        .unwrap();
+        );
         let mut next = 0;
         let mut turn = TurnId::new();
         let mut interrupted = false;
@@ -1006,14 +1002,12 @@ fn shutdown_during_spawn_never_ready() {
                     },
                     native: None,
 
-                    import: None,
                     root: false,
                 },
                 env,
                 out,
                 1,
-            )
-            .unwrap();
+            );
             handle.control.send(SessionControl::Shutdown).unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
@@ -1068,14 +1062,12 @@ fn request_replay(
                 },
                 native: None,
 
-                import: None,
                 root: false,
             },
             env,
             out,
             1,
-        )
-        .unwrap();
+        );
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             let mut events = Vec::new();
             let mut requests = 0;
@@ -1246,14 +1238,12 @@ for line in sys.stdin:
                 },
                 native: None,
 
-                import: None,
                 root: false,
             },
             env,
             out,
             1,
-        )
-        .unwrap();
+        );
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             let mut events = Vec::new();
             let mut ends = 0;
@@ -1436,14 +1426,12 @@ for line in sys.stdin:
                 },
                 native: None,
 
-                import: None,
                 root: false,
             },
             env,
             out,
             1,
-        )
-        .unwrap();
+        );
         let result = tokio::time::timeout(Duration::from_secs(30), async {
             let mut outcomes = Vec::new();
             let mut old_end = false;
@@ -1603,14 +1591,12 @@ fn queued_prompt_with_followup(followup: bool) {
                 },
                 native: None,
 
-                import: None,
                 root: false,
             },
             env,
             out,
             1,
-        )
-        .unwrap();
+        );
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             let mut events = Vec::new();
             let mut sent_next = false;
@@ -1776,9 +1762,9 @@ fn blocked_interrupt_probe(stop: bool) {
         let handle = session::spawn(SessionSpec {
             thread: ThreadId::new(), cwd: scratch.0.clone(),
             config: ThreadConfig { model: None, effort: None, mode: PermissionMode::AskFirst },
-            native: None,  import: None,
+            native: None,
                     root: false,
-        }, env, out, 1).unwrap();
+        }, env, out, 1);
         let result = tokio::time::timeout(Duration::from_secs(15), async {
             let mut sent = false;
             let mut released = false;
@@ -1847,226 +1833,6 @@ fn blocked_writer_stop_cannot_reach_later_provider_turn() {
 #[test]
 fn blocked_writer_without_stop_leaves_provider_turn_completed() {
     blocked_interrupt_probe(false);
-}
-
-#[test]
-fn claude_session_file_import() {
-    use veyra_engine::provider::{History, HistoryRequest};
-    let root = std::path::Path::new("/tmp").join(format!("veyra-term-import-{}", ThreadId::new()));
-    std::fs::create_dir_all(root.join("projects/isolated-project")).unwrap();
-    let scratch = Scratch(root);
-    std::fs::copy(
-        fixture("session-file-import"),
-        scratch
-            .0
-            .join("projects/isolated-project/native-import.jsonl"),
-    )
-    .unwrap();
-    let request = HistoryRequest {
-        cursor: Some("old-user".into()),
-        sent: ["sent".into()].into(),
-    };
-    let imported = claude_history_from_config_env(&scratch.0, &request);
-    assert_eq!(
-        imported,
-        History {
-            failed: false,
-            cursor: Some("new-user".into()),
-            text: "second\nreply second".into()
-        }
-    );
-    let repeat = claude_history_from_config_env(
-        &scratch.0,
-        &HistoryRequest {
-            cursor: imported.cursor,
-            ..request
-        },
-    );
-    assert_eq!(repeat.text, "");
-    assert_eq!(repeat.cursor.as_deref(), Some("new-user"));
-}
-
-#[test]
-fn claude_import_precedes_ready() {
-    let root = Path::new("/tmp").join(format!("veyra-term-claude-open-{}", ThreadId::new()));
-    fs::create_dir_all(root.join("config/projects/isolated")).unwrap();
-    let scratch = Scratch(root);
-    fs::copy(
-        fixture("session-file-import"),
-        scratch
-            .0
-            .join("config/projects/isolated/native-import.jsonl"),
-    )
-    .unwrap();
-    let records = [
-        serde_json::json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","\
-            request":{"subtype":"initialize"}}}),
-        serde_json::json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"succe\
-            ss","request_id":"<id:init>","response":{}}}}),
-        serde_json::json!({"type":"spin","ms":200}),
-        serde_json::json!({"type":"exit","code":0}),
-    ];
-    fs::write(
-        scratch.0.join("t1-s1.jsonl"),
-        records
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
-    )
-    .unwrap();
-    let mut env = ChildEnv::isolated()
-        .with_binary(
-            ProviderKind::Claude,
-            env!("CARGO_BIN_EXE_veyra-fake-cli").into(),
-        )
-        .with_variable("CLAUDE_CONFIG_DIR", scratch.0.join("config"));
-    env.fixtures = Some(scratch.0.clone());
-    Runtime::new().unwrap().block_on(async {
-        let (out, mut events) = mpsc::channel(256);
-        let handle = session::spawn(
-            SessionSpec {
-                thread: ThreadId::new(),
-                cwd: scratch.0.clone(),
-                config: ThreadConfig {
-                    model: None,
-                    effort: None,
-                    mode: PermissionMode::FullAccess,
-                },
-                native: Some(NativeSessionId("native-import".into())),
-                import: Some(HistoryRequest {
-                    cursor: Some("old-user".into()),
-                    sent: ["sent".into()].into(),
-                }),
-
-                root: false,
-            },
-            env,
-            out,
-            1,
-        )
-        .unwrap();
-        let mut imported = false;
-        let mut ready = false;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
-                match event {
-                    ProviderEvent::Session(SessionEvent::History { history, .. }) => {
-                        assert!(!ready);
-                        assert_eq!(history.text, "second\nreply second");
-                        imported = true;
-                    }
-                    ProviderEvent::Session(SessionEvent::Ready { .. }) => {
-                        assert!(imported);
-                        ready = true;
-                        handle.control.send(SessionControl::Shutdown).unwrap();
-                    }
-                    ProviderEvent::Session(SessionEvent::Exited { crash }) => {
-                        assert_eq!(crash, None);
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            panic!("Claude import session did not exit");
-        })
-        .await
-        .unwrap();
-        assert!(ready);
-    });
-}
-
-#[test]
-fn fake_claude_tui_requires_isolated_config() {
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_veyra-fake-cli"))
-        .env_clear()
-        .args([
-            "--resume",
-            &ThreadId::new().to_string(),
-            "--permission-mode",
-            "default",
-        ])
-        .output()
-        .unwrap();
-    assert!(!result.status.success());
-    assert!(
-        String::from_utf8(result.stderr)
-            .unwrap()
-            .contains("requires CLAUDE_CONFIG_DIR")
-    );
-}
-
-fn claude_history_from_config_env(root: &Path, request: &HistoryRequest) -> History {
-    let records = [
-        serde_json::json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","\
-            request":{"subtype":"initialize"}}}),
-        serde_json::json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"succe\
-            ss","request_id":"<id:init>","response":{}}}}),
-        serde_json::json!({"type":"spin","ms":10000}),
-    ];
-    fs::write(
-        root.join("t1-s1.jsonl"),
-        records
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-    .unwrap();
-    let mut env = ChildEnv::isolated()
-        .with_binary(
-            ProviderKind::Claude,
-            env!("CARGO_BIN_EXE_veyra-fake-cli").into(),
-        )
-        .with_variable("CLAUDE_CONFIG_DIR", root);
-    env.fixtures = Some(root.to_owned());
-    Runtime::new().unwrap().block_on(async {
-        let (out, mut events) = mpsc::channel(256);
-        let handle = session::spawn(
-            SessionSpec {
-                thread: ThreadId::new(),
-                cwd: root.to_owned(),
-                config: ThreadConfig {
-                    model: None,
-                    effort: None,
-                    mode: PermissionMode::FullAccess,
-                },
-                native: Some(NativeSessionId("native-import".into())),
-                import: Some(request.clone()),
-                root: false,
-            },
-            env,
-            out,
-            1,
-        )
-        .unwrap();
-        let mut history = None;
-        let exited = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(message) = events.recv().await {
-                if let EngineMsg::Provider { event, .. } = message {
-                    match event {
-                        ProviderEvent::Session(SessionEvent::History {
-                            history: value, ..
-                        }) => history = Some(value),
-                        ProviderEvent::Session(SessionEvent::Ready { .. }) => {
-                            let _ = handle.control.send(SessionControl::Shutdown);
-                        }
-                        ProviderEvent::Session(SessionEvent::Exited { crash }) => {
-                            assert!(crash.is_none(), "{crash:?}");
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            panic!("config environment session lost Exited");
-        })
-        .await;
-        let _ = handle.control.send(SessionControl::Shutdown);
-        exited.unwrap();
-        history.expect("Claude History through config environment")
-    })
 }
 
 fn probe_reads(name: &str, expected: Readiness) {
@@ -2177,14 +1943,13 @@ fn two_turns_on_one_process(name: &str, first: &str) {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-                import: None,
+
                 root: false,
             },
             env,
             out,
             1,
-        )
-        .unwrap();
+        );
         let mut events = Vec::new();
         let mut turns = 0;
         let finished = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2311,7 +2076,7 @@ fn shell_snapshot_case(test: &str, failing: bool, check: fn(bool)) {
 fn check_child_env_snapshot(failing: bool) {
     let env = ChildEnv::load();
     let result = Runtime::new().unwrap().block_on(async {
-        let env = env.wait_for_login_path().await;
+        env.wait_for_login_path().await;
         env.command(
             Path::new("/bin/sh"),
             &[

@@ -2,6 +2,7 @@
 // Gpui actions deserialize JSON payloads at the action wire boundary.
 pub mod actions;
 mod composer;
+mod drawer;
 mod header;
 mod new_thread;
 mod notify;
@@ -26,7 +27,6 @@ use std::{
 };
 use theme::{Appearance, Theme};
 use transcript::MessageScrollerState;
-use veyra_engine::domain::View;
 use veyra_engine::{
     Engine,
     commands::{Ack, Command},
@@ -654,8 +654,11 @@ pub struct Shell {
     sent_archives: Vec<(ThreadId, bool)>,
     #[cfg(debug_assertions)]
     repaints: u64,
-    terminal: Option<(ThreadId, Entity<terminal_view::TerminalView>)>,
-    view_refusal: Option<String>,
+    drawers: BTreeMap<ThreadId, drawer::Drawer>,
+    close_sheet: Option<drawer::CloseSheet>,
+    close_focus: FocusHandle,
+    drawer_resizing: Option<(ThreadId, Pixels, Pixels)>,
+    quit_drawer_focus: bool,
     focus: FocusHandle,
     dock_focus: FocusHandle,
     approval_scroll: ApprovalScroll,
@@ -849,8 +852,11 @@ impl Shell {
         let mut shell = Self {
             #[cfg(debug_assertions)]
             repaints: 0,
-            terminal: None,
-            view_refusal: None,
+            drawers: BTreeMap::new(),
+            close_sheet: None,
+            close_focus: cx.focus_handle(),
+            drawer_resizing: None,
+            quit_drawer_focus: false,
             focus,
             dock_focus: cx.focus_handle(),
             approval_scroll: ApprovalScroll::default(),
@@ -991,6 +997,9 @@ impl Shell {
                 return;
             }
             self.thread_menu = None;
+            if self.archive_shells(thread, keep_children, window, cx) {
+                return;
+            }
             self.send_command(
                 Command::ArchiveThread {
                     thread,
@@ -1136,7 +1145,6 @@ impl Shell {
         } else {
             self.forget_branch();
         }
-        self.view_refusal = None;
         self.view = view;
     }
     fn start_branch_lookup(&mut self, cx: &mut Context<Self>) {
@@ -1183,70 +1191,7 @@ impl Shell {
     }
     #[cfg(debug_assertions)]
     pub fn terminal_has_focus(&self, window: &Window, cx: &App) -> bool {
-        self.terminal
-            .as_ref()
-            .is_some_and(|(_, view)| view.focus_handle(cx).is_focused(window))
-    }
-    fn terminal_selected(&self) -> Option<ThreadId> {
-        self.view.chat().filter(|id| {
-            self.state
-                .threads
-                .get(id)
-                .is_some_and(|row| row.view == View::Terminal)
-        })
-    }
-    fn sync_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.terminal_selected() else {
-            if self.terminal.take().is_some() && self.view.chat().is_some() {
-                self.input.update(cx, |input, cx| input.focus(window, cx));
-            }
-            return;
-        };
-        let handle = self.engine.terminal(thread);
-        let current = self.terminal.as_ref().is_some_and(|(id, view)| {
-            *id == thread
-                && match (&view.read(cx).handle, &handle) {
-                    (Some(old), Some(new)) => old.same(new),
-                    (None, None) => true,
-                    _ => false,
-                }
-        });
-        if !current {
-            let view = cx.new(|cx| terminal_view::TerminalView::new(handle, window, cx));
-            window.focus(&view.focus_handle(cx), cx);
-            self.terminal = Some((thread, view));
-        }
-    }
-    fn switch_view(&mut self, action: &SwitchView, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.view.chat() else {
-            return;
-        };
-        let to = if action
-            .terminal
-            .unwrap_or(self.terminal_selected().is_none())
-        {
-            View::Terminal
-        } else {
-            View::Chat
-        };
-        self.engine
-            .set_terminal_colors(cx.global::<Theme>().terminal.engine_colors());
-        let reply = self.engine.send(Command::SwitchView { thread, to });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = reply.await;
-            let _ = this.update_in(cx, |shell, window, cx| {
-                if shell.view.chat() == Some(thread) {
-                    shell.view_refusal = match result {
-                        Ok(Ok(_)) => None,
-                        Ok(Err(error)) => Some(error.to_string()),
-                        Err(_) => Some("The engine closed before answering".into()),
-                    };
-                    shell.sync_terminal(window, cx);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.shell_has_focus(window, cx)
     }
     fn select_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         self.show(MainView::Chat(thread));
@@ -1416,16 +1361,30 @@ impl Shell {
         };
         self.send_command(command, window, cx);
     }
+    fn thread_label(&self, thread: &Thread) -> String {
+        let project = self
+            .state
+            .projects
+            .get(&thread.project)
+            .map(|row| row.name.as_str())
+            .unwrap_or("");
+        let root = self
+            .state
+            .threads
+            .get(&thread.root())
+            .filter(|row| row.id != thread.id)
+            .map(|row| format!("{} / ", row.title))
+            .unwrap_or_default();
+        format!("{project} · {root}{}", thread.title)
+    }
     fn busy_threads(&self) -> Vec<String> {
         let work = self.engine.window_threads();
         self.state
             .threads
             .values()
-            .filter(|thread| {
-                thread.view == View::Terminal
-                    || work.get(&thread.id).is_some_and(|state| state.busy)
-            })
-            .map(|thread| thread.title.clone())
+            .filter(|thread| work.get(&thread.id).is_some_and(|state| state.busy))
+            .map(|thread| self.thread_label(thread))
+            .chain(self.running_shells())
             .collect()
     }
     fn stop_target(&self) -> Option<StopTarget> {
@@ -1582,13 +1541,6 @@ impl Shell {
                     .border_color(t.colors.border_strong)
                     .child(div().text_size(t.text.h2.size).child("Quit Veyra?"))
                     .child("Quitting stops these threads:")
-                    .when(
-                        self.state
-                            .threads
-                            .values()
-                            .any(|thread| thread.view == View::Terminal),
-                        |sheet| sheet.child("Quitting ends any open CLI session."),
-                    )
                     .children(
                         self.busy_threads()
                             .into_iter()
@@ -1837,7 +1789,6 @@ impl Shell {
                         ":parent.id,"title":parent.title,"linked":!parent.archived})),
                     "parent_attention":header::parent_attention(&self.state,thread.id),
                     "failure":self.state.failure(thread.id), "hold":thread.hold,
-                    "native_cursor":thread.native_cursor, "import_pending":thread.import_pending, "view":thread.view,
                     "wait_reason":self.engine.window_threads().get(&thread.id)
                         .and_then(|state| state.wait_reason).map(|reason| reason.to_string())
                 })
@@ -1988,12 +1939,15 @@ impl Shell {
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
             "login_path":self.engine.login_path_status(),
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
-            "header_branch":self.branch, "view_refusal":self.view_refusal,
-            "terminal":self.terminal.as_ref().map(|(_,view)|view.read(cx).dump()),
+            "header_branch":self.branch, "drawer":self.drawer_dump(cx),
+            "focus":if self.active_shell().is_some_and(|tab|tab.view.read(cx).focused())
+                || self.close_sheet.as_ref().is_some_and(|sheet|sheet.drawer_focus)
+                || self.quit_sheet && self.quit_drawer_focus { "drawer" } else { "composer" },
             "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows(), "menu_thread\
                 ":self.thread_menu.as_ref().map(|(id,_)|id)},
             "selected_thread":self.dump_selected(), "transcript":transcript,
-            "composer_text":self.input.read(cx).value().to_string(), "composer":self.dump_composer(cx),
+            "composer_text":self.input.read(cx).value().to_string(),
+            "composer_caret":self.input.read(cx).cursor(), "composer":self.dump_composer(cx),
             "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
             "awake":self.engine.awake(), "processes":self.engine.processes(),
             "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.gap.maximum_ms,
@@ -2004,7 +1958,7 @@ impl Shell {
                 "mailbox_free":perf.mailbox_free,
                 "commits":perf.commits, "actor_max_ms":perf.actor_max_ms, "actor_busy_ms":perf.actor_busy_ms,
                 "repaints":self.repaints, "max_batch_events":self.state.max_batch_events,
-                "flood":self.terminal.as_ref().and_then(|(_,view)|view.read(cx).flood())},
+                "flood":self.active_shell().and_then(|tab|tab.view.read(cx).flood())},
             "window_active":self.window_active, "notifications":{"posted":self.notifications_posted},
             "quit_sheet":{"open":self.quit_sheet, "threads":self.busy_threads()},
             "requests":self.state.requests,
@@ -2017,7 +1971,6 @@ impl Shell {
         match self.view {
             MainView::Settings { .. } => "settings",
             MainView::NewThread => "new_thread",
-            MainView::Chat(_) if self.terminal_selected().is_some() => "terminal",
             MainView::Chat(thread) if self.state.failure(thread).is_some() => "failed_thread",
             MainView::Chat(_) => "chat",
         }
@@ -2030,7 +1983,7 @@ impl Focusable for Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_terminal(window, cx);
+        self.sync_drawers(cx);
         #[cfg(debug_assertions)]
         {
             self.repaints += 1;
@@ -2080,9 +2033,34 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|shell, _: &NewThread, window, cx| shell.new_thread(window, cx)))
             .on_action(cx.listener(|shell, _: &Send, window, cx| shell.send(window, cx)))
-            .on_action(cx.listener(|shell, action: &SwitchView, window, cx| {
-                shell.switch_view(action, window, cx)
+            .on_action(cx.listener(|shell, _: &ToggleShellDrawer, window, cx| {
+                shell.toggle_drawer(window, cx)
             }))
+            .on_action(
+                cx.listener(|shell, _: &NewShellTab, window, cx| shell.new_shell(window, cx)),
+            )
+            .on_action(cx.listener(|shell, _: &CloseShellTab, window, cx| {
+                shell.close_active_shell(window, cx)
+            }))
+            .on_action(
+                cx.listener(|shell, _: &NextShellTab, window, cx| {
+                    shell.step_shell(true, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|shell, _: &PreviousShellTab, window, cx| {
+                shell.step_shell(false, window, cx)
+            }))
+            .on_action(cx.listener(|shell, _: &ConfirmCloseShellTab, window, cx| {
+                shell.confirm_close_shell(window, cx)
+            }))
+            .on_action(cx.listener(|shell, _: &CancelCloseShellTab, window, cx| {
+                shell.cancel_close_shell(window, cx)
+            }))
+            .on_action(
+                cx.listener(|shell, _: &RestartShellTab, window, cx| {
+                    shell.restart_shell(window, cx)
+                }),
+            )
             .on_action(
                 cx.listener(|shell, action: &ChooseAsyncOption, window, cx| {
                     shell.choose_async_option(action, window, cx)
@@ -2369,6 +2347,7 @@ impl Render for Shell {
                 if shell.busy_threads().is_empty() {
                     shell.confirm_quit(cx);
                 } else {
+                    shell.quit_drawer_focus = shell.shell_has_focus(window, cx);
                     shell.quit_sheet = true;
                     window.focus(&shell.quit_focus, cx);
                     cx.notify();
@@ -2380,8 +2359,8 @@ impl Render for Shell {
                     return;
                 }
                 shell.quit_sheet = false;
-                if let Some((_, terminal)) = &shell.terminal {
-                    window.focus(&terminal.focus_handle(cx), cx);
+                if shell.quit_drawer_focus {
+                    shell.focus_shell(window, cx);
                 } else {
                     shell.input.update(cx, |input, cx| input.focus(window, cx));
                 }
@@ -2433,7 +2412,10 @@ impl Render for Shell {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|shell, _, _, _| shell.resizing = false),
+                cx.listener(|shell, _, _, _| {
+                    shell.resizing = false;
+                    shell.drawer_resizing = None;
+                }),
             )
             .child(sidebar::render(self, cx))
             .child(
@@ -2465,15 +2447,18 @@ impl Render for Shell {
                             settings::render(self.state.settings, self.notice.clone(), cx)
                                 .into_any_element()
                         }
-                        MainView::Chat(_) if self.terminal.is_some() => {
-                            self.terminal.as_ref().unwrap().1.clone().into_any_element()
-                        }
                         MainView::Chat(_) => transcript::render(self, cx).into_any_element(),
-                    }),
+                    })
+                    .children(self.render_drawer(window, cx)),
             );
+        let root = root.children(self.render_shell_close_sheet(cx));
         let root = root.when(self.quit_sheet, |root| {
             root.child(self.render_quit_sheet(cx))
         });
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|shell, _: &DebugFocusShellDrawer, window, cx| {
+            shell.focus_shell(window, cx);
+        }));
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|_, action: &DebugStallUi, window, cx| {
             let milliseconds = action.milliseconds;
@@ -2683,32 +2668,25 @@ mod tests {
     #[cfg(debug_assertions)]
     #[gpui::test]
     fn family_card_renders_user_status_words(cx: &mut gpui::TestAppContext) {
-        for (status, expected, raw) in [
-            (Status::NeedsYou, "Needs you", "NeedsYou"),
-            (Status::InTerminal, "In terminal", "InTerminal"),
-        ] {
-            let text = std::sync::Arc::new(crate::tests::RenderedText::default());
-            let mut test = gpui::TestAppContext::build_with_text_system(
-                cx.dispatcher.clone(),
-                None,
-                text.clone(),
-            );
-            with_docked_shell(&mut test, |shell, cx, _, _| {
-                shell.update(cx, |shell, cx| {
-                    let (parent, child, _) = add_family(shell, cx);
-                    shell.state.statuses.insert(child, status);
-                    shell.state.requests.clear();
-                    shell.show(super::MainView::Chat(parent));
-                });
-                draw(cx);
-                let lines = text.lines();
-                assert!(cx.debug_bounds("family-card").is_some());
-                assert!(
-                    lines.contains(expected) && !lines.contains(raw),
-                    "card words: {lines:?}"
-                );
+        let (status, expected, raw) = (Status::NeedsYou, "Needs you", "NeedsYou");
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        with_docked_shell(&mut test, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (parent, child, _) = add_family(shell, cx);
+                shell.state.statuses.insert(child, status);
+                shell.state.requests.clear();
+                shell.show(super::MainView::Chat(parent));
             });
-        }
+            draw(cx);
+            let lines = text.lines();
+            assert!(cx.debug_bounds("family-card").is_some());
+            assert!(
+                lines.contains(expected) && !lines.contains(raw),
+                "card words: {lines:?}"
+            );
+        });
     }
 
     #[gpui::test]
@@ -2716,12 +2694,7 @@ mod tests {
         assert!(
             include_str!("sidebar.rs").contains(".tooltip(super::header::status_text(&status))")
         );
-        for (status, expected) in [
-            (Status::NeedsYou, "Needs you"),
-            (Status::InTerminal, "In terminal"),
-        ] {
-            assert_eq!(super::header::status_text(&status), expected);
-        }
+        assert_eq!(super::header::status_text(&Status::NeedsYou), "Needs you");
     }
 
     #[cfg(debug_assertions)]
@@ -2764,15 +2737,6 @@ mod tests {
                 );
             }
         });
-    }
-
-    #[test]
-    fn terminal_header_uses_display_words() {
-        assert_eq!(
-            super::header::status_text(&Status::InTerminal),
-            "In terminal"
-        );
-        assert_eq!(Status::InTerminal.words(), "InTerminal");
     }
 
     fn draw(cx: &mut gpui::VisualTestContext) {
@@ -2820,12 +2784,8 @@ mod tests {
                     .capture_action(move |_: &super::AllowInThread, _, _| {
                         granted.borrow_mut().push("AllowInThread");
                     })
-                    .capture_action(move |action: &super::SwitchView, _, _| {
-                        switched.borrow_mut().push(match action.terminal {
-                            Some(true) => "Terminal",
-                            Some(false) => "Chat",
-                            None => "SwitchView",
-                        });
+                    .capture_action(move |_: &super::ToggleShellDrawer, _, _| {
+                        switched.borrow_mut().push("ToggleShellDrawer");
                     })
                     .child(self.shell.clone())
             }
@@ -3034,11 +2994,10 @@ mod tests {
             config: shell.config.clone(),
             cwd: "/tmp".into(),
             native: None,
-            native_cursor: None,
+
             cli_version: None,
             hold: None,
-            view: View::Chat,
-            import_pending: false,
+
             archived: false,
         };
         shell.state.threads.insert(root, parent.clone());
@@ -4053,11 +4012,10 @@ mod tests {
                 config: shell.config.clone(),
                 cwd: "/tmp".into(),
                 native: None,
-                native_cursor: None,
+
                 cli_version: None,
                 hold: hold.then_some(HoldReason::ChildReport),
-                view: View::Chat,
-                import_pending: false,
+
                 archived: false,
             },
         );
@@ -6167,11 +6125,10 @@ mod tests {
                     },
                     cwd: scratch.0.clone(),
                     native: None,
-                    native_cursor: None,
+
                     cli_version: None,
                     hold: None,
-                    view: View::Chat,
-                    import_pending: false,
+
                     archived: false,
                 })),
             })
@@ -6267,11 +6224,10 @@ mod tests {
             },
             cwd: "/tmp".into(),
             native: None,
-            native_cursor: None,
+
             cli_version: None,
             hold: None,
-            view: View::Chat,
-            import_pending: false,
+
             archived: false,
         };
         let mut state = AppState::default();
@@ -6398,11 +6354,10 @@ mod tests {
                 },
                 cwd: "/tmp/veyra-snapshot-test".into(),
                 native: None,
-                native_cursor: None,
+
                 cli_version: None,
                 hold: None,
-                view: View::Chat,
-                import_pending: false,
+
                 archived: false,
             })),
         });
@@ -7122,11 +7077,10 @@ mod tests {
             },
             cwd: "/tmp".into(),
             native: None,
-            native_cursor: None,
+
             cli_version: None,
             hold: None,
-            view: View::Chat,
-            import_pending: false,
+
             archived: false,
         };
         state.apply(UiEvent::Change {
@@ -7643,216 +7597,6 @@ mod tests {
             assert_ne!(reason.size.height, gpui::Pixels::default());
         });
     }
-    #[cfg(debug_assertions)]
-    #[gpui::test]
-    fn terminal_window_layout_matrix(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, _, _| {
-            shell.update(cx, |shell, cx| {
-                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
-                shell.state.requests.clear();
-                shell.state.threads.get_mut(&thread).unwrap().view = View::Terminal;
-                shell.state.statuses.insert(thread, Status::InTerminal);
-                cx.notify();
-            });
-            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
-            for viewport in [theme.layout.window_min, theme.layout.window_default] {
-                cx.simulate_resize(viewport);
-                draw(cx);
-                let hint = cx.debug_bounds("terminal-hint").expect("terminal hint row");
-                let grid = cx.debug_bounds("terminal-grid").expect("terminal grid");
-                let header = cx
-                    .debug_bounds("view-switch")
-                    .expect("Chat and Terminal switch");
-                assert_eq!(hint.size.height, theme.layout.terminal_hint);
-                assert_eq!(hint.size.width, grid.size.width);
-                assert_eq!(hint.top(), grid.bottom());
-                assert!(header.right() <= viewport.width && header.top() < grid.top());
-                assert_eq!(
-                    shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx))["view"],
-                    "terminal"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn terminal_sidebar_uses_muted_open_arc() {
-        let theme = super::Theme::new(super::Appearance::Dark);
-        assert_eq!(super::sidebar::glyph(&Status::InTerminal), "◔");
-        assert_eq!(
-            super::sidebar::glyph_color(&Status::InTerminal, &theme),
-            theme.colors.text_muted
-        );
-    }
-    #[cfg(debug_assertions)]
-    #[gpui::test]
-    fn terminal_header_buttons_dispatch_requested_view(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, dispatched, _| {
-            shell.update(cx, |shell, cx| {
-                configure_dock_thread(shell, ProviderKind::Claude, false, false);
-                cx.notify();
-            });
-            draw(cx);
-            for button in ["view-terminal", "view-chat"] {
-                let bounds = cx.debug_bounds(button).expect("header view button");
-                cx.simulate_click(bounds.center(), gpui::Modifiers::none());
-                draw(cx);
-            }
-            assert_eq!(*dispatched.borrow(), ["Terminal", "Chat"]);
-        });
-    }
-    #[cfg(debug_assertions)]
-    #[gpui::test]
-    fn terminal_metadata_switches_surface_and_restores_composer_focus(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use gpui::Focusable;
-        with_docked_shell(cx, |shell, cx, _, events| {
-            let mut row = shell.update(cx, |shell, cx| {
-                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
-                shell.state.requests.clear();
-                cx.notify();
-                shell.state.threads[&thread].clone()
-            });
-            row.view = View::Terminal;
-            events
-                .send(UiEvent::Change {
-                    counter: Some(1),
-                    event: ChangeEvent::ThreadUpdated(Box::new(row.clone())),
-                })
-                .unwrap();
-            draw(cx);
-            assert_eq!(
-                shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx))["view"],
-                "terminal"
-            );
-            assert_eq!(
-                shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx))["terminal"]
-                    ["focused"],
-                true
-            );
-            row.view = View::Chat;
-            row.native_cursor = Some("imported-native-turn".into());
-            events
-                .send(UiEvent::Change {
-                    counter: Some(2),
-                    event: ChangeEvent::ThreadUpdated(Box::new(row)),
-                })
-                .unwrap();
-            draw(cx);
-            let dump =
-                shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx));
-            assert_eq!(dump["view"], "chat");
-            assert!(dump["terminal"].is_null());
-            assert_eq!(
-                dump["selected_thread"]["native_cursor"],
-                "imported-native-turn"
-            );
-            assert!(shell.update_in(cx, |shell, window, cx| {
-                shell.input.focus_handle(cx).is_focused(window)
-            }));
-        });
-    }
-    #[cfg(debug_assertions)]
-    #[gpui::test]
-    fn open_terminal_uses_the_quit_sheet_and_command_new_thread(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, _, _| {
-            shell.update(cx, |shell, cx| {
-                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
-                shell.state.requests.clear();
-                shell.state.threads.get_mut(&thread).unwrap().view = View::Terminal;
-                cx.notify();
-            });
-            draw(cx);
-            assert!(shell.read_with(cx, |shell, cx| {
-                shell.terminal.as_ref().unwrap().1.read(cx).dump()["focused"] == true
-            }));
-            cx.simulate_keystrokes("secondary-q");
-            draw(cx);
-            assert!(
-                shell.read_with(cx, |shell, _| shell.quit_sheet),
-                "open terminal bypassed quit confirmation"
-            );
-            shell.update_in(cx, |shell, window, cx| {
-                shell.quit_sheet = false;
-                use gpui::Focusable;
-                window.focus(&shell.terminal.as_ref().unwrap().1.focus_handle(cx), cx);
-                cx.notify();
-            });
-            draw(cx);
-            cx.simulate_keystrokes("secondary-n");
-            draw(cx);
-            assert!(shell.read_with(cx, |shell, _| matches!(
-                shell.view,
-                super::MainView::NewThread
-            )));
-        });
-    }
-
-    #[cfg(debug_assertions)]
-    #[gpui::test]
-    fn cancel_quit_restores_the_visible_thread_surface(cx: &mut gpui::TestAppContext) {
-        use gpui::Focusable;
-        with_docked_shell(cx, |shell, cx, _, _| {
-            struct Shutdown {
-                engine: veyra_engine::Engine,
-                runtime: tokio::runtime::Runtime,
-            }
-            impl Drop for Shutdown {
-                fn drop(&mut self) {
-                    self.runtime.block_on(self.engine.shutdown_wait());
-                }
-            }
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
-            let engine = veyra_engine::Engine::start_with_env(
-                runtime.handle(),
-                veyra_engine::data_dir::DataDir::at(data).unwrap(),
-                veyra_engine::provider::env::ChildEnv::isolated(),
-            )
-            .unwrap();
-            shell.update(cx, |shell, _| {
-                shell.engine = engine.clone();
-                shell.runtime = runtime.handle().clone();
-            });
-            let _shutdown = Shutdown { engine, runtime };
-            for view in [View::Terminal, View::Chat] {
-                shell.update(cx, |shell, cx| {
-                    let (thread, _) =
-                        configure_dock_thread(shell, ProviderKind::Claude, false, false);
-                    shell.state.requests.clear();
-                    shell.state.threads.get_mut(&thread).unwrap().view = view;
-                    cx.notify();
-                });
-                draw(cx);
-                shell.update_in(cx, |shell, window, cx| {
-                    shell.quit_sheet = true;
-                    window.focus(&shell.quit_focus, cx);
-                    cx.notify();
-                });
-                draw(cx);
-                cx.simulate_keystrokes("escape");
-                draw(cx);
-                assert!(!shell.read_with(cx, |shell, _| shell.quit_sheet));
-                assert!(
-                    shell.update_in(cx, |shell, window, cx| match view {
-                        View::Terminal => shell
-                            .terminal
-                            .as_ref()
-                            .unwrap()
-                            .1
-                            .focus_handle(cx)
-                            .is_focused(window),
-                        View::Chat => shell.input.focus_handle(cx).is_focused(window),
-                    }),
-                    "cancel did not restore {view:?} focus"
-                );
-            }
-        });
-    }
 
     #[test]
     fn terminal_spans_bound_transcript_order_independently_of_time() {
@@ -7911,5 +7655,164 @@ mod tests {
                 [imported, queued]
             );
         }
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn cancel_quit_restores_composer_focus(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        with_docked_shell(cx, |shell, cx, _, _| {
+            struct Shutdown {
+                engine: veyra_engine::Engine,
+                runtime: tokio::runtime::Runtime,
+            }
+            impl Drop for Shutdown {
+                fn drop(&mut self) {
+                    self.runtime.block_on(self.engine.shutdown_wait());
+                }
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
+            let engine = veyra_engine::Engine::start_with_env(
+                runtime.handle(),
+                veyra_engine::data_dir::DataDir::at(data).unwrap(),
+                veyra_engine::provider::env::ChildEnv::isolated(),
+            )
+            .unwrap();
+            shell.update(cx, |shell, _| {
+                shell.engine = engine.clone();
+                shell.runtime = runtime.handle().clone();
+            });
+            let _shutdown = Shutdown { engine, runtime };
+            shell.update(cx, |shell, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                cx.notify();
+            });
+            draw(cx);
+            shell.update_in(cx, |shell, window, cx| {
+                shell.quit_sheet = true;
+                window.focus(&shell.quit_focus, cx);
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            assert!(!shell.read_with(cx, |shell, _| shell.quit_sheet));
+            assert!(
+                shell.update_in(cx, |shell, window, cx| {
+                    shell.input.focus_handle(cx).is_focused(window)
+                }),
+                "cancel did not restore composer focus"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn drawer_open_keeps_draft_focus_until_click(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.input.update(cx, |input, cx| {
+                    input.set_value("keep this draft", window, cx);
+                    input.focus(window, cx);
+                });
+            });
+            draw(cx);
+            cx.simulate_keystrokes("left left");
+            draw(cx);
+            let caret = shell.read_with(cx, |shell, cx| shell.input.read(cx).cursor());
+            cx.simulate_keystrokes("secondary-j");
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
+            assert!(shell.read_with(cx, |shell, _| {
+                shell.drawers[&shell.view.chat().unwrap()].open
+            }));
+            shell.update_in(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(super::actions::RestartShellTab), cx);
+            });
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
+            shell.read_with(cx, |shell, cx| {
+                assert_eq!(shell.input.read(cx).value().as_ref(), "keep this draft");
+                assert_eq!(shell.input.read(cx).cursor(), caret);
+            });
+            cx.simulate_keystrokes("secondary-t");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.drawers[&shell.view.chat().unwrap()]
+                    .tabs
+                    .len()),
+                1
+            );
+            let grid = cx.debug_bounds("terminal-grid").unwrap();
+            cx.simulate_click(grid.center(), gpui::Modifiers::none());
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+            for key in [
+                "secondary-t",
+                "secondary-shift-[",
+                "secondary-shift-]",
+                "secondary-w",
+            ] {
+                assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+                cx.simulate_keystrokes(key);
+                draw(cx);
+                assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+                shell.read_with(cx, |shell, cx| {
+                    assert_eq!(shell.input.read(cx).value().as_ref(), "keep this draft");
+                    assert_eq!(shell.input.read(cx).cursor(), caret);
+                });
+            }
+            cx.simulate_keystrokes("secondary-j");
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
+            cx.simulate_keystrokes("secondary-j");
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
+            cx.simulate_keystrokes("secondary-j");
+            draw(cx);
+            shell.update_in(cx, |shell, window, cx| {
+                shell
+                    .input
+                    .update(cx, |input, cx| input.set_value("", window, cx))
+            });
+            cx.simulate_keystrokes("secondary-j");
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+            for _ in 0..7 {
+                cx.simulate_keystrokes("secondary-t");
+                draw(cx);
+            }
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.drawers[&shell.view.chat().unwrap()]
+                    .tabs
+                    .len()),
+                6
+            );
+            for _ in 0..6 {
+                cx.simulate_keystrokes("secondary-w");
+                draw(cx);
+            }
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
+            assert!(!shell.read_with(cx, |shell, _| {
+                shell.drawers[&shell.view.chat().unwrap()].open
+            }));
+        });
     }
 }

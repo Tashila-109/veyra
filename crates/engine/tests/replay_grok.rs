@@ -282,22 +282,19 @@ async fn grok_no_first_frame_fails_at_60s() {
     let (scratch, env) = environment("no-first-frame");
     let (out, mut events) = mpsc::channel(32);
     let turn = TurnId::new();
-    let handle = Spawner::Cli(Box::new(env))
-        .spawn(
-            ProviderKind::Grok,
-            SessionSpec {
-                thread: ThreadId::new(),
-                cwd: scratch.0.canonicalize().unwrap(),
-                config: config(),
-                native: None,
+    let handle = Spawner::Cli(Box::new(env)).spawn(
+        ProviderKind::Grok,
+        SessionSpec {
+            thread: ThreadId::new(),
+            cwd: scratch.0.canonicalize().unwrap(),
+            config: config(),
+            native: None,
 
-                import: None,
-                root: false,
-            },
-            out,
-            1,
-        )
-        .unwrap();
+            root: false,
+        },
+        out,
+        1,
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let Some(EngineMsg::Provider { event, .. }) = events.recv().await else {
@@ -318,7 +315,6 @@ async fn grok_no_first_frame_fails_at_60s() {
         })
         .unwrap();
     let EngineMsg::Provider {
-        cursor: Some(cursor),
         event: ProviderEvent::Session(SessionEvent::Dispatched { turn: dispatched }),
         ..
     } = events.recv().await.unwrap()
@@ -326,7 +322,6 @@ async fn grok_no_first_frame_fails_at_60s() {
         panic!("missing dispatched cursor");
     };
     assert_eq!(dispatched, turn);
-    assert_eq!(cursor.value().as_deref(), Some(turn.to_string().as_str()));
     handle
         .control
         .send(SessionControl::DispatchCommitted { turn })
@@ -499,16 +494,7 @@ fn grok_background_work_blocks_replacement() {
                                     .unwrap(),
                                 Err(CommandError::Busy(WaitReason::BackgroundWork))
                             ));
-                            assert!(matches!(
-                                engine
-                                    .send(Command::SwitchView {
-                                        thread,
-                                        to: View::Terminal
-                                    })
-                                    .await
-                                    .unwrap(),
-                                Err(CommandError::Busy(WaitReason::BackgroundWork))
-                            ));
+
                             checked = true;
                         }
                         UiEvent::Change {
@@ -547,22 +533,19 @@ fn grok_signed_out_never_authenticates() {
     let (scratch, env) = environment("signed-out");
     Runtime::new().unwrap().block_on(async {
         let (out, mut events) = mpsc::channel(32);
-        let _handle = Spawner::Cli(Box::new(env))
-            .spawn(
-                ProviderKind::Grok,
-                SessionSpec {
-                    thread: ThreadId::new(),
-                    cwd: scratch.0.canonicalize().unwrap(),
-                    config: config(),
-                    native: None,
+        let _handle = Spawner::Cli(Box::new(env)).spawn(
+            ProviderKind::Grok,
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: scratch.0.canonicalize().unwrap(),
+                config: config(),
+                native: None,
 
-                    import: None,
-                    root: false,
-                },
-                out,
-                1,
-            )
-            .unwrap();
+                root: false,
+            },
+            out,
+            1,
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
                 match event {
@@ -1366,76 +1349,6 @@ fn grok_provider_permission_without_prompt_is_persisted_and_answered() {
     );
 }
 
-#[test]
-fn grok_load_replay_import() {
-    let (_scratch, env) = harness::environment(ProviderKind::Grok, "load-replay-import");
-    Runtime::new().unwrap().block_on(async {
-        let (out, mut events) = mpsc::channel(256);
-        let handle = Spawner::Cli(Box::new(env))
-            .spawn(
-                ProviderKind::Grok,
-                SessionSpec {
-                    thread: ThreadId::new(),
-                    cwd: _scratch.0.clone(),
-                    config: ThreadConfig {
-                        model: None,
-                        effort: None,
-                        mode: PermissionMode::FullAccess,
-                    },
-                    native: Some(NativeSessionId("native-import".into())),
-                    import: Some(HistoryRequest {
-                        cursor: Some("old".into()),
-                        sent: ["sent".into()].into(),
-                    }),
-                    root: false,
-                },
-                out,
-                1,
-            )
-            .unwrap();
-        let mut history = None;
-        let mut ready = false;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
-                match event {
-                    ProviderEvent::Session(SessionEvent::History {
-                        native,
-                        history: value,
-                    }) => {
-                        assert!(!ready);
-                        assert!(history.is_none());
-                        assert_eq!(native.0, "native-import");
-                        history = Some(value);
-                    }
-                    ProviderEvent::Session(SessionEvent::Ready { .. }) => {
-                        assert!(history.is_some(), "Ready preceded the import");
-                        ready = true;
-                        handle.control.send(SessionControl::Shutdown).unwrap();
-                    }
-                    ProviderEvent::Session(SessionEvent::Exited { crash }) => {
-                        assert_eq!(crash, None);
-                        return;
-                    }
-                    ProviderEvent::Turn { .. } => panic!("replay escaped as a new running turn"),
-                    _ => {}
-                }
-            }
-            panic!("import session ended without Exited");
-        })
-        .await
-        .unwrap();
-        assert!(ready);
-        assert_eq!(
-            history.unwrap(),
-            History {
-                failed: false,
-                cursor: Some("terminal".into()),
-                text: "second\nreply second".into()
-            }
-        );
-    });
-}
-
 fn guarded_completion_fixture() -> (Vec<ProviderEvent>, Duration) {
     let (scratch, env) = environment("turn-completed-only");
     let started = std::time::Instant::now();
@@ -1448,14 +1361,13 @@ fn guarded_completion_fixture() -> (Vec<ProviderEvent>, Duration) {
                 cwd: scratch.0.canonicalize().unwrap(),
                 config: config(),
                 native: None,
-                import: None,
+
                 root: false,
             },
             env,
             out,
             1,
-        )
-        .unwrap();
+        );
         let mut events = Vec::new();
         let mut sent = 0;
         tokio::time::timeout(Duration::from_secs(10), async {

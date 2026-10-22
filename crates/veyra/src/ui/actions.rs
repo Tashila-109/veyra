@@ -5,12 +5,20 @@ use veyra_engine::{
 };
 
 #[cfg(debug_assertions)]
-actions!(veyra, [ActivateWindow]);
+actions!(veyra, [ActivateWindow, DebugFocusShellDrawer]);
 
 actions!(
     veyra,
     [
         Quit,
+        ToggleShellDrawer,
+        NewShellTab,
+        CloseShellTab,
+        NextShellTab,
+        PreviousShellTab,
+        ConfirmCloseShellTab,
+        CancelCloseShellTab,
+        RestartShellTab,
         ConfirmQuit,
         CancelQuit,
         Continue,
@@ -72,15 +80,6 @@ pub struct Stop {
     pub target: Option<StopTarget>,
 }
 choice_action!(AddProject, path, std::path::PathBuf);
-#[derive(
-    Clone, Default, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action,
-)]
-#[serde(default)]
-#[schemars(crate = "::gpui::private::schemars")]
-#[action(namespace = veyra)]
-pub struct SwitchView {
-    pub terminal: Option<bool>,
-}
 choice_action!(PickProvider, provider, ProviderKind);
 choice_action!(PickModel, model, String);
 choice_action!(PickEffort, effort, String);
@@ -196,7 +195,18 @@ macro_rules! binding {
 pub fn bindings() -> Vec<Binding> {
     vec![
         binding!(Quit, "secondary-q", None),
-        binding!(SwitchView, "secondary-shift-v", None),
+        binding!(ToggleShellDrawer, "secondary-j", None),
+        binding!(NewShellTab, "secondary-t", Some("VeyraTerminal")),
+        binding!(CloseShellTab, "secondary-w", Some("VeyraTerminal")),
+        binding!(NextShellTab, "secondary-shift-]", Some("VeyraTerminal")),
+        binding!(PreviousShellTab, "secondary-shift-[", Some("VeyraTerminal")),
+        binding!(
+            ConfirmCloseShellTab,
+            "secondary-enter",
+            Some("VeyraShellClose")
+        ),
+        binding!(CancelCloseShellTab, "escape", Some("VeyraShellClose")),
+        binding!(RestartShellTab, "enter", Some("VeyraTerminal")),
         binding!(ConfirmQuit, "secondary-enter", Some("VeyraQuit")),
         binding!(CancelQuit, "escape", Some("VeyraQuit")),
         binding!(OpenSettings, "secondary-,", Some("Veyra")),
@@ -293,11 +303,12 @@ pub fn init(cx: &mut App) {
         let mut context = binding
             .context
             .map(|context| KeyBindingContextPredicate::parse(context).unwrap());
-        if !key.modifiers.platform
-            || (matches!(key.key.as_str(), "left" | "right")
-                && !key.modifiers.shift
-                && !key.modifiers.alt
-                && !key.modifiers.control)
+        if binding.context != Some("VeyraTerminal")
+            && (!key.modifiers.platform
+                || (matches!(key.key.as_str(), "left" | "right")
+                    && !key.modifiers.shift
+                    && !key.modifiers.alt
+                    && !key.modifiers.control))
         {
             let outside_terminal = KeyBindingContextPredicate::Not(Box::new(
                 KeyBindingContextPredicate::Identifier("VeyraTerminal".into()),

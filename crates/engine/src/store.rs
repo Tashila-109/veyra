@@ -137,11 +137,11 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
                 json(&t.config)?,
                 t.cwd.to_string_lossy(),
                 t.native.as_ref().map(|n| &n.0),
-                t.native_cursor.as_deref(),
+                Option::<&str>::None,
                 t.cli_version.as_deref(),
                 t.hold.as_ref().map(word).transpose()?,
-                word(&t.view)?,
-                t.import_pending,
+                "chat",
+                false,
                 now,
                 t.archived.then_some(now),
             ],
@@ -294,7 +294,6 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         }
         let (pid, pgid) = match live.live {
             Live::Structured { pid, pgid, .. } => (Some(pid), Some(pgid)),
-            Live::Terminal { pid, .. } => (pid, pid),
             _ => (None, None),
         };
         tx.execute(
@@ -331,8 +330,7 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
     }
     let mut q = db.prepare(
         "SELECT id,project_id,title,parent_thread_id,relationship,root_thread_id,provider,
-             config_json,cwd,native_id,native_cursor,cli_version,hold_reason,view,import_pending,
-             archived_at FROM threads",
+             config_json,cwd,native_id,cli_version,hold_reason,archived_at FROM threads",
     )?;
     let mut rows = q.query([])?;
     while let Some(r) = rows.next()? {
@@ -353,17 +351,14 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
             config: parse(r.get(7)?)?,
             cwd: Path::new(&r.get::<_, String>(8)?).to_owned(),
             native: r.get::<_, Option<String>>(9)?.map(NativeSessionId),
-            native_cursor: r.get::<_, Option<String>>(10)?.map(NativeCursor),
             cli_version: r
-                .get::<_, Option<String>>(11)?
+                .get::<_, Option<String>>(10)?
                 .filter(|version| !version.is_empty()),
             hold: r
-                .get::<_, Option<String>>(12)?
+                .get::<_, Option<String>>(11)?
                 .map(parse_word)
                 .transpose()?,
-            view: parse_word(r.get(13)?)?,
-            import_pending: r.get(14)?,
-            archived: r.get::<_, Option<Millis>>(15)?.is_some(),
+            archived: r.get::<_, Option<Millis>>(12)?.is_some(),
         };
         p.threads.insert(t.id, t);
     }
@@ -493,3 +488,10 @@ pub(crate) fn live_processes(db: &Connection) -> Result<Vec<(u32, u32)>, StoreEr
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<Vec<_>, _>>()?)
 }
+
+#[cfg(test)]
+pub(crate) const LEGACY_TERMINAL_ROW: &str =
+    "UPDATE threads SET view='terminal',import_pending=1,native_cursor='old' WHERE id=?1";
+#[cfg(test)]
+pub(crate) const LEGACY_TERMINAL_COLUMNS: &str =
+    "SELECT view,import_pending,native_cursor FROM threads WHERE id=?1";

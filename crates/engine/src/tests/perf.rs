@@ -3,7 +3,7 @@ use crate::Engine;
 use std::time::Instant;
 
 #[test]
-fn claude_stream_keeps_seven_fixed_commits() {
+fn claude_stream_keeps_six_fixed_commits() {
     let mut f = Fixture::new(LiveState::Starting);
     let before = f.actor.test_commits;
     let Ack::Turn(turn) = f
@@ -38,7 +38,7 @@ fn claude_stream_keeps_seven_fixed_commits() {
     let mut text_writes = 0;
     let mut before_end = None;
     for record in records {
-        let mut decoded = match record {
+        let decoded = match record {
             crate::fixture::Record::ExpectOutbound { line } if line["type"] == "user" => {
                 assert_eq!(
                     f.controls.try_recv().unwrap(),
@@ -76,15 +76,10 @@ fn claude_stream_keeps_seven_fixed_commits() {
                 f.actor.handle(EngineMsg::Provider {
                     thread: f.thread,
                     epoch: 1,
-                    cursor: decoded.cursor.take(),
                     event,
                 });
             }
             if dispatched {
-                assert_eq!(
-                    f.loaded().threads[&f.thread].native_cursor.as_deref(),
-                    Some(turn.to_string().as_str())
-                );
                 assert_eq!(
                     f.controls.try_recv().unwrap(),
                     SessionControl::DispatchCommitted { turn }
@@ -94,7 +89,7 @@ fn claude_stream_keeps_seven_fixed_commits() {
                 deltas += 1;
                 if deltas == 1 {
                     println!("startup commits={}", f.actor.test_commits - before);
-                    assert_eq!(f.actor.test_commits - before, 4);
+                    assert_eq!(f.actor.test_commits - before, 3);
                     assert_eq!(
                         f.loaded().threads[&f.thread].cli_version.as_deref(),
                         Some("2.1.294")
@@ -115,7 +110,7 @@ fn claude_stream_keeps_seven_fixed_commits() {
     assert_eq!(deltas, 2000);
     assert_eq!(text_writes, 5);
     assert_eq!(f.actor.test_commits - before_end.unwrap(), 3);
-    assert_eq!(f.actor.test_commits - before - text_writes, 7);
+    assert_eq!(f.actor.test_commits - before - text_writes, 6);
     let stored = f.loaded();
     assert_eq!(
         stored.threads[&f.thread].cli_version.as_deref(),
@@ -185,11 +180,10 @@ fn seed_large_snapshot(db: &mut Connection, path: &std::path::Path) -> ThreadId 
             config: config(),
             cwd: path.into(),
             native: None,
-            native_cursor: None,
+
             cli_version: None,
             hold: None,
-            view: View::Chat,
-            import_pending: false,
+
             archived: false,
         },
     );

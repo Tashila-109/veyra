@@ -8,7 +8,6 @@ fn spec(root: bool) -> SessionSpec {
         cwd: "/project".into(),
         config: config(),
         native: None,
-        import: None,
         root,
     }
 }

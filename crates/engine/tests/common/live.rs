@@ -39,26 +39,22 @@ pub fn live(
     let env = ChildEnv::load();
     runtime.block_on(async {
         let (out, mut rx) = mpsc::channel(256);
-        let handle = Spawner::Cli(Box::new(env))
-            .spawn(
-                provider,
-                SessionSpec {
-                    thread: ThreadId::new(),
-                    cwd: root.clone(),
-                    config: ThreadConfig {
-                        model: None,
-                        effort: None,
-                        mode,
-                    },
-                    native: None,
-
-                    import: None,
-                    root: false,
+        let handle = Spawner::Cli(Box::new(env)).spawn(
+            provider,
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: root.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode,
                 },
-                out,
-                1,
-            )
-            .unwrap();
+                native: None,
+                root: false,
+            },
+            out,
+            1,
+        );
         let result = tokio::time::timeout(Duration::from_secs(180), async {
             let mut events = vec![];
             let mut sent = 0;

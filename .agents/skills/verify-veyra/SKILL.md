@@ -213,7 +213,7 @@ Run each page's Codex and Grok sections in the fake lane after its existing driv
 Every section after new-thread's first starts with the driver's `prepare()`, which adds the project, installs the fake CLI and waits for Ready only when no earlier page did, then opens a new Claude composer, so a page can run alone after Launch, Doctor and app-launch's first section, or after any earlier section without a relaunch.
 Before any provider drive, wait with `poll('login-path-ready', lambda d: d['login_path'] != 'pending')`; Doctor performs this wait for the first launch. After a relaunch, wait again before checking providers. `login_path` reads `pending`, `loaded` or `fallback`; Checking remains until the first probe answers.
 Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
-Run [chat-terminal-switch](features/chat-terminal-switch.md) for the fake TUI, recovery import and one flood.
+Run [shell-drawer](features/shell-drawer.md) for owned shell fixtures, tab keys, focus, shutdown and one flood.
 The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
 Use the same exported `RUN` in every fresh shell.
@@ -226,7 +226,7 @@ For an explicit AnswerQuestion request, supply its question index as well.
 Action and key replies acknowledge dispatch; poll `dump` for the resulting view or use `ctl wait` for a thread state.
 `keys KEYSTROKES` parses the whole sequence before dispatch, then sends key-down followed by key-up for each keystroke through the window.
 Buttons activate on key-up; terminal input consumes key-down only.
-`text STRING` uses the focused textarea's public input handler or dispatches character key events while Terminal has focus; Settings has no text handler.
+`text STRING` uses the focused textarea's public input handler or dispatches character key events while the shell drawer has focus; Settings has no text handler.
 Enter or ⌘↵ sends through `veyra::Send`; Shift+Enter inserts a newline.
 `wait THREAD STATUS [SECONDS]` is a client-only loop over `dump`, polling every 50 ms for 30 seconds by default.
 It exits 0 for the status, 1 for timeout or a driver/connection error, 2 for bad usage and 3 for a missing or archived thread.
@@ -238,13 +238,17 @@ A timeout does not cancel an enqueued action; run Doctor before retrying.
 Commands remain bounded at 64 KiB; the client accepts replies up to 4 MiB so the seeded 5,000-item transcript can be measured without truncating its dump.
 After another Send on an existing thread, gate `wait Done` on the new turn row or a changed status so the preceding Done cannot satisfy it.
 
-The read-only dump reports `login_path`, `terminal`, `view_refusal`, `tasks`, `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
+The read-only dump reports `login_path`, `drawer`, `focus`, `composer_caret`, `tasks`, `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
 `header_branch` is the branch text used by the header and is empty after leaving Chat.
-`view` is `new_thread`, `chat`, `terminal`, `failed_thread` or `settings`.
-`veyra::SwitchView` toggles the selected thread through the window-level ⌘⇧V binding; its optional terminal boolean selects Chat or Terminal.
-`view_refusal` holds the last switch refusal shown in the header.
-`terminal` holds the emulator text `grid`, focus, columns, rows and debug repaint count, or null in chat.
-`selected_thread.native_cursor`, `import_pending` and stored `view` expose the engine metadata.
+`view` is `new_thread`, `chat`, `failed_thread` or `settings`.
+`drawer` describes the selected thread's open state, height, active_tab and tabs, with each tab's number, label, pid, running process paths, exit_code, exited flag and error.
+Its nested `terminal` carries grid, focused, columns, rows and repaint count for the active tab.
+`focus` reports composer or drawer; a confirmation sheet retains its originating surface while the sheet's key context handles confirmation.
+`composer_caret` is the input's byte offset and verifies that toggling the drawer preserves a draft's caret.
+`VEYRA_DEBUG_SHELL_FIXTURE` runs only the adjacent fake CLI's shell mode, using a run-owned fixture; the fake lane always sets it and never opens the user's real shell.
+The shell environment strips all VEYRA_* variables, so the fake fixture path is injected only after that filter for the debug fake.
+`perf.flood` measures the active drawer tab after its FLOOD_DONE marker.
+
 `perf.flood` is null before FLOOD_DONE, then holds `pty_bytes`, `elapsed_ms`, `repaints`, `median_repaint_gap_ms` and `max_repaint_gap_ms` between the reader markers.
 The bytes exclude both OSC markers; the repaint gaps use only painted frames inside those timestamps.
 `sidebar.rows` holds project and thread rows in tree order, with status for each thread, row_status for its rendered family glyph, depth, quiet_minutes and archive_keep_children.
@@ -350,19 +354,20 @@ required = {
         'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png',
         'approval-write-inside.png','approval-write-outside.png','approval-web-fetch.png',
         'approval-notebook-edit.png','approval-mcp.png','approval-long-command.png',
-        'approval-long-command-end.png','approval-new-long-command.png','approval-switch-refused.png','approval-view-switch-grant.json','approval-view-switch-grant.png'],
+        'approval-long-command-end.png','approval-new-long-command.png'],
     'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
         'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
     'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json',
         'restart-child-interrupted.png','restart-child-parent-held.png','restart-child-delivered.json',
-        'restart-after-ctl-database.txt','restart-after-crash-database.txt','restart-database-kept.json'],
+        'restart-after-ctl-database.txt','restart-after-crash-database.txt','restart-database-kept.json','restart-stored-terminal.png'],
     'multi-agent':['multi-tree-working.png','multi-child-task.png','multi-family-done.png','multi-report-delivered.png',
         'multi-child-parent-needs.png','multi-menu.png','multi-child-stop-held.png','multi-parent-stop-held.png',
         'multi-child-archive-held.json','multi-child-archive-held.png',
         'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png',
         'multi-stopped-child-wake-received.json'],
-    'chat-terminal-switch':['terminal-open.png','terminal-imported.png','terminal-recovered.png',
-        'terminal-hex.json','terminal-empty-repeat.json','terminal-cursor-updates.json','terminal-history-grep.txt','terminal-flood.json','terminal-flood.png'],
+    'shell-drawer':['drawer-open.png','drawer-header.png','drawer-draft.json','drawer-keys.json',
+        'drawer-hidden.json','drawer-running-close.png','drawer-restarted.json','drawer-missing-folder.png',
+        'drawer-archive.png','drawer-quit-sheet.png','drawer-crash.json','drawer-flood.json','drawer-flood.png'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
         'settings-existing.json','settings-new.json'],
     'new-thread-codex':['codex-new-thread-missing.json','codex-new-thread-missing.png',
@@ -394,7 +399,7 @@ pairs = {
     'new-thread':[('new-thread-missing','new-thread-ready'),
         ('new-thread-provider-menu','new-thread-provider-menu-ready')],
     'chat-send-stream':[('chat-working','chat-done'),('chat-tool-collapsed','chat-tool-expanded')],
-    'chat-terminal-switch':[('terminal-open','terminal-imported')],
+    'shell-drawer':[('drawer-open','drawer-running-close')],
     'settings':[('settings-full-access','settings')],
     'chat-send-stream-live':[('chat-working','chat-done')],
     'chat-send-stream-codex':[('codex-chat-working','codex-chat-done')],

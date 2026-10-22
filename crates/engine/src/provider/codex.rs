@@ -69,7 +69,6 @@ pub fn initialize() -> Value {
 enum Call {
     Initialize,
     Thread,
-    History,
     Start(TurnId),
     Interrupt(TurnId),
 }
@@ -227,8 +226,6 @@ pub(crate) struct Codec {
     requests: BTreeMap<String, Request>,
     seen_requests: BTreeSet<String>,
     interrupted: Option<Interruption>,
-    history_turns: Vec<wire::Turn>,
-    history_pages: BTreeSet<String>,
 }
 impl Codec {
     pub(crate) fn new(
@@ -252,8 +249,6 @@ impl Codec {
             requests: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
             interrupted: None,
-            history_turns: vec![],
-            history_pages: BTreeSet::new(),
         }
     }
     pub(crate) fn initialize(&mut self) -> Value {
@@ -264,54 +259,6 @@ impl Codec {
     }
     pub(crate) fn active(&self) -> Option<ActiveTurn> {
         self.turn.active()
-    }
-    fn finish_history(&mut self, decoded: &mut Decoded, failed: bool) {
-        let request = self.spec.import.as_ref().unwrap();
-        let cursor = self
-            .history_turns
-            .first()
-            .and_then(|turn| turn.id.clone())
-            .map(Into::into)
-            .or_else(|| request.cursor.clone());
-        let mut text = Vec::new();
-        if !failed && request.cursor.is_some() {
-            for turn in self.history_turns.drain(..).rev() {
-                let items = turn.items.unwrap_or_default();
-                for item in items {
-                    match item {
-                        wire::Item::UserMessage(user) => {
-                            for content in user.content {
-                                if let wire::UserContent::Text { text: value } = content {
-                                    text.push(value);
-                                }
-                            }
-                        }
-                        wire::Item::AgentMessage(agent)
-                            if agent.phase.as_deref() == Some("final_answer") =>
-                        {
-                            if let Some(value) = agent.text {
-                                text.push(value);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        self.history_turns.clear();
-        decoded.history = Some(super::History {
-            cursor,
-            text: text.join("\n"),
-            failed,
-        });
-    }
-    fn history_page(&mut self, cursor: Option<&str>) -> Value {
-        self.peer.send(
-            Call::History,
-            "thread/turns/list",
-            json!({"threadId":self.native().unwrap().0,"cursor\
-            ":cursor,"limit":100,"sortDirection":"desc"}),
-        )
     }
     fn open_thread(&mut self) -> Result<Outbound, ProviderError> {
         let mut spec = self.spec.clone();
@@ -350,7 +297,6 @@ impl Codec {
         self.interrupted = None;
         let params = turn_params(&native, &self.spec.config, text);
         Some(Decoded {
-            cursor: Some(super::CursorUpdate::Unknown),
             events: vec![ProviderEvent::Session(SessionEvent::Dispatched { turn })],
             controls: vec![Outbound::Prompt(self.peer.send(
                 Call::Start(turn),
@@ -372,55 +318,7 @@ impl Codec {
                 decoded
                     .replies
                     .push(self.peer.notification("initialized", Value::Null));
-                if self.spec.import.is_some() && self.native().is_some() {
-                    decoded.replies.push(self.history_page(None));
-                } else {
-                    self.queue_thread(&mut decoded)?;
-                }
-            }
-            Frame::Reply {
-                tag: Call::History,
-                result,
-            } => {
-                let page = result
-                    .map_err(jsonrpc::failure)
-                    .and_then(|result| decode::<wire::TurnsPage>(result, "history page"));
-                match page {
-                    Ok(page) => {
-                        let request = self.spec.import.as_ref().unwrap();
-                        let mut found = false;
-                        for turn in page.data {
-                            if turn.id.as_deref().is_none_or(str::is_empty) {
-                                continue;
-                            }
-                            if turn.id.as_deref() == request.cursor.as_deref()
-                                && request.cursor.is_some()
-                            {
-                                found = true;
-                                break;
-                            }
-                            self.history_turns.push(turn);
-                        }
-                        if !found
-                            && request.cursor.is_some()
-                            && let Some(cursor) = page.next_cursor
-                        {
-                            if self.history_pages.insert(cursor.clone()) {
-                                decoded.replies.push(self.history_page(Some(&cursor)));
-                            } else {
-                                self.finish_history(&mut decoded, true);
-                                self.queue_thread(&mut decoded)?;
-                            }
-                        } else {
-                            self.finish_history(&mut decoded, !found && request.cursor.is_some());
-                            self.queue_thread(&mut decoded)?;
-                        }
-                    }
-                    Err(_) => {
-                        self.finish_history(&mut decoded, true);
-                        self.queue_thread(&mut decoded)?;
-                    }
-                }
+                self.queue_thread(&mut decoded)?;
             }
             Frame::Reply {
                 tag: Call::Thread,
@@ -521,7 +419,7 @@ impl Codec {
                     }
                     _ => vec![],
                 };
-                decoded.cursor = Some(id.clone().into());
+
                 self.turns.entry(id).or_insert(Turn {
                     owner: ActiveTurn::Veyra(turn),
                     phase: TurnPhase::Pending,
@@ -617,7 +515,7 @@ impl Codec {
             TurnBinding::Idle => {
                 let owner = ActiveTurn::Provider(TurnId::new());
                 decoded.provider_turn = Some(owner.target());
-                decoded.cursor = Some(id.into());
+
                 self.turn = TurnBinding::Bound {
                     owner,
                     native: id.into(),
@@ -735,7 +633,6 @@ impl Codec {
         let agent = matches!(&notification, N::AgentDelta { params: _ });
         match notification {
             N::TurnStarted { params: _ } => {
-                decoded.cursor = Some(id.clone().into());
                 if let Some(turn) = self.turns.get_mut(&id)
                     && turn.phase == TurnPhase::Pending
                 {
@@ -1561,36 +1458,6 @@ pub(super) async fn probe_exchange(
     ))
 }
 
-pub fn tui_command(
-    native: &crate::domain::NativeSessionId,
-    mode: crate::domain::PermissionMode,
-) -> Vec<String> {
-    let mut args = vec![
-        "resume".into(),
-        native.0.clone(),
-        "--include-non-interactive".into(),
-        "--no-daemon".into(),
-        "-c".into(),
-        "check_for_update_on_startup=false".into(),
-    ];
-    match mode {
-        PermissionMode::AskFirst => args.extend(["-s".into(), "read-only".into()]),
-        PermissionMode::AcceptEdits => args.extend([
-            "-a".into(),
-            "on-request".into(),
-            "-s".into(),
-            "workspace-write".into(),
-        ]),
-        PermissionMode::FullAccess => args.extend([
-            "-a".into(),
-            "never".into(),
-            "-s".into(),
-            "danger-full-access".into(),
-        ]),
-    }
-    args
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1606,7 +1473,6 @@ mod tests {
                 },
                 native: Some(NativeSessionId("old-thread".into())),
 
-                import: None,
                 root: false,
             },
             1,
@@ -1649,37 +1515,6 @@ mod tests {
                 "unknown kind lost the failure"
             );
         }
-    }
-
-    #[test]
-    fn dispatch_cursor_is_unknown_until_the_server_names_the_turn() {
-        let mut codec = resumed();
-        codec
-            .value(json!({"id":2,"result":{"thread":{"id":"old-thread"}}}))
-            .unwrap();
-        let turn = TurnId::new();
-        let dispatched = codec.start(turn, "cursor probe".into()).unwrap();
-        assert_eq!(dispatched.cursor, Some(super::super::CursorUpdate::Unknown));
-        assert!(
-            matches!(dispatched.events.as_slice(), [ProviderEvent::Session(SessionEvent::Dispatched { turn:
-                owner })] if *owner == turn)
-        );
-        let decoded = codec
-            .value(
-                json!({"id":dispatched.controls[0].value()["id"],"result":{"turn":{"id":"serv\
-            er-turn"}}}),
-            )
-            .unwrap();
-        assert_eq!(decoded.cursor, Some("server-turn".into()));
-        codec.value(json!({"method":"turn/completed","params":{"threadId":"old-thread","turn":{"id":"server-tur\
-            n","status":"completed"}}})).unwrap();
-        let decoded = codec
-            .value(
-                json!({"method":"turn/started","params":{"threadId":"old-thread","turn":{"id\
-            ":"cli-turn"}}}),
-            )
-            .unwrap();
-        assert_eq!(decoded.cursor, Some("cli-turn".into()));
     }
 
     #[test]
@@ -2085,7 +1920,6 @@ mod limit_tests {
                 },
                 native: None,
 
-                import: None,
                 root: false,
             },
             1,
@@ -2163,7 +1997,6 @@ mod collaboration_tests {
                     },
                     native: None,
 
-                    import: None,
                     root: false,
                 },
                 1,

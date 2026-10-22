@@ -19,26 +19,23 @@ fn live_claude_ok_reply() {
         let (out, mut events) = mpsc::channel(256);
         let thread = ThreadId::new();
         let turn = TurnId::new();
-        let handle = Spawner::Cli(Box::new(ChildEnv::load()))
-            .spawn(
-                ProviderKind::Claude,
-                SessionSpec {
-                    thread,
-                    cwd: cwd.clone(),
-                    config: ThreadConfig {
-                        model: None,
-                        effort: None,
-                        mode: PermissionMode::FullAccess,
-                    },
-                    native: None,
-
-                    import: None,
-                    root: false,
+        let handle = Spawner::Cli(Box::new(ChildEnv::load())).spawn(
+            ProviderKind::Claude,
+            SessionSpec {
+                thread,
+                cwd: cwd.clone(),
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::FullAccess,
                 },
-                out,
-                1,
-            )
-            .unwrap();
+                native: None,
+
+                root: false,
+            },
+            out,
+            1,
+        );
         tokio::time::timeout(Duration::from_secs(30), async {
             let mut sent = false;
             let mut completed = false;

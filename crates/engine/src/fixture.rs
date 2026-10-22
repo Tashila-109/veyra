@@ -56,39 +56,29 @@ pub enum Record {
 
 pub fn run() -> io::Result<i32> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let tui = args.first().is_some_and(|arg| arg == "resume")
+    let tui = args
+        .first()
+        .is_some_and(|arg| arg == "resume" || arg == "shell")
         || args.iter().any(|arg| arg == "--resume")
             && !args
                 .iter()
                 .any(|arg| arg == "-p" || arg == "app-server" || arg == "agent");
-    if tui { run_tui(&args) } else { cli::run() }
+    if tui { run_tui() } else { cli::run() }
 }
 
-fn run_tui(args: &[String]) -> io::Result<i32> {
+fn run_tui() -> io::Result<i32> {
     use std::io::{Read, Write};
-    let claude = args.iter().any(|arg| arg == "--permission-mode")
-        && !args.iter().any(|arg| arg == "--no-auto-update");
-    let history = if claude {
-        let root = std::env::var_os("CLAUDE_CONFIG_DIR")
-            .ok_or_else(|| io::Error::other("fake Claude TUI requires CLAUDE_CONFIG_DIR"))?;
-        let native = args
-            .iter()
-            .position(|arg| arg == "--resume")
-            .and_then(|index| args.get(index + 1))
-            .ok_or_else(|| io::Error::other("fake Claude TUI requires --resume"))?;
-        let id = uuid::Uuid::parse_str(native).map_err(io::Error::other)?;
-        let folder = std::path::PathBuf::from(root).join("projects/veyra-fake");
-        std::fs::create_dir_all(&folder)?;
-        Some((folder.join(format!("{id}.jsonl")), native))
-    } else {
-        None
-    };
     crate::platform::raw_terminal_input()?;
     let mut output = std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout().lock());
+    let mut job = None;
     if let Some(path) = std::env::var_os("VEYRA_FAKE_FIXTURE") {
         for record in load(Path::new(&path))? {
             match record {
-                Record::TranscriptStart { .. } => {}
+                Record::TranscriptStart { scenario, .. } => {
+                    if scenario == "shell-background-job" {
+                        job = Some(crate::platform::shell_fixture_job()?);
+                    }
+                }
                 Record::Spin { ms } => std::thread::sleep(std::time::Duration::from_millis(ms)),
                 Record::Exit { code, stderr } => {
                     for line in stderr {
@@ -117,67 +107,14 @@ fn run_tui(args: &[String]) -> io::Result<i32> {
     output.flush()?;
     let mut input = std::io::stdin().lock();
     let mut bytes = [0; 1];
-    let mut line = Vec::new();
     while input.read(&mut bytes)? != 0 {
+        if bytes[0] == 3 {
+            drop(job.take());
+        }
         writeln!(output, "{:02x}\r", bytes[0])?;
         output.flush()?;
-        match bytes[0] {
-            b'\r' | b'\n' => {
-                if let Some((path, native)) = &history {
-                    append_tui_history(path, native, &String::from_utf8_lossy(&line))?;
-                }
-                line.clear();
-            }
-            byte => line.push(byte),
-        }
     }
     Ok(0)
-}
-
-fn append_tui_history(path: &Path, native: &str, text: &str) -> io::Result<()> {
-    use std::io::{BufRead, Write};
-    let mut parent = None;
-    if let Ok(file) = std::fs::File::open(path) {
-        for line in std::io::BufReader::new(file).lines() {
-            let entry: Value = serde_json::from_str(&line?)?;
-            if let Some(uuid) = entry["uuid"].as_str() {
-                parent = Some(uuid.to_owned());
-            }
-        }
-    }
-    let user = uuid::Uuid::now_v7().to_string();
-    let attachment = uuid::Uuid::now_v7().to_string();
-    let assistant = uuid::Uuid::now_v7().to_string();
-    let common = serde_json::json!({"sessionId":native,"isSidechain":false,"entrypoint":"cli",
-        "userType":"external","cwd":std::env::current_dir()?,"version":"2.1.302",
-            "timestamp":"2026-10-17T00:00:00Z","gitBranch":""});
-    let mut user_entry = common.clone();
-    for (key,value) in serde_json::json!({"uuid":user,"parentUuid":parent,"promptId":uuid::Uuid::now_v7(
-        ).to_string(),"type":"user","message":{"role":"user","content":text},"promptSource":"typed",
-            "turnOrigin":"human","origin":{"kind":"human"},"turnPosition":{"promptIndex":0,"turnIndex":1},
-                "permissionMode":"default"}).as_object().unwrap() { user_entry[key] = value.clone(); }
-    let mut attachment_entry = common.clone();
-    for (key, value) in serde_json::json!({"uuid":attachment,"parentUuid":user,"type":"attachment",
-        "attachment":{"type":"environment"},"rendered":[],"renderedRole":"system"})
-    .as_object()
-    .unwrap()
-    {
-        attachment_entry[key] = value.clone();
-    }
-    let mut assistant_entry = common;
-    for (key,value) in serde_json::json!({"uuid":assistant,"parentUuid":attachment,"type":"assistant",
-        "message":{"role":"assistant","model":"veyra-fake","id":uuid::Uuid::now_v7().to_string(),"content":[{
-            "type":"text","text":format!("fake reply: {text}")}],"stop_reason":"end_turn","usage":{}},
-                "apiBlockIndex":0,"requestId":uuid::Uuid::now_v7().to_string(),"requestedModel":"veyra-fake",
-                    "effort":"default"}).as_object().unwrap() { assistant_entry[key] = value.clone(); }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    for entry in [user_entry, attachment_entry, assistant_entry] {
-        writeln!(file, "{entry}")?;
-    }
-    file.flush()
 }
 
 fn once() -> usize {

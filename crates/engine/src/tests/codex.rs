@@ -109,7 +109,6 @@ fn codex_params_per_mode() {
             config: config.clone(),
             native: Some(NativeSessionId("native".into())),
 
-            import: None,
             root: false,
         };
         assert_eq!(

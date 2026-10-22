@@ -1,5 +1,5 @@
 #![allow(clippy::disallowed_types)] // Debug terminal dump methods serialize grid and perf wire JSON.
-use super::{actions::SwitchView, theme::Theme};
+use super::theme::Theme;
 use gpui_kit::component::StyledExt;
 use gpui_kit::{prelude::*, *};
 #[cfg(debug_assertions)]
@@ -186,18 +186,35 @@ fn snapshot(handle: &TerminalHandle) -> Option<Grid> {
         rows: (0..term.screen_lines())
             .map(|row| {
                 (0..term.columns())
-                    .map(|col| term.grid()[Line(row as i32)][Column(col)].clone())
+                    .map(|col| {
+                        let point = veyra_engine::terminal::Point::new(
+                            Line(row as i32 - term.grid().display_offset() as i32),
+                            Column(col),
+                        );
+                        let mut cell = term.grid()[point].clone();
+                        if term
+                            .renderable_content()
+                            .selection
+                            .is_some_and(|selection| selection.contains(point))
+                        {
+                            cell.flags.toggle(Flags::INVERSE);
+                        }
+                        cell
+                    })
                     .collect()
             })
             .collect(),
         palette: (0..=NamedColor::DimForeground as usize)
             .map(|i| term.colors()[i])
             .collect(),
-        cursor: (cursor.shape != CursorShape::Hidden && cursor.point.line.0 >= 0).then_some((
-            cursor.point.line.0 as usize,
-            cursor.point.column.0,
-            cursor.shape,
-        )),
+        cursor: (term.grid().display_offset() == 0
+            && cursor.shape != CursorShape::Hidden
+            && cursor.point.line.0 >= 0)
+            .then_some((
+                cursor.point.line.0 as usize,
+                cursor.point.column.0,
+                cursor.shape,
+            )),
         #[cfg(debug_assertions)]
         flood: emulator.flood,
     })
@@ -261,6 +278,7 @@ struct FloodPerf {
     done: Option<veyra_engine::terminal::ReaderStamp>,
     frames: Vec<Instant>,
     repaints: u64,
+    frame_requests: u64,
 }
 #[cfg(debug_assertions)]
 impl FloodPerf {
@@ -309,6 +327,10 @@ pub(super) struct TerminalView {
     focus: FocusHandle,
     resize: Option<(u16, u16)>,
     pending_frame: bool,
+    visible: bool,
+    geometry: Option<(Bounds<Pixels>, Pixels, Pixels)>,
+    selecting: bool,
+    scrolled: bool,
     app_cursor: bool,
     error: Option<SharedString>,
     #[cfg(debug_assertions)]
@@ -327,16 +349,7 @@ impl TerminalView {
                 while wake.changed().await.is_ok() {
                     if this
                         .update_in(cx, |terminal, window, cx| {
-                            if !terminal.pending_frame {
-                                terminal.pending_frame = true;
-                                let this = cx.entity().downgrade();
-                                window.on_next_frame(move |_, cx| {
-                                    let _ = this.update(cx, |terminal, cx| {
-                                        terminal.pending_frame = false;
-                                        cx.notify();
-                                    });
-                                });
-                            }
+                            terminal.queue_frame(window, cx);
                         })
                         .is_err()
                     {
@@ -372,6 +385,10 @@ impl TerminalView {
             focus,
             resize: None,
             pending_frame: false,
+            visible: false,
+            geometry: None,
+            selecting: false,
+            scrolled: false,
             app_cursor: false,
             error: None,
             #[cfg(debug_assertions)]
@@ -380,15 +397,129 @@ impl TerminalView {
             focused: false,
         }
     }
-    fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(handle) = &self.handle else {
-            return;
-        };
-        if let Some(bytes) = terminal_key_bytes(&event.keystroke, self.app_cursor) {
-            if let Err(error) = handle.write(&bytes) {
-                self.error = Some(error.to_string().into());
+    fn queue_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible && !self.pending_frame {
+            #[cfg(debug_assertions)]
+            {
+                self.perf.frame_requests += 1;
+            }
+            self.pending_frame = true;
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = this.update(cx, |terminal, cx| {
+                    terminal.pending_frame = false;
+                    if terminal.visible {
+                        cx.notify();
+                    }
+                });
+            });
+        }
+    }
+    #[cfg(debug_assertions)]
+    pub fn frame_counts(&self) -> (u64, u64) {
+        (self.perf.frame_requests, self.perf.repaints)
+    }
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            if visible {
                 cx.notify();
             }
+        }
+    }
+    #[cfg(debug_assertions)]
+    pub fn focused(&self) -> bool {
+        self.visible && self.focused
+    }
+    fn scroll(&mut self, scroll: veyra_engine::terminal::Scroll, cx: &mut Context<Self>) {
+        if matches!(scroll, veyra_engine::terminal::Scroll::Bottom) && !self.scrolled {
+            return;
+        }
+        if let Some(emulator) = self.handle.as_ref().and_then(TerminalHandle::emulator) {
+            let mut emulator = emulator.lock();
+            emulator.term.scroll_display(scroll);
+            self.scrolled = emulator.term.grid().display_offset() != 0;
+            cx.notify();
+        }
+    }
+    pub fn send_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.scroll(veyra_engine::terminal::Scroll::Bottom, cx);
+        if let Some(handle) = &self.handle
+            && let Err(error) = handle.write(bytes)
+        {
+            self.error = Some(error.to_string().into());
+            cx.notify();
+        }
+    }
+    fn select(&mut self, position: Point<Pixels>, start: bool, cx: &mut Context<Self>) {
+        use veyra_engine::terminal::{Point as CellPoint, Selection, SelectionType, Side};
+        let Some((bounds, width, height)) = self.geometry else {
+            return;
+        };
+        let Some(emulator) = self.handle.as_ref().and_then(TerminalHandle::emulator) else {
+            return;
+        };
+        let mut emulator = emulator.lock();
+        let term = &mut emulator.term;
+        let row = (((position.y - bounds.origin.y) / height).floor() as i32)
+            .clamp(0, term.screen_lines() as i32 - 1)
+            - term.grid().display_offset() as i32;
+        let col =
+            (((position.x - bounds.origin.x) / width).floor() as usize).min(term.columns() - 1);
+        let point = CellPoint::new(Line(row), Column(col));
+        if start {
+            term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        } else if let Some(selection) = &mut term.selection {
+            selection.update(point, Side::Right);
+        }
+        cx.notify();
+    }
+    fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let key = &event.keystroke;
+        if key.modifiers.platform && key.key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let bracketed = self
+                    .handle
+                    .as_ref()
+                    .and_then(TerminalHandle::emulator)
+                    .is_some_and(|emulator| {
+                        emulator
+                            .lock()
+                            .term
+                            .mode()
+                            .contains(TermMode::BRACKETED_PASTE)
+                    });
+                self.send_input(&paste_bytes(&text, bracketed), cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if key.modifiers.platform && key.key == "c" {
+            if let Some(text) = self
+                .handle
+                .as_ref()
+                .and_then(TerminalHandle::emulator)
+                .and_then(|emulator| emulator.lock().term.selection_to_string())
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if key.modifiers.shift && matches!(key.key.as_str(), "pageup" | "pagedown") {
+            self.scroll(
+                if key.key == "pageup" {
+                    veyra_engine::terminal::Scroll::PageUp
+                } else {
+                    veyra_engine::terminal::Scroll::PageDown
+                },
+                cx,
+            );
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(bytes) = terminal_key_bytes(key, self.app_cursor) {
+            self.send_input(&bytes, cx);
             cx.stop_propagation();
         }
     }
@@ -429,6 +560,7 @@ impl TerminalView {
             .expect("terminal font advance");
         let padding = theme.layout.terminal_padding;
         let origin = bounds.origin + point(padding.width, padding.height);
+        self.geometry = Some((Bounds::new(origin, bounds.size), cell_width, line_height));
         let cols = (((bounds.size.width - padding.width * 2.) / cell_width).floor() as u16).max(2);
         let rows =
             (((bounds.size.height - padding.height * 2.) / line_height).floor() as u16).max(1);
@@ -589,9 +721,39 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .key_context("VeyraTerminal")
             .on_key_down(cx.listener(Self::key))
+            .on_scroll_wheel(
+                cx.listener(|terminal, event: &ScrollWheelEvent, window, cx| {
+                    let height = cx
+                        .global::<Theme>()
+                        .text
+                        .terminal
+                        .line_height
+                        .to_pixels(window.rem_size());
+                    let rows = (event.delta.pixel_delta(height).y / height).round() as i32;
+                    terminal.scroll(veyra_engine::terminal::Scroll::Delta(rows), cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|terminal, event: &MouseMoveEvent, _, cx| {
+                if terminal.selecting {
+                    terminal.select(event.position, false, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|terminal, _, _, _| terminal.selecting = false),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|terminal, _, _, _| terminal.selecting = false),
+            )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|terminal, _, window, cx| window.focus(&terminal.focus, cx)),
+                cx.listener(|terminal, event: &MouseDownEvent, window, cx| {
+                    window.focus(&terminal.focus, cx);
+                    terminal.selecting = true;
+                    terminal.select(event.position, true, cx);
+                }),
             )
             .child(
                 div()
@@ -634,22 +796,6 @@ impl Render for TerminalView {
                         )
                         .size_full(),
                     ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "terminal-hint".into())
-                    .h(theme.layout.terminal_hint)
-                    .flex_none()
-                    .h_flex()
-                    .items_center()
-                    .pl(theme.layout.terminal_padding.width)
-                    .pr(theme.layout.terminal_padding.width)
-                    .gap(theme.space.0[3])
-                    .text_size(theme.text.meta.size)
-                    .text_color(theme.colors.text_muted)
-                    .child(super::actions::shortcut_chip::<SwitchView>(cx))
-                    .child("Switching ends the CLI session")
-                    .children(self.error.clone()),
             )
     }
 }
@@ -714,7 +860,7 @@ mod tests {
             );
         }
         assert_eq!(
-            terminal_key_bytes(&Keystroke::parse("secondary-shift-v").unwrap(), false),
+            terminal_key_bytes(&Keystroke::parse("secondary-j").unwrap(), false),
             None
         );
         assert_eq!(
@@ -814,12 +960,9 @@ mod window_tests {
         rc::Rc,
         time::{Duration, Instant},
     };
-    use veyra_engine::{
-        Engine,
-        commands::{Ack, Command},
-        domain::*,
-        provider::{ProviderKind, env::ChildEnv},
-    };
+    use veyra_engine::{Engine, domain::*, provider::env::ChildEnv};
+
+    use veyra_engine::terminal::Dimensions;
 
     struct TerminalFixture {
         engine: Engine,
@@ -839,18 +982,6 @@ mod window_tests {
             );
             std::fs::create_dir_all(scratch.0.join("fixtures")).unwrap();
             std::fs::create_dir_all(scratch.0.join("project")).unwrap();
-            let source =
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/fixtures");
-            std::fs::copy(
-                source.join("claude/ok-reply.jsonl"),
-                scratch.0.join("fixtures/t1-s1.jsonl"),
-            )
-            .unwrap();
-            std::fs::copy(
-                source.join("tui/echo.jsonl"),
-                scratch.0.join("fixtures/t1-s2.jsonl"),
-            )
-            .unwrap();
             let binary = std::env::current_exe()
                 .unwrap()
                 .parent()
@@ -858,10 +989,21 @@ mod window_tests {
                 .parent()
                 .unwrap()
                 .join("veyra-test-cli");
-            let mut env = ChildEnv::isolated()
-                .with_binary(ProviderKind::Claude, binary)
-                .with_variable("CLAUDE_CONFIG_DIR", scratch.0.join("claude-home"));
-            env.fixtures = Some(scratch.0.join("fixtures"));
+            let shell = scratch.0.join("shell");
+            std::fs::write(
+                &shell,
+                format!("#!/bin/sh\nexec '{}' shell\n", binary.display()),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&shell)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let env = ChildEnv::isolated().with_variable("SHELL", shell.as_os_str());
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let engine = Engine::start_with_env(
                 runtime.handle(),
@@ -869,79 +1011,25 @@ mod window_tests {
                 env,
             )
             .unwrap();
-            let handle = runtime.block_on(async {
-                let Ack::Project(project) = engine
-                    .send(Command::AddProject {
-                        path: scratch.0.join(
-                            "project\
-                    ",
-                        ),
-                    })
-                    .await
-                    .unwrap()
-                    .unwrap()
-                else {
-                    panic!("project acknowledgement");
-                };
-                let Ack::Thread(thread) = engine
-                    .send(Command::CreateThread {
-                        project,
-                        provider: ProviderKind::Claude,
-                        config: ThreadConfig {
-                            model: None,
-                            effort: None,
-                            mode: PermissionMode::AskFirst,
-                        },
-                        text: "warm up".into(),
-                    })
-                    .await
-                    .unwrap()
-                    .unwrap()
-                else {
-                    panic!("thread acknowledgement");
-                };
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let snapshot = engine.snapshot(thread).await.unwrap();
-                        if snapshot.items.iter().any(|item| {
-                            matches!(&item.body, ItemBody::AssistantText {
-                            text, done: true } if text == "ok")
-                        }) && !engine.window_threads()[&thread].busy
-                        {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                })
-                .await
+            let handle = engine
+                .open_shell(
+                    ThreadId::new(),
+                    scratch.0.join("project"),
+                    veyra_engine::terminal::PtySize::default(),
+                )
                 .unwrap();
-                engine
-                    .send(Command::SwitchView {
-                        thread,
-                        to: View::Terminal,
-                    })
-                    .await
-                    .unwrap()
-                    .unwrap();
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        if let Some(handle) = engine.terminal(thread)
-                            && handle
-                                .emulator()
-                                .unwrap()
-                                .lock()
-                                .text()
-                                .iter()
-                                .any(|line| line == "VEYRA_TUI_READY")
-                        {
-                            break handle;
-                        }
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                })
-                .await
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !handle
+                .emulator()
                 .unwrap()
-            });
+                .lock()
+                .text()
+                .iter()
+                .any(|line| line == "VEYRA_TUI_READY")
+            {
+                assert!(Instant::now() < deadline, "shell fixture did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            }
             Self {
                 engine,
                 runtime,
@@ -966,7 +1054,17 @@ mod window_tests {
             gpui::div()
                 .size_full()
                 .key_context("Veyra")
-                .on_action(move |_: &actions::SwitchView, _, _| switches.set(switches.get() + 1))
+                .on_action(move |_: &actions::ToggleShellDrawer, _, _| {
+                    switches.set(switches.get() + 1)
+                })
+                .on_action({
+                    let counter = self.switches.clone();
+                    move |_: &actions::NewShellTab, _, _| counter.set(counter.get() + 1)
+                })
+                .on_action({
+                    let counter = self.switches.clone();
+                    move |_: &actions::CloseShellTab, _, _| counter.set(counter.get() + 1)
+                })
                 .on_action(move |_: &actions::NewThread, _, _| {
                     new_threads.set(new_threads.get() + 1)
                 })
@@ -998,6 +1096,7 @@ mod window_tests {
             let terminal = cx.new(|cx| {
                 let mut terminal = TerminalView::new(None, window, cx);
                 terminal.handle = Some(fixture.handle.clone());
+                terminal.visible = true;
                 terminal
             });
             window.focus(&terminal.focus_handle(cx), cx);
@@ -1034,7 +1133,7 @@ mod window_tests {
         }
     }
     #[gpui::test]
-    fn terminal_window_keys_text_resize_and_switch_precedence(cx: &mut gpui::TestAppContext) {
+    fn drawer_keys_win_over_terminal_element(cx: &mut gpui::TestAppContext) {
         let fixture = TerminalFixture::new();
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1046,6 +1145,7 @@ mod window_tests {
             let terminal = cx.new(|cx| {
                 let mut terminal = TerminalView::new(None, window, cx);
                 terminal.handle = Some(fixture.handle.clone());
+                terminal.visible = true;
                 terminal
             });
             window.focus(&terminal.focus_handle(cx), cx);
@@ -1114,12 +1214,19 @@ mod window_tests {
         draw(cx);
         assert_eq!(root.read_with(cx, |root, _| root.new_threads.get()), 1);
         let grid = fixture.handle.emulator().unwrap().lock().text();
-        cx.simulate_keystrokes("secondary-shift-v");
+        cx.simulate_keystrokes("secondary-j");
         draw(cx);
         assert_eq!(switches.get(), 1, "window binding must beat terminal input");
+        cx.simulate_keystrokes("secondary-t secondary-w");
+        draw(cx);
+        assert_eq!(
+            switches.get(),
+            3,
+            "drawer bindings must beat terminal input"
+        );
         assert_eq!(fixture.handle.emulator().unwrap().lock().text(), grid);
         assert_eq!(
-            terminal_key_bytes(&gpui::Keystroke::parse("secondary-shift-v").unwrap(), false),
+            terminal_key_bytes(&gpui::Keystroke::parse("secondary-j").unwrap(), false),
             None
         );
         assert!(view.read_with(cx, |view, _| view.perf.repaints) > 0);
@@ -1136,6 +1243,7 @@ mod window_tests {
             let terminal = cx.new(|cx| {
                 let mut terminal = TerminalView::new(None, window, cx);
                 terminal.handle = Some(fixture.handle.clone());
+                terminal.visible = true;
                 terminal
             });
             window.focus(&terminal.focus_handle(cx), cx);
@@ -1176,6 +1284,124 @@ mod window_tests {
         assert!(
             elapsed < Duration::from_millis(150),
             "keydown waited for emulator: {elapsed:?}"
+        );
+    }
+    #[gpui::test]
+    fn scrollback_returns_on_key(cx: &mut gpui::TestAppContext) {
+        let fixture = TerminalFixture::new();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            actions::init(cx);
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Theme::apply(Appearance::Dark, window, cx);
+            let terminal = cx.new(|cx| {
+                let mut terminal = TerminalView::new(None, window, cx);
+                terminal.handle = Some(fixture.handle.clone());
+                terminal.visible = true;
+                terminal
+            });
+            window.focus(&terminal.focus_handle(cx), cx);
+            KeyWindow {
+                terminal,
+                switches: Rc::new(Cell::new(0)),
+                new_threads: Rc::new(Cell::new(0)),
+            }
+        });
+        draw(cx);
+        fixture.handle.write(&[b'x'; 200]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while fixture
+            .handle
+            .emulator()
+            .unwrap()
+            .lock()
+            .term
+            .grid()
+            .history_size()
+            == 0
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let view = root.read_with(cx, |root, _| root.terminal.clone());
+        view.update(cx, |view, cx| {
+            view.scroll(veyra_engine::terminal::Scroll::PageUp, cx)
+        });
+        assert!(
+            fixture
+                .handle
+                .emulator()
+                .unwrap()
+                .lock()
+                .term
+                .grid()
+                .display_offset()
+                > 0
+        );
+        cx.simulate_keystrokes("up");
+        assert_eq!(
+            fixture
+                .handle
+                .emulator()
+                .unwrap()
+                .lock()
+                .term
+                .grid()
+                .display_offset(),
+            0
+        );
+    }
+    #[gpui::test]
+    fn hidden_tab_wakes_no_repaint(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            actions::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            Theme::apply(Appearance::Dark, window, cx);
+            TerminalView::new(None, window, cx)
+        });
+        draw(cx);
+        let before = view.read_with(cx, |view, _| view.frame_counts());
+        view.update_in(cx, |view, window, cx| {
+            view.set_visible(false, cx);
+            view.queue_frame(window, cx);
+            assert!(!view.pending_frame);
+        });
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.frame_counts()), before);
+        view.update_in(cx, |view, window, cx| {
+            view.set_visible(true, cx);
+            view.queue_frame(window, cx);
+            assert!(view.pending_frame);
+        });
+        draw(cx);
+        assert!(view.read_with(cx, |view, _| view.frame_counts()).0 > before.0);
+        assert!(view.read_with(cx, |view, _| view.frame_counts()).1 > before.1);
+    }
+}
+
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[201~");
+    }
+    bytes
+}
+
+#[cfg(test)]
+mod paste_tests {
+    #[test]
+    fn paste_is_bracketed_when_asked() {
+        assert_eq!(super::paste_bytes("one\ntwo", false), b"one\ntwo");
+        assert_eq!(
+            super::paste_bytes("one\ntwo", true),
+            b"\x1b[200~one\ntwo\x1b[201~"
         );
     }
 }

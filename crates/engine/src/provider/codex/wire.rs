@@ -568,12 +568,6 @@ pub(super) struct RateWindow {
     pub resets_at: Option<i64>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub(super) struct TurnsPage {
-    pub data: Vec<Turn>,
-    pub next_cursor: Option<String>,
-}
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct UserMessage {

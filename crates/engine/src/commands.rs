@@ -45,10 +45,6 @@ pub enum Command {
         thread: ThreadId,
         drop_queued: bool,
     },
-    SwitchView {
-        thread: ThreadId,
-        to: View,
-    },
     StopThread {
         thread: ThreadId,
     },
@@ -124,10 +120,6 @@ pub fn decide(
             drop_queued,
         } => {
             continue_thread(p, l, &mut c, thread, drop_queued, now)?;
-            Ack::Applied
-        }
-        Command::SwitchView { thread, to } => {
-            switch_view(p, l, &mut c, thread, to)?;
             Ack::Applied
         }
         Command::StopThread { thread } => {
@@ -206,11 +198,8 @@ fn create_thread(
         config,
         cwd: project.path.clone(),
         native: None,
-        native_cursor: None,
         cli_version: None,
         hold: None,
-        view: View::Chat,
-        import_pending: false,
         archived: false,
     };
     c.events.push(Ev::ThreadCreated(Box::new(t.clone())));
@@ -248,22 +237,6 @@ pub fn queue(p: &Projection, c: &mut ChangeSet, thread: ThreadId, origin: TurnOr
     c.turns.insert(turn.id, turn.clone());
     turn.id
 }
-pub fn queue_import(p: &Projection, c: &mut ChangeSet, thread: ThreadId) -> TurnId {
-    let mut queued: Vec<_> = c
-        .turns(p, thread)
-        .filter(|turn| turn.state == TurnState::Queued)
-        .cloned()
-        .collect();
-    queued.sort_by_key(|turn| turn.ordinal);
-    let id = queue(p, c, thread, TurnOrigin::Provider);
-    let ordinal = c.turns[&id].ordinal;
-    for (index, mut turn) in queued.into_iter().enumerate() {
-        turn.ordinal = ordinal + index as u32 + 1;
-        c.events.push(Ev::TurnQueued(turn.clone()));
-        c.turns.insert(turn.id, turn);
-    }
-    id
-}
 pub fn add_item(p: &Projection, c: &mut ChangeSet, mut item: Item) {
     item.seq = c.items(p, item.thread).map(|i| i.seq).max().unwrap_or(0) + 1;
     c.events.push(Ev::ItemAdded(item.clone()));
@@ -294,11 +267,9 @@ fn send(
         set_hold(p, c, thread, None);
     }
     let turn = match &l[&thread].live {
-        Live::Parked
-        | Live::Starting { .. }
-        | Live::Structured { .. }
-        | Live::Terminal { .. }
-        | Live::Stopping { .. } => queue_user(p, c, thread, text),
+        Live::Parked | Live::Starting { .. } | Live::Structured { .. } | Live::Stopping { .. } => {
+            queue_user(p, c, thread, text)
+        }
     };
     Ok(Ack::Turn(turn))
 }
@@ -485,7 +456,6 @@ fn respond(
         Live::Structured { .. } => {
             return Err(CommandError::RequestClosed);
         }
-        Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
         Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
     }
     Ok(())
@@ -511,7 +481,6 @@ fn configure(
             control(c, thread, SessionControl::Shutdown);
             stopping(l, c, thread, AfterStop::Park);
         }
-        Live::Terminal { .. } => return Err(CommandError::Busy(WaitReason::TerminalView)),
         Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
     }
     t.config = config.clone();
@@ -532,68 +501,11 @@ fn continue_thread(
         drop_turns(p, c, thread, true, now);
     }
     match &l[&thread].live {
-        Live::Parked
-        | Live::Starting { .. }
-        | Live::Structured { .. }
-        | Live::Terminal { .. }
-        | Live::Stopping { .. } => set_hold(p, c, thread, None),
+        Live::Parked | Live::Starting { .. } | Live::Structured { .. } | Live::Stopping { .. } => {
+            set_hold(p, c, thread, None)
+        }
     }
     settle_idle_child(p, l, c, thread, true, now);
-    Ok(())
-}
-fn switch_view(
-    p: &Projection,
-    l: &BTreeMap<ThreadId, LiveThread>,
-    c: &mut ChangeSet,
-    thread: ThreadId,
-    to: View,
-) -> Result<(), CommandError> {
-    let mut t = get_thread(p, thread)?.clone();
-    if l[&thread].background_work {
-        return Err(CommandError::Busy(WaitReason::BackgroundWork));
-    }
-    if c.view(p, l, thread).unwrap().pending_request {
-        return Err(CommandError::Busy(WaitReason::PendingRequest));
-    }
-    if to == View::Terminal
-        && t.native.is_none()
-        && matches!(l[&thread].live, Live::Parked | Live::Structured { .. })
-        && !c.view(p, l, thread).unwrap().turn_busy()
-    {
-        return Err(CommandError::Busy(WaitReason::NoNativeSession));
-    }
-    match &l[&thread].live {
-        Live::Parked if to == View::Terminal => {
-            let mut live = l[&thread].clone();
-            live.epoch += 1;
-            c.live.insert(thread, live);
-            c.effects.push(Effect::OpenTerminal { thread });
-        }
-        Live::Starting { .. } => return Err(CommandError::Busy(WaitReason::Starting)),
-        Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
-            return Err(CommandError::Busy(WaitReason::TurnRunning));
-        }
-        Live::Structured { .. } if to == View::Terminal => {
-            control(c, thread, SessionControl::ShutdownForTerminal);
-            stopping(l, c, thread, AfterStop::StartTerminal);
-        }
-        Live::Terminal { pid, .. } if to == View::Chat => {
-            c.effects.push(Effect::StopTerminal { thread });
-            t.import_pending |= pid.is_some();
-            stopping(
-                l,
-                c,
-                thread,
-                AfterStop::StartStructured {
-                    import: t.import_pending,
-                },
-            );
-        }
-        Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
-        Live::Parked | Live::Structured { .. } | Live::Terminal { .. } => {}
-    }
-    t.view = to;
-    c.threads.insert(thread, t);
     Ok(())
 }
 fn reached(p: &Projection, thread: ThreadId, keep_children: bool) -> Vec<ThreadId> {
@@ -716,22 +628,7 @@ pub(crate) fn stop_one(
         Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
             interrupt_active(p, l, c, thread, reason);
         }
-        Live::Terminal { pid, .. } => {
-            c.effects.push(Effect::StopTerminal { thread });
-            stopping(l, c, thread, AfterStop::Park);
-            let mut row = c.thread(p, thread).unwrap().clone();
-            row.view = View::Chat;
-            row.import_pending |= pid.is_some();
-            c.threads.insert(thread, row);
-        }
-        Live::Stopping { then } => {
-            let imported = matches!(then, AfterStop::StartStructured { import: true });
-            stopping(l, c, thread, AfterStop::Park);
-            let mut row = c.thread(p, thread).unwrap().clone();
-            row.view = View::Chat;
-            row.import_pending |= imported;
-            c.threads.insert(thread, row);
-        }
+        Live::Stopping { .. } => stopping(l, c, thread, AfterStop::Park),
         Live::Parked | Live::Structured { .. } => {}
     }
     end_active(p, l, c, thread, reason, now);
@@ -874,7 +771,7 @@ pub fn start_changed(
             continue;
         }
         match v.live.live {
-            Live::Parked => spawn(l, c, id, false),
+            Live::Parked => spawn(l, c, id),
             Live::Structured { .. } => {
                 let mut t = c
                     .turns(p, id)
@@ -893,18 +790,18 @@ pub fn start_changed(
                     turn: t.id,
                 });
             }
-            Live::Starting { .. } | Live::Terminal { .. } | Live::Stopping { .. } => {}
+            Live::Starting { .. } | Live::Stopping { .. } => {}
         }
     }
 }
-pub fn spawn(l: &BTreeMap<ThreadId, LiveThread>, c: &mut ChangeSet, id: ThreadId, import: bool) {
+pub fn spawn(l: &BTreeMap<ThreadId, LiveThread>, c: &mut ChangeSet, id: ThreadId) {
     let mut live = c.live(l, id).clone();
     live.epoch += 1;
     live.live = Live::Starting { session: None };
     live.admission = None;
     live.background_work = false;
     c.live.insert(id, live);
-    c.effects.push(Effect::Spawn { thread: id, import });
+    c.effects.push(Effect::Spawn { thread: id });
 }
 pub fn turn_text(p: &Projection, c: &ChangeSet, turn: &Turn) -> String {
     match &turn.origin {

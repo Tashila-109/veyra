@@ -22,7 +22,7 @@ ENV = {key:value for key,value in os.environ.items() if not (
     or key in ['CLAUDE_PID','CLAUDE_EFFORT','CLAUDECODE','CLAUDE_AGENT_SDK_VERSION'])}
 ENV['VEYRA_DATA_DIR'] = str(DATA)
 ENV['VEYRA_REAP_PIDS'] = ''
-for name in ['VEYRA_CLAUDE_BIN','VEYRA_CODEX_BIN','VEYRA_GROK_BIN','VEYRA_FAKE_FIXTURES','VEYRA_FAKE_FIXTURE','VEYRA_RECORD']:
+for name in ['VEYRA_CLAUDE_BIN','VEYRA_CODEX_BIN','VEYRA_GROK_BIN','VEYRA_FAKE_FIXTURES','VEYRA_FAKE_FIXTURE','VEYRA_RECORD','VEYRA_DEBUG_SHELL_FIXTURE']:
     ENV.pop(name,None)
 BRANCH_BIN = DATA/'branch-bin'
 if LANE == 'fake':
@@ -30,6 +30,9 @@ if LANE == 'fake':
     ENV['HOME'] = str(DATA/'home')
     ENV['PATH'] = str(BRANCH_BIN)+os.pathsep+ENV['PATH']
     ENV['CLAUDE_CONFIG_DIR'] = str(DATA/'claude-home')
+    ENV['VEYRA_DEBUG_SHELL_FIXTURE'] = str(FIXTURES.resolve()/'drawer.jsonl')
+    if not (FIXTURES/'drawer.jsonl').exists():
+        shutil.copyfile('crates/engine/tests/fixtures/tui/echo.jsonl',FIXTURES/'drawer.jsonl')
     ENV.update(VEYRA_CLAUDE_BIN=str(DATA/'fake-cli'),VEYRA_CODEX_BIN=str(DATA/'fake-cli'),
         VEYRA_GROK_BIN=str(DATA/'fake-cli'),
         VEYRA_FAKE_FIXTURES=str(FIXTURES.resolve()),
@@ -167,8 +170,15 @@ def guarded_capture(name):
     subprocess.run([helper,pid,window],check=True)
     dump = ctl(name+'-capture-state','dump')
     visible = {key:dump[key] for key in ['view','sidebar','selected_thread','transcript','composer_text',
-        'composer','settings','notice','quit_sheet','view_refusal']}
-    visible['terminal'] = None if dump['terminal'] is None else {key:dump['terminal'][key] for key in ['grid','focused','columns','rows']}
+        'composer','settings','notice','quit_sheet','focus','composer_caret']}
+    drawer = dump['drawer']
+    visible['drawer'] = None if drawer is None else {'open':drawer['open']}
+    if drawer and drawer['open']:
+        active = next(tab for tab in drawer['tabs'] if tab['number']==drawer['active_tab'])
+        visible['drawer'].update(height=drawer['height'],active_tab=drawer['active_tab'],
+            tabs=[{key:tab[key] for key in ['number','label']} for tab in drawer['tabs']],
+            status={key:active[key] for key in ['exit_code','exited','error']},close_sheet=drawer['close_sheet'],
+            terminal=None if drawer['terminal'] is None else {key:drawer['terminal'][key] for key in ['grid','focused','columns','rows']})
     visible['providers'] = [probe['readiness'] for probe in dump['providers']]
     state = json.dumps(visible,sort_keys=True)
     target = PROOF/(name+'.png')
@@ -343,28 +353,24 @@ def start(label):
 def restart(label, crash=False):
     stop(label,crash)
     return start(label)
-def terminal_seed(thread):
+def drawer_fixture(name='echo', job=False):
     assert LANE == 'fake'
-    native = sql("select native_id from threads where id='"+thread+"'")
-    cursor = sql("select native_cursor from threads where id='"+thread+"'")
-    assert native and cursor
-    path = DATA/'claude-home'/'projects'/'veyra-fake'/(native+'.jsonl')
-    path.parent.mkdir(parents=True,exist_ok=True)
-    if not path.exists():
-        entry = {'sessionId':native,'uuid':cursor,'parentUuid':None,'isSidechain':False,
-            'type':'user','entrypoint':'sdk-cli','message':{'role':'user','content':'Already shown in chat'}}
-        path.write_text(json.dumps(entry)+'\n')
-    return native,path
-def terminal_enter(name, fixture='echo'):
-    source = pathlib.Path('crates/engine/tests/fixtures/tui')/(fixture+'.jsonl')
-    stage_records([json.loads(line) for line in source.read_text().splitlines()])
-    ctl(name+'-switch','keys','cmd-shift-v')
-    return poll(name,lambda d:d['view']=='terminal' and d['terminal']['focused']
-        and 'VEYRA_TUI_READY' in ''.join(d['terminal']['grid']))
-def terminal_back(name, scenario='ok-reply'):
-    stage(scenario)
-    ctl(name+'-switch','keys','cmd-shift-v')
-    return poll(name,lambda d:d['view']=='chat' and not d['selected_thread']['import_pending'])
+    source = pathlib.Path('crates/engine/tests/fixtures/tui')/(name+'.jsonl')
+    records = [json.loads(line) for line in source.read_text().splitlines()]
+    if name == 'echo':
+        records.insert(0,dict(type='emit_raw',base64='G1s/MjAwNGg='))
+    if job:
+        records = [dict(type='transcript_start',provider='shell',protocol='terminal',cli_version='fixture',
+            scenario='shell-background-job',source='scripted'),*records]
+    link_fixture('drawer.jsonl',fixture_source(records))
+def drawer_keys(name, chord, before, after, draft=None, caret=None):
+    state = ctl(name+'-before','dump')
+    assert state['focus'] == before, (name,state['focus'],before)
+    ctl(name+'-key','keys',chord)
+    state = poll(name,lambda d:d['focus'] == after)
+    if draft is not None: assert state['composer_text'] == draft
+    if caret is not None: assert state['composer_caret'] == caret
+    return state
 def fixture_source(records):
     text = '\n'.join(json.dumps(record) for record in records)+'\n'
     folder = FIXTURES/'records'
@@ -417,7 +423,7 @@ def stage(scenario, slow=False, turns=1):
                     part['after_ms'] = 500
                     expanded.append(part)
             else:
-                if wire.get('type') == 'result': record['after_ms'] = 500
+                if wire.get('type') == 'result': record['after_ms'] = 1500
                 expanded.append(record)
         records = expanded
     if scenario == 'background-tasks':

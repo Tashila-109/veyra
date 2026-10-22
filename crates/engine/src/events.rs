@@ -86,10 +86,6 @@ pub struct ThreadSnapshot {
 pub enum Effect {
     Spawn {
         thread: ThreadId,
-        import: bool,
-    },
-    OpenTerminal {
-        thread: ThreadId,
     },
     StartTurn {
         thread: ThreadId,
@@ -98,9 +94,6 @@ pub enum Effect {
     Control {
         thread: ThreadId,
         control: SessionControl,
-    },
-    StopTerminal {
-        thread: ThreadId,
     },
 }
 #[derive(Default, Clone)]

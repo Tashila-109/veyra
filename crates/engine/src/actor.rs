@@ -29,17 +29,11 @@ pub enum EngineMsg {
         reply: oneshot::Sender<ThreadSnapshot>,
     },
     Provider {
-        cursor: Option<CursorUpdate>,
         thread: ThreadId,
         epoch: u32,
         event: ProviderEvent,
     },
 
-    Terminal {
-        thread: ThreadId,
-        epoch: u32,
-        event: TerminalEvent,
-    },
     Tool {
         caller: ThreadId,
         session: Option<crate::mcp::Caller>,
@@ -59,7 +53,6 @@ impl EngineMsg {
             Self::Command { .. } => "command",
             Self::Snapshot { .. } => "snapshot",
             Self::Provider { .. } => "provider",
-            Self::Terminal { .. } => "terminal",
             Self::Tool { .. } => "tool",
             Self::Tick => "tick",
             Self::TextFlush => "text_flush",
@@ -77,7 +70,6 @@ struct TextBuffer {
 }
 enum Dispatch {
     Session(mpsc::UnboundedSender<SessionControl>, SessionControl),
-    Terminal(mpsc::UnboundedSender<TerminalControl>),
 }
 struct Blocked {
     changes: ChangeSet,
@@ -336,24 +328,7 @@ impl Actor {
                     let _ = reply.send(Err(CommandError::Closed));
                     return;
                 }
-                EngineMsg::Terminal {
-                    thread,
-                    epoch,
-                    event: TerminalEvent::Exited { started, crash },
-                } if self.current(thread, epoch) => {
-                    self.state.terminals.lock().unwrap().remove(&thread);
-                    if self.blocked.is_some() {
-                        let live = self.live.get_mut(&thread).unwrap();
-                        live.live = Live::Parked;
-                        live.background_work = false;
-                    } else {
-                        let c = self.terminal_exited(thread, started, crash);
-                        self.commit_event(c);
-                    }
-                    return;
-                }
                 EngineMsg::Provider {
-                    cursor: None,
                     thread,
                     epoch,
                     event:
@@ -372,7 +347,6 @@ impl Actor {
                     return;
                 }
                 EngineMsg::Provider {
-                    cursor: None,
                     thread,
                     epoch,
                     event: ProviderEvent::Session(SessionEvent::Exited { crash }),
@@ -382,7 +356,6 @@ impl Actor {
                     return;
                 }
                 EngineMsg::Provider {
-                    cursor: None,
                     thread,
                     epoch,
                     event: ProviderEvent::Session(SessionEvent::ResolutionFailed { error }),
@@ -415,7 +388,7 @@ impl Actor {
                     let _ = reply.send(Err(CommandError::StorageBlocked(blocked.error.clone())));
                     return;
                 }
-                EngineMsg::Provider { .. } | EngineMsg::Terminal { .. } => {
+                EngineMsg::Provider { .. } => {
                     blocked.deferred.push_back(msg);
                     return;
                 }
@@ -488,41 +461,9 @@ impl Actor {
                 thread,
                 epoch,
                 event,
-                cursor,
             } => {
                 let c = self.provider(thread, epoch, event);
-                if let Some(mut c) = c {
-                    if let Some(cursor) = cursor {
-                        self.apply_cursor(&mut c, thread, cursor.value());
-                    }
-                    self.commit_event(c);
-                }
-            }
-            EngineMsg::Terminal {
-                thread,
-                epoch,
-                event: TerminalEvent::Ready { pid },
-            } => {
-                if self.current(thread, epoch)
-                    && let Live::Terminal { term, .. } = &self.live[&thread].live
-                {
-                    let mut live = self.live[&thread].clone();
-                    live.live = Live::Terminal {
-                        term: term.clone(),
-                        pid: Some(pid),
-                    };
-                    let mut c = ChangeSet::default();
-                    c.live.insert(thread, live);
-                    self.commit_event(c);
-                }
-            }
-            EngineMsg::Terminal {
-                thread,
-                epoch,
-                event: TerminalEvent::Exited { started, crash },
-            } => {
-                if self.current(thread, epoch) {
-                    let c = self.terminal_exited(thread, started, crash);
+                if let Some(c) = c {
                     self.commit_event(c);
                 }
             }
@@ -743,9 +684,6 @@ impl Actor {
                         };
                     let _ = session.control.send(control);
                 }
-                if let Live::Terminal { term, .. } = &live.live {
-                    let _ = term.control.send(TerminalControl::Stop);
-                }
             }
             let error = error.to_string();
             self.publish(UiEvent::StorageBlocked {
@@ -780,23 +718,18 @@ impl Actor {
         }
     }
     fn install(&mut self, c: ChangeSet) {
-        let controls: Vec<_> = c
-            .effects
-            .iter()
-            .filter_map(|effect| match effect {
-                Effect::Control { thread, control } => self
-                    .live
-                    .get(thread)?
-                    .live
-                    .session()
-                    .map(|session| Dispatch::Session(session.control.clone(), control.clone())),
-                Effect::StopTerminal { thread } => match &self.live.get(thread)?.live {
-                    Live::Terminal { term, .. } => Some(Dispatch::Terminal(term.control.clone())),
+        let controls: Vec<_> =
+            c.effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::Control { thread, control } => {
+                        self.live.get(thread)?.live.session().map(|session| {
+                            Dispatch::Session(session.control.clone(), control.clone())
+                        })
+                    }
                     _ => None,
-                },
-                _ => None,
-            })
-            .collect();
+                })
+                .collect();
         let ended: BTreeSet<_> = c
             .turns
             .values()
@@ -891,51 +824,31 @@ impl Actor {
                 Dispatch::Session(sender, control) => {
                     let _ = sender.send(control);
                 }
-                Dispatch::Terminal(sender) => {
-                    let _ = sender.send(TerminalControl::Stop);
-                }
             }
         }
         for effect in effects {
             if self.state.closing.is_closing()
-                && matches!(
-                    effect,
-                    Effect::Spawn { .. } | Effect::StartTurn { .. } | Effect::OpenTerminal { .. }
-                )
+                && matches!(effect, Effect::Spawn { .. } | Effect::StartTurn { .. })
             {
                 continue;
             }
             match effect {
-                Effect::Spawn { thread, import } => {
+                Effect::Spawn { thread } => {
                     let row = &self.projection.threads[&thread];
                     let spec = SessionSpec {
                         thread,
                         cwd: row.cwd.clone(),
                         config: row.config.clone(),
                         native: row.native.clone(),
-                        import: (import || row.import_pending)
-                            .then(|| self.history_request(thread)),
                         root: matches!(row.lineage, Lineage::Root),
                     };
                     let epoch = self.live[&thread].epoch;
-                    match self
+                    let session = self
                         .spawner
-                        .spawn(row.provider, spec, self.out.clone(), epoch)
-                    {
-                        Ok(session) => {
-                            self.live.get_mut(&thread).unwrap().live = Live::Starting {
-                                session: Some(session),
-                            }
-                        }
-                        Err(error) => self.post(EngineMsg::Provider {
-                            cursor: None,
-                            thread,
-                            epoch,
-                            event: ProviderEvent::Session(SessionEvent::Exited {
-                                crash: Some(error.to_string()),
-                            }),
-                        }),
-                    }
+                        .spawn(row.provider, spec, self.out.clone(), epoch);
+                    self.live.get_mut(&thread).unwrap().live = Live::Starting {
+                        session: Some(session),
+                    };
                 }
                 Effect::StartTurn { thread, turn } => {
                     let text = commands::turn_text(
@@ -949,60 +862,9 @@ impl Actor {
                             .send(SessionControl::StartTurn { turn, text });
                     }
                 }
-                Effect::OpenTerminal { thread } => {
-                    let row = &self.projection.threads[&thread];
-                    let spec = SessionSpec {
-                        thread,
-                        cwd: row.cwd.clone(),
-                        config: row.config.clone(),
-                        native: row.native.clone(),
-                        import: None,
-                        root: false,
-                    };
-                    let epoch = self.live[&thread].epoch;
-                    let colors = *self.state.terminal_colors.lock().unwrap();
-                    match self
-                        .spawner
-                        .terminal(colors, row.provider, spec, self.out.clone(), epoch)
-                    {
-                        Ok(term) => {
-                            self.state
-                                .terminals
-                                .lock()
-                                .unwrap()
-                                .insert(thread, term.clone());
-                            self.live.get_mut(&thread).unwrap().live =
-                                Live::Terminal { term, pid: None };
-                            let event = ChangeSet::default().status_event(
-                                &self.projection,
-                                &self.live,
-                                thread,
-                            );
-                            let counter = self.next_counter(thread);
-                            self.publish(UiEvent::Change {
-                                counter: Some(counter),
-                                event,
-                            });
-                        }
-                        Err(error) => self.post(EngineMsg::Terminal {
-                            thread,
-                            epoch,
-                            event: TerminalEvent::Exited {
-                                started: false,
-                                crash: Some(crate::record::redact(&error.to_string(), None)),
-                            },
-                        }),
-                    }
-                }
-                Effect::Control { .. } | Effect::StopTerminal { .. } => {}
+                Effect::Control { .. } => {}
             }
         }
-    }
-    fn post(&self, message: EngineMsg) {
-        let out = self.out.clone();
-        tokio::spawn(async move {
-            let _ = out.send(message).await;
-        });
     }
     fn current(&self, thread: ThreadId, epoch: u32) -> bool {
         self.live.get(&thread).is_some_and(|l| l.epoch == epoch)
@@ -1078,14 +940,6 @@ impl Actor {
                 c.turns.insert(turn.id, turn);
                 return Some(c);
             }
-            ProviderEvent::Session(SessionEvent::History { native, history }) => {
-                if self.projection.threads[&thread].native.as_ref() != Some(&native)
-                    || !self.projection.threads[&thread].import_pending
-                {
-                    return None;
-                }
-                self.import_history(&mut c, thread, history);
-            }
             ProviderEvent::Session(SessionEvent::Ready {
                 native,
                 cli_version,
@@ -1113,16 +967,6 @@ impl Actor {
                 };
                 live.capabilities = capabilities;
                 c.live.insert(thread, live);
-                if self.projection.threads[&thread].import_pending {
-                    self.import_history(
-                        &mut c,
-                        thread,
-                        History {
-                            failed: true,
-                            ..Default::default()
-                        },
-                    );
-                }
                 let mut t = c.thread(&self.projection, thread).unwrap().clone();
                 t.native = Some(native.clone());
                 if let Some(cli_version) = cli_version {
@@ -1141,12 +985,6 @@ impl Actor {
                     native,
                     cli_version,
                 });
-                if self.projection.threads[&thread].view == View::Terminal {
-                    commands::control(&mut c, thread, SessionControl::Shutdown);
-                    c.live.get_mut(&thread).unwrap().live = Live::Stopping {
-                        then: AfterStop::StartTerminal,
-                    };
-                }
             }
             ProviderEvent::Session(SessionEvent::Notice { text }) => {
                 if let Some(turn) = notice_turn(&self.projection, &c, thread, "session") {
@@ -1470,96 +1308,6 @@ impl Actor {
             }
         }
     }
-    fn apply_cursor(&self, c: &mut ChangeSet, thread: ThreadId, cursor: Option<NativeCursor>) {
-        if c.thread(&self.projection, thread).unwrap().native_cursor != cursor {
-            let mut row = c.thread(&self.projection, thread).unwrap().clone();
-            row.native_cursor = cursor;
-            c.threads.insert(thread, row);
-        }
-    }
-    fn import_history(&self, c: &mut ChangeSet, thread: ThreadId, mut history: History) {
-        let failed = history.failed
-            || c.thread(&self.projection, thread)
-                .unwrap()
-                .native_cursor
-                .is_none();
-        history
-            .text
-            .retain(|ch| ch >= ' ' && ch != '\u{7f}' || matches!(ch, '\n' | '\t'));
-        if failed || !history.text.is_empty() {
-            let turn = commands::queue_import(&self.projection, c, thread);
-            let body = if failed {
-                ItemBody::Notice(Notice {
-                    text: IMPORT_NOTICE.into(),
-                })
-            } else {
-                ItemBody::TerminalSpan(TerminalSpan { text: history.text })
-            };
-            commands::add_item(
-                &self.projection,
-                c,
-                Item {
-                    id: ItemId::new(),
-                    thread,
-                    turn,
-                    seq: 0,
-                    body,
-                },
-            );
-            let turn = c.turns[&turn].clone();
-            commands::end_turn(&self.projection, c, turn, TurnOutcome::Completed, now());
-        }
-        self.apply_cursor(c, thread, history.cursor);
-        let mut row = c.thread(&self.projection, thread).unwrap().clone();
-        row.import_pending = false;
-        c.threads.insert(thread, row);
-    }
-    fn history_request(&self, thread: ThreadId) -> HistoryRequest {
-        HistoryRequest {
-            cursor: self.projection.threads[&thread].native_cursor.clone(),
-            sent: self
-                .projection
-                .turns_for(thread)
-                .filter(|turn| !matches!(turn.origin, TurnOrigin::Provider))
-                .map(|turn| turn.id.to_string())
-                .collect(),
-        }
-    }
-    fn terminal_exited(&self, thread: ThreadId, started: bool, crash: Option<String>) -> ChangeSet {
-        let mut c = self.exited(thread, crash.clone());
-        let mut row = c.thread(&self.projection, thread).unwrap().clone();
-        row.view = View::Chat;
-        row.import_pending |= started;
-        c.threads.insert(thread, row);
-        if let Some(message) = crash {
-            let turn = commands::queue(&self.projection, &mut c, thread, TurnOrigin::Provider);
-            commands::add_item(
-                &self.projection,
-                &mut c,
-                Item {
-                    id: ItemId::new(),
-                    thread,
-                    turn,
-                    seq: 0,
-                    body: ItemBody::Notice(Notice {
-                        text: message.clone(),
-                    }),
-                },
-            );
-            let turn = c.turns[&turn].clone();
-            commands::end_turn(
-                &self.projection,
-                &mut c,
-                turn,
-                TurnOutcome::Failed { message },
-                now(),
-            );
-        }
-        if !self.state.closing.is_closing() {
-            commands::start_changed(&self.projection, &self.live, &mut c, now());
-        }
-        c
-    }
     fn resolution_failed(&self, thread: ThreadId, error: String) -> ChangeSet {
         let mut c = self.exited(thread, Some(error));
         if matches!(self.live[&thread].live, Live::Starting { .. }) {
@@ -1573,7 +1321,6 @@ impl Actor {
         {
             server.revoke(thread, self.live[&thread].epoch);
         }
-        self.state.terminals.lock().unwrap().remove(&thread);
         let mut c = ChangeSet::default();
         let old = &self.live[&thread];
         let active: Vec<_> = self
@@ -1631,26 +1378,6 @@ impl Actor {
         live.background_work = false;
         c.live.insert(thread, live);
 
-        if !self.state.closing.is_closing() {
-            match &old.live {
-                Live::Stopping {
-                    then: AfterStop::StartStructured { import },
-                } => commands::spawn(&self.live, &mut c, thread, *import),
-                Live::Stopping {
-                    then: AfterStop::StartTerminal,
-                } => {
-                    c.live.get_mut(&thread).unwrap().epoch += 1;
-                    c.effects.push(Effect::OpenTerminal { thread });
-                }
-                Live::Parked
-                | Live::Starting { .. }
-                | Live::Structured { .. }
-                | Live::Terminal { .. }
-                | Live::Stopping {
-                    then: AfterStop::Park,
-                } => {}
-            }
-        }
         commands::settle_idle_child(&self.projection, &self.live, &mut c, thread, false, now());
         if !self.state.closing.is_closing() {
             commands::start_changed(&self.projection, &self.live, &mut c, now());
@@ -1702,10 +1429,9 @@ impl Actor {
     fn prepare_commit(&self, c: &mut ChangeSet) {
         debug_assert!(
             !self.shutting_down
-                || c.effects.iter().all(|effect| matches!(
-                    effect,
-                    Effect::Control { .. } | Effect::StopTerminal { .. }
-                ))
+                || c.effects
+                    .iter()
+                    .all(|effect| matches!(effect, Effect::Control { .. }))
         );
         let ended: std::collections::BTreeSet<_> = c
             .turns
@@ -2087,9 +1813,6 @@ impl Actor {
                 live.background_work = false;
                 c.live.insert(thread, live);
             }
-            if let Live::Terminal { .. } = &live.live {
-                c.effects.push(Effect::StopTerminal { thread });
-            }
         }
         self.commit_event(c);
         if self.blocked.is_none() {
@@ -2158,7 +1881,6 @@ mod tests {
             Live::Starting { session: Some(_) }
         ));
         actor.handle(EngineMsg::Provider {
-            cursor: None,
             thread,
             epoch: actor.live[&thread].epoch,
             event: ProviderEvent::Session(SessionEvent::ResolutionFailed {
@@ -2244,11 +1966,7 @@ mod tests {
     fn shutdown_exit_decides_no_restart_or_queued_start() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _entered = runtime.enter();
-        for then in [
-            AfterStop::Park,
-            AfterStop::StartStructured { import: false },
-            AfterStop::StartTerminal,
-        ] {
+        for then in [AfterStop::Park] {
             for hold in [None, Some(HoldReason::Interrupted)] {
                 let mut db = Connection::open_in_memory().unwrap();
                 store::initialize(&mut db).unwrap();
@@ -2290,10 +2008,9 @@ mod tests {
                 actor.handle(EngineMsg::Shutdown);
                 let c = actor.exited(thread, None);
                 assert!(
-                    c.effects.iter().all(|effect| matches!(
-                        effect,
-                        Effect::Control { .. } | Effect::StopTerminal { .. }
-                    )),
+                    c.effects
+                        .iter()
+                        .all(|effect| matches!(effect, Effect::Control { .. })),
                     "shutdown proposed a start effect"
                 );
                 assert_eq!(c.live[&thread].epoch, epoch);

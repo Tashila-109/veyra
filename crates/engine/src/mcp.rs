@@ -814,7 +814,6 @@ mod attempt_tests {
                     },
                     native: Some(NativeSessionId("old-thread".into())),
 
-                    import: None,
                     root: true,
                 },
                 std::process::id(),
@@ -1122,7 +1121,6 @@ async fn codex_rejected_optional_keys_retry_independently() {
                     mode: PermissionMode::AskFirst,
                 },
                 native: resume.then(|| NativeSessionId("retained".into())),
-                import: None,
                 root: true,
             },
             std::process::id(),

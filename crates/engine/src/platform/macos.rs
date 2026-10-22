@@ -1022,3 +1022,57 @@ fn raw_terminal_input_preserves_escape_and_carriage_return() {
     ready.unwrap();
     assert!(status.unwrap().success());
 }
+
+pub fn user_shell() -> PathBuf {
+    env::var_os("SHELL")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/zsh"))
+}
+pub fn foreground_group(pty: i32) -> io::Result<u32> {
+    let group = unsafe { libc::tcgetpgrp(pty) };
+    if group <= 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(group as u32)
+    }
+}
+pub fn child_pids(pid: u32) -> io::Result<Vec<u32>> {
+    let mut children = vec![0u32; 64];
+    loop {
+        let count = unsafe {
+            libc::proc_listchildpids(
+                pid as i32,
+                children.as_mut_ptr().cast(),
+                (children.len() * std::mem::size_of::<u32>()) as i32,
+            )
+        };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = count as usize;
+        if count < children.len() {
+            children.truncate(count);
+            children.retain(|pid| bsd_info(*pid).is_ok_and(|info| info.pbi_status != 5));
+            return Ok(children);
+        }
+        children.resize(children.len() * 2, 0);
+    }
+}
+
+pub struct ShellJob(std::process::Child);
+impl Drop for ShellJob {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+pub fn shell_fixture_job() -> io::Result<ShellJob> {
+    Command::new("/bin/sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(ShellJob)
+}

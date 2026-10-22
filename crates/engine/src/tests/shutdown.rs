@@ -328,30 +328,26 @@ fn quit_during_stop_drain_keeps_queued_work_held_after_reload() {
 }
 
 #[test]
-fn quit_while_stopping_cancels_session_and_terminal_restarts() {
-    for then in [
-        AfterStop::Park,
-        AfterStop::StartStructured { import: false },
-        AfterStop::StartTerminal,
-    ] {
-        let mut f = Fixture::new(LiveState::Stopping);
-        f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping { then };
-        let queued = f.user("waiting for retiring session");
-        let _entered = f.runtime.enter();
-        f.actor.handle(EngineMsg::Shutdown);
-        f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
-        assert!(
-            matches!(f.actor.live[&f.thread].live, Live::Parked),
-            "quit restarted a stopping thread: {:?}",
-            f.actor.live[&f.thread].live
-        );
-        assert_eq!(f.running(), None);
-        assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
-        assert_eq!(
-            f.loaded().threads[&f.thread].hold,
-            Some(HoldReason::Restarted)
-        );
-    }
+fn quit_while_stopping_keeps_queued_work_parked() {
+    let mut f = Fixture::new(LiveState::Stopping);
+    f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping {
+        then: AfterStop::Park,
+    };
+    let queued = f.user("waiting for retiring session");
+    let _entered = f.runtime.enter();
+    f.actor.handle(EngineMsg::Shutdown);
+    f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
+    assert!(
+        matches!(f.actor.live[&f.thread].live, Live::Parked),
+        "quit restarted a stopping thread: {:?}",
+        f.actor.live[&f.thread].live
+    );
+    assert_eq!(f.running(), None);
+    assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
+    assert_eq!(
+        f.loaded().threads[&f.thread].hold,
+        Some(HoldReason::Restarted)
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -483,7 +479,6 @@ fn shutdown_request_prevents_ready_start_before_mailbox_shutdown() {
         .inner
         .sender
         .try_send(EngineMsg::Provider {
-            cursor: None,
             thread: f.thread,
             epoch: 1,
             event: ProviderEvent::Session(SessionEvent::Ready {
@@ -550,11 +545,7 @@ fn shutdown_request_rejects_backlogged_start_commands() {
 #[test]
 fn shutdown_request_prevents_retiring_session_restart_before_mailbox_shutdown() {
     let mut restarted = Vec::new();
-    for then in [
-        AfterStop::Park,
-        AfterStop::StartStructured { import: false },
-        AfterStop::StartTerminal,
-    ] {
+    for then in [AfterStop::Park] {
         for hold in [None, Some(HoldReason::Interrupted)] {
             let mut f = Fixture::new(LiveState::Stopping);
             f.hold(hold);
@@ -576,7 +567,6 @@ fn shutdown_request_prevents_retiring_session_restart_before_mailbox_shutdown() 
                 .inner
                 .sender
                 .try_send(EngineMsg::Provider {
-                    cursor: None,
                     thread: f.thread,
                     epoch: 1,
                     event: ProviderEvent::Session(SessionEvent::Exited { crash: None }),
@@ -689,4 +679,115 @@ fn shutdown_between_actor_check_and_decide_commits_then_holds_turn() {
         assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Shutdown);
         assert!(f.controls.try_recv().is_err());
     }
+}
+
+#[cfg(debug_assertions)]
+fn fake_binary() -> std::path::PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("veyra-fake-cli")
+}
+#[cfg(debug_assertions)]
+#[allow(clippy::disallowed_types)] // Hand-written fake-provider wire records.
+fn session_fixture(
+    provider: ProviderKind,
+    records: &[serde_json::Value],
+) -> (Fixture, Scratch, env::ChildEnv) {
+    let mut f = Fixture::new(LiveState::Parked);
+    let root = std::path::Path::new("/tmp").join(format!("veyra-term-fixture-{}", ThreadId::new()));
+    crate::platform::private_dir(&root).unwrap();
+    std::fs::write(
+        root.join("t1-s1.jsonl"),
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let mut c = ChangeSet::default();
+    let mut row = f.actor.projection.threads[&f.thread].clone();
+    row.provider = provider;
+    row.cwd = root.clone();
+    row.native = Some(NativeSessionId(ThreadId::new().to_string()));
+    c.threads.insert(f.thread, row);
+    f.save(c);
+    let mut db = store::open(&root.join("test.db")).unwrap();
+    let tx = db.transaction().unwrap();
+    store::apply(
+        &tx,
+        &ChangeSet {
+            projects: f.actor.projection.projects.clone(),
+            threads: f.actor.projection.threads.clone(),
+            ..Default::default()
+        },
+        now(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    f.actor.db = db;
+    let mut env = env::ChildEnv::isolated().with_binary(provider, fake_binary());
+    env.fixtures = Some(root.clone());
+    (f, Scratch(root), env)
+}
+#[cfg(debug_assertions)]
+#[test]
+fn plain_shutdown_has_no_switch_grace() {
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+    let (f, scratch, env) = session_fixture(
+        ProviderKind::Claude,
+        &[
+            json!({"type":"expect_outbound","line":{"type":"control_request","request_id":"<id:init>","request\
+                ":{"subtype":"initialize"}}}),
+            json!({"type":"emit_inbound","line":{"type":"control_response","response":{"subtype":"success","req\
+                uest_id":"<id:init>","response":{}}}}),
+            json!({"type":"spin","ms":1600}),
+            json!({"type":"touch","path":"graceful-exit"}),
+            json!({"type":"exit","code":0}),
+        ],
+    );
+    f.runtime.block_on(async {
+        let (out, mut events) = mpsc::channel(256);
+        let handle = session::spawn(
+            SessionSpec {
+                thread: f.thread,
+                cwd: scratch.0.clone(),
+                config: config(),
+                native: None,
+                root: false,
+            },
+            env,
+            out,
+            1,
+        );
+        let elapsed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut started = None;
+            while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
+                match event {
+                    ProviderEvent::Session(SessionEvent::Ready { .. }) => {
+                        started = Some(Instant::now());
+                        handle.control.send(SessionControl::Shutdown).unwrap();
+                    }
+                    ProviderEvent::Session(SessionEvent::Exited { crash }) => {
+                        assert_eq!(crash, None);
+                        return started.unwrap().elapsed();
+                    }
+                    _ => {}
+                }
+            }
+            panic!("missing exit")
+        })
+        .await
+        .unwrap();
+        assert!(
+            elapsed < Duration::from_millis(1300),
+            "ordinary Shutdown took {elapsed:?}"
+        );
+        assert!(!scratch.0.join("graceful-exit").exists());
+    });
 }

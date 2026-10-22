@@ -51,6 +51,7 @@ if LANE == 'fake':
 assert dump['login_path'] in ['pending','loaded','fallback']
 assert dump['sidebar']['width'] == 240 and dump['sidebar']['rows'] == []
 assert dump['notice'] is None and dump['view'] == 'new_thread'
+assert dump['drawer'] is None and dump['focus'] == 'composer'
 capture('window-launch')
 start = time.monotonic()
 second = subprocess.Popen(['target/debug/veyra'],env=ENV,stdout=(PROOF/'second-launch.txt').open('w'),

@@ -8,7 +8,7 @@ pub(super) fn priority(status: &Status) -> u8 {
         Status::Held => 2,
         Status::Interrupted => 3,
         Status::Working { .. } => 4,
-        Status::InTerminal => 5,
+
         Status::Done { .. } => 6,
         Status::Idle => 7,
     }
@@ -80,11 +80,10 @@ mod tests {
             },
             cwd: "/tmp".into(),
             native: None,
-            native_cursor: None,
+
             cli_version: None,
             hold: None,
-            view: View::Chat,
-            import_pending: false,
+
             archived: false,
         };
         let turn = Turn {

@@ -50,14 +50,6 @@ pub fn decide(p: &Projection, now: Millis) -> ChangeSet {
         }
         set_hold(p, &mut c, req.thread, Some(HoldReason::Restarted));
     }
-    for t in p.threads.values().filter(|t| t.view == View::Terminal) {
-        let mut t = c.thread(p, t.id).unwrap().clone();
-        t.view = View::Chat;
-        t.import_pending = true;
-        let id = t.id;
-        c.threads.insert(id, t);
-        set_hold(p, &mut c, id, Some(HoldReason::Restarted));
-    }
     let tasks: Vec<_> = c.tasks(p).cloned().collect();
     for mut task in tasks {
         if let TaskState::Settled {

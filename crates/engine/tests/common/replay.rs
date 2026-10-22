@@ -99,35 +99,31 @@ pub fn replay(
                 .unwrap(),
             ));
         }
-        let handle = Spawner::Cli(Box::new(env))
-            .spawn(
-                provider,
-                SessionSpec {
-                    thread,
-                    cwd: scratch.0.canonicalize().unwrap(),
-                    config: ThreadConfig {
-                        model: (provider == ProviderKind::Codex).then(|| "veyra-model".into()),
-                        effort: (provider == ProviderKind::Codex).then(|| "medium".into()),
-                        mode,
-                    },
-                    native: resume.then(|| {
-                        NativeSessionId(
-                            if provider == ProviderKind::Codex {
-                                "missing-native"
-                            } else {
-                                "retained-session"
-                            }
-                            .into(),
-                        )
-                    }),
-
-                    import: None,
-                    root,
+        let handle = Spawner::Cli(Box::new(env)).spawn(
+            provider,
+            SessionSpec {
+                thread,
+                cwd: scratch.0.canonicalize().unwrap(),
+                config: ThreadConfig {
+                    model: (provider == ProviderKind::Codex).then(|| "veyra-model".into()),
+                    effort: (provider == ProviderKind::Codex).then(|| "medium".into()),
+                    mode,
                 },
-                out,
-                1,
-            )
-            .unwrap();
+                native: resume.then(|| {
+                    NativeSessionId(
+                        if provider == ProviderKind::Codex {
+                            "missing-native"
+                        } else {
+                            "retained-session"
+                        }
+                        .into(),
+                    )
+                }),
+                root,
+            },
+            out,
+            1,
+        );
         let events = tokio::time::timeout(Duration::from_secs(15), async {
             let mut events = Vec::new();
             let mut sent = false;

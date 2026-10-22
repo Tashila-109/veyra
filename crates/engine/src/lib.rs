@@ -61,7 +61,7 @@ struct EngineInner {
 pub(crate) struct RuntimeState {
     pub awake: AtomicBool,
     pub terminal_colors: Mutex<terminal::Colors>,
-    pub terminals: Mutex<std::collections::BTreeMap<ThreadId, provider::TerminalHandle>>,
+    pub terminals: Mutex<std::collections::BTreeMap<ThreadId, Vec<provider::TerminalHandle>>>,
     pub catalog: Arc<Mutex<std::collections::BTreeMap<provider::ProviderKind, provider::Probe>>>,
     pub closing: Arc<LaunchGate>,
     pub window_threads: Mutex<std::collections::BTreeMap<ThreadId, WindowThread>>,
@@ -188,7 +188,12 @@ impl Engine {
                 .truncate(false),
         )?;
         let db = store::open(&data.path().join("veyra.db"))?;
-        process::start(store::live_processes(&db)?, &env);
+        let stored = store::live_processes(&db)?;
+        let reaper_env = env.clone();
+        runtime.spawn(async move {
+            reaper_env.wait_for_login_path().await;
+            process::start(stored, &reaper_env);
+        });
         Self::launch(runtime, db, Spawner::Cli(Box::new(env)), Some(lock))
     }
     fn launch(
@@ -262,6 +267,11 @@ impl Engine {
     }
     pub fn shutdown(&self) {
         self.inner.state.closing.close();
+        for tabs in self.inner.state.terminals.lock().unwrap().values() {
+            for tab in tabs {
+                tab.close();
+            }
+        }
         if let Err(mpsc::error::TrySendError::Full(message)) =
             self.inner.sender.try_send(EngineMsg::Shutdown)
         {
@@ -274,14 +284,33 @@ impl Engine {
     pub async fn shutdown_wait(&self) {
         self.shutdown();
         let sender = self.inner.sender.clone();
-        let _ = self
+        let tabs: Vec<_> = self
             .inner
-            .runtime
-            .spawn(async move {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(3), sender.closed()).await;
-            })
-            .await;
+            .state
+            .terminals
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        let _ =
+            self.inner
+                .runtime
+                .spawn(async move {
+                    let shells = async {
+                        while tabs.iter().any(|tab| {
+                            !matches!(tab.status(), terminal::ShellStatus::Exited { .. })
+                        }) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    };
+                    let _ = tokio::join!(
+                        tokio::time::timeout(Duration::from_secs(3), sender.closed()),
+                        tokio::time::timeout(Duration::from_secs(3), shells),
+                    );
+                })
+                .await;
     }
     pub async fn on_app_quit(&self) {
         self.shutdown();
@@ -292,6 +321,7 @@ impl Engine {
             .lock()
             .unwrap()
             .values()
+            .flatten()
             .filter_map(|handle| handle.terminal.as_ref())
             .filter_map(|terminal| terminal.pid().map(|pid| (pid, terminal.clone())))
             .collect();
@@ -324,14 +354,37 @@ impl Engine {
     pub fn set_terminal_colors(&self, colors: terminal::Colors) {
         *self.inner.state.terminal_colors.lock().unwrap() = colors;
     }
-    pub fn terminal(&self, thread: ThreadId) -> Option<provider::TerminalHandle> {
-        self.inner
-            .state
-            .terminals
-            .lock()
-            .unwrap()
-            .get(&thread)
-            .cloned()
+    pub fn open_shell(
+        &self,
+        thread: ThreadId,
+        cwd: std::path::PathBuf,
+        size: terminal::PtySize,
+    ) -> Result<provider::TerminalHandle, provider::ProviderError> {
+        let mut tabs = self.inner.state.terminals.lock().unwrap();
+        let list = tabs.entry(thread).or_default();
+        list.retain(|tab| !matches!(tab.status(), terminal::ShellStatus::Exited { .. }));
+        if list.iter().filter(|tab| !tab.is_closing()).count() >= 6 || self.is_closing() {
+            return Err(provider::ProviderError::Cancelled);
+        }
+        let handle = terminal::spawn(
+            cwd,
+            size,
+            self.child_env(),
+            self.inner.runtime.clone(),
+            *self.inner.state.terminal_colors.lock().unwrap(),
+        )?;
+        list.push(handle.clone());
+        Ok(handle)
+    }
+    pub fn close_shell(&self, _thread: ThreadId, handle: &provider::TerminalHandle) {
+        handle.close();
+    }
+    pub fn close_shells(&self, thread: ThreadId) {
+        if let Some(tabs) = self.inner.state.terminals.lock().unwrap().get(&thread) {
+            for tab in tabs {
+                tab.close();
+            }
+        }
     }
     pub fn window_threads(&self) -> std::collections::BTreeMap<ThreadId, WindowThread> {
         self.inner.state.window_threads.lock().unwrap().clone()

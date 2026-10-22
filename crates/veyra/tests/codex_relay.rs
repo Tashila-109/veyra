@@ -99,11 +99,10 @@ fn fake_family(
         },
         cwd: root.clone(),
         native,
-        native_cursor: None,
+
         cli_version: None,
         hold: None,
-        view: View::Chat,
-        import_pending: false,
+
         archived: false,
     };
     let id = thread.id;

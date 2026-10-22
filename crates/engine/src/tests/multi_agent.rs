@@ -52,7 +52,6 @@ fn task_turn(f: &Fixture, task: TaskId) -> TurnId {
 fn child_event(f: &mut Fixture, child: ThreadId, event: ProviderEvent) {
     let _entered = f.runtime.enter();
     f.actor.handle(EngineMsg::Provider {
-        cursor: None,
         thread: child,
         epoch: f.actor.live[&child].epoch,
         event,
@@ -841,12 +840,10 @@ fn get_task_status_matches_window() {
         "Failed",
         "Interrupted",
         "Done",
-        "InTerminal",
     ] {
         let mut c = ChangeSet::default();
         let mut row = f.actor.projection.threads[&child].clone();
         row.hold = None;
-        row.view = View::Chat;
         c.threads.insert(child, row);
         let mut live = f.actor.live[&child].clone();
         live.background_work = false;
@@ -923,16 +920,6 @@ fn get_task_status_matches_window() {
                     at: 2,
                 }
             }
-            "InTerminal" => {
-                let (control, _) = mpsc::unbounded_channel();
-                live.live = Live::Terminal {
-                    term: TerminalHandle {
-                        control,
-                        terminal: None,
-                    },
-                    pid: Some(1),
-                };
-            }
             _ => unreachable!(),
         }
         c.live.insert(child, live);
@@ -953,7 +940,7 @@ fn get_task_status_matches_window() {
         );
         observed.insert(words);
     }
-    assert_eq!(observed.len(), 8);
+    assert_eq!(observed.len(), 7);
 }
 
 #[test]
@@ -1286,7 +1273,6 @@ fn quit_retries_retained_changes_after_the_write_lock_clears() {
     {
         let _entered = f.runtime.enter();
         actor.handle(EngineMsg::Provider {
-            cursor: None,
             thread: f.thread,
             epoch: actor.live[&f.thread].epoch,
             event: ProviderEvent::Session(SessionEvent::Notice {

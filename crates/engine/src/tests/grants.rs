@@ -308,7 +308,6 @@ fn codex_grant_codec(f: &Fixture) -> crate::provider::codex::Codec {
             config: config(),
             native: Some(NativeSessionId("codex-thread".into())),
 
-            import: None,
             root: false,
         },
         1,

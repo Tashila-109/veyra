@@ -1,5 +1,6 @@
 mod awake;
 mod codex;
+mod drawer;
 mod grants;
 mod multi_agent;
 mod perf;
@@ -11,7 +12,6 @@ mod shutdown;
 mod stop;
 mod storage;
 mod table;
-mod view_switch;
 
 use crate::{
     actor::{Actor, EngineMsg, now},
@@ -35,7 +35,6 @@ enum LiveState {
     Starting,
     Idle,
     Running,
-    Terminal,
     Stopping,
 }
 
@@ -75,15 +74,9 @@ impl Fixture {
             config: config(),
             cwd: "/tmp".into(),
             native: None,
-            native_cursor: None,
+
             cli_version: None,
             hold: None,
-            view: if state == LiveState::Terminal {
-                View::Terminal
-            } else {
-                View::Chat
-            },
-            import_pending: false,
             archived: false,
         };
         let (control, controls) = mpsc::unbounded_channel();
@@ -99,18 +92,8 @@ impl Fixture {
                 pgid: 9,
                 draining: None,
             },
-            LiveState::Terminal => {
-                let (control, _rx) = mpsc::unbounded_channel();
-                Live::Terminal {
-                    term: TerminalHandle {
-                        control,
-                        terminal: None,
-                    },
-                    pid: Some(9),
-                }
-            }
             LiveState::Stopping => Live::Stopping {
-                then: AfterStop::StartTerminal,
+                then: AfterStop::Park,
             },
         };
         let mut c = ChangeSet::default();
@@ -184,7 +167,6 @@ impl Fixture {
     fn event_epoch(&mut self, epoch: u32, event: ProviderEvent) {
         let _entered = self.runtime.enter();
         self.actor.handle(EngineMsg::Provider {
-            cursor: None,
             thread: self.thread,
             epoch,
             event,

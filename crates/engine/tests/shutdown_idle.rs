@@ -48,26 +48,22 @@ async fn requested_shutdown_of_idle_provider_is_not_a_crash() {
                 .with_binary(provider, env!("CARGO_BIN_EXE_veyra-fake-cli").into());
             env.fixtures = Some(root.clone());
             let (out, mut events) = mpsc::channel(32);
-            let handle = Spawner::Cli(Box::new(env))
-                .spawn(
-                    provider,
-                    SessionSpec {
-                        thread: ThreadId::new(),
-                        cwd: root.canonicalize().unwrap(),
-                        config: ThreadConfig {
-                            model: (provider == ProviderKind::Codex).then(|| "veyra-model".into()),
-                            effort: (provider == ProviderKind::Codex).then(|| "medium".into()),
-                            mode: PermissionMode::AskFirst,
-                        },
-                        native: None,
-
-                        import: None,
-                        root: false,
+            let handle = Spawner::Cli(Box::new(env)).spawn(
+                provider,
+                SessionSpec {
+                    thread: ThreadId::new(),
+                    cwd: root.canonicalize().unwrap(),
+                    config: ThreadConfig {
+                        model: (provider == ProviderKind::Codex).then(|| "veyra-model".into()),
+                        effort: (provider == ProviderKind::Codex).then(|| "medium".into()),
+                        mode: PermissionMode::AskFirst,
                     },
-                    out,
-                    1,
-                )
-                .unwrap();
+                    native: None,
+                    root: false,
+                },
+                out,
+                1,
+            );
             let mut handle = Some(handle);
             let mut pid = None;
             let mut ended = false;

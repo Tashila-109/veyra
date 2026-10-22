@@ -10,6 +10,7 @@ Covers: crates/engine/src/data_dir.rs crates/engine/src/mcp.rs crates/engine/src
 - Orderly quit persists Interrupted and Restarted; a relaunch shows Held and Continue.
 - A crash expires pending requests and holds queued work without resending it.
 - An idle Quit exits immediately.
+- A stored Terminal view opens in chat without a view-specific hold and preserves its stored terminal span.
 - A crashed child shows Interrupted with Continue, settles its task on Continue, and leaves a held parent wake until Continue there.
 - The `ctl quit` and crash relaunches keep the project row, schema 3, WAL, the eight tables, the stored default mode and the database inode.
 
@@ -66,7 +67,7 @@ capture('restart-before-sheet')
 ctl('restart-quit-key','keys','secondary-q')
 sheet = poll('restart-sheet',lambda d: d['quit_sheet']['open'])
 assert sheet['quit_sheet']['threads'] and sheet['selected_thread']['status']=='Working'
-assert sheet['selected_thread']['title'] in sheet['quit_sheet']['threads']
+assert any(sheet['selected_thread']['title'] in line for line in sheet['quit_sheet']['threads'])
 capture('restart-quit-sheet')
 # Compare a sidebar pixel outside the sheet, using the platform's PNG reader.
 checker = PROOF/'quit-overlay.swift'
@@ -195,6 +196,23 @@ poll('restart-child-idle',lambda d:sql('select count(*) from threads where live_
 action('restart-archive-recovered','Archive',{'thread':root})
 poll('restart-archive-hidden',lambda d:all(row.get('id') not in [root,child] for row in d['sidebar']['rows']))
 save('restart-database-kept',database_rows)
+stored = create('restart-stored-terminal-thread','reply with the word ok')
+ctl('restart-stored-terminal-done','wait',stored,'Done')
+stop('before-stored-terminal')
+import uuid
+with sqlite3.connect(DB) as db:
+    turn = db.execute("select id from turns where thread_id=? and state='ended' order by ordinal desc limit 1",(stored,)).fetchone()[0]
+    seq = db.execute('select coalesce(max(seq),0)+1 from items where thread_id=?',(stored,)).fetchone()[0]
+    db.execute("update threads set view='terminal',import_pending=1,native_cursor='legacy' where id=?",(stored,))
+    db.execute('insert into items(id,thread_id,turn_id,seq,kind,body_json,done) values(?,?,?,?,?,?,1)',
+        (str(uuid.uuid4()),stored,turn,seq,'terminal_span',json.dumps({'TerminalSpan':{'text':'Stored shell transcript'}})))
+start('after-stored-terminal')
+action('restart-stored-terminal-select','SelectThread',{'thread':stored})
+legacy = poll('restart-stored-terminal',lambda d:d['selected_thread'] is not None
+    and d['selected_thread']['id']==stored and any(item.get('text')=='Stored shell transcript' for item in d['transcript']['items']))
+assert legacy['view']=='chat' and legacy['selected_thread']['hold'] is None
+assert sql("select count(*) from threads where id='"+stored+"' and live_pid is not null")=='0'
+capture('restart-stored-terminal')
 page_done('restart-recovery')
 print('PASS quit sheet, Cancel, ConfirmQuit, ctl quit, Interrupted/Restarted holds, crash and idle quit')
 PY

@@ -435,11 +435,10 @@ fn engine_replay(
         },
         cwd: root.clone(),
         native: None,
-        native_cursor: None,
+
         cli_version: None,
         hold: None,
-        view: View::Chat,
-        import_pending: false,
+
         archived: false,
     };
     let child = Thread {
@@ -679,26 +678,23 @@ fn codex_session_cancels_early_request_before_interrupt() {
     Runtime::new().unwrap().block_on(async {
         let (out, mut messages) = mpsc::channel(256);
         let turn = TurnId::new();
-        let session = Spawner::Cli(Box::new(env))
-            .spawn(
-                ProviderKind::Codex,
-                SessionSpec {
-                    thread: ThreadId::new(),
-                    cwd: std::env::current_dir().unwrap(),
-                    config: ThreadConfig {
-                        mode: PermissionMode::AskFirst,
-                        model: Some("veyra-model".into()),
-                        effort: Some("medium".into()),
-                    },
-                    native: None,
-
-                    import: None,
-                    root: false,
+        let session = Spawner::Cli(Box::new(env)).spawn(
+            ProviderKind::Codex,
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: std::env::current_dir().unwrap(),
+                config: ThreadConfig {
+                    mode: PermissionMode::AskFirst,
+                    model: Some("veyra-model".into()),
+                    effort: Some("medium".into()),
                 },
-                out,
-                1,
-            )
-            .unwrap();
+                native: None,
+
+                root: false,
+            },
+            out,
+            1,
+        );
         let mut ended = None;
         tokio::time::timeout(Duration::from_secs(8), async {
             while let Some(EngineMsg::Provider { event, .. }) = messages.recv().await {
@@ -888,26 +884,22 @@ fn codex_accept_edits_grants_no_git_roots() {
     Runtime::new().unwrap().block_on(async {
         let (out, mut events) = mpsc::channel(256);
         let turn = TurnId::new();
-        let handle = Spawner::Cli(Box::new(env))
-            .spawn(
-                ProviderKind::Codex,
-                SessionSpec {
-                    thread: ThreadId::new(),
-                    cwd: project,
-                    config: ThreadConfig {
-                        mode: PermissionMode::AcceptEdits,
-                        model: None,
-                        effort: None,
-                    },
-                    native: None,
-                    root: false,
-
-                    import: None,
+        let handle = Spawner::Cli(Box::new(env)).spawn(
+            ProviderKind::Codex,
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: project,
+                config: ThreadConfig {
+                    mode: PermissionMode::AcceptEdits,
+                    model: None,
+                    effort: None,
                 },
-                out,
-                1,
-            )
-            .unwrap();
+                native: None,
+                root: false,
+            },
+            out,
+            1,
+        );
         let mut ended = None;
         tokio::time::timeout(Duration::from_secs(8), async {
             while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
@@ -1301,74 +1293,4 @@ fn codex_untagged_elicitation_expires_without_an_extra_reply() {
             })
         },
     );
-}
-
-#[test]
-fn codex_thread_read_import() {
-    let (_scratch, env) = harness::environment(ProviderKind::Codex, "turns-list-import");
-    Runtime::new().unwrap().block_on(async {
-        let (out, mut events) = mpsc::channel(256);
-        let handle = Spawner::Cli(Box::new(env))
-            .spawn(
-                ProviderKind::Codex,
-                SessionSpec {
-                    thread: ThreadId::new(),
-                    cwd: _scratch.0.clone(),
-                    config: ThreadConfig {
-                        model: None,
-                        effort: None,
-                        mode: PermissionMode::FullAccess,
-                    },
-                    native: Some(NativeSessionId("native-import".into())),
-                    import: Some(HistoryRequest {
-                        cursor: Some("anchor".into()),
-                        sent: ["sent".into()].into(),
-                    }),
-                    root: false,
-                },
-                out,
-                1,
-            )
-            .unwrap();
-        let mut history = None;
-        let mut ready = false;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(EngineMsg::Provider { event, .. }) = events.recv().await {
-                match event {
-                    ProviderEvent::Session(SessionEvent::History {
-                        native,
-                        history: value,
-                    }) => {
-                        assert!(!ready);
-                        assert!(history.is_none());
-                        assert_eq!(native.0, "native-import");
-                        history = Some(value);
-                    }
-                    ProviderEvent::Session(SessionEvent::Ready { .. }) => {
-                        assert!(history.is_some(), "Ready preceded the import");
-                        ready = true;
-                        handle.control.send(SessionControl::Shutdown).unwrap();
-                    }
-                    ProviderEvent::Session(SessionEvent::Exited { crash }) => {
-                        assert_eq!(crash, None);
-                        return;
-                    }
-                    ProviderEvent::Turn { .. } => panic!("replay escaped as a new running turn"),
-                    _ => {}
-                }
-            }
-            panic!("import session ended without Exited");
-        })
-        .await
-        .unwrap();
-        assert!(ready);
-        assert_eq!(
-            history.unwrap(),
-            History {
-                failed: false,
-                cursor: Some("newer".into()),
-                text: "second\nreply second\nthird\nreply third".into()
-            }
-        );
-    });
 }

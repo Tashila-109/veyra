@@ -16,7 +16,7 @@ pub(super) struct SidebarScroll {
 }
 pub fn glyph(status: &Status) -> &'static str {
     match status {
-        Status::Working { .. } | Status::InTerminal => "◔",
+        Status::Working { .. } => "◔",
         Status::Failed => "×",
         Status::Done { .. } => "✓",
         Status::NeedsYou | Status::Held => "◇",

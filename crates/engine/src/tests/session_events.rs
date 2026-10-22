@@ -1894,24 +1894,16 @@ fn refusal_waits_for_active_turn_end() {
 }
 
 #[test]
-fn pending_admission_blocks_configuration_and_view_switch() {
+fn pending_admission_blocks_configuration() {
     let (mut f, _, _) = admitted_while_queued();
-    for command in [
-        Command::Configure {
+    assert!(matches!(
+        f.command(Command::Configure {
             thread: f.thread,
             config: config(),
-        },
-        Command::SwitchView {
-            thread: f.thread,
-            to: View::Terminal,
-        },
-    ] {
-        assert!(matches!(
-            f.command(command),
-            Err(CommandError::Busy(WaitReason::TurnRunning))
-        ));
-        assert!(f.controls.try_recv().is_err());
-    }
+        }),
+        Err(CommandError::Busy(WaitReason::TurnRunning))
+    ));
+    assert!(f.controls.try_recv().is_err());
 }
 
 #[test]
@@ -2328,4 +2320,263 @@ fn accepted_turn_clears_admission_without_a_commit() {
     ));
     assert!(f.loaded().items.values().any(|item| matches!(&item.body,
         ItemBody::AssistantText { text, done: true } if text=="accepted reply")));
+}
+
+#[cfg(debug_assertions)]
+mod held_prompts {
+    use super::*;
+    #[cfg(debug_assertions)]
+    #[derive(Clone, Copy, Debug)]
+    enum HeldCancellation {
+        Interrupt,
+        StopThread,
+        StorageBlocked,
+    }
+
+    #[cfg(debug_assertions)]
+    struct HeldSessionCleanup {
+        runtime: tokio::runtime::Handle,
+        env: env::ChildEnv,
+        session: SessionHandle,
+    }
+    #[cfg(debug_assertions)]
+    impl Drop for HeldSessionCleanup {
+        fn drop(&mut self) {
+            self.env.closing.close();
+            let _ = self.session.control.send(SessionControl::Shutdown);
+            for pid in self.env.groups.lock().unwrap().iter().copied() {
+                let _ = crate::platform::signal_group(pid, crate::platform::Signal::Kill);
+            }
+            let cleaned = self.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !self.env.groups.lock().unwrap().is_empty() {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+            });
+            if cleaned.is_err() && !std::thread::panicking() {
+                panic!("held-prompt session cleanup did not reap its group");
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn cancel_held_prompt(cancellation: HeldCancellation) {
+        use std::{fs, time::Duration};
+        let scratch = Scratch(
+            std::path::Path::new("/tmp")
+                .join(format!("veyra-term-held-prompt-{}", ThreadId::new())),
+        );
+        fs::create_dir_all(scratch.0.join("projects/fixture")).unwrap();
+        let binary = scratch.0.join("provider");
+        fs::write(
+            &binary,
+            concat!(
+                "#!/usr/bin/python3\nimport json,pathlib,sys\nroot=pathlib.Path.cwd(",
+                ")\nactive=None\nfor raw in sys.stdin:\n    wire=json.loads(raw)\n    ",
+                "with (root/'stdin.jsonl').open('a') as out: out.write(raw)\n    if",
+                " wire.get('type')=='user': active=wire['uuid']\n    elif wire.get(",
+                "'request',{}).get('subtype')=='initialize':\n        print(json.du",
+                "mps({'type':'control_response','response':{'subtype':'success','r",
+                "equest_id':wire['request_id'],'response':{}}}),flush=True)\n    el",
+                "if wire.get('request',{}).get('subtype')=='interrupt' and active:",
+                "\n        print(json.dumps({'type':'result','subtype':'error_durin",
+                "g_execution','session_id':'native','is_error':True,'uuid':'result",
+                "','result':'interrupted'}),flush=True)\n        active=None\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("700")
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let native = NativeSessionId("native".into());
+        let mut f = Fixture::new(LiveState::Idle);
+        let mut changes = ChangeSet::default();
+        let mut row = f.loaded().threads[&f.thread].clone();
+        row.cwd = scratch.0.clone();
+        row.native = Some(native.clone());
+        changes.threads.insert(f.thread, row);
+        f.save(changes);
+        let env = env::ChildEnv::isolated().with_binary(ProviderKind::Claude, binary);
+        let (out, mut events) = mpsc::channel(256);
+        let session = {
+            let _entered = f.runtime.enter();
+            session::spawn(
+                SessionSpec {
+                    thread: f.thread,
+                    cwd: scratch.0.clone(),
+                    config: config(),
+                    native: Some(native.clone()),
+                    root: false,
+                },
+                env.clone(),
+                out,
+                1,
+            )
+        };
+        let cleanup = HeldSessionCleanup {
+            runtime: f.runtime.handle().clone(),
+            env,
+            session: session.clone(),
+        };
+        f.actor.live.get_mut(&f.thread).unwrap().live = Live::Starting {
+            session: Some(session.clone()),
+        };
+        let ready = f.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        {
+            let _entered = f.runtime.enter();
+            f.actor.handle(ready);
+        }
+        let Ack::Turn(turn) = f
+            .command(Command::Send {
+                thread: f.thread,
+                text: "held prompt".into(),
+            })
+            .unwrap()
+        else {
+            panic!("missing turn")
+        };
+        let dispatched = f.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            matches!(&dispatched, EngineMsg::Provider { event: ProviderEvent::Session(SessionEvent::Dispatched {
+            turn: id }), .. } if *id == turn)
+        );
+        let started = std::time::Instant::now();
+        match cancellation {
+            HeldCancellation::Interrupt => {
+                f.command(Command::Interrupt {
+                    thread: f.thread,
+                    turn,
+                })
+                .unwrap();
+            }
+            HeldCancellation::StopThread => {
+                f.command(Command::StopThread { thread: f.thread }).unwrap();
+            }
+            HeldCancellation::StorageBlocked => {
+                f.actor.fail_write = true;
+                f.event(ProviderEvent::Session(SessionEvent::Notice {
+                    text: "storage write".into(),
+                }));
+            }
+        }
+        {
+            let _entered = f.runtime.enter();
+            f.actor.handle(dispatched);
+        }
+        let ended = f.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(6), async {
+                loop {
+                    let message = events.recv().await.unwrap();
+                    let end = match &message {
+                        EngineMsg::Provider {
+                            event:
+                                ProviderEvent::Turn {
+                                    event: TurnEvent::TurnEnded { outcome, park },
+                                    ..
+                                },
+                            ..
+                        } => Some((outcome.clone(), *park)),
+                        _ => None,
+                    };
+                    f.actor.handle(message);
+                    if let Some(end) = end {
+                        return end;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        });
+        let elapsed = started.elapsed();
+        let kept_process = !cleanup.env.groups.lock().unwrap().is_empty();
+        f.actor.fail_write = false;
+        {
+            let _entered = f.runtime.enter();
+            f.actor.handle(EngineMsg::Tick);
+        }
+        session.control.send(SessionControl::Shutdown).ok();
+        f.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(message) = events.recv().await {
+                    if matches!(
+                        message,
+                        EngineMsg::Provider {
+                            event: ProviderEvent::Session(SessionEvent::Exited { .. }),
+                            ..
+                        }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        });
+        drop(cleanup);
+        let wires: Vec<serde_json::Value> = fs::read_to_string(scratch.0.join("stdin.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let order: Vec<_> = wires
+            .iter()
+            .map(|wire| {
+                wire["request"]["subtype"]
+                    .as_str()
+                    .unwrap_or(wire["type"].as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(order, ["initialize", "user", "interrupt"]);
+        assert_eq!(wires[1]["uuid"], turn.to_string());
+        assert_eq!(wires[1]["message"]["content"], "held prompt");
+        assert_eq!(
+            ended,
+            (
+                TurnOutcome::Interrupted {
+                    reason: if matches!(cancellation, HeldCancellation::StorageBlocked) {
+                        StopReason::StorageBlocked.text().into()
+                    } else {
+                        StopReason::User.text().into()
+                    },
+                },
+                false
+            )
+        );
+        assert!(kept_process && elapsed < Duration::from_secs(2));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn interrupt_held_prompt_delivers_prompt_before_interrupt() {
+        cancel_held_prompt(HeldCancellation::Interrupt);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn stop_thread_held_prompt_delivers_prompt_before_interrupt() {
+        cancel_held_prompt(HeldCancellation::StopThread);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn storage_blocked_held_prompt_delivers_prompt_before_interrupt() {
+        cancel_held_prompt(HeldCancellation::StorageBlocked);
+    }
 }

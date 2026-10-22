@@ -26,19 +26,7 @@ pub struct SessionSpec {
     pub cwd: PathBuf,
     pub config: ThreadConfig,
     pub native: Option<NativeSessionId>,
-    pub import: Option<HistoryRequest>,
     pub root: bool,
-}
-#[derive(Clone, Debug, Default)]
-pub struct HistoryRequest {
-    pub cursor: Option<NativeCursor>,
-    pub sent: std::collections::BTreeSet<String>,
-}
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct History {
-    pub cursor: Option<NativeCursor>,
-    pub text: String,
-    pub failed: bool,
 }
 #[derive(Clone, Debug)]
 pub struct SessionHandle {
@@ -63,7 +51,6 @@ pub enum SessionControl {
         reply: Reply,
     },
     Shutdown,
-    ShutdownForTerminal,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -97,10 +84,6 @@ pub enum ProviderEvent {
 pub enum SessionEvent {
     Dispatched {
         turn: TurnId,
-    },
-    History {
-        native: NativeSessionId,
-        history: History,
     },
     StartTurnRefused {
         turn: TurnId,
@@ -201,6 +184,32 @@ pub struct TerminalHandle {
     pub(crate) terminal: Option<std::sync::Arc<crate::terminal::Terminal>>,
 }
 impl TerminalHandle {
+    pub fn close(&self) {
+        if let Some(terminal) = &self.terminal {
+            terminal.close();
+        }
+        let _ = self.control.send(TerminalControl::Stop);
+    }
+    pub fn is_closing(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_none_or(|terminal| terminal.is_closing())
+    }
+    pub fn pid(&self) -> Option<u32> {
+        self.terminal.as_ref().and_then(|terminal| terminal.pid())
+    }
+    pub fn status(&self) -> crate::terminal::ShellStatus {
+        self.terminal
+            .as_ref()
+            .map_or(crate::terminal::ShellStatus::Starting, |terminal| {
+                terminal.status()
+            })
+    }
+    pub fn running_processes(&self) -> Vec<std::path::PathBuf> {
+        self.terminal
+            .as_ref()
+            .map_or_else(Vec::new, |terminal| terminal.running_processes())
+    }
     pub fn same(&self, other: &Self) -> bool {
         match (&self.terminal, &other.terminal) {
             (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
@@ -235,16 +244,6 @@ impl TerminalHandle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalControl {
     Stop,
-}
-#[derive(Clone, Debug)]
-pub enum TerminalEvent {
-    Ready {
-        pid: u32,
-    },
-    Exited {
-        started: bool,
-        crash: Option<String>,
-    },
 }
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -334,13 +333,6 @@ impl ProviderKind {
             Self::Grok => "grok",
         }
     }
-    pub fn tui_command(self, native: &NativeSessionId, config: &ThreadConfig) -> Vec<String> {
-        match self {
-            Self::Claude => claude::tui_command(native, config.mode),
-            Self::Codex => codex::tui_command(native, config.mode),
-            Self::Grok => grok::tui_command(native, config.mode),
-        }
-    }
     pub fn install_hint(self) -> &'static str {
         match self {
             Self::Claude => "Run npm install -g @anthropic-ai/claude-code and check again.",
@@ -415,29 +407,13 @@ impl Spawner {
         spec: SessionSpec,
         out: mpsc::Sender<EngineMsg>,
         epoch: u32,
-    ) -> Result<SessionHandle, ProviderError> {
+    ) -> SessionHandle {
         match self {
             Self::Cli(env) => {
                 session::spawn_provider(provider, spec, env.as_ref().clone(), out, epoch)
             }
             #[cfg(test)]
-            Self::Scripted(script) => Ok(script.spawn(spec, out, epoch)),
-        }
-    }
-    pub fn terminal(
-        &self,
-        colors: crate::terminal::Colors,
-        provider: ProviderKind,
-        spec: SessionSpec,
-        out: mpsc::Sender<EngineMsg>,
-        epoch: u32,
-    ) -> Result<TerminalHandle, ProviderError> {
-        match self {
-            Self::Cli(env) => {
-                crate::terminal::spawn(provider, spec, env.as_ref().clone(), out, epoch, colors)
-            }
-            #[cfg(test)]
-            Self::Scripted(script) => Ok(script.terminal()),
+            Self::Scripted(script) => script.spawn(spec, out, epoch),
         }
     }
 }
@@ -575,33 +551,8 @@ impl Outbound {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CursorUpdate {
-    Known(NativeCursor),
-    Unknown,
-}
-impl CursorUpdate {
-    pub fn value(self) -> Option<NativeCursor> {
-        match self {
-            Self::Known(cursor) => Some(cursor),
-            Self::Unknown => None,
-        }
-    }
-}
-impl From<String> for CursorUpdate {
-    fn from(value: String) -> Self {
-        Self::Known(value.into())
-    }
-}
-impl From<&str> for CursorUpdate {
-    fn from(value: &str) -> Self {
-        Self::Known(value.into())
-    }
-}
 #[derive(Default)]
 pub(crate) struct Decoded {
-    pub cursor: Option<CursorUpdate>,
-    pub history: Option<History>,
     pub events: Vec<ProviderEvent>,
     pub replies: Vec<serde_json::Value>,
     pub controls: Vec<Outbound>,
@@ -626,29 +577,6 @@ impl Decoded {
         }
         frames.extend(interrupts);
         frames
-    }
-}
-
-pub const IMPORT_NOTICE: &str =
-    "The turns typed in the terminal could not be shown here. The CLI still has them.";
-impl ProviderKind {
-    pub(crate) fn file_import(
-        self,
-        env: &env::ChildEnv,
-        native: &NativeSessionId,
-        request: &HistoryRequest,
-    ) -> Option<History> {
-        match self {
-            Self::Claude => Some(
-                claude::config_dir(env)
-                    .and_then(|root| claude::session_file_import(&root, native, request))
-                    .unwrap_or(History {
-                        failed: true,
-                        ..Default::default()
-                    }),
-            ),
-            Self::Codex | Self::Grok => None,
-        }
     }
 }
 
@@ -769,61 +697,4 @@ fn decoded_batch_always_places_replies_before_interrupts() {
             serde_json::json!({"interrupt":true})
         ]
     );
-}
-
-#[cfg(test)]
-#[test]
-fn tui_command_per_mode() {
-    let native = NativeSessionId("native-session".into());
-    for (mode, claude_mode) in [
-        (PermissionMode::AskFirst, "default"),
-        (PermissionMode::AcceptEdits, "acceptEdits"),
-        (PermissionMode::FullAccess, "bypassPermissions"),
-    ] {
-        let config = ThreadConfig {
-            model: None,
-            effort: None,
-            mode,
-        };
-        let mut claude = vec![
-            "--resume",
-            "native-session",
-            "--permission-mode",
-            claude_mode,
-        ];
-        let mut codex = vec![
-            "resume",
-            "native-session",
-            "--include-non-interactive",
-            "--no-daemon",
-            "-c",
-            "check_for_update_on_startup=false",
-        ];
-        let mut grok = vec!["--no-auto-update"];
-        match mode {
-            PermissionMode::AskFirst => codex.extend(["-s", "read-only"]),
-            PermissionMode::AcceptEdits => {
-                codex.extend(["-a", "on-request", "-s", "workspace-write"])
-            }
-            PermissionMode::FullAccess => codex.extend(["-a", "never", "-s", "danger-full-access"]),
-        }
-        if mode == PermissionMode::FullAccess {
-            claude.push("--allow-dangerously-skip-permissions");
-            grok.push("--always-approve");
-        } else {
-            grok.extend(["--permission-mode", "default"]);
-        }
-        grok.extend(["--resume", "native-session"]);
-        for (provider, expected) in [
-            (ProviderKind::Claude, claude),
-            (ProviderKind::Codex, codex),
-            (ProviderKind::Grok, grok),
-        ] {
-            assert_eq!(
-                provider.tui_command(&native, &config),
-                expected,
-                "{provider:?} {mode:?}"
-            );
-        }
-    }
 }

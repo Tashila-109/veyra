@@ -411,14 +411,12 @@ async fn session_config_lifecycle(root_thread: bool, reported: Option<&str>) {
             },
             native: None,
 
-            import: None,
             root: root_thread,
         },
         env,
         out,
         1,
-    )
-    .unwrap();
+    );
     let mut token = None;
     let mut started = false;
     tokio::time::timeout(Duration::from_secs(5), async {

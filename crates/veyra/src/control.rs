@@ -243,7 +243,6 @@ fn parse_args(args: &[String]) -> anyhow::Result<ClientCommand> {
                     "held",
                     "interrupted",
                     "needsyou",
-                    "interminal",
                 ]
                 .contains(&status.to_lowercase().as_str())
             {

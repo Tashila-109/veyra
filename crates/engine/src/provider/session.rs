@@ -482,7 +482,7 @@ pub fn spawn(
     env: ChildEnv,
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
-) -> Result<SessionHandle, ProviderError> {
+) -> SessionHandle {
     spawn_provider(ProviderKind::Claude, spec, env, out, epoch)
 }
 pub fn spawn_provider(
@@ -491,8 +491,8 @@ pub fn spawn_provider(
     env: ChildEnv,
     out: mpsc::Sender<EngineMsg>,
     epoch: u32,
-) -> Result<SessionHandle, ProviderError> {
-    Ok(start_provider_task(provider, None, spec, env, out, epoch))
+) -> SessionHandle {
+    start_provider_task(provider, None, spec, env, out, epoch)
 }
 
 #[cfg(test)]
@@ -518,10 +518,19 @@ fn start_provider_task(
     let thread = spec.thread;
     let supervisor_out = out.clone();
     let task = tokio::spawn(async move {
-        let env = tokio::select! {
-            env = env.wait_for_login_path() => env,
-            _ = out.closed() => return false,
-        };
+        let mut receiver = SessionControls::new(receiver, env.closing.clone());
+        loop {
+            tokio::select! {
+                biased;
+                _ = out.closed() => return false,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if receiver.drain_and_check_launch(&out).is_err() {
+                        return emit(&out, thread, epoch, launch_failed(ProviderError::Cancelled)).await;
+                    }
+                }
+                _ = env.wait_for_login_path() => break,
+            }
+        }
         if process.is_none()
             && let Err(error) = env.resolve(provider)
         {
@@ -536,37 +545,9 @@ fn start_provider_task(
             .await;
         }
         let mut spec = spec;
-        let mut receiver = SessionControls::new(receiver, env.closing.clone());
         #[cfg(test)]
         {
             receiver.close_before_user_write = env.close_before_user_write.clone();
-        }
-        if let (Some(native), Some(request)) = (&spec.native, &spec.import) {
-            let native = native.clone();
-            let request = request.clone();
-            let import_env = env.clone();
-            let history = tokio::task::spawn_blocking(move || {
-                provider.file_import(&import_env, &native, &request)
-            })
-            .await;
-            let history = history.unwrap_or(Some(super::History {
-                failed: true,
-                ..Default::default()
-            }));
-            if let Some(history) = history
-                && !emit(
-                    &out,
-                    thread,
-                    epoch,
-                    ProviderEvent::Session(SessionEvent::History {
-                        native: spec.native.clone().unwrap(),
-                        history,
-                    }),
-                )
-                .await
-            {
-                return false;
-            }
         }
         let mut process = match process {
             Some(process) => process,
@@ -683,7 +664,6 @@ async fn emit(
     event: ProviderEvent,
 ) -> bool {
     out.send(EngineMsg::Provider {
-        cursor: None,
         thread,
         epoch,
         event,
@@ -716,10 +696,7 @@ impl SessionControls {
             self.receiver.close();
         }
         while let Ok(message) = self.receiver.try_recv() {
-            if matches!(
-                message,
-                SessionControl::Shutdown | SessionControl::ShutdownForTerminal
-            ) {
+            if matches!(message, SessionControl::Shutdown) {
                 self.receiver.close();
             }
             self.pending.push_back(message);
@@ -750,10 +727,7 @@ impl SessionControls {
                 return Some(SessionControl::Shutdown);
             }
         }
-        if matches!(
-            message,
-            Some(SessionControl::Shutdown | SessionControl::ShutdownForTerminal) | None
-        ) {
+        if matches!(message, Some(SessionControl::Shutdown) | None) {
             self.receiver.close();
         }
         message.or(Some(SessionControl::Shutdown))
@@ -850,7 +824,7 @@ async fn run_one(
                     }
                     *active_turn.lock().unwrap() = codec.active().map(ActiveTurn::target);
                     for event in std::mem::take(&mut dispatched.events) {
-                        if out.send(EngineMsg::Provider { thread, epoch, cursor: dispatched.cursor.take(),
+                        if out.send(EngineMsg::Provider { thread, epoch,
                             event }).await.is_err() {
                             consumer_gone = true;
                             break;
@@ -869,7 +843,7 @@ async fn run_one(
                         }
                     }
                 }
-                Some(shutdown @ (SessionControl::Shutdown | SessionControl::ShutdownForTerminal)) => {
+                Some(SessionControl::Shutdown) => {
                     shutdown_requested = true;
                     let lines = codec.interrupt_active(StopReason::AppClosing);
                     for line in lines {
@@ -878,18 +852,9 @@ async fn run_one(
                             break;
                         }
                     }
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
                     drop(writer);
                     if tokio::time::timeout(Duration::from_secs(1), &mut write_task).await.is_ok() {
                         writer_done = true;
-                    }
-                    if matches!(shutdown, SessionControl::ShutdownForTerminal) && !control.closing.is_closing() {
-                        while tokio::time::Instant::now() < deadline {
-                            if process.child.child.as_mut().is_none_or(|child| child.try_wait().ok().flatten(
-                                ).is_some()) { break; }
-                            if control.closing.is_closing() { break; }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
                     }
                     break;
                 }
@@ -982,29 +947,16 @@ async fn run_one(
                                     error.to_string()); break; }
                             }
                             if failure.is_some() { break; }
-                            if let Some(provider_turn) = decoded.provider_turn {
-                                let event = ProviderEvent::Session(SessionEvent::ProviderTurnStarted { provider_turn });
-                                let sent = if let Some(cursor) = decoded.cursor.take() { out.send(
-                                    EngineMsg::Provider { thread, epoch, cursor: Some(cursor), event
-                                        }).await.is_ok() } else { emit(out, thread, epoch, event).await };
-                                if !sent { consumer_gone = true; break; }
+                            if let Some(provider_turn) = decoded.provider_turn
+                                && !emit(out, thread, epoch, ProviderEvent::Session(
+                                    SessionEvent::ProviderTurnStarted { provider_turn })).await {
+                                consumer_gone = true; break;
                             }
-                            if let Some(history) = decoded.history.take() && let Some(native) = codec.native()
-                                && !emit(out, thread, epoch, ProviderEvent::Session(SessionEvent::History {
-                                    native: native.clone(), history })).await { consumer_gone = true; break; }
-                            let provider_cursor = decoded.events.iter().any(|event| matches!(event,
-                                ProviderEvent::Session(SessionEvent::ProviderTurnStarted { .. })));
                             for event in decoded.events {
                                 if matches!(event, ProviderEvent::Session(SessionEvent::Ready { .. })) {
                                     ready = true;
                                 }
-                                let cursor = if !provider_cursor || matches!(&event, ProviderEvent::Session(
-                                    SessionEvent::ProviderTurnStarted { .. })) { decoded.cursor.take() } else { None };
-                                let sent = if let Some(cursor) = cursor {
-                                    out.send(EngineMsg::Provider { thread, epoch, cursor: Some(cursor), event
-                                        }).await.is_ok()
-                                } else { emit(out, thread, epoch, event).await };
-                                if !sent { consumer_gone = true; break; }
+                                if !emit(out, thread, epoch, event).await { consumer_gone = true; break; }
                             }
                             if consumer_gone { break; }
                         }
@@ -1201,7 +1153,7 @@ async fn probe_environment(
     tokio::select! {
         biased;
         _ = cancelled => Err(ProviderError::Cancelled),
-        env = env.wait_for_login_path() => Ok(env),
+        _ = env.wait_for_login_path() => Ok(env.clone()),
     }
 }
 pub async fn probe(
@@ -1383,6 +1335,7 @@ impl Codec {
             Self::Grok(_) => SessionProfile::rpc(ProviderKind::Grok),
         }
     }
+    #[cfg(debug_assertions)]
     fn native(&self) -> Option<&NativeSessionId> {
         match self {
             Self::Claude(c) => Some(c.native()),
@@ -1691,14 +1644,12 @@ mod tests {
 
     fn expect_claude_dispatch(message: EngineMsg) {
         let EngineMsg::Provider {
-            cursor: Some(cursor),
-            event: ProviderEvent::Session(SessionEvent::Dispatched { turn }),
+            event: ProviderEvent::Session(SessionEvent::Dispatched { .. }),
             ..
         } = message
         else {
-            panic!("missing dispatched cursor");
+            panic!("missing dispatch admission");
         };
-        assert_eq!(cursor.value().as_deref(), Some(turn.to_string().as_str()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2026,7 +1977,6 @@ mod tests {
                 },
                 native: None,
 
-                import: None,
                 root: false,
             },
             env,
@@ -2307,7 +2257,6 @@ mod tests {
                 },
                 native: None,
 
-                import: None,
                 root: false,
             },
             env,
@@ -2493,7 +2442,6 @@ mod tests {
                         },
                         native: Some(NativeSessionId("missing-native".into())),
 
-                        import: None,
                         root: false,
                     },
                     env.clone(),
@@ -2595,14 +2543,12 @@ mod tests {
                     },
                     native: None,
 
-                    import: None,
                     root: false,
                 },
                 env.clone(),
                 out,
                 1,
-            )
-            .unwrap();
+            );
             let turn = TurnId::new();
             handle
                 .control
@@ -2698,14 +2644,12 @@ done
                     },
                     native: None,
 
-                    import: None,
                     root: false,
                 },
                 env.clone(),
                 out,
                 1,
-            )
-            .unwrap();
+            );
             tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(message) = events.recv().await {
                     if matches!(
@@ -2835,14 +2779,12 @@ done
                     },
                     native: None,
 
-                    import: None,
                     root: false,
                 },
                 env.clone(),
                 out,
                 1,
-            )
-            .unwrap();
+            );
             tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(message) = events.recv().await {
                     if matches!(
@@ -2962,7 +2904,6 @@ mod mcp_record_tests {
                 },
                 native: Some(NativeSessionId("lost-native".into())),
 
-                import: None,
                 root: true,
             },
             std::process::id(),
@@ -3112,7 +3053,6 @@ mod recorder_tests {
                     },
                     native: None,
 
-                    import: None,
                     root: false,
                 },
                 child.pid(),
@@ -3206,14 +3146,13 @@ mod availability_tests {
                     },
                     native: None,
 
-                    import: None,
                     root: false,
                 },
                 env.clone(),
                 out,
                 1,
             );
-            let handle = result.unwrap();
+            let handle = result;
             let end = tokio::time::Instant::now() + Duration::from_secs(3);
             while !marker.exists() {
                 assert!(

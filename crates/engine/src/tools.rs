@@ -458,11 +458,10 @@ pub fn decide(
                 },
                 cwd: parent.cwd.clone(),
                 native: None,
-                native_cursor: None,
+
                 cli_version: None,
                 hold: None,
-                view: View::Chat,
-                import_pending: false,
+
                 archived: false,
             };
             let child_id = child.id;

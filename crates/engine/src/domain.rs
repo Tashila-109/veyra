@@ -25,25 +25,6 @@ id!(ProjectId, ThreadId, TurnId, ItemId, RequestId, TaskId);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSessionId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct NativeCursor(pub String);
-impl From<String> for NativeCursor {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-impl From<&str> for NativeCursor {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-impl std::ops::Deref for NativeCursor {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeRequestRef(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NativeItemKey(pub String);
@@ -63,11 +44,8 @@ pub struct Thread {
     pub config: ThreadConfig,
     pub cwd: PathBuf,
     pub native: Option<NativeSessionId>,
-    pub native_cursor: Option<NativeCursor>,
     pub cli_version: Option<String>,
     pub hold: Option<HoldReason>,
-    pub view: View,
-    pub import_pending: bool,
     pub archived: bool,
 }
 impl Thread {
@@ -112,12 +90,6 @@ pub enum Lineage {
 #[serde(rename_all = "snake_case")]
 pub enum Relationship {
     Subagent,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum View {
-    Chat,
-    Terminal,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {
@@ -639,7 +611,6 @@ pub enum Status {
     Held,
     Interrupted,
     Working { since: Millis },
-    InTerminal,
     Done { took: Millis },
     Idle,
 }
@@ -651,7 +622,6 @@ impl Status {
             Self::Held => "Held",
             Self::Interrupted => "Interrupted",
             Self::Working { .. } => "Working",
-            Self::InTerminal => "InTerminal",
             Self::Done { .. } => "Done",
             Self::Idle => "Idle",
         }
@@ -663,7 +633,6 @@ impl Status {
             Self::Held => 2,
             Self::Interrupted => 3,
             Self::Working { .. } => 4,
-            Self::InTerminal => 5,
             Self::Done { .. } => 6,
             Self::Idle => 7,
         }
@@ -684,9 +653,6 @@ pub fn thread_status(v: &ThreadView<'_>) -> Status {
     }) = v.running
     {
         return Status::Working { since: *since };
-    }
-    if matches!(v.live.live, crate::live::Live::Terminal { .. }) {
-        return Status::InTerminal;
     }
     if v.live.admission.is_some()
         || v.live.background_work
@@ -732,7 +698,6 @@ pub enum WaitReason {
     TurnRunning,
     Starting,
     BackgroundWork,
-    TerminalView,
     Stopping,
     Archived,
 }
@@ -750,7 +715,6 @@ impl std::fmt::Display for WaitReason {
             Self::TurnRunning => "Waits for the current turn",
             Self::Starting => "Waits for the CLI to start",
             Self::BackgroundWork => "Waits for background work",
-            Self::TerminalView => "Waits until you switch back to chat",
             Self::Stopping => "Waits for the CLI to stop",
             Self::Archived => "This thread is archived",
         })
@@ -769,9 +733,6 @@ pub fn wait_reason(v: &ThreadView<'_>) -> Option<WaitReason> {
     }
     if v.live.background_work {
         return Some(WaitReason::BackgroundWork);
-    }
-    if v.thread.view == View::Terminal || matches!(v.live.live, Live::Terminal { .. }) {
-        return Some(WaitReason::TerminalView);
     }
     if matches!(
         v.live.live,

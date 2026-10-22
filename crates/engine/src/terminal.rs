@@ -1,10 +1,6 @@
 use crate::{
-    actor::EngineMsg,
     platform::{self, Signal},
-    provider::{
-        ProviderError, ProviderKind, SessionSpec, TerminalControl, TerminalEvent, TerminalHandle,
-        env::ChildEnv,
-    },
+    provider::{ProviderError, TerminalControl, TerminalHandle, env::ChildEnv},
 };
 use alacritty_terminal::{
     event::{Event, EventListener},
@@ -13,8 +9,9 @@ use alacritty_terminal::{
     vte::ansi::Processor,
 };
 pub use alacritty_terminal::{
-    grid::Dimensions,
-    index::{Column, Line},
+    grid::{Dimensions, Scroll},
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
     term::{
         TermMode,
         cell::{Cell, Flags},
@@ -230,7 +227,7 @@ impl Emulator {
             false
         }
     }
-    fn visible_tail(&self) -> String {
+    pub fn visible_tail(&self) -> String {
         let mut lines: Vec<_> = self
             .text()
             .into_iter()
@@ -245,7 +242,8 @@ impl Emulator {
     pub fn text(&self) -> Vec<String> {
         (0..self.term.screen_lines())
             .map(|row| {
-                let line = &self.term.grid()[Line(row as i32)];
+                let line =
+                    &self.term.grid()[Line(row as i32 - self.term.grid().display_offset() as i32)];
                 let text: String = (0..self.term.columns())
                     .filter_map(|col| {
                         let cell = &line[Column(col)];
@@ -271,7 +269,12 @@ pub struct Terminal {
     input: Mutex<Option<std::sync::mpsc::Sender<Input>>>,
     dirty: AtomicBool,
     pid: Mutex<Option<u32>>,
+    foreground: Mutex<Option<i32>>,
+    status: Mutex<ShellStatus>,
     hangup_sent: AtomicBool,
+    hangup_at: Mutex<Option<Instant>>,
+    hungup_foreground: Mutex<Option<u32>>,
+    closing: AtomicBool,
     wake: watch::Sender<u64>,
 }
 impl std::fmt::Debug for Terminal {
@@ -280,15 +283,51 @@ impl std::fmt::Debug for Terminal {
     }
 }
 impl Terminal {
-    pub(crate) fn pid(&self) -> Option<u32> {
+    pub fn pid(&self) -> Option<u32> {
         *self.pid.lock().unwrap()
+    }
+    pub(crate) fn close(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.hangup();
+    }
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
     }
     pub(crate) fn hangup(&self) {
         if let Some(pid) = self.pid()
             && !self.hangup_sent.swap(true, Ordering::AcqRel)
         {
+            *self.hangup_at.lock().unwrap() = Some(Instant::now());
+            *self.hungup_foreground.lock().unwrap() =
+                self.foreground_group().filter(|group| *group != pid);
             let _ = platform::signal_group(pid, Signal::Hangup);
         }
+    }
+    pub fn status(&self) -> ShellStatus {
+        self.status.lock().unwrap().clone()
+    }
+    fn foreground_group(&self) -> Option<u32> {
+        self.foreground
+            .lock()
+            .unwrap()
+            .and_then(|fd| platform::foreground_group(fd).ok())
+    }
+    pub fn running_processes(&self) -> Vec<std::path::PathBuf> {
+        let Some(pid) = self.pid() else {
+            return Vec::new();
+        };
+        let mut pids = platform::child_pids(pid).unwrap_or_default();
+        if let Some(group) = self.foreground_group().filter(|group| *group != pid) {
+            pids.push(group);
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids.into_iter()
+            .map(|pid| {
+                platform::process_executable(pid)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("command"))
+            })
+            .collect()
     }
     fn enqueue(&self, input: Input) -> io::Result<()> {
         self.input
@@ -315,52 +354,41 @@ impl Terminal {
         self.wake.subscribe()
     }
 }
-struct Exit {
-    out: mpsc::Sender<EngineMsg>,
-    thread: crate::domain::ThreadId,
-    epoch: u32,
-    started: bool,
-    crash: Option<String>,
-}
-impl Drop for Exit {
-    fn drop(&mut self) {
-        let crash = if std::thread::panicking() {
-            Some("The terminal stopped unexpectedly".into())
-        } else {
-            self.crash.take()
-        };
-        let _ = self.out.blocking_send(EngineMsg::Terminal {
-            thread: self.thread,
-            epoch: self.epoch,
-            event: TerminalEvent::Exited {
-                started: self.started,
-                crash,
-            },
-        });
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShellStatus {
+    Starting,
+    Running,
+    Exited {
+        code: Option<u32>,
+        error: Option<String>,
+    },
 }
 pub(crate) fn spawn(
-    provider: ProviderKind,
-    mut spec: SessionSpec,
+    cwd: std::path::PathBuf,
+    size: PtySize,
     env: ChildEnv,
-    out: mpsc::Sender<EngineMsg>,
-    epoch: u32,
+    runtime: tokio::runtime::Handle,
     colors: Colors,
 ) -> Result<TerminalHandle, ProviderError> {
-    let native = spec.native.take().ok_or_else(|| {
-        ProviderError::Protocol(
-            "Send a message first; the terminal opens the CLI's conversation.".into(),
-        )
-    })?;
+    if !cwd.is_dir() {
+        return Err(ProviderError::Protocol(
+            "The thread folder no longer exists".into(),
+        ));
+    }
     let terminal = Arc::new(Terminal {
-        emulator: FairMutex::new(Emulator::with_colors(PtySize::default(), colors)),
+        emulator: FairMutex::new(Emulator::with_colors(size, colors)),
         input: Mutex::new(None),
         dirty: AtomicBool::new(false),
         pid: Mutex::new(None),
+        foreground: Mutex::new(None),
+        status: Mutex::new(ShellStatus::Starting),
         hangup_sent: AtomicBool::new(false),
+        hangup_at: Mutex::new(None),
+        hungup_foreground: Mutex::new(None),
+        closing: AtomicBool::new(false),
         wake: watch::channel(0).0,
     });
-    let (control, controls) = mpsc::unbounded_channel();
+    let (control, mut controls) = mpsc::unbounded_channel();
     let handle = TerminalHandle {
         control,
         terminal: Some(terminal.clone()),
@@ -368,18 +396,45 @@ pub(crate) fn spawn(
     std::thread::Builder::new()
         .name("veyra-pty".into())
         .spawn(move || {
-            let mut exit = Exit {
-                out,
-                thread: spec.thread,
-                epoch,
-                started: false,
-                crash: None,
-            };
-            if let Err(error) = run(provider, spec, native, env, terminal, controls, &mut exit)
-                && !matches!(error, ProviderError::Cancelled)
-            {
-                exit.crash = Some(crate::record::redact(&error.to_string(), None));
+            let waiting = runtime.block_on(async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = controls.recv() => return false,
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                            if env.closing.is_closing() { return false; }
+                        }
+                        _ = env.wait_for_login_path() => return true,
+                    }
+                }
+            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if waiting {
+                    run(cwd, size, env, terminal.clone(), controls)
+                } else {
+                    Err(ProviderError::Cancelled)
+                }
+            }))
+            .unwrap_or_else(|_| {
+                Err(ProviderError::Protocol(
+                    "The shell worker stopped unexpectedly".into(),
+                ))
+            });
+            let mut status = terminal.status.lock().unwrap();
+            if let Err(error) = result {
+                *status = ShellStatus::Exited {
+                    code: None,
+                    error: (!matches!(error, ProviderError::Cancelled))
+                        .then(|| crate::record::redact(&error.to_string(), None)),
+                };
+            } else if !matches!(*status, ShellStatus::Exited { .. }) {
+                *status = ShellStatus::Exited {
+                    code: None,
+                    error: None,
+                };
             }
+            drop(status);
+            terminal.wake.send_modify(|counter| *counter += 1);
         })?;
     Ok(handle)
 }
@@ -436,6 +491,7 @@ impl Workers {
 impl Drop for Workers {
     fn drop(&mut self) {
         drop(self.child.take());
+        *self.terminal.foreground.lock().unwrap() = None;
         *self.terminal.pid.lock().unwrap() = None;
         *self.terminal.input.lock().unwrap() = None;
         let writer = self.writer.take();
@@ -446,35 +502,46 @@ impl Drop for Workers {
     }
 }
 fn run(
-    provider: ProviderKind,
-    spec: SessionSpec,
-    native: crate::domain::NativeSessionId,
+    cwd: std::path::PathBuf,
+    size: PtySize,
     env: ChildEnv,
     terminal: Arc<Terminal>,
     mut controls: mpsc::UnboundedReceiver<TerminalControl>,
-    exit: &mut Exit,
 ) -> Result<(), ProviderError> {
-    let binary = env.resolve(provider)?;
     let pair = portable_pty::native_pty_system()
-        .openpty(PtySize::default())
+        .openpty(size)
         .map_err(io::Error::other)?;
-    let mut command = CommandBuilder::new(binary);
+    let shell = env
+        .variable("SHELL")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(platform::user_shell);
+    #[cfg(debug_assertions)]
+    let fixture = env.shell_fixture.clone();
+    #[cfg(not(debug_assertions))]
+    let fixture: Option<std::path::PathBuf> = None;
+    let mut command = if let Some(fixture) = &fixture {
+        let binary = std::env::current_exe()?
+            .parent()
+            .unwrap()
+            .join("veyra-fake-cli");
+        let mut command = CommandBuilder::new(binary);
+        command.arg("shell");
+        command.env("VEYRA_FAKE_FIXTURE", fixture);
+        command
+    } else {
+        let mut command = CommandBuilder::new(shell);
+        command.arg("-l");
+        command
+    };
     #[cfg(test)]
     command.set_controlling_tty(env.terminal_controlling_tty);
-    command.args(provider.tui_command(&native, &spec.config));
-    command.cwd(&spec.cwd);
+    command.cwd(&cwd);
     command.env_clear();
-    for (key, value) in env.tui_environment(std::env::vars_os()) {
+    for (key, value) in env.shell_environment(std::env::vars_os()) {
         command.env(key, value);
     }
-    #[cfg(debug_assertions)]
-    if let Some(root) = &env.fixtures {
-        let (n, spawn) = env.next_lane(spec.thread);
-        let fixture = root.join(format!("t{n}-s{spawn}.jsonl"));
-        if !fixture.is_file() {
-            return Err(ProviderError::FixtureMissing(fixture));
-        }
-        command.env("VEYRA_FAKE_FIXTURE", std::fs::canonicalize(fixture)?);
+    if let Some(fixture) = fixture {
+        command.env("VEYRA_FAKE_FIXTURE", fixture);
     }
     let admission = env.closing.enter();
     if env.closing.is_closing() || controls.is_closed() || controls.try_recv().is_ok() {
@@ -484,7 +551,6 @@ fn run(
         .slave
         .spawn_command(command)
         .map_err(io::Error::other)?;
-    exit.started = true;
     let pid = child
         .process_id()
         .ok_or_else(|| io::Error::other("PTY child has no pid"))?;
@@ -508,6 +574,7 @@ fn run(
     if let Err(error) = platform::lower_priority(pid) {
         tracing::warn!(%error, "could not lower terminal priority");
     }
+    *terminal.foreground.lock().unwrap() = pair.master.as_raw_fd();
     let reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
     let writer = pair.master.take_writer().map_err(io::Error::other)?;
     let (input, queue) = std::sync::mpsc::channel();
@@ -524,45 +591,59 @@ fn run(
             .name("veyra-pty-reader".into())
             .spawn(move || read(reader, &reading))?,
     );
-    let _ = exit.out.blocking_send(EngineMsg::Terminal {
-        thread: spec.thread,
-        epoch: exit.epoch,
-        event: TerminalEvent::Ready { pid },
-    });
-    let mut stopping = None;
+    *terminal.status.lock().unwrap() = ShellStatus::Running;
+    terminal.wake.send_modify(|counter| *counter += 1);
+    let mut stopping: Option<Instant> = None;
+    let mut foreground: Option<u32> = None;
     loop {
+        if stopping.is_none()
+            && let Some(at) = *terminal.hangup_at.lock().unwrap()
+        {
+            stopping = Some(at);
+            foreground = terminal
+                .hungup_foreground
+                .lock()
+                .unwrap()
+                .or_else(|| terminal.foreground_group().filter(|group| *group != pid));
+        }
         if let Some(status) = workers.child.as_mut().unwrap().child.try_wait()? {
+            if let (Some(at), Some(group)) = (stopping, foreground) {
+                loop {
+                    let grace = Duration::from_secs(if env.closing.is_closing() { 1 } else { 3 });
+                    if at.elapsed() >= grace || !platform::group_exists(group).unwrap_or(false) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let _ = platform::signal_group(group, Signal::Kill);
+            }
             drop(workers.child.take());
             let reader = workers.reader.take();
             workers.finish(reader, "reader");
-            if !status.success()
-                && stopping.is_none()
-                && !terminal.hangup_sent.load(Ordering::Acquire)
-                && !env.closing.is_closing()
-            {
-                let text = terminal.emulator.lock().visible_tail();
-                return Err(ProviderError::Protocol(format!(
-                    "{} terminal exited: {}",
-                    provider.name(),
-                    text.trim()
-                )));
-            }
+            *terminal.status.lock().unwrap() = ShellStatus::Exited {
+                code: Some(status.exit_code()),
+                error: None,
+            };
             break;
         }
         if stopping.is_none()
-            && (controls.try_recv().is_ok()
+            && (terminal.closing.load(Ordering::Acquire)
+                || controls.try_recv().is_ok()
                 || controls.is_closed()
-                || env.closing.is_closing()
-                || exit.out.is_closed())
+                || env.closing.is_closing())
         {
+            foreground = terminal.foreground_group().filter(|group| *group != pid);
             terminal.hangup();
-            stopping = Some(Instant::now());
+            stopping = *terminal.hangup_at.lock().unwrap();
         }
         let grace = Duration::from_secs(if env.closing.is_closing() { 1 } else { 3 });
         if let Some(at) = stopping {
             workers.deadline = Some(at + grace);
         }
         if stopping.is_some_and(|at: Instant| at.elapsed() >= grace) {
+            if let Some(group) = foreground.or_else(|| terminal.foreground_group()) {
+                let _ = platform::signal_group(group, Signal::Kill);
+            }
             let _ = platform::signal_group(pid, Signal::Kill);
         }
         if stopping.is_none()

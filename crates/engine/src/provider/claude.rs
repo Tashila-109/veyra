@@ -591,6 +591,7 @@ pub(crate) struct Codec {
     prompt_started: bool,
 }
 impl Codec {
+    #[cfg(debug_assertions)]
     pub fn native(&self) -> &NativeSessionId {
         &self.native
     }
@@ -622,7 +623,6 @@ impl Codec {
         self.interrupted = None;
         self.prompt_started = false;
         Some(Decoded {
-            cursor: Some(turn.to_string().into()),
             events: vec![ProviderEvent::Session(SessionEvent::Dispatched { turn })],
             controls: vec![Outbound::Prompt(json!({
                 "type":"user", "uuid":turn.to_string(), "session_id":self.native.0,
@@ -673,8 +673,7 @@ impl Codec {
                     controls: Vec::new(),
                     replies: vec![Self::unsupported_request(id)],
                     provider_turn: None,
-                    cursor: None,
-                    history: None,
+
                     #[cfg(debug_assertions)]
                     recording: None,
                 });
@@ -1415,232 +1414,6 @@ impl Codec {
                 .as_ref()
                 .is_some_and(|origin| origin["kind"] != "human")
     }
-}
-
-#[derive(Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum SessionEntryType {
-    User,
-    Assistant,
-    #[serde(other)]
-    Other,
-}
-#[derive(Default, Deserialize, PartialEq)]
-enum Entrypoint {
-    #[serde(rename = "cli")]
-    Cli,
-    #[serde(rename = "sdk-cli")]
-    SdkCli,
-    #[default]
-    #[serde(other)]
-    Other,
-}
-#[derive(Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum SessionOrigin {
-    Sdk,
-    #[serde(other)]
-    Other,
-}
-fn session_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::de::DeserializeOwned,
-{
-    let value = Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).ok())
-}
-
-#[derive(Deserialize)]
-#[serde(try_from = "SessionBlockFields")]
-enum SessionBlock {
-    Text { text: String },
-    Other,
-}
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SessionBlockFields {
-    Object {
-        #[serde(rename = "type", default, deserialize_with = "session_optional")]
-        kind: Option<String>,
-        #[serde(default, deserialize_with = "session_optional")]
-        text: Option<String>,
-    },
-    Other(serde::de::IgnoredAny),
-}
-impl TryFrom<SessionBlockFields> for SessionBlock {
-    type Error = &'static str;
-    fn try_from(fields: SessionBlockFields) -> Result<Self, Self::Error> {
-        match fields {
-            SessionBlockFields::Object { kind, text } if kind.as_deref() == Some("text") => text
-                .map(|text| Self::Text { text })
-                .ok_or("unreadable session text"),
-            _ => Ok(Self::Other),
-        }
-    }
-}
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SessionContent {
-    Text(String),
-    Blocks(Vec<SessionBlock>),
-}
-#[derive(Deserialize)]
-struct SessionMessage {
-    content: SessionContent,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionEntry {
-    #[serde(default, deserialize_with = "session_optional")]
-    session_id: Option<String>,
-    uuid: String,
-    #[serde(default, deserialize_with = "session_optional")]
-    is_sidechain: Option<bool>,
-    #[serde(rename = "type")]
-    kind: SessionEntryType,
-    #[serde(default, deserialize_with = "session_optional")]
-    entrypoint: Option<Entrypoint>,
-    #[serde(default, deserialize_with = "session_optional")]
-    turn_origin: Option<SessionOrigin>,
-    message: Option<SessionMessage>,
-}
-
-pub(crate) fn config_dir(
-    env: &super::env::ChildEnv,
-) -> Result<std::path::PathBuf, super::ProviderError> {
-    env.variable("CLAUDE_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| env.home.as_ref().map(|home| home.join(".claude")))
-        .ok_or_else(|| {
-            super::ProviderError::Protocol(
-                "Claude history requires an explicit isolated config directory".into(),
-            )
-        })
-}
-
-pub fn session_file_import(
-    root: &std::path::Path,
-    native: &NativeSessionId,
-    request: &super::HistoryRequest,
-) -> Result<super::History, super::ProviderError> {
-    use std::io::BufRead;
-    if std::path::Path::new(&native.0).file_name() != Some(std::ffi::OsStr::new(&native.0)) {
-        return Err(super::ProviderError::Protocol(
-            "Invalid Claude history id".into(),
-        ));
-    }
-    let folders = match std::fs::read_dir(root.join("projects")) {
-        Ok(folders) => folders,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && request.cursor.is_none() => {
-            return Ok(Default::default());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let mut file = None;
-    for folder in folders {
-        let folder = folder?;
-        if !folder.file_type()?.is_dir() {
-            continue;
-        }
-        let path = folder.path().join(format!("{}.jsonl", native.0));
-        if path.is_file() {
-            if file.is_some() {
-                return Err(super::ProviderError::Protocol(
-                    "Claude history id matches more than one file".into(),
-                ));
-            }
-            file = Some(std::fs::File::open(path)?);
-        }
-    }
-    let Some(file) = file else {
-        if request.cursor.is_some() {
-            return Err(super::ProviderError::Protocol(
-                "Claude history cursor file is missing".into(),
-            ));
-        }
-        return Ok(Default::default());
-    };
-    let mut history = super::History::default();
-    let mut after = false;
-    let mut include = false;
-    let mut text = Vec::new();
-    for line in std::io::BufReader::new(file).split(b'\n') {
-        let Ok(entry): Result<SessionEntry, _> = serde_json::from_slice(&line?) else {
-            continue;
-        };
-        if entry.session_id.as_ref().is_some_and(|id| *id != native.0)
-            || entry.is_sidechain == Some(true)
-        {
-            continue;
-        }
-        if entry.kind == SessionEntryType::User {
-            history.cursor = Some(entry.uuid.clone().into());
-        }
-        if !after {
-            if request.cursor.as_deref() == Some(entry.uuid.as_str()) {
-                after = true;
-            }
-            continue;
-        }
-        if entry.kind == SessionEntryType::User {
-            let own = request.sent.contains(&entry.uuid)
-                || entry.entrypoint == Some(Entrypoint::SdkCli)
-                || entry.turn_origin == Some(SessionOrigin::Sdk);
-            include = !own;
-        }
-        if !include || entry.entrypoint == Some(Entrypoint::SdkCli) {
-            continue;
-        }
-        match entry.message.map(|message| message.content) {
-            Some(SessionContent::Text(value)) if entry.kind == SessionEntryType::User => {
-                if !value.is_empty() {
-                    text.push(value);
-                }
-            }
-            Some(SessionContent::Blocks(blocks))
-                if matches!(
-                    entry.kind,
-                    SessionEntryType::User | SessionEntryType::Assistant
-                ) =>
-            {
-                for block in blocks {
-                    if let SessionBlock::Text { text: value } = block
-                        && !value.is_empty()
-                    {
-                        text.push(value);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    history.failed = request.cursor.is_some() && !after;
-    if after {
-        history.text = text.join("\n");
-    }
-    Ok(history)
-}
-
-pub fn tui_command(
-    native: &crate::domain::NativeSessionId,
-    mode: crate::domain::PermissionMode,
-) -> Vec<String> {
-    let mut args = vec![
-        "--resume".into(),
-        native.0.clone(),
-        "--permission-mode".into(),
-        match mode {
-            crate::domain::PermissionMode::AskFirst => "default",
-            crate::domain::PermissionMode::AcceptEdits => "acceptEdits",
-            crate::domain::PermissionMode::FullAccess => "bypassPermissions",
-        }
-        .into(),
-    ];
-    if mode == crate::domain::PermissionMode::FullAccess {
-        args.push("--allow-dangerously-skip-permissions".into());
-    }
-    args
 }
 
 #[cfg(test)]
@@ -2455,7 +2228,6 @@ mod tests {
             },
             native: None,
 
-            import: None,
             root: false,
         };
         for (mode, expected, dangerous) in [

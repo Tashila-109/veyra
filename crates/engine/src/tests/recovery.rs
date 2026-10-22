@@ -30,7 +30,6 @@ fn child_task(f: &mut Fixture) -> (ThreadId, TaskId, TurnId) {
 fn child_event(f: &mut Fixture, child: ThreadId, turn: TurnId, event: TurnEvent) {
     let _enter = f.runtime.enter();
     f.actor.handle(EngineMsg::Provider {
-        cursor: None,
         thread: child,
         epoch: f.actor.live[&child].epoch,
         event: turn_event(Some(turn), event),
@@ -468,7 +467,6 @@ fn child_settlement_keeps_final_buffered_report() {
     ] {
         let _enter = f.runtime.enter();
         f.actor.handle(EngineMsg::Provider {
-            cursor: None,
             thread: child,
             epoch: child_epoch,
             event: turn_event(Some(turn), event),
@@ -595,15 +593,6 @@ fn reconcile_requeues_unaccepted_wake() {
     assert_eq!(p.turns[&new].state, TurnState::Queued);
     assert_eq!(p.turns[&new].origin, TurnOrigin::Wake { tasks: vec![task] });
     assert_eq!(p.threads[&f.thread].hold, Some(HoldReason::Restarted));
-}
-#[test]
-fn reconcile_terminal_view_sets_import_pending() {
-    let mut f = Fixture::new(LiveState::Terminal);
-    reconcile_fixture(&mut f);
-    let t = &f.loaded().threads[&f.thread];
-    assert_eq!(t.view, View::Chat);
-    assert!(t.import_pending);
-    assert_eq!(t.hold, Some(HoldReason::Restarted));
 }
 #[test]
 fn reconcile_is_idempotent() {
@@ -860,7 +849,6 @@ fn wait_reason_follows_start_rule() {
     for (state, reason) in [
         (LiveState::Running, WaitReason::TurnRunning),
         (LiveState::Starting, WaitReason::Starting),
-        (LiveState::Terminal, WaitReason::TerminalView),
         (LiveState::Stopping, WaitReason::Stopping),
     ] {
         let f = Fixture::new(state);
