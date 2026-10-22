@@ -1,6 +1,6 @@
 # New thread
 
-Status: passed, 2026-10-22, 2bd80b1, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 476fc61a), 050c36e8317e3c8cdfb8d8943ecb54de29fa357ab4659fe590c87af0c47ffa69
+Status: passed, 2026-10-23, 0fca537, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 613a6eb9), 1c291af9439d815f4ea4b27cbfed02cbaf3be9317c8775fddd3d3e7da26d3109
 Covers: crates/veyra/src/ui/new_thread.rs crates/veyra/src/ui/settings.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
 
 ## Sub-features

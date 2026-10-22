@@ -1,6 +1,6 @@
 # Approvals and questions
 
-Status: passed, 2026-10-22, 2bd80b1, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 476fc61a), 190e2a9d901437ee1b0e9376012cdaa0f996637027e425b50e59ea236ee85f82
+Status: passed, 2026-10-23, 0fca537, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 613a6eb9), e97891121cce56fae9af8769844e75f787fee80e931b02d0a380ac4c30f4dd15
 Covers: crates/veyra/src/ui/provider_text.rs crates/veyra/src/ui/terminal_view.rs crates/engine/src/terminal.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/** crates/engine/tests/fixtures/tui/**
 
 ## Sub-features
