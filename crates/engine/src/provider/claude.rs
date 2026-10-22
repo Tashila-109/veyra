@@ -2227,7 +2227,6 @@ mod tests {
                 mode: PermissionMode::AskFirst,
             },
             native: None,
-
             root: false,
         };
         for (mode, expected, dangerous) in [

@@ -30,7 +30,6 @@ fn live_claude_ok_reply() {
                     mode: PermissionMode::FullAccess,
                 },
                 native: None,
-
                 root: false,
             },
             out,

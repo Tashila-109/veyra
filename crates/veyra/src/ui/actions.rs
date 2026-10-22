@@ -19,6 +19,10 @@ actions!(
         ConfirmCloseShellTab,
         CancelCloseShellTab,
         RestartShellTab,
+        PasteShell,
+        CopyShell,
+        ScrollShellHistoryUp,
+        ScrollShellHistoryDown,
         ConfirmQuit,
         CancelQuit,
         Continue,
@@ -206,7 +210,15 @@ pub fn bindings() -> Vec<Binding> {
             Some("VeyraShellClose")
         ),
         binding!(CancelCloseShellTab, "escape", Some("VeyraShellClose")),
-        binding!(RestartShellTab, "enter", Some("VeyraTerminal")),
+        binding!(RestartShellTab, "secondary-enter", Some("VeyraTerminal")),
+        binding!(PasteShell, "secondary-v", Some("VeyraTerminal")),
+        binding!(CopyShell, "secondary-c", Some("VeyraTerminal")),
+        binding!(ScrollShellHistoryUp, "shift-pageup", Some("VeyraTerminal")),
+        binding!(
+            ScrollShellHistoryDown,
+            "shift-pagedown",
+            Some("VeyraTerminal")
+        ),
         binding!(ConfirmQuit, "secondary-enter", Some("VeyraQuit")),
         binding!(CancelQuit, "escape", Some("VeyraQuit")),
         binding!(OpenSettings, "secondary-,", Some("Veyra")),
@@ -369,4 +381,12 @@ mod tests {
         #[cfg(debug_assertions)]
         assert_eq!(shortcut::<ActivateWindow>(), None);
     }
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugDragShellDrawer {
+    pub pixels: f32,
 }

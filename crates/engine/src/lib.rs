@@ -294,23 +294,21 @@ impl Engine {
             .flatten()
             .cloned()
             .collect();
-        let _ =
-            self.inner
-                .runtime
-                .spawn(async move {
-                    let shells = async {
-                        while tabs.iter().any(|tab| {
-                            !matches!(tab.status(), terminal::ShellStatus::Exited { .. })
-                        }) {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    };
-                    let _ = tokio::join!(
-                        tokio::time::timeout(Duration::from_secs(3), sender.closed()),
-                        tokio::time::timeout(Duration::from_secs(3), shells),
-                    );
-                })
-                .await;
+        let _ = self
+            .inner
+            .runtime
+            .spawn(async move {
+                let shells = async {
+                    while tabs.iter().any(|tab| !tab.status().is_finished()) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                };
+                let _ = tokio::join!(
+                    tokio::time::timeout(Duration::from_secs(3), sender.closed()),
+                    tokio::time::timeout(Duration::from_secs(3), shells),
+                );
+            })
+            .await;
     }
     pub async fn on_app_quit(&self) {
         self.shutdown();
@@ -322,7 +320,7 @@ impl Engine {
             .unwrap()
             .values()
             .flatten()
-            .filter_map(|handle| handle.terminal.as_ref())
+            .map(|handle| &handle.terminal)
             .filter_map(|terminal| terminal.pid().map(|pid| (pid, terminal.clone())))
             .collect();
         for &group in self.inner.groups.lock().unwrap().iter() {
@@ -362,21 +360,22 @@ impl Engine {
     ) -> Result<provider::TerminalHandle, provider::ProviderError> {
         let mut tabs = self.inner.state.terminals.lock().unwrap();
         let list = tabs.entry(thread).or_default();
-        list.retain(|tab| !matches!(tab.status(), terminal::ShellStatus::Exited { .. }));
-        if list.iter().filter(|tab| !tab.is_closing()).count() >= 6 || self.is_closing() {
+        list.retain(|tab| !tab.status().is_finished());
+        if list.iter().filter(|tab| !tab.is_closing()).count() >= terminal::SHELL_TAB_LIMIT
+            || self.is_closing()
+        {
             return Err(provider::ProviderError::Cancelled);
         }
         let handle = terminal::spawn(
             cwd,
             size,
             self.child_env(),
-            self.inner.runtime.clone(),
             *self.inner.state.terminal_colors.lock().unwrap(),
         )?;
         list.push(handle.clone());
         Ok(handle)
     }
-    pub fn close_shell(&self, _thread: ThreadId, handle: &provider::TerminalHandle) {
+    pub fn close_shell(&self, handle: &provider::TerminalHandle) {
         handle.close();
     }
     pub fn close_shells(&self, thread: ThreadId) {

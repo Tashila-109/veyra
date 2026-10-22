@@ -243,7 +243,7 @@ The read-only dump reports `login_path`, `drawer`, `focus`, `composer_caret`, `t
 `view` is `new_thread`, `chat`, `failed_thread` or `settings`.
 `drawer` describes the selected thread's open state, height, active_tab and tabs, with each tab's number, label, pid, running process paths, exit_code, exited flag and error.
 Its nested `terminal` carries grid, focused, columns, rows and repaint count for the active tab.
-`focus` reports composer or drawer; a confirmation sheet retains its originating surface while the sheet's key context handles confirmation.
+`focus` reports composer, drawer or none from their focus observations. Sheets report none and remember their originating surface only for Cancel.
 `composer_caret` is the input's byte offset and verifies that toggling the drawer preserves a draft's caret.
 `VEYRA_DEBUG_SHELL_FIXTURE` runs only the adjacent fake CLI's shell mode, using a run-owned fixture; the fake lane always sets it and never opens the user's real shell.
 The shell environment strips all VEYRA_* variables, so the fake fixture path is injected only after that filter for the debug fake.
@@ -365,7 +365,7 @@ required = {
         'multi-child-archive-held.json','multi-child-archive-held.png',
         'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png',
         'multi-stopped-child-wake-received.json'],
-    'shell-drawer':['drawer-open.png','drawer-header.png','drawer-draft.json','drawer-keys.json',
+    'shell-drawer':['drawer-open.png','drawer-header.png','drawer-resize.png','drawer-paste.png','drawer-draft.json','drawer-keys.json',
         'drawer-hidden.json','drawer-running-close.png','drawer-restarted.json','drawer-missing-folder.png',
         'drawer-archive.png','drawer-quit-sheet.png','drawer-crash.json','drawer-flood.json','drawer-flood.png'],
     'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',

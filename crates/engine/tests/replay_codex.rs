@@ -435,10 +435,8 @@ fn engine_replay(
         },
         cwd: root.clone(),
         native: None,
-
         cli_version: None,
         hold: None,
-
         archived: false,
     };
     let child = Thread {
@@ -689,7 +687,6 @@ fn codex_session_cancels_early_request_before_interrupt() {
                     effort: Some("medium".into()),
                 },
                 native: None,
-
                 root: false,
             },
             out,

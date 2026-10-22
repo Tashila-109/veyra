@@ -1,7 +1,7 @@
 use crate::{
     domain::*,
     events::{ChangeEvent as Ev, ChangeSet, Effect},
-    live::{AfterStop, Live, LiveThread, TurnAdmission, can_start, park_due},
+    live::{Live, LiveThread, TurnAdmission, can_start, park_due},
     provider::{ProviderKind, SessionControl, StopReason},
     store::StoreError,
 };
@@ -479,7 +479,7 @@ fn configure(
         }
         Live::Structured { .. } => {
             control(c, thread, SessionControl::Shutdown);
-            stopping(l, c, thread, AfterStop::Park);
+            stopping(l, c, thread);
         }
         Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
     }
@@ -623,12 +623,12 @@ pub(crate) fn stop_one(
     match &l[&thread].live {
         Live::Starting { .. } => {
             control(c, thread, SessionControl::Shutdown);
-            stopping(l, c, thread, AfterStop::Park);
+            stopping(l, c, thread);
         }
         Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
             interrupt_active(p, l, c, thread, reason);
         }
-        Live::Stopping { .. } => stopping(l, c, thread, AfterStop::Park),
+        Live::Stopping { .. } => stopping(l, c, thread),
         Live::Parked | Live::Structured { .. } => {}
     }
     end_active(p, l, c, thread, reason, now);
@@ -651,20 +651,15 @@ pub fn idle_park_tick(
     let v = c.view(p, l, thread).unwrap();
     if park_due(&v, idle_since, now) {
         control(c, thread, SessionControl::Shutdown);
-        stopping(l, c, thread, AfterStop::Park);
+        stopping(l, c, thread);
     }
 }
 pub fn control(c: &mut ChangeSet, thread: ThreadId, control: SessionControl) {
     c.effects.push(Effect::Control { thread, control });
 }
-pub fn stopping(
-    l: &BTreeMap<ThreadId, LiveThread>,
-    c: &mut ChangeSet,
-    thread: ThreadId,
-    then: AfterStop,
-) {
+pub fn stopping(l: &BTreeMap<ThreadId, LiveThread>, c: &mut ChangeSet, thread: ThreadId) {
     let mut live = c.live(l, thread).clone();
-    live.live = Live::Stopping { then };
+    live.live = Live::Stopping {};
     c.live.insert(thread, live);
 }
 pub fn expire_requests(p: &Projection, c: &mut ChangeSet, turn: TurnId, reason: &str) {

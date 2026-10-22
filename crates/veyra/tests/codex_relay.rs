@@ -102,7 +102,6 @@ fn fake_family(
 
         cli_version: None,
         hold: None,
-
         archived: false,
     };
     let id = thread.id;

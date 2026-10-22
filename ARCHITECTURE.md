@@ -259,7 +259,7 @@ The engine derives thread status with `domain::thread_status` and publishes `Thr
 The window, sidebar, header, dump and ctl wait consume that status, including background work and NeedsYou.
 Spawn increments the epoch; stale session events are ignored.
 Turn events must also match the running turn, unless uncorrelated content joins the Provider-origin row opened by ProviderTurnStarted.
-An admitted `TurnEnded { park: true }` first sends Shutdown and enters `Stopping { Park }`, even if its turn already ended.
+An admitted `TurnEnded { park: true }` first sends Shutdown and enters `Stopping`, even if its turn already ended.
 Stopping drops that session's later turn events; its Exited still matches the epoch.
 The actor waits for Exited before parking and spawning eligible queued work.
 A late end cannot settle another turn.
@@ -470,23 +470,22 @@ Only a resume-not-found stderr class starts a fresh native session; other errors
 
 The drawer is a utility for the human and never changes an agent's live state.
 `Engine::open_shell(thread, cwd, size)` starts a tab and returns a TerminalHandle; `close_shell` and `close_shells` close one tab or every tab of a thread.
-RuntimeState keeps the handles by thread, including closing tabs until they exit. New opens prune exited handles and enforce six non-closing tabs per thread.
+RuntimeState keeps the handles by thread, including closing tabs until they exit. New opens prune finished handles and enforce terminal::SHELL_TAB_LIMIT, six non-closing tabs per thread; the window reads the same constant.
 Both quit paths reach that registry even after the UI removes a tab or archives a thread.
 No drawer command, actor event, transcript item or SQLite row is created. StopThread affects only the agent.
 
 `terminal.rs` owns each portable-pty child, master, writer, reader and alacritty emulator.
-A tab worker awaits the login PATH cell off the UI and actor, while checking cancellation and closing.
-It then starts `platform::user_shell()` with `-l` in the supplied thread folder; a missing folder refuses the launch.
+A tab worker starts without waiting for the provider PATH cell. It starts `platform::user_shell()` with `-l` in the supplied thread folder; a missing folder refuses the launch.
 The shell environment inherits the application's PATH rather than replacing it with the probe snapshot, because the login shell builds its own PATH.
 It strips the four Claude nesting markers, every VEYRA_* variable, host-terminal identities and forced-colour settings, then sets TERM=xterm-256color and COLORTERM=truecolor.
 The debug-only VEYRA_DEBUG_SHELL_FIXTURE instead selects the adjacent veyra-fake-cli in shell mode with one owned fixture. The production shell receives no tool-server configuration, token or provider-resume arguments.
 The shared launch gate covers the final cancellation check, OS spawn and group registration. portable-pty creates a session whose leader and group id equal the shell pid.
 
 TerminalHandle exposes direct queued writes, resizes, subscriptions, shell status, pid and running process paths. Exits and worker errors update the handle, never the actor.
-ShellStatus is Starting, Running or Exited with an optional exit code and error.
-A worker unwind still publishes an exited status after its owned process cleanup.
+ShellStatus distinguishes Starting, Running, Exited with a numeric code, Signalled, Closed and Failed with an error. The pinned PTY library exposes signal outcomes only through its Display output; classification recognizes its signal prefix and never displays Rust debug formatting.
+A worker unwind publishes Failed after its owned process cleanup. Cancelled starts publish Closed.
 A tab is running when the PTY foreground group differs from the shell's group, or the shell has a live child. Background and stopped jobs therefore require consent too.
-`platform::foreground_group` uses tcgetpgrp; `child_pids` uses proc_listchildpids and filters zombies. Its return value is a pid count.
+`platform::foreground_group` borrows a dup-owned PTY descriptor held under the terminal mutex through each tcgetpgrp call. Dropping or reusing the writer's original descriptor cannot change that target. The duplicate is released during worker cleanup. `child_pids` uses proc_listchildpids and filters zombies. Its return value is a pid count.
 The window names processes through process_executable without reading or printing their arguments or environments.
 
 Closing records the foreground group before sending SIGHUP to the shell group. A surviving shell and the recorded foreground group receive SIGKILL after three seconds; app closing shortens that grace to one second.
@@ -504,12 +503,12 @@ Kitty keyboard mode stays disabled. Emulator clipboard events are discarded; cli
 
 `ui::drawer` owns each thread's open state, height, active index and numbered tab list. These last only for the app session.
 `ui::terminal_view` paints the active tab's current emulator grid, with bundled mono text and a still cursor. Hidden tabs keep parsing while their subscriptions schedule no repaint.
-The drawer opens under composition, reuses the theme's 32 px tab strip and terminal line height, and bounds its height against the header, composer budget and three reading lines. Its drag rail changes the retained height.
+The drawer opens under composition, reuses the theme's 32 px tab strip and terminal line height, and bounds its height against the header, the measured composition surface including its padding, and three reading lines. Its drag rail changes the retained height on held-left movement, clamps it at both bounds and clears the drag on release.
 Opening with an empty draft focuses the drawer; opening with a draft preserves composer focus, text and caret. Hiding always returns to the composer. Clicks change surface focus; output, exit and restart do not.
 Tab keys exist only in VeyraTerminal. Command-J remains a window binding; Command-T, Command-W and the tab chords win over terminal byte translation.
 Closing the last tab hides the drawer and focuses the composer. A running tab or an Archive that reaches running tabs opens a process-naming close sheet first; Cancel preserves the work and confirms close the chosen scope.
-An exited tab keeps its screen and exit code. Return replaces its PTY and emulator in the same numbered tab, rechecking the folder before starting anything.
-Command-V reads the clipboard and adds bracketed-paste markers only when the emulator requested them. The wheel and Shift-PageUp/Down scroll history; the next input returns to the bottom.
+An ended tab keeps its screen and shows its numeric exit code, signal, closure or failure in words. Command-Return replaces its PTY and emulator in the same numbered tab, rechecking the folder before starting anything.
+PasteShell, CopyShell and ScrollShellHistoryUp/Down are gpui actions bound in the shared VeyraTerminal key table. Command-V reads the clipboard, strips ESC and all C0 controls except tab, newline and carriage return in both modes, and adds bracketed-paste markers only when the emulator requested them. The wheel and Shift-PageUp/Down scroll history; the next input returns to the bottom.
 A drag updates alacritty's own selection and Command-C copies selection_to_string. IME is not supported.
 
 Debug terminal grid sizing still accepts decimal columns 2–1000 and rows 1–1000 through VEYRA_DEBUG_TERMINAL_GRID, once at launch; invalid or absent values use layout sizing and release excludes the override.
@@ -1182,7 +1181,7 @@ Dump's awake reports whether the actor retains the guard, without checking the c
 Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, mailbox_free, repaints, max_batch_events and the completed terminal flood measurement.
 Dump drawer holds the selected thread's open state, height, active tab, tab processes and exits, plus its active terminal grid and paint count.
-Dump focus reports composer or drawer, preserving a modal sheet's originating surface, and composer_caret reports the input offset. The debug-only DebugFocusShellDrawer action targets the same terminal focus handle as a click, for deterministic drive preconditions.
+Dump focus reports composer, drawer or none from focus-handle observations. A modal sheet reports none; it remembers the originating surface for Cancel. composer_caret reports the input offset. The debug-only DebugFocusShellDrawer action targets the same terminal focus handle as a click, for deterministic drive preconditions.
 All terminal repaint counters and flood measurement consumers are excluded from release builds with cfg(debug_assertions).
 mailbox_free is the command sender's unreserved channel capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
@@ -1383,6 +1382,6 @@ Grok live tests are ignored by default.
 Shell tests cover login arguments and cwd, environment isolation, foreground/background close detection, the close and quit ladders, missing folders, per-thread closure, native quit latency, blocked actor independence, stalled synchronized output, large paste, worker panic and escaped PTY holders.
 The three held-prompt cancellation tests retain prompt-before-interrupt coverage without native history cursors, and ordinary provider shutdown keeps its one-second writer drain.
 stored_terminal_view_opens_in_chat checks that legacy flags create no hold, retain the stored TerminalSpan and leave the agent parked. The store keeps schema 3 and writes chat, zero and null into the three unread legacy columns on thread upserts.
-Window tests cover the focus table and draft caret, the tab cap, key precedence, bracketed paste bytes, return from scrollback, hidden repaint suppression, legacy terminal-span dump text and the emulator's nonblocking key path.
+Window tests cover rail movement and bounds, observed composer/drawer/none focus, the focus table and draft caret, the tab cap, key precedence, real-key bracketed paste mode detection and control filtering, return from scrollback, hidden repaint suppression, legacy terminal-span dump text and the emulator's nonblocking key path.
 The guarded shell-drawer page exercises native subscriptions, every drawer key from its required surface, close and archive consent, hidden output, restart, missing folders, orderly quit, crash hangup and one flood using owned fixtures. Engine tests exercise the direct on_app_quit cleanup hook with live shells.
-Synthetic clicks and control keys do not establish native pointer delivery, IME or the user's real shell plugins. Real provider behavior still requires separately authorized live verification.
+DebugDragShellDrawer dispatches synthetic mouse-down, held-left movement and mouse-up through the window rail handlers for the native recipe. Synthetic clicks and control keys do not establish native pointer delivery, IME or the user's real shell plugins. Real provider behavior still requires separately authorized live verification.

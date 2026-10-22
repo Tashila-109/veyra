@@ -167,7 +167,7 @@ fn shell_close_asks_with_foreground_or_background_job() {
         });
         assert!(!handle.running_processes().is_empty());
         run.engine.close_shells(run.thread);
-        run.wait(|| matches!(handle.status(), ShellStatus::Exited { .. }));
+        run.wait(|| handle.status().is_finished());
     }
     let run = ShellRun::new(None);
     let handle = run.open();
@@ -184,11 +184,88 @@ fn shell_close_kills_group_after_grace() {
     let pid = handle.pid().unwrap();
     let start = Instant::now();
     run.engine.close_shells(run.thread);
-    run.wait(|| matches!(handle.status(), ShellStatus::Exited { .. }));
+    run.wait(|| handle.status().is_finished());
     assert!(start.elapsed() >= Duration::from_secs(3));
     assert!(start.elapsed() < Duration::from_secs(5));
     assert!(!crate::platform::group_exists(pid).unwrap());
 }
+#[test]
+fn shell_tab_limit_is_enforced_by_engine() {
+    let run = ShellRun::new(None);
+    let tabs: Vec<_> = (0..crate::terminal::SHELL_TAB_LIMIT)
+        .map(|_| run.open())
+        .collect();
+    assert!(
+        run.engine
+            .open_shell(
+                run.thread,
+                run.scratch.0.join("project"),
+                PtySize::default()
+            )
+            .is_err()
+    );
+    let other = run.engine.open_shell(
+        ThreadId::new(),
+        run.scratch.0.join("project"),
+        PtySize::default(),
+    );
+    assert!(other.is_ok());
+    tabs[0].close();
+    assert!(
+        run.engine
+            .open_shell(
+                run.thread,
+                run.scratch.0.join("project"),
+                PtySize::default()
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn shell_foreground_job_is_killed_after_grace() {
+    struct Job(std::path::PathBuf);
+    impl Drop for Job {
+        fn drop(&mut self) {
+            if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                let _ = crate::platform::signal_group(
+                    pid.trim().parse().unwrap(),
+                    crate::platform::Signal::Kill,
+                );
+            }
+        }
+    }
+    let run = ShellRun::new(Some(
+        "set -m\n/bin/sh -c 'trap \"\" HUP; echo $$ > foreground; exec /bin/sleep 60'\n",
+    ));
+    let job = Job(run.scratch.0.join("project/foreground"));
+    let handle = run.open();
+    run.wait(|| {
+        job.0.is_file()
+            && handle
+                .running_processes()
+                .iter()
+                .any(|path| path.file_name().is_some_and(|name| name == "sleep"))
+    });
+    let group: u32 = std::fs::read_to_string(&job.0)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(group, handle.pid().unwrap());
+    let started = Instant::now();
+    run.engine.close_shells(run.thread);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        crate::platform::group_exists(group).unwrap(),
+        "foreground job did not ignore HUP"
+    );
+    run.wait(|| !crate::platform::group_exists(group).unwrap());
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    run.wait(|| handle.status().is_finished());
+}
+
 #[test]
 fn shell_missing_folder_starts_nothing() {
     let run = ShellRun::new(None);
@@ -221,7 +298,7 @@ fn close_shells_ends_every_tab_of_thread() {
     run.wait(|| {
         [one.status(), two.status()]
             .iter()
-            .all(|status| matches!(status, ShellStatus::Exited { .. }))
+            .all(|status| status.is_finished())
     });
     assert!(matches!(other.status(), ShellStatus::Running));
 }
@@ -240,7 +317,7 @@ fn quit_hangs_up_every_shell() {
     run.wait(|| {
         [one.status(), two.status()]
             .iter()
-            .all(|status| matches!(status, ShellStatus::Exited { .. }))
+            .all(|status| status.is_finished())
     });
     assert!(start.elapsed() < Duration::from_secs(3));
 }
@@ -379,10 +456,7 @@ fn worker_panic_still_exits() {
     .join();
     let handle = run.open();
     gate_recover(&run.env.closing);
-    assert!(matches!(
-        handle.status(),
-        ShellStatus::Exited { error: Some(_), .. }
-    ));
+    assert!(matches!(handle.status(), ShellStatus::Failed { .. }));
     assert!(run.env.groups.lock().unwrap().is_empty());
 }
 fn gate_recover(gate: &crate::LaunchGate) {
@@ -397,7 +471,7 @@ fn closing_shell_uses_one_second_ladder() {
     run.text(&handle, "ready");
     let started = Instant::now();
     run.runtime.block_on(run.engine.shutdown_wait());
-    assert!(matches!(handle.status(), ShellStatus::Exited { .. }));
+    assert!(handle.status().is_finished());
     assert!(started.elapsed() >= Duration::from_secs(1));
     assert!(started.elapsed() < Duration::from_secs(2));
 }
@@ -451,10 +525,7 @@ fn worker_setup_error_before_handle_is_visible() {
     let run = ShellRun::new(None);
     std::fs::remove_file(run.scratch.0.join("shell")).unwrap();
     let handle = run.open();
-    assert!(matches!(
-        handle.status(),
-        ShellStatus::Exited { error: Some(_), .. }
-    ));
+    assert!(matches!(handle.status(), ShellStatus::Failed { .. }));
     assert_eq!(handle.pid(), None);
 }
 #[test]
@@ -462,11 +533,8 @@ fn failed_shell_keeps_exit_code_and_visible_reason() {
     let run = ShellRun::new(None);
     run.fixture(&[serde_json::json!({"type":"exit","code":7,"stderr":["Shell fixture ended"]})]);
     let handle = run.open();
-    run.wait(|| matches!(handle.status(), ShellStatus::Exited { .. }));
-    assert!(matches!(
-        handle.status(),
-        ShellStatus::Exited { code: Some(7), .. }
-    ));
+    run.wait(|| handle.status().is_finished());
+    assert!(matches!(handle.status(), ShellStatus::Exited { code: 7 }));
     assert!(
         handle
             .emulator()
@@ -524,7 +592,7 @@ fn escaped_pty_holder(closing: bool) {
     } else {
         run.engine.close_shells(run.thread);
     }
-    run.wait(|| matches!(handle.status(), ShellStatus::Exited { .. }));
+    run.wait(|| handle.status().is_finished());
     assert!(started.elapsed() < Duration::from_millis(if closing { 1800 } else { 3600 }));
     drop(cleanup);
 }

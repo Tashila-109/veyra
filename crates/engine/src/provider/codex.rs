@@ -1472,7 +1472,6 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: Some(NativeSessionId("old-thread".into())),
-
                 root: false,
             },
             1,
@@ -1919,7 +1918,6 @@ mod limit_tests {
                     effort: None,
                 },
                 native: None,
-
                 root: false,
             },
             1,
@@ -1996,7 +1994,6 @@ mod collaboration_tests {
                         effort: None,
                     },
                     native: None,
-
                     root: false,
                 },
                 1,

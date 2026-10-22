@@ -22,6 +22,7 @@ pub use portable_pty::PtySize;
 use portable_pty::{CommandBuilder, MasterPty};
 use std::{
     io::{self, Read, Write},
+    os::fd::OwnedFd,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -260,6 +261,8 @@ impl Emulator {
     }
 }
 
+pub const SHELL_TAB_LIMIT: usize = 6;
+
 enum Input {
     Write(Vec<u8>),
     Resize(PtySize),
@@ -269,7 +272,7 @@ pub struct Terminal {
     input: Mutex<Option<std::sync::mpsc::Sender<Input>>>,
     dirty: AtomicBool,
     pid: Mutex<Option<u32>>,
-    foreground: Mutex<Option<i32>>,
+    foreground: Mutex<Option<OwnedFd>>,
     status: Mutex<ShellStatus>,
     hangup_sent: AtomicBool,
     hangup_at: Mutex<Option<Instant>>,
@@ -310,6 +313,7 @@ impl Terminal {
         self.foreground
             .lock()
             .unwrap()
+            .as_ref()
             .and_then(|fd| platform::foreground_group(fd).ok())
     }
     pub fn running_processes(&self) -> Vec<std::path::PathBuf> {
@@ -358,16 +362,32 @@ impl Terminal {
 pub enum ShellStatus {
     Starting,
     Running,
-    Exited {
-        code: Option<u32>,
-        error: Option<String>,
-    },
+    Exited { code: u32 },
+    Signalled,
+    Closed,
+    Failed { error: String },
+}
+impl ShellStatus {
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self,
+            Self::Exited { .. } | Self::Signalled | Self::Closed | Self::Failed { .. }
+        )
+    }
+    fn from_exit(status: portable_pty::ExitStatus) -> Self {
+        if status.to_string().starts_with("Terminated by ") {
+            Self::Signalled
+        } else {
+            Self::Exited {
+                code: status.exit_code(),
+            }
+        }
+    }
 }
 pub(crate) fn spawn(
     cwd: std::path::PathBuf,
     size: PtySize,
     env: ChildEnv,
-    runtime: tokio::runtime::Handle,
     colors: Colors,
 ) -> Result<TerminalHandle, ProviderError> {
     if !cwd.is_dir() {
@@ -388,32 +408,16 @@ pub(crate) fn spawn(
         closing: AtomicBool::new(false),
         wake: watch::channel(0).0,
     });
-    let (control, mut controls) = mpsc::unbounded_channel();
+    let (control, controls) = mpsc::unbounded_channel();
     let handle = TerminalHandle {
         control,
-        terminal: Some(terminal.clone()),
+        terminal: terminal.clone(),
     };
     std::thread::Builder::new()
         .name("veyra-pty".into())
         .spawn(move || {
-            let waiting = runtime.block_on(async {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = controls.recv() => return false,
-                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                            if env.closing.is_closing() { return false; }
-                        }
-                        _ = env.wait_for_login_path() => return true,
-                    }
-                }
-            });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if waiting {
-                    run(cwd, size, env, terminal.clone(), controls)
-                } else {
-                    Err(ProviderError::Cancelled)
-                }
+                run(cwd, size, env, terminal.clone(), controls)
             }))
             .unwrap_or_else(|_| {
                 Err(ProviderError::Protocol(
@@ -422,16 +426,15 @@ pub(crate) fn spawn(
             });
             let mut status = terminal.status.lock().unwrap();
             if let Err(error) = result {
-                *status = ShellStatus::Exited {
-                    code: None,
-                    error: (!matches!(error, ProviderError::Cancelled))
-                        .then(|| crate::record::redact(&error.to_string(), None)),
+                *status = if matches!(error, ProviderError::Cancelled) {
+                    ShellStatus::Closed
+                } else {
+                    ShellStatus::Failed {
+                        error: crate::record::redact(&error.to_string(), None),
+                    }
                 };
-            } else if !matches!(*status, ShellStatus::Exited { .. }) {
-                *status = ShellStatus::Exited {
-                    code: None,
-                    error: None,
-                };
+            } else if !status.is_finished() {
+                *status = ShellStatus::Closed;
             }
             drop(status);
             terminal.wake.send_modify(|counter| *counter += 1);
@@ -574,7 +577,11 @@ fn run(
     if let Err(error) = platform::lower_priority(pid) {
         tracing::warn!(%error, "could not lower terminal priority");
     }
-    *terminal.foreground.lock().unwrap() = pair.master.as_raw_fd();
+    *terminal.foreground.lock().unwrap() = Some(platform::duplicate_fd(
+        pair.master
+            .as_raw_fd()
+            .ok_or_else(|| io::Error::other("PTY has no descriptor"))?,
+    )?);
     let reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
     let writer = pair.master.take_writer().map_err(io::Error::other)?;
     let (input, queue) = std::sync::mpsc::channel();
@@ -620,10 +627,7 @@ fn run(
             drop(workers.child.take());
             let reader = workers.reader.take();
             workers.finish(reader, "reader");
-            *terminal.status.lock().unwrap() = ShellStatus::Exited {
-                code: Some(status.exit_code()),
-                error: None,
-            };
+            *terminal.status.lock().unwrap() = ShellStatus::from_exit(status);
             break;
         }
         if stopping.is_none()
@@ -722,6 +726,17 @@ fn read(mut reader: Box<dyn Read + Send>, terminal: &Terminal) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shell_exit_outcomes_are_distinct() {
+        assert_eq!(
+            ShellStatus::from_exit(portable_pty::ExitStatus::with_exit_code(7)),
+            ShellStatus::Exited { code: 7 }
+        );
+        assert_eq!(
+            ShellStatus::from_exit(portable_pty::ExitStatus::with_signal("Hangup")),
+            ShellStatus::Signalled
+        );
+    }
     #[cfg(debug_assertions)]
     #[test]
     fn flood_stamps_match_consumed_title_boundaries() {

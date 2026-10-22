@@ -80,10 +80,8 @@ mod tests {
             },
             cwd: "/tmp".into(),
             native: None,
-
             cli_version: None,
             hold: None,
-
             archived: false,
         };
         let turn = Turn {

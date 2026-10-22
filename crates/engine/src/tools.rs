@@ -458,10 +458,8 @@ pub fn decide(
                 },
                 cwd: parent.cwd.clone(),
                 native: None,
-
                 cli_version: None,
                 hold: None,
-
                 archived: false,
             };
             let child_id = child.id;

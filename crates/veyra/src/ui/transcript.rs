@@ -809,7 +809,27 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .min_h_0()
                 .max_h_full()
                 .py(t.space.0[5])
-                .child(composer::render(shell, cx)),
+                .relative()
+                .debug_selector(|| "composition-surface".into())
+                .child(composer::render(shell, cx))
+                .child(
+                    canvas(
+                        {
+                            let shell = cx.entity().downgrade();
+                            move |bounds, _, cx| {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    if shell.composition_height != bounds.size.height {
+                                        shell.composition_height = bounds.size.height;
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                ),
         )
 }
 fn tool_label(call: &ToolCall) -> String {

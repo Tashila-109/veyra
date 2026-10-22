@@ -282,7 +282,7 @@ impl ChildEnv {
         self.variables.insert(key.into(), value.into());
         self
     }
-    pub(crate) fn shell_environment(
+    fn inherited_environment(
         &self,
         parent: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> std::collections::BTreeMap<OsString, OsString> {
@@ -298,16 +298,26 @@ impl ChildEnv {
                     "CLAUDE_AGENT_SDK_VERSION",
                 ]
                 .contains(&name.as_ref())
-                && ![
-                    "ITERM_",
-                    "GHOSTTY_",
-                    "KITTY_",
-                    "WEZTERM_",
-                    "ALACRITTY_",
-                    "VTE_",
-                ]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+        });
+        variables
+    }
+    pub(crate) fn shell_environment(
+        &self,
+        parent: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> std::collections::BTreeMap<OsString, OsString> {
+        let mut variables = self.inherited_environment(parent);
+        variables.retain(|key, _| {
+            let name = key.to_string_lossy();
+            ![
+                "ITERM_",
+                "GHOSTTY_",
+                "KITTY_",
+                "WEZTERM_",
+                "ALACRITTY_",
+                "VTE_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
                 && ![
                     "TERM_PROGRAM",
                     "TERM_PROGRAM_VERSION",
@@ -327,8 +337,7 @@ impl ChildEnv {
         &self,
         parent: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> std::collections::BTreeMap<OsString, OsString> {
-        let mut variables: std::collections::BTreeMap<_, _> = parent.into_iter().collect();
-        variables.extend(self.variables.clone());
+        let mut variables = self.inherited_environment(parent);
         let login = self.login_path();
         if let Some(login) = &login {
             variables.remove(std::ffi::OsStr::new("__MISE_DIFF"));
@@ -338,23 +347,15 @@ impl ChildEnv {
         }
         variables.retain(|key, _| {
             let name = key.to_string_lossy();
-            !name.starts_with("VEYRA_")
-                && !(matches!(self.resolution, Resolution::Explicit(_))
-                    && [
-                        "__MISE_DIFF",
-                        "CLAUDE_CODE_AUTO_CONNECT_IDE",
-                        "ENABLE_CLAUDEAI_MCP_SERVERS",
-                    ]
-                    .contains(&name.as_ref())
-                    && !self.variables.contains_key(key)
-                    && !(name == "__MISE_DIFF" && login.is_some()))
-                && ![
-                    "CLAUDECODE",
-                    "CLAUDE_CODE_ENTRYPOINT",
-                    "CLAUDE_CODE_SSE_PORT",
-                    "CLAUDE_AGENT_SDK_VERSION",
+            !(matches!(self.resolution, Resolution::Explicit(_))
+                && [
+                    "__MISE_DIFF",
+                    "CLAUDE_CODE_AUTO_CONNECT_IDE",
+                    "ENABLE_CLAUDEAI_MCP_SERVERS",
                 ]
                 .contains(&name.as_ref())
+                && !self.variables.contains_key(key)
+                && !(name == "__MISE_DIFF" && login.is_some()))
         });
         if !self.xai_api_key_set {
             variables.remove(std::ffi::OsStr::new("XAI_API_KEY"));
@@ -1002,6 +1003,54 @@ mod login_path_tests {
     }
 
     #[tokio::test]
+    async fn drawer_shell_does_not_wait_for_login_path() {
+        let (scratch, env) = delayed_environment(false);
+        let shell = scratch.0.join("drawer-shell");
+        std::fs::write(&shell, "#!/bin/sh\nprintf drawer-ready\nexec /bin/cat\n").unwrap();
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("700")
+                .arg(&shell)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let env = env.with_variable("SHELL", shell);
+        let engine = crate::Engine::start_with_env(
+            &tokio::runtime::Handle::current(),
+            crate::data_dir::DataDir::at(scratch.0.join("data")).unwrap(),
+            env.clone(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let handle = engine
+            .open_shell(
+                ThreadId::new(),
+                scratch.0.clone(),
+                crate::terminal::PtySize::default(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(700), async {
+            while !handle
+                .emulator()
+                .unwrap()
+                .lock()
+                .text()
+                .join("")
+                .contains("drawer-ready")
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("drawer waited for provider PATH");
+        assert!(started.elapsed() < Duration::from_millis(700));
+        assert_eq!(env.login_path_status(), "pending");
+        engine.shutdown_wait().await;
+        env.wait_for_login_path().await;
+    }
+
+    #[tokio::test]
     async fn launch_does_not_wait_for_login_shell() {
         let (scratch, env) = delayed_environment(false);
         let status = env.clone();
@@ -1150,7 +1199,6 @@ mod login_path_tests {
                     effort: None,
                 },
                 native: None,
-
                 root: false,
             },
             env.clone(),

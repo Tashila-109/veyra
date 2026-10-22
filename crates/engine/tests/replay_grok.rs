@@ -289,7 +289,6 @@ async fn grok_no_first_frame_fails_at_60s() {
             cwd: scratch.0.canonicalize().unwrap(),
             config: config(),
             native: None,
-
             root: false,
         },
         out,
@@ -540,7 +539,6 @@ fn grok_signed_out_never_authenticates() {
                 cwd: scratch.0.canonicalize().unwrap(),
                 config: config(),
                 native: None,
-
                 root: false,
             },
             out,
@@ -1361,7 +1359,6 @@ fn guarded_completion_fixture() -> (Vec<ProviderEvent>, Duration) {
                 cwd: scratch.0.canonicalize().unwrap(),
                 config: config(),
                 native: None,
-
                 root: false,
             },
             env,

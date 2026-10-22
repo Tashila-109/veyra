@@ -78,7 +78,6 @@ fn replay(name: &str, resume: bool) -> Vec<ProviderEvent> {
                     mode: PermissionMode::AskFirst,
                 },
                 native: resume.then(|| NativeSessionId("missing-native".into())),
-
                 root: false,
             },
             env,
@@ -614,7 +613,6 @@ fn controlled_replay_with(
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-
                 root: false,
             },
             env,
@@ -1001,7 +999,6 @@ fn shutdown_during_spawn_never_ready() {
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
-
                     root: false,
                 },
                 env,
@@ -1061,7 +1058,6 @@ fn request_replay(
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-
                 root: false,
             },
             env,
@@ -1237,7 +1233,6 @@ for line in sys.stdin:
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-
                 root: false,
             },
             env,
@@ -1425,7 +1420,6 @@ for line in sys.stdin:
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-
                 root: false,
             },
             env,
@@ -1590,7 +1584,6 @@ fn queued_prompt_with_followup(followup: bool) {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-
                 root: false,
             },
             env,
@@ -1943,7 +1936,6 @@ fn two_turns_on_one_process(name: &str, first: &str) {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-
                 root: false,
             },
             env,

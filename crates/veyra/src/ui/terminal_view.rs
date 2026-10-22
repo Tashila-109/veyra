@@ -1,5 +1,5 @@
 #![allow(clippy::disallowed_types)] // Debug terminal dump methods serialize grid and perf wire JSON.
-use super::theme::Theme;
+use super::{actions::*, theme::Theme};
 use gpui_kit::component::StyledExt;
 use gpui_kit::{prelude::*, *};
 #[cfg(debug_assertions)]
@@ -474,50 +474,36 @@ impl TerminalView {
         }
         cx.notify();
     }
-    fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let key = &event.keystroke;
-        if key.modifiers.platform && key.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                let bracketed = self
-                    .handle
-                    .as_ref()
-                    .and_then(TerminalHandle::emulator)
-                    .is_some_and(|emulator| {
-                        emulator
-                            .lock()
-                            .term
-                            .mode()
-                            .contains(TermMode::BRACKETED_PASTE)
-                    });
-                self.send_input(&paste_bytes(&text, bracketed), cx);
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if key.modifiers.platform && key.key == "c" {
-            if let Some(text) = self
+    fn paste(&mut self, _: &PasteShell, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            let bracketed = self
                 .handle
                 .as_ref()
                 .and_then(TerminalHandle::emulator)
-                .and_then(|emulator| emulator.lock().term.selection_to_string())
-            {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
-            cx.stop_propagation();
-            return;
+                .is_some_and(|emulator| {
+                    emulator
+                        .lock()
+                        .term
+                        .mode()
+                        .contains(TermMode::BRACKETED_PASTE)
+                });
+            self.send_input(&paste_bytes(&text, bracketed), cx);
         }
-        if key.modifiers.shift && matches!(key.key.as_str(), "pageup" | "pagedown") {
-            self.scroll(
-                if key.key == "pageup" {
-                    veyra_engine::terminal::Scroll::PageUp
-                } else {
-                    veyra_engine::terminal::Scroll::PageDown
-                },
-                cx,
-            );
-            cx.stop_propagation();
-            return;
+        cx.stop_propagation();
+    }
+    fn copy(&mut self, _: &CopyShell, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self
+            .handle
+            .as_ref()
+            .and_then(TerminalHandle::emulator)
+            .and_then(|emulator| emulator.lock().term.selection_to_string())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        cx.stop_propagation();
+    }
+    fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let key = &event.keystroke;
         if let Some(bytes) = terminal_key_bytes(key, self.app_cursor) {
             self.send_input(&bytes, cx);
             cx.stop_propagation();
@@ -720,6 +706,16 @@ impl Render for TerminalView {
             .min_h_0()
             .track_focus(&self.focus)
             .key_context("VeyraTerminal")
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(|terminal, _: &ScrollShellHistoryUp, _, cx| {
+                terminal.scroll(veyra_engine::terminal::Scroll::PageUp, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|terminal, _: &ScrollShellHistoryDown, _, cx| {
+                terminal.scroll(veyra_engine::terminal::Scroll::PageDown, cx);
+                cx.stop_propagation();
+            }))
             .on_key_down(cx.listener(Self::key))
             .on_scroll_wheel(
                 cx.listener(|terminal, event: &ScrollWheelEvent, window, cx| {
@@ -992,7 +988,10 @@ mod window_tests {
             let shell = scratch.0.join("shell");
             std::fs::write(
                 &shell,
-                format!("#!/bin/sh\nexec '{}' shell\n", binary.display()),
+                format!(
+                    "#!/bin/sh\nprintf '\\033[?2004h'\nexec '{}' shell\n",
+                    binary.display()
+                ),
             )
             .unwrap();
             assert!(
@@ -1287,13 +1286,143 @@ mod window_tests {
         );
     }
     #[gpui::test]
+    fn terminal_clipboard_and_history_use_bound_actions(cx: &mut gpui::TestAppContext) {
+        for (name, chord) in [
+            ("RestartShellTab", "secondary-enter"),
+            ("PasteShell", "secondary-v"),
+            ("CopyShell", "secondary-c"),
+            ("ScrollShellHistoryUp", "shift-pageup"),
+            ("ScrollShellHistoryDown", "shift-pagedown"),
+        ] {
+            assert!(
+                actions::bindings()
+                    .iter()
+                    .any(|binding| binding.action == name
+                        && binding.chord == chord
+                        && binding.context == Some("VeyraTerminal")),
+                "{name}"
+            );
+        }
+        let fixture = TerminalFixture::new();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            actions::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            Theme::apply(Appearance::Dark, window, cx);
+            let terminal = cx.new(|cx| {
+                let mut terminal = TerminalView::new(None, window, cx);
+                terminal.handle = Some(fixture.handle.clone());
+                terminal.visible = true;
+                terminal
+            });
+            window.focus(&terminal.focus_handle(cx), cx);
+            KeyWindow {
+                terminal,
+                switches: Rc::new(Cell::new(0)),
+                new_threads: Rc::new(Cell::new(0)),
+            }
+        });
+        draw(cx);
+        cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("Q".into())));
+        cx.simulate_keystrokes("secondary-v");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let text = fixture.handle.emulator().unwrap().lock().text().join(" ");
+            if text.contains("51") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "paste did not reach PTY: {text}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let expected = {
+            use veyra_engine::terminal::{Column, Line, Point, Selection, SelectionType, Side};
+            let mut emulator = fixture.handle.emulator().unwrap().lock();
+            let mut selection = Selection::new(
+                SelectionType::Simple,
+                Point::new(Line(0), Column(0)),
+                Side::Left,
+            );
+            selection.update(Point::new(Line(0), Column(4)), Side::Right);
+            emulator.term.selection = Some(selection);
+            emulator.term.selection_to_string().unwrap()
+        };
+        assert!(!expected.is_empty());
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()))
+        });
+        cx.simulate_keystrokes("secondary-c");
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some(expected)
+        );
+    }
+
+    #[gpui::test]
+    fn paste_key_observes_bracketed_mode(cx: &mut gpui::TestAppContext) {
+        let fixture = TerminalFixture::new();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            actions::init(cx);
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            Theme::apply(Appearance::Dark, window, cx);
+            let terminal = cx.new(|cx| {
+                let mut terminal = TerminalView::new(None, window, cx);
+                terminal.handle = Some(fixture.handle.clone());
+                terminal.visible = true;
+                terminal
+            });
+            window.focus(&terminal.focus_handle(cx), cx);
+            KeyWindow {
+                terminal,
+                switches: Rc::new(Cell::new(0)),
+                new_threads: Rc::new(Cell::new(0)),
+            }
+        });
+        draw(cx);
+        assert!(
+            fixture
+                .handle
+                .emulator()
+                .unwrap()
+                .lock()
+                .term
+                .mode()
+                .contains(veyra_engine::terminal::TermMode::BRACKETED_PASTE)
+        );
+        cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("Q".into())));
+        cx.simulate_keystrokes("secondary-v");
+        let expected = [
+            "1b", "5b", "32", "30", "30", "7e", "51", "1b", "5b", "32", "30", "31", "7e",
+        ];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let lines = fixture.handle.emulator().unwrap().lock().text();
+            let hex: Vec<_> = lines
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| line.len() == 2)
+                .collect();
+            if hex.ends_with(&expected) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bracketed paste bytes missing: {lines:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[gpui::test]
     fn scrollback_returns_on_key(cx: &mut gpui::TestAppContext) {
         let fixture = TerminalFixture::new();
         cx.update(|cx| {
             gpui_kit::init(cx);
             actions::init(cx);
         });
-        let (root, cx) = cx.add_window_view(|window, cx| {
+        let (_, cx) = cx.add_window_view(|window, cx| {
             Theme::apply(Appearance::Dark, window, cx);
             let terminal = cx.new(|cx| {
                 let mut terminal = TerminalView::new(None, window, cx);
@@ -1324,10 +1453,31 @@ mod window_tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        let view = root.read_with(cx, |root, _| root.terminal.clone());
-        view.update(cx, |view, cx| {
-            view.scroll(veyra_engine::terminal::Scroll::PageUp, cx)
-        });
+        cx.simulate_keystrokes("shift-pageup");
+        assert!(
+            fixture
+                .handle
+                .emulator()
+                .unwrap()
+                .lock()
+                .term
+                .grid()
+                .display_offset()
+                > 0
+        );
+        cx.simulate_keystrokes("shift-pagedown");
+        assert_eq!(
+            fixture
+                .handle
+                .emulator()
+                .unwrap()
+                .lock()
+                .term
+                .grid()
+                .display_offset(),
+            0
+        );
+        cx.simulate_keystrokes("shift-pageup");
         assert!(
             fixture
                 .handle
@@ -1387,7 +1537,10 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
         bytes.extend_from_slice(b"\x1b[200~");
     }
-    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend(
+        text.bytes()
+            .filter(|byte| *byte >= 0x20 || matches!(*byte, b'\t' | b'\n' | b'\r')),
+    );
     if bracketed {
         bytes.extend_from_slice(b"\x1b[201~");
     }
@@ -1396,6 +1549,37 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod paste_tests {
+    #[test]
+    fn paste_strips_controls_and_embedded_bracket_markers() {
+        let text = "a\x1b[201~b\x1b[200~c\0\x03\x07\x08\x0b\x0c\x1f\t\n\r";
+        for bracketed in [false, true] {
+            let bytes = super::paste_bytes(text, bracketed);
+            let expected = b"a[201~b[200~c\t\n\r";
+            if bracketed {
+                assert_eq!(
+                    bytes,
+                    [b"\x1b[200~".as_slice(), expected, b"\x1b[201~"].concat()
+                );
+                assert_eq!(
+                    bytes
+                        .windows(6)
+                        .filter(|part| *part == b"\x1b[200~")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    bytes
+                        .windows(6)
+                        .filter(|part| *part == b"\x1b[201~")
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(bytes, expected);
+            }
+        }
+    }
+
     #[test]
     fn paste_is_bracketed_when_asked() {
         assert_eq!(super::paste_bytes("one\ntwo", false), b"one\ntwo");

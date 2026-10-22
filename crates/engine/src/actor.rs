@@ -3,7 +3,7 @@ use crate::{
     commands::{self, Ack, Command, CommandError},
     domain::*,
     events::{ChangeEvent as Ev, ChangeSet, Effect, ThreadSnapshot, UiEvent},
-    live::{AfterStop, Live, LiveThread},
+    live::{Live, LiveThread},
     provider::*,
     reconcile,
     store::{self, StoreError},
@@ -1063,7 +1063,7 @@ impl Actor {
                     .is_some_and(|id| self.projection.turns[&id].origin == TurnOrigin::Provider);
                 if matches!(event, TurnEvent::TurnEnded { park: true, .. }) {
                     commands::control(&mut c, thread, SessionControl::Shutdown);
-                    commands::stopping(&self.live, &mut c, thread, AfterStop::Park);
+                    commands::stopping(&self.live, &mut c, thread);
                 } else if matches!(event, TurnEvent::TurnEnded { .. })
                     && drained.is_some()
                     && (turn == drained || turn.is_none() && provider_drain)
@@ -1802,9 +1802,7 @@ impl Actor {
                     control: SessionControl::Shutdown,
                 });
                 let mut live = live.clone();
-                live.live = Live::Stopping {
-                    then: AfterStop::Park,
-                };
+                live.live = Live::Stopping {};
                 c.live.insert(thread, live);
             }
             if matches!(live.live, Live::Starting { session: None }) {
@@ -1966,66 +1964,64 @@ mod tests {
     fn shutdown_exit_decides_no_restart_or_queued_start() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _entered = runtime.enter();
-        for then in [AfterStop::Park] {
-            for hold in [None, Some(HoldReason::Interrupted)] {
-                let mut db = Connection::open_in_memory().unwrap();
-                store::initialize(&mut db).unwrap();
-                let (out, _messages) = mpsc::channel(256);
-                let mut actor = Actor::new(db, out, Spawner::Scripted(Default::default())).unwrap();
-                let (reply, mut ack) = oneshot::channel();
-                actor.handle(EngineMsg::Command {
-                    command: Command::AddProject {
-                        path: "/tmp".into(),
+        for hold in [None, Some(HoldReason::Interrupted)] {
+            let mut db = Connection::open_in_memory().unwrap();
+            store::initialize(&mut db).unwrap();
+            let (out, _messages) = mpsc::channel(256);
+            let mut actor = Actor::new(db, out, Spawner::Scripted(Default::default())).unwrap();
+            let (reply, mut ack) = oneshot::channel();
+            actor.handle(EngineMsg::Command {
+                command: Command::AddProject {
+                    path: "/tmp".into(),
+                },
+                reply,
+            });
+            let Ack::Project(project) = ack.try_recv().unwrap().unwrap() else {
+                panic!("missing project")
+            };
+            let (reply, mut ack) = oneshot::channel();
+            actor.handle(EngineMsg::Command {
+                command: Command::CreateThread {
+                    project,
+                    provider: ProviderKind::Claude,
+                    config: ThreadConfig {
+                        model: None,
+                        effort: None,
+                        mode: PermissionMode::AskFirst,
                     },
-                    reply,
-                });
-                let Ack::Project(project) = ack.try_recv().unwrap().unwrap() else {
-                    panic!("missing project")
-                };
-                let (reply, mut ack) = oneshot::channel();
-                actor.handle(EngineMsg::Command {
-                    command: Command::CreateThread {
-                        project,
-                        provider: ProviderKind::Claude,
-                        config: ThreadConfig {
-                            model: None,
-                            effort: None,
-                            mode: PermissionMode::AskFirst,
-                        },
-                        text: "queued before quit".into(),
-                    },
-                    reply,
-                });
-                let Ack::Thread(thread) = ack.try_recv().unwrap().unwrap() else {
-                    panic!("missing thread")
-                };
-                actor.live.get_mut(&thread).unwrap().live = Live::Stopping { then: then.clone() };
-                actor.projection.threads.get_mut(&thread).unwrap().hold = hold;
-                let epoch = actor.live[&thread].epoch;
-                if hold.is_none() {
-                    assert!(!actor.exited(thread, None).effects.is_empty());
-                }
-                actor.handle(EngineMsg::Shutdown);
-                let c = actor.exited(thread, None);
-                assert!(
-                    c.effects
-                        .iter()
-                        .all(|effect| matches!(effect, Effect::Control { .. })),
-                    "shutdown proposed a start effect"
-                );
-                assert_eq!(c.live[&thread].epoch, epoch);
-                assert!(matches!(c.live[&thread].live, Live::Parked));
-                assert!(c.turns.values().all(|turn| turn.state == TurnState::Queued));
-                assert!(
-                    c.events
-                        .iter()
-                        .all(|event| !matches!(event, Ev::TurnStarted(_)))
-                );
-                assert_eq!(
-                    actor.projection.threads[&thread].hold,
-                    Some(hold.unwrap_or(HoldReason::Restarted))
-                );
+                    text: "queued before quit".into(),
+                },
+                reply,
+            });
+            let Ack::Thread(thread) = ack.try_recv().unwrap().unwrap() else {
+                panic!("missing thread")
+            };
+            actor.live.get_mut(&thread).unwrap().live = Live::Stopping {};
+            actor.projection.threads.get_mut(&thread).unwrap().hold = hold;
+            let epoch = actor.live[&thread].epoch;
+            if hold.is_none() {
+                assert!(!actor.exited(thread, None).effects.is_empty());
             }
+            actor.handle(EngineMsg::Shutdown);
+            let c = actor.exited(thread, None);
+            assert!(
+                c.effects
+                    .iter()
+                    .all(|effect| matches!(effect, Effect::Control { .. })),
+                "shutdown proposed a start effect"
+            );
+            assert_eq!(c.live[&thread].epoch, epoch);
+            assert!(matches!(c.live[&thread].live, Live::Parked));
+            assert!(c.turns.values().all(|turn| turn.state == TurnState::Queued));
+            assert!(
+                c.events
+                    .iter()
+                    .all(|event| !matches!(event, Ev::TurnStarted(_)))
+            );
+            assert_eq!(
+                actor.projection.threads[&thread].hold,
+                Some(hold.unwrap_or(HoldReason::Restarted))
+            );
         }
     }
 }

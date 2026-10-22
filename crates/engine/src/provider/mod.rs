@@ -181,64 +181,41 @@ impl TurnEvent {
 #[derive(Clone, Debug)]
 pub struct TerminalHandle {
     pub(crate) control: mpsc::UnboundedSender<TerminalControl>,
-    pub(crate) terminal: Option<std::sync::Arc<crate::terminal::Terminal>>,
+    pub(crate) terminal: std::sync::Arc<crate::terminal::Terminal>,
 }
 impl TerminalHandle {
     pub fn close(&self) {
-        if let Some(terminal) = &self.terminal {
-            terminal.close();
-        }
+        self.terminal.close();
         let _ = self.control.send(TerminalControl::Stop);
     }
     pub fn is_closing(&self) -> bool {
-        self.terminal
-            .as_ref()
-            .is_none_or(|terminal| terminal.is_closing())
+        self.terminal.is_closing()
     }
     pub fn pid(&self) -> Option<u32> {
-        self.terminal.as_ref().and_then(|terminal| terminal.pid())
+        self.terminal.pid()
     }
     pub fn status(&self) -> crate::terminal::ShellStatus {
-        self.terminal
-            .as_ref()
-            .map_or(crate::terminal::ShellStatus::Starting, |terminal| {
-                terminal.status()
-            })
+        self.terminal.status()
     }
     pub fn running_processes(&self) -> Vec<std::path::PathBuf> {
-        self.terminal
-            .as_ref()
-            .map_or_else(Vec::new, |terminal| terminal.running_processes())
+        self.terminal.running_processes()
     }
     pub fn same(&self, other: &Self) -> bool {
-        match (&self.terminal, &other.terminal) {
-            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
-            _ => false,
-        }
+        std::sync::Arc::ptr_eq(&self.terminal, &other.terminal)
     }
     pub fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.terminal
-            .as_ref()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "terminal has no PTY")
-            })?
-            .write(bytes)
+        self.terminal.write(bytes)
     }
     pub fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
-        self.terminal.as_ref().map(|terminal| terminal.subscribe())
+        Some(self.terminal.subscribe())
     }
     pub fn emulator(
         &self,
     ) -> Option<&alacritty_terminal::sync::FairMutex<crate::terminal::Emulator>> {
-        self.terminal.as_ref().map(|terminal| &terminal.emulator)
+        Some(&self.terminal.emulator)
     }
     pub fn resize(&self, size: portable_pty::PtySize) -> std::io::Result<()> {
-        self.terminal
-            .as_ref()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "terminal has no PTY")
-            })?
-            .resize(size)
+        self.terminal.resize(size)
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

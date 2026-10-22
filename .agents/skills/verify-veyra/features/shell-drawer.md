@@ -9,8 +9,8 @@ Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/terminal_view.rs crate
 - `veyra::ToggleShellDrawer` opens or hides with ⌘J. An empty composer gives focus to the drawer; a draft keeps composer focus, text and caret. Hiding returns focus to the composer.
 - `veyra::NewShellTab`, `veyra::CloseShellTab`, `veyra::NextShellTab` and `veyra::PreviousShellTab` use ⌘T, ⌘W, ⌘⇧] and ⌘⇧[ only with drawer focus.
 - A bare prompt closes immediately; a foreground, background or stopped job asks. `veyra::ConfirmCloseShellTab` confirms with ⌘↵; `veyra::CancelCloseShellTab` cancels with Escape.
-- Output and exits retain focus. Hidden output keeps parsing without scheduling paints. `veyra::RestartShellTab`, Return, replaces an ended shell in the same tab; a missing folder starts nothing.
-- ⌘V sends bracketed paste when requested; scrolling returns to the bottom on the next key. Drag selection and ⌘C use the emulator selection.
+- Output and exits retain focus. Hidden output keeps parsing without scheduling paints. `veyra::RestartShellTab`, ⌘Return, replaces an ended shell in the same tab; a missing folder starts nothing.
+- `veyra::PasteShell` and `veyra::CopyShell` bind ⌘V and ⌘C. Paste removes ESC and C0 controls except tab, newline and carriage return in both modes, and adds brackets only when requested. `veyra::ScrollShellHistoryUp` and `veyra::ScrollShellHistoryDown` bind ⇧PageUp and ⇧PageDown; the next input returns to the bottom. Drag selection and copy use the emulator selection.
 - Archive confirms running jobs and closes the reached drawers; Stop thread leaves shells alone. Quit names running tabs and their commands. A crash hangs up the run's shell groups.
 - The active tab supplies `perf.flood` and one 50,000,020-byte smoke measurement.
 
@@ -20,7 +20,7 @@ Open a thread and press ⌘J, or click the header's ⌘J button.
 Click the terminal to focus it, then type or use the tab keys.
 The top rail resizes the drawer within the space left by chat and composition.
 Click the composer to return to the draft.
-A running tab's close button or ⌘W opens its confirmation sheet; Return restarts an exited tab.
+A running tab's close button or ⌘W opens its confirmation sheet; ⌘Return restarts an exited tab.
 The shell uses the thread folder and the user's login shell with `-l`, without Veyra credentials or host-terminal identity variables.
 
 ## Driving it with veyra ctl
@@ -28,9 +28,10 @@ The shell uses the thread folder and the user's login shell with `-l`, without V
 Use the fake lane only. `VEYRA_DEBUG_SHELL_FIXTURE` points to an owned fixture and starts the adjacent fake CLI in shell mode.
 The scripted shell used to load PATH remains owned too; no human shell or dotfile is used.
 `veyra::DebugFocusShellDrawer` applies the same focus target as the terminal click, for setting a drive's focus precondition; synthetic window tests separately exercise the click. It does not prove native pointer delivery.
+`veyra::DebugDragShellDrawer` dispatches mouse-down on the rendered top rail, a held-left move and mouse-up through the window; its signed pixel amount grows the drawer upwards. It exercises the pointer handlers without establishing native pointer delivery.
 Every key below uses `keys`, with `focus` asserted before and after by `drawer_keys`. Draft checks also retain `composer_caret`.
 The focus table is: hidden + empty composer opens into drawer; hidden + draft opens while composer stays focused; either shown focus hides into composer; tab keys retain drawer focus, except closing its last tab hides into composer. Output and restart keep the existing surface focus.
-The modal close sheet retains the originating `focus` surface while its confirmation key context receives keys.
+A sheet reports `focus` as `none` because neither terminal nor composer holds focus; Cancel restores its originating surface. After archive opens the new-thread screen, its composer receives focus; the recipe asserts that settled screen and focus together.
 The orderly lifecycle case uses `ctl quit` to exercise shutdown with any owned idle structured sessions too, then verifies their groups and every owned shell pid are gone before the guarded relaunch.
 
 ```sh
@@ -63,6 +64,13 @@ def remember(d):
 remember(opened)
 capture('drawer-open')
 capture('drawer-header')
+height = opened['drawer']['height']
+action('drawer-resize-drag','DebugDragShellDrawer',{'pixels':48})
+resized = poll('drawer-resize',lambda d:d['drawer']['height']==height+48)
+assert resized['focus']=='drawer'
+capture('drawer-resize')
+action('drawer-resize-restore','DebugDragShellDrawer',{'pixels':-48})
+poll('drawer-resize-restored',lambda d:d['drawer']['height']==height)
 for index in range(7):
     drawer_keys('drawer-new-'+str(index),'cmd-t','drawer','drawer')
 full = poll('drawer-six-tabs',lambda d:len(d['drawer']['tabs'])==6 and all(tab['pid'] for tab in d['drawer']['tabs']))
@@ -81,11 +89,12 @@ for name,key,expected in [('control','ctrl-c',['03']),('line-start','cmd-left',[
         if re.fullmatch('[0-9a-f]{2}',line.strip())][-len(expected):] == expected)
 clipboard = subprocess.check_output(['pbpaste'])
 try:
-    subprocess.run(['pbcopy'],input=b'Q',check=True)
+    subprocess.run(['pbcopy'],input=b'Q\x1b[201~\x1b[200~\0\x03\x07',check=True)
     drawer_keys('drawer-paste','cmd-v','drawer','drawer')
-    expected = ['1b','5b','32','30','30','7e','51','1b','5b','32','30','31','7e']
+    expected = [f'{byte:02x}' for byte in b'\x1b[200~Q[201~[200~\x1b[201~']
     poll('drawer-paste-echo',lambda d:[line.strip() for line in d['drawer']['terminal']['grid']
         if re.fullmatch('[0-9a-f]{2}',line.strip())][-len(expected):] == expected)
+    capture('drawer-paste')
 finally: subprocess.run(['pbcopy'],input=clipboard,check=True)
 save('drawer-keys',ctl('drawer-key-state','dump'))
 drawer_keys('drawer-hide','cmd-j','drawer','composer',draft='',caret=0)
@@ -129,13 +138,13 @@ remember(job)
 action('drawer-stop-thread-keeps-shell','StopThread',{'thread':thread})
 kept = ctl('drawer-after-stop-thread','dump')
 assert any(tab['running'] for tab in kept['drawer']['tabs']) and kept['focus']=='drawer'
-drawer_keys('drawer-job-close','cmd-w','drawer','drawer')
+drawer_keys('drawer-job-close','cmd-w','drawer','none')
 poll('drawer-close-sheet',lambda d:d['drawer']['close_sheet'] is not None)
 capture('drawer-running-close')
-drawer_keys('drawer-cancel-close','escape','drawer','drawer')
+drawer_keys('drawer-cancel-close','escape','none','drawer')
 assert any(tab['running'] for tab in ctl('drawer-job-kept','dump')['drawer']['tabs'])
-drawer_keys('drawer-job-close-again','cmd-w','drawer','drawer')
-drawer_keys('drawer-confirm-close','cmd-enter','drawer','drawer')
+drawer_keys('drawer-job-close-again','cmd-w','drawer','none')
+drawer_keys('drawer-confirm-close','cmd-enter','none','drawer')
 poll('drawer-job-closed',lambda d:len(d['drawer']['tabs'])==1)
 drawer_fixture()
 other = create('drawer-other-thread','reply with the word ok')
@@ -156,7 +165,7 @@ ended = poll('drawer-ended',lambda d:any(tab['exited'] for tab in d['drawer']['t
 number = ended['drawer']['active_tab']
 assert ended['focus']=='drawer' and any(tab['exit_code']==7 for tab in ended['drawer']['tabs'])
 drawer_fixture()
-drawer_keys('drawer-restart','enter','drawer','drawer')
+drawer_keys('drawer-restart','cmd-enter','drawer','drawer')
 restarted = poll('drawer-restarted',lambda d:d['drawer']['active_tab']==number
     and all(not tab['exited'] for tab in d['drawer']['tabs']) and 'VEYRA_TUI_READY' in ''.join(d['drawer']['terminal']['grid']))
 remember(restarted)
@@ -168,7 +177,8 @@ remember(poll('drawer-archive-running',lambda d:any(tab['running'] for tab in d[
 action('drawer-archive','Archive',{'thread':thread})
 poll('drawer-archive-sheet',lambda d:d['drawer']['close_sheet'] is not None)
 capture('drawer-archive')
-drawer_keys('drawer-archive-confirm','cmd-enter','drawer','composer')
+archived_focus = drawer_keys('drawer-archive-confirm','cmd-enter','none','composer')
+assert archived_focus['view']=='new_thread' and archived_focus['selected_thread'] is None
 poll('drawer-archived',lambda d:all(row.get('id')!=thread for row in d['sidebar']['rows']))
 action('drawer-select-other','SelectThread',{'thread':other})
 poll('drawer-other-selected',lambda d:d['selected_thread'] is not None and d['selected_thread']['id']==other)
@@ -176,13 +186,13 @@ action('drawer-other-focus','DebugFocusShellDrawer')
 poll('drawer-other-focus-state',lambda d:d['focus']=='drawer')
 drawer_keys('drawer-quit-job','cmd-t','drawer','drawer')
 remember(poll('drawer-quit-running',lambda d:any(tab['running'] for tab in d['drawer']['tabs'])))
-drawer_keys('drawer-quit','cmd-q','drawer','drawer')
+drawer_keys('drawer-quit','cmd-q','drawer','none')
 quit_state = poll('drawer-quit-sheet',lambda d:d['quit_sheet']['open'])
 project_name = next(row['name'] for row in quit_state['sidebar']['rows'] if row['kind']=='project')
 assert any('sleep' in line and project_name in line and quit_state['selected_thread']['title'] in line
     for line in quit_state['quit_sheet']['threads'])
 capture('drawer-quit-sheet')
-drawer_keys('drawer-cancel-quit','escape','drawer','drawer')
+drawer_keys('drawer-cancel-quit','escape','none','drawer')
 app = identity()
 provider_groups = [int(value) for value in sql('select live_pgid from threads where live_pgid is not null').split()]
 ctl('drawer-orderly-quit','quit')
@@ -214,7 +224,7 @@ missing_state = ctl('drawer-missing-folder','dump')
 assert missing_state['drawer']['tabs'][0]['pid'] is None and 'folder' in missing_state['drawer']['tabs'][0]['error']
 capture('drawer-missing-folder')
 folder.mkdir()
-drawer_keys('drawer-folder-retry','enter','drawer','drawer')
+drawer_keys('drawer-folder-retry','cmd-enter','drawer','drawer')
 remember(poll('drawer-folder-restarted',lambda d:all(tab['pid'] for tab in d['drawer']['tabs'])))
 drawer_fixture(job=True)
 drawer_keys('drawer-crash-job','cmd-t','drawer','drawer')
@@ -250,7 +260,7 @@ PY
 The native recipe checks exact fake byte echoes, both close decisions, independent thread state, a same-tab restart, missing-folder refusal, archive confirmation, orderly shutdown and crash hangup.
 `drawer-hidden.json` checks that hidden output adds no terminal frame_requests or repaints, then verifies the parsed text on show. The global window counter includes composer caret blinks and is not a terminal wake counter.
 `drawer-flood.json` includes the active grid and `perf.flood` fields pty_bytes, elapsed_ms, repaints, median_repaint_gap_ms and max_repaint_gap_ms.
-Read the drawer, header, close-sheet, missing-folder, archive, quit-sheet and flood PNGs at original size.
+Read the drawer, resize, paste, header, close-sheet, missing-folder, archive, quit-sheet and flood PNGs at original size.
 
 ## Gotchas
 

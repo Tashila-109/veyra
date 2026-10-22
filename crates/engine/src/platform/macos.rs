@@ -1029,8 +1029,12 @@ pub fn user_shell() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/bin/zsh"))
 }
-pub fn foreground_group(pty: i32) -> io::Result<u32> {
-    let group = unsafe { libc::tcgetpgrp(pty) };
+pub fn duplicate_fd(fd: i32) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::BorrowedFd;
+    unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
+}
+pub fn foreground_group(pty: &std::os::fd::OwnedFd) -> io::Result<u32> {
+    let group = unsafe { libc::tcgetpgrp(pty.as_raw_fd()) };
     if group <= 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -1075,4 +1079,30 @@ pub fn shell_fixture_job() -> io::Result<ShellJob> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map(ShellJob)
+}
+
+#[cfg(test)]
+#[test]
+fn duplicated_descriptor_survives_original_reuse() {
+    use std::io::{Read, Seek, Write};
+    let root = std::env::temp_dir().join(format!("veyra-fd-{}", crate::domain::ThreadId::new()));
+    std::fs::create_dir(&root).unwrap();
+    let _scratch = crate::tests::Scratch(root.clone());
+    let mut original = File::create(root.join("original")).unwrap();
+    original.write_all(b"original").unwrap();
+    drop(original);
+    let original = File::open(root.join("original")).unwrap();
+    let number = original.as_raw_fd();
+    let duplicate = duplicate_fd(number).unwrap();
+    assert_ne!(duplicate.as_raw_fd(), number);
+    drop(original);
+    let replacement = File::create(root.join("replacement")).unwrap();
+    let reused = replacement.as_raw_fd() == number;
+    let mut held = File::from(duplicate);
+    held.rewind().unwrap();
+    let mut contents = String::new();
+    held.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "original");
+    assert!(foreground_group(&held.into()).is_err());
+    println!("original descriptor reused by owned replacement: {reused}");
 }

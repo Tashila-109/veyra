@@ -8,7 +8,7 @@ use veyra_engine::{
     commands::Command,
     domain::ThreadId,
     provider::TerminalHandle,
-    terminal::{PtySize, ShellStatus},
+    terminal::{PtySize, SHELL_TAB_LIMIT, ShellStatus},
 };
 
 pub(super) struct Tab {
@@ -121,7 +121,7 @@ impl Shell {
         if self
             .drawers
             .get(&thread)
-            .is_some_and(|drawer| drawer.tabs.len() >= 6)
+            .is_some_and(|drawer| drawer.tabs.len() >= SHELL_TAB_LIMIT)
         {
             return;
         }
@@ -276,7 +276,7 @@ impl Shell {
         {
             let tab = drawer.tabs.remove(index);
             if let Some(handle) = tab.handle {
-                self.engine.close_shell(thread, &handle);
+                self.engine.close_shell(&handle);
             }
             drawer.active = drawer.active.min(drawer.tabs.len().saturating_sub(1));
             if drawer.tabs.is_empty() {
@@ -385,7 +385,7 @@ impl Shell {
         let drawer = self.drawers.get_mut(&thread).unwrap();
         let index = drawer.active;
         if let Some(handle) = drawer.tabs.remove(index).handle {
-            self.engine.close_shell(thread, &handle);
+            self.engine.close_shell(&handle);
         }
         self.add_shell(focused, window, cx);
         let drawer = self.drawers.get_mut(&thread).unwrap();
@@ -406,6 +406,17 @@ impl Shell {
             self.input.update(cx, |input, cx| input.focus(window, cx));
         }
         self.sync_drawers(cx);
+    }
+    pub(super) fn drawer_height_bounds(&self, window: &Window, cx: &App) -> (Pixels, Pixels) {
+        let theme = cx.global::<Theme>();
+        let min =
+            theme.space.0[8] + theme.text.terminal.line_height.to_pixels(window.rem_size()) * 6.;
+        let max = (window.viewport_size().height
+            - theme.layout.header
+            - self.composition_height
+            - theme.text.read.line_height.to_pixels(window.rem_size()) * 3.)
+            .max(min);
+        (min, max)
     }
     pub(super) fn render_drawer(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let thread = self.view.chat()?;
@@ -455,20 +466,48 @@ impl Shell {
                 .handle
                 .as_ref()
                 .and_then(|handle| match handle.status() {
-                    ShellStatus::Exited { code, error } => Some(error.unwrap_or_else(|| {
-                        format!("Shell exited ({code:?}). Press Return to restart.")
-                    })),
+                    ShellStatus::Exited { code } => Some(format!(
+                        "Shell exited with code {code}. Press ⌘Return to restart."
+                    )),
+                    ShellStatus::Closed => Some("Shell closed. Press ⌘Return to restart.".into()),
+                    ShellStatus::Signalled => {
+                        Some("Shell ended after a signal. Press ⌘Return to restart.".into())
+                    }
+                    ShellStatus::Failed { error } => {
+                        Some(format!("{error}. Press ⌘Return to restart."))
+                    }
                     _ => None,
                 })
         });
-        let max = (window.viewport_size().height
-            - theme.layout.header
-            - theme.layout.composer_max_height
-            - theme.text.read.line_height.to_pixels(window.rem_size()) * 3.)
-            .max(
-                theme.space.0[8]
-                    + theme.text.terminal.line_height.to_pixels(window.rem_size()) * 6.,
+        let (_, max) = self.drawer_height_bounds(window, cx);
+        let rail = div()
+            .id("drawer-resize")
+            .h(theme.space.0[1])
+            .w_full()
+            .cursor(CursorStyle::ResizeUpDown)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                    shell.drawer_resizing =
+                        Some((thread, event.position.y, shell.drawers[&thread].height));
+                    cx.stop_propagation();
+                }),
             );
+        #[cfg(debug_assertions)]
+        let rail = rail.relative().child(
+            canvas(
+                {
+                    let shell = cx.entity().downgrade();
+                    move |bounds, _, cx| {
+                        let _ =
+                            shell.update(cx, |shell, _| shell.drawer_rail = Some((thread, bounds)));
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        );
         Some(
             div()
                 .v_flex()
@@ -479,21 +518,7 @@ impl Shell {
                 .debug_selector(|| "shell-drawer".into())
                 .border_t(theme.layout.border)
                 .border_color(theme.colors.border)
-                .child(
-                    div()
-                        .id("drawer-resize")
-                        .h(theme.space.0[1])
-                        .w_full()
-                        .cursor(CursorStyle::ResizeUpDown)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
-                                shell.drawer_resizing =
-                                    Some((thread, event.position.y, shell.drawers[&thread].height));
-                                cx.stop_propagation();
-                            }),
-                        ),
-                )
+                .child(rail)
                 .child(tabs)
                 .children(
                     message.map(|message| div().text_color(theme.colors.text_muted).child(message)),
@@ -565,15 +590,15 @@ impl Shell {
             "tabs":drawer.tabs.iter().map(|tab| {
                 let counts = tab.view.read(cx).frame_counts();
                 let status = tab.handle.as_ref().map(TerminalHandle::status);
-                let exit_code = match status { Some(ShellStatus::Exited { code, .. }) => code, _ => None };
+                let exit_code = match status { Some(ShellStatus::Exited { code }) => Some(code), _ => None };
                 serde_json::json!({"number":tab.number,"label":tab.label,
                     "frame_requests":counts.0,"repaints":counts.1,
                     "pid":tab.handle.as_ref().and_then(TerminalHandle::pid),
                     "running":tab.handle.as_ref().map(TerminalHandle::running_processes).unwrap_or_default(),
                     "exit_code":exit_code,
-                    "exited":matches!(status,Some(ShellStatus::Exited { .. })) || tab.error.is_some(),
+                    "exited":status.as_ref().is_some_and(ShellStatus::is_finished) || tab.error.is_some(),
                     "error":tab.error.clone().or_else(|| match &status {
-                        Some(ShellStatus::Exited { error, .. }) => error.clone(), _ => None })})
+                        Some(ShellStatus::Failed { error }) => Some(error.clone()), _ => None })})
             }).collect::<Vec<_>>(),"terminal":self.active_shell().map(|tab|tab.view.read(cx).dump()),
             "close_sheet":self.close_sheet.as_ref().map(|sheet|&sheet.processes)})
     }

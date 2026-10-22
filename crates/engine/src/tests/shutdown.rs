@@ -295,12 +295,7 @@ fn quit_during_stop_drain_keeps_queued_work_held_after_reload() {
     ));
     let _entered = f.runtime.enter();
     f.actor.handle(EngineMsg::Shutdown);
-    assert!(matches!(
-        f.actor.live[&f.thread].live,
-        Live::Stopping {
-            then: AfterStop::Park
-        }
-    ));
+    assert!(matches!(f.actor.live[&f.thread].live, Live::Stopping {}));
     f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
     assert!(
         matches!(f.actor.live[&f.thread].live, Live::Parked),
@@ -330,9 +325,7 @@ fn quit_during_stop_drain_keeps_queued_work_held_after_reload() {
 #[test]
 fn quit_while_stopping_keeps_queued_work_parked() {
     let mut f = Fixture::new(LiveState::Stopping);
-    f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping {
-        then: AfterStop::Park,
-    };
+    f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping {};
     let queued = f.user("waiting for retiring session");
     let _entered = f.runtime.enter();
     f.actor.handle(EngineMsg::Shutdown);
@@ -545,45 +538,44 @@ fn shutdown_request_rejects_backlogged_start_commands() {
 #[test]
 fn shutdown_request_prevents_retiring_session_restart_before_mailbox_shutdown() {
     let mut restarted = Vec::new();
-    for then in [AfterStop::Park] {
-        for hold in [None, Some(HoldReason::Interrupted)] {
-            let mut f = Fixture::new(LiveState::Stopping);
-            f.hold(hold);
-            let _entered = f.runtime.enter();
-            f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping { then: then.clone() };
-            let queued = f.user("queued before quit");
-            let (sender, mut receiver) = mpsc::channel(256);
-            let engine = crate::Engine {
-                inner: std::sync::Arc::new(crate::EngineInner {
-                    sender,
-                    schema_version: 2,
-                    state: f.actor.state.clone(),
-                    runtime: f.runtime.handle().clone(),
-                    groups: Default::default(),
-                    environment: env::ChildEnv::isolated(),
-                }),
-            };
-            engine
-                .inner
-                .sender
-                .try_send(EngineMsg::Provider {
-                    thread: f.thread,
-                    epoch: 1,
-                    event: ProviderEvent::Session(SessionEvent::Exited { crash: None }),
-                })
-                .unwrap();
-            engine.shutdown();
-            f.actor.handle(receiver.try_recv().unwrap());
-            if !matches!(f.actor.live[&f.thread].live, Live::Parked) {
-                restarted.push(then.clone());
-            }
-            assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
-            assert_eq!(
-                f.loaded().threads[&f.thread].hold,
-                Some(hold.unwrap_or(HoldReason::Restarted))
-            );
+    for hold in [None, Some(HoldReason::Interrupted)] {
+        let mut f = Fixture::new(LiveState::Stopping);
+        f.hold(hold);
+        let _entered = f.runtime.enter();
+        f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping {};
+        let queued = f.user("queued before quit");
+        let (sender, mut receiver) = mpsc::channel(256);
+        let engine = crate::Engine {
+            inner: std::sync::Arc::new(crate::EngineInner {
+                sender,
+                schema_version: 2,
+                state: f.actor.state.clone(),
+                runtime: f.runtime.handle().clone(),
+                groups: Default::default(),
+                environment: env::ChildEnv::isolated(),
+            }),
+        };
+        engine
+            .inner
+            .sender
+            .try_send(EngineMsg::Provider {
+                thread: f.thread,
+                epoch: 1,
+                event: ProviderEvent::Session(SessionEvent::Exited { crash: None }),
+            })
+            .unwrap();
+        engine.shutdown();
+        f.actor.handle(receiver.try_recv().unwrap());
+        if !matches!(f.actor.live[&f.thread].live, Live::Parked) {
+            restarted.push(hold);
         }
+        assert_eq!(f.loaded().turns[&queued].state, TurnState::Queued);
+        assert_eq!(
+            f.loaded().threads[&f.thread].hold,
+            Some(hold.unwrap_or(HoldReason::Restarted))
+        );
     }
+
     assert!(
         restarted.is_empty(),
         "session restarted after Engine::shutdown: {restarted:?}"

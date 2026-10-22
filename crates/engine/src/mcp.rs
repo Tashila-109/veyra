@@ -813,7 +813,6 @@ mod attempt_tests {
                         effort: None,
                     },
                     native: Some(NativeSessionId("old-thread".into())),
-
                     root: true,
                 },
                 std::process::id(),

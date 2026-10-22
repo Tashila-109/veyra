@@ -41,13 +41,7 @@ pub enum Live {
         pgid: u32,
         draining: Option<TurnId>,
     },
-    Stopping {
-        then: AfterStop,
-    },
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AfterStop {
-    Park,
+    Stopping {},
 }
 impl Live {
     pub fn session(&self) -> Option<&SessionHandle> {

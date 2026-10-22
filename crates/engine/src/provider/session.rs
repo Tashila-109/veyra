@@ -1976,7 +1976,6 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-
                 root: false,
             },
             env,
@@ -2256,7 +2255,6 @@ mod tests {
                     mode: PermissionMode::AskFirst,
                 },
                 native: None,
-
                 root: false,
             },
             env,
@@ -2441,7 +2439,6 @@ mod tests {
                             mode: PermissionMode::AskFirst,
                         },
                         native: Some(NativeSessionId("missing-native".into())),
-
                         root: false,
                     },
                     env.clone(),
@@ -2542,7 +2539,6 @@ mod tests {
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
-
                     root: false,
                 },
                 env.clone(),
@@ -2643,7 +2639,6 @@ done
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
-
                     root: false,
                 },
                 env.clone(),
@@ -2778,7 +2773,6 @@ done
                         mode: PermissionMode::AskFirst,
                     },
                     native: None,
-
                     root: false,
                 },
                 env.clone(),
@@ -2903,7 +2897,6 @@ mod mcp_record_tests {
                     effort: None,
                 },
                 native: Some(NativeSessionId("lost-native".into())),
-
                 root: true,
             },
             std::process::id(),
@@ -3052,7 +3045,6 @@ mod recorder_tests {
                         effort: None,
                     },
                     native: None,
-
                     root: false,
                 },
                 child.pid(),
@@ -3145,7 +3137,6 @@ mod availability_tests {
                         effort: None,
                     },
                     native: None,
-
                     root: false,
                 },
                 env.clone(),

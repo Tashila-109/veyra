@@ -658,6 +658,11 @@ pub struct Shell {
     close_sheet: Option<drawer::CloseSheet>,
     close_focus: FocusHandle,
     drawer_resizing: Option<(ThreadId, Pixels, Pixels)>,
+    composition_height: Pixels,
+    #[cfg(debug_assertions)]
+    drawer_rail: Option<(ThreadId, Bounds<Pixels>)>,
+    #[cfg(debug_assertions)]
+    composer_focused: bool,
     quit_drawer_focus: bool,
     focus: FocusHandle,
     dock_focus: FocusHandle,
@@ -856,6 +861,11 @@ impl Shell {
             close_sheet: None,
             close_focus: cx.focus_handle(),
             drawer_resizing: None,
+            composition_height: Pixels::ZERO,
+            #[cfg(debug_assertions)]
+            drawer_rail: None,
+            #[cfg(debug_assertions)]
+            composer_focused: false,
             quit_drawer_focus: false,
             focus,
             dock_focus: cx.focus_handle(),
@@ -917,6 +927,20 @@ impl Shell {
             cx.notify();
         })
         .detach();
+        #[cfg(debug_assertions)]
+        {
+            shell.composer_focused = shell.input.focus_handle(cx).is_focused(window);
+            cx.on_focus(&shell.input.focus_handle(cx), window, |shell, _, cx| {
+                shell.composer_focused = true;
+                cx.notify();
+            })
+            .detach();
+            cx.on_focus_out(&shell.input.focus_handle(cx), window, |shell, _, _, cx| {
+                shell.composer_focused = false;
+                cx.notify();
+            })
+            .detach();
+        }
         shell.recheck(false, window, cx);
         shell
     }
@@ -1940,9 +1964,9 @@ impl Shell {
             "login_path":self.engine.login_path_status(),
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
             "header_branch":self.branch, "drawer":self.drawer_dump(cx),
-            "focus":if self.active_shell().is_some_and(|tab|tab.view.read(cx).focused())
-                || self.close_sheet.as_ref().is_some_and(|sheet|sheet.drawer_focus)
-                || self.quit_sheet && self.quit_drawer_focus { "drawer" } else { "composer" },
+            "focus":if self.active_shell().is_some_and(|tab|tab.view.read(cx).focused()) {
+                "drawer"
+            } else if self.composer_focused { "composer" } else { "none" },
             "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows(), "menu_thread\
                 ":self.thread_menu.as_ref().map(|(id,_)|id)},
             "selected_thread":self.dump_selected(), "transcript":transcript,
@@ -2401,6 +2425,17 @@ impl Render for Shell {
                 );
             }))
             .on_mouse_move(cx.listener(|shell, event: &MouseMoveEvent, window, cx| {
+                if let Some((thread, origin, height)) = shell.drawer_resizing {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        let (min, max) = shell.drawer_height_bounds(window, cx);
+                        if let Some(drawer) = shell.drawers.get_mut(&thread) {
+                            drawer.height = (height + origin - event.position.y).clamp(min, max);
+                            cx.notify();
+                        }
+                    } else {
+                        shell.drawer_resizing = None;
+                    }
+                }
                 if shell.resizing && event.pressed_button == Some(MouseButton::Left) {
                     window.dispatch_action(
                         Box::new(SetSidebarWidth {
@@ -2459,6 +2494,53 @@ impl Render for Shell {
         let root = root.on_action(cx.listener(|shell, _: &DebugFocusShellDrawer, window, cx| {
             shell.focus_shell(window, cx);
         }));
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(
+            |shell, action: &DebugDragShellDrawer, window, cx| {
+                if !action.pixels.is_finite() {
+                    return;
+                }
+                let Some((_, bounds)) = shell.drawer_rail.filter(|(thread, _)| {
+                    shell.view.chat() == Some(*thread)
+                        && shell.drawers.get(thread).is_some_and(|drawer| drawer.open)
+                }) else {
+                    return;
+                };
+                let position = bounds.center();
+                let pixels = action.pixels;
+                cx.spawn_in(window, async move |_, cx| {
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_event(
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                position,
+                                button: MouseButton::Left,
+                                click_count: 1,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position: position - point(Pixels::ZERO, Pixels::from(pixels)),
+                                pressed_button: Some(MouseButton::Left),
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::MouseUp(MouseUpEvent {
+                                position: position - point(Pixels::ZERO, Pixels::from(pixels)),
+                                button: MouseButton::Left,
+                                click_count: 1,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            },
+        ));
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|_, action: &DebugStallUi, window, cx| {
             let milliseconds = action.milliseconds;
@@ -2994,10 +3076,8 @@ mod tests {
             config: shell.config.clone(),
             cwd: "/tmp".into(),
             native: None,
-
             cli_version: None,
             hold: None,
-
             archived: false,
         };
         shell.state.threads.insert(root, parent.clone());
@@ -4012,10 +4092,8 @@ mod tests {
                 config: shell.config.clone(),
                 cwd: "/tmp".into(),
                 native: None,
-
                 cli_version: None,
                 hold: hold.then_some(HoldReason::ChildReport),
-
                 archived: false,
             },
         );
@@ -6125,10 +6203,8 @@ mod tests {
                     },
                     cwd: scratch.0.clone(),
                     native: None,
-
                     cli_version: None,
                     hold: None,
-
                     archived: false,
                 })),
             })
@@ -6224,10 +6300,8 @@ mod tests {
             },
             cwd: "/tmp".into(),
             native: None,
-
             cli_version: None,
             hold: None,
-
             archived: false,
         };
         let mut state = AppState::default();
@@ -6354,10 +6428,8 @@ mod tests {
                 },
                 cwd: "/tmp/veyra-snapshot-test".into(),
                 native: None,
-
                 cli_version: None,
                 hold: None,
-
                 archived: false,
             })),
         });
@@ -7077,10 +7149,8 @@ mod tests {
             },
             cwd: "/tmp".into(),
             native: None,
-
             cli_version: None,
             hold: None,
-
             archived: false,
         };
         state.apply(UiEvent::Change {
@@ -7707,6 +7777,133 @@ mod tests {
                 }),
                 "cancel did not restore composer focus"
             );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn drawer_dump_reports_actual_surface_focus(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.input.update(cx, |input, cx| input.focus(window, cx));
+            });
+            draw(cx);
+            let focus = |shell: &gpui::Entity<super::Shell>, cx: &gpui::VisualTestContext| {
+                shell.read_with(cx, |shell, cx| {
+                    shell.dump(std::path::Path::new("/tmp"), cx)["focus"].clone()
+                })
+            };
+            assert_eq!(focus(&shell, cx), "composer");
+            cx.simulate_keystrokes("secondary-j");
+            draw(cx);
+            assert_eq!(focus(&shell, cx), "drawer");
+            shell.update_in(cx, |shell, window, cx| window.focus(&shell.close_focus, cx));
+            draw(cx);
+            assert_eq!(focus(&shell, cx), "none");
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn drawer_native_drag_action_uses_pointer_handlers(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.toggle_drawer(window, cx);
+            });
+            draw(cx);
+            let before = shell.read_with(cx, |shell, _| {
+                shell.drawers[&shell.view.chat().unwrap()].height
+            });
+            shell.update_in(cx, |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(super::actions::DebugDragShellDrawer { pixels: 48. }),
+                    cx,
+                )
+            });
+            draw(cx);
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(
+                    shell.drawers[&shell.view.chat().unwrap()].height,
+                    before + gpui::Pixels::from(48.)
+                );
+                assert!(shell.drawer_resizing.is_none());
+            });
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn drawer_rail_drag_changes_height_and_clamps(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.toggle_drawer(window, cx);
+            });
+            draw(cx);
+            let composition = cx.debug_bounds("composition-surface").unwrap().size.height;
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.composition_height),
+                composition
+            );
+            let rail = cx.debug_bounds("shell-drawer").unwrap().top();
+            let position = gpui::point(gpui::Pixels::from(500.), rail + gpui::Pixels::from(2.));
+            let before = shell.read_with(cx, |shell, _| {
+                shell.drawers[&shell.view.chat().unwrap()].height
+            });
+            cx.simulate_event(gpui::MouseDownEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.drawer_resizing.is_some()));
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: position - gpui::point(gpui::Pixels::from(0.), gpui::Pixels::from(48.)),
+                pressed_button: Some(gpui::MouseButton::Left),
+                ..Default::default()
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.drawers[&shell.view.chat().unwrap()]
+                    .height),
+                before + gpui::Pixels::from(48.)
+            );
+            let bottom = cx.update(|window, _| window.viewport_size().height);
+            for (y, minimum) in [
+                (bottom - gpui::Pixels::from(1.), true),
+                (gpui::Pixels::from(1.), false),
+            ] {
+                cx.simulate_event(gpui::MouseMoveEvent {
+                    position: gpui::point(position.x, y),
+                    pressed_button: Some(gpui::MouseButton::Left),
+                    ..Default::default()
+                });
+                draw(cx);
+                let height = shell.read_with(cx, |shell, _| {
+                    shell.drawers[&shell.view.chat().unwrap()].height
+                });
+                let bounds = cx.debug_bounds("shell-drawer").unwrap();
+                assert_eq!(height, bounds.size.height);
+                if minimum {
+                    assert_eq!(height, gpui::Pixels::from(134.));
+                } else {
+                    assert!(height > before + gpui::Pixels::from(48.));
+                }
+            }
+            cx.simulate_event(gpui::MouseUpEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.drawer_resizing.is_none()));
         });
     }
 

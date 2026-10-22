@@ -18,7 +18,7 @@ use crate::{
     commands::{Ack, Command, CommandError},
     domain::*,
     events::{ChangeSet, UiEvent},
-    live::{AfterStop, Live, LiveThread},
+    live::{Live, LiveThread},
     provider::{scripted::Scripted, *},
     store,
 };
@@ -74,7 +74,6 @@ impl Fixture {
             config: config(),
             cwd: "/tmp".into(),
             native: None,
-
             cli_version: None,
             hold: None,
             archived: false,
@@ -92,9 +91,7 @@ impl Fixture {
                 pgid: 9,
                 draining: None,
             },
-            LiveState::Stopping => Live::Stopping {
-                then: AfterStop::Park,
-            },
+            LiveState::Stopping => Live::Stopping {},
         };
         let mut c = ChangeSet::default();
         c.projects.insert(project.id, project.clone());

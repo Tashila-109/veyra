@@ -180,10 +180,8 @@ fn seed_large_snapshot(db: &mut Connection, path: &std::path::Path) -> ThreadId 
             config: config(),
             cwd: path.into(),
             native: None,
-
             cli_version: None,
             hold: None,
-
             archived: false,
         },
     );

@@ -1081,9 +1081,7 @@ mod cli {
         if account || eof {
             assert!(matches!(
                 run.f.actor.live[&run.f.thread].live,
-                Live::Stopping {
-                    then: AfterStop::Park
-                }
+                Live::Stopping {}
             ));
         }
         run.until(|f| f.running() == Some(second));
@@ -1143,14 +1141,7 @@ mod cli {
                 turn: first,
             })
             .unwrap();
-        run.until(|f| {
-            matches!(
-                f.actor.live[&f.thread].live,
-                Live::Stopping {
-                    then: AfterStop::Park
-                }
-            )
-        });
+        run.until(|f| matches!(f.actor.live[&f.thread].live, Live::Stopping {}));
         run.finish();
         run.f
             .command(Command::Continue {
@@ -1199,14 +1190,7 @@ mod cli {
             Some(WaitReason::Stopping)
         );
         if ignored {
-            run.until(|f| {
-                matches!(
-                    f.actor.live[&f.thread].live,
-                    Live::Stopping {
-                        then: AfterStop::Park
-                    }
-                )
-            });
+            run.until(|f| matches!(f.actor.live[&f.thread].live, Live::Stopping {}));
             assert!(stopped.elapsed() < std::time::Duration::from_secs(5));
         }
         run.until(|f| f.running() == Some(second));
