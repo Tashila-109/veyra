@@ -118,7 +118,8 @@ def verdict(record, counted, late=False):
     minute away.
     """
     failed, seen = record['failed'], record.get('observed') or {}
-    record['interrupted'] = record.get('interrupted') or (take_pending() or [None])[0]
+    taken = take_pending()
+    record['interrupted'] = record.get('interrupted') or (taken or [None])[0]
     if record['interrupted']: return 'FAILED: interrupted by '+record['interrupted'],counted
     if record.get('cleanup_exit') not in (0,None) or record.get('scratch_left'):
         return 'FAILED: Cleanup did not pass',counted
@@ -382,7 +383,7 @@ def new_run(scratch):
         run = secrets.token_hex(4)
         if not (REPO/'target/verify-veyra'/run).exists() and not os.path.exists(scratch+run): return run
 
-def kept(path, data):
+def receipt_error(path, data):
     """Write a required receipt once and read it back. Returns None when it holds data, else the error, which goes to
     stderr because the receipt that would hold it was not kept."""
     try:
@@ -469,7 +470,7 @@ def main():
         # Cleanup has run and the signals are blocked: the verdict comes first, then the one write of attempt.json.
         status,counted = verdict(record,counted,time.time() >= args.deadline-60)
         record['verdict'] = status or 'another attempt'
-        error = kept(args.evidence/label/'attempt.json',record)
+        error = receipt_error(args.evidence/label/'attempt.json',record)
         if error:
             lost.append('attempt.json')
             status = 'FAILED: attempt.json was not kept: '+error
@@ -480,16 +481,16 @@ def main():
             except Interrupted as stop: status = 'FAILED: interrupted by '+str(stop)+' between attempts'
     try: signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
     except Interrupted: pass
-    if kept(args.evidence/'outcome.json',{'status':status,'plan':['/'.join(key) for key in plan],
+    if receipt_error(args.evidence/'outcome.json',{'status':status,'plan':['/'.join(key) for key in plan],
             'attempts':attempts,'finished_epoch':time.time()}): lost.append('outcome.json')
-    late = pending()
-    final = status
-    if late:
-        final = f'FAILED: interrupted by {late[0]} after the verdict, as the receipts were written; they keep {status}'
-        print(final,file=sys.stderr,flush=True)
-    if lost: final = 'FAILED: '+' and '.join(lost)+' not kept, so the run cannot be DONE'
+    final = 'FAILED: '+' and '.join(lost)+' not kept, so the run cannot be DONE' if lost else status
     print(final,'evidence='+str(args.evidence),flush=True)
-    # The verdict and receipts are final: discard what is pending, then restore the mask.
+    # The last check comes after the final line, so a signal while it is written also counts.
+    late = pending()
+    if late:
+        print(f'FAILED: interrupted by {late[0]} after the verdict, while the receipts or the final line were written; '
+            f'the receipts keep {status}',file=sys.stderr,flush=True)
+    # Discard what is pending, then restore the mask.
     for number in SIGNALS: signal.signal(number,signal.SIG_IGN)
     signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
     if late: return 128+signal.Signals[late[0]].value
