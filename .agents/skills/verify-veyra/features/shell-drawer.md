@@ -6,12 +6,22 @@ Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/terminal_view.rs crate
 ## Sub-features
 
 - Each thread keeps its own drawer, height and up to six tabs in memory; no shell row or actor event is written.
-- `veyra::ToggleShellDrawer` opens or hides with ⌘J. An empty composer gives focus to the drawer; a draft keeps composer focus, text and caret. Hiding returns focus to the composer.
+- `veyra::ToggleShellDrawer` opens or hides with ⌘J.
+  An empty composer gives focus to the drawer; a draft keeps composer focus, text and caret.
+  Hiding returns focus to the composer.
 - `veyra::NewShellTab`, `veyra::CloseShellTab`, `veyra::NextShellTab` and `veyra::PreviousShellTab` use ⌘T, ⌘W, ⌘⇧] and ⌘⇧[ only with drawer focus.
-- A bare prompt closes immediately; a foreground, background or stopped job asks. `veyra::ConfirmCloseShellTab` confirms with ⌘↵; `veyra::CancelCloseShellTab` cancels with Escape.
-- Output and exits retain focus. Hidden output keeps parsing without scheduling paints. `veyra::RestartShellTab`, Return, replaces an ended shell in the same tab; a missing folder starts nothing.
-- `veyra::PasteShell` and `veyra::CopyShell` bind ⌘V and ⌘C. Paste removes ESC and C0 controls except tab, newline and carriage return in both modes, and adds brackets only when requested. `veyra::ScrollShellHistoryUp` and `veyra::ScrollShellHistoryDown` bind ⇧PageUp and ⇧PageDown; the next input returns to the bottom. Drag selection and copy use the emulator selection.
-- Archive confirms running jobs and closes the reached drawers; Stop thread leaves shells alone. Quit names running tabs and their commands. A crash hangs up the run's shell groups.
+- A bare prompt closes immediately; a foreground, background or stopped job asks.
+  `veyra::ConfirmCloseShellTab` confirms with ⌘↵; `veyra::CancelCloseShellTab` cancels with Escape.
+- Output and exits retain focus.
+  Hidden output keeps parsing without scheduling paints.
+  `veyra::RestartShellTab`, Return, replaces an ended shell in the same tab; a missing folder starts nothing.
+- `veyra::PasteShell` and `veyra::CopyShell` bind ⌘V and ⌘C.
+  Paste removes ESC, DEL and C0 controls except tab, newline and carriage return in both modes, and adds brackets only when requested.
+  `veyra::ScrollShellHistoryUp` and `veyra::ScrollShellHistoryDown` bind ⇧PageUp and ⇧PageDown; the next input returns to the bottom.
+  Drag selection and copy use the emulator selection.
+- Archive confirms running jobs and closes the reached drawers; Stop thread leaves shells alone.
+  Quit names running tabs and their commands.
+  A crash hangs up the run's shell groups.
 - The active tab supplies `perf.flood` and one 50,000,020-byte smoke measurement.
 
 ## How to get to it (user POV)
@@ -25,13 +35,19 @@ The shell uses the thread folder and the user's login shell with `-l`, without V
 
 ## Driving it with veyra ctl
 
-Use the fake lane only. `VEYRA_DEBUG_SHELL_FIXTURE` points to an owned fixture and starts the adjacent fake CLI in shell mode.
+Use the fake lane only.
+`VEYRA_DEBUG_SHELL_FIXTURE` points to an owned fixture and starts the adjacent fake CLI in shell mode.
 The scripted shell used to load PATH remains owned too; no human shell or dotfile is used.
-`veyra::DebugFocusShellDrawer` applies the same focus target as the terminal click, for setting a drive's focus precondition; synthetic window tests separately exercise the click. It does not prove native pointer delivery.
-`veyra::DebugDragShellDrawer` dispatches mouse-down on the rendered top rail, a held-left move and mouse-up through the window; its signed pixel amount grows the drawer upwards. It exercises the pointer handlers without establishing native pointer delivery.
-Every key below uses `keys`, with `focus` asserted before and after by `drawer_keys`. Draft checks also retain `composer_caret`.
-The focus table is: hidden + empty composer opens into drawer; hidden + draft opens while composer stays focused; either shown focus hides into composer; tab keys retain drawer focus, except closing its last tab hides into composer. Output and restart keep the existing surface focus.
-A sheet reports `focus` as `none` because neither terminal nor composer holds focus; Cancel restores its originating surface. After archive opens the new-thread screen, its composer receives focus; the recipe asserts that settled screen and focus together.
+`veyra::DebugFocusShellDrawer` applies the same focus target as the terminal click, for setting a drive's focus precondition; synthetic window tests separately exercise the click.
+It does not prove native pointer delivery.
+`veyra::DebugDragShellDrawer` dispatches mouse-down on the rendered top rail, a held-left move and mouse-up through the window; its signed pixel amount grows the drawer upwards.
+It exercises the pointer handlers without establishing native pointer delivery.
+Every key below uses `keys`, with `focus` asserted before and after by `drawer_keys`.
+Draft checks also retain `composer_caret`.
+The focus table is: hidden + empty composer opens into drawer; hidden + draft opens while composer stays focused; either shown focus hides into composer; tab keys retain drawer focus, except closing its last tab hides into composer.
+Output and restart keep the existing surface focus.
+A sheet reports `focus` as `none` because neither terminal nor composer holds focus; Cancel restores its originating surface.
+After archive opens the new-thread screen, its composer receives focus; the recipe asserts that settled screen and focus together.
 The orderly lifecycle case uses `ctl quit` to exercise shutdown with any owned idle structured sessions too, then verifies their groups and every owned shell pid are gone before the guarded relaunch.
 
 ```sh
@@ -284,14 +300,23 @@ PY
 
 `drawer` reports open, height, active_tab, tab pids, running process paths and exit codes; its nested terminal reports grid, focused, columns and rows.
 `focus` and `composer_caret` accompany every key receipt.
-The paste fixture records all received bytes as one compact hexadecimal record, so all 23 bracketed-paste bytes are checked exactly and in order at layout sizing, including a nine-row drawer. No grid override is needed. The native recipe checks exact fake byte echoes, both close decisions, independent thread state, a same-tab restart, missing-folder refusal, archive confirmation, orderly shutdown and crash hangup.
-`drawer-hidden.json` checks that hidden output adds no terminal frame_requests or repaints, then verifies the parsed text on show. The global window counter includes composer caret blinks and is not a terminal wake counter.
+The paste fixture plants ESC, DEL and C0 controls and records all received bytes as one compact hexadecimal record, so all 23 filtered bracketed-paste bytes are checked exactly and in order at layout sizing, including a nine-row drawer.
+No grid override is needed.
+The native recipe checks exact fake byte echoes, both close decisions, independent thread state, a same-tab restart, missing-folder refusal, archive confirmation, orderly shutdown and crash hangup.
+`drawer-hidden.json` checks that hidden output adds no terminal frame_requests or repaints, then verifies the parsed text on show.
+The global window counter includes composer caret blinks and is not a terminal wake counter.
 `drawer-flood.json` includes the active grid and `perf.flood` fields pty_bytes, elapsed_ms, repaints, median_repaint_gap_ms and max_repaint_gap_ms.
 Read the drawer, resize, paste, header, close-sheet, ended-tab, restarted-tab, missing-folder, archive, quit-sheet and flood PNGs at original size.
 
 ## Gotchas
 
-Native pointer delivery, selection dragging and IME are not established by the control driver. Window tests cover the click focus and emulator selection wiring; IME remains unsupported.
-The pasteboard helper snapshots every item and every declared type into memory before staging the fixture text. It runs in its own session and restores on pipe EOF, including when the driving process exits. It refuses an incomplete or changing snapshot before touching the board. The planted check uses two items containing PNG, binary, rich text and plain text; only their types and hashes are recorded. The original clipboard's contents and hashes are never logged or stored.
+Native pointer delivery, selection dragging and IME are not established by the control driver.
+Window tests cover the click focus and emulator selection wiring; IME remains unsupported.
+The pasteboard helper snapshots every item and every declared type into memory before staging the fixture text.
+It runs in its own session and restores on pipe EOF, including when the driving process exits.
+It refuses an incomplete or changing snapshot before touching the board.
+The planted check uses two items containing PNG, binary, rich text and plain text; only their types and hashes are recorded.
+The original clipboard's contents and hashes are never logged or stored.
 The shell fixture's background-job scenario starts only an owned sleep child; Control-C ends it, and normal group hangup reaches it.
-The shell and terminal paths never launch an installed agent CLI. Never replace the owned fixture with the human's shell during verification.
+The shell and terminal paths never launch an installed agent CLI.
+Never replace the owned fixture with the human's shell during verification.

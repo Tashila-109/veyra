@@ -243,7 +243,8 @@ The read-only dump reports `login_path`, `drawer`, `focus`, `composer_caret`, `t
 `view` is `new_thread`, `chat`, `failed_thread` or `settings`.
 `drawer` describes the selected thread's open state, height, active_tab and tabs, with each tab's number, label, pid, running process paths, exit_code, exited flag and error.
 Its nested `terminal` carries grid, focused, columns, rows and repaint count for the active tab.
-`focus` reports composer, drawer or none from their focus observations. Sheets report none and remember their originating surface only for Cancel.
+`focus` reports composer, drawer or none from their focus observations.
+Sheets report none and remember their originating surface only for Cancel.
 `composer_caret` is the input's byte offset and verifies that toggling the drawer preserves a draft's caret.
 `VEYRA_DEBUG_SHELL_FIXTURE` runs only the adjacent fake CLI's shell mode, using a run-owned fixture; the fake lane always sets it and never opens the user's real shell.
 The shell environment strips all VEYRA_* variables, so the fake fixture path is injected only after that filter for the debug fake.

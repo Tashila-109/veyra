@@ -736,7 +736,7 @@ pub fn wait_reason(v: &ThreadView<'_>) -> Option<WaitReason> {
     }
     if matches!(
         v.live.live,
-        Live::Stopping { .. }
+        Live::Stopping
             | Live::Structured {
                 draining: Some(_),
                 ..

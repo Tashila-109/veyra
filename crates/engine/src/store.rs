@@ -289,7 +289,7 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
         )?;
     }
     for (id, live) in &c.live {
-        if matches!(live.live, Live::Stopping { .. }) {
+        if matches!(live.live, Live::Stopping) {
             continue;
         }
         let (pid, pgid) = match live.live {

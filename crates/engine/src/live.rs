@@ -41,7 +41,7 @@ pub enum Live {
         pgid: u32,
         draining: Option<TurnId>,
     },
-    Stopping {},
+    Stopping,
 }
 impl Live {
     pub fn session(&self) -> Option<&SessionHandle> {

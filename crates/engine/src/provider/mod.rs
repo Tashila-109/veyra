@@ -206,13 +206,11 @@ impl TerminalHandle {
     pub fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.terminal.write(bytes)
     }
-    pub fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
-        Some(self.terminal.subscribe())
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.terminal.subscribe()
     }
-    pub fn emulator(
-        &self,
-    ) -> Option<&alacritty_terminal::sync::FairMutex<crate::terminal::Emulator>> {
-        Some(&self.terminal.emulator)
+    pub fn emulator(&self) -> &alacritty_terminal::sync::FairMutex<crate::terminal::Emulator> {
+        &self.terminal.emulator
     }
     pub fn resize(&self, size: portable_pty::PtySize) -> std::io::Result<()> {
         self.terminal.resize(size)

@@ -170,7 +170,7 @@ fn cell(row: Row, state: LiveState) {
                         LiveState::Parked => matches!(live, Live::Parked),
                         LiveState::Starting => matches!(live, Live::Starting { .. }),
                         LiveState::Idle => matches!(live, Live::Structured { draining: None, .. }),
-                        LiveState::Stopping => matches!(live, Live::Stopping {}),
+                        LiveState::Stopping => matches!(live, Live::Stopping),
                         LiveState::Running => unreachable!(),
                     });
                 }
@@ -228,7 +228,7 @@ fn cell(row: Row, state: LiveState) {
                     }
                 );
                 if state == LiveState::Idle {
-                    assert!(matches!(live, Live::Stopping {}));
+                    assert!(matches!(live, Live::Stopping));
                     assert_eq!(f.controls.try_recv().unwrap(), SessionControl::Shutdown);
                 }
             }
@@ -237,7 +237,7 @@ fn cell(row: Row, state: LiveState) {
                 assert_eq!(t.archived, matches!(row, Row::Archive));
                 assert_eq!(f.running(), None);
                 if matches!(state, LiveState::Starting | LiveState::Stopping) {
-                    assert!(matches!(live, Live::Stopping {}));
+                    assert!(matches!(live, Live::Stopping));
                 }
                 if matches!(row, Row::Archive) {
                     assert!(f.drain().iter().any(|e| matches!(
@@ -250,7 +250,7 @@ fn cell(row: Row, state: LiveState) {
                 }
             }
             Row::Park => assert_eq!(
-                matches!(live, Live::Stopping {}),
+                matches!(live, Live::Stopping),
                 matches!(state, LiveState::Idle | LiveState::Stopping)
             ),
         }

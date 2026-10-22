@@ -104,7 +104,7 @@ func run() throws -> Int32 {
     }
     if !audit {
         try restore([[Flavor(type: NSPasteboard.PasteboardType.string.rawValue,
-            data: Data([81, 27, 91, 50, 48, 49, 126, 27, 91, 50, 48, 48, 126, 0, 3, 7]))]])
+            data: Data([81, 27, 91, 50, 48, 49, 126, 27, 91, 50, 48, 48, 126, 0, 3, 7, 127]))]])
     }
     try emit(["phase": "ready", "original": metadata(original), "saved": metadata(saved, hashes: planted)])
     _ = readLine()

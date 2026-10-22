@@ -91,7 +91,7 @@ impl Fixture {
                 pgid: 9,
                 draining: None,
             },
-            LiveState::Stopping => Live::Stopping {},
+            LiveState::Stopping => Live::Stopping,
         };
         let mut c = ChangeSet::default();
         c.projects.insert(project.id, project.clone());

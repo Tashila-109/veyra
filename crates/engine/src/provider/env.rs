@@ -1033,7 +1033,6 @@ mod login_path_tests {
         tokio::time::timeout(Duration::from_millis(700), async {
             while !handle
                 .emulator()
-                .unwrap()
                 .lock()
                 .text()
                 .join("")

@@ -1104,5 +1104,5 @@ fn duplicated_descriptor_survives_original_reuse() {
     held.read_to_string(&mut contents).unwrap();
     assert_eq!(contents, "original");
     assert!(foreground_group(&held.into()).is_err());
-    println!("original descriptor reused by owned replacement: {reused}");
+    assert!(reused, "the owned replacement did not reuse the descriptor");
 }

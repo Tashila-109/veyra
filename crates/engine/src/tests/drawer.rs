@@ -79,15 +79,7 @@ impl ShellRun {
         }
     }
     fn text(&self, handle: &TerminalHandle, text: &str) {
-        self.wait(|| {
-            handle
-                .emulator()
-                .unwrap()
-                .lock()
-                .text()
-                .join("\n")
-                .contains(text)
-        });
+        self.wait(|| handle.emulator().lock().text().join("\n").contains(text));
     }
 }
 impl Drop for ShellRun {
@@ -515,7 +507,7 @@ fn terminal_input_skips_actor_mailbox() {
         .unwrap();
     run.text(&handle, "4b");
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(handle.emulator().unwrap().lock().text().len(), 30);
+    assert_eq!(handle.emulator().lock().text().len(), 30);
     db.execute_batch("COMMIT").unwrap();
     run.runtime.block_on(command).unwrap().unwrap().unwrap();
 }
@@ -538,7 +530,6 @@ fn failed_shell_keeps_exit_code_and_visible_reason() {
     assert!(
         handle
             .emulator()
-            .unwrap()
             .lock()
             .text()
             .join("\n")

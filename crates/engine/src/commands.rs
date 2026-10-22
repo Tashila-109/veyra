@@ -267,7 +267,7 @@ fn send(
         set_hold(p, c, thread, None);
     }
     let turn = match &l[&thread].live {
-        Live::Parked | Live::Starting { .. } | Live::Structured { .. } | Live::Stopping { .. } => {
+        Live::Parked | Live::Starting { .. } | Live::Structured { .. } | Live::Stopping => {
             queue_user(p, c, thread, text)
         }
     };
@@ -456,7 +456,7 @@ fn respond(
         Live::Structured { .. } => {
             return Err(CommandError::RequestClosed);
         }
-        Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
+        Live::Stopping => return Err(CommandError::Busy(WaitReason::Stopping)),
     }
     Ok(())
 }
@@ -481,7 +481,7 @@ fn configure(
             control(c, thread, SessionControl::Shutdown);
             stopping(l, c, thread);
         }
-        Live::Stopping { .. } => return Err(CommandError::Busy(WaitReason::Stopping)),
+        Live::Stopping => return Err(CommandError::Busy(WaitReason::Stopping)),
     }
     t.config = config.clone();
     c.threads.insert(thread, t);
@@ -501,7 +501,7 @@ fn continue_thread(
         drop_turns(p, c, thread, true, now);
     }
     match &l[&thread].live {
-        Live::Parked | Live::Starting { .. } | Live::Structured { .. } | Live::Stopping { .. } => {
+        Live::Parked | Live::Starting { .. } | Live::Structured { .. } | Live::Stopping => {
             set_hold(p, c, thread, None)
         }
     }
@@ -628,7 +628,7 @@ pub(crate) fn stop_one(
         Live::Structured { .. } if c.view(p, l, thread).unwrap().turn_busy() => {
             interrupt_active(p, l, c, thread, reason);
         }
-        Live::Stopping { .. } => stopping(l, c, thread),
+        Live::Stopping => stopping(l, c, thread),
         Live::Parked | Live::Structured { .. } => {}
     }
     end_active(p, l, c, thread, reason, now);
@@ -659,7 +659,7 @@ pub fn control(c: &mut ChangeSet, thread: ThreadId, control: SessionControl) {
 }
 pub fn stopping(l: &BTreeMap<ThreadId, LiveThread>, c: &mut ChangeSet, thread: ThreadId) {
     let mut live = c.live(l, thread).clone();
-    live.live = Live::Stopping {};
+    live.live = Live::Stopping;
     c.live.insert(thread, live);
 }
 pub fn expire_requests(p: &Projection, c: &mut ChangeSet, turn: TurnId, reason: &str) {
@@ -785,7 +785,7 @@ pub fn start_changed(
                     turn: t.id,
                 });
             }
-            Live::Starting { .. } | Live::Stopping { .. } => {}
+            Live::Starting { .. } | Live::Stopping => {}
         }
     }
 }

@@ -175,13 +175,13 @@ struct Grid {
     #[cfg(debug_assertions)]
     flood: veyra_engine::terminal::FloodStamps,
 }
-fn snapshot(handle: &TerminalHandle) -> Option<Grid> {
-    let mutex = handle.emulator()?;
+fn snapshot(handle: &TerminalHandle) -> Grid {
+    let mutex = handle.emulator();
     let _lease = mutex.lease();
     let emulator = mutex.lock_unfair();
     let term = &emulator.term;
     let cursor = term.renderable_content().cursor;
-    Some(Grid {
+    Grid {
         app_cursor: term.mode().contains(TermMode::APP_CURSOR),
         rows: (0..term.screen_lines())
             .map(|row| {
@@ -217,7 +217,7 @@ fn snapshot(handle: &TerminalHandle) -> Option<Grid> {
             )),
         #[cfg(debug_assertions)]
         flood: emulator.flood,
-    })
+    }
 }
 fn segments(row: &[Cell]) -> Vec<(usize, String, &Cell)> {
     let mut result = Vec::new();
@@ -332,7 +332,6 @@ pub(super) struct TerminalView {
     selecting: bool,
     scrolled: bool,
     app_cursor: bool,
-    error: Option<SharedString>,
     #[cfg(debug_assertions)]
     perf: FloodPerf,
     #[cfg(debug_assertions)]
@@ -344,7 +343,8 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        if let Some(mut wake) = handle.as_ref().and_then(TerminalHandle::subscribe) {
+        if let Some(handle) = &handle {
+            let mut wake = handle.subscribe();
             cx.spawn_in(window, async move |this, cx| {
                 while wake.changed().await.is_ok() {
                     if this
@@ -390,7 +390,6 @@ impl TerminalView {
             selecting: false,
             scrolled: false,
             app_cursor: false,
-            error: None,
             #[cfg(debug_assertions)]
             perf: FloodPerf::default(),
             #[cfg(debug_assertions)]
@@ -435,7 +434,7 @@ impl TerminalView {
         if matches!(scroll, veyra_engine::terminal::Scroll::Bottom) && !self.scrolled {
             return;
         }
-        if let Some(emulator) = self.handle.as_ref().and_then(TerminalHandle::emulator) {
+        if let Some(emulator) = self.handle.as_ref().map(TerminalHandle::emulator) {
             let mut emulator = emulator.lock();
             emulator.term.scroll_display(scroll);
             self.scrolled = emulator.term.grid().display_offset() != 0;
@@ -444,11 +443,8 @@ impl TerminalView {
     }
     pub fn send_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.scroll(veyra_engine::terminal::Scroll::Bottom, cx);
-        if let Some(handle) = &self.handle
-            && let Err(error) = handle.write(bytes)
-        {
-            self.error = Some(error.to_string().into());
-            cx.notify();
+        if let Some(handle) = &self.handle {
+            let _ = handle.write(bytes);
         }
     }
     fn select(&mut self, position: Point<Pixels>, start: bool, cx: &mut Context<Self>) {
@@ -456,7 +452,7 @@ impl TerminalView {
         let Some((bounds, width, height)) = self.geometry else {
             return;
         };
-        let Some(emulator) = self.handle.as_ref().and_then(TerminalHandle::emulator) else {
+        let Some(emulator) = self.handle.as_ref().map(TerminalHandle::emulator) else {
             return;
         };
         let mut emulator = emulator.lock();
@@ -479,7 +475,7 @@ impl TerminalView {
             let bracketed = self
                 .handle
                 .as_ref()
-                .and_then(TerminalHandle::emulator)
+                .map(TerminalHandle::emulator)
                 .is_some_and(|emulator| {
                     emulator
                         .lock()
@@ -495,7 +491,7 @@ impl TerminalView {
         if let Some(text) = self
             .handle
             .as_ref()
-            .and_then(TerminalHandle::emulator)
+            .map(TerminalHandle::emulator)
             .and_then(|emulator| emulator.lock().term.selection_to_string())
         {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -514,7 +510,7 @@ impl TerminalView {
         let grid = self
             .handle
             .as_ref()
-            .and_then(|handle| handle.emulator())
+            .map(|handle| handle.emulator())
             .map(|emulator| emulator.lock().text())
             .unwrap_or_default();
         serde_json::json!({"grid":grid,"focused":self.focused,"columns":self.resize.map(|s|s.0),"rows\
@@ -557,17 +553,16 @@ impl TerminalView {
             .unwrap_or((cols, rows));
         if self.resize != Some((cols, rows))
             && let Some(handle) = &self.handle
+            && handle
+                .resize(PtySize {
+                    cols,
+                    rows,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .is_ok()
         {
-            match handle.resize(PtySize {
-                cols,
-                rows,
-                pixel_width: 0,
-                pixel_height: 0,
-            }) {
-                Ok(()) => self.resize = Some((cols, rows)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
-                Err(error) => self.error = Some(error.to_string().into()),
-            }
+            self.resize = Some((cols, rows));
         }
         let mut frame = Frame {
             backgrounds: Vec::new(),
@@ -577,7 +572,7 @@ impl TerminalView {
             #[cfg(debug_assertions)]
             flood: Default::default(),
         };
-        let Some(grid) = self.handle.as_ref().and_then(snapshot) else {
+        let Some(grid) = self.handle.as_ref().map(snapshot) else {
             return frame;
         };
         self.app_cursor = grid.app_cursor;
@@ -1030,7 +1025,6 @@ mod window_tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !handle
                 .emulator()
-                .unwrap()
                 .lock()
                 .text()
                 .iter()
@@ -1125,7 +1119,7 @@ mod window_tests {
             loop {
                 draw(cx);
                 let actual = {
-                    let emulator = fixture.handle.emulator().unwrap();
+                    let emulator = fixture.handle.emulator();
                     let emulator = emulator.lock();
                     (emulator.term.columns(), emulator.term.screen_lines())
                 };
@@ -1173,7 +1167,7 @@ mod window_tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             draw(cx);
-            if fixture.handle.emulator().unwrap().lock().text().len()
+            if fixture.handle.emulator().lock().text().len()
                 == view.read_with(cx, |view, _| view.resize.unwrap().1 as usize)
             {
                 break;
@@ -1211,7 +1205,7 @@ mod window_tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             draw(cx);
-            let grid = fixture.handle.emulator().unwrap().lock().text().join(" ");
+            let grid = fixture.handle.emulator().lock().text().join(" ");
             if grid.contains("51 c3 a9 1b 0d 1b 62 0c 1b 1b 5b 35 7e 1b 5b 36 7e 09 03") {
                 break;
             }
@@ -1222,7 +1216,7 @@ mod window_tests {
         cx.simulate_keystrokes("secondary-n");
         draw(cx);
         assert_eq!(root.read_with(cx, |root, _| root.new_threads.get()), 1);
-        let grid = fixture.handle.emulator().unwrap().lock().text();
+        let grid = fixture.handle.emulator().lock().text();
         cx.simulate_keystrokes("secondary-j");
         draw(cx);
         assert_eq!(switches.get(), 1, "window binding must beat terminal input");
@@ -1233,7 +1227,7 @@ mod window_tests {
             3,
             "drawer bindings must beat terminal input"
         );
-        assert_eq!(fixture.handle.emulator().unwrap().lock().text(), grid);
+        assert_eq!(fixture.handle.emulator().lock().text(), grid);
         assert_eq!(
             terminal_key_bytes(&gpui::Keystroke::parse("secondary-j").unwrap(), false),
             None
@@ -1268,7 +1262,7 @@ mod window_tests {
         let (ready, reached) = std::sync::mpsc::sync_channel(1);
         let (release, released) = std::sync::mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || {
-            let _lock = handle.emulator().unwrap().lock();
+            let _lock = handle.emulator().lock();
             ready.send(()).unwrap();
             let _ = released.recv_timeout(Duration::from_millis(300));
         });
@@ -1348,7 +1342,7 @@ mod window_tests {
         cx.simulate_keystrokes("secondary-v");
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let text = fixture.handle.emulator().unwrap().lock().text().join(" ");
+            let text = fixture.handle.emulator().lock().text().join(" ");
             if text.contains("51") {
                 break;
             }
@@ -1357,7 +1351,7 @@ mod window_tests {
         }
         let expected = {
             use veyra_engine::terminal::{Column, Line, Point, Selection, SelectionType, Side};
-            let mut emulator = fixture.handle.emulator().unwrap().lock();
+            let mut emulator = fixture.handle.emulator().lock();
             let mut selection = Selection::new(
                 SelectionType::Simple,
                 Point::new(Line(0), Column(0)),
@@ -1405,7 +1399,6 @@ mod window_tests {
             fixture
                 .handle
                 .emulator()
-                .unwrap()
                 .lock()
                 .term
                 .mode()
@@ -1418,7 +1411,7 @@ mod window_tests {
         ];
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let lines = fixture.handle.emulator().unwrap().lock().text();
+            let lines = fixture.handle.emulator().lock().text();
             let hex: Vec<_> = lines
                 .iter()
                 .map(|line| line.trim())
@@ -1460,16 +1453,7 @@ mod window_tests {
         draw(cx);
         fixture.handle.write(&[b'x'; 200]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(4);
-        while fixture
-            .handle
-            .emulator()
-            .unwrap()
-            .lock()
-            .term
-            .grid()
-            .history_size()
-            == 0
-        {
+        while fixture.handle.emulator().lock().term.grid().history_size() == 0 {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1478,7 +1462,6 @@ mod window_tests {
             fixture
                 .handle
                 .emulator()
-                .unwrap()
                 .lock()
                 .term
                 .grid()
@@ -1490,7 +1473,6 @@ mod window_tests {
             fixture
                 .handle
                 .emulator()
-                .unwrap()
                 .lock()
                 .term
                 .grid()
@@ -1502,7 +1484,6 @@ mod window_tests {
             fixture
                 .handle
                 .emulator()
-                .unwrap()
                 .lock()
                 .term
                 .grid()
@@ -1514,7 +1495,6 @@ mod window_tests {
             fixture
                 .handle
                 .emulator()
-                .unwrap()
                 .lock()
                 .term
                 .grid()
@@ -1558,8 +1538,9 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
         bytes.extend_from_slice(b"\x1b[200~");
     }
     bytes.extend(
-        text.bytes()
-            .filter(|byte| *byte >= 0x20 || matches!(*byte, b'\t' | b'\n' | b'\r')),
+        text.bytes().filter(|byte| {
+            (*byte >= 0x20 && *byte != 0x7f) || matches!(*byte, b'\t' | b'\n' | b'\r')
+        }),
     );
     if bracketed {
         bytes.extend_from_slice(b"\x1b[201~");
@@ -1569,6 +1550,21 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod paste_tests {
+    #[test]
+    fn paste_drops_del_in_both_modes() {
+        for bracketed in [false, true] {
+            let expected = if bracketed {
+                "\x1b[200~a\t\n\rbé\u{9b}\x1b[201~"
+            } else {
+                "a\t\n\rbé\u{9b}"
+            };
+            assert_eq!(
+                super::paste_bytes("a\x7f\t\n\rbé\u{9b}", bracketed),
+                expected.as_bytes()
+            );
+        }
+    }
+
     #[test]
     fn paste_strips_controls_and_embedded_bracket_markers() {
         let text = "a\x1b[201~b\x1b[200~c\0\x03\x07\x08\x0b\x0c\x1f\t\n\r";

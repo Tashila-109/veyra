@@ -41,6 +41,15 @@ pub(super) struct CloseSheet {
     pub processes: Vec<String>,
     pub drawer_focus: bool,
 }
+fn shell_start_failure(error: &str) -> String {
+    let reason = error.strip_prefix("Provider protocol: ").unwrap_or(error);
+    let reason = if let Some(reason) = reason.strip_prefix("Unable to spawn ") {
+        reason.replacen(" because ", ": ", 1)
+    } else {
+        reason.to_owned()
+    };
+    format!("The shell could not start: {reason}. Press Return to restart.")
+}
 impl Shell {
     pub(super) fn active_shell(&self) -> Option<&Tab> {
         let drawer = self.drawers.get(&self.view.chat()?)?;
@@ -416,6 +425,18 @@ impl Shell {
             .max(min);
         (min, max)
     }
+    pub(super) fn clamp_drawer_height(&mut self, window: &Window, cx: &App) {
+        let (min, max) = self.drawer_height_bounds(window, cx);
+        if let Some(thread) = self.view.chat()
+            && let Some(drawer) = self.drawers.get_mut(&thread)
+        {
+            let height = drawer.height.clamp(min, max);
+            if height != drawer.height {
+                drawer.height = height;
+                self.drawer_resizing = None;
+            }
+        }
+    }
     pub(super) fn render_drawer(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let thread = self.view.chat()?;
         let drawer = self.drawers.get(&thread).filter(|drawer| drawer.open)?;
@@ -471,13 +492,10 @@ impl Shell {
                     ShellStatus::Signalled => {
                         Some("Shell ended after a signal. Press Return to restart.".into())
                     }
-                    ShellStatus::Failed { error } => {
-                        Some(format!("{error}. Press Return to restart."))
-                    }
+                    ShellStatus::Failed { error } => Some(shell_start_failure(&error)),
                     _ => None,
                 })
         });
-        let (_, max) = self.drawer_height_bounds(window, cx);
         let rail = div()
             .id("drawer-resize")
             .h(theme.space.0[1])
@@ -509,7 +527,7 @@ impl Shell {
         Some(
             div()
                 .v_flex()
-                .h(drawer.height.min(max))
+                .h(drawer.height)
                 .flex_none()
                 .min_h_0()
                 .w_full()
@@ -599,5 +617,29 @@ impl Shell {
                         Some(ShellStatus::Failed { error }) => Some(error.clone()), _ => None })})
             }).collect::<Vec<_>>(),"terminal":self.active_shell().map(|tab|tab.view.read(cx).dump()),
             "close_sheet":self.close_sheet.as_ref().map(|sheet|&sheet.processes)})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_start_failure;
+    #[test]
+    fn failed_shell_message_uses_plain_reason() {
+        for (error, reason) in [
+            ("Permission denied", "Permission denied"),
+            (
+                "Provider protocol: The shell worker stopped unexpectedly",
+                "The shell worker stopped unexpectedly",
+            ),
+            (
+                "Unable to spawn /owned/shell because it is not executable",
+                "/owned/shell: it is not executable",
+            ),
+        ] {
+            assert_eq!(
+                shell_start_failure(error),
+                format!("The shell could not start: {reason}. Press Return to restart.")
+            );
+        }
     }
 }

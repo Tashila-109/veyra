@@ -504,6 +504,21 @@ impl Drop for Workers {
         self.terminal.wake.send_modify(|counter| *counter += 1);
     }
 }
+fn take_foreground_kill(
+    group: &mut Option<u32>,
+    expired: bool,
+    exists: impl FnOnce(u32) -> bool,
+) -> Option<u32> {
+    let pid = (*group)?;
+    if !exists(pid) {
+        *group = None;
+        None
+    } else if expired {
+        group.take()
+    } else {
+        None
+    }
+}
 fn run(
     cwd: std::path::PathBuf,
     size: PtySize,
@@ -602,6 +617,8 @@ fn run(
     terminal.wake.send_modify(|counter| *counter += 1);
     let mut stopping: Option<Instant> = None;
     let mut foreground: Option<u32> = None;
+    let mut exited = None;
+    let mut leader_killed = false;
     loop {
         if stopping.is_none()
             && let Some(at) = *terminal.hangup_at.lock().unwrap()
@@ -613,24 +630,11 @@ fn run(
                 .unwrap()
                 .or_else(|| terminal.foreground_group().filter(|group| *group != pid));
         }
-        if let Some(status) = workers.child.as_mut().unwrap().child.try_wait()? {
-            if let (Some(at), Some(group)) = (stopping, foreground) {
-                loop {
-                    let grace = Duration::from_secs(if env.closing.is_closing() { 1 } else { 3 });
-                    if at.elapsed() >= grace || !platform::group_exists(group).unwrap_or(false) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                let _ = platform::signal_group(group, Signal::Kill);
-            }
-            drop(workers.child.take());
-            let reader = workers.reader.take();
-            workers.finish(reader, "reader");
-            *terminal.status.lock().unwrap() = ShellStatus::from_exit(status);
-            break;
+        if exited.is_none() {
+            exited = workers.child.as_mut().unwrap().child.try_wait()?;
         }
         if stopping.is_none()
+            && exited.is_none()
             && (terminal.closing.load(Ordering::Acquire)
                 || controls.try_recv().is_ok()
                 || controls.is_closed()
@@ -644,11 +648,26 @@ fn run(
         if let Some(at) = stopping {
             workers.deadline = Some(at + grace);
         }
-        if stopping.is_some_and(|at: Instant| at.elapsed() >= grace) {
-            if let Some(group) = foreground.or_else(|| terminal.foreground_group()) {
-                let _ = platform::signal_group(group, Signal::Kill);
+        let expired = stopping.is_some_and(|at| at.elapsed() >= grace);
+        if let Some(group) = take_foreground_kill(&mut foreground, expired, |group| {
+            platform::group_exists(group).unwrap_or(false)
+        }) {
+            let _ = platform::signal_group(group, Signal::Kill);
+        }
+        if expired && exited.is_none() && !leader_killed {
+            leader_killed = true;
+            if platform::group_exists(pid).unwrap_or(false) {
+                let _ = platform::signal_group(pid, Signal::Kill);
             }
-            let _ = platform::signal_group(pid, Signal::Kill);
+        }
+        if foreground.is_none()
+            && let Some(status) = exited.take()
+        {
+            drop(workers.child.take());
+            let reader = workers.reader.take();
+            workers.finish(reader, "reader");
+            *terminal.status.lock().unwrap() = ShellStatus::from_exit(status);
+            break;
         }
         if stopping.is_none()
             && workers
@@ -726,6 +745,29 @@ fn read(mut reader: Box<dyn Read + Send>, terminal: &Terminal) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreground_grace_forgets_gone_groups_and_takes_survivors_once() {
+        let mut group = Some(42);
+        assert_eq!(take_foreground_kill(&mut group, false, |_| true), None);
+        assert_eq!(group, Some(42));
+        assert_eq!(take_foreground_kill(&mut group, false, |_| false), None);
+        assert_eq!(group, None);
+        assert_eq!(
+            take_foreground_kill(&mut group, true, |_| panic!("revisited a gone group")),
+            None
+        );
+        let mut group = Some(43);
+        assert_eq!(
+            take_foreground_kill(&mut group, true, |id| id == 43),
+            Some(43)
+        );
+        assert_eq!(group, None);
+        assert_eq!(
+            take_foreground_kill(&mut group, true, |_| panic!("repeated a grace kill")),
+            None
+        );
+    }
+
     #[test]
     fn shell_exit_outcomes_are_distinct() {
         assert_eq!(

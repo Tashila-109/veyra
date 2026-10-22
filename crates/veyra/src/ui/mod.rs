@@ -2008,6 +2008,7 @@ impl Focusable for Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_drawers(cx);
+        self.clamp_drawer_height(window, cx);
         #[cfg(debug_assertions)]
         {
             self.repaints += 1;
@@ -7847,7 +7848,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             };
-            let text = || handle.emulator().unwrap().lock().text().join("\n");
+            let text = || handle.emulator().lock().text().join("\n");
             wait(&|| text().contains("VEYRA_TUI_READY"));
             let pid = handle.pid().unwrap();
             shell.update_in(cx, |shell, window, cx| {
@@ -7959,6 +7960,93 @@ mod tests {
                 );
                 assert!(shell.drawer_resizing.is_none());
             });
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn drawer_drag_after_window_shrink_uses_displayed_height(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            cx.simulate_resize(gpui::size(
+                gpui::Pixels::from(1280.),
+                gpui::Pixels::from(800.),
+            ));
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.toggle_drawer(window, cx);
+            });
+            draw(cx);
+            shell.update_in(cx, |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(super::actions::DebugDragShellDrawer { pixels: 400. }),
+                    cx,
+                );
+            });
+            draw(cx);
+            let maximum = cx.debug_bounds("shell-drawer").unwrap().size.height;
+            cx.simulate_resize(gpui::size(
+                gpui::Pixels::from(1280.),
+                gpui::Pixels::from(650.),
+            ));
+            draw(cx);
+            let bounds = cx.debug_bounds("shell-drawer").unwrap();
+            assert!(bounds.size.height < maximum);
+            let position = gpui::point(
+                gpui::Pixels::from(500.),
+                bounds.top() + gpui::Pixels::from(2.),
+            );
+            cx.simulate_event(gpui::MouseDownEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: position + gpui::point(gpui::Pixels::from(0.), gpui::Pixels::from(48.)),
+                pressed_button: Some(gpui::MouseButton::Left),
+                ..Default::default()
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            draw(cx);
+            let expected = bounds.size.height - gpui::Pixels::from(48.);
+            assert_eq!(
+                cx.debug_bounds("shell-drawer").unwrap().size.height,
+                expected
+            );
+            shell.read_with(cx, |shell, cx| {
+                assert_eq!(shell.drawers[&shell.view.chat().unwrap()].height, expected);
+                assert_eq!(
+                    shell.dump(std::path::Path::new("/tmp"), cx)["drawer"]["height"],
+                    f64::from(expected)
+                );
+            });
+            shell.update_in(cx, |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(super::actions::DebugDragShellDrawer { pixels: -48. }),
+                    cx,
+                );
+            });
+            draw(cx);
+            let expected = expected - gpui::Pixels::from(48.);
+            assert_eq!(
+                cx.debug_bounds("shell-drawer").unwrap().size.height,
+                expected
+            );
+            cx.simulate_resize(gpui::size(
+                gpui::Pixels::from(1280.),
+                gpui::Pixels::from(800.),
+            ));
+            draw(cx);
+            assert_eq!(
+                cx.debug_bounds("shell-drawer").unwrap().size.height,
+                expected
+            );
         });
     }
 

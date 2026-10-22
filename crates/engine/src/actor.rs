@@ -1802,7 +1802,7 @@ impl Actor {
                     control: SessionControl::Shutdown,
                 });
                 let mut live = live.clone();
-                live.live = Live::Stopping {};
+                live.live = Live::Stopping;
                 c.live.insert(thread, live);
             }
             if matches!(live.live, Live::Starting { session: None }) {
@@ -1996,7 +1996,7 @@ mod tests {
             let Ack::Thread(thread) = ack.try_recv().unwrap().unwrap() else {
                 panic!("missing thread")
             };
-            actor.live.get_mut(&thread).unwrap().live = Live::Stopping {};
+            actor.live.get_mut(&thread).unwrap().live = Live::Stopping;
             actor.projection.threads.get_mut(&thread).unwrap().hold = hold;
             let epoch = actor.live[&thread].epoch;
             if hold.is_none() {

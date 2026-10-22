@@ -295,7 +295,7 @@ fn quit_during_stop_drain_keeps_queued_work_held_after_reload() {
     ));
     let _entered = f.runtime.enter();
     f.actor.handle(EngineMsg::Shutdown);
-    assert!(matches!(f.actor.live[&f.thread].live, Live::Stopping {}));
+    assert!(matches!(f.actor.live[&f.thread].live, Live::Stopping));
     f.event(ProviderEvent::Session(SessionEvent::Exited { crash: None }));
     assert!(
         matches!(f.actor.live[&f.thread].live, Live::Parked),
@@ -325,7 +325,7 @@ fn quit_during_stop_drain_keeps_queued_work_held_after_reload() {
 #[test]
 fn quit_while_stopping_keeps_queued_work_parked() {
     let mut f = Fixture::new(LiveState::Stopping);
-    f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping {};
+    f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping;
     let queued = f.user("waiting for retiring session");
     let _entered = f.runtime.enter();
     f.actor.handle(EngineMsg::Shutdown);
@@ -542,7 +542,7 @@ fn shutdown_request_prevents_retiring_session_restart_before_mailbox_shutdown() 
         let mut f = Fixture::new(LiveState::Stopping);
         f.hold(hold);
         let _entered = f.runtime.enter();
-        f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping {};
+        f.actor.live.get_mut(&f.thread).unwrap().live = Live::Stopping;
         let queued = f.user("queued before quit");
         let (sender, mut receiver) = mpsc::channel(256);
         let engine = crate::Engine {
