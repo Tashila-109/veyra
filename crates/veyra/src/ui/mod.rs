@@ -7782,6 +7782,133 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn drawer_return_uses_live_key_path_and_restarts_ended_tab(cx: &mut gpui::TestAppContext) {
+        use std::time::{Duration, Instant};
+        use veyra_engine::{provider::env::ChildEnv, terminal::PtySize};
+        with_docked_shell(cx, |shell, cx, _, _| {
+            struct Shutdown {
+                engine: veyra_engine::Engine,
+                runtime: tokio::runtime::Runtime,
+            }
+            impl Drop for Shutdown {
+                fn drop(&mut self) {
+                    self.runtime.block_on(self.engine.shutdown_wait());
+                }
+            }
+            let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
+            let binary = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("veyra-test-cli");
+            let script = data.join("shell");
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\nexec '{}' shell\n", binary.display()),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&script)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let engine = veyra_engine::Engine::start_with_env(
+                runtime.handle(),
+                veyra_engine::data_dir::DataDir::at(data.clone()).unwrap(),
+                ChildEnv::isolated().with_variable("SHELL", script.as_os_str()),
+            )
+            .unwrap();
+            let shutdown = Shutdown { engine, runtime };
+            let thread = shell.update(cx, |shell, _| {
+                shell.engine = shutdown.engine.clone();
+                shell.runtime = shutdown.runtime.handle().clone();
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.state.threads.get_mut(&thread).unwrap().cwd = data;
+                thread
+            });
+            let handle = shutdown
+                .engine
+                .open_shell(thread, script.parent().unwrap().into(), PtySize::default())
+                .unwrap();
+            let wait = |ready: &dyn Fn() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready() {
+                    assert!(Instant::now() < deadline, "shell condition timed out");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            let text = || handle.emulator().unwrap().lock().text().join("\n");
+            wait(&|| text().contains("VEYRA_TUI_READY"));
+            let pid = handle.pid().unwrap();
+            shell.update_in(cx, |shell, window, cx| {
+                let view = cx.new(|cx| {
+                    let mut view = super::terminal_view::TerminalView::new(None, window, cx);
+                    view.handle = Some(handle.clone());
+                    view
+                });
+                shell.drawers.insert(
+                    thread,
+                    super::drawer::Drawer {
+                        open: true,
+                        height: gpui::Pixels::from(240.),
+                        active: 0,
+                        next: 2,
+                        tabs: vec![super::drawer::Tab {
+                            number: 1,
+                            label: "Shell 1".into(),
+                            handle: Some(handle.clone()),
+                            view,
+                            error: None,
+                        }],
+                    },
+                );
+                shell.sync_drawers(cx);
+                shell.focus_shell(window, cx);
+                cx.notify();
+            });
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+            cx.simulate_keystrokes("enter");
+            wait(&|| text().lines().any(|line| line.trim() == "0d"));
+            assert_eq!(handle.pid(), Some(pid));
+            assert!(!handle.status().is_finished());
+            shell.update_in(cx, |shell, window, cx| shell.restart_shell(window, cx));
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(text().lines().filter(|line| line.trim() == "0d").count(), 1);
+            assert_eq!(handle.pid(), Some(pid));
+            shutdown.engine.close_shell(&handle);
+            wait(&|| handle.status().is_finished());
+            draw(cx);
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(gpui::Keystroke::parse("enter").unwrap(), cx)
+            });
+            let restarted = shell.read_with(cx, |shell, _| {
+                let tab = shell.active_shell().unwrap();
+                assert_eq!(tab.number, 1);
+                tab.handle.clone().unwrap()
+            });
+            assert!(
+                !restarted.same(&handle),
+                "Return did not replace the ended shell"
+            );
+            wait(&|| restarted.pid().is_some());
+            assert_ne!(restarted.pid(), Some(pid));
+            assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn drawer_dump_reports_actual_surface_focus(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             shell.update_in(cx, |shell, window, cx| {

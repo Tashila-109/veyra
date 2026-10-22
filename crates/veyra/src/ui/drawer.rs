@@ -372,13 +372,11 @@ impl Shell {
         let Some(tab) = self.active_shell() else {
             return;
         };
-        if tab.handle.as_ref().is_some_and(|handle| {
-            matches!(
-                handle.status(),
-                ShellStatus::Running | ShellStatus::Starting
-            )
-        }) {
-            tab.view.update(cx, |view, cx| view.send_input(b"\r", cx));
+        if tab
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.status().is_finished())
+        {
             return;
         }
         let number = tab.number;
@@ -467,14 +465,14 @@ impl Shell {
                 .as_ref()
                 .and_then(|handle| match handle.status() {
                     ShellStatus::Exited { code } => Some(format!(
-                        "Shell exited with code {code}. Press ⌘Return to restart."
+                        "Shell exited with code {code}. Press Return to restart."
                     )),
-                    ShellStatus::Closed => Some("Shell closed. Press ⌘Return to restart.".into()),
+                    ShellStatus::Closed => Some("Shell closed. Press Return to restart.".into()),
                     ShellStatus::Signalled => {
-                        Some("Shell ended after a signal. Press ⌘Return to restart.".into())
+                        Some("Shell ended after a signal. Press Return to restart.".into())
                     }
                     ShellStatus::Failed { error } => {
-                        Some(format!("{error}. Press ⌘Return to restart."))
+                        Some(format!("{error}. Press Return to restart."))
                     }
                     _ => None,
                 })

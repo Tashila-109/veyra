@@ -507,7 +507,7 @@ The drawer opens under composition, reuses the theme's 32 px tab strip and termi
 Opening with an empty draft focuses the drawer; opening with a draft preserves composer focus, text and caret. Hiding always returns to the composer. Clicks change surface focus; output, exit and restart do not.
 Tab keys exist only in VeyraTerminal. Command-J remains a window binding; Command-T, Command-W and the tab chords win over terminal byte translation.
 Closing the last tab hides the drawer and focuses the composer. A running tab or an Archive that reaches running tabs opens a process-naming close sheet first; Cancel preserves the work and confirms close the chosen scope.
-An ended tab keeps its screen and shows its numeric exit code, signal, closure or failure in words. Command-Return replaces its PTY and emulator in the same numbered tab, rechecking the folder before starting anything.
+An ended tab keeps its screen and shows its numeric exit code, signal, closure or failure in words. Return binds RestartShellTab only in its ended-terminal context and replaces its PTY and emulator in the same numbered tab, rechecking the folder before starting anything. Live Return reaches the shell through terminal key translation without an action.
 PasteShell, CopyShell and ScrollShellHistoryUp/Down are gpui actions bound in the shared VeyraTerminal key table. Command-V reads the clipboard, strips ESC and all C0 controls except tab, newline and carriage return in both modes, and adds bracketed-paste markers only when the emulator requested them. The wheel and Shift-PageUp/Down scroll history; the next input returns to the bottom.
 A drag updates alacritty's own selection and Command-C copies selection_to_string. IME is not supported.
 

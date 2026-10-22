@@ -705,7 +705,17 @@ impl Render for TerminalView {
             .size_full()
             .min_h_0()
             .track_focus(&self.focus)
-            .key_context("VeyraTerminal")
+            .key_context(
+                if self
+                    .handle
+                    .as_ref()
+                    .is_none_or(|handle| handle.status().is_finished())
+                {
+                    "VeyraTerminal VeyraTerminalEnded"
+                } else {
+                    "VeyraTerminal"
+                },
+            )
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(|terminal, _: &ScrollShellHistoryUp, _, cx| {
@@ -1285,10 +1295,20 @@ mod window_tests {
             "keydown waited for emulator: {elapsed:?}"
         );
     }
+    #[test]
+    fn restart_binding_is_return_only_in_ended_terminal() {
+        let bindings = actions::bindings();
+        let restarts: Vec<_> = bindings
+            .iter()
+            .filter(|binding| binding.action == "RestartShellTab")
+            .map(|binding| (binding.chord, binding.context))
+            .collect();
+        assert_eq!(restarts, [("enter", Some("VeyraTerminalEnded"))]);
+    }
+
     #[gpui::test]
     fn terminal_clipboard_and_history_use_bound_actions(cx: &mut gpui::TestAppContext) {
         for (name, chord) in [
-            ("RestartShellTab", "secondary-enter"),
             ("PasteShell", "secondary-v"),
             ("CopyShell", "secondary-c"),
             ("ScrollShellHistoryUp", "shift-pageup"),

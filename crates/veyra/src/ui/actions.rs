@@ -210,7 +210,7 @@ pub fn bindings() -> Vec<Binding> {
             Some("VeyraShellClose")
         ),
         binding!(CancelCloseShellTab, "escape", Some("VeyraShellClose")),
-        binding!(RestartShellTab, "secondary-enter", Some("VeyraTerminal")),
+        binding!(RestartShellTab, "enter", Some("VeyraTerminalEnded")),
         binding!(PasteShell, "secondary-v", Some("VeyraTerminal")),
         binding!(CopyShell, "secondary-c", Some("VeyraTerminal")),
         binding!(ScrollShellHistoryUp, "shift-pageup", Some("VeyraTerminal")),
@@ -315,12 +315,14 @@ pub fn init(cx: &mut App) {
         let mut context = binding
             .context
             .map(|context| KeyBindingContextPredicate::parse(context).unwrap());
-        if binding.context != Some("VeyraTerminal")
-            && (!key.modifiers.platform
-                || (matches!(key.key.as_str(), "left" | "right")
-                    && !key.modifiers.shift
-                    && !key.modifiers.alt
-                    && !key.modifiers.control))
+        if !matches!(
+            binding.context,
+            Some("VeyraTerminal" | "VeyraTerminalEnded")
+        ) && (!key.modifiers.platform
+            || (matches!(key.key.as_str(), "left" | "right")
+                && !key.modifiers.shift
+                && !key.modifiers.alt
+                && !key.modifiers.control))
         {
             let outside_terminal = KeyBindingContextPredicate::Not(Box::new(
                 KeyBindingContextPredicate::Identifier("VeyraTerminal".into()),
