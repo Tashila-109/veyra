@@ -29,6 +29,7 @@ Those are proof-copy wires; the committed fixture is unchanged.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -169,6 +170,30 @@ The two pmset files retain OS assertion evidence around awake.
 `notifications-background.json` proves no Done banner at foreground end while work remains.
 `processes`, `perf.commits`, `perf.actor_max_ms`, `perf.actor_busy_ms`, `perf.mailbox_free`, `perf.repaints` and `perf.max_batch_events` remain available to an authorized performance run.
 The debug-only DebugStallUi action remains available for that lane.
+
+### Dump fields
+
+`selected_thread.hold` and `wait_reason` describe held work.
+`composer.discard_queued_visible` reports the held queue control.
+
+### Evidence contract
+
+```json
+{
+  "required": {
+    "stop-interrupt": [
+      "stop-working.png",
+      "stop-held.png",
+      "stop-discarded.json",
+      "stop-expired.json",
+      "notifications-background.json",
+      "notifications-older-selected.json",
+      "notifications-older-response.png"
+    ]
+  },
+  "pairs": {}
+}
+```
 
 ## Gotchas
 

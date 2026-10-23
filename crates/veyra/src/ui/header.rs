@@ -1,6 +1,6 @@
 use super::{
     MainView, Shell,
-    actions::{NewThread, SelectThread, ToggleShellDrawer},
+    actions::{SelectThread, ToggleShellDrawer},
     composer::labelled_button,
     theme::Theme,
 };
@@ -176,10 +176,6 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                 }),
             )
         })
-        .child(
-            labelled_button("new-thread", "New thread  ⌘N", cx)
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
-        )
 }
 
 #[cfg(test)]

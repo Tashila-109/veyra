@@ -1545,10 +1545,17 @@ fn migration_leaves_older_tasks_without_inferred_report_sources() {
     end_child(&mut f, child, task);
     f.actor
         .db
-        .execute_batch("ALTER TABLE tasks DROP COLUMN source_item_id")
+        .execute_batch(
+            "ALTER TABLE tasks DROP COLUMN source_item_id;
+             ALTER TABLE settings DROP COLUMN window_background;",
+        )
         .unwrap();
     f.actor.db.pragma_update(None, "user_version", 2).unwrap();
     store::initialize(&mut f.actor.db).unwrap();
+    assert_eq!(
+        f.loaded().settings.window_background,
+        WindowBackground::Translucent
+    );
     assert!(matches!(&f.loaded().tasks[&task].state,
         TaskState::Settled { source: None, summary, .. } if summary == "Child report"));
     store::initialize(&mut f.actor.db).unwrap();

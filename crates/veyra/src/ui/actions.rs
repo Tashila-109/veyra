@@ -1,6 +1,6 @@
 use gpui_kit::*;
 use veyra_engine::{
-    domain::{ItemId, PermissionMode, ProjectId, RequestId, ThreadId, TurnId},
+    domain::{ItemId, PermissionMode, ProjectId, RequestId, ThreadId, TurnId, WindowBackground},
     provider::ProviderKind,
 };
 
@@ -89,6 +89,7 @@ choice_action!(PickModel, model, String);
 choice_action!(PickEffort, effort, String);
 choice_action!(PickPermission, mode, PermissionMode);
 choice_action!(SetDefaultMode, mode, PermissionMode);
+choice_action!(SetWindowBackground, background, WindowBackground);
 choice_action!(SelectThread, thread, ThreadId);
 choice_action!(StopThread, thread, ThreadId);
 choice_action!(OpenThreadMenu, thread, ThreadId);
@@ -139,6 +140,19 @@ pub struct SetSidebarWidth {
 #[action(namespace = veyra)]
 pub struct DebugStallUi {
     pub milliseconds: u64,
+}
+
+#[cfg(debug_assertions)]
+#[derive(
+    Clone, Default, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action,
+)]
+#[serde(default)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugDisplayOptions {
+    pub reduce_transparency: bool,
+    pub increase_contrast: bool,
+    pub reduce_motion: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -248,6 +262,7 @@ pub fn bindings() -> Vec<Binding> {
         binding!(ScrollTranscriptEnd, "secondary-end", Some("Veyra")),
         binding!(RecheckProviders, "secondary-alt-r", Some("Veyra")),
         binding!(SetDefaultMode, "secondary-alt-d", Some("Veyra")),
+        binding!(SetWindowBackground, "secondary-alt-b", Some("Veyra")),
         binding!(SelectThread, "secondary-alt-1", Some("Veyra")),
         binding!(SelectProject, "secondary-alt-shift-1", Some("Veyra")),
         binding!(ToggleItem, "secondary-shift-i", Some("Veyra")),
@@ -348,7 +363,10 @@ pub fn init(cx: &mut App) {
         name: "Veyra".into(),
         disabled: false,
         items: vec![
+            MenuItem::action("New Thread", NewThread),
+            MenuItem::action("Add Project…", AddProject::default()),
             MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action("Toggle Window Background", SetWindowBackground::default()),
             MenuItem::separator(),
             MenuItem::action("Quit Veyra", Quit),
         ],

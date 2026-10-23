@@ -157,6 +157,103 @@ def capture(name):
     except Exception:
         observe_failure(name,'capture')
         raise
+def cg_windows():
+    """Read WindowServer metadata in memory; never retain another window's title."""
+    import plistlib
+    cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+    cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+    cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32,ctypes.c_uint32]
+    cg.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+    cf.CFPropertyListCreateData.argtypes = [ctypes.c_void_p,ctypes.c_void_p,ctypes.c_long,
+        ctypes.c_ulong,ctypes.c_void_p]
+    cf.CFPropertyListCreateData.restype = ctypes.c_void_p
+    cf.CFDataGetLength.argtypes = [ctypes.c_void_p]
+    cf.CFDataGetLength.restype = ctypes.c_long
+    cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+    cf.CFDataGetBytePtr.restype = ctypes.c_void_p
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    windows = cg.CGWindowListCopyWindowInfo(1,0)
+    assert windows, 'WindowServer list unavailable'
+    data = None
+    try:
+        data = cf.CFPropertyListCreateData(None,windows,100,0,None)
+        assert data, 'WindowServer metadata unavailable'
+        rows = plistlib.loads(ctypes.string_at(cf.CFDataGetBytePtr(data),cf.CFDataGetLength(data)))
+        return [{key:row[key] for key in ['kCGWindowNumber','kCGWindowOwnerPID','kCGWindowLayer',
+            'kCGWindowBounds'] if key in row} for row in rows]
+    finally:
+        if data: cf.CFRelease(data)
+        cf.CFRelease(windows)
+def display_rectangles():
+    class Rect(ctypes.Structure):
+        _fields_ = [(name,ctypes.c_double) for name in ['x','y','width','height']]
+    cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+    cg.CGGetActiveDisplayList.argtypes = [ctypes.c_uint32,ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32)]
+    cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayBounds.restype = Rect
+    count = ctypes.c_uint32()
+    assert cg.CGGetActiveDisplayList(0,None,ctypes.byref(count)) == 0
+    displays = (ctypes.c_uint32*count.value)()
+    assert cg.CGGetActiveDisplayList(count.value,displays,ctypes.byref(count)) == 0
+    return [(int(display),tuple(getattr(cg.CGDisplayBounds(display),key)
+        for key in ['x','y','width','height'])) for display in displays[:count.value]]
+def region_snapshot(pid, window, backdrop, rectangle=None):
+    """All region guards, including the existing frontmost guard, immediately around a capture."""
+    assert not locked()
+    subprocess.run([str((PROOF/'capture-window').resolve()),str(pid),str(window)],check=True)
+    rows = cg_windows()
+    def bounds(row):
+        frame = row['kCGWindowBounds']
+        return tuple(frame[key] for key in ['X','Y','Width','Height'])
+    def contains(outer, inner):
+        x,y,w,h = outer
+        a,b,c,d = inner
+        return c > 0 and d > 0 and x <= a and y <= b and a+c <= x+w and b+d <= y+h
+    def intersects(a,b):
+        return a[0] < b[0]+b[2] and b[0] < a[0]+a[2] and a[1] < b[1]+b[3] and b[1] < a[1]+a[3]
+    index = next((i for i,row in enumerate(rows) if row.get('kCGWindowNumber') == int(window)
+        and row.get('kCGWindowOwnerPID') == int(pid) and row.get('kCGWindowLayer') == 0),None)
+    assert index is not None, 'owned window is off-screen'
+    frame = bounds(rows[index])
+    assert frame == tuple(round(value) for value in frame), 'owned window has non-integral bounds'
+    assert rectangle is None or frame == tuple(rectangle), 'owned window rectangle changed'
+    owned = {int(value) for value in (PROOF/'backdrop-owned-pids').read_text().split()}
+    assert int(backdrop['pid']) in owned, 'backdrop was not started by this run'
+    candidates = [row for row in rows[index+1:] if row.get('kCGWindowOwnerPID') == int(backdrop['pid'])
+        and row.get('kCGWindowNumber') in backdrop['windows'] and row.get('kCGWindowLayer') == 0
+        and contains(bounds(row),frame)]
+    assert candidates, 'rectangle is not wholly inside one owned backdrop window'
+    background = candidates[0]
+    displays = [(identifier,screen) for identifier,screen in display_rectangles()
+        if contains(screen,frame) and contains(screen,bounds(background))]
+    assert displays, 'rectangle and backdrop are not on one display'
+    above = [row['kCGWindowNumber'] for row in rows[:index] if intersects(bounds(row),frame)]
+    assert not above, 'owned window is covered by intersecting windows: '+str(above)
+    return {'rectangle':frame,'window':int(window),'pid':int(pid),
+        'backdrop_window':background['kCGWindowNumber'],'backdrop_bounds':bounds(background),
+        'display':displays[0],'frontmost':True,'intersecting_above':0}
+def region_capture(target, pid, window):
+    """Discard a region capture when any guard changes, and retry at most three times."""
+    backdrop = json.loads((PROOF/'backdrop-windows.json').read_text())
+    attempts = []
+    for attempt in range(3):
+        target.unlink(missing_ok=True)
+        try:
+            before = region_snapshot(pid,window,backdrop)
+            rectangle = before['rectangle']
+            region = ','.join(str(round(value)) for value in rectangle)
+            subprocess.run(['screencapture','-x','-R',region,str(target)],check=True)
+            after = region_snapshot(pid,window,backdrop,rectangle)
+            assert before == after, 'region guards changed during capture'
+            save(target.stem+'-region-guards',{'attempts':attempts,'before':before,'after':after})
+            return
+        except Exception as error:
+            target.unlink(missing_ok=True)
+            attempts.append({'attempt':attempt+1,'error':str(error)})
+            save(target.stem+'-region-guards',{'attempts':attempts})
+            if attempt == 2: raise
+            time.sleep(.1)
 def guarded_capture(name):
     assert not locked()
     window = (PROOF/'window-id').read_text().strip()
@@ -182,7 +279,10 @@ def guarded_capture(name):
     visible['providers'] = [probe['readiness'] for probe in dump['providers']]
     state = json.dumps(visible,sort_keys=True)
     target = PROOF/(name+'.png')
-    subprocess.run(['screencapture','-x','-o','-l',window,str(target)],check=True)
+    if dump['look']['background'] == 'translucent':
+        region_capture(target,pid,window)
+    else:
+        subprocess.run(['screencapture','-x','-o','-l',window,str(target)],check=True)
     subprocess.run([helper,pid,window],check=True)
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     previous = PROOF/'capture-last.json'
@@ -210,7 +310,7 @@ def sql(query):
 def database(label, mode):
     values = [sql('pragma user_version'),sql('pragma journal_mode'),
         *sql('.tables').split(),sql('select default_mode from settings')]
-    assert values == ['3','wal',*TABLES,mode], (label,values)
+    assert values == ['4','wal',*TABLES,mode], (label,values)
     (PROOF/(label+'-database.txt')).write_text('\n'.join(values)+'\n')
     (PROOF/(label+'-inode.txt')).write_text(str(DB.stat().st_ino)+'\n')
     save(label,ctl(label+'-dump','dump'))

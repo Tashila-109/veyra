@@ -52,6 +52,8 @@ pub const MIGRATIONS: &[&str] = &[
                                                 edits','full_access')));\nINSERT INTO settings(id) VALUES(1);\n",
     "UPDATE threads SET cli_version=NULL WHERE cli_version='';",
     "ALTER TABLE tasks ADD COLUMN source_item_id TEXT REFERENCES items(id);",
+    "ALTER TABLE settings ADD COLUMN window_background TEXT NOT NULL DEFAULT 'translucent' \
+     CHECK (window_background IN ('translucent','solid'));",
 ];
 
 pub fn open(path: &Path) -> Result<Connection, StoreError> {
@@ -284,8 +286,11 @@ pub fn apply(tx: &Transaction<'_>, c: &ChangeSet, now: Millis) -> Result<(), Sto
     }
     if let Some(settings) = c.settings {
         tx.execute(
-            "UPDATE settings SET default_mode=?1 WHERE id=1",
-            params![word(&settings.default_mode)?],
+            "UPDATE settings SET default_mode=?1,window_background=?2 WHERE id=1",
+            params![
+                word(&settings.default_mode)?,
+                word(&settings.window_background)?
+            ],
         )?;
     }
     for (id, live) in &c.live {
@@ -309,6 +314,11 @@ pub fn load(db: &Connection) -> Result<Projection, StoreError> {
     let mut p = Projection::default();
     p.settings.default_mode = parse_word(db.query_row(
         "SELECT default_mode FROM settings WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?)?;
+    p.settings.window_background = parse_word(db.query_row(
+        "SELECT window_background FROM settings WHERE id=1",
         [],
         |r| r.get(0),
     )?)?;
@@ -495,3 +505,55 @@ pub(crate) const LEGACY_TERMINAL_ROW: &str =
 #[cfg(test)]
 pub(crate) const LEGACY_TERMINAL_COLUMNS: &str =
     "SELECT view,import_pending,native_cursor FROM threads WHERE id=?1";
+
+#[cfg(test)]
+mod window_background_tests {
+    use super::*;
+
+    #[test]
+    fn migration_4_adds_window_background() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..3] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.execute("UPDATE settings SET default_mode='ask_first'", [])
+            .unwrap();
+        db.pragma_update(None, "user_version", 3).unwrap();
+        initialize(&mut db).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            4
+        );
+        let settings = load(&db).unwrap().settings;
+        assert_eq!(settings.default_mode, PermissionMode::AskFirst);
+        assert_eq!(settings.window_background, WindowBackground::Translucent);
+        initialize(&mut db).unwrap();
+        assert_eq!(load(&db).unwrap().settings, settings);
+    }
+
+    #[test]
+    fn window_background_refuses_unknown_value() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&mut db).unwrap();
+        assert!(
+            db.execute("UPDATE settings SET window_background='unknown'", [])
+                .is_err()
+        );
+        assert!(
+            db.execute("UPDATE settings SET window_background=NULL", [])
+                .is_err()
+        );
+        assert_eq!(
+            load(&db).unwrap().settings.window_background,
+            WindowBackground::Translucent
+        );
+        db.execute("UPDATE settings SET window_background='solid'", [])
+            .unwrap();
+        assert_eq!(
+            load(&db).unwrap().settings.window_background,
+            WindowBackground::Solid
+        );
+        assert!(serde_json::from_str::<WindowBackground>("\"unknown\"").is_err());
+    }
+}

@@ -3,7 +3,7 @@
 ## Executive summary
 
 Veyra is one native macOS chat window backed by an orchestration actor and per-thread Claude stream-json, Codex app-server or Grok ACP processes, with engine-owned PTYs for the human's shell drawer.
-SQLite rows are the source of truth for projects, threads, turns, transcript items, tasks and the default permission mode.
+SQLite rows are the source of truth for projects, threads, turns, transcript items, tasks, the default permission mode and the window background choice.
 The engine actor is the sole database writer after startup.
 The gpui `Shell` owns window state and a read-only event projection, not another database connection.
 The engine never depends on gpui.
@@ -17,7 +17,8 @@ Codec cancellation on provider completion, and cancellation on storage-blocked o
 Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
 The window owns render and event-batch counters.
 Inactive-window family changes post system banners, and busy Quit opens a sheet.
-Chat is the only agent surface. Each thread has a separate in-memory shell drawer; the engine owns its PTYs and emulators, and ui::drawer owns its tabs and focus.
+Chat is the only agent surface.
+Each thread has a separate in-memory shell drawer; the engine owns its PTYs and emulators, and ui::drawer owns its tabs and focus.
 Engine startup binds the MCP socket server, and root Claude, Codex and Grok sessions receive its five actor-owned tools through the relay.
 
 ### System architecture
@@ -55,7 +56,7 @@ debug ctl -> private Unix socket -> socket thread -> gpui window actions
 veyra -> veyra-engine -> rusqlite (bundled) + tokio
                      -> serde + serde_json + uuid + thiserror + tracing + regex + base64 + sha2
                      -> portable-pty + alacritty_terminal
-                     -> platform -> libc + Rust standard library
+                     -> platform -> libc + objc2 + objc2-app-kit + Rust standard library
 veyra -> gpui-kit + gpui-pre
       -> tokio + serde + serde_json + tracing + tracing-subscriber + anyhow
 ```
@@ -63,6 +64,8 @@ veyra -> gpui-kit + gpui-pre
 Direct versions are exact pins and `Cargo.lock` is kept.
 The engine's tokio features are `sync`, `rt-multi-thread`, `time`, `macros`, `process`, `io-util` and `net`; engine tests add `test-util`.
 Only the application crate declares gpui dependencies.
+It pins gpui-kit to =0.7.3 and gpui-pre to =0.3.9.
+The engine pins the macOS-only objc2 =0.6.5 and objc2-app-kit =0.3.2 dependencies to read NSWorkspace display options.
 The terminal window uses the alacritty_terminal cell, mode, colour and FairMutex types and portable-pty size type re-exported by the engine, so changes to those APIs also affect ui/terminal_view.rs.
 `platform_boundary` scans for libc, socket, process-group, target and listed command strings outside `platform/`; the header's `git` child is a reviewed exception.
 Manifest review keeps gpui out of the engine and direct versions exact; no automated manifest check enforces those rules.
@@ -99,7 +102,8 @@ Cleanup kills only the shell's group; an escaped descendant keeping the pipe ope
 Only the lock holder stamps its pid or removes a stale debug socket.
 A second launch refuses the folder and exits 1.
 The OS releases the lock on exit or crash.
-The scheduled reaper first awaits the shared PATH cell on the runtime. Then `process::start` resolves canonical provider binaries through the engine's ChildEnv before validating stored pid/group pairs; this wait never delays the window or reconciliation.
+The scheduled reaper first awaits the shared PATH cell on the runtime.
+Then `process::start` resolves canonical provider binaries through the engine's ChildEnv before validating stored pid/group pairs; this wait never delays the window or reconciliation.
 A provider leader is recognized by a provider argv basename, by node, bun or a shell running a provider script, or by a canonical executable path matching one of those binaries.
 Its dead-parent `VEYRA_PARENT_PID` marker must also validate before signalling.
 A background sweep lists argv, checks the group-leader rule once, and lazily reads executable paths before reading environments only for recognized provider or Veyra leaders.
@@ -131,11 +135,14 @@ The debug listener binds before the window opens.
 
 ## Quit and shutdown
 
-Quit opens a sheet for running, pending- or refused-admission, Starting and background-busy threads and for drawer tabs with foreground or child processes. Bare prompts do not require confirmation. Thread lines include the project and child lineage; shell lines name the thread, tab and processes.
+Quit opens a sheet for running, pending- or refused-admission, Starting and background-busy threads and for drawer tabs with foreground or child processes.
+Bare prompts do not require confirmation.
+Thread lines include the project and child lineage; shell lines name the thread, tab and processes.
 CancelQuit dismisses it and restores the originating composer or drawer focus until ConfirmQuit begins; afterward Escape and CancelQuit keep the sheet open.
 ConfirmQuit synchronously closes the engine and cancels readiness probes and the branch task, then awaits Engine::shutdown_wait in a gpui task and calls cx.quit.
 The debug ctl quit verb dispatches ConfirmQuit directly.
-`Engine::shutdown_wait` refuses new commands, ends running and pending-admission turns, expires pending requests and asks every session to shut down. It also waits for registered shell handles to finish, concurrently with the actor wait; shell workers use their one-second quit grace and the overall wait remains bounded by three seconds.
+`Engine::shutdown_wait` refuses new commands, ends running and pending-admission turns, expires pending requests and asks every session to shut down.
+It also waits for registered shell handles to finish, concurrently with the actor wait; shell workers use their one-second quit grace and the overall wait remains bounded by three seconds.
 Shutdown persists Restarted holds for running, queued, Starting and background-busy threads in its own transaction, without replacing an earlier hold.
 The engine owns one LaunchGate shared with the actor, every CLI session, ChildEnv and Probes.
 It combines an atomic closing state with a small synchronous lock; no guard crosses an await.
@@ -207,7 +214,11 @@ The actor completes buffered text for ended turns and finalizes newly settled ta
 It calls `store::apply`, commits, installs the changed rows/runtime, publishes numbered events, then dispatches effects.
 `ChangeSet::stores_nothing` owns an exhaustive check of its row and live-state fields; `Actor::write` skips the transaction when it returns true.
 The actor still installs text buffers and publishes events/effects, so pure streaming deltas do not open a SQLite transaction.
-A repeated Ready stores thread metadata only when it changed. Version-only Ready metadata waits in Actor::pending_versions for the next transaction that already changes a row; Actor::write adds the version to that same transaction and clears it only after commit. The existing two-second TextWrite timer also flushes pending versions if no other write arrives. Successful writes install the version and publish ThreadUpdated after commit; a failed write retains it for retry. Storage-blocked shutdown keeps its existing unpublished staging of retained changes.
+A repeated Ready stores thread metadata only when it changed.
+Version-only Ready metadata waits in Actor::pending_versions for the next transaction that already changes a row; Actor::write adds the version to that same transaction and clears it only after commit.
+The existing two-second TextWrite timer also flushes pending versions if no other write arrives.
+Successful writes install the version and publish ThreadUpdated after commit; a failed write retains it for retry.
+Storage-blocked shutdown keeps its existing unpublished staging of retained changes.
 The live pid/group UPDATE affects only rows whose stored pair differs.
 Actor::write rolls back a transaction with no affected rows rather than committing or counting it; runtime changes and events still install.
 Row-bearing events resolve from the final changed rows rather than being patched individually.
@@ -215,17 +226,24 @@ StartTurn effects name the turn until install builds its text from committed ite
 
 The send-to-reply path is ordered as follows.
 
-1. CreateThread stores the thread and user item with a queued turn.
-2. The Spawn effect starts the session on its own process group.
+1.
+CreateThread stores the thread and user item with a queued turn.
+2.
+The Spawn effect starts the session on its own process group.
 While the thread is still Starting, an exit before Ready fails the oldest queued turn.
 A session that started adds a Stopped hold only if another turn remains queued, preserving any earlier hold; without queued work it adds no hold.
-An asynchronous binary-resolution failure reports ResolutionFailed and retains the Stopped hold while Starting; provider crashes and sign-out follow the ordinary Exited rule. Spawner::spawn returns a SessionHandle immediately; there is no synchronous spawn-error result.
-3. Claude publishes Ready on a matched initialize reply or system/init; Codex publishes it on a successful thread/start or thread/resume reply, with the returned thread id and cliVersion, after any not-found fallback or active-writer retry.
+An asynchronous binary-resolution failure reports ResolutionFailed and retains the Stopped hold while Starting; provider crashes and sign-out follow the ordinary Exited rule.
+Spawner::spawn returns a SessionHandle immediately; there is no synchronous spawn-error result.
+3.
+Claude publishes Ready on a matched initialize reply or system/init; Codex publishes it on a successful thread/start or thread/resume reply, with the returned thread id and cliVersion, after any not-found fallback or active-writer retry.
 Grok publishes Ready on a successful session/new, session/resume or session/load reply with its native session id and initialize version.
 Ready changes Starting to Structured.
 4. start_changed makes the queued turn Running, records pending admission and dispatches StartTurn with committed prompt text.
 The first prompt waits for Ready.
 The codec admits StartTurn only while its provider work is idle; Grok requires its native prompt map to be empty, and Codex requires TurnBinding::Idle.
+The session retains the admitted prompt frames while it reports Dispatched to the actor.
+The actor validates that the turn belongs to the current thread and epoch, then returns DispatchCommitted; only that acknowledgement releases the matching held prompt frames to the writer.
+Interrupt and InterruptActive release the matching held prompt before its interrupt frames; Shutdown leaves the held prompt unsent and interrupts only the codec's active work.
 The session reports StartTurnRefused when the codec refuses admission.
 Grok announces any still-open foreign prompts as Provider work immediately after its Veyra turn ends, so retained native work always has a running actor row and Stop target.
 ProviderTurnStarted opens the CLI's own turn under its reported id and restores a pending Veyra turn to Queued with its original ordinal.
@@ -236,8 +254,10 @@ A Refused admission names no turn, so window Stop has no target unless a Running
 A refusal replaces Pending admission with Refused until the next CLI turn end; the first correlated turn event confirms an admitted prompt and restores its Running row if CLI work displaced it.
 The Provider end applies start_changed, which retries eligible queued work once pending admission has resolved.
 The Claude codec also emits Ready on system/init, so an early system/init can open the Ready gate before the initialize reply.
-5. The codec normalizes deltas; the actor buffers text and counts actual stream deltas before flushing.
-6. Item and turn completion persist final rows, free streaming buffers and publish the engine-owned status.
+5.
+The codec normalizes deltas; the actor buffers text and counts actual stream deltas before flushing.
+6.
+Item and turn completion persist final rows, free streaming buffers and publish the engine-owned status.
 
 Text coalesces per item, normally flushing to the UI at most once per 16 ms.
 Requests, item completion and turn completion flush pending UI text immediately.
@@ -325,7 +345,7 @@ AllowInThread stores the exact thread, tool and command in grants, and a later i
 Other commands, tools and threads still dock, including compound commands and requests in Full access.
 Turn completion and process exit expire pending requests and publish RequestClosed in the same transaction.
 
-`store::MIGRATIONS` owns schema 3, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
+`store::MIGRATIONS` owns schema 4, with WAL, `synchronous=NORMAL`, foreign keys and a two-second busy timeout.
 Migrations use `PRAGMA user_version` in transactions and refuse newer schemas.
 The eight tables are projects, threads, turns, items, requests, grants, tasks and settings.
 User text lives once in an item referenced by its turn.
@@ -337,6 +357,8 @@ The prompt remains in its existing user item, and Continue cannot resend that un
 Unstarted queued turns remain queued and held; pending wakes keep the existing safer duplicate-report recovery.
 Migration 2 normalizes older empty CLI versions to NULL once.
 Migration 3 adds the nullable tasks.source_item_id foreign key to items; older tasks load with no source link.
+Migration 4 adds settings.window_background with a Translucent default and a CHECK allowing only translucent or solid.
+SetWindowBackground and SetDefaultMode preserve the other setting and publish the complete SettingsChanged value only after the transaction commits.
 Loading rows is read-only and treats any remaining empty CLI version as unknown.
 Empty versions become unknown at the codec, probe and row-load boundaries; the actor and writes trust that input.
 `store::apply` writes both live pid and group on Ready, clears both when parked, and preserves the first archive time on later archived writes.
@@ -345,15 +367,17 @@ Startup validates stored live pid/group pairs before reaping; reconciliation its
 
 Lineage CHECKs and the parent/root foreign key refuse grandchildren and inconsistent roots.
 The hold CHECK allows only the typed hold reasons or null.
-The singleton settings row starts in Full access and constrains the three modes.
+The singleton settings row starts in Full access and Translucent and constrains the three modes and two background choices.
 Thread configuration remains in `config_json`; a default-mode change never rewrites existing threads.
 
 `reconcile::decide` runs once before commands are accepted.
 The actor routes that change through `prepare_commit`, completing interrupted text and unfinished tools in the same startup transaction.
 It interrupts stored running turns, expires requests and holds affected queues as Restarted without replacing an earlier hold.
 It replaces an already-started unaccepted wake, preserves an unstarted wake, and leaves running child tasks open.
-Stored terminal-view columns are ignored during load and reconciliation, so an otherwise idle legacy thread opens parked in chat without a view-specific hold. Stored TerminalSpan items remain readable.
-Startup schedules the PATH-gated reaper with captured process pairs. Independently, reconciliation writes every thread Parked and clears both live_pid and live_pgid; it does not await the reaper.
+Stored terminal-view columns are ignored during load and reconciliation, so an otherwise idle legacy thread opens parked in chat without a view-specific hold.
+Stored TerminalSpan items remain readable.
+Startup schedules the PATH-gated reaper with captured process pairs.
+Independently, reconciliation writes every thread Parked and clears both live_pid and live_pgid; it does not await the reaper.
 No provider work restarts automatically and Veyra writes no user CLI configuration.
 
 ## Shared provider process boundary
@@ -366,8 +390,13 @@ Scripted sessions exist only in engine tests and start no OS process.
 `ChildEnv` shares one asynchronously filled login-shell PATH and optional non-empty __MISE_DIFF cell, with both inherited values as fallback after a failed shell or loader-thread creation.
 A successful shell with no __MISE_DIFF retains the application-inherited value in the cell.
 Explicit isolated environments strip inherited __MISE_DIFF, CLAUDE_CODE_AUTO_CONNECT_IDE and ENABLE_CLAUDEAI_MCP_SERVERS unless the caller supplies them explicitly.
-LoginPathState is Pending, Loaded(LoginPath) or Fallback(LoginPath). One private reader supplies environment construction and binary resolution from the cell; waiting only awaits readiness. An isolated environment with no loader reports pending. The loader fills one paired value once; later waits reuse it, including waits that begin after the fill.
-Engine::start starts the loader immediately after the instance lock. Session tasks, all three probe tasks and startup reaping await the cell before resolving a binary, so neither the actor nor the main thread waits for the shell. Check again and Retry use the same wait.
+LoginPathState is Pending, Loaded(LoginPath) or Fallback(LoginPath).
+One private reader supplies environment construction and binary resolution from the cell; waiting only awaits readiness.
+An isolated environment with no loader reports pending.
+The loader fills one paired value once; later waits reuse it, including waits that begin after the fill.
+Engine::start starts the loader immediately after the instance lock.
+Session tasks, all three probe tasks and startup reaping await the cell before resolving a binary, so neither the actor nor the main thread waits for the shell.
+Check again and Retry use the same wait.
 The picker stays Checking until a probe answers, a session awaiting PATH stays Starting and honours pending Stop, shutdown and the shared closing gate, and the debug dump's login_path reports pending, loaded or fallback.
 Resolution tries absolute entries from inherited PATH, that snapshot, then `KNOWN_BIN_DIRS`, returning a canonical absolute executable path.
 Relative and empty search entries are ignored.
@@ -375,7 +404,8 @@ Known home-relative folders include .grok/bin, so a Finder launch can resolve Gr
 Explicit isolated environments never fall through to home-relative install folders.
 Executable checks and process-group setup for structured and probe children are platform functions.
 Structured providers and probes have piped stdio and kill_on_drop(true); drawer shells use their PTYs and ChildGroup guards.
-Structured sessions and probes create an owned process group and add VEYRA_PARENT_PID naming the application. Drawer shells strip every VEYRA_* variable, including that marker, and are tracked by runtime handles instead of stored agent pids.
+Structured sessions and probes create an owned process group and add VEYRA_PARENT_PID naming the application.
+Drawer shells strip every VEYRA_* variable, including that marker, and are tracked by runtime handles instead of stored agent pids.
 It strips CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SSE_PORT, CLAUDE_AGENT_SDK_VERSION and every inherited VEYRA_* variable before adding its own marker and optional replay fixture.
 Veyra inherits the user's hooks/MCP configuration and never edits it.
 The new-thread hint names that behavior.
@@ -470,57 +500,94 @@ Only a resume-not-found stderr class starts a fresh native session; other errors
 
 The drawer is a utility for the human and never changes an agent's live state.
 `Engine::open_shell(thread, cwd, size)` starts a tab and returns a TerminalHandle; `close_shell` and `close_shells` close one tab or every tab of a thread.
-RuntimeState keeps the handles by thread, including closing tabs until they exit. New opens prune finished handles and enforce terminal::SHELL_TAB_LIMIT, six non-closing tabs per thread; the window reads the same constant.
+RuntimeState keeps the handles by thread, including closing tabs until they exit.
+New opens prune finished handles and enforce terminal::SHELL_TAB_LIMIT, six non-closing tabs per thread; the window reads the same constant.
 Both quit paths reach that registry even after the UI removes a tab or archives a thread.
-No drawer command, actor event, transcript item or SQLite row is created. StopThread affects only the agent.
+No drawer command, actor event, transcript item or SQLite row is created.
+StopThread affects only the agent.
 
 `terminal.rs` owns each portable-pty child, master, writer, reader and alacritty emulator.
-A tab worker starts without waiting for the provider PATH cell. It starts `platform::user_shell()` with `-l` in the supplied thread folder; a missing folder refuses the launch.
+A tab worker starts without waiting for the provider PATH cell.
+It starts `platform::user_shell()` with `-l` in the supplied thread folder; a missing folder refuses the launch.
 The shell environment inherits the application's PATH rather than replacing it with the probe snapshot, because the login shell builds its own PATH.
 It strips the four Claude nesting markers, every VEYRA_* variable, host-terminal identities and forced-colour settings, then sets TERM=xterm-256color and COLORTERM=truecolor.
-The debug-only VEYRA_DEBUG_SHELL_FIXTURE instead selects the adjacent veyra-fake-cli in shell mode with one owned fixture. The production shell receives no tool-server configuration, token or provider-resume arguments.
+The debug-only VEYRA_DEBUG_SHELL_FIXTURE instead selects the adjacent veyra-fake-cli in shell mode with one owned fixture.
+The production shell receives no tool-server configuration, token or provider-resume arguments.
 The shared launch gate covers the final cancellation check, OS spawn and group registration. portable-pty creates a session whose leader and group id equal the shell pid.
 
-TerminalHandle exposes direct queued writes, resizes, subscriptions, shell status, pid and running process paths. Exits and worker errors update the handle, never the actor.
-ShellStatus distinguishes Starting, Running, Exited with a numeric code, Signalled, Closed and Failed with an error. The pinned PTY library exposes signal outcomes only through its Display output; classification recognizes its signal prefix and never displays Rust debug formatting.
-A worker unwind publishes Failed after its owned process cleanup. Cancelled starts publish Closed.
-A tab is running when the PTY foreground group differs from the shell's group, or the shell has a live child. Background and stopped jobs therefore require consent too.
-`platform::foreground_group` borrows a dup-owned PTY descriptor held under the terminal mutex through each tcgetpgrp call. Dropping or reusing the writer's original descriptor cannot change that target. The duplicate is released during worker cleanup. `child_pids` uses proc_listchildpids and filters zombies. Its return value is a pid count.
+TerminalHandle exposes direct queued writes, resizes, subscriptions, shell status, pid and running process paths.
+Exits and worker errors update the handle, never the actor.
+ShellStatus distinguishes Starting, Running, Exited with a numeric code, Signalled, Closed and Failed with an error.
+The pinned PTY library exposes signal outcomes only through its Display output; classification recognizes its signal prefix and never displays Rust debug formatting.
+A worker unwind publishes Failed after its owned process cleanup.
+Cancelled starts publish Closed.
+Typed startup error paths supply the shell's start-failure words in terminal::run, and errors after startup keep their own runtime words.
+The drawer displays that reason without parsing a provider or PTY library prefix.
+A tab is running when the PTY foreground group differs from the shell's group, or the shell has a live child.
+Background and stopped jobs therefore require consent too.
+`platform::foreground_group` borrows a dup-owned PTY descriptor held under the terminal mutex through each tcgetpgrp call.
+Dropping or reusing the writer's original descriptor cannot change that target.
+The duplicate is released during worker cleanup.
+`child_pids` uses proc_listchildpids and filters zombies.
+Its return value is a pid count.
 The window names processes through process_executable without reading or printing their arguments or environments.
 
-Closing records the foreground group before sending SIGHUP to the shell group. A surviving shell and the recorded foreground group receive SIGKILL after three seconds; app closing shortens that grace to one second.
+Closing records the foreground group before sending SIGHUP to the shell group.
+A surviving shell and the recorded foreground group receive SIGKILL after three seconds; app closing shortens that grace to one second.
 The foreground deadline still applies when the shell exits before its foreground job.
 One foreground grace-kill site checks that the recorded group still exists before sending SIGKILL and consumes that target once.
 Observing the group gone clears the target, so a reused group number is never revisited.
-The child guard reaps the leader and kills its owned group on unwind. Reader and writer joins share the same bounded cleanup deadline; an escaped process retaining the PTY cannot keep the handle live indefinitely.
-Such a process is outside the shell group, and a detached reader ends when it eventually releases the PTY. A deadline warning can name its pid, never its arguments.
+The child guard signals its owned group before waiting on unwind and never signals it after a successful reap.
+The reap and hangup paths hold the same pid mutex, and reaping clears both the terminal pid and group registration.
+Reader and writer joins share the same bounded cleanup deadline; an escaped process retaining the PTY cannot keep the handle live indefinitely.
+Such a process is outside the shell group, and a detached reader ends when it eventually releases the PTY.
+A deadline warning can name its pid, never its arguments.
 A Dock or logout quit sends registered shells SIGHUP before the engine's 100 ms native-termination wait; structured and probe groups receive SIGTERM.
 The hangup flag prevents duplicate shell hangups across these paths.
 
 The PTY writer queue is unbounded, so sustained input faster than the shell reads can retain queued bytes.
-The reader parses at most 64 KiB under alacritty's FairMutex and releases the lock between reads. Emulator callbacks use an Arc-shared Mutex list, making the emulator Send.
+The reader parses at most 64 KiB under alacritty's FairMutex and releases the lock between reads.
+Emulator callbacks use an Arc-shared Mutex list, making the emulator Send.
 Every PtyWrite reply and colour query reply goes straight to the writer queue, independent of SQLite and actor admission.
 The worker flushes an expired synchronized-update block without needing another input byte and coalesces dirty notifications on its 16 ms polling interval.
-Kitty keyboard mode stays disabled. Emulator clipboard events are discarded; clipboard access requires the human's explicit copy or paste action in the window.
+Kitty keyboard mode stays disabled.
+Emulator clipboard events are discarded; clipboard access requires the human's explicit copy or paste action in the window.
 
-`ui::drawer` owns each thread's open state, height, active index and numbered tab list. These last only for the app session.
-`ui::terminal_view` paints the active tab's current emulator grid, with bundled mono text and a still cursor. Hidden tabs keep parsing while their subscriptions schedule no repaint.
-The drawer opens under composition, reuses the theme's 32 px tab strip and terminal line height, and bounds its height against the header, the measured composition surface including its padding, and three reading lines. Before rendering, the selected drawer clamps its stored height to the current bounds; rendering, drag starts and the debug dump read that same height.
-A smaller window keeps the clamped height when it grows again, until the user resizes the drawer.
-Its drag rail changes that height on held-left movement, clamps it at both bounds and clears the drag on release or a bounds-driven height change.
-Opening with an empty draft focuses the drawer; opening with a draft preserves composer focus, text and caret. Hiding always returns to the composer. Clicks change surface focus; output, exit and restart do not.
-Tab keys exist only in VeyraTerminal. Command-J remains a window binding; Command-T, Command-W and the tab chords win over terminal byte translation.
-Closing the last tab hides the drawer and focuses the composer. A running tab or an Archive that reaches running tabs opens a process-naming close sheet first; Cancel preserves the work and confirms close the chosen scope.
+`ui::drawer` owns each thread's open state, height, active index and numbered tab list.
+These last only for the app session.
+`ui::terminal_view` paints the active tab's current emulator grid, with bundled mono text and a still cursor.
+Hidden tabs keep parsing while their subscriptions schedule no repaint.
+The drawer opens under composition with the theme's 32 px tab strip, 134 px minimum, 236 px starting height and 72 px minimum tab width.
+It stores the human's chosen height independently of the current space.
+One displayed_drawer_height function clamps that choice against the header, the measured composition surface including its padding, and three reading lines.
+Rendering, a drag's start and the debug dump read that function.
+A smaller window or a longer draft temporarily lowers the displayed height, and the chosen height returns when space returns.
+A drag starts from the displayed height and sets the chosen height on held-left movement.
+Release, loss of the held button or a changed height budget cancels the drag.
+Opening with an empty draft focuses the drawer; opening with a draft preserves composer focus, text and caret.
+Hiding always returns to the composer.
+Clicks change surface focus; output, exit and restart do not.
+Tab keys exist only in VeyraTerminal.
+Command-J remains a window binding; Command-T, Command-W and the tab chords win over terminal byte translation.
+Closing the last tab hides the drawer and focuses the composer.
+A running tab or an Archive that reaches running tabs opens a process-naming close sheet first; Cancel preserves the work and confirms close the chosen scope.
 An ended tab keeps its screen and shows its numeric exit code, signal, closure or failure in words.
-ShellStatus::Failed messages begin with "The shell could not start:" and the reason, without the provider or PTY library prefix.
+PTY-open and shell-spawn failures begin with "The shell could not start:" and a plain reason from the typed error mapping.
+Failures after startup keep their runtime wording, such as "The terminal input stopped".
 Synchronous open errors display their reason directly.
-Return binds RestartShellTab only in its ended-terminal context and replaces its PTY and emulator in the same numbered tab, rechecking the folder before starting anything. Live Return reaches the shell through terminal key translation without an action.
-PasteShell, CopyShell and ScrollShellHistoryUp/Down are gpui actions bound in the shared VeyraTerminal key table. Command-V reads the clipboard, strips ESC, DEL and all C0 controls except tab, newline and carriage return in both modes, and adds bracketed-paste markers only when the emulator requested them. The wheel and Shift-PageUp/Down scroll history; the next input returns to the bottom.
-A drag updates alacritty's own selection and Command-C copies selection_to_string. IME is not supported.
+Return binds RestartShellTab only in its ended-terminal context and replaces its PTY and emulator in the same numbered tab, rechecking the folder before starting anything.
+Live Return reaches the shell through terminal key translation without an action.
+PasteShell, CopyShell and ScrollShellHistoryUp/Down are gpui actions bound in the shared VeyraTerminal key table.
+Command-V reads the clipboard, strips ESC, DEL and all C0 controls except tab, newline and carriage return in both modes, and adds bracketed-paste markers only when the emulator requested them.
+The wheel and Shift-PageUp/Down scroll history; the next input returns to the bottom.
+A drag updates alacritty's own selection and Command-C copies selection_to_string.
+IME is not supported.
 
 Debug terminal grid sizing still accepts decimal columns 2–1000 and rows 1–1000 through VEYRA_DEBUG_TERMINAL_GRID, once at launch; invalid or absent values use layout sizing and release excludes the override.
-Debug flood stamps count consumed bytes at FLOOD_START and FLOOD_DONE, excluding the markers. The active view counts only paints between those stamps and reports payload bytes, elapsed time and repaint gaps through perf.flood.
-The fake shell can echo input bytes, emit recorded raw output or start an owned sleep child for the background-job fixture. It writes no Claude history and never reads the user's CLI homes.
+Debug flood stamps count consumed bytes at FLOOD_START and FLOOD_DONE, excluding the markers.
+The active view counts only paints between those stamps and reports payload bytes, elapsed time and repaint gaps through perf.flood.
+The fake shell can echo input bytes, emit recorded raw output or start an owned sleep child for the background-job fixture.
+It writes no Claude history and never reads the user's CLI homes.
 
 ## JSON-RPC peer and Codex codec
 
@@ -551,8 +618,10 @@ Root MCP config adds mcp_optional_startup_grace_ms 5000 and mcp_servers.veyra.to
 CodexOption owns both optional keys and their values.
 An open rejection naming one key revokes that attempt credential, logs its key without the error payload, and retries once without that key.
 Each key can be dropped once per root session; a repeated rejection fails, and children receive neither option.
-Codex 0.162.1 accepted both keys in the retained live run. The drop-key fallback is deliberate: a later CLI rejecting an optional key must not break every Codex root.
-The user’s own permissionRequest hooks run inside Codex before a request reaches Veyra and can delay a dock; the retained run recorded about 65 seconds. Whether tool_timeout_sec 30 includes the approval wait is not settled by that record; Veyra keeps the value at 30.
+Codex 0.162.1 accepted both keys in the retained live run.
+The drop-key fallback is deliberate: a later CLI rejecting an optional key must not break every Codex root.
+The user’s own permissionRequest hooks run inside Codex before a request reaches Veyra and can delay a dock; the retained run recorded about 65 seconds.
+Whether tool_timeout_sec 30 includes the approval wait is not settled by that record; Veyra keeps the value at 30.
 Only the measured no rollout found for thread id text falls back to thread/start and a notice, retaining the same app-server.
 An active-writer refusal retries at 250 ms intervals for at most three seconds, then fails with Codex's message and keeps the native id for Retry.
 Other resume failures keep that id and fail without starting a replacement conversation.
@@ -579,7 +648,8 @@ Another thread's requests are refused without docking, and a start reply that ch
 The matching turn/completed ends that turn even before turn/started, and a completed native id cannot reopen work.
 Another native turn on this conversation can open a separately announced Provider turn; another thread id is filtered before turn routing.
 Thread status, token usage, hooks, startup status and unknown notifications do not mark work or add notices.
-A failed turn with the typed codexErrorInfo unauthorized uses Veyra’s sign-in instruction naming codex login. Missing or unknown error kinds, including unfamiliar object shapes, retain the redacted provider message or the existing generic failure when no message exists.
+A failed turn with the typed codexErrorInfo unauthorized uses Veyra’s sign-in instruction naming codex login.
+Missing or unknown error kinds, including unfamiliar object shapes, retain the redacted provider message or the existing generic failure when no message exists.
 Own-thread turn completion reconciles its typed item summary by native item key, supplying a final reply absent from individual frames without duplicating already completed or streamed items.
 Foreign-thread items and turn summaries are filtered before reconciliation.
 Parent collabAgentToolCall rows use a typed action to label wait, spawn, send, resume or stop in Veyra's words.
@@ -821,7 +891,8 @@ The token never enters argv, logs, evidence, fixture text or crash text.
 
 Actor::handle_inner sends every tool decision through tools::decide, the existing ChangeSet commit and the existing effects path.
 ProviderKind::ALL supplies the start_thread schema's provider choices.
-list_providers reads the shared readiness catalog and offers adapters with Ready and a resolved path, their models and offered_modes, the caller's mode_ceiling and remaining fan-out. The ceiling is the parent provider's effective run mode.
+list_providers reads the shared readiness catalog and offers adapters with Ready and a resolved path, their models and offered_modes, the caller's mode_ceiling and remaining fan-out.
+The ceiling is the parent provider's effective run mode.
 start_thread accepts each provider whose probe has a resolved path and Ready status, including Grok.
 Probes populate that catalog and Engine::child_env shares it with the actor.
 start_thread creates a child lineage, first task turn and UUID-v5 task keyed by caller and start_thread:client_request_id.
@@ -994,7 +1065,10 @@ Later stale transcript events are ignored, but metadata stays on the ordered eve
 This joins the item snapshot and event stream without duplicated or missing text.
 When the selected Chat thread becomes archived, both the event pump and acknowledgement path call leave_archived_thread to open New thread with the stored default mode and reset its draft, picker, notice and branch.
 
+The sidebar puts Add project and New thread in its top action group and Settings at its foot.
+The header retains identity, status and the drawer button.
 The sidebar reads projects in creation order, then each root and its children on a one-pixel guide, with the root glyph derived from family_status.
+A thread row is one selection target with a fixed action space, a Stop control only while work can be stopped, and a menu revealed by pointer hover or keyboard focus.
 Project and thread rows do not shrink inside the scroll column.
 SidebarScroll retains the scroll handle and last revealed selection; a changed selection scrolls its immediate row into view during layout.
 An unarchived child whose root is archived becomes a top-level row and keeps its own status.
@@ -1040,7 +1114,8 @@ AppState::text_rows selects only a text-only pump batch's changed rows in the op
 Other batches still remeasure the list for structural, outcome and queue-label changes.
 The inline streaming caret remains part of the markdown source, so a growing assistant row still takes the kit's full-replacement parse path.
 Failed tools show their last nonempty output line, truncated to one row at its width.
-The window and dump share row_outcome, which annotates only each ended turn's final item. The failed banner's own turn is captioned Failed alone because the banner already shows its cause; historical failed turns retain the cause in their caption.
+The window and dump share row_outcome, which annotates only each ended turn's final item.
+The failed banner's own turn is captioned Failed alone because the banner already shows its cause; historical failed turns retain the cause in their caption.
 A user scroll detaches following; new text, requests and tool rows preserve that state.
 Scrolling within text.read.line_height of the bottom or choosing Latest reattaches.
 Latest appears only while following is detached and content remains below.
@@ -1070,7 +1145,9 @@ ProviderKind owns offered_modes, run_mode and next_mode.
 Claude and Codex offer three modes; Grok offers Ask first and Full access.
 The composer renders the effective run mode and cycles only offered modes while preserving unsupported values on an existing stored thread.
 New thread resets text and applies the selected provider’s run mode to the current stored default.
-Settings occupies the main column, opens through OpenSettings/Menu/Command-comma and exposes one three-mode row.
+Settings occupies the main column and opens through OpenSettings, the sidebar foot, the native menu or Command-comma.
+Its three-mode default row and two-choice Window background row use actions and persist independently.
+Command-Option-B cycles SetWindowBackground.
 SetDefaultMode publishes SettingsChanged; Escape or thread/project selection leaves Settings.
 
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
@@ -1087,12 +1164,13 @@ The chat column bounds the composer by its available height; the transcript give
 Flex layout measures the hold row, request count, consequence, wrapped decision buttons, focus hint, input and toolbar before shrinking the details to the remaining height, capped at composer_max_height (240px).
 The command or file path, model-written reason and bounded argument preview share that details scroll area, which keeps at least one code-text line.
 The consequence, any Deny-only consent reason and any outside working folder sit above it, and Allow and Deny stay below it.
-The folder's viewport keeps at most three label-text lines; while a request is docked, the message input has a fixed 48px height and its draft remains scrollable.
-The dock also switches the editor from two-to-ten auto-growing rows to one row, gives its frame a definite 48px height and clips that viewport, so the editor itself fits above the toolbar while its full draft remains scrollable.
-Closing the dock restores the normal two-to-ten-row growth and 240px input limit.
-Growing the docked input when there is spare room is carried to the polish stage.
+The folder's viewport keeps at most three label-text lines.
+Docks, the input and toolbar share one raised surface, rim and height budget.
+The message input grows from 48px to 240px while space remains and keeps its draft scrollable under pressure.
+The composition surface yields its scrolling details and input space before hiding decisions, while the transcript retains three reading lines.
+A fade at the transcript's foot draws only over the opaque content plane.
 Decision controls put Deny and Allow once before the optional thread grant, so a wide grant wraps after both decisions instead of forcing three rows.
-At both theme window sizes, the approval matrix includes Deny-only controls and retains the long folder's three lines and at least one code line even with all fixed controls present, so no smaller-folder fallback is needed.
+The approval matrix asserts that both theme window sizes retain Deny-only controls, the long folder's three lines and at least one code line with all fixed controls present.
 Folder, details and question text use one bounded-scroll helper whose caller supplies minimum and maximum heights, with independent kit scrollbars visible only for actual overflow.
 Its 16px logical thumb minimum leaves travel on a 20px one-line track; the kit's 4px end insets leave an 8px painted thumb at that minimum.
 The working-folder quote uses the 16px label line height and the scrolling dock question uses the 20px UI line height.
@@ -1129,7 +1207,19 @@ A Refused admission with no Running row has no Stop target; held reasons and Con
 Discard queued appears only when a held thread has queued turns.
 The quit sheet overlays the existing window content.
 The Theme global owns all colours, geometry, type, radii and motion tokens.
-Theme::apply projects them through the kit and follows macOS appearance.
+The Look global carries the stored background choice and macOS display flags.
+The full-height sidebar is the glass plane; the header, transcript, composer, drawer and other main views stay on an opaque content plane.
+Translucent uses gpui's Blurred window background and the sidebar's shell tint at coverage 0.96 in dark and 0.98 in light.
+Solid uses Opaque and the opaque shell tint.
+Theme::apply restores that window background on each appearance change instead of leaving the kit's background reset in force.
+It also makes the kit root's background transparent in effective Translucent, so the kit does not cover the sidebar's glass tint, and restores an opaque root in Solid or forced Solid.
+Content, raised card and floating colour roles form the dark elevation ladder; light uses white planes and shadows.
+Floating sheets use the floating radius and shadow, and the kit's popup shadow is enabled.
+The platform reads Reduce Transparency, Increase Contrast and Reduce Motion from NSWorkspace at launch and window activation.
+Either transparency or contrast flag forces Solid without changing the stored choice, and Settings names the forcing flag.
+Increase Contrast raises borders to a component contrast colour and uses the text colour for muted roles.
+Reduce Motion sets gpui's reduce-motion flag and snaps every motion token, including the spinner, to zero.
+The working glyph remains still and the one-second status clock continues to update elapsed time.
 Theme values and roles live in ui/theme.rs.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
 Window geometry comes from the theme and can be overridden by the window manager.
@@ -1168,7 +1258,8 @@ An incremental same-user sender can keep a line read occupied inside the per-rea
 A full queue rejects before enqueueing; a reply timeout does not cancel an action already queued.
 
 Action accepts optional JSON data, keys parses the entire sequence before dispatching a key-down then key-up for each keystroke, text uses the focused textarea's public input handler or dispatches character key events to the focused terminal, and quit dispatches ConfirmQuit.
-The keys_dispatches_down_then_up_per_keystroke unit test guards that order. The native keyboard proof opens a composer chip through key release; terminal input handles key-down only, so adding key-up emits no extra terminal bytes.
+The keys_dispatches_down_then_up_per_keystroke unit test guards that order.
+The native keyboard proof opens a composer chip through key release; terminal input handles key-down only, so adding key-up emits no extra terminal bytes.
 Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
 Each sidebar thread and selected thread includes lineage, and tasks includes each received task row with its state, delivery and optional report source.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
@@ -1182,13 +1273,19 @@ No wait server command exists.
 [verify-veyra](.agents/skills/verify-veyra/SKILL.md) owns the fresh-shell launch, driver, capture, evidence and cleanup procedure.
 Its fake checks isolate data and use only the fake CLI; explicitly authorized live checks record actual provider wires.
 Proof stays outside disposable scratch, and driver and cleanup actions target only processes this run started.
-Captures require the owned window to remain on-screen and frontmost; the guard prevents covered or stale frames from counting as proof.
+Solid captures use a window capture and require the owned window to remain on-screen and frontmost.
+Translucent captures use the window's exact on-screen rectangle over run-owned backdrop windows.
+Immediately before and after each region capture, the driver checks frontmost identity, unchanged bounds, full coverage by one backdrop window on one display, and no intersecting on-screen window above Veyra.
+A changed guard discards the file and retries at most three times.
+The Settings page plants a run-owned occluding window and requires rejection without a retained capture.
 Release ignores the debug reap filter and can signal any validated orphan, so the skill keeps release checks away from another run's deliberate orphan.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
 Dump also reports each known live CLI pid with resident_bytes.
 Debug perf reports commits, actor_max_ms, actor_busy_ms, mailbox_free, repaints, max_batch_events and the completed terminal flood measurement.
 Dump drawer holds the selected thread's open state, height, active tab, tab processes and exits, plus its active terminal grid and paint count.
-Dump focus reports composer, drawer or none from focus-handle observations. A modal sheet reports none; it remembers the originating surface for Cancel. composer_caret reports the input offset. The debug-only DebugFocusShellDrawer action targets the same terminal focus handle as a click, for deterministic drive preconditions.
+Dump focus reports composer, drawer or none from focus-handle observations.
+A modal sheet reports none; it remembers the originating surface for Cancel. composer_caret reports the input offset.
+The debug-only DebugFocusShellDrawer action targets the same terminal focus handle as a click, for deterministic drive preconditions.
 All terminal repaint counters and flood measurement consumers are excluded from release builds with cfg(debug_assertions).
 mailbox_free is the command sender's unreserved channel capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
@@ -1197,6 +1294,8 @@ The composer exposes offered_modes and permission_picker_open beside its effecti
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
 Its allow_once_enabled, allow_in_thread_enabled and consent_reason use the same typed consent as the rendered controls.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
+The debug-only veyra::DebugDisplayOptions action overrides the three display flags without changing macOS settings.
+The look dump reports the stored choice, effective background, flags and forcing reason.
 The debug-only `veyra::DebugAgeQuiet` action accepts a thread id and minutes, subtracts those minutes from that Working thread's quiet activity timestamp, and repaints; the next activity event replaces it with the real timestamp.
 It changes no engine status or turn timing, and `header::quiet_for` remains the display rule.
 
@@ -1206,18 +1305,36 @@ The runtime sections above own the implemented rules.
 The earlier follow-ups on writable Git roots, root family instructions and Grok’s two offered modes are already reflected in design-6 and are not differences.
 The following clarifications and remaining differences are checked against the code.
 
-- Design 7.3’s Codex examples leave live output and error variants open. The codec prefers completed aggregatedOutput, accepts quoted tool names and a trailing question mark in MCP approval messages, and distinguishes resume-not-found, active-writer and no-active-turn refusals by text. Async-card choices stop active work before sending an ordinary user message; command thread grants require the exact project cwd (`provider/codex.rs`, `commands.rs`).
-- Design 7.4’s Grok catalog recipe calls grok models beside --version when a catalog exists. The implemented probe instead reads authMethods, bare _meta.agentVersion and optional modelState from one initialize, without authenticating or opening a session (`provider/grok.rs`).
-- Clarification of design 7.4: Grok’s question wire is flat and needs no question or prompt id. Session/resume replies can omit the session id, and session/load is the fallback when resume is not advertised. Restrictive sessions turn off settings-seeded auto/yolo, but preserve user allow rules and add no client hook gate. Exact-command grants accept only the recognized Bash input shape (`provider/grok.rs`).
-- Design 7.1’s shell snapshot can supply no non-empty __MISE_DIFF. In that case ambient children retain any application-inherited value beside the shell PATH; failed shells retain both inherited values (`provider/env.rs`).
+- Design 7.3’s Codex examples leave live output and error variants open.
+  The codec prefers completed aggregatedOutput, accepts quoted tool names and a trailing question mark in MCP approval messages, and distinguishes resume-not-found, active-writer and no-active-turn refusals by text.
+  Async-card choices stop active work before sending an ordinary user message; command thread grants require the exact project cwd (`provider/codex.rs`, `commands.rs`).
+- Design 7.4’s Grok catalog recipe calls grok models beside --version when a catalog exists.
+  The implemented probe instead reads authMethods, bare _meta.agentVersion and optional modelState from one initialize, without authenticating or opening a session (`provider/grok.rs`).
+- Clarification of design 7.4: Grok’s question wire is flat and needs no question or prompt id.
+  Session/resume replies can omit the session id, and session/load is the fallback when resume is not advertised.
+  Restrictive sessions turn off settings-seeded auto/yolo, but preserve user allow rules and add no client hook gate.
+  Exact-command grants accept only the recognized Bash input shape (`provider/grok.rs`).
+- Design 7.1’s shell snapshot can supply no non-empty __MISE_DIFF.
+  In that case ambient children retain any application-inherited value beside the shell PATH; failed shells retain both inherited values (`provider/env.rs`).
 - Design 11’s captures use collision-safe numbered names and additionally mask account metadata, Grok identity/hostname, commands, server connection details, URL paths and queries, and email shapes (`record.rs`).
-- Clarification of design 9: Provider-text presentation distinguishes marked literal consent text from one-line projected labels. Chosen async option messages retain raw bytes, so a bidi override can still affect their user bubble. That rendering rule remains unresolved (`text.rs`, `ui/provider_text.rs`, `ui/transcript.rs`).
-- Clarification of design 9: Dock layout keeps decision buttons visible, bounds outside-folder text to three lines, scrolls long details and question text independently, and never truncates option captions. A docked draft uses a fixed 48px input instead of growing into unused space (`ui/composer.rs`, `ui/provider_text.rs`, `ui/mod.rs`).
-- Clarification of design 12: Ordinary tests use explicit isolated provider environments in debug and release; only ignored live tests resolve installed CLIs. Terminal throughput measurements must name their grid, which the debug launch override can fix (`provider/env.rs`, `ui/mod.rs`).
+- Clarification of design 9: Provider-text presentation distinguishes marked literal consent text from one-line projected labels.
+  Chosen async option messages retain raw bytes, so a bidi override can still affect their user bubble.
+  That rendering rule remains unresolved (`text.rs`, `ui/provider_text.rs`, `ui/transcript.rs`).
+- Clarification of design 9: Dock layout keeps decision buttons visible, bounds outside-folder text to three lines, scrolls long details and question text independently, and never truncates option captions.
+  The input grows into the space its docks leave and remains scrollable under pressure (`ui/composer.rs`, `ui/provider_text.rs`, `ui/mod.rs`).
+- Clarification of design 12: Ordinary tests use explicit isolated provider environments in debug and release; only ignored live tests resolve installed CLIs.
+  Terminal throughput measurements must name their grid, which the debug launch override can fix (`provider/env.rs`, `ui/mod.rs`).
 
-- Design 7.2 asks for retry without a refused Claude probe flag. That fallback is not implemented: session::probe spawns once with claude::probe_args. If a later CLI refuses --settings or --strict-mcp-config and exits without initialize, readiness is Ready with no models after the probe error (`provider/session.rs`, `provider/claude.rs`, `provider/mod.rs`). A live check on 2026-10-20 recorded Claude 2.1.304 accepting both flags.
-- Design 7.2 also asks for retry without a refused --append-system-prompt. That fallback is not implemented: every Claude root receives the flag; refusal exits before initialize and fails the turn (`provider/claude.rs`, `provider/session.rs`). A live check on 2026-10-20 recorded Claude 2.1.304 accepting it.
-- Design 9.1 asks for a separate next-step line. The failed view shows each failure's own cause, Retry and Open Terminal, without a separate next-step line. The cause carries the next step when the provider supplies one (`ui/transcript.rs`).
+- Design 7.2 asks for retry without a refused Claude probe flag.
+  That fallback is not implemented: session::probe spawns once with claude::probe_args.
+  If a later CLI refuses --settings or --strict-mcp-config and exits without initialize, readiness is Ready with no models after the probe error (`provider/session.rs`, `provider/claude.rs`, `provider/mod.rs`).
+  A live check on 2026-10-20 recorded Claude 2.1.304 accepting both flags.
+- Design 7.2 also asks for retry without a refused --append-system-prompt.
+  That fallback is not implemented: every Claude root receives the flag; refusal exits before initialize and fails the turn (`provider/claude.rs`, `provider/session.rs`).
+  A live check on 2026-10-20 recorded Claude 2.1.304 accepting it.
+- Design 9.1 asks for a separate next-step line.
+  The failed view shows each failure's own cause, Retry and Open Terminal, without a separate next-step line.
+  The cause carries the next step when the provider supplies one (`ui/transcript.rs`).
 
 ## Source map
 
@@ -1238,13 +1355,17 @@ The following clarifications and remaining differences are checked against the c
 
 The provider_options tests guard the repaired provider contract: offered_modes_and_run_mode, provider_mode_cycle_uses_only_offered_modes, list_providers_reports_offered_modes, ceiling_reads_parent_run_mode and child_requested_mode_is_checked_before_provider_run_mode cover the offered modes, requested child mode and parent's effective ceiling. claude_root_args_append_family_rules checks root-only family instructions; codex_initialize_opts_out_of_turn_diff checks both session and probe initialize.
 
-Claude's claude_probe_args_turn_off_hooks_and_mcp and claude_probe_args_skip_strict_mcp_beside_managed_file check both policy branches. claude_probe_replay_uses_owned_managed_policy_path checks the explicit-environment boundary; claude_probe_env_turns_off_ide_and_connectors checks its child environment. claude_account_presence_and_source_types_control_sign_out and the claude_probe_signed_out_needs_token_source_none, claude_probe_api_key_reads_ready, claude_probe_third_party_reads_ready and claude_probe_silent_account_reads_ready replays cover the narrow signed-out rule. Their Veyra-authored fixtures are probe-signed-out.jsonl, probe-api-key.jsonl, probe-third-party.jsonl and probe-no-account.jsonl. claude_403_shows_cli_text_and_keeps_session and claude_skipped_prompt_fails_turn replay result-403.jsonl and prompt-skipped.jsonl through following turns on the same process. login_shell_reads_mise_diff calls the platform function with a scripted shell; child_env_carries_mise_diff_with_path and failing_login_shell_keeps_inherited_path_and_mise_diff check the child snapshot and inherited fallback.
+Claude's claude_probe_args_turn_off_hooks_and_mcp and claude_probe_args_skip_strict_mcp_beside_managed_file check both policy branches. claude_probe_replay_uses_owned_managed_policy_path checks the explicit-environment boundary; claude_probe_env_turns_off_ide_and_connectors checks its child environment. claude_account_presence_and_source_types_control_sign_out and the claude_probe_signed_out_needs_token_source_none, claude_probe_api_key_reads_ready, claude_probe_third_party_reads_ready and claude_probe_silent_account_reads_ready replays cover the narrow signed-out rule.
+Their Veyra-authored fixtures are probe-signed-out.jsonl, probe-api-key.jsonl, probe-third-party.jsonl and probe-no-account.jsonl. claude_403_shows_cli_text_and_keeps_session and claude_skipped_prompt_fails_turn replay result-403.jsonl and prompt-skipped.jsonl through following turns on the same process. login_shell_reads_mise_diff calls the platform function with a scripted shell; child_env_carries_mise_diff_with_path and failing_login_shell_keeps_inherited_path_and_mise_diff check the child snapshot and inherited fallback.
 
 codex_root_config_sets_grace_and_tool_timeout and codex_rejected_optional_keys_retry_independently guard both optional keys and independent drop-key retries. codex_sign_in_failure_names_login_once replays sign-in-required.jsonl, whose unauthorized error shape is from Codex 0.162.1's TurnCompletedNotification schema; its message is Veyra-authored, not a recorded authentication failure. codex_unknown_error_kinds_keep_the_failure_message guards forward-compatible fallback. grok_turn_completed_ends_own_prompt_after_guard and grok_old_tail_never_ends_next_prompt run turn-completed-only.jsonl through the session timer; codec_guard_waits_once_and_ignores_late_reply and codec_untagged_tail_never_ends_next_prompt guard adverse ordering. grok_approval_deny retains the denial ending.
 
 capture_keeps_none_and_masks_other_account_values and fixtures_hold_no_secret_shapes guard recording and fixture masking. keys_dispatches_down_then_up_per_keystroke guards the debug driver. chip_lists_offered_modes checks the composer. family_card_renders_user_status_words checks rendered card text; sidebar_tooltip_uses_shared_status_display is a GPUI wiring assertion that the tooltip uses the same display function, not a native tooltip capture. failed_banner_renders_own_cause_and_one_sign_in_instruction checks rendered causes and the absence/presence of sign-in text; failure_caption_defers_to_banner_and_preserves_history guards captions. actor_shutdown_during_missing_resume_spawns_no_replacement waits on marker and exit conditions with 30-second bounds, keeping its no-replacement and recovery assertions.
 
-A live check on 2026-10-20 recorded the shapes on Claude 2.1.304, codex-cli 0.162.1 and Grok 1.0.62; the 403 frame and Codex's rejection wording rest only on Veyra-authored fixtures. Its Claude lifecycle ran queued, started, result, completed, so completion without started remains fixture-only. Grok's tagged completion, prompt_complete and reply arrived within the guard, so expiry and reordered untagged tails remain fixture-only. Codex accepted both optional keys; no live rejection exercised their fallback.
+A live check on 2026-10-20 recorded the shapes on Claude 2.1.304, codex-cli 0.162.1 and Grok 1.0.62; the 403 frame and Codex's rejection wording rest only on Veyra-authored fixtures.
+Its Claude lifecycle ran queued, started, result, completed, so completion without started remains fixture-only.
+Grok's tagged completion, prompt_complete and reply arrived within the guard, so expiry and reordered untagged tails remain fixture-only.
+Codex accepted both optional keys; no live rejection exercised their fallback.
 
 
 multi_agent tests exercise actor rules, idempotent tasks, guidance, shared status words, settlement, held and successor wakes, grants, uncertain-admission recovery and retained writes and recovery notices.
@@ -1344,7 +1465,8 @@ The ignored live tests require fresh human consent; ordinary workspace tests use
 live_claude_approval_round_trip uses the public engine in Ask first to check an exact Bash request, Deny without a file, and AllowOnce on a repeat with the file created.
 Actor tests check account-error retirement before queued work; a separate probe fixture checks Signed out while the no-account fixture remains Ready.
 Live CLI behavior and performance need explicitly authorized checks; fake replay and structural checks cannot establish them.
-Drawer tests use a scripted SHELL and the fake CLI's shell mode. Ordinary tests do not open the user's shell or an installed provider TUI.
+Drawer tests use a scripted SHELL and the fake CLI's shell mode.
+Ordinary tests do not open the user's shell or an installed provider TUI.
 Real provider permission behavior, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.
 Composer Stop sends Interrupt and sidebar StopThread sends StopThread; real-provider continuation requires explicitly authorized live verification.
 
@@ -1388,7 +1510,17 @@ Grok live tests are ignored by default.
 
 Shell tests cover login arguments and cwd, environment isolation, foreground/background close detection, the close and quit ladders, missing folders, per-thread closure, native quit latency, blocked actor independence, stalled synchronized output, large paste, worker panic and escaped PTY holders.
 The three held-prompt cancellation tests retain prompt-before-interrupt coverage without native history cursors, and ordinary provider shutdown keeps its one-second writer drain.
-stored_terminal_view_opens_in_chat checks that legacy flags create no hold, retain the stored TerminalSpan and leave the agent parked. The store keeps schema 3 and writes chat, zero and null into the three unread legacy columns on thread upserts.
+stored_terminal_view_opens_in_chat checks that legacy flags create no hold, retain the stored TerminalSpan and leave the agent parked.
+The store keeps schema 4 and writes chat, zero and null into the three unread legacy columns on thread upserts.
 Window tests cover rail movement and bounds, observed composer/drawer/none focus, the focus table and draft caret, the tab cap, key precedence, real-key bracketed paste mode detection and control filtering, return from scrollback, hidden repaint suppression, legacy terminal-span dump text and the emulator's nonblocking key path.
-The guarded shell-drawer page exercises native subscriptions, every drawer key from its required surface, close and archive consent, hidden output, restart, missing folders, orderly quit, crash hangup and one flood using owned fixtures. Engine tests exercise the direct on_app_quit cleanup hook with live shells.
-DebugDragShellDrawer dispatches synthetic mouse-down, held-left movement and mouse-up through the window rail handlers for the native recipe. Synthetic clicks and control keys do not establish native pointer delivery, IME or the user's real shell plugins. Real provider behavior still requires separately authorized live verification.
+The guarded shell-drawer page exercises native subscriptions, every drawer key from its required surface, close and archive consent, hidden output, restart, missing folders, orderly quit, crash hangup and one flood using owned fixtures.
+Engine tests exercise the direct on_app_quit cleanup hook with live shells.
+DebugDragShellDrawer dispatches synthetic mouse-down, held-left movement and mouse-up through the window rail handlers for the native recipe.
+Synthetic clicks and control keys do not establish native pointer delivery, IME or the user's real shell plugins.
+Real provider behavior still requires separately authorized live verification.
+
+Migration and settings tests cover version-3 upgrade, unknown background refusal, persistence and SettingsChanged publication.
+The display and theme tests cover forced Solid, every reduced-motion token and both appearances' contrast pairs, including sidebar tint over worst-case desktops.
+The synthetic theme-apply test checks the retained Look projection across appearance changes; the native guarded captures establish the actual window material.
+Drawer regressions cover a held drag cancelled by shrink and restoration of the chosen height after the composer shrinks.
+The failed-shell spawn regression uses a real failing spawn, and the group guard regression requires signalling before reaping and no signal afterward.

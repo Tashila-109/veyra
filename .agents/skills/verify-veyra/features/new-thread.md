@@ -46,6 +46,7 @@ Each section recovers RUN and proof records in a fresh shell.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -153,6 +154,7 @@ Run this fake-only section after the existing drive and before Evidence.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -202,6 +204,7 @@ The signed-out fixture advertises only grok.com; the catalog fixture supplies th
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -325,6 +328,69 @@ Its SQLite thread count remains zero, and its PNGs show the disabled reason and 
 
 The open provider picker keeps the Not installed repair hint above the input, where the popover cannot cover it.
 Inspect the provider-menu PNG for that text before accepting the page.
+
+### Dump fields
+
+`composer` includes the chosen provider and effective permission mode, plus Send's readiness and disabled reason.
+`composer.offered_modes` is the provider's menu and key-cycle list: three modes for Claude and Codex, Ask first and Full access for Grok.
+`composer.permission_picker_open` reports the visible permission menu.
+Settings keeps all three defaults; a new Grok composer applies Accept edits as Ask first.
+`providers` reports each probe's path, version, models, readiness and `account`, either `known` or `unknown`, with no account value.
+`composer.provider_picker_open` reports the picker opened by `OpenProviderPicker` or ⌘⌥⇧P.
+
+### Evidence contract
+
+```json
+{
+  "required": {
+    "new-thread": [
+      "new-thread-missing.json",
+      "new-thread-ready.json",
+      "new-thread-no-account.json",
+      "new-thread-provider-menu.png",
+      "new-thread-provider-menu-ready.png",
+      "new-thread-ready.png",
+      "new-thread.png"
+    ],
+    "new-thread-codex": [
+      "codex-new-thread-missing.json",
+      "codex-new-thread-missing.png",
+      "codex-new-thread-ready.json",
+      "codex-provider-menu-ready.png",
+      "codex-new-thread-choices.json",
+      "codex-new-thread.png"
+    ],
+    "new-thread-grok": [
+      "grok-new-thread-ready.json",
+      "grok-provider-menu-ready.png",
+      "grok-new-thread-defaults.json",
+      "grok-new-thread.png"
+    ],
+    "new-thread-live": [
+      "new-thread-live.json",
+      "new-thread-live.png"
+    ]
+  },
+  "pairs": {
+    "new-thread": [
+      [
+        "new-thread-missing",
+        "new-thread-ready"
+      ],
+      [
+        "new-thread-provider-menu",
+        "new-thread-provider-menu-ready"
+      ]
+    ],
+    "new-thread-codex": [
+      [
+        "codex-new-thread-missing",
+        "codex-new-thread"
+      ]
+    ]
+  }
+}
+```
 
 ## Gotchas
 

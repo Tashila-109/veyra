@@ -9,6 +9,86 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 const WAKE_OUTCOME_CHARS: usize = 200;
 
+#[cfg(test)]
+#[test]
+fn set_window_background_publishes_settings() {
+    use crate::{Engine, data_dir::DataDir, events::UiEvent, provider::env::ChildEnv};
+    let root = std::path::Path::new("/tmp").join(format!("veyra-background-{}", ThreadId::new()));
+    let _scratch = crate::tests::Scratch(root.clone());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let engine = Engine::start_with_env(
+        runtime.handle(),
+        DataDir::at(root.clone()).unwrap(),
+        ChildEnv::isolated(),
+    )
+    .unwrap();
+    runtime.block_on(async {
+        let mut events = engine.subscribe();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            UiEvent::Change {
+                counter: None,
+                event: Ev::SettingsChanged(Settings {
+                    window_background: WindowBackground::Translucent,
+                    ..
+                })
+            }
+        ));
+        for background in [WindowBackground::Solid, WindowBackground::Translucent] {
+            engine
+                .send(Command::SetWindowBackground { background })
+                .await
+                .unwrap()
+                .unwrap();
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                event,
+                UiEvent::Change {
+                    counter: None,
+                    event: Ev::SettingsChanged(Settings {
+                        default_mode: PermissionMode::FullAccess,
+                        window_background: background
+                    })
+                }
+            );
+            assert_eq!(
+                crate::store::load(&crate::store::open(&root.join("veyra.db")).unwrap())
+                    .unwrap()
+                    .settings
+                    .window_background,
+                background
+            );
+        }
+        engine
+            .send(Command::SetWindowBackground {
+                background: WindowBackground::Solid,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .send(Command::SetDefaultMode {
+                mode: PermissionMode::AskFirst,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::store::load(&crate::store::open(&root.join("veyra.db")).unwrap())
+                .unwrap()
+                .settings,
+            Settings {
+                default_mode: PermissionMode::AskFirst,
+                window_background: WindowBackground::Solid
+            }
+        );
+        engine.shutdown_wait().await;
+    });
+}
+
 #[derive(Clone, Debug)]
 pub enum Command {
     AddProject {
@@ -54,6 +134,9 @@ pub enum Command {
     },
     SetDefaultMode {
         mode: PermissionMode,
+    },
+    SetWindowBackground {
+        background: WindowBackground,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,7 +217,23 @@ pub fn decide(
             Ack::Applied
         }
         Command::SetDefaultMode { mode } => {
-            set_default_mode(&mut c, mode);
+            set_settings(
+                &mut c,
+                Settings {
+                    default_mode: mode,
+                    ..p.settings
+                },
+            );
+            Ack::Applied
+        }
+        Command::SetWindowBackground { background } => {
+            set_settings(
+                &mut c,
+                Settings {
+                    window_background: background,
+                    ..p.settings
+                },
+            );
             Ack::Applied
         }
     };
@@ -635,8 +734,7 @@ pub(crate) fn stop_one(
     drop_turns(p, c, thread, false, now);
     set_hold(p, c, thread, Some(HoldReason::Stopped));
 }
-fn set_default_mode(c: &mut ChangeSet, mode: PermissionMode) {
-    let s = Settings { default_mode: mode };
+fn set_settings(c: &mut ChangeSet, s: Settings) {
     c.settings = Some(s);
     c.events.push(Ev::SettingsChanged(s));
 }

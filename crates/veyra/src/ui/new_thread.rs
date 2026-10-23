@@ -18,6 +18,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .gap(t.space.0[5])
                 .child(
                     div()
+                        .pl(t.space.0[5])
+                        .pr(t.space.0[5])
                         .text_size(t.text.h2.size)
                         .line_height(t.text.h2.line_height)
                         .font_weight(t.text.h2.weight)
@@ -26,6 +28,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .child(composer::render(shell, cx))
                 .child(
                     div()
+                        .pl(t.space.0[5])
+                        .pr(t.space.0[5])
                         .text_size(t.text.meta.size)
                         .line_height(t.text.meta.line_height)
                         .text_color(t.colors.text_faint)

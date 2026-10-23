@@ -35,6 +35,7 @@ With `VEYRA_VERIFY_REAL_QUIET=1`, which `bin/run --real-quiet` sets, it waits fo
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -214,6 +215,7 @@ The following section runs in a fresh shell with only RUN carried forward.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -258,6 +260,7 @@ Run this fake-only section after the existing drive and before Evidence.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -342,6 +345,7 @@ The log receipt names that root's accepted connection and call without arguments
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -405,6 +409,72 @@ The child task bubble shows the stored first-task guidance, and the later user r
 Both the visible count and largest gap reset on a selection change and when that thread's turn starts; hidden streams do not affect them.
 `perf.transcript_open_ms` is null until a transcript opens, measures its Snapshot request through the first render of the installed snapshot, and each open replaces it.
 The visible-count, selection-reset and turn-reset dumps accompany the family drive; the transcript-open stamp is read after selection.
+
+### Dump fields
+
+`sidebar.rows` holds project and thread rows in tree order, with status for each thread, row_status for its rendered family glyph, depth, quiet_minutes and archive_keep_children.
+`sidebar.menu_thread` names the open row menu.
+OpenThreadMenu, Archive and ArchiveKeepChildren accept a thread id; the latter keeps a root's children running.
+Each thread and selected_thread has lineage, and top-level tasks carries task state, delivery and its nullable source item id.
+The child breadcrumb includes its root title and whether its SelectThread link is available; parent_attention names a parent that needs you.
+`transcript.family_card` carries the first derived list row, Started N agents, and its Open and Stop actions.
+Task and Wake rows carry turn_label and task_card text; report_delivered marks only the assistant row named by a Delivered task's source; a null source produces no badge.
+`selected_thread.quiet_minutes` and header_status share Quiet for N min without changing status.
+`awake` reports the engine's idle-sleep guard.
+`processes` lists each reported live CLI with its thread, pid and resident bytes, retaining retiring groups until Exited.
+`perf.commits`, `perf.actor_max_ms` and `perf.actor_busy_ms` expose committed transactions and actor timing.
+`perf.mailbox_free` is the engine mailbox's unreserved capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
+`perf.repaints` counts window renders and `perf.max_batch_events` counts the largest applied pump batch.
+`perf.visible` holds `thread`, `applied_batches` and `max_batch_gap_ms` for the selected Chat thread.
+Its count and largest gap reset on selection changes and on that thread's TurnStarted; hidden text changes neither counter.
+`perf.transcript_open_ms` stamps the first render of the installed snapshot, measured from its Snapshot request.
+It is null until a transcript opens, and each open replaces it.
+The debug-only `veyra::DebugNotificationResponse` action takes a banner `tag` and invokes the native response handler.
+The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and blocks the main thread for that interval.
+`settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
+
+### Evidence contract
+
+```json
+{
+  "required": {
+    "multi-agent": [
+      "multi-tree-working.png",
+      "multi-child-task.png",
+      "multi-family-done.png",
+      "multi-report-delivered.png",
+      "multi-child-parent-needs.png",
+      "multi-menu.png",
+      "multi-child-stop-held.png",
+      "multi-parent-stop-held.png",
+      "multi-child-archive-held.json",
+      "multi-child-archive-held.png",
+      "multi-archived-family.json",
+      "multi-kept-child.png",
+      "multi-quiet-sidebar.png",
+      "multi-quiet-header.png",
+      "multi-stopped-child-wake-received.json"
+    ],
+    "multi-agent-codex": [
+      "codex-relay-done.json",
+      "codex-relay.png",
+      "codex-relay-log.txt",
+      "codex-relay-parent.json",
+      "codex-relay-processes.txt",
+      "codex-child-task.json",
+      "codex-child-task.png",
+      "codex-family-done.json",
+      "codex-family-done.png"
+    ],
+    "multi-agent-grok": [
+      "grok-relay-done.json",
+      "grok-relay.png",
+      "grok-relay-log.txt"
+    ]
+  },
+  "pairs": {}
+}
+```
 
 ## Gotchas
 

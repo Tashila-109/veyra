@@ -1,6 +1,7 @@
 ---
 name: verify-veyra
-description: Verify Veyra's native macOS window and CLI after UI, launch, logging, data-folder, or debug-driver changes. Launch an isolated instance, drive gpui actions through veyra ctl, capture the window, and preserve evidence after cleanup.
+description: Verify Veyra's native macOS window and CLI after UI, launch, logging, data-folder, or debug-driver changes.
+Launch an isolated instance, drive gpui actions through veyra ctl, capture the window, and preserve evidence after cleanup.
 ---
 
 # Verify Veyra
@@ -42,7 +43,7 @@ After the verdict, `DIR/ATTEMPT/attempt.json` is written once, with the verdict,
 Between attempts, the 60-second wait is unblocked, and a signal there ends the run FAILED.
 After the last attempt, `DIR/outcome.json` is written once, with the status, every attempt and the gate wait apart from the recipe time, and read back.
 A receipt that fails to write or read back ends the run FAILED with exit 1, and its error goes to stderr, because the receipt that would hold it was not kept.
-The runner checks for pending signals before it prints the final line, which then says FAILED (interrupted), and once more after it.
+The runner checks for pending signals before it prints the final line, which says FAILED (interrupted) when a signal is pending and every receipt was kept, and once more after it.
 A signal still pending at the last check, which arrived after the verdict while the receipts or the final line were written, cannot be recorded in the receipts, so it ends the run with exit 128 plus its number and the reason on stderr.
 The run exits 0 only when the verdict was DONE, both receipts were written and read back, and no signal was pending at that last check.
 
@@ -63,7 +64,9 @@ Launch, Doctor, app-launch's first section, Evidence and Cleanup always run; a s
 `--real-quiet` makes multi-agent wait for the real ten-minute quiet clock, which a phase gate runs once when `ui/header.rs`, `ui/sidebar.rs` or a `ui/mod.rs` line naming `last_activity`, `quiet_minutes` or `cadence_due` changed.
 `--expect-head SHA` refuses a checkout at another commit, `--deadline EPOCH` bounds the whole run, and `--scratch PREFIX` sets the scratch prefix, `/tmp/veyra-verify-` by default.
 The tree's identity, its HEAD, `git status --short`, the diff's SHA-256 and each untracked file's SHA-256, is saved at the start and checked after Launch's build and after Cleanup.
-`--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, and checks that Launch calls `gate()` before its first `start()`. It reads `start()`'s relaunch refusal (`foreign = foreign_veyra()` then `assert not foreign`, before the launch) and Cleanup's `assert not other_markers` and `retry_exiting=True` calls as Python structure, and checks only that the 30 s drain, stale-screenshot and covered-window guard texts are present. It tables the verdict, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers, failing if that self-test runs past 30 seconds.
+`--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, and checks that Launch calls `gate()` before its first `start()`.
+It reads `start()`'s relaunch refusal (`foreign = foreign_veyra()` then `assert not foreign`, before the launch) and Cleanup's `assert not other_markers` and `retry_exiting=True` calls as Python structure, and checks only that the 30 s drain, stale-screenshot and covered-window guard texts are present.
+It tables the verdict, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers, failing if that self-test runs past 30 seconds.
 
 ## Selection
 
@@ -122,6 +125,8 @@ Both lanes remove the caller's Claude session variables while keeping `CLAUDE_CO
 The fake lane puts a run-owned `git` first on the app's PATH; it answers `git branch --show-current` with `fixture-branch` only while `$DATA/branch-on` exists, and otherwise runs the real `git`.
 Every app launch runs from `$DATA/appcwd`; probes run in Veyra's private data folder.
 The fake lane uses an owned login-shell script with a 1.5 s delay, so the first ready line and dump prove the window opens while `login_path` is `pending`.
+Doctor sets Solid through `veyra::SetWindowBackground` before a page captures the window.
+Only a page proving Translucent starts the compiled backdrop; Launch compiles it before opening the app.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -141,6 +146,8 @@ printf '%s\n' "${VEYRA_VERIFY_LANE:-fake}" >"$PROOF/lane"
 : >"$PROOF/pages-run"
 swiftc -O "$BIN/capture-window.swift" -o "$PROOF/capture-window"
 swiftc -O "$BIN/winid.swift" -o "$PROOF/winid"
+swiftc -O "$BIN/backdrop.swift" -o "$PROOF/backdrop"
+swiftc -O "$BIN/pasteboard.swift" -o "$PROOF/pasteboard"
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
 cp crates/engine/tests/fixtures/codex/probe-ready.jsonl "$PROOF/fixtures/probe-codex.jsonl"
 cp crates/engine/tests/fixtures/grok/probe-grok.jsonl "$PROOF/fixtures/probe-grok.jsonl"
@@ -182,6 +189,7 @@ The macOS appearance read treats a missing `AppleInterfaceStyle` key as light.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -199,7 +207,9 @@ assert dump['appearance'] == expected, (dump['appearance'],expected)
 window = window_id(pid)
 assert window == (PROOF/'window-id').read_text().strip()
 poll('doctor-login-path',lambda d:d['login_path'] != 'pending')
-bounds = subprocess.check_output(['swift','.agents/skills/verify-veyra/bin/winid.swift',str(pid),'--bounds'],text=True)
+action('doctor-solid','SetWindowBackground',{'background':'solid'})
+poll('doctor-solid-applied',lambda d:d['look']['background']=='solid')
+bounds = subprocess.check_output([str(PROOF/'winid'),str(pid),'--bounds'],text=True)
 (PROOF/'bounds.txt').write_text(bounds)
 print(f'PASS doctor pid={pid} appearance={expected} seconds={seconds:.3f} window={window}')
 PY
@@ -211,7 +221,9 @@ Run [app-launch](features/app-launch.md), then [new-thread](features/new-thread.
 Also run [approvals-questions](features/approvals-questions.md), [stop-interrupt](features/stop-interrupt.md) and [restart-recovery](features/restart-recovery.md).
 Run each page's Codex and Grok sections in the fake lane after its existing drive.
 Every section after new-thread's first starts with the driver's `prepare()`, which adds the project, installs the fake CLI and waits for Ready only when no earlier page did, then opens a new Claude composer, so a page can run alone after Launch, Doctor and app-launch's first section, or after any earlier section without a relaunch.
-Before any provider drive, wait with `poll('login-path-ready', lambda d: d['login_path'] != 'pending')`; Doctor performs this wait for the first launch. After a relaunch, wait again before checking providers. `login_path` reads `pending`, `loaded` or `fallback`; Checking remains until the first probe answers.
+Before any provider drive, wait with `poll('login-path-ready', lambda d: d['login_path'] != 'pending')`; Doctor performs this wait for the first launch.
+After a relaunch, wait again before checking providers.
+`login_path` reads `pending`, `loaded` or `fallback`; Checking remains until the first probe answers.
 Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
 Run [shell-drawer](features/shell-drawer.md) for owned shell fixtures, tab keys, focus, shutdown and one flood.
 The fake lane runs those pages without a provider login.
@@ -238,81 +250,18 @@ A timeout does not cancel an enqueued action; run Doctor before retrying.
 Commands remain bounded at 64 KiB; the client accepts replies up to 4 MiB so the seeded 5,000-item transcript can be measured without truncating its dump.
 After another Send on an existing thread, gate `wait Done` on the new turn row or a changed status so the preceding Done cannot satisfy it.
 
-The read-only dump reports `login_path`, `drawer`, `focus`, `composer_caret`, `tasks`, `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
-`header_branch` is the branch text used by the header and is empty after leaving Chat.
-`view` is `new_thread`, `chat`, `failed_thread` or `settings`.
-`drawer` describes the selected thread's open state, height, active_tab and tabs, with each tab's number, label, pid, running process paths, exit_code, exited flag and error.
-Its nested `terminal` carries grid, focused, columns, rows and repaint count for the active tab.
-`focus` reports composer, drawer or none from their focus observations.
-Sheets report none and remember their originating surface only for Cancel.
-`composer_caret` is the input's byte offset and verifies that toggling the drawer preserves a draft's caret.
-`VEYRA_DEBUG_SHELL_FIXTURE` runs only the adjacent fake CLI's shell mode, using a run-owned fixture; the fake lane always sets it and never opens the user's real shell.
-The shell environment strips all VEYRA_* variables, so the fake fixture path is injected only after that filter for the debug fake.
-`perf.flood` measures the active drawer tab after its FLOOD_DONE marker.
-
-`perf.flood` is null before FLOOD_DONE, then holds `pty_bytes`, `elapsed_ms`, `repaints`, `median_repaint_gap_ms` and `max_repaint_gap_ms` between the reader markers.
-The bytes exclude both OSC markers; the repaint gaps use only painted frames inside those timestamps.
-`sidebar.rows` holds project and thread rows in tree order, with status for each thread, row_status for its rendered family glyph, depth, quiet_minutes and archive_keep_children.
-`sidebar.menu_thread` names the open row menu.
-OpenThreadMenu, Archive and ArchiveKeepChildren accept a thread id; the latter keeps a root's children running.
-Each thread and selected_thread has lineage, and top-level tasks carries task state, delivery and its nullable source item id.
-The child breadcrumb includes its root title and whether its SelectThread link is available; parent_attention names a parent that needs you.
-`transcript.family_card` carries the first derived list row, Started N agents, and its Open and Stop actions.
-`transcript.items` contains the stored item rows; item_tops includes the family card first when present.
-Task and Wake rows carry turn_label and task_card text; report_delivered marks only the assistant row named by a Delivered task's source; a null source produces no badge.
-`selected_thread.quiet_minutes` and header_status share Quiet for N min without changing status.
-`selected_thread` includes its native id, configuration, failure cause and `header_status`, the rendered status with elapsed seconds.
-`composer` includes the chosen provider and effective permission mode, plus Send's readiness and disabled reason.
-`composer.offered_modes` is the provider's menu and key-cycle list: three modes for Claude and Codex, Ask first and Full access for Grok.
-`composer.permission_picker_open` reports the visible permission menu.
-For stored-mode compatibility, see [stored Grok modes](features/permission-matrix.md#stored-grok-modes); dump retains the stored configuration beside the effective composer mode.
-Settings keeps all three defaults; a new Grok composer applies Accept edits as Ask first.
-`providers` reports each probe's path, version, models, readiness and `account`, either `known` or `unknown`, with no account value.
-`transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
-`transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
-Items include `outcome`, queued `wait_reason`, a tool's `failed_last_line` and its rendered `tool_label`. The failed banner's own turn has `outcome` `["Failed"]`; historical failed turns retain their cause in the caption.
-`selected_thread.hold` and `wait_reason` describe held work.
-`composer.discard_queued_visible` reports the held queue control.
-`composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
-Approval answer chords appear only with dock focus; otherwise its hint shows the FocusDock chord.
-Approval dock action_text, consequence and preview report the same typed target, one-line effect and bounded arguments rendered in the window.
-A cut preview ends with a notice.
-Consent command, preview and path displays mark Unicode controls and invisible formats as ⟨U+XXXX⟩; command newlines remain for heredocs.
-The dock's grant_caption uses the same marked command as the thread-grant button; request and grant identities keep the exact raw bytes.
-The dock emits details_scroll, with offset_y and max_offset_y, only after the rendered scroll handle matches its current request id. Poll for its presence after a request change. DebugScrollApproval accepts a finite pixels value and scrolls that same handle, without changing the pending request or its decision. A new docked request resets to the top.
-The command or file path, the model-written reason and the bounded preview share the details scroll area, capped at 240px and shrinking to the window height left by the fixed controls.
-The transcript gives up space first, and the details keep at least the command's first line.
-The consequence and any outside working folder sit above it.
-The folder value has its own vertical scroll, bounded to three label-text lines; replacing both scroll handles on a changed request id opens each request at the top without eliding the marked path.
-Its kit scrollbar stays visible whenever the folder overflows and is absent when the path fits.
-Allow and Deny stay below that area.
-Approval docks report `allow_once_enabled`, `allow_in_thread_enabled` and `consent_reason` from the same consent used by their buttons.
-A Deny-only request keeps both allow buttons disabled, shows its reason above the details and leaves Deny enabled.
-Disabled allow buttons show no answer chord, and their key or action cannot send a response.
-Questions share the same unfocused FocusDock prompt.
-Their quoted text scrolls within a one-line minimum and 240px maximum, independently of the label and options.
-Up to four options use one column and larger lists use three columns. Captions wrap without visual truncation; overflowing lists use the same bounded scrollbar. The request and question index own independent text and option-list scroll resets.
-A pending dock limits the message input to 48px with its draft scrollable; the normal height limit returns after the dock closes.
-Answering one request keeps dock focus while requests remain.
-`notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
-Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
-`composer.provider_picker_open` reports the picker opened by `OpenProviderPicker` or ⌘⌥⇧P.
-`awake` reports the engine's idle-sleep guard.
-`processes` lists each reported live CLI with its thread, pid and resident bytes, retaining retiring groups until Exited.
-`perf.commits`, `perf.actor_max_ms` and `perf.actor_busy_ms` expose committed transactions and actor timing.
-`perf.mailbox_free` is the engine mailbox's unreserved capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
-Engine commands await space in the window's gpui task, so Stop is retained when that capacity is zero.
-`perf.repaints` counts window renders and `perf.max_batch_events` counts the largest applied pump batch.
-`perf.visible` holds `thread`, `applied_batches` and `max_batch_gap_ms` for the selected Chat thread.
-Its count and largest gap reset on selection changes and on that thread's TurnStarted; hidden text changes neither counter.
-`perf.transcript_open_ms` stamps the first render of the installed snapshot, measured from its Snapshot request.
-It is null until a transcript opens, and each open replaces it.
-The debug-only `veyra::DebugNotificationResponse` action takes a banner `tag` and invokes the native response handler.
-The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and blocks the main thread for that interval.
-`settings.default_mode` is the stored default; `perf.applied_batches` and `perf.max_batch_gap_ms` report the event pump.
+The read-only dump reports identity, the current view and the look in force.
+Each page owns the dump fields and required evidence for the behaviour it drives.
+Its `### Evidence contract` JSON block owns that page's `required` files and `pairs` comparisons.
+Evidence reads those blocks through `bin/pages.py` and applies every completed token's entries.
 Before every capture, the debug-only `ActivateWindow` action activates Veyra from inside the app.
 The helper waits for two separate rendered frames and 100 ms before inspecting and capturing the window.
-Capture checks the owned window is on-screen and verifies it remains frontmost.
+Solid captures use `screencapture -x -o -l WINDOW` and keep the existing on-screen and frontmost guards.
+Translucent captures use `screencapture -x -R x,y,w,h` of the exact on-screen window rectangle.
+They require `bin/backdrop.swift` behind Veyra, with its run-owned pid and window ids in `backdrop-windows.json`.
+Immediately before and after each region capture, the helper checks that Veyra is frontmost, its bounds equal the rectangle, the rectangle is wholly covered by one backdrop window on one display, and no other on-screen window above Veyra intersects it.
+A changed guard discards the capture and retries at most three times.
+The Settings page places a second run-owned backdrop above Veyra and requires the guard to reject it without retaining a PNG.
 Veyra must stay frontmost during captures.
 A changed visible state with an identical PNG fails; Evidence also compares named state pairs.
 Concurrent windows may cause a capture to fail, but cannot make a covered or off-screen frame pass.
@@ -326,6 +275,7 @@ The required files enforce the relaunch, release and feature proofs.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -340,55 +290,8 @@ capture('window')
 shutil.copy2(DATA/'logs/veyra.log',PROOF/'veyra.log')
 (PROOF/'git-identity.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True)
     +subprocess.check_output(['git','status','--short'],text=True))
-required = {
-    'app-launch-main':['window-launch.png','dump-before.json','second-launch.txt'],
-    'app-launch':['initial-database.txt','after-migration-database.txt','persisted-project.txt',
-        'migration-unlinked-report.png'],
-    'app-launch-release':['release/ctl.txt','release/strings.txt','release/data-listing.txt',
-        'release/provider-probes.txt'],
-    'new-thread':['new-thread-missing.json','new-thread-ready.json','new-thread-no-account.json',
-        'new-thread-provider-menu.png','new-thread-provider-menu-ready.png','new-thread-ready.png','new-thread.png'],
-    'chat-send-stream':['chat-working.json','chat-working.png','chat-done.json','chat-done.png',
-        'chat-failed.json','chat-failed.png','chat-provider-done.json','chat-background-working.json'],
-    'approvals-questions':['approval-deny.png','approval-allow.png','question.png','question-two.png','question-four.png','question-nine.png',
-        'approvals-done.json','questions-done.json','approval-composer-pending.json','question-focused.png',
-        'approval-deny-focused.png','approval-allow-focused.png','question-two-next.png',
-        'approval-write-inside.png','approval-write-outside.png','approval-web-fetch.png',
-        'approval-notebook-edit.png','approval-mcp.png','approval-long-command.png',
-        'approval-long-command-end.png','approval-new-long-command.png'],
-    'stop-interrupt':['stop-working.png','stop-held.png','stop-discarded.json','stop-expired.json',
-        'notifications-background.json','notifications-older-selected.json','notifications-older-response.png'],
-    'restart-recovery':['restart-quit-sheet.png','restart-held.png','restart-crash-held.json','restart-continued.json',
-        'restart-child-interrupted.png','restart-child-parent-held.png','restart-child-delivered.json',
-        'restart-after-ctl-database.txt','restart-after-crash-database.txt','restart-database-kept.json','restart-stored-terminal.png'],
-    'multi-agent':['multi-tree-working.png','multi-child-task.png','multi-family-done.png','multi-report-delivered.png',
-        'multi-child-parent-needs.png','multi-menu.png','multi-child-stop-held.png','multi-parent-stop-held.png',
-        'multi-child-archive-held.json','multi-child-archive-held.png',
-        'multi-archived-family.json','multi-kept-child.png','multi-quiet-sidebar.png','multi-quiet-header.png',
-        'multi-stopped-child-wake-received.json'],
-    'shell-drawer':['drawer-open.png','drawer-header.png','drawer-resize.png','drawer-paste.png','drawer-draft.json','drawer-keys.json',
-        'drawer-hidden.json','drawer-running-close.png','drawer-restarted.json','drawer-missing-folder.png',
-        'drawer-archive.png','drawer-quit-sheet.png','drawer-crash.json','drawer-flood.json','drawer-flood.png'],
-    'settings':['settings-first.json','settings-ask-first.json','settings-relaunch.json','settings.png',
-        'settings-existing.json','settings-new.json'],
-    'new-thread-codex':['codex-new-thread-missing.json','codex-new-thread-missing.png',
-        'codex-new-thread-ready.json','codex-provider-menu-ready.png','codex-new-thread-choices.json','codex-new-thread.png'],
-    'chat-send-stream-codex':['codex-chat-working.json','codex-chat-working.png','codex-chat-done.json',
-        'codex-chat-done.png','codex-other-thread-done.json','codex-other-thread.png','codex-notices-done.json','codex-notices.png'],
-    'approvals-questions-codex':['codex-command.json','codex-command.png','codex-command-other-cwd.png',
-        'codex-file.png','codex-permissions.png','codex-question.png','codex-mcp-first.png','codex-mcp-second.png',
-        'codex-async-question.png','codex-async-question-chosen.png','codex-async-question-typed-closed.png','codex-card-done.json','codex-reason-quoted.png',
-        'codex-long-working-folder.png','codex-long-working-folder-end.png'],
-    'multi-agent-codex':['codex-relay-done.json','codex-relay.png','codex-relay-log.txt',
-        'codex-relay-parent.json','codex-relay-processes.txt',
-        'codex-child-task.json','codex-child-task.png','codex-family-done.json','codex-family-done.png'],
-    'new-thread-grok':['grok-new-thread-ready.json','grok-provider-menu-ready.png','grok-new-thread-defaults.json','grok-new-thread.png'],
-    'chat-send-stream-grok':['grok-chat-working.json','grok-chat-working.png','grok-chat-done.json','grok-chat-done.png','grok-launch-argv.json','grok-signed-out.json','grok-signed-out.png'],
-    'approvals-questions-grok':['grok-approval-deny.png','grok-approval-allow.png','grok-deny-only.json','grok-deny-only.png','grok-question.png','grok-question-second.png','grok-questions-done.json','grok-question-expired.json','grok-question-expired.png'],
-    'multi-agent-grok':['grok-relay-done.json','grok-relay.png','grok-relay-log.txt'],
-    'new-thread-live':['new-thread-live.json','new-thread-live.png'],
-    'chat-send-stream-live':['chat-working.json','chat-working.png','chat-done.json','chat-done.png','rec/probe.jsonl'],
-}
+import pages as page_map
+required,pairs = page_map.evidence_contract(pathlib.Path.cwd())
 assert pages <= required.keys(), pages
 for name in ['drive.log','sql.log',*(name for page in pages for name in required[page])]:
     assert (PROOF/name).stat().st_size > 0, name
@@ -396,17 +299,6 @@ if 'app-launch' in pages:
     assert len({(PROOF/(label+'-inode.txt')).read_text() for label in ['initial','after-migration']}) == 1
 for pid in (PROOF/'owned-app-pids').read_text().split():
     assert f'veyra ready pid={pid} data_dir={DATA}' in (PROOF/'veyra.log').read_text()
-pairs = {
-    'new-thread':[('new-thread-missing','new-thread-ready'),
-        ('new-thread-provider-menu','new-thread-provider-menu-ready')],
-    'chat-send-stream':[('chat-working','chat-done'),('chat-tool-collapsed','chat-tool-expanded')],
-    'shell-drawer':[('drawer-open','drawer-running-close')],
-    'settings':[('settings-full-access','settings')],
-    'chat-send-stream-live':[('chat-working','chat-done')],
-    'chat-send-stream-codex':[('codex-chat-working','codex-chat-done')],
-    'new-thread-codex':[('codex-new-thread-missing','codex-new-thread')],
-    'chat-send-stream-grok':[('grok-chat-working','grok-chat-done')],
-}
 for page in pages:
     for first,second in pairs.get(page,[]):
         assert (PROOF/(first+'.png')).read_bytes() != (PROOF/(second+'.png')).read_bytes(), (first,second)
@@ -424,7 +316,7 @@ Do not count native typing, pointer dragging, IME or a manual theme change as dr
 ## Cleanup
 
 Read `live_pgid` and `live_pid` into memory first, before quitting or removing anything; a missing `veyra.db` or `threads` table leaves both lists empty, and a read that fails is marked unreadable.
-A proof write that fails is marked too, and Cleanup still makes every stop.
+A proof write before DATA is removed that fails is marked too, and Cleanup still makes every stop.
 Quit the app and SIGKILL its group, then SIGTERM the provider groups and SIGKILL them one second later, so a member that outlived its leader is stopped too.
 Signal only groups saved in this run's database and the app group this run started.
 The leftover checks retry for five seconds and fail only for saved run-owned pids or groups.
@@ -437,10 +329,12 @@ ESRCH or an empty argument block after either sysctl read means the process is g
 EINVAL or an incomplete block from a still-listed process keeps it in the leftover count and retries within the same five-second window.
 During Cleanup, EIO also keeps a still-listed process in the count for another read within the five-second owned-leftover window or the thirty-second other-marker drain; an unreadable process remaining at that window's deadline fails with its pid.
 The startup marker check still refuses EIO immediately.
-A failed database read, proof write, group check or marker check leaves DATA for diagnosis.
+A failed database read, a failed proof write before DATA is removed, or a failed group or marker check leaves DATA for diagnosis.
+A cleanup-listing write fails the section after DATA has been removed.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 DATA=${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN
@@ -465,7 +359,7 @@ printf '%s\n' "$groups" >"$PROOF/provider-groups.txt" || written=no
 printf '%s\n' "$pids" >"$PROOF/provider-pids.txt" || written=no
 if kill -0 "$PID" 2>/dev/null; then
     test "$(ps -o pgid= -p "$PID" | tr -d ' ')" = "$PGID"
-    VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl quit >"$PROOF/quit.json" 2>"$PROOF/quit.stderr" || true
+    { VEYRA_DATA_DIR="$DATA" target/debug/veyra ctl quit || true; } >"$PROOF/quit.json" 2>"$PROOF/quit.stderr" || written=no
 fi
 for attempt in $(seq 1 50); do
     kill -0 "$PID" 2>/dev/null || break
@@ -544,7 +438,9 @@ It does not signal an unrecorded group.
 - `bin/run` is the gated runner described in [Run](#run).
 - `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
 - `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.
-- `bin/backdrop.swift` draws its own black and white stripes and sharp text across every display, using one borderless window per screen in one process. `--coarse` uses approximately 400 pt blocks and 160 pt text to reveal soft gradients and blurred letters through a translucent window; `--invert` swaps black and white to distinguish backdrop-dependent blur from a flat fill, and combines with `--coarse`. It prints each window number and screen frame, then one ready line, and SIGTERM to its own pid closes every window.
+- `bin/backdrop.swift` draws its own black and white stripes and sharp text across every display, using one borderless window per screen in one process.
+  `--coarse` uses approximately 400 pt blocks and 160 pt text to reveal soft gradients and blurred letters through a translucent window; `--invert` swaps black and white to distinguish backdrop-dependent blur from a flat fill, and combines with `--coarse`.
+  It prints each window number and screen frame, then one ready line, and SIGTERM to its own pid closes every window.
 - `bin/select-pages`, `bin/fresh-pages` and `bin/pages.py` are described in [Selection](#selection).
 
 A socket path permits 103 usable bytes; keep RUN and the scratch prefix short.

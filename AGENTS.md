@@ -31,6 +31,11 @@ Never drive an instance this run did not start.
 
 ## Standing rules
 
+- Choose the smallest model that makes the behaviour clear.
+- Give every way into a state a way out, and handle the return path.
+- Prove each change with a focused check and state what that check leaves unproved.
+- Honour reduced motion in every animation, including working indicators.
+
 - Never commit `.tstack/` or any planning, design, or exploration artifact.
 The planning documents live in `.tstack/tasks/` of the primary checkout and are never committed.
 - Cross-review every design and plan on the `interrogate reviewers` role before the human's gate.

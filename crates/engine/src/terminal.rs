@@ -297,7 +297,8 @@ impl Terminal {
         self.closing.load(Ordering::Acquire)
     }
     pub(crate) fn hangup(&self) {
-        if let Some(pid) = self.pid()
+        let owned = self.pid.lock().unwrap();
+        if let Some(pid) = *owned
             && !self.hangup_sent.swap(true, Ordering::AcqRel)
         {
             *self.hangup_at.lock().unwrap() = Some(Instant::now());
@@ -445,12 +446,30 @@ struct ChildGroup {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     pid: u32,
     groups: crate::provider::env::Groups,
+    reaped: bool,
+}
+impl ChildGroup {
+    fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.reaped |= status.is_some();
+        if self.reaped {
+            self.groups.lock().unwrap().remove(&self.pid);
+        }
+        Ok(status)
+    }
+    fn finish(&mut self, signal: impl FnOnce(u32)) {
+        if !self.reaped {
+            signal(self.pid);
+            self.reaped = self.child.wait().is_ok();
+        }
+        self.groups.lock().unwrap().remove(&self.pid);
+    }
 }
 impl Drop for ChildGroup {
     fn drop(&mut self) {
-        let _ = platform::signal_group(self.pid, Signal::Kill);
-        let _ = self.child.wait();
-        self.groups.lock().unwrap().remove(&self.pid);
+        self.finish(|pid| {
+            let _ = platform::signal_group(pid, Signal::Kill);
+        });
     }
 }
 struct Workers {
@@ -493,9 +512,11 @@ impl Workers {
 }
 impl Drop for Workers {
     fn drop(&mut self) {
+        let mut owned = self.terminal.pid.lock().unwrap();
         drop(self.child.take());
+        *owned = None;
+        drop(owned);
         *self.terminal.foreground.lock().unwrap() = None;
-        *self.terminal.pid.lock().unwrap() = None;
         *self.terminal.input.lock().unwrap() = None;
         let writer = self.writer.take();
         self.finish(writer, "writer");
@@ -528,7 +549,11 @@ fn run(
 ) -> Result<(), ProviderError> {
     let pair = portable_pty::native_pty_system()
         .openpty(size)
-        .map_err(io::Error::other)?;
+        .map_err(|_| {
+            ProviderError::Protocol(
+                "The shell could not start: macOS could not open a terminal".into(),
+            )
+        })?;
     let shell = env
         .variable("SHELL")
         .map(std::path::PathBuf::from)
@@ -565,10 +590,13 @@ fn run(
     if env.closing.is_closing() || controls.is_closed() || controls.try_recv().is_ok() {
         return Err(ProviderError::Cancelled);
     }
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(io::Error::other)?;
+    let child = pair.slave.spawn_command(command).map_err(|error| {
+        let reason = error
+            .downcast_ref::<io::Error>()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "the selected shell is missing or is not executable".into());
+        ProviderError::Protocol(format!("The shell could not start: {reason}"))
+    })?;
     let pid = child
         .process_id()
         .ok_or_else(|| io::Error::other("PTY child has no pid"))?;
@@ -577,6 +605,7 @@ fn run(
             child,
             pid,
             groups: env.groups.clone(),
+            reaped: false,
         }),
         terminal: terminal.clone(),
         reader: None,
@@ -631,7 +660,11 @@ fn run(
                 .or_else(|| terminal.foreground_group().filter(|group| *group != pid));
         }
         if exited.is_none() {
-            exited = workers.child.as_mut().unwrap().child.try_wait()?;
+            let mut owned = terminal.pid.lock().unwrap();
+            exited = workers.child.as_mut().unwrap().try_wait()?;
+            if exited.is_some() {
+                *owned = None;
+            }
         }
         if stopping.is_none()
             && exited.is_none()
@@ -745,6 +778,120 @@ fn read(mut reader: Box<dyn Read + Send>, terminal: &Terminal) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_shell_spawn_has_a_plain_start_reason() {
+        let root = std::path::Path::new("/tmp").join(format!(
+            "veyra-shell-spawn-{}",
+            crate::domain::ThreadId::new()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let env =
+            ChildEnv::isolated().with_variable("SHELL", root.join("missing-shell").as_os_str());
+        let handle = spawn(root, PtySize::default(), env, Colors::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.status().is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            handle.status(),
+            ShellStatus::Failed {
+                error:
+                    "The shell could not start: the selected shell is missing or is not executable"
+                        .into()
+            }
+        );
+        assert!(handle.pid().is_none());
+    }
+
+    #[test]
+    fn failure_after_shell_started_keeps_runtime_words() {
+        let root = std::path::Path::new("/tmp").join(format!(
+            "veyra-shell-input-{}",
+            crate::domain::ThreadId::new()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let shell = root.join("shell");
+        std::fs::write(&shell, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("700")
+                .arg(&shell)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let env = ChildEnv::isolated().with_variable("SHELL", shell.as_os_str());
+        let handle = spawn(root, PtySize::default(), env, Colors::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.status() != ShellStatus::Running {
+            assert!(
+                Instant::now() < deadline,
+                "shell did not start: {:?}",
+                handle.status()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pid = handle.pid().unwrap();
+        handle.terminal.input.lock().unwrap().take();
+        while !handle.status().is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            handle.status(),
+            ShellStatus::Failed {
+                error: "The terminal input stopped".into()
+            }
+        );
+        assert!(!platform::is_alive(pid).unwrap());
+    }
+
+    #[test]
+    fn child_group_signals_only_before_reaping() {
+        for reaped in [false, true] {
+            let mut command = tokio::process::Command::new("/bin/sleep");
+            command.arg("60");
+            platform::own_group(&mut command);
+            let child = command.as_std_mut().spawn().unwrap();
+            let pid = child.id();
+            let groups = Arc::new(Mutex::new([pid].into_iter().collect()));
+            let mut guard = ChildGroup {
+                child: Box::new(child),
+                pid,
+                groups: groups.clone(),
+                reaped: false,
+            };
+            if reaped {
+                platform::signal_group(pid, Signal::Kill).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while guard.try_wait().unwrap().is_none() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let mut signals = 0;
+            guard.finish(|group| {
+                signals += 1;
+                assert_eq!(group, pid);
+                assert!(platform::is_alive(pid).unwrap());
+                platform::signal_group(group, Signal::Kill).unwrap();
+            });
+            assert_eq!(signals, usize::from(!reaped));
+            drop(guard);
+            assert!(groups.lock().unwrap().is_empty());
+            assert!(!platform::is_alive(pid).unwrap());
+        }
+    }
+
+    #[test]
+    fn foreground_grace_skips_group_gone_at_deadline() {
+        let mut group = Some(44);
+        assert_eq!(take_foreground_kill(&mut group, true, |_| false), None);
+        assert_eq!(group, None);
+    }
     #[test]
     fn foreground_grace_forgets_gone_groups_and_takes_survivors_once() {
         let mut group = Some(42);

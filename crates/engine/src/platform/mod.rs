@@ -4,6 +4,13 @@ pub enum Signal {
     Kill,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayOptions {
+    pub reduce_transparency: bool,
+    pub increase_contrast: bool,
+    pub reduce_motion: bool,
+}
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]

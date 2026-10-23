@@ -34,6 +34,7 @@ Use ctl wait for thread states; do not replace it with sleeps.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -313,6 +314,7 @@ Run this fake-only section after the existing drive and before Evidence.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -386,6 +388,7 @@ The launch-argument receipt records only the fake CLI's own arguments and must c
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -497,7 +500,8 @@ SQLite retains one User turn and one Provider turn, both Completed, after task_s
 The Codex section saves streamed `o`, completed `ok` with two `delta_count` events, its stored item and Completed turn.
 The foreign-thread fixture leaves one User turn and only `ok`; the retry/limit fixture stores exactly two Notice items.
 The Codex PNGs show Working, Done and both notices.
-`codex-command-row.png` shows Veyra’s unquoted Command label; `codex-provider-tool-row.png` keeps a provider-named MCP tool quoted. Both names share the bounded display projection.
+`codex-command-row.png` shows Veyra’s unquoted Command label; `codex-provider-tool-row.png` keeps a provider-named MCP tool quoted.
+Both names share the bounded display projection.
 
 - `chat-working.json` has Working, assistant `o` with `done: false`, a native id and cleared composer; inspect its PNG for the caret and Working header.
 - `chat-done.json` has one user prompt and exactly one completed assistant `ok`, Done in the selected thread and sidebar, and an increased applied-batch counter.
@@ -517,6 +521,95 @@ The Codex PNGs show Working, Done and both notices.
 `chat-follow-25.json` remains detached at 25 px and `chat-follow-24.json` reattaches within one read line.
 The failed-tool PNG shows the last diagnostic while collapsed; its expansion assertion compares the same row top.
 The signed-out, retirement and notice dumps cover account and notice window behavior.
+
+### Dump fields
+
+`header_branch` is the branch text used by the header and is empty after leaving Chat.
+`view` is `new_thread`, `chat`, `failed_thread` or `settings`.
+`transcript.items` contains the stored item rows; item_tops includes the family card first when present.
+`selected_thread` includes its native id, configuration, failure cause and `header_status`, the rendered status with elapsed seconds.
+For stored-mode compatibility, see [stored Grok modes](permission-matrix.md#stored-grok-modes); dump retains the stored configuration beside the effective composer mode.
+`transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
+`transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
+Items include `outcome`, queued `wait_reason`, a tool's `failed_last_line` and its rendered `tool_label`.
+The failed banner's own turn has `outcome` `["Failed"]`; historical failed turns retain their cause in the caption.
+Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
+Engine commands await space in the window's gpui task, so Stop is retained when that capacity is zero.
+
+### Evidence contract
+
+```json
+{
+  "required": {
+    "chat-send-stream": [
+      "chat-working.json",
+      "chat-working.png",
+      "chat-done.json",
+      "chat-done.png",
+      "chat-failed.json",
+      "chat-failed.png",
+      "chat-provider-done.json",
+      "chat-background-working.json"
+    ],
+    "chat-send-stream-codex": [
+      "codex-chat-working.json",
+      "codex-chat-working.png",
+      "codex-chat-done.json",
+      "codex-chat-done.png",
+      "codex-other-thread-done.json",
+      "codex-other-thread.png",
+      "codex-notices-done.json",
+      "codex-notices.png"
+    ],
+    "chat-send-stream-grok": [
+      "grok-chat-working.json",
+      "grok-chat-working.png",
+      "grok-chat-done.json",
+      "grok-chat-done.png",
+      "grok-launch-argv.json",
+      "grok-signed-out.json",
+      "grok-signed-out.png"
+    ],
+    "chat-send-stream-live": [
+      "chat-working.json",
+      "chat-working.png",
+      "chat-done.json",
+      "chat-done.png",
+      "rec/probe.jsonl"
+    ]
+  },
+  "pairs": {
+    "chat-send-stream": [
+      [
+        "chat-working",
+        "chat-done"
+      ],
+      [
+        "chat-tool-collapsed",
+        "chat-tool-expanded"
+      ]
+    ],
+    "chat-send-stream-live": [
+      [
+        "chat-working",
+        "chat-done"
+      ]
+    ],
+    "chat-send-stream-codex": [
+      [
+        "codex-chat-working",
+        "codex-chat-done"
+      ]
+    ],
+    "chat-send-stream-grok": [
+      [
+        "grok-chat-working",
+        "grok-chat-done"
+      ]
+    ]
+  }
+}
+```
 
 ## Gotchas
 

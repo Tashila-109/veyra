@@ -12,6 +12,17 @@ use std::{
 };
 
 pub const SOCKET_PATH_MAX: usize = 103;
+
+pub fn display_options() -> super::DisplayOptions {
+    objc2::rc::autoreleasepool(|_| {
+        let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+        super::DisplayOptions {
+            reduce_transparency: workspace.accessibilityDisplayShouldReduceTransparency(),
+            increase_contrast: workspace.accessibilityDisplayShouldIncreaseContrast(),
+            reduce_motion: workspace.accessibilityDisplayShouldReduceMotion(),
+        }
+    })
+}
 pub const CLAUDE_MANAGED_MCP: &str = "/Library/Application Support/ClaudeCode/managed-mcp.json";
 pub const KNOWN_BIN_DIRS: &[&str] = &[
     "/opt/homebrew/bin",
@@ -1096,13 +1107,63 @@ fn duplicated_descriptor_survives_original_reuse() {
     let duplicate = duplicate_fd(number).unwrap();
     assert_ne!(duplicate.as_raw_fd(), number);
     drop(original);
-    let replacement = File::create(root.join("replacement")).unwrap();
-    let reused = replacement.as_raw_fd() == number;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let replacement = loop {
+        let replacement = File::create(root.join("replacement")).unwrap();
+        if replacement.as_raw_fd() == number {
+            break replacement;
+        }
+        drop(replacement);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owned descriptor was not reused within two seconds"
+        );
+        std::thread::yield_now();
+    };
     let mut held = File::from(duplicate);
     held.rewind().unwrap();
     let mut contents = String::new();
     held.read_to_string(&mut contents).unwrap();
     assert_eq!(contents, "original");
     assert!(foreground_group(&held.into()).is_err());
-    assert!(reused, "the owned replacement did not reuse the descriptor");
+    assert_eq!(replacement.as_raw_fd(), number);
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "descriptor churn stress loop"]
+fn duplicated_descriptor_reuse_under_churn() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let opened = Arc::new(AtomicUsize::new(0));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = stop.clone();
+            let opened = opened.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let file = File::open("/dev/null").unwrap();
+                    opened.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                    drop(file);
+                }
+            })
+        })
+        .collect();
+    let failures = (0..20_000)
+        .filter(|_| {
+            std::panic::catch_unwind(duplicated_descriptor_survives_original_reuse).is_err()
+        })
+        .count();
+    stop.store(true, Ordering::Release);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let opened = opened.load(Ordering::Relaxed);
+    println!("descriptor reuse: 20000 repetitions, {failures} failures, {opened} concurrent opens");
+    assert!(opened > 0);
+    assert_eq!(failures, 0);
 }

@@ -10,7 +10,7 @@ use gpui_kit::component::{
     StyledExt,
     button::{Button, ButtonVariants},
     input::Textarea,
-    menu::DropdownMenu,
+    menu::PopupMenu,
     popover::Popover,
 };
 use gpui_kit::{prelude::*, *};
@@ -188,6 +188,7 @@ pub(super) fn labelled_button_with(
         .ghost()
         .h(t.layout.icon_button)
         .px(t.space.0[3])
+        .rounded(t.radius.control)
         .accessibility_label(label.into())
         .child(content)
 }
@@ -217,6 +218,87 @@ fn option_caption(option: usize, label: SharedString, cx: &App) -> Div {
         .min_w_0()
         .whitespace_normal()
         .child(label)
+}
+
+pub(super) fn floating_panel(cx: &App) -> Div {
+    let theme = cx.global::<Theme>();
+    div()
+        .bg(theme.colors.floating)
+        .rounded(theme.radius.floating)
+        .shadow(theme.shadows.floating.clone())
+}
+
+struct MenuState {
+    popup: Option<Entity<PopupMenu>>,
+}
+
+type MenuBuilder =
+    std::rc::Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
+type MenuOpen = Box<dyn Fn(&bool, &mut Window, &mut App)>;
+
+#[derive(IntoElement)]
+struct MenuButton {
+    id: &'static str,
+    trigger: Button,
+    build: MenuBuilder,
+    on_open: Option<MenuOpen>,
+}
+
+impl MenuButton {
+    fn new(
+        id: &'static str,
+        trigger: Button,
+        build: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+    ) -> Self {
+        Self {
+            id,
+            trigger,
+            build: std::rc::Rc::new(build),
+            on_open: None,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn on_open_change(mut self, callback: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self {
+        self.on_open = Some(Box::new(callback));
+        self
+    }
+}
+
+impl RenderOnce for MenuButton {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let menu = window.use_keyed_state(self.id, cx, |_, _| MenuState { popup: None });
+        let retained = menu.clone();
+        Popover::new(self.id)
+            .appearance(false)
+            .overlay_closable(false)
+            .trigger(self.trigger)
+            .on_open_change(move |open, window, cx| {
+                if !*open {
+                    menu.update(cx, |menu, _| menu.popup = None);
+                }
+                if let Some(callback) = &self.on_open {
+                    callback(open, window, cx);
+                }
+            })
+            .content(move |_, window, cx| {
+                if retained.read(cx).popup.is_none() {
+                    let build = self.build.clone();
+                    let popup = PopupMenu::build(window, cx, move |menu, window, cx| {
+                        build(menu, window, cx)
+                    });
+                    let host = cx.entity().downgrade();
+                    window
+                        .subscribe(&popup, cx, move |_, _: &DismissEvent, window, cx| {
+                            let _ = host.update(cx, |host, cx| host.dismiss(window, cx));
+                        })
+                        .detach();
+                    popup.focus_handle(cx).focus(window, cx);
+                    retained.update(cx, |menu, _| menu.popup = Some(popup));
+                }
+                floating_panel(cx).children(retained.read(cx).popup.clone())
+            })
+    }
 }
 
 pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
@@ -249,8 +331,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         .on_open_change(move |open, window, cx| {
             let _ = this.update(cx, |shell, cx| shell.set_provider_picker(*open, window, cx));
         })
-        .content(move |_, _, _| div().children(menu.clone()));
-    let model_button = labelled_button(
+        .content(move |_, _, cx| floating_panel(cx).children(menu.clone()));
+    let model_trigger = labelled_button(
         "model",
         config
             .model
@@ -258,8 +340,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
             .unwrap_or_else(|| "Default model".into()),
         cx,
     )
-    .debug_selector(|| "composer-model".into())
-    .dropdown_menu(move |mut menu, _, _| {
+    .debug_selector(|| "composer-model".into());
+    let model_button = MenuButton::new("model-menu", model_trigger, move |mut menu, _, _| {
         if models.is_empty() {
             return menu.menu("Default", Box::new(PickModel { model: None }));
         }
@@ -273,13 +355,13 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         }
         menu
     });
-    let effort_button = labelled_button(
+    let effort_trigger = labelled_button(
         "effort",
         config.effort.clone().unwrap_or_else(|| "Effort".into()),
         cx,
     )
-    .debug_selector(|| "composer-effort".into())
-    .dropdown_menu(move |mut menu, _, _| {
+    .debug_selector(|| "composer-effort".into());
+    let effort_button = MenuButton::new("effort-menu", effort_trigger, move |mut menu, _, _| {
         if efforts.is_empty() {
             return menu.menu("Default", Box::new(PickEffort { effort: None }));
         }
@@ -294,21 +376,25 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         menu
     });
     let provider = shell.chosen_provider();
-    let permission_button = labelled_button(
+    let permission_trigger = labelled_button(
         "permission",
         settings::mode_label(provider.run_mode(config.mode)),
         cx,
     )
-    .debug_selector(|| "composer-permission".into())
-    .dropdown_menu(move |mut menu, _, _| {
-        for &mode in provider.offered_modes() {
-            menu = menu.menu(
-                settings::mode_label(mode),
-                Box::new(PickPermission { mode: Some(mode) }),
-            );
-        }
-        menu
-    });
+    .debug_selector(|| "composer-permission".into());
+    let permission_button = MenuButton::new(
+        "permission-menu",
+        permission_trigger,
+        move |mut menu, _, _| {
+            for &mode in provider.offered_modes() {
+                menu = menu.menu(
+                    settings::mode_label(mode),
+                    Box::new(PickPermission { mode: Some(mode) }),
+                );
+            }
+            menu
+        },
+    );
     #[cfg(debug_assertions)]
     let permission_button = permission_button.on_open_change(cx.listener(|shell, open, _, cx| {
         shell.permission_picker_open = *open;
@@ -360,13 +446,15 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .bg(t.colors.card)
                 .border(t.layout.border)
                 .border_color(t.colors.border)
-                .p(t.space.0[5])
+                .pl(t.space.0[5])
+                .pr(t.space.0[5])
+                .py(t.space.0[3])
                 .when_some(hold, |composer, hold| {
                     composer.child(
                         div()
                             .v_flex()
                             .flex_none()
-                            .gap(t.space.0[3])
+                            .gap(t.space.0[1])
                             .pb(t.space.0[4])
                             .debug_selector(|| "composer-hold".into())
                             .child(
@@ -415,11 +503,10 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         .v_flex()
                         .w_full()
                         .min_h_0()
-                        .gap(t.space.0[3])
-                        .p(t.space.0[4])
-                        .mb(t.space.0[5])
-                        .rounded(t.radius.control)
-                        .border(t.layout.border)
+                        .gap(t.space.0[0])
+                        .pb(t.space.0[3])
+                        .mb(t.space.0[3])
+                        .border_b(t.layout.border)
                         .border_color(if shell.dock_focused {
                             t.colors.accent
                         } else {
@@ -726,6 +813,11 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         .v_flex()
                         .w_full()
                         .min_h(t.layout.composer_min_height)
+                        .max_h(t.layout.composer_max_height)
+                        .flex_shrink(t.layout.composer_input_shrink)
+                        .when(target.is_some(), |input| {
+                            input.h(t.layout.composer_max_height)
+                        })
                         .key_context("VeyraComposer")
                         .debug_selector(|| "composer-input".into())
                         .when(target.is_some(), |input| input.overflow_hidden())
@@ -736,9 +828,8 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                 .w_full()
                                 .min_h(t.layout.composer_min_height)
                                 .max_h(t.layout.composer_max_height)
-                                .when(target.is_some(), |input| {
-                                    input.h(t.layout.composer_min_height)
-                                })
+                                .max_h_full()
+                                .when(target.is_some(), |input| input.h(relative(1.)))
                                 .text_size(t.text.read.size)
                                 .line_height(t.text.read.line_height)
                                 .aria_label("Message"),
@@ -761,6 +852,10 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             labelled_button(submit_id, if stop { "Stop" } else { "Send" }, cx)
                                 .debug_selector(|| "composer-submit-button".into())
                                 .primary()
+                                .bg(t.plate(t.colors.solid))
+                                .border(t.layout.border)
+                                .border_color(t.colors.border)
+                                .shadow(t.plate_highlight())
                                 .disabled(!stop && reason.is_some())
                                 .when(stop, |button| button.child(shortcut_chip::<Stop>(cx)))
                                 .on_click(move |_, window, cx| {

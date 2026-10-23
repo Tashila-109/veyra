@@ -18,5 +18,9 @@ sha2 = "=0.10.9"
 portable-pty = "=0.8.1"
 alacritty_terminal = "=0.26.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSWorkspace", "NSAccessibility"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -12,7 +12,7 @@ Covers: crates/engine/src/data_dir.rs crates/engine/src/mcp.rs crates/engine/src
 - An idle Quit exits immediately.
 - A stored Terminal view opens in chat without a view-specific hold and preserves its stored terminal span.
 - A crashed child shows Interrupted with Continue, settles its task on Continue, and leaves a held parent wake until Continue there.
-- The `ctl quit` and crash relaunches keep the project row, schema 3, WAL, the eight tables, the stored default mode and the database inode.
+- The `ctl quit` and crash relaunches keep the project row, schema 4, WAL, the eight tables, the stored default mode and the database inode.
 
 ## How to get to it (user POV)
 
@@ -33,6 +33,7 @@ Its post-relaunch marker check uses Cleanup's exiting-process retry and chooses 
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -84,9 +85,6 @@ if !before.colorAt(x: x, y: y)!.isEqual(after.colorAt(x: x, y: y)!) {
 }
 print("PASS quit sheet preserves the sidebar")
 """)
-checked = subprocess.run(['swift',str(checker),str(PROOF/'restart-before-sheet.png'),
-    str(PROOF/'restart-quit-sheet.png')])
-assert checked.returncode == 0, 'quit sheet hid the sidebar'
 
 ctl('restart-cancel-key','keys','escape')
 kept = poll('restart-cancelled',lambda d: not d['quit_sheet']['open'])
@@ -98,6 +96,10 @@ groups = [int(x) for x in sql('select live_pgid from threads where live_pgid is 
 ctl('restart-confirm-key','keys','secondary-enter')
 wait_gone(pid)
 owned_groups_gone(groups)
+checked = subprocess.run(['swift',str(checker),str(PROOF/'restart-before-sheet.png'),
+    str(PROOF/'restart-quit-sheet.png')])
+assert checked.returncode == 0, 'quit sheet hid the sidebar'
+
 start('restart-orderly')
 poll('restart-ready',lambda d: d['providers'][0]['readiness']=='ready')
 action('restart-select','SelectThread',{'thread':thread})
@@ -227,8 +229,31 @@ The process checks show every owned provider group gone before orderly relaunch.
 `restart-expired.json` has no dock; SQLite retains Veyra is closing.
 `restart-crash-held.json` and its PNG show the same hold after a crash, without starting the queued turn.
 `restart-child-interrupted.png` shows the recovered child and Continue, `restart-child-parent-held.png` shows its pending held wake, and `restart-child-delivered.json` agrees with SQLite delivered.
-`restart-after-ctl-database.txt`, `restart-after-crash-database.txt` and `restart-database-kept.json` hold schema 3, WAL, the eight tables and the stored mode after each relaunch, with the page's starting project row and database inode.
+`restart-after-ctl-database.txt`, `restart-after-crash-database.txt` and `restart-database-kept.json` hold schema 4, WAL, the eight tables and the stored mode after each relaunch, with the page's starting project row and database inode.
 Both Archive and ArchiveKeepChildren and the top-level tasks key are named here; the archive choices are exercised on multi-agent.
+
+### Evidence contract
+
+```json
+{
+  "required": {
+    "restart-recovery": [
+      "restart-quit-sheet.png",
+      "restart-held.png",
+      "restart-crash-held.json",
+      "restart-continued.json",
+      "restart-child-interrupted.png",
+      "restart-child-parent-held.png",
+      "restart-child-delivered.json",
+      "restart-after-ctl-database.txt",
+      "restart-after-crash-database.txt",
+      "restart-database-kept.json",
+      "restart-stored-terminal.png"
+    ]
+  },
+  "pairs": {}
+}
+```
 
 ## Gotchas
 

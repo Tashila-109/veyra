@@ -1,10 +1,47 @@
 use gpui_kit::component::{Theme as KitTheme, ThemeMode};
 use gpui_kit::{
-    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Point, Rems, Rgba, SharedString, Size,
-    Window, WindowAppearance, point, px, rems, rgb, rgba, size,
+    App, Background, BoxShadow, FontWeight, Global, Hsla, Pixels, Point, Rems, Rgba, SharedString,
+    Size, Window, WindowAppearance, WindowBackgroundAppearance, linear_color_stop, linear_gradient,
+    point, px, rems, rgb, rgba, size,
 };
 use std::{borrow::Cow, time::Duration};
 use veyra_engine::terminal::{Color, NamedColor, Rgb};
+use veyra_engine::{domain::WindowBackground, platform::DisplayOptions};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Look {
+    pub requested: WindowBackground,
+    pub options: DisplayOptions,
+    #[cfg(debug_assertions)]
+    pub overridden: bool,
+}
+impl Global for Look {}
+impl Look {
+    pub fn background(self) -> WindowBackground {
+        if self.options.reduce_transparency || self.options.increase_contrast {
+            WindowBackground::Solid
+        } else {
+            self.requested
+        }
+    }
+    pub fn forced_by(self) -> Option<&'static str> {
+        match (
+            self.options.reduce_transparency,
+            self.options.increase_contrast,
+        ) {
+            (true, true) => Some("Reduce Transparency and Increase Contrast"),
+            (true, false) => Some("Reduce Transparency"),
+            (false, true) => Some("Increase Contrast"),
+            _ => None,
+        }
+    }
+    pub fn window_background(self) -> WindowBackgroundAppearance {
+        match self.background() {
+            WindowBackground::Translucent => WindowBackgroundAppearance::Blurred,
+            WindowBackground::Solid => WindowBackgroundAppearance::Opaque,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appearance {
@@ -32,6 +69,8 @@ pub struct Colors {
     pub bg: Hsla,
     pub shell: Hsla,
     pub card: Hsla,
+    pub floating: Hsla,
+    pub scrim: Hsla,
     pub overlay: Hsla,
     pub raised: Hsla,
     pub hover: Hsla,
@@ -64,6 +103,8 @@ impl Colors {
             bg: rgb(0x0a0b0c).into(),
             shell: rgb(0x0f1011).into(),
             card: rgb(0x141416).into(),
+            floating: rgb(0x1e1d20).into(),
+            scrim: rgba(0x00000080).into(),
             overlay: rgb(0x1a1b1c).into(),
             raised: rgb(0x222224).into(),
             hover: rgba(0xffffff0b).into(),
@@ -96,6 +137,8 @@ impl Colors {
             bg: rgb(0xffffff).into(),
             shell: rgb(0xf6f6f8).into(),
             card: rgb(0xffffff).into(),
+            floating: rgb(0xffffff).into(),
+            scrim: rgba(0x00000050).into(),
             overlay: rgb(0xffffff).into(),
             raised: rgb(0xffffff).into(),
             hover: rgba(0x00000008).into(),
@@ -167,6 +210,7 @@ pub struct Radii {
     pub control: Pixels,
     pub track: Pixels,
     pub card: Pixels,
+    pub floating: Pixels,
     pub large: Pixels,
     pub full: Pixels,
 }
@@ -180,7 +224,7 @@ pub struct Motion {
     pub hover: Transition,
     pub press: Transition,
     pub collapse: Transition,
-    pub view_switch: Transition,
+    pub drawer: Transition,
     pub menu: [Transition; 2],
     pub resize: Transition,
     pub stream_reveal: Transition,
@@ -211,6 +255,7 @@ pub struct Layout {
     pub composer_min_height: Pixels,
     pub composer_max_height: Pixels,
     pub composer_toolbar: Pixels,
+    pub composer_input_shrink: f32,
     pub dock_question_min_height: Pixels,
     pub fade: Pixels,
     pub terminal_padding: Size<Pixels>,
@@ -225,6 +270,10 @@ pub struct Layout {
     pub icon_stroke: Pixels,
     pub status_glyph: Pixels,
     pub provider_mark: Pixels,
+    pub drawer_tabs: Pixels,
+    pub drawer_min: Pixels,
+    pub drawer_default: Pixels,
+    pub drawer_tab: Pixels,
 }
 #[derive(Clone)]
 pub struct Theme {
@@ -237,6 +286,8 @@ pub struct Theme {
     pub radius: Radii,
     pub layout: Layout,
     pub motion: Motion,
+    pub look: Look,
+    pub glass_coverage: f32,
 }
 impl Global for Theme {}
 
@@ -325,6 +376,7 @@ impl Theme {
                 control: px(6.),
                 track: px(8.),
                 card: px(8.),
+                floating: px(12.),
                 large: px(16.),
                 full: px(9999.),
             },
@@ -332,7 +384,7 @@ impl Theme {
                 hover: transition(100, [0.25, 0.1, 0.25, 1.]),
                 press: transition(100, [0.25, 0.1, 0.25, 1.]),
                 collapse: transition(200, [0., 0., 0.58, 1.]),
-                view_switch: transition(200, [0.25, 0.1, 0.25, 1.]),
+                drawer: transition(200, [0., 0., 0.58, 1.]),
                 menu: [
                     transition(200, [0., 0., 0.58, 1.]),
                     transition(100, [0.42, 0., 1., 1.]),
@@ -365,6 +417,7 @@ impl Theme {
                 composer_min_height: px(48.),
                 composer_max_height: px(240.),
                 composer_toolbar: px(40.),
+                composer_input_shrink: 1000.,
                 dock_question_min_height: px(44.),
                 fade: px(24.),
                 terminal_padding: size(px(14.), px(20.)),
@@ -379,7 +432,13 @@ impl Theme {
                 icon_stroke: px(1.5),
                 status_glyph: px(12.),
                 provider_mark: px(14.),
+                drawer_tabs: px(32.),
+                drawer_min: px(134.),
+                drawer_default: px(236.),
+                drawer_tab: px(72.),
             },
+            look: Look::default(),
+            glass_coverage: if dark { 0.96 } else { 0.98 },
         }
     }
     pub fn apply(appearance: Appearance, window: &mut Window, cx: &mut App) {
@@ -391,15 +450,21 @@ impl Theme {
             Some(window),
             cx,
         );
-        let theme = Self::new(appearance);
+        let look = cx.try_global::<Look>().copied().unwrap_or_default();
+        let theme = Self::with_look(appearance, look);
+        window.set_background_appearance(look.window_background());
+        cx.set_reduce_motion(look.options.reduce_motion);
         KitTheme::update(cx, |kit| {
             let c = &theme.colors;
-            kit.background = c.bg;
+            kit.background = match look.background() {
+                WindowBackground::Translucent => c.bg.opacity(0.),
+                WindowBackground::Solid => c.bg,
+            };
             kit.foreground = c.text;
             kit.muted_foreground = c.text_muted;
             kit.sidebar = c.shell;
             kit.sidebar_foreground = c.text;
-            kit.popover = c.overlay;
+            kit.popover = c.floating;
             kit.popover_foreground = c.text;
             kit.secondary = c.raised;
             kit.secondary_foreground = c.text;
@@ -423,11 +488,90 @@ impl Theme {
             kit.mono_font_family = theme.text.mono_font.clone();
             kit.font_size = theme.text.base;
             kit.mono_font_size = theme.text.code.size.to_pixels(theme.text.base);
-            kit.radius = theme.radius.control;
-            kit.shadow = false;
+            kit.radius = theme.radius.floating;
+            kit.shadow = true;
         });
         cx.set_global(theme);
         cx.refresh_windows();
+    }
+
+    pub fn with_look(appearance: Appearance, look: Look) -> Self {
+        let mut theme = Self::new(appearance);
+        theme.look = look;
+        if look.options.increase_contrast {
+            theme.colors.border = match appearance {
+                Appearance::Dark => rgb(0x737477).into(),
+                Appearance::Light => rgb(0x777779).into(),
+            };
+            theme.colors.border_strong = theme.colors.border;
+            theme.colors.text_muted = theme.colors.text;
+            theme.colors.text_faint = theme.colors.text;
+        }
+        if look.options.reduce_motion {
+            for token in theme.motion.tokens_mut() {
+                token.duration = Duration::ZERO;
+            }
+        }
+        theme
+    }
+
+    pub fn sidebar_fill(&self) -> Hsla {
+        let mut color = self.colors.shell;
+        if self.look.background() == WindowBackground::Translucent {
+            color.a = self.glass_coverage;
+        }
+        color
+    }
+
+    pub fn plate(&self, fill: Hsla) -> Background {
+        let wash = self.colors.hover.to_rgb();
+        let base = fill.to_rgb();
+        let top: Hsla = Rgba {
+            r: wash.r * wash.a + base.r * (1. - wash.a),
+            g: wash.g * wash.a + base.g * (1. - wash.a),
+            b: wash.b * wash.a + base.b * (1. - wash.a),
+            a: 1.,
+        }
+        .into();
+        linear_gradient(
+            180.,
+            linear_color_stop(top, 0.),
+            linear_color_stop(fill, 0.5),
+        )
+    }
+
+    pub fn plate_highlight(&self) -> Vec<BoxShadow> {
+        vec![BoxShadow {
+            color: self.colors.hover,
+            offset: point(Pixels::ZERO, self.layout.border),
+            blur_radius: Pixels::ZERO,
+            spread_radius: Pixels::ZERO,
+            inset: true,
+        }]
+    }
+
+    pub fn composer_fade(&self) -> Background {
+        linear_gradient(
+            180.,
+            linear_color_stop(self.colors.bg.opacity(0.), 0.),
+            linear_color_stop(self.colors.bg, 1.),
+        )
+    }
+}
+impl Motion {
+    fn tokens_mut(&mut self) -> [&mut Transition; 9] {
+        let [menu_in, menu_out] = &mut self.menu;
+        [
+            &mut self.hover,
+            &mut self.press,
+            &mut self.collapse,
+            &mut self.drawer,
+            menu_in,
+            menu_out,
+            &mut self.resize,
+            &mut self.stream_reveal,
+            &mut self.spinner,
+        ]
     }
 }
 pub fn register_fonts(cx: &mut App) -> anyhow::Result<()> {
@@ -536,9 +680,188 @@ mod tests {
         assert_eq!(token_call_count("\"//\" px(1)"), 1);
     }
     #[test]
+    fn display_flags_force_solid() {
+        for requested in [WindowBackground::Translucent, WindowBackground::Solid] {
+            for reduce_transparency in [false, true] {
+                for increase_contrast in [false, true] {
+                    let look = Look {
+                        requested,
+                        options: DisplayOptions {
+                            reduce_transparency,
+                            increase_contrast,
+                            reduce_motion: true,
+                        },
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        look.background(),
+                        if reduce_transparency || increase_contrast {
+                            WindowBackground::Solid
+                        } else {
+                            requested
+                        }
+                    );
+                    assert_eq!(
+                        look.forced_by().is_some(),
+                        reduce_transparency || increase_contrast
+                    );
+                    assert_eq!(look.requested, requested);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reduce_motion_snaps_every_token() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let mut normal = Theme::new(appearance);
+            assert!(
+                normal
+                    .motion
+                    .tokens_mut()
+                    .iter()
+                    .all(|token| !token.duration.is_zero())
+            );
+            let mut reduced = Theme::with_look(
+                appearance,
+                Look {
+                    options: DisplayOptions {
+                        reduce_motion: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            assert!(
+                reduced
+                    .motion
+                    .tokens_mut()
+                    .iter()
+                    .all(|token| token.duration.is_zero())
+            );
+            assert_eq!(reduced.motion.spinner.duration, Duration::ZERO);
+        }
+    }
+
+    #[gpui::test]
+    fn theme_apply_keeps_blurred_in_translucent(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            gpui_kit::init(cx);
+            let look = Look::default();
+            cx.set_global(look);
+            for appearance in [Appearance::Dark, Appearance::Light, Appearance::Dark] {
+                Theme::apply(appearance, window, cx);
+                assert_eq!(
+                    cx.global::<Theme>().look.window_background(),
+                    WindowBackgroundAppearance::Blurred
+                );
+                assert_eq!(cx.global::<Theme>().appearance, appearance);
+                assert_eq!(KitTheme::global(cx).background.a, 0.);
+                assert!(KitTheme::global(cx).shadow);
+                assert_eq!(
+                    KitTheme::global(cx).popover,
+                    cx.global::<Theme>().colors.floating
+                );
+            }
+            for look in [
+                Look {
+                    requested: WindowBackground::Solid,
+                    ..Default::default()
+                },
+                Look {
+                    options: DisplayOptions {
+                        reduce_transparency: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Look {
+                    options: DisplayOptions {
+                        increase_contrast: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ] {
+                cx.set_global(look);
+                for appearance in [Appearance::Dark, Appearance::Light] {
+                    Theme::apply(appearance, window, cx);
+                    assert_eq!(KitTheme::global(cx).background.a, 1.);
+                    assert_eq!(
+                        cx.global::<Theme>().look.window_background(),
+                        WindowBackgroundAppearance::Opaque
+                    );
+                }
+            }
+        });
+    }
+
+    fn sidebar_contrast_passes(theme: &Theme, coverage: f32) -> bool {
+        let c = &theme.colors;
+        let desktop = match theme.appearance {
+            Appearance::Dark => rgb(0xffffff),
+            Appearance::Light => rgb(0x000000),
+        };
+        let mut painted = theme.clone();
+        painted.glass_coverage = coverage;
+        let shell: Hsla = over(painted.sidebar_fill().to_rgb(), desktop).into();
+        [
+            shell,
+            Hsla::from(over(c.hover.to_rgb(), shell.to_rgb())),
+            Hsla::from(over(c.sel.to_rgb(), shell.to_rgb())),
+        ]
+        .into_iter()
+        .all(|background| {
+            [
+                (c.text, 4.5),
+                (c.text_muted, 4.5),
+                (c.text_faint, 4.5),
+                (c.accent, 3.),
+                (c.danger, 3.),
+                (c.success, 3.),
+                (c.warning, 3.),
+            ]
+            .into_iter()
+            .all(|(foreground, floor)| contrast(foreground, background, shell) >= floor)
+        })
+    }
+
+    #[test]
     fn theme_contrast() {
         for appearance in [Appearance::Dark, Appearance::Light] {
             let t = Theme::new(appearance);
+            let coverage = (35..=50)
+                .map(|step| step as f32 * 0.02)
+                .find(|coverage| sidebar_contrast_passes(&t, *coverage))
+                .expect("no passing glass tint");
+            println!("{} glass_coverage={coverage:.2}", appearance.name());
+            assert!(
+                (t.glass_coverage - coverage).abs() < 0.001,
+                "{appearance:?} stored glass coverage {} should be {coverage:.2}",
+                t.glass_coverage
+            );
+            let high = Theme::with_look(
+                appearance,
+                Look {
+                    options: DisplayOptions {
+                        increase_contrast: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            for background in [
+                high.colors.bg,
+                high.colors.card,
+                high.colors.shell,
+                high.colors.floating,
+            ] {
+                assert!(contrast(high.colors.border, background, background) >= 3.);
+                for foreground in [high.colors.text_muted, high.colors.text_faint] {
+                    assert!(contrast(foreground, background, background) >= 4.5);
+                }
+            }
             let c = &t.colors;
             let pairs = [
                 ("text/bg", c.text, c.bg, c.bg, 4.5),

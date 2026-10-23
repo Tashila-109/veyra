@@ -527,14 +527,23 @@ pub enum Delivery {
     Pending { wake: TurnId },
     Delivered { wake: TurnId },
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowBackground {
+    #[default]
+    Translucent,
+    Solid,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub default_mode: PermissionMode,
+    pub window_background: WindowBackground,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             default_mode: PermissionMode::FullAccess,
+            window_background: WindowBackground::Translucent,
         }
     }
 }

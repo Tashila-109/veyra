@@ -110,7 +110,7 @@ link_fixture('drawer.jsonl',fixture_source(paste_records))
 drawer_keys('drawer-paste-tab','cmd-t','drawer','drawer')
 remember(poll('drawer-paste-ready',lambda d:'VEYRA_TUI_READY' in ''.join(d['drawer']['terminal']['grid'])))
 pasteboard_helper = PROOF/'pasteboard'
-subprocess.run(['swiftc','-O','.agents/skills/verify-veyra/bin/pasteboard.swift','-o',str(pasteboard_helper)],check=True)
+assert pasteboard_helper.is_file()
 pasteboard = subprocess.Popen([str(pasteboard_helper),'--plant'],stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
 save('drawer-pasteboard-helper',{'pid':pasteboard.pid,'pgid':pasteboard.pid})
@@ -307,6 +307,57 @@ The native recipe checks exact fake byte echoes, both close decisions, independe
 The global window counter includes composer caret blinks and is not a terminal wake counter.
 `drawer-flood.json` includes the active grid and `perf.flood` fields pty_bytes, elapsed_ms, repaints, median_repaint_gap_ms and max_repaint_gap_ms.
 Read the drawer, resize, paste, header, close-sheet, ended-tab, restarted-tab, missing-folder, archive, quit-sheet and flood PNGs at original size.
+
+### Dump fields
+
+The read-only dump reports `login_path`, `drawer`, `focus`, `composer_caret`, `tasks`, `pid`, `build_rev`, `data_dir`, `schema_version`, `appearance`, `view`, `header_branch`, `sidebar`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `perf`, `awake`, `processes`, `window_active`, `notifications`, `quit_sheet`, `requests` and `notice`.
+`drawer` describes the selected thread's open state, height, active_tab and tabs, with each tab's number, label, pid, running process paths, exit_code, exited flag and error.
+`focus` reports composer, drawer or none from their focus observations.
+`composer_caret` is the input's byte offset and verifies that toggling the drawer preserves a draft's caret.
+`VEYRA_DEBUG_SHELL_FIXTURE` runs only the adjacent fake CLI's shell mode, using a run-owned fixture; the fake lane always sets it and never opens the user's real shell.
+The shell environment strips all VEYRA_* variables, so the fake fixture path is injected only after that filter for the debug fake.
+`perf.flood` measures the active drawer tab after its FLOOD_DONE marker.
+`perf.flood` is null before FLOOD_DONE, then holds `pty_bytes`, `elapsed_ms`, `repaints`, `median_repaint_gap_ms` and `max_repaint_gap_ms` between the reader markers.
+
+Its nested `terminal` carries grid, focused, columns, rows and repaint count for the active tab.
+
+Sheets report none and remember their originating surface only for Cancel.
+
+The bytes exclude both OSC markers; the repaint gaps use only painted frames inside those timestamps.
+
+### Evidence contract
+
+```json
+{
+  "required": {
+    "shell-drawer": [
+      "drawer-open.png",
+      "drawer-header.png",
+      "drawer-resize.png",
+      "drawer-paste.png",
+      "drawer-draft.json",
+      "drawer-keys.json",
+      "drawer-hidden.json",
+      "drawer-running-close.png",
+      "drawer-restarted.json",
+      "drawer-missing-folder.png",
+      "drawer-archive.png",
+      "drawer-quit-sheet.png",
+      "drawer-crash.json",
+      "drawer-flood.json",
+      "drawer-flood.png"
+    ]
+  },
+  "pairs": {
+    "shell-drawer": [
+      [
+        "drawer-open",
+        "drawer-running-close"
+      ]
+    ]
+  }
+}
+```
 
 ## Gotchas
 

@@ -11,6 +11,24 @@ import hashlib, os, pathlib, re, shutil, subprocess, sys, tempfile
 SKILL = '.agents/skills/verify-veyra'
 LIVE = {'permission-matrix'}
 
+def evidence_contract(repo):
+    """Each page owns its unchanged required files and screenshot pairs."""
+    import json
+    required, pairs = {}, {}
+    for path in sorted((pathlib.Path(repo)/SKILL/'features').glob('*.md')):
+        if path.name == 'README.md': continue
+        match = re.search(r'^### Evidence contract\n\n```json\n(.*?)\n```',path.read_text(),re.S|re.M)
+        assert match, 'missing evidence contract: '+path.name
+        contract = json.loads(match[1])
+        assert set(contract) == {'required','pairs'}, path.name
+        for destination,key in [(required,'required'),(pairs,'pairs')]:
+            for page,entries in contract[key].items():
+                assert page == path.stem or page.startswith(path.stem+'-'), (path.name,page)
+                assert page not in destination, 'duplicate evidence token: '+page
+                destination[page] = entries
+    assert pairs.keys() <= required.keys(), 'screenshot pairs lack a required-file token'
+    return required,pairs
+
 def rule_lists(text):
     """The glob lists of SKILL.md's Selection block, their one owner; an indented row continues the list above it."""
     section = re.search(r'^## Selection\n(.*?)(?=^## |\Z)',text,re.S|re.M)

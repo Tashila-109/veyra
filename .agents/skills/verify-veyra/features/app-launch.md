@@ -8,7 +8,7 @@ Covers: crates/engine/src/data_dir.rs crates/veyra/src/ui/new_thread.rs
 - `launch-window`: one native window, Geist, sidebar, header and upper-third new-thread composer.
 - `launch-ready`: exact ready line with this run's pid and data folder while `login_path` is still `pending` in the fake lane.
 - `launch-identity`: live pid, build revision, data folder, schema_version and system appearance.
-- `launch-database`: migration 3, WAL, eight tables and Full access default.
+- `launch-database`: migration 4, WAL, eight tables and Full access default.
 - `launch-recovery`: the project written before the schema-2 relaunch survives it in the same database; [restart-recovery](restart-recovery.md) checks the quit and crash relaunches.
 - `launch-lock`: a second process refuses the same folder while the first still answers.
 - `launch-controls`: live width and notice transitions through actions and individual keys.
@@ -36,6 +36,7 @@ No provider turn runs in this page.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -103,13 +104,14 @@ PY
 
 The project write is the pre-quit value.
 The helper uses one expected table list in SKILL.md.
-The migration check seeds a stopped schema-2 database with a settled report, then verifies schema 3 adds a null source without inferring a badge; it removes only those fixture rows while stopped.
+The migration check seeds a stopped schema-2 database with a settled report, then verifies schema 4 adds a null source and the Translucent background default without inferring a badge; it removes only those fixture rows while stopped.
 A missing or lost WAL row fails the project equality after the relaunch.
 Relaunch updates the pid, group and window records before Doctor or Evidence.
 The quit and crash relaunches, with the same WAL, inode, project-row and schema checks, run in [restart-recovery](restart-recovery.md).
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -127,6 +129,7 @@ import uuid
 root,child,task,turn,wake,report = [str(uuid.uuid4()) for _ in range(6)]
 with sqlite3.connect(DB) as db:
     db.execute('pragma foreign_keys=on')
+    db.execute('alter table settings drop column window_background')
     db.execute('alter table tasks drop column source_item_id')
     db.execute('pragma user_version=2')
     project = db.execute('select id from projects order by id').fetchone()[0]
@@ -147,6 +150,8 @@ with sqlite3.connect(DB) as db:
         (task,root,child,turn,'migration report',json.dumps('Completed'),wake))
 assert sql('pragma user_version') == '2'
 start('after-migration')
+action('migration-solid','SetWindowBackground',{'background':'solid'})
+poll('migration-solid-applied',lambda d:d['look']['background']=='solid')
 database('after-migration','full_access')
 dump = poll('migration-task-loaded',lambda d: any(t['id']==task for t in d['tasks']))
 settled = next(t for t in dump['tasks'] if t['id']==task)['state']['Settled']
@@ -194,6 +199,7 @@ This section stops the debug app before opening the release window, then relaunc
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -202,6 +208,10 @@ REL_PROOF=$PROOF/release
 test ! -e "$REL_DATA"
 mkdir -p "$REL_PROOF"
 test -x /usr/bin/sandbox-exec
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
+from driver import *
+stop('before-release')
+PY
 cargo build --release -p veyra
 if target/release/veyra ctl dump >"$REL_PROOF/ctl.txt" 2>&1; then rc=0; else rc=$?; fi
 printf 'exit=%s\n' "$rc" >>"$REL_PROOF/ctl.txt"
@@ -230,10 +240,6 @@ if /usr/bin/sandbox-exec -f "$REL_PROOF/no-child-exec.sb" target/release/veyra c
 printf 'exit=%s\n' "$rc" >>"$REL_PROOF/profile-load.txt"
 test "$rc" = 2
 grep -qx 'usage: veyra \[mcp\]' "$REL_PROOF/profile-load.txt"
-PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
-from driver import *
-stop('before-release')
-PY
 DEBUG_PID=$(<"$PROOF/pid")
 if kill -0 "$DEBUG_PID" 2>/dev/null; then
     printf 'debug app is still running before release launch\n' >&2
@@ -322,12 +328,39 @@ PY
 - Lock: `second-launch.txt` contains the refusal and exit 1; the first process still answers.
 - Controls: `drive.log` records exit codes and all asserted width, text and notice transitions.
 - Log: `veyra.log` retains the asserted ready line and rejected Send notice.
-- Migration: `migration-task-loaded.json` retains the delivered summary with a null source; `migration-unlinked-report.png` shows the legacy reply without a delivery badge after the schema-2 to schema-3 launch.
+- Migration: `migration-task-loaded.json` retains the delivered summary with a null source; `migration-unlinked-report.png` shows the legacy reply without a delivery badge after the schema-2 to schema-4 launch.
 - Recovery: `persisted-project.txt` matches the SQLite row after the schema-2 relaunch and its fixture cleanup; migration, WAL, tables, mode and inode are asserted.
 - Release: `release/strings.txt` has zero release counts and positive debug controls for every driver and override name, `ctl.txt` exits 2 and `data-listing.txt` has no driver socket.
 - Release: `release/provider-paths.json` records each known provider path, including `/opt/homebrew/bin/codex`; `profile-load.txt` proves the sandbox loaded.
 - Release: `release/veyra.log` contains no `reaper signalled orphan group` line; `provider-probes.txt` shows failed execs and no provider version.
 - Cleanup: `marker-check.txt` passes and DATA is absent while proof remains.
+
+### Evidence contract
+
+```json
+{
+  "required": {
+    "app-launch-main": [
+      "window-launch.png",
+      "dump-before.json",
+      "second-launch.txt"
+    ],
+    "app-launch": [
+      "initial-database.txt",
+      "after-migration-database.txt",
+      "persisted-project.txt",
+      "migration-unlinked-report.png"
+    ],
+    "app-launch-release": [
+      "release/ctl.txt",
+      "release/strings.txt",
+      "release/data-listing.txt",
+      "release/provider-probes.txt"
+    ]
+  },
+  "pairs": {}
+}
+```
 
 ## Gotchas
 

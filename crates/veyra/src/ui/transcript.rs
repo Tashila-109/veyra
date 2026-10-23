@@ -636,6 +636,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
         .map(|reason| reason.to_string());
     let mut content = div()
         .v_flex()
+        .relative()
         .flex_1()
         .min_h_0()
         .items_center()
@@ -694,7 +695,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
         .child(
             div()
                 .flex_1()
-                .min_h_0()
+                .min_h(t.text.read.line_height.to_pixels(t.text.base) * 3.)
                 .w_full()
                 .max_w(t.layout.transcript_max)
                 .vertical_scrollbar(&shell.scroller.read(cx).list)
@@ -807,8 +808,19 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .max_w(t.layout.composer_max)
                 .v_flex()
                 .min_h_0()
-                .max_h_full()
-                .py(t.space.0[5])
+                .flex_none()
+                .max_h(
+                    (shell.drawer_viewport
+                        - t.layout.header
+                        - t.text.read.line_height.to_pixels(t.text.base) * 3.
+                        - if shell.active_shell().is_some() {
+                            t.layout.drawer_min
+                        } else {
+                            Pixels::ZERO
+                        })
+                    .max(t.layout.composer_min_height),
+                )
+                .py(t.space.0[3])
                 .relative()
                 .debug_selector(|| "composition-surface".into())
                 .child(composer::render(shell, cx))
@@ -830,6 +842,15 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                     .absolute()
                     .size_full(),
                 ),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(shell.composition_height)
+                .w_full()
+                .max_w(t.layout.composer_max)
+                .h(t.layout.fade)
+                .bg(t.composer_fade()),
         )
 }
 fn tool_label(call: &ToolCall) -> String {

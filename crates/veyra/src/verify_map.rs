@@ -49,9 +49,17 @@ fn dump_keys(source: &str) -> BTreeSet<String> {
 }
 #[test]
 fn verify_nested_dump_names() {
-    let skill =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.agents/skills/verify-veyra/SKILL.md");
-    let map = fs::read_to_string(skill).unwrap();
+    let skill = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.agents/skills/verify-veyra");
+    let mut map = fs::read_to_string(skill.join("SKILL.md")).unwrap();
+    let mut pages: Vec<_> = fs::read_dir(skill.join("features"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .collect();
+    pages.sort();
+    for page in pages {
+        map.push_str(&fs::read_to_string(page).unwrap());
+    }
     let mapped: BTreeSet<_> = identifiers(&map).collect();
     for name in [
         "follow",

@@ -25,6 +25,13 @@ pub(super) struct Drawer {
     pub next: u64,
     pub tabs: Vec<Tab>,
 }
+#[derive(Clone, Copy)]
+pub(super) struct Drag {
+    pub thread: ThreadId,
+    pub origin: Pixels,
+    pub height: Pixels,
+    pub bounds: (Pixels, Pixels),
+}
 pub(super) enum CloseTarget {
     Tab {
         thread: ThreadId,
@@ -40,15 +47,6 @@ pub(super) struct CloseSheet {
     pub target: CloseTarget,
     pub processes: Vec<String>,
     pub drawer_focus: bool,
-}
-fn shell_start_failure(error: &str) -> String {
-    let reason = error.strip_prefix("Provider protocol: ").unwrap_or(error);
-    let reason = if let Some(reason) = reason.strip_prefix("Unable to spawn ") {
-        reason.replacen(" because ", ": ", 1)
-    } else {
-        reason.to_owned()
-    };
-    format!("The shell could not start: {reason}. Press Return to restart.")
 }
 impl Shell {
     pub(super) fn active_shell(&self) -> Option<&Tab> {
@@ -136,8 +134,7 @@ impl Shell {
         }
         let cwd = row.cwd.clone();
         let theme = cx.global::<Theme>();
-        let height =
-            theme.space.0[8] + theme.text.terminal.line_height.to_pixels(window.rem_size()) * 12.;
+        let height = theme.layout.drawer_default;
         self.engine
             .set_terminal_colors(theme.terminal.engine_colors());
         let (handle, error) = match self.engine.open_shell(thread, cwd, PtySize::default()) {
@@ -414,34 +411,33 @@ impl Shell {
         }
         self.sync_drawers(cx);
     }
-    pub(super) fn drawer_height_bounds(&self, window: &Window, cx: &App) -> (Pixels, Pixels) {
+    pub(super) fn drawer_height_bounds(&self, cx: &App) -> (Pixels, Pixels) {
         let theme = cx.global::<Theme>();
-        let min =
-            theme.space.0[8] + theme.text.terminal.line_height.to_pixels(window.rem_size()) * 6.;
-        let max = (window.viewport_size().height
+        let min = theme.layout.drawer_min;
+        let max = (self.drawer_viewport
             - theme.layout.header
             - self.composition_height
-            - theme.text.read.line_height.to_pixels(window.rem_size()) * 3.)
+            - theme.text.read.line_height.to_pixels(theme.text.base) * 3.)
             .max(min);
         (min, max)
     }
-    pub(super) fn clamp_drawer_height(&mut self, window: &Window, cx: &App) {
-        let (min, max) = self.drawer_height_bounds(window, cx);
-        if let Some(thread) = self.view.chat()
-            && let Some(drawer) = self.drawers.get_mut(&thread)
+    pub(super) fn displayed_drawer_height(&self, thread: ThreadId, cx: &App) -> Pixels {
+        let (min, max) = self.drawer_height_bounds(cx);
+        self.drawers[&thread].height.clamp(min, max)
+    }
+    pub(super) fn cancel_changed_drawer_drag(&mut self, cx: &App) {
+        if self
+            .drawer_resizing
+            .is_some_and(|drag| drag.bounds != self.drawer_height_bounds(cx))
         {
-            let height = drawer.height.clamp(min, max);
-            if height != drawer.height {
-                drawer.height = height;
-                self.drawer_resizing = None;
-            }
+            self.drawer_resizing = None;
         }
     }
-    pub(super) fn render_drawer(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_drawer(&self, _window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let thread = self.view.chat()?;
         let drawer = self.drawers.get(&thread).filter(|drawer| drawer.open)?;
         let theme = cx.global::<Theme>();
-        let tabs_height = theme.space.0[8];
+        let tabs_height = theme.layout.drawer_tabs;
         let mut tabs = div()
             .h_flex()
             .h(tabs_height)
@@ -452,7 +448,7 @@ impl Shell {
             tabs = tabs.child(
                 div()
                     .h_flex()
-                    .min_w(theme.text.read.line_height.to_pixels(window.rem_size()) * 3.)
+                    .min_w(theme.layout.drawer_tab)
                     .bg(if drawer.active == index {
                         theme.colors.card
                     } else {
@@ -492,7 +488,9 @@ impl Shell {
                     ShellStatus::Signalled => {
                         Some("Shell ended after a signal. Press Return to restart.".into())
                     }
-                    ShellStatus::Failed { error } => Some(shell_start_failure(&error)),
+                    ShellStatus::Failed { error } => {
+                        Some(format!("{error}. Press Return to restart."))
+                    }
                     _ => None,
                 })
         });
@@ -504,8 +502,12 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
-                    shell.drawer_resizing =
-                        Some((thread, event.position.y, shell.drawers[&thread].height));
+                    shell.drawer_resizing = Some(Drag {
+                        thread,
+                        origin: event.position.y,
+                        height: shell.displayed_drawer_height(thread, cx),
+                        bounds: shell.drawer_height_bounds(cx),
+                    });
                     cx.stop_propagation();
                 }),
             );
@@ -527,7 +529,7 @@ impl Shell {
         Some(
             div()
                 .v_flex()
-                .h(drawer.height)
+                .h(self.displayed_drawer_height(thread, cx))
                 .flex_none()
                 .min_h_0()
                 .w_full()
@@ -556,14 +558,23 @@ impl Shell {
                 .justify_center()
                 .track_focus(&self.close_focus)
                 .key_context("VeyraShellClose")
+                .pl(self.sidebar_width + theme.layout.border)
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .left(self.sidebar_width + theme.layout.border)
+                        .bg(theme.colors.scrim),
+                )
                 .child(
                     div()
                         .v_flex()
                         .w(theme.layout.transcript_min)
                         .p(theme.space.0[7])
                         .gap(theme.space.0[5])
-                        .rounded(theme.radius.large)
-                        .bg(theme.colors.card)
+                        .rounded(theme.radius.floating)
+                        .bg(theme.colors.floating)
+                        .shadow(theme.shadows.floating.clone())
                         .border(theme.layout.border)
                         .border_color(theme.colors.border_strong)
                         .child("Stop these commands?")
@@ -601,7 +612,7 @@ impl Shell {
         let Some(drawer) = self.drawers.get(&thread) else {
             return serde_json::json!({"open":false,"tabs":[]});
         };
-        serde_json::json!({"open":drawer.open,"height":f32::from(drawer.height),
+        serde_json::json!({"open":drawer.open,"height":f32::from(self.displayed_drawer_height(thread, cx)),
             "active_tab":drawer.tabs.get(drawer.active).map(|tab|tab.number),
             "tabs":drawer.tabs.iter().map(|tab| {
                 let counts = tab.view.read(cx).frame_counts();
@@ -617,29 +628,5 @@ impl Shell {
                         Some(ShellStatus::Failed { error }) => Some(error.clone()), _ => None })})
             }).collect::<Vec<_>>(),"terminal":self.active_shell().map(|tab|tab.view.read(cx).dump()),
             "close_sheet":self.close_sheet.as_ref().map(|sheet|&sheet.processes)})
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::shell_start_failure;
-    #[test]
-    fn failed_shell_message_uses_plain_reason() {
-        for (error, reason) in [
-            ("Permission denied", "Permission denied"),
-            (
-                "Provider protocol: The shell worker stopped unexpectedly",
-                "The shell worker stopped unexpectedly",
-            ),
-            (
-                "Unable to spawn /owned/shell because it is not executable",
-                "/owned/shell: it is not executable",
-            ),
-        ] {
-            assert_eq!(
-                shell_start_failure(error),
-                format!("The shell could not start: {reason}. Press Return to restart.")
-            );
-        }
     }
 }

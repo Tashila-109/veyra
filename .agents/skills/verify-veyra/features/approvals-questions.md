@@ -22,8 +22,9 @@ Composer ⌘↵ sends a nonempty draft and leaves the request pending; an empty 
 Every button's shortcut_chip reads the same bindings table as the keymap.
 Buttons answer their displayed request; an expired request or a question index that already advanced sends no answer.
 A question keeps its labeled text in a bounded scroll area above its options.
-Up to four options use one column; larger lists use three columns. Captions wrap in their buttons, and overflowing lists scroll with the shared visible scrollbar.
-A pending dock keeps the scrollable message input at a fixed 48px height; closing the dock restores its normal height limit.
+Up to four options use one column; larger lists use three columns.
+Captions wrap in their buttons, and overflowing lists scroll with the shared visible scrollbar.
+A pending dock keeps the scrollable message input between 48px and 240px within the shared flex budget; closing the dock restores its normal auto-growing layout.
 Click Focus to use shortcuts or press ⌘⇧Y to FocusDock.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
 More than one pending request shows 1 of N.
@@ -37,6 +38,7 @@ All added wires below are proof copies of Veyra's own fixtures.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -151,7 +153,14 @@ action('approval-long-command-focus','FocusDock')
 poll('approval-long-command-focused',lambda d: d['composer']['dock']['focused'])
 capture('approval-long-command')
 action('approval-long-command-scroll','DebugScrollApproval',{'pixels':-100000})
-scrolled = poll('approval-long-command-scrolled',lambda d:d['composer']['dock'].get('details_scroll',{}).get('offset_y',0) < 0)['composer']['dock']['details_scroll']
+last_scroll = {}
+def at_details_end(d):
+    last_scroll.clear()
+    last_scroll.update(d['composer']['dock'].get('details_scroll',{}))
+    return last_scroll.get('max_offset_y',0)>0 and last_scroll.get('offset_y')==-last_scroll['max_offset_y']
+try: scrolled = poll('approval-long-command-scrolled',at_details_end)['composer']['dock']['details_scroll']
+except AssertionError as error:
+    raise AssertionError(f"{error}; last offset_y={last_scroll.get('offset_y')}, max_offset_y={last_scroll.get('max_offset_y')}") from error
 assert scrolled['max_offset_y'] > 0 and abs(scrolled['offset_y']+scrolled['max_offset_y']) < 1
 capture('approval-long-command-end')
 ctl('approval-long-command-allow','keys','secondary-enter')
@@ -257,6 +266,7 @@ Run this fake-only section after the existing drive and before Evidence.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -351,7 +361,14 @@ assert dock['provider_text'][0]=={'kind':'working_folder','label':'Working folde
 assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
 capture('codex-long-working-folder')
 action('codex-long-working-folder-scroll','DebugScrollApproval',{'pixels':-100000})
-scrolled = poll('codex-long-working-folder-scrolled',lambda d:d['composer']['dock'].get('details_scroll',{}).get('offset_y',0) < 0)['composer']['dock']
+last_scroll = {}
+def at_details_end(d):
+    last_scroll.clear()
+    last_scroll.update(d['composer']['dock'].get('details_scroll',{}))
+    return last_scroll.get('max_offset_y',0)>0 and last_scroll.get('offset_y')==-last_scroll['max_offset_y']
+try: scrolled = poll('codex-long-working-folder-scrolled',at_details_end)['composer']['dock']
+except AssertionError as error:
+    raise AssertionError(f"{error}; last offset_y={last_scroll.get('offset_y')}, max_offset_y={last_scroll.get('max_offset_y')}") from error
 assert scrolled['provider_text'][0]==dock['provider_text'][0]
 capture('codex-long-working-folder-end')
 action('codex-long-working-folder-allow','AllowOnce',{'request':dock['request']['id']})
@@ -494,6 +511,7 @@ Stop removes the question dock; `requests` and SQLite preserve its Expired state
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
@@ -618,7 +636,7 @@ The two question PNGs dock the flat live shape under the running turn and cover 
 
 `question.png`, `question-focused.png` and `codex-question.png` show two-option docks with text clear of the controls.
 `question-four.png` shows the four realistic database labels in one column.
-`question-nine.png` shows every long route label wrapped in three columns below the 400-character question, with a tall draft retained in the fixed 48px message input.
+`question-nine.png` shows every long route label wrapped in three columns below the 400-character question, with a tall draft retained in the scrollable message input.
 The digit-9 reply preserves the ninth route label as the answer in the strict fixture and stored user text.
 The dock renders the typed request, not provider wire, so Codex's four- and nine-option questions share Claude's layout.
 `every_dock_kind_has_disjoint_regions_and_controls_in_window` checks that layout for every dock kind, and `codex_question_answered` (`crates/engine/tests/replay_codex.rs`) replays Codex's question wire to its answer, so this page drives those two Codex docks no longer.
@@ -632,7 +650,9 @@ The shared scrollbar uses a 16px logical thumb minimum so even a one-line track 
 
 `codex-command-invisibles.png` shows U+202E and U+200B markers in the command and grant button; the stored request keeps the exact bytes and Allow once completes the fixture.
 Previews mark control characters too, and literal file and working-folder paths mark embedded newlines.
-`DebugScrollApproval` changes the same details scroll handle used by the wheel. `composer.dock.details_scroll.offset_y` and `max_offset_y` prove an overflowing approval reached its end and the next request opened at zero. `approval-long-command-end.png` shows the first approval scrolled; `approval-new-long-command.png` shows the next long command starting with its curl-to-shell line.
+`DebugScrollApproval` changes the same details scroll handle used by the wheel.
+`composer.dock.details_scroll.offset_y` and `max_offset_y` prove an overflowing approval reached its end and the next request opened at zero.
+`approval-long-command-end.png` shows the first approval scrolled; `approval-new-long-command.png` shows the next long command starting with its curl-to-shell line.
 `codex-long-working-folder.png` and `codex-long-working-folder-end.png` show a complete, marked working folder longer than 2,000 characters in its own viewport of at most three text lines above the scrolling details.
 Allow and Deny and the command's first line remain visible when it opens; the model-written reason stays inside the details.
 The GPUI wheel test proves the folder scrolls to its end independently without eliding its path.
@@ -647,7 +667,8 @@ File and permission denials, the Violet answer and both MCP decisions are persis
 The reason PNG shows a single quoted provider line, under its own label and apart from the consequence.
 The async-question PNG shows the complete two-paragraph markdown reply above the quoted sanitized title, option controls and choice consequence; its captured UserText preserves the option's exact bidi-bearing bytes.
 The chosen PNG retains the question, shows Sent Violet and disables both controls.
-Command-1 chooses the latest-turn card. The typed-answer PNG leaves its option unselected and closes both controls; a later key or explicit stale choice starts no third turn.
+Command-1 chooses the latest-turn card.
+The typed-answer PNG leaves its option unselected and closes both controls; a later key or explicit stale choice starts no third turn.
 The strict fixture requires its pending request cancellation before interrupt and Violet as ordinary user input; SQLite records two User turns, the expired request and no hold.
 Both MCP PNGs name `veyra / list_providers` and show Deny and Allow once without a thread grant.
 The second MCP dock is focused so its answer shortcuts distinguish the captures even when the changed sidebar row or request details are off-screen.
@@ -657,7 +678,8 @@ The focused approval PNGs show Allow once, Deny and their answer chords, matchin
 The project file stays absent after Deny and exists after Allow once.
 The Write PNGs and action_text/consequence fields show absolute targets inside and outside the project, plus their content preview.
 The WebFetch, NotebookEdit and MCP PNGs show their full arguments in a bounded, scrollable area.
-The long-command PNG shows a heredoc in that area with an always-visible scrollbar, a 202-line consequence above it, and Allow and Deny visible below it. The MCP preview retains its pretty JSON line breaks.
+The long-command PNG shows a heredoc in that area with an always-visible scrollbar, a 202-line consequence above it, and Allow and Deny visible below it.
+The MCP preview retains its pretty JSON line breaks.
 Its action_text keeps heredoc newlines and marks invisible characters; its stored grant key preserves the whole original command.
 Only the provider codec interprets tool fields and resolves file locations; rendering consumes typed data.
 Those fake requests check dock presentation, not outside file effects.
@@ -668,6 +690,98 @@ SQLite records one grant and three requests, showing the identical granted reque
 `question-two.png` shows 1 of 2; `question-two-next.json` and its PNG show the remaining request still focused.
 The next digit answers it without refocusing; `questions-done.json` and SQLite show both answered.
 `composer.dock`, `requests`, `selected_thread.status` and `transcript.items` are the observable window state.
+
+### Dump fields
+
+`composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
+Approval answer chords appear only with dock focus; otherwise its hint shows the FocusDock chord.
+Approval dock action_text, consequence and preview report the same typed target, one-line effect and bounded arguments rendered in the window.
+Consent command, preview and path displays mark Unicode controls and invisible formats as ⟨U+XXXX⟩; command newlines remain for heredocs.
+The dock's grant_caption uses the same marked command as the thread-grant button; request and grant identities keep the exact raw bytes.
+The dock emits details_scroll, with offset_y and max_offset_y, only after the rendered scroll handle matches its current request id.
+Poll for its presence after a request change.
+DebugScrollApproval accepts a finite pixels value and scrolls that same handle, without changing the pending request or its decision.
+A new docked request resets to the top.
+The consequence and any outside working folder sit above it.
+The folder value has its own vertical scroll, bounded to three label-text lines; replacing both scroll handles on a changed request id opens each request at the top without eliding the marked path.
+Its kit scrollbar stays visible whenever the folder overflows and is absent when the path fits.
+Allow and Deny stay below that area.
+Approval docks report `allow_once_enabled`, `allow_in_thread_enabled` and `consent_reason` from the same consent used by their buttons.
+A Deny-only request keeps both allow buttons disabled, shows its reason above the details and leaves Deny enabled.
+Questions share the same unfocused FocusDock prompt.
+Up to four options use one column and larger lists use three columns.
+Captions wrap without visual truncation; overflowing lists use the same bounded scrollbar.
+The request and question index own independent text and option-list scroll resets.
+A pending dock leaves the message input every available pixel up to 240px, with a 48px minimum and a scrollable draft.
+Answering one request keeps dock focus while requests remain.
+`notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
+
+A cut preview ends with a notice.
+The command or file path, the model-written reason and the bounded preview share the details scroll area, capped at 240px and shrinking to the window height left by the fixed controls.
+The transcript gives up space first, and the details keep at least the command's first line.
+Disabled allow buttons show no answer chord, and their key or action cannot send a response.
+Their quoted text scrolls within a one-line minimum and 240px maximum, independently of the label and options.
+
+### Evidence contract
+
+```json
+{
+  "required": {
+    "approvals-questions": [
+      "approval-deny.png",
+      "approval-allow.png",
+      "question.png",
+      "question-two.png",
+      "question-four.png",
+      "question-nine.png",
+      "approvals-done.json",
+      "questions-done.json",
+      "approval-composer-pending.json",
+      "question-focused.png",
+      "approval-deny-focused.png",
+      "approval-allow-focused.png",
+      "question-two-next.png",
+      "approval-write-inside.png",
+      "approval-write-outside.png",
+      "approval-web-fetch.png",
+      "approval-notebook-edit.png",
+      "approval-mcp.png",
+      "approval-long-command.png",
+      "approval-long-command-end.png",
+      "approval-new-long-command.png"
+    ],
+    "approvals-questions-codex": [
+      "codex-command.json",
+      "codex-command.png",
+      "codex-command-other-cwd.png",
+      "codex-file.png",
+      "codex-permissions.png",
+      "codex-question.png",
+      "codex-mcp-first.png",
+      "codex-mcp-second.png",
+      "codex-async-question.png",
+      "codex-async-question-chosen.png",
+      "codex-async-question-typed-closed.png",
+      "codex-card-done.json",
+      "codex-reason-quoted.png",
+      "codex-long-working-folder.png",
+      "codex-long-working-folder-end.png"
+    ],
+    "approvals-questions-grok": [
+      "grok-approval-deny.png",
+      "grok-approval-allow.png",
+      "grok-deny-only.json",
+      "grok-deny-only.png",
+      "grok-question.png",
+      "grok-question-second.png",
+      "grok-questions-done.json",
+      "grok-question-expired.json",
+      "grok-question-expired.png"
+    ]
+  },
+  "pairs": {}
+}
+```
 
 ## Gotchas
 

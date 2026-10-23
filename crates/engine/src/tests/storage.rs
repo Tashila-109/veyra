@@ -407,7 +407,8 @@ fn set_default_mode_persists_and_publishes() {
             UiEvent::Change {
                 counter: None,
                 event: Ev::SettingsChanged(Settings {
-                    default_mode: PermissionMode::FullAccess
+                    default_mode: PermissionMode::FullAccess,
+                    window_background: WindowBackground::Translucent
                 })
             },
             UiEvent::Change {
@@ -441,7 +442,8 @@ fn set_default_mode_persists_and_publishes() {
         vec![UiEvent::Change {
             counter: None,
             event: Ev::SettingsChanged(Settings {
-                default_mode: PermissionMode::AskFirst
+                default_mode: PermissionMode::AskFirst,
+                window_background: WindowBackground::Translucent
             })
         }]
     );
@@ -618,13 +620,20 @@ fn startup_normalizes_empty_cli_versions() {
         .db
         .execute("UPDATE threads SET cli_version=''", [])
         .unwrap();
-    f.actor.db.pragma_update(None, "user_version", 1).unwrap();
     assert_eq!(f.loaded().threads[&f.thread].cli_version, None);
     f.actor
         .db
-        .execute_batch("ALTER TABLE tasks DROP COLUMN source_item_id")
+        .execute_batch(
+            "ALTER TABLE tasks DROP COLUMN source_item_id;
+             ALTER TABLE settings DROP COLUMN window_background;",
+        )
         .unwrap();
+    f.actor.db.pragma_update(None, "user_version", 1).unwrap();
     store::initialize(&mut f.actor.db).unwrap();
+    assert_eq!(
+        f.loaded().settings.window_background,
+        WindowBackground::Translucent
+    );
     let version: Option<String> = f
         .actor
         .db

@@ -657,7 +657,8 @@ pub struct Shell {
     drawers: BTreeMap<ThreadId, drawer::Drawer>,
     close_sheet: Option<drawer::CloseSheet>,
     close_focus: FocusHandle,
-    drawer_resizing: Option<(ThreadId, Pixels, Pixels)>,
+    drawer_resizing: Option<drawer::Drag>,
+    drawer_viewport: Pixels,
     composition_height: Pixels,
     #[cfg(debug_assertions)]
     drawer_rail: Option<(ThreadId, Bounds<Pixels>)>,
@@ -731,6 +732,18 @@ impl Shell {
         let focus = cx.focus_handle();
         cx.observe_window_activation(window, |shell, window, cx| {
             shell.window_active = window.is_window_active();
+            if shell.window_active {
+                let mut look = cx.try_global::<theme::Look>().copied().unwrap_or_default();
+                #[cfg(debug_assertions)]
+                let refresh = !look.overridden;
+                #[cfg(not(debug_assertions))]
+                let refresh = true;
+                if refresh {
+                    look.options = veyra_engine::platform::display_options();
+                    cx.set_global(look);
+                    Theme::apply(Appearance::from_window(window.appearance()), window, cx);
+                }
+            }
             cx.notify();
         })
         .detach();
@@ -768,6 +781,7 @@ impl Shell {
                 if this
                     .update_in(cx, |shell, window, cx| {
                         let old_default = shell.state.settings.default_mode;
+                        let old_background = shell.state.settings.window_background;
                         for event in &batch {
                             match event {
                                 UiEvent::StorageBlocked { error } => {
@@ -791,6 +805,13 @@ impl Shell {
                             .chat()
                             .map_or(0, |thread| shell.state.family_offset(thread));
                         shell.state.apply_all(batch);
+                        if old_background != shell.state.settings.window_background {
+                            let mut look =
+                                cx.try_global::<theme::Look>().copied().unwrap_or_default();
+                            look.requested = shell.state.settings.window_background;
+                            cx.set_global(look);
+                            Theme::apply(Appearance::from_window(window.appearance()), window, cx);
+                        }
                         shell.leave_archived_thread(window, cx);
                         shell.post_banners(&families, cx);
                         shell.start_branch_lookup(cx);
@@ -837,7 +858,7 @@ impl Shell {
             }
         })
         .detach();
-        let cadence = cx.global::<Theme>().motion.spinner.duration;
+        let cadence = std::time::Duration::from_secs(1);
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(cadence).await;
@@ -861,6 +882,7 @@ impl Shell {
             close_sheet: None,
             close_focus: cx.focus_handle(),
             drawer_resizing: None,
+            drawer_viewport: window.viewport_size().height,
             composition_height: Pixels::ZERO,
             #[cfg(debug_assertions)]
             drawer_rail: None,
@@ -1553,14 +1575,23 @@ impl Shell {
             .justify_center()
             .track_focus(&self.quit_focus)
             .key_context("VeyraQuit")
+            .pl(self.sidebar_width + t.layout.border)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .left(self.sidebar_width + t.layout.border)
+                    .bg(t.colors.scrim),
+            )
             .child(
                 div()
                     .v_flex()
                     .w(t.layout.transcript_min)
                     .p(t.space.0[7])
                     .gap(t.space.0[5])
-                    .rounded(t.radius.large)
-                    .bg(t.colors.card)
+                    .rounded(t.radius.floating)
+                    .bg(t.colors.floating)
+                    .shadow(t.shadows.floating.clone())
                     .border(t.layout.border)
                     .border_color(t.colors.border_strong)
                     .child(div().text_size(t.text.h2.size).child("Quit Veyra?"))
@@ -1963,6 +1994,12 @@ impl Shell {
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
             "login_path":self.engine.login_path_status(),
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
+            "look":{"background":cx.global::<Theme>().look.background(),
+                "stored":self.state.settings.window_background,
+                "reduce_transparency":cx.global::<Theme>().look.options.reduce_transparency,
+                "increase_contrast":cx.global::<Theme>().look.options.increase_contrast,
+                "reduce_motion":cx.global::<Theme>().look.options.reduce_motion,
+                "forced_by":cx.global::<Theme>().look.forced_by()},
             "header_branch":self.branch, "drawer":self.drawer_dump(cx),
             "focus":if self.active_shell().is_some_and(|tab|tab.view.read(cx).focused()) {
                 "drawer"
@@ -1972,7 +2009,7 @@ impl Shell {
             "selected_thread":self.dump_selected(), "transcript":transcript,
             "composer_text":self.input.read(cx).value().to_string(),
             "composer_caret":self.input.read(cx).cursor(), "composer":self.dump_composer(cx),
-            "providers":self.dump_providers(), "settings":{"default_mode":self.state.settings.default_mode},
+            "providers":self.dump_providers(), "settings":self.state.settings,
             "awake":self.engine.awake(), "processes":self.engine.processes(),
             "perf":{"applied_batches":self.state.applied_batches, "max_batch_gap_ms":self.state.gap.maximum_ms,
                 "visible":{"thread":self.state.visible_perf.thread,"applied_batches\
@@ -2008,7 +2045,8 @@ impl Focusable for Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_drawers(cx);
-        self.clamp_drawer_height(window, cx);
+        self.drawer_viewport = window.viewport_size().height;
+        self.cancel_changed_drawer_drag(cx);
         #[cfg(debug_assertions)]
         {
             self.repaints += 1;
@@ -2046,7 +2084,6 @@ impl Render for Shell {
             .h_flex()
             .size_full()
             .relative()
-            .bg(theme.colors.bg)
             .text_color(theme.colors.text)
             .font_family(theme.text.ui_font.clone())
             .text_size(theme.text.ui.size)
@@ -2204,6 +2241,22 @@ impl Render for Shell {
                     .unwrap_or_else(|| settings::next_mode(shell.state.settings.default_mode));
                 shell.send_command(Command::SetDefaultMode { mode }, window, cx);
             }))
+            .on_action(
+                cx.listener(|shell, action: &SetWindowBackground, window, cx| {
+                    let background =
+                        action
+                            .background
+                            .unwrap_or(match shell.state.settings.window_background {
+                                veyra_engine::domain::WindowBackground::Translucent => {
+                                    veyra_engine::domain::WindowBackground::Solid
+                                }
+                                veyra_engine::domain::WindowBackground::Solid => {
+                                    veyra_engine::domain::WindowBackground::Translucent
+                                }
+                            });
+                    shell.send_command(Command::SetWindowBackground { background }, window, cx);
+                }),
+            )
             .on_action(cx.listener(|shell, _: &OpenProviderPicker, window, cx| {
                 if shell.view == MainView::NewThread {
                     shell.set_provider_picker(shell.provider_picker.is_none(), window, cx);
@@ -2426,9 +2479,16 @@ impl Render for Shell {
                 );
             }))
             .on_mouse_move(cx.listener(|shell, event: &MouseMoveEvent, window, cx| {
-                if let Some((thread, origin, height)) = shell.drawer_resizing {
+                shell.cancel_changed_drawer_drag(cx);
+                if let Some(drawer::Drag {
+                    thread,
+                    origin,
+                    height,
+                    ..
+                }) = shell.drawer_resizing
+                {
                     if event.pressed_button == Some(MouseButton::Left) {
-                        let (min, max) = shell.drawer_height_bounds(window, cx);
+                        let (min, max) = shell.drawer_height_bounds(cx);
                         if let Some(drawer) = shell.drawers.get_mut(&thread) {
                             drawer.height = (height + origin - event.position.y).clamp(min, max);
                             cx.notify();
@@ -2453,7 +2513,7 @@ impl Render for Shell {
                     shell.drawer_resizing = None;
                 }),
             )
-            .child(sidebar::render(self, cx))
+            .child(sidebar::render(self, window, cx))
             .child(
                 div()
                     .id("sidebar-resize")
@@ -2476,6 +2536,7 @@ impl Render for Shell {
                     .flex_1()
                     .min_w_0()
                     .h_full()
+                    .bg(theme.colors.bg)
                     .child(header::render(self, cx))
                     .child(match self.view {
                         MainView::NewThread => new_thread::render(self, cx).into_any_element(),
@@ -2491,6 +2552,18 @@ impl Render for Shell {
         let root = root.when(self.quit_sheet, |root| {
             root.child(self.render_quit_sheet(cx))
         });
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|_, action: &DebugDisplayOptions, window, cx| {
+            let mut look = cx.try_global::<theme::Look>().copied().unwrap_or_default();
+            look.options = veyra_engine::platform::DisplayOptions {
+                reduce_transparency: action.reduce_transparency,
+                increase_contrast: action.increase_contrast,
+                reduce_motion: action.reduce_motion,
+            };
+            look.overridden = true;
+            cx.set_global(look);
+            Theme::apply(Appearance::from_window(window.appearance()), window, cx);
+        }));
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|shell, _: &DebugFocusShellDrawer, window, cx| {
             shell.focus_shell(window, cx);
@@ -2620,6 +2693,11 @@ pub fn run(
             theme::register_fonts(cx).expect("bundled Geist fonts");
             actions::init(cx);
             let layout = Theme::new(Appearance::Dark).layout;
+            let look = theme::Look {
+                options: veyra_engine::platform::display_options(),
+                ..Default::default()
+            };
+            cx.set_global(look);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -2627,6 +2705,7 @@ pub fn run(
                     cx,
                 ))),
                 window_min_size: Some(layout.window_min),
+                window_background: look.window_background(),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Veyra".into()),
                     appears_transparent: true,
@@ -2775,8 +2854,10 @@ mod tests {
     #[gpui::test]
     fn sidebar_tooltip_uses_shared_status_display(_: &mut gpui::TestAppContext) {
         assert!(
-            include_str!("sidebar.rs").contains(".tooltip(super::header::status_text(&status))")
+            include_str!("sidebar.rs")
+                .contains("let tooltip = super::header::status_text(&status);")
         );
+        assert!(include_str!("sidebar.rs").contains("Tooltip::new(tooltip.clone())"));
         assert_eq!(super::header::status_text(&Status::NeedsYou), "Needs you");
     }
 
@@ -7783,7 +7864,111 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn drawer_shrink_while_dragging_cancels_motion(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            cx.simulate_resize(gpui::size(
+                gpui::Pixels::from(1280.),
+                gpui::Pixels::from(800.),
+            ));
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.toggle_drawer(window, cx);
+            });
+            draw(cx);
+            shell.update_in(cx, |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(super::actions::DebugDragShellDrawer { pixels: 400. }),
+                    cx,
+                );
+            });
+            draw(cx);
+            let rail = cx.debug_bounds("shell-drawer").unwrap();
+            let position = gpui::point(
+                gpui::Pixels::from(500.),
+                rail.top() + gpui::Pixels::from(2.),
+            );
+            cx.simulate_event(gpui::MouseDownEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+            assert!(shell.read_with(cx, |shell, _| shell.drawer_resizing.is_some()));
+            cx.simulate_resize(gpui::size(
+                gpui::Pixels::from(1280.),
+                gpui::Pixels::from(650.),
+            ));
+            draw(cx);
+            let shrunk = cx.debug_bounds("shell-drawer").unwrap().size.height;
+            assert!(shell.read_with(cx, |shell, _| shell.drawer_resizing.is_none()));
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: position + gpui::point(gpui::Pixels::ZERO, gpui::Pixels::from(48.)),
+                pressed_button: Some(gpui::MouseButton::Left),
+                ..Default::default()
+            });
+            draw(cx);
+            assert_eq!(cx.debug_bounds("shell-drawer").unwrap().size.height, shrunk);
+            cx.simulate_event(gpui::MouseUpEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            });
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn drawer_chosen_height_returns_after_composer_shrinks(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            cx.simulate_resize(gpui::size(
+                gpui::Pixels::from(1280.),
+                gpui::Pixels::from(800.),
+            ));
+            shell.update_in(cx, |shell, window, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.toggle_drawer(window, cx);
+            });
+            draw(cx);
+            shell.update_in(cx, |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(super::actions::DebugDragShellDrawer { pixels: 400. }),
+                    cx,
+                )
+            });
+            draw(cx);
+            let chosen = cx.debug_bounds("shell-drawer").unwrap().size.height;
+            shell.update_in(cx, |shell, window, cx| {
+                shell.input.update(cx, |input, cx| {
+                    input.set_value("draft line\n".repeat(10), window, cx);
+                })
+            });
+            draw(cx);
+            let reduced = cx.debug_bounds("shell-drawer").unwrap().size.height;
+            assert!(reduced < chosen, "the long draft must clamp the drawer");
+            shell.read_with(cx, |shell, cx| {
+                assert_eq!(shell.drawers[&shell.view.chat().unwrap()].height, chosen);
+                assert_eq!(
+                    shell.dump(std::path::Path::new("/tmp"), cx)["drawer"]["height"],
+                    f64::from(reduced)
+                );
+            });
+            shell.update_in(cx, |shell, window, cx| {
+                shell.input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                })
+            });
+            draw(cx);
+            assert_eq!(cx.debug_bounds("shell-drawer").unwrap().size.height, chosen);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn drawer_return_uses_live_key_path_and_restarts_ended_tab(cx: &mut gpui::TestAppContext) {
+        cx.dispatcher.allow_parking();
         use std::time::{Duration, Instant};
         use veyra_engine::{provider::env::ChildEnv, terminal::PtySize};
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -7905,6 +8090,13 @@ mod tests {
             wait(&|| restarted.pid().is_some());
             assert_ne!(restarted.pid(), Some(pid));
             assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+            let restarted_pid = restarted.pid().unwrap();
+            shutdown.engine.close_shell(&restarted);
+            wait(&|| {
+                restarted.status().is_finished()
+                    && !veyra_engine::platform::is_alive(restarted_pid).unwrap()
+            });
+            draw(cx);
         });
     }
 
@@ -7992,6 +8184,16 @@ mod tests {
             draw(cx);
             let bounds = cx.debug_bounds("shell-drawer").unwrap();
             assert!(bounds.size.height < maximum);
+            shell.read_with(cx, |shell, cx| {
+                eprintln!(
+                    "SHRUNK viewport={:?} composition={:?} chosen={:?} displayed={:?} actual={:?}",
+                    shell.drawer_viewport,
+                    shell.composition_height,
+                    shell.drawers[&shell.view.chat().unwrap()].height,
+                    shell.displayed_drawer_height(shell.view.chat().unwrap(), cx),
+                    bounds
+                )
+            });
             let position = gpui::point(
                 gpui::Pixels::from(500.),
                 bounds.top() + gpui::Pixels::from(2.),

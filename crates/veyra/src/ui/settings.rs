@@ -1,8 +1,12 @@
-use super::{actions::SetDefaultMode, composer::labelled_button, theme::Theme};
+use super::{
+    actions::{SetDefaultMode, SetWindowBackground},
+    composer::labelled_button,
+    theme::Theme,
+};
 use gpui_kit::base::Selectable;
 use gpui_kit::component::StyledExt;
 use gpui_kit::{prelude::*, *};
-use veyra_engine::domain::{PermissionMode, Settings};
+use veyra_engine::domain::{PermissionMode, Settings, WindowBackground};
 
 pub const MODES: [PermissionMode; 3] = [
     PermissionMode::AskFirst,
@@ -54,7 +58,9 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
             div()
                 .v_flex()
                 .w_full()
-                .max_w(t.layout.transcript_max)
+                .max_w(t.layout.composer_max)
+                .pl(t.space.0[5])
+                .pr(t.space.0[5])
                 .gap(t.space.0[5])
                 .child(
                     div()
@@ -67,6 +73,13 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                     MODES.into_iter().enumerate().map(|(index, mode)| {
                         labelled_button(("default-mode", index), mode_label(mode), cx)
                             .selected(mode == settings.default_mode)
+                            .when(mode == settings.default_mode, |button| {
+                                button
+                                    .bg(t.plate(t.colors.card))
+                                    .border(t.layout.border)
+                                    .border_color(t.colors.border)
+                                    .shadow(t.plate_highlight())
+                            })
                             .on_click(move |_, window, cx| {
                                 window.dispatch_action(
                                     Box::new(SetDefaultMode { mode: Some(mode) }),
@@ -87,6 +100,59 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                         .line_height(t.text.meta.line_height)
                         .text_color(t.colors.text_muted)
                         .child("Applies to threads you create from now on"),
+                )
+                .child(
+                    div()
+                        .mt(t.space.0[7])
+                        .text_size(t.text.h2.size)
+                        .line_height(t.text.h2.line_height)
+                        .font_weight(t.text.h2.weight)
+                        .child("Window background"),
+                )
+                .child(
+                    div().h_flex().gap(t.layout.segment_padding).children(
+                        [
+                            (WindowBackground::Translucent, "Translucent"),
+                            (WindowBackground::Solid, "Solid"),
+                        ]
+                        .into_iter()
+                        .map(|(background, label)| {
+                            labelled_button(label, label, cx)
+                                .selected(background == settings.window_background)
+                                .when(background == settings.window_background, |button| {
+                                    button
+                                        .bg(t.plate(t.colors.card))
+                                        .border(t.layout.border)
+                                        .border_color(t.colors.border)
+                                        .shadow(t.plate_highlight())
+                                })
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(SetWindowBackground {
+                                            background: Some(background),
+                                        }),
+                                        cx,
+                                    )
+                                })
+                        }),
+                    ),
+                )
+                .child(
+                    div()
+                        .text_size(t.text.meta.size)
+                        .line_height(t.text.meta.line_height)
+                        .text_color(t.colors.text_muted)
+                        .child(
+                            t.look
+                                .forced_by()
+                                .map(|flag| {
+                                    format!("Solid is required by {flag}. Your choice is saved.")
+                                })
+                                .unwrap_or_else(|| {
+                                    "Translucent shows your desktop softly through the sidebar."
+                                        .into()
+                                }),
+                        ),
                 ),
         )
         .when_some(notice, |this, notice| {

@@ -1,4 +1,8 @@
 #!/bin/sh
 # Print the verify-veyra pages whose Status FINGERPRINT still matches; see SKILL.md, section Selection.
+if [ "${1-}" = --help ] || [ "${1-}" = -h ]; then
+    printf '%s\n' 'usage: bin/fresh-pages HEAD [--versions FILE] | --print COMMIT'
+    exit 0
+fi
 if [ "$1" = --print ]; then shift; exec python3 "$(dirname "$0")/pages.py" print "$@"; fi
 exec python3 "$(dirname "$0")/pages.py" fresh "$@"
