@@ -317,7 +317,8 @@ A pending request makes the thread NeedsYou and docks its exact command, tool ta
 The Claude codec turns each approval into ProposedAction, a tool label and provider-neutral ApprovalTarget: Command, File or Tool.
 Command preserves exact command text; File carries its operation, literal target path, location and preview; Tool carries its argument preview.
 File previews include content and edit strings, and other tool previews include every argument as pretty-printed text.
-Command previews include all arguments other than the separately displayed command.
+Each codec builds the residual approval preview from the fields it did not map into separately displayed typed values.
+Claude command previews omit command and the description or reason selected for the reason quote; an additional reason or description and an unrecognized cwd remain in the preview.
 Each preview retains at most TOOL_OUTPUT_CHARS, the same 10,000-character cap as tool output, and carries a truncation flag rendered as a cut notice.
 Write, Edit, MultiEdit and Read use file_path; NotebookEdit uses notebook_path.
 A missing target or a conflicting file_path, path or notebook_path becomes a Tool action showing every argument without a file-location claim.
@@ -676,10 +677,13 @@ Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
 A command approval with a known folder shows it in a separate labeled, muted quote; a reported outside cwd takes precedence over the project folder.
 CommandCwd::NotVerified instead shows the unverified-location consequence and no folder quote.
-The model-written reason is a typed ApprovalPreview hydrated at action construction or legacy deserialization and has its own labeled quote.
-Command previews omit only the separately displayed command, cwd, reason or description and the named internal thread, turn, item, tool-call, timestamp, environment and request-kind keys.
-Every other field remains in the marked preview, including sandbox options, and truncated previews keep their cut notice.
-An incomplete JSON preview remains visible as stored text.
+The model-written reason is a typed ApprovalPreview selected by the codec or hydrated at legacy action construction or deserialization and has its own labeled quote.
+Each codec omits only the fields it mapped into the command, a shown working folder or the selected reason, plus its own wire identity fields.
+Codex removes threadId, turnId and itemId from its params preview, and removes cwd only when CommandCwd names a shown folder; Claude and Grok take their previews from tool input, outside the wrapper that carries their invocation ids.
+Grok leaves an unrecognized cwd in its preview and selects description before reason, retaining the other explanation.
+Every unmapped field remains in the preview, including environment, network and sandbox options, and truncated previews keep their cut notice.
+The window applies the consent projection to the received preview without decoding JSON or omitting keys.
+A stored preview from an older codec, including incomplete JSON, remains visible in full.
 The working-folder quote stays beside the consequence above the scrolling details, with its path in a vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
 ToolCall retains its serde-defaulted veyra_label flag for stored compatibility.
 Transcript tool titles use unquoted bounded display text for both Veyra and provider names, followed by a distinct command, search target or other main argument when present.
@@ -793,6 +797,7 @@ Both x.ai and _x.ai task_backgrounded and task_completed spellings update the ba
 Task updates prefer update.task_snapshot.task_id and fall back to update.task_id; the recorded backgrounding frames carry the root task_id.
 The actor's existing background-work flag prevents Configure, parking and early task settlement while that set is nonempty.
 Text, reasoning, tool rows and plans normalize to engine events; tool output emits cumulative-output suffix deltas and the actor bounds their retained tail.
+One Grok tool-key function links tool creation and permission requests to the same invocation.
 A nonempty changed tool title emits ToolTitleChanged before output or completion.
 The actor replaces the existing keyed ToolItem.call.name through ItemAdded, preserving its item id, sequence, input and output; it never creates a row for a title update.
 Permission option kinds, session-update kinds, tool status and completion reasons decode into enums with an Unknown fallback.

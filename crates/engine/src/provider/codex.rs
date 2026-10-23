@@ -1020,8 +1020,18 @@ impl Codec {
             ));
             return;
         }
-        let preview =
-            || ApprovalPreview::new(serde_json::to_string_pretty(&params).unwrap_or_default());
+        let preview = |shown: &[&str]| {
+            let mut residual = params.clone();
+            if let Some(fields) = residual.as_object_mut() {
+                for key in ["threadId", "turnId", "itemId"]
+                    .into_iter()
+                    .chain(shown.iter().copied())
+                {
+                    fields.remove(key);
+                }
+            }
+            ApprovalPreview::new(serde_json::to_string_pretty(&residual).unwrap_or_default())
+        };
         let approval = |tool: String, target| RequestKind::Approval {
             action: ProposedAction::new(tool, target),
         };
@@ -1046,6 +1056,13 @@ impl Codec {
                 } else {
                     CommandCwd::NotVerified
                 };
+                let mut shown = vec!["command"];
+                if !matches!(location, CommandCwd::NotVerified) {
+                    shown.push("cwd");
+                }
+                if command.reason.is_some() {
+                    shown.push("reason");
+                }
                 (
                     RequestKind::Approval {
                         action: ProposedAction::new(
@@ -1054,7 +1071,7 @@ impl Codec {
                                 command: text.into(),
                                 cwd: location,
                                 reason: command.reason.clone().map(ApprovalPreview::new),
-                                preview: preview(),
+                                preview: preview(&shown),
                             },
                         )
                         .with_grant(in_project.then(|| GrantKey {
@@ -1068,7 +1085,9 @@ impl Codec {
             wire::Request::File { params: _ } => (
                 approval(
                     "File change".into(),
-                    ApprovalTarget::Tool { preview: preview() },
+                    ApprovalTarget::Tool {
+                        preview: preview(&[]),
+                    },
                 ),
                 RequestReply::Decision,
             ),
@@ -1084,7 +1103,9 @@ impl Codec {
                 (
                     approval(
                         "Permissions".into(),
-                        ApprovalTarget::Tool { preview: preview() },
+                        ApprovalTarget::Tool {
+                            preview: preview(&[]),
+                        },
                     ),
                     RequestReply::Permissions(serde_json::to_value(profile).unwrap()),
                 )
@@ -1119,7 +1140,9 @@ impl Codec {
                             "{} / {tool}",
                             elicitation.server_name.as_deref().unwrap_or("MCP")
                         ),
-                        ApprovalTarget::Tool { preview: preview() },
+                        ApprovalTarget::Tool {
+                            preview: preview(&[]),
+                        },
                     ),
                     RequestReply::Elicitation,
                 )
@@ -1678,6 +1701,78 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(link, known.then(|| Codec::key("native-turn", "invocation")));
+        }
+    }
+    #[test]
+    fn codex_fixture_approval_preview_keeps_every_unmapped_field() {
+        let frame = include_str!("../../tests/fixtures/codex/approval-command.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| {
+                record["type"] == "emit_inbound"
+                    && record["line"]["method"] == "item/commandExecution/requestApproval"
+            })
+            .unwrap()["line"]
+            .clone();
+        for cwd in [Value::Null, json!(""), json!("/elsewhere/other-project")] {
+            let mut codec = early_request_codec();
+            let mut frame = frame.clone();
+            let params = frame["params"].as_object_mut().unwrap();
+            params.insert("threadId".into(), json!("old-thread"));
+            params.insert("turnId".into(), json!("native-turn"));
+            params.insert("itemId".into(), json!("codex-internal-sentinel"));
+            params.insert("cwd".into(), cwd.clone());
+            params.insert("description".into(), json!("Additional description"));
+            params.insert("env".into(), json!({"CHECK":"material"}));
+            params.insert("networkAccess".into(), json!(true));
+            params.insert("dangerouslyDisableSandbox".into(), json!(true));
+            let mut expected = params.clone();
+            for field in ["threadId", "turnId", "itemId", "command", "reason"] {
+                expected.remove(field);
+            }
+            if cwd.as_str().is_some_and(|path| !path.is_empty()) {
+                expected.remove("cwd");
+            }
+            let decoded = codec.value(frame).unwrap();
+            let action = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event:
+                            TurnEvent::RequestOpened {
+                                kind: RequestKind::Approval { action },
+                                ..
+                            },
+                        ..
+                    } => Some(action),
+                    _ => None,
+                })
+                .unwrap();
+            let ApprovalTarget::Command {
+                command,
+                cwd: location,
+                reason,
+                preview,
+            } = &action.target
+            else {
+                panic!("command approval")
+            };
+            assert_eq!(command, "touch veyra-check.txt");
+            assert_eq!(reason.as_ref().unwrap().text, "Create the requested file");
+            assert_eq!(
+                location,
+                &if cwd.as_str().is_some_and(|path| !path.is_empty()) {
+                    CommandCwd::Directory("/elsewhere/other-project".into())
+                } else {
+                    CommandCwd::NotVerified
+                }
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&preview.text).unwrap(),
+                Value::Object(expected)
+            );
+            assert!(!preview.text.contains("codex-internal-sentinel"));
         }
     }
     #[test]

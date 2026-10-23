@@ -247,14 +247,7 @@ fn request_key(tool: Tool, id: &str) -> Result<String, CommandError> {
             "client_request_id must be nonempty; call {tool} with a new client_request_id"
         )));
     }
-    Ok(if tool == "start_thread" {
-        StartThreadRequest {
-            client_request_id: id,
-        }
-        .key()
-    } else {
-        format!("{tool}:{id}")
-    })
+    Ok(format!("{tool}:{id}"))
 }
 fn owned_child(p: &Projection, caller: ThreadId, child: ThreadId) -> Result<&Thread, CommandError> {
     p.threads
@@ -535,6 +528,27 @@ pub fn decide(
 #[cfg(test)]
 mod description_tests {
     use super::*;
+    #[test]
+    fn request_keys_retain_tool_names_and_start_view() {
+        let key = request_key(Tool::StartThread, "original").unwrap();
+        assert_eq!(key, "start_thread:original");
+        let task = Task {
+            id: TaskId::new(),
+            parent: ThreadId::new(),
+            child: ThreadId::new(),
+            turn: TurnId::new(),
+            request_key: key,
+            state: TaskState::Running,
+        };
+        assert_eq!(task.start_request().unwrap().client_request_id, "original");
+        assert_eq!(
+            request_key(Tool::MessageThread, "original").unwrap(),
+            "message_thread:original"
+        );
+        for tool in Tool::ALL {
+            assert!(request_key(tool, "").is_err());
+        }
+    }
     #[test]
     fn start_thread_description_teaches_the_first_call_rules() {
         let tools = list();

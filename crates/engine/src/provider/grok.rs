@@ -91,6 +91,9 @@ enum PromptWork {
     Veyra { id: String, turn: TurnId },
     Provider { turn: TurnId },
 }
+fn tool_key(owner: ActiveTurn, prompt: &str, tool: &str) -> String {
+    format!("{}/{prompt}/tool/{tool}", owner.target())
+}
 impl PromptWork {
     fn owner(&self) -> ActiveTurn {
         match self {
@@ -957,7 +960,7 @@ impl Codec {
                 if tool.tool_call_id.is_empty() {
                     return Ok(());
                 }
-                let tool_key = format!("{}/{id}/tool/{}", owner.target(), tool.tool_call_id);
+                let tool_key = tool_key(owner, &id, &tool.tool_call_id);
                 let output = tool_output(&tool.raw_output, &tool.content);
                 if let Some(start) = self
                     .prompts
@@ -1115,7 +1118,19 @@ impl Codec {
                         tool: "Bash".into(),
                         command: command.into(),
                     });
+                    let mut residual = permission.tool_call.raw_input.clone();
                     let target = if let Some(command) = command {
+                        let reason = ["description", "reason"].into_iter().find_map(|field| {
+                            permission.tool_call.raw_input[field]
+                                .as_str()
+                                .map(|text| (field, ApprovalPreview::new(text.into())))
+                        });
+                        if let Some(fields) = residual.as_object_mut() {
+                            fields.remove("command");
+                            if let Some((field, _)) = &reason {
+                                fields.remove(*field);
+                            }
+                        }
                         ApprovalTarget::Command {
                             command: command.into(),
                             cwd: if exact_command {
@@ -1123,10 +1138,8 @@ impl Codec {
                             } else {
                                 CommandCwd::NotVerified
                             },
-                            reason: None,
-                            preview: ApprovalPreview::new(serde_json::to_string_pretty(
-                                &permission.tool_call.raw_input,
-                            )?),
+                            reason: reason.map(|(_, preview)| preview),
+                            preview: ApprovalPreview::new(serde_json::to_string_pretty(&residual)?),
                         }
                     } else {
                         ApprovalTarget::Tool {
@@ -1220,8 +1233,7 @@ impl Codec {
             decoded,
             owner,
             TurnEvent::RequestOpened {
-                tool: requested_tool
-                    .map(|id| NativeItemKey(format!("{}/{prompt_id}/tool/{id}", owner.target()))),
+                tool: requested_tool.map(|id| NativeItemKey(tool_key(owner, &prompt_id, &id))),
                 native: NativeRequestRef(native.clone()),
                 kind: kind.clone(),
             },
@@ -1596,12 +1608,26 @@ mod wire_tests {
     #[test]
     fn grok_fixture_permission_carries_only_its_native_tool_key() {
         let (mut codec, turn) = boundary_codec();
+        let started = codec
+            .value(
+                json!({"jsonrpc":"2.0", "method":"session/update", "params":{
+            "sessionId":"veyra-grok-session", "_meta":{"promptId":turn.to_string()}, "update":{
+            "sessionUpdate":"tool_call", "toolCallId":"create-check", "title":"Execute",
+            "status":"pending", "rawInput":{"command":"printf check","variant":"Bash"}}}}),
+            )
+            .unwrap();
         let frame = fixture_frame(
             include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
             |frame| frame["method"] == "session/request_permission",
             turn,
         );
-        let expected = NativeItemKey(format!("{turn}/{turn}/tool/create-check"));
+        let expected = NativeItemKey(tool_key(
+            ActiveTurn::Veyra(turn),
+            &turn.to_string(),
+            "create-check",
+        ));
+        assert!(started.events.iter().any(|event| matches!(event,
+            ProviderEvent::Turn { event: TurnEvent::ToolStarted { key, .. }, .. } if key == &expected)));
         let decoded = codec.value(frame).unwrap();
         assert!(decoded.events.iter().any(|event| matches!(event,
             ProviderEvent::Turn { event: TurnEvent::RequestOpened { tool: Some(key), .. }, .. } if key == &expected)));
@@ -1618,6 +1644,60 @@ mod wire_tests {
                 ..
             }
         )));
+    }
+    #[test]
+    fn grok_fixture_approval_preview_keeps_every_unmapped_field() {
+        let (mut codec, turn) = boundary_codec();
+        let mut frame = fixture_frame(
+            include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
+            |frame| frame["method"] == "session/request_permission",
+            turn,
+        );
+        let input = json!({"variant":"Bash", "command":"printf check", "cwd":"/elsewhere/other-project",
+            "description":"Description shown separately", "reason":"Additional reason",
+            "env":{"CHECK":"material"}, "networkAccess":true, "dangerouslyDisableSandbox":true,
+            "itemId":"an argument, not a Grok id"});
+        frame["params"]["toolCall"]["rawInput"] = input.clone();
+        frame["params"]["toolCall"]["toolCallId"] = json!("grok-internal-sentinel");
+        let decoded = codec.value(frame).unwrap();
+        let action = decoded
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Turn {
+                    event:
+                        TurnEvent::RequestOpened {
+                            kind: RequestKind::Approval { action },
+                            ..
+                        },
+                    ..
+                } => Some(action),
+                _ => None,
+            })
+            .unwrap();
+        let ApprovalTarget::Command {
+            command,
+            cwd,
+            reason,
+            preview,
+        } = &action.target
+        else {
+            panic!("command approval")
+        };
+        assert_eq!(command, "printf check");
+        assert_eq!(cwd, &CommandCwd::NotVerified);
+        assert_eq!(
+            reason.as_ref().unwrap().text,
+            "Description shown separately"
+        );
+        let mut expected = input;
+        expected.as_object_mut().unwrap().remove("command");
+        expected.as_object_mut().unwrap().remove("description");
+        assert_eq!(
+            serde_json::from_str::<Value>(&preview.text).unwrap(),
+            expected
+        );
+        assert!(!preview.text.contains("grok-internal-sentinel"));
     }
     #[test]
     fn grok_fixture_text_chunks_keep_tool_boundaries() {

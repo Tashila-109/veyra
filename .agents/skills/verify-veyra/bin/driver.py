@@ -778,6 +778,14 @@ def backdrop_pid_self_test():
     with patch(__name__+'._backdrop_executable',return_value=expected), patch('os.kill') as kill:
         verify_owned_backdrop(pid,expected)
         kill.assert_not_called()
+    outside = (DATA.resolve().parent/'outside-backdrop.app/Contents/MacOS/backdrop').resolve()
+    with patch(__name__+'._backdrop_executable',return_value=outside), patch('os.kill') as kill:
+        rejects(lambda: verify_owned_backdrop(pid,outside))
+        opened = []
+        rejects(lambda: reopen_owned_backdrop(pid,outside,lambda: opened.append(True)))
+        assert not opened, 'backdrop outside scratch was reopened'
+        rejects(lambda: stop_owned_backdrop(pid,outside))
+        kill.assert_not_called()
     for actual in (None,foreign):
         with patch(__name__+'._backdrop_executable',return_value=actual), patch('os.kill') as kill:
             rejects(lambda: verify_owned_backdrop(pid,expected))

@@ -3175,15 +3175,22 @@ mod tests {
         impl Render for QueuedTranscript {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 self.0.update(cx, |shell, cx| {
-                    super::transcript::render_with_wait(
-                        shell,
-                        Some(WaitReason::TurnRunning.to_string()),
-                        cx,
-                    )
+                    super::transcript::render(shell, cx).into_any_element()
                 })
             }
         }
-        with_docked_shell(cx, |shell, cx, _, _| {
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        with_docked_shell(&mut test, |shell, cx, _, _| {
+            let scratch = Scratch(
+                std::path::PathBuf::from("/tmp").join(format!("veyra-queued-{}", ThreadId::new())),
+            );
+            std::fs::create_dir_all(&scratch.0).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             shell.update(cx, |shell, cx| {
                 let (thread, child, _) = add_family(shell, cx);
                 shell.state.threads.remove(&child);
@@ -3217,6 +3224,28 @@ mod tests {
                     .statuses
                     .insert(thread, Status::Working { since: 1 });
                 shell.state.sort_transcript(thread);
+                let mut db = veyra_engine::store::open(&scratch.0.join("veyra.db")).unwrap();
+                let changes = veyra_engine::events::ChangeSet {
+                    projects: shell.state.projects.clone(),
+                    threads: BTreeMap::from([(thread, shell.state.threads[&thread].clone())]),
+                    turns: BTreeMap::from([(turn, shell.state.turns[&turn].clone())]),
+                    items: shell.state.items[&thread].clone(),
+                    ..Default::default()
+                };
+                let tx = db.transaction().unwrap();
+                veyra_engine::store::apply(&tx, &changes, 1).unwrap();
+                tx.commit().unwrap();
+                drop(db);
+                shell.engine = veyra_engine::Engine::start_with_env(
+                    runtime.handle(),
+                    veyra_engine::data_dir::DataDir::at(scratch.0.clone()).unwrap(),
+                    veyra_engine::provider::env::ChildEnv::isolated(),
+                )
+                .unwrap();
+                assert_eq!(
+                    shell.engine.window_threads()[&thread].wait_reason,
+                    Some(WaitReason::Held(HoldReason::Restarted))
+                );
                 shell.scroller.update(cx, |state, cx| {
                     state.reset(shell.state.transcript_rows(thread), cx)
                 });
@@ -3230,6 +3259,12 @@ mod tests {
                 .expect("production queued wait row is visible");
             assert!(wait.top() >= bubble.bottom());
             assert_eq!(wait.right(), bubble.right());
+            assert!(
+                text.lines()
+                    .contains("Held because Veyra closed while this ran")
+            );
+            let engine = shell.read_with(cx, |shell, _| shell.engine.clone());
+            runtime.block_on(engine.shutdown_wait());
         });
     }
     #[cfg(debug_assertions)]

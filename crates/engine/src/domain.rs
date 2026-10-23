@@ -564,15 +564,16 @@ pub struct Task {
 pub struct StartThreadRequest<'a> {
     pub client_request_id: &'a str,
 }
+const START_THREAD_PREFIX: &str = "start_thread:";
 impl StartThreadRequest<'_> {
     pub fn key(&self) -> String {
-        format!("start_thread:{}", self.client_request_id)
+        format!("{START_THREAD_PREFIX}{}", self.client_request_id)
     }
 }
 impl Task {
     pub fn start_request(&self) -> Option<StartThreadRequest<'_>> {
         self.request_key
-            .strip_prefix("start_thread:")
+            .strip_prefix(START_THREAD_PREFIX)
             .map(|client_request_id| StartThreadRequest { client_request_id })
     }
 }

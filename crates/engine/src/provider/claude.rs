@@ -982,10 +982,19 @@ impl Codec {
             .filter(|_| tool.tool_name == "Bash")
         {
             arguments.remove("command");
+            let reason = ["description", "reason"].into_iter().find_map(|field| {
+                tool.input
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(|text| (field, ApprovalPreview::new(text.into())))
+            });
+            if let Some((field, _)) = &reason {
+                arguments.remove(*field);
+            }
             ApprovalTarget::Command {
                 command: command.into(),
                 cwd: Default::default(),
-                reason: None,
+                reason: reason.map(|(_, preview)| preview),
                 preview: Self::preview(arguments),
             }
         } else if let Some((field, operation, path)) = file_target {
@@ -1432,6 +1441,65 @@ impl Codec {
 mod tests {
     use super::*;
     use crate::tests::Scratch;
+    #[test]
+    fn claude_fixture_approval_preview_keeps_every_unmapped_field() {
+        let mut frame = include_str!("../../tests/fixtures/claude/approval-deny.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| {
+                record["type"] == "emit_inbound"
+                    && record["line"]["type"] == "control_request"
+                    && record["line"]["request"]["subtype"] == "can_use_tool"
+            })
+            .unwrap()["line"]
+            .clone();
+        let input = json!({"command":"printf check", "cwd":"/elsewhere/other-project",
+            "description":"Description shown separately", "reason":"Additional reason",
+            "env":{"CHECK":"material"}, "networkAccess":true, "dangerouslyDisableSandbox":true,
+            "threadId":"an argument, not a Claude id"});
+        frame["request"]["input"] = input.clone();
+        frame["request"]["tool_use_id"] = json!("claude-internal-sentinel");
+        let mut codec = codec();
+        codec.start(TurnId::new(), "approve".into());
+        let decoded = codec.value(frame).unwrap();
+        let action = decoded
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Turn {
+                    event:
+                        TurnEvent::RequestOpened {
+                            kind: RequestKind::Approval { action },
+                            ..
+                        },
+                    ..
+                } => Some(action),
+                _ => None,
+            })
+            .unwrap();
+        let ApprovalTarget::Command {
+            command,
+            reason,
+            preview,
+            ..
+        } = &action.target
+        else {
+            panic!("command approval")
+        };
+        assert_eq!(command, "printf check");
+        assert_eq!(
+            reason.as_ref().unwrap().text,
+            "Description shown separately"
+        );
+        let mut expected = input;
+        expected.as_object_mut().unwrap().remove("command");
+        expected.as_object_mut().unwrap().remove("description");
+        assert_eq!(
+            serde_json::from_str::<Value>(&preview.text).unwrap(),
+            expected
+        );
+        assert!(!preview.text.contains("claude-internal-sentinel"));
+    }
     #[test]
     fn claude_fixture_approval_carries_the_matching_tool_key_when_present() {
         let source = include_str!("../../tests/fixtures/claude/approval-deny.jsonl");

@@ -302,11 +302,13 @@ records = [json.loads(line) for line in (SOURCE/'ok-reply.jsonl').read_text().sp
 initial_frame = next(record for record in records if record.get('type')=='emit_inbound'
     and record.get('line',{}).get('type')=='system' and record['line'].get('subtype')=='init')
 records.insert(records.index(initial_frame),{'type':'emit_inbound','line':{'type':'assistant','message':{'id':'search-message',
-    'content':[{'type':'tool_use','id':'search-tool','name':'Grep','input':{'pattern':'slice-four-search-target'}}]}}})
+    'content':[{'type':'tool_use','id':'search-tool','name':'Grep','input':{'pattern':'veyra-search-target'}}]}}})
+records.insert(records.index(initial_frame),{'type':'emit_inbound','line':{'type':'user','message':{
+    'role':'user','content':[{'type':'tool_result','tool_use_id':'search-tool','content':'No matches','is_error':False}]}}})
 stage_records(records)
 search = create('search-target','Search for the requested target',scenario=None)
 searched = ctl('search-target-done','wait',search,'Done')
-assert any(row['kind']=='tool' and row['tool_label']=='Grep · slice-four-search-target' for row in searched['transcript']['items'])
+assert any(row['kind']=='tool' and row['tool_label']=='Grep · veyra-search-target' and row['tool_status']=='Done' for row in searched['transcript']['items'])
 capture('search-target')
 records = [json.loads(line) for line in (SOURCE/'question.jsonl').read_text().splitlines()]
 question_request = next(record for record in records if record.get('type')=='emit_inbound'
@@ -394,11 +396,16 @@ request = next(record['line']['params'] for record in records if record.get('typ
     and record.get('line',{}).get('method')=='item/commandExecution/requestApproval')
 raw_marks='e'+'\u0301'*7
 request.update(unknownCapability='write everything',dangerouslyDisableSandbox=True,
-    command='printf '+raw_marks)
+    env={'CHECK':'material'},networkAccess=True,description='Additional description',command='printf '+raw_marks)
 extra = create_codex('codex-extra-fields',records=records)
 extra_dock = poll('codex-extra-fields',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert 'unknownCapability' in extra_dock['preview'] and 'write everything' in extra_dock['preview']
 assert 'dangerouslyDisableSandbox' in extra_dock['preview'] and 'true' in extra_dock['preview']
+assert json.loads(extra_dock['preview'])['env']=={'CHECK':'material'}
+assert json.loads(extra_dock['preview'])['networkAccess'] is True
+assert json.loads(extra_dock['preview'])['description']=='Additional description'
+assert any(quote['kind']=='reason' and 'Create the requested file' in quote['text'] for quote in extra_dock['provider_text'])
+assert all(key not in json.loads(extra_dock['preview']) for key in ('threadId','turnId','itemId'))
 assert extra_dock['action_text']=='printf e'+'\u0301'*3+'⟨U+0301⟩'*4
 assert extra_dock['request']['kind']['Approval']['action']['target']['command']=='printf '+raw_marks
 capture('codex-extra-fields')
@@ -683,6 +690,23 @@ for label,scenario,decision in [('deny','approval-deny','Deny'),('allow','approv
     assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))==decision
     assert check.exists()==(decision=='AllowOnce')
 check.unlink()
+records = grok_records('approval-deny')
+permission = next(record for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('method')=='session/request_permission')['line']['params']['toolCall']
+permission['rawInput'].update(cwd='/elsewhere/other-project',description='Description shown separately',
+    reason='Additional reason',env={'CHECK':'material'},networkAccess=True,dangerouslyDisableSandbox=True)
+thread = create_grok('grok-command-unverified-cwd',records=records,prompt='Review every command field')
+dock = poll('grok-command-unverified-cwd',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert dock['request']['kind']['Approval']['action']['target']['cwd']=='not_verified'
+assert dock['consequence']=='Grok will run this command at a location that is not verified.'
+preview = json.loads(dock['preview'])
+assert preview['cwd']=='/elsewhere/other-project' and preview['reason']=='Additional reason'
+assert preview['env']=={'CHECK':'material'} and preview['networkAccess'] is True
+assert preview['dangerouslyDisableSandbox'] is True and 'toolCallId' not in preview
+assert any(quote['kind']=='reason' and 'Description shown separately' in quote['text'] for quote in dock['provider_text'])
+capture('grok-command-unverified-cwd')
+action('grok-command-unverified-cwd-answer','Deny',{'request':dock['request']['id']})
+ctl('grok-command-unverified-cwd-done','wait',thread,'Interrupted')
 stage_records(grok_records('approval-accept-edits'))
 action('grok-accept-edits-new','NewThread')
 action('grok-accept-edits-provider','PickProvider',{'provider':'grok'})

@@ -976,7 +976,7 @@ fn outcome_row(outcome: OutcomeLine, cx: &App) -> Div {
             )
         })
 }
-pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
+pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
     let wait_reason = shell
         .view
         .chat()
@@ -988,13 +988,6 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .and_then(|state| state.wait_reason)
         })
         .map(|reason| reason.to_string());
-    render_with_wait(shell, wait_reason, cx)
-}
-pub(super) fn render_with_wait(
-    shell: &mut Shell,
-    wait_reason: Option<String>,
-    cx: &Context<Shell>,
-) -> AnyElement {
     #[cfg(debug_assertions)]
     if let Some(open) = &mut shell.state.transcript_open
         && shell.view.chat() == Some(open.thread)
