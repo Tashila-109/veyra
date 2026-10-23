@@ -18,7 +18,7 @@ pub struct Look {
 impl Global for Look {}
 impl Look {
     pub fn background(self) -> WindowBackground {
-        if self.options.reduce_transparency || self.options.increase_contrast {
+        if self.forced_by().is_some() {
             WindowBackground::Solid
         } else {
             self.requested

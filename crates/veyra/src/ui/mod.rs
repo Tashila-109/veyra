@@ -2251,7 +2251,7 @@ impl Render for Shell {
             }))
             .on_action(
                 cx.listener(|shell, action: &SetWindowBackground, window, cx| {
-                    if cx.global::<theme::Look>().forced_by().is_some() {
+                    if cx.global::<Theme>().look.forced_by().is_some() {
                         return;
                     }
                     let background =
@@ -2945,6 +2945,7 @@ mod tests {
                 let denied = self.dispatched.clone();
                 let granted = self.dispatched.clone();
                 let switched = self.dispatched.clone();
+                let background = self.dispatched.clone();
                 div()
                     .size_full()
                     .capture_action(move |_: &super::Stop, _, _| {
@@ -2961,6 +2962,9 @@ mod tests {
                     })
                     .capture_action(move |_: &super::ToggleShellDrawer, _, _| {
                         switched.borrow_mut().push("ToggleShellDrawer");
+                    })
+                    .capture_action(move |_: &super::SetWindowBackground, _, _| {
+                        background.borrow_mut().push("SetWindowBackground");
                     })
                     .child(self.shell.clone())
             }
@@ -5863,7 +5867,7 @@ mod tests {
     fn forced_solid_keeps_background_choice_and_blocks_every_entry(cx: &mut gpui::TestAppContext) {
         use gpui_kit::base::Selectable;
         use veyra_engine::domain::WindowBackground::{Solid, Translucent};
-        with_docked_shell(cx, |shell, cx, _, _| {
+        with_docked_shell(cx, |shell, cx, dispatched, _| {
             cx.dispatch_action(super::OpenSettings);
             draw(cx);
             cx.dispatch_action(super::DebugDisplayOptions::default());
@@ -5875,6 +5879,7 @@ mod tests {
                 shell.read_with(cx, |shell, _| shell.sent_backgrounds.clone()),
                 [Solid]
             );
+            assert_eq!(dispatched.borrow().as_slice(), ["SetWindowBackground"]);
             for flags in [
                 super::DebugDisplayOptions {
                     reduce_transparency: true,
@@ -5885,6 +5890,7 @@ mod tests {
                     ..Default::default()
                 },
             ] {
+                dispatched.borrow_mut().clear();
                 shell.update(cx, |shell, _| {
                     shell.state.settings.window_background = Translucent;
                     shell.sent_backgrounds.clear();
@@ -5902,6 +5908,10 @@ mod tests {
                     let button = cx.debug_bounds(selector).unwrap().center();
                     cx.simulate_click(button, gpui::Modifiers::none());
                     draw(cx);
+                    assert!(
+                        dispatched.borrow().is_empty(),
+                        "disabled {selector} dispatched an action"
+                    );
                 }
                 cx.dispatch_action(super::SetWindowBackground {
                     background: Some(Solid),

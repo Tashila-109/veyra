@@ -541,7 +541,20 @@ fn take_foreground_kill(
     }
 }
 fn shell_spawn_reason(error: &io::Error) -> String {
-    io::Error::from(error.kind()).to_string()
+    match (error.kind(), error.raw_os_error()) {
+        (io::ErrorKind::NotFound, _) => "not found".into(),
+        (io::ErrorKind::PermissionDenied, _) => "permission denied".into(),
+        (_, Some(8 | 86 | 88)) => "not a program this Mac can run".into(),
+        (_, code) => {
+            let message = error.to_string();
+            let suffix = code.map(|code| format!(" (os error {code})"));
+            suffix
+                .as_deref()
+                .and_then(|suffix| message.strip_suffix(suffix))
+                .unwrap_or(&message)
+                .to_owned()
+        }
+    }
 }
 fn run(
     cwd: std::path::PathBuf,
@@ -593,10 +606,23 @@ fn run(
     if env.closing.is_closing() || controls.is_closed() || controls.try_recv().is_ok() {
         return Err(ProviderError::Cancelled);
     }
+    let program = std::path::PathBuf::from(&command.get_argv()[0]);
     let child = pair.slave.spawn_command(command).map_err(|error| {
         let reason = error
             .downcast_ref::<io::Error>()
             .map(shell_spawn_reason)
+            .or_else(|| {
+                if !program.is_absolute() {
+                    return None;
+                }
+                match std::fs::metadata(&program) {
+                    Err(error) => Some(shell_spawn_reason(&error)),
+                    Ok(_) if !platform::is_executable(&program) => {
+                        Some(shell_spawn_reason(&io::ErrorKind::PermissionDenied.into()))
+                    }
+                    _ => None,
+                }
+            })
             .unwrap_or_else(|| "the selected shell is missing or is not executable".into());
         ProviderError::Protocol(format!("The shell could not start: {reason}"))
     })?;
@@ -885,9 +911,34 @@ mod tests {
         assert_eq!(
             handle.status(),
             ShellStatus::Failed {
-                error:
-                    "The shell could not start: the selected shell is missing or is not executable"
-                        .into()
+                error: "The shell could not start: not found".into()
+            }
+        );
+        assert!(handle.pid().is_none());
+    }
+
+    #[test]
+    fn failed_shell_permission_has_a_plain_reason() {
+        let root = std::path::Path::new("/tmp").join(format!(
+            "veyra-shell-permission-{}",
+            crate::domain::ThreadId::new()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let shell = root.join("shell");
+        std::fs::write(&shell, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(!platform::is_executable(&shell));
+        let env = ChildEnv::isolated().with_variable("SHELL", shell.as_os_str());
+        let handle = spawn(root, PtySize::default(), env, Colors::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.status().is_finished() {
+            assert!(Instant::now() < deadline, "failed shell did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            handle.status(),
+            ShellStatus::Failed {
+                error: "The shell could not start: permission denied".into()
             }
         );
         assert!(handle.pid().is_none());
@@ -895,11 +946,26 @@ mod tests {
 
     #[test]
     fn failed_shell_os_errors_have_plain_reasons() {
-        let error = io::Error::from_raw_os_error(13);
-        assert_eq!(shell_spawn_reason(&error), "permission denied");
+        for (code, words) in [
+            (2, "not found"),
+            (13, "permission denied"),
+            (8, "not a program this Mac can run"),
+            (86, "not a program this Mac can run"),
+            (88, "not a program this Mac can run"),
+            (24, "Too many open files"),
+        ] {
+            assert_eq!(
+                shell_spawn_reason(&io::Error::from_raw_os_error(code)),
+                words
+            );
+        }
         assert_eq!(
             shell_spawn_reason(&io::ErrorKind::NotFound.into()),
-            "entity not found"
+            "not found"
+        );
+        assert_eq!(
+            shell_spawn_reason(&io::Error::other("the shell stopped")),
+            "the shell stopped"
         );
     }
 

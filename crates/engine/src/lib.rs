@@ -326,12 +326,12 @@ impl Engine {
             .filter_map(|terminal| terminal.pid().map(|pid| (pid, terminal.clone())))
             .collect();
         let groups: Vec<_> = self.inner.groups.lock().unwrap().iter().copied().collect();
-        #[cfg(test)]
-        if let Some(hook) = self.inner.state.quit_signal_hook.lock().unwrap().take() {
-            hook();
-        }
         for group in groups {
             if let Some(terminal) = terminals.get(&group) {
+                #[cfg(test)]
+                if let Some(hook) = self.inner.state.quit_signal_hook.lock().unwrap().take() {
+                    hook();
+                }
                 terminal.hangup();
             } else {
                 let _ = platform::signal_group(group, platform::Signal::Terminate);
