@@ -91,6 +91,14 @@ termination.resume()
 
 for window in windows { window.orderFrontRegardless() }
 let pid = ProcessInfo.processInfo.processIdentifier
+if let pidFile = Bundle.main.object(forInfoDictionaryKey: "VeyraBackdropPidFile") as? String {
+    do {
+        try "\(pid)\n".write(toFile: pidFile, atomically: true, encoding: .utf8)
+    } catch {
+        fputs("backdrop pid file unavailable\n", stderr)
+        exit(1)
+    }
+}
 func windowRecords() -> [[String: Any]]? {
     guard let listed = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
         return nil

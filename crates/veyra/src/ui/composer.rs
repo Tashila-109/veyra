@@ -86,8 +86,14 @@ pub(super) fn approval_text(
             preview,
         ),
     };
-    let mut preview_text = consent_multiline(&preview.text);
-    if preview.truncated {
+    let command = matches!(action.target, ApprovalTarget::Command { .. });
+    let structured_command = command && preview.text.trim_start().starts_with(['{', '[']);
+    let mut preview_text = if structured_command {
+        String::new()
+    } else {
+        consent_multiline(&preview.text)
+    };
+    if preview.truncated && !structured_command {
         let cap = veyra_engine::domain::TOOL_OUTPUT_CHARS;
         let limit = format!("{},{:03}", cap / 1000, cap % 1000);
         preview_text.push_str(&format!("\nPreview cut after {limit} characters."));
@@ -98,7 +104,12 @@ pub(super) fn approval_text(
 pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<QuotedText> {
     let mut values = Vec::new();
     match &action.target {
-        ApprovalTarget::Command { cwd, reason, .. } => {
+        ApprovalTarget::Command {
+            cwd,
+            reason,
+            preview,
+            ..
+        } => {
             if let CommandCwd::Directory(path) = cwd {
                 values.push(QuotedText::from_quoted(
                     QuoteKind::WorkingFolder,
@@ -106,12 +117,27 @@ pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<Qu
                     format!("“{}”", consent_line(&path.to_string_lossy())),
                 ));
             }
+            #[derive(serde::Deserialize)]
+            struct CommandReason {
+                description: Option<String>,
+                reason: Option<String>,
+            }
+            let fallback = serde_json::from_str::<CommandReason>(&preview.text)
+                .ok()
+                .and_then(|value| value.description.or(value.reason));
             if let Some(reason) = reason {
                 values.push(QuotedText::new(
                     QuoteKind::Reason,
                     format!("{provider}'s reason (model-written)"),
                     &reason.text,
                     reason.truncated,
+                ));
+            } else if let Some(reason) = fallback {
+                values.push(QuotedText::new(
+                    QuoteKind::Reason,
+                    format!("{provider}'s reason (model-written)"),
+                    &reason,
+                    false,
                 ));
             }
         }
@@ -127,6 +153,31 @@ pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<Qu
         )),
     }
     values
+}
+pub(super) fn approval_display_quotes(
+    action: &ProposedAction,
+    provider: &str,
+    cwd: Option<&std::path::Path>,
+) -> Vec<QuotedText> {
+    let mut quotes = approval_quotes(action, provider);
+    if matches!(
+        action.target,
+        ApprovalTarget::Command {
+            cwd: CommandCwd::ProjectFolder,
+            ..
+        }
+    ) && let Some(cwd) = cwd
+    {
+        quotes.insert(
+            0,
+            QuotedText::from_quoted(
+                QuoteKind::WorkingFolder,
+                "Working folder".into(),
+                format!("“{}”", consent_line(&cwd.to_string_lossy())),
+            ),
+        );
+    }
+    quotes
 }
 pub(super) fn grant_caption(command: &str) -> String {
     format!("Allow `{}` in this thread", consent_multiline(command))
@@ -217,6 +268,8 @@ fn option_caption(option: usize, label: SharedString, cx: &App) -> Div {
         .w_full()
         .min_w_0()
         .whitespace_normal()
+        .line_clamp(2)
+        .text_ellipsis()
         .child(label)
 }
 
@@ -336,7 +389,13 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         "model",
         config
             .model
-            .clone()
+            .as_ref()
+            .map(|value| {
+                models
+                    .iter()
+                    .find(|model| &model.value == value)
+                    .map_or_else(|| value.clone(), |model| model.display_name.clone())
+            })
             .unwrap_or_else(|| "Default model".into()),
         cx,
     )
@@ -426,17 +485,6 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
         .min_h_0()
         .max_h_full()
         .gap(t.space.0[3])
-        .when_some(
-            reason.clone().filter(|_| shell.provider_picker.is_some()),
-            |this, reason| {
-                this.child(
-                    div()
-                        .text_size(t.text.meta.size)
-                        .text_color(t.colors.text_muted)
-                        .child(reason),
-                )
-            },
-        )
         .child(
             div()
                 .v_flex()
@@ -536,8 +584,11 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             let allow_in_thread = consent.allow_in_thread;
                             let (label, consequence, preview) =
                                 approval_text(action, shell.chosen_provider());
-                            let mut quotes =
-                                approval_quotes(action, shell.chosen_provider().label());
+                            let mut quotes = approval_display_quotes(
+                                action,
+                                shell.chosen_provider().label(),
+                                shell.working_folder(),
+                            );
                             let folder = quotes
                                 .iter()
                                 .position(|value| matches!(value.kind, QuoteKind::WorkingFolder))
@@ -719,6 +770,19 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                             let index = question_index;
                             if let Some(question) = questions.get(index) {
                                 dock = dock
+                                    .when(questions.len() > 1, |dock| {
+                                        dock.child(
+                                            div()
+                                                .debug_selector(|| "question-count".into())
+                                                .text_size(t.text.meta.size)
+                                                .text_color(t.colors.text_muted)
+                                                .child(format!(
+                                                    "{} of {}",
+                                                    index + 1,
+                                                    questions.len()
+                                                )),
+                                        )
+                                    })
                                     .child(
                                         QuotedText::new(
                                             QuoteKind::Question,
@@ -873,23 +937,21 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                         ),
                 ),
         )
-        .when_some(
-            reason.filter(|_| shell.provider_picker.is_none()),
-            |this, reason| {
-                this.child(
-                    div()
-                        .text_size(t.text.meta.size)
-                        .line_height(t.text.meta.line_height)
-                        .text_color(t.colors.text_muted)
-                        .child(reason),
-                )
-                .when(!shell.ready(provider), |this| {
-                    this.child(labelled_button("check-again", "Check again", cx).on_click(
-                        |_, window, cx| window.dispatch_action(Box::new(RecheckProviders), cx),
-                    ))
-                })
-            },
-        )
+        .when_some(reason, |this, reason| {
+            this.child(
+                div()
+                    .text_size(t.text.meta.size)
+                    .line_height(t.text.meta.line_height)
+                    .debug_selector(|| "composer-disabled-reason".into())
+                    .text_color(t.colors.text_muted)
+                    .child(reason),
+            )
+            .when(!shell.ready(provider), |this| {
+                this.child(labelled_button("check-again", "Check again", cx).on_click(
+                    |_, window, cx| window.dispatch_action(Box::new(RecheckProviders), cx),
+                ))
+            })
+        })
         .when_some(shell.notice.clone(), |this, notice| {
             this.child(
                 div()
@@ -1300,5 +1362,37 @@ mod consent_display_tests {
             approval_quotes(&file, "Claude Code")[0].text,
             "“/tmp/a⟨U+000A⟩b⟨U+202E⟩”"
         );
+    }
+}
+
+#[cfg(test)]
+mod command_preview_tests {
+    #[test]
+    fn command_preview_shows_folder_and_reason_without_request_json() {
+        use veyra_engine::{domain::*, provider::ProviderKind};
+        let action = ProposedAction {
+            tool: "Bash".into(),
+            consent: Default::default(),
+            target: ApprovalTarget::Command {
+                command: "printf check".into(),
+                cwd: CommandCwd::ProjectFolder,
+                reason: None,
+                preview: ApprovalPreview::new(
+                    concat!(
+                        r#"{"command":"printf check","description":"Check output","#,
+                        r#""toolCallId":"internal"}"#,
+                    )
+                    .into(),
+                ),
+            },
+        };
+        let (command, _, preview) = super::approval_text(&action, ProviderKind::Grok);
+        assert_eq!(command, "printf check");
+        assert!(preview.is_empty());
+        let quotes =
+            super::approval_display_quotes(&action, "Grok", Some(std::path::Path::new("/project")));
+        assert_eq!(quotes[0].text, "“/project”");
+        assert_eq!(quotes[1].text, "“Check output”");
+        assert!(quotes.iter().all(|quote| !quote.text.contains("internal")));
     }
 }

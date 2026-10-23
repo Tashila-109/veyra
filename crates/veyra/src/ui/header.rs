@@ -11,6 +11,13 @@ use veyra_engine::{
     domain::{Millis, Status, ThreadId},
     events::{ChangeEvent, UiEvent},
 };
+pub(super) fn starting_text(
+    provider: veyra_engine::provider::ProviderKind,
+    wait: Option<veyra_engine::domain::WaitReason>,
+) -> Option<String> {
+    (wait == Some(veyra_engine::domain::WaitReason::Starting))
+        .then(|| format!("Starting {}", provider.label()))
+}
 pub(super) fn status_text(status: &Status) -> String {
     match status {
         Status::Working { since } => format!(
@@ -78,10 +85,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
             .map(|thread| thread.title.clone())
             .unwrap_or_default(),
     };
-    let text = shell
-        .view
-        .chat()
-        .map(|thread| shell.state.header_status(thread));
+    let text = shell.view.chat().map(|thread| shell.header_status(thread));
     let parent = shell
         .view
         .chat()
@@ -252,5 +256,23 @@ mod quiet_tests {
             *status = Status::Done { took: 1 };
         }
         assert!(!cadence_due(&statuses));
+    }
+}
+
+#[cfg(test)]
+mod starting_tests {
+    #[test]
+    fn starting_header_names_each_threads_provider() {
+        use veyra_engine::{domain::WaitReason, provider::ProviderKind};
+        for provider in ProviderKind::ALL {
+            assert_eq!(
+                super::starting_text(provider, Some(WaitReason::Starting)),
+                Some(format!("Starting {}", provider.label()))
+            );
+            assert_eq!(
+                super::starting_text(provider, Some(WaitReason::TurnRunning)),
+                None
+            );
+        }
     }
 }

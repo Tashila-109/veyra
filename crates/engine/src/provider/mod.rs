@@ -101,6 +101,7 @@ pub enum SessionEvent {
     Notice {
         text: String,
     },
+    TimedNotice(Notice),
     BackgroundWork {
         pending: bool,
     },

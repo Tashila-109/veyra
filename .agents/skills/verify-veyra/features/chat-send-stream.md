@@ -65,6 +65,14 @@ if LANE == 'live':
     page_done('chat-send-stream-live')
     print('PASS live streamed reply; Working to Done; stored reply and native metadata')
     sys.exit(0)
+records = [json.loads(line) for line in (SOURCE/'ok-reply.jsonl').read_text().splitlines()]
+records[2]['after_ms']=3000
+stage_records(records)
+starting_thread = create('chat-starting','Wait for the CLI to start',scenario=None)
+starting = poll('chat-starting',lambda d:d['selected_thread']['wait_reason']=='Waits for the CLI to start')
+assert starting['selected_thread']['header_status']=='Starting Claude Code'
+capture('chat-starting')
+ctl('chat-starting-done','wait',starting_thread,'Done')
 thread = create('chat','reply with the word ok',slow=True)
 working = ctl('chat-wait-working','wait',thread,'Working')
 assert working['selected_thread']['status'] == 'Working'
@@ -187,6 +195,7 @@ follow_thread = create('chat-follow','Show a long reply',scenario=None)
 poll('chat-follow-streaming',lambda d: any(item['kind']=='assistant' and len(item['text'])>1000 for item in d['transcript']['items']))
 poll('chat-follow-laid-out',lambda d:d['transcript']['top_offset']>200)
 assert ctl('chat-follow-attached','dump')['transcript']['follow']
+capture('chat-follow-first-bottom')
 action('chat-follow-scroll','DebugScrollTranscript',{'pixels':-200})
 detached = poll('chat-follow-detached',lambda d: not d['transcript']['follow'])
 capture('chat-follow-detached')
@@ -257,6 +266,8 @@ for scenario, count in [('bad-lines',1),('notices',3)]:
     dump = ctl('chat-'+scenario+'-done','wait',thread,'Done')
     assert len([item for item in dump['transcript']['items'] if item['kind']=='notice'])==count
     if scenario=='bad-lines': assert any(item['kind']=='assistant' and item['text']=='ok' for item in dump['transcript']['items'])
+    if scenario=='notices':
+        assert any('The reset time has passed.' in item['text'] and item['body']['Notice'].get('reset_at')==12345 for item in dump['transcript']['items'] if item['kind']=='notice')
     capture('chat-'+scenario)
 poll('chat-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null') == '0')
 def retained(records, provider):
@@ -298,6 +309,22 @@ for scenario, words in [
     action(label+'-close','PickPermission',{'mode':'ask_first'})
     poll(label+'-closed',lambda d:sql("select live_pid from threads where id='"+thread+"'")=='' )
 
+
+records = [json.loads(line) for line in (SOURCE/'bash-echo.jsonl').read_text().splitlines()]
+position = next(i for i,r in enumerate(records) if r.get('line',{}).get('type')=='result')
+records[position]['after_ms']=60000
+records.insert(position,{'type':'emit_inbound','line':{'type':'assistant','session_id':'<id:session>',
+    'parent_tool_use_id':None,'message':{'content':[{'type':'tool_use','id':'still-open-tool',
+        'name':'Bash','input':{'command':'second command'}}]}}})
+stage_records(records)
+thread = create('chat-result-stop','Keep the first result when stopping the second command',scenario=None)
+before_stop = poll('chat-result-before-stop',lambda d:len([row for row in d['transcript']['items'] if row['kind']=='tool'])==2)
+assert [row['tool_status'] for row in before_stop['transcript']['items'] if row['kind']=='tool']==['Done','Working']
+action('chat-result-stop','Stop')
+after_stop = ctl('chat-result-stopped','wait',thread,'Interrupted')
+assert [row['tool_status'] for row in after_stop['transcript']['items'] if row['kind']=='tool']==['Done','Stopped']
+assert next(row for row in after_stop['transcript']['items'] if row['kind']=='tool')['text']=='veyra-probe'
+capture('chat-result-stopped')
 
 page_done('chat-send-stream')
 print('PASS chat streamed o → ok, Working → Done; crash cause/tail; Retry; wait exits 0/1/2/3')
@@ -342,13 +369,26 @@ assert 'User' in json.loads(sql("select origin_json from turns where thread_id='
 assert [item['text'] for item in done['transcript']['items'] if item['kind']=='assistant']==['ok']
 assert sql("select json_extract(body_json,'$.AssistantText.text') from items where thread_id='"+thread+"' and kind='assistant_text'")=='ok'
 capture('codex-other-thread')
-thread = create_codex('codex-notices',scenario='retry-and-limits')
+records = codex_records('retry-and-limits')
+reset = int(time.time())+65
+for record in records:
+    if record.get('line',{}).get('method')=='account/rateLimits/updated':
+        record['line']['params']['rateLimits']['primary']['resetsAt']=reset
+thread = create_codex('codex-notices',records=records)
 done = ctl('codex-notices-wait','wait',thread,'Done')
 save('codex-notices-done',done)
 expected = ['Codex is retrying after a provider error.','Codex is near its usage limit: primary window, 95% used.']
-assert [item['text'] for item in done['transcript']['items'] if item['kind']=='notice']==expected
+notices = [item for item in done['transcript']['items'] if item['kind']=='notice']
+assert notices[0]['text']==expected[0]
+assert notices[1]['text']==expected[1]+' Resets in 2 min.'
+assert notices[1]['body']['Notice']['reset_at']==reset
 stored = sql("select json_extract(body_json,'$.Notice.text') from items where thread_id='"+thread+"' and kind='notice' order by seq").splitlines()
 assert stored==expected
+frame = done['perf']['repaints']
+advanced = poll('codex-notice-clock',lambda d:any(item['kind']=='notice'
+    and item['text']==expected[1]+' Resets in less than a minute.' for item in d['transcript']['items'])
+    and d['perf']['repaints']>frame)
+assert next(item for item in advanced['transcript']['items'] if item['body'].get('Notice',{}).get('reset_at'))['body']['Notice']['reset_at']==reset
 capture('codex-notices')
 records = codex_records('shell-echo')
 for record in records:
@@ -360,7 +400,7 @@ for record in records:
 thread = create_codex('codex-command-row',records=records)
 done = ctl('codex-command-row-done','wait',thread,'Done')
 tool = next(item for item in done['transcript']['items'] if item['kind']=='tool')
-assert tool['tool_label']=='Command' and tool['body']['Tool']['call']['veyra_label'] is True
+assert tool['tool_label']=='Command · '+tool['body']['Tool']['call']['input_summary'] and tool['body']['Tool']['call']['veyra_label'] is True
 capture('codex-command-row')
 action('codex-command-row-expand','ToggleItem',{'item':tool['id']})
 capture('codex-command-row-expanded')
@@ -370,8 +410,21 @@ records.insert(position,{'type':'emit_inbound','line':{'method':'item/completed'
 thread = create_codex('codex-provider-tool-row',records=records)
 done = ctl('codex-provider-tool-row-done','wait',thread,'Done')
 tool = next(item for item in done['transcript']['items'] if item['kind']=='tool')
-assert tool['tool_label']=='“example / lookup”' and tool['body']['Tool']['call']['veyra_label'] is False
+assert tool['tool_label']=='example / lookup' and tool['body']['Tool']['call']['veyra_label'] is False
 capture('codex-provider-tool-row')
+records = codex_records('ok-reply')
+position = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='turn/completed')
+second = next(json.loads(json.dumps(r)) for r in records if r.get('line',{}).get('method')=='item/completed'
+    and r['line']['params']['item'].get('type')=='agentMessage')
+second['line']['params']['item'].update(id='paragraph-two',text='A second paragraph: a'+'\u0301'*6)
+records.insert(position,second)
+thread = create_codex('codex-separated-parts',records=records)
+parts = ctl('codex-separated-parts-done','wait',thread,'Done')
+replies = [row for row in parts['transcript']['items'] if row['kind']=='assistant']
+assert len(replies)==2 and replies[0]['text']=='ok'
+assert replies[1]['text']=='A second paragraph: a'+'\u0301'*3
+assert replies[1]['body']['AssistantText']['text'].endswith('\u0301'*6)
+capture('codex-separated-parts')
 action('codex-chat-return-new','NewThread')
 action('codex-chat-return-claude','PickProvider',{'provider':'claude'})
 page_done('chat-send-stream-codex')
@@ -438,10 +491,16 @@ assert sql("select count(*) from turns where thread_id='"+thread+"' and outcome_
 assert sql("select count(*) from turns where thread_id='"+thread+"' and origin_json='\"Provider\"'")=='1'
 assert [item['text'] for item in background['transcript']['items'] if item['kind']=='assistant']==['foreground','background reply']
 capture('grok-background-done')
-thread = create_grok('grok-tool-title',scenario='tool-title',prompt='Run pwd')
+records = grok_records('tool-title')
+position = next(i for i,r in enumerate(records) if r.get('line',{}).get('params',{}).get('update',{}).get('sessionUpdate')=='tool_call')
+message = next(json.loads(json.dumps(r)) for r in records if r.get('line',{}).get('params',{}).get('update',{}).get('sessionUpdate')=='agent_message_chunk')
+message['line']['params']['update']['content']['text']='Before the tool.'
+records.insert(position,message)
+thread = create_grok('grok-tool-title',records=records,prompt='Run pwd')
 titled = ctl('grok-tool-title-done','wait',thread,'Done')
 tools = [item for item in titled['transcript']['items'] if item['kind']=='tool']
 assert len(tools)==1 and tools[0]['body']['Tool']['call']['name']=='Execute `pwd`'
+assert len([item for item in titled['transcript']['items'] if item['kind']=='assistant'])==2
 assert sql("select count(*) from items where thread_id='"+thread+"' and kind='tool'")=='1'
 capture('grok-tool-title')
 poll('grok-chat-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
@@ -500,7 +559,12 @@ SQLite retains one User turn and one Provider turn, both Completed, after task_s
 The Codex section saves streamed `o`, completed `ok` with two `delta_count` events, its stored item and Completed turn.
 The foreign-thread fixture leaves one User turn and only `ok`; the retry/limit fixture stores exactly two Notice items.
 The Codex PNGs show Working, Done and both notices.
-`codex-command-row.png` shows Veyra’s unquoted Command label; `codex-provider-tool-row.png` keeps a provider-named MCP tool quoted.
+`codex-command-row.png` shows the unquoted Command title followed by its command; `codex-provider-tool-row.png` shows the provider-named MCP tool without quotes.
+`codex-notice-clock.json` keeps the stored reset instant while the rendered notice advances from two minutes to less than a minute and the repaint counter advances.
+`codex-separated-parts.png` separates two item replies and bounds the visible combining marks while the stored body keeps all six.
+`grok-tool-title.png` separates the replies on each side of the tool.
+`chat-starting.png` shows Starting Claude Code from the pending spawn wait reason.
+`chat-result-stopped.png` retains the completed result and marks only the second, open command Stopped.
 Both names share the bounded display projection.
 
 - `chat-working.json` has Working, assistant `o` with `done: false`, a native id and cleared composer; inspect its PNG for the caret and Working header.
@@ -549,7 +613,11 @@ Engine commands await space in the window's gpui task, so Stop is retained when 
       "chat-failed.json",
       "chat-failed.png",
       "chat-provider-done.json",
-      "chat-background-working.json"
+      "chat-background-working.json",
+      "chat-follow-first-bottom.png",
+      "chat-starting.png",
+      "chat-starting.json",
+      "chat-result-stopped.png"
     ],
     "chat-send-stream-codex": [
       "codex-chat-working.json",
@@ -559,7 +627,9 @@ Engine commands await space in the window's gpui task, so Stop is retained when 
       "codex-other-thread-done.json",
       "codex-other-thread.png",
       "codex-notices-done.json",
-      "codex-notices.png"
+      "codex-notices.png",
+      "codex-separated-parts.png",
+      "codex-separated-parts-done.json"
     ],
     "chat-send-stream-grok": [
       "grok-chat-working.json",
@@ -612,6 +682,9 @@ Engine commands await space in the window's gpui task, so Stop is retained when 
 ```
 
 ## Gotchas
+
+A Codex command approval that arrives without an item frame has no transcript tool row.
+The codec consumes typed item frames and reads no raw events to invent one.
 
 Replay is not a live permission or tool proof.
 Approvals, questions and Stop are covered by their feature pages.

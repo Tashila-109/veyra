@@ -191,90 +191,91 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                 .content(move |_, _, cx| {
                     super::composer::floating_panel(cx).children(menu.clone())
                 });
-            let content = div()
-                .h_flex()
-                .w_full()
-                .min_w_0()
-                .items_center()
-                .gap(t.space.0[3])
-                .when(quiet.is_some(), |row| row.gap_0())
-                .child(
-                    div()
-                        .w(t.layout.status_glyph)
-                        .flex_none()
-                        .text_color(glyph_color(&status, t))
-                        .child(glyph(&status)),
-                )
-                .child(
-                    div()
-                        .h_flex()
-                        .items_center()
-                        .min_w_0()
-                        .debug_selector(|| "sidebar-thread-title".into())
-                        .flex_1()
-                        .when(quiet.is_none(), |title| {
-                            title.pl(t.space.0[3]).pr(t.space.0[3])
-                        })
-                        .child(
-                            button_text(thread.title.clone().into(), cx)
-                                .flex_1()
-                                .min_w(t.layout.small_icon_button),
-                        )
-                        .children(quiet.map(|minutes| {
-                            let compact = shell.sidebar_width < t.layout.sidebar_default;
-                            div()
-                                .debug_selector(|| "sidebar-quiet".into())
-                                .flex_none()
-                                .whitespace_nowrap()
-                                .min_w(t.layout.status_glyph * 6.)
-                                .text_size(t.text.meta.size)
-                                .text_color(t.colors.text_muted)
-                                .child(if compact {
-                                    format!("Quiet {minutes}m")
-                                } else {
-                                    format!("Quiet for {minutes} min")
-                                })
-                        })),
-                )
-                .child(
-                    div()
-                        .h_flex()
-                        .items_center()
-                        .flex_none()
-                        .w(t.layout.icon_button * 2.)
-                        .child(
-                            div().w(t.layout.icon_button).flex_none().when(
-                                shell.thread_stop_target(id).is_some()
-                                    || shell
-                                        .engine
-                                        .window_threads()
-                                        .get(&id)
-                                        .is_some_and(|work| work.busy),
-                                |slot| {
-                                    slot.child(
-                                        labelled_button(
-                                            SharedString::from(format!("stop-thread-{id}")),
-                                            "■",
-                                            cx,
-                                        )
-                                        .debug_selector(|| "sidebar-thread-stop".into())
-                                        .w(t.layout.icon_button)
-                                        .accessibility_label("Stop thread")
-                                        .tooltip("Stop thread")
-                                        .on_click(
-                                            move |_, window, cx| {
-                                                window.dispatch_action(
-                                                    Box::new(StopThread { thread: Some(id) }),
+            let content =
+                div()
+                    .h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap(t.space.0[3])
+                    .child(
+                        div()
+                            .w(t.layout.status_glyph)
+                            .flex_none()
+                            .text_color(glyph_color(&status, t))
+                            .child(glyph(&status)),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .min_w_0()
+                            .debug_selector(|| "sidebar-thread-title".into())
+                            .flex_1()
+                            .pl(t.space.0[3])
+                            .pr(t.space.0[3])
+                            .child(
+                                button_text(thread.title.clone().into(), cx)
+                                    .flex_1()
+                                    .min_w(t.layout.small_icon_button),
+                            )
+                            .children(quiet.map(|minutes| {
+                                let compact = shell.sidebar_width < t.layout.sidebar_default;
+                                div()
+                                    .debug_selector(|| "sidebar-quiet".into())
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .min_w(t.layout.status_glyph * 6.)
+                                    .text_size(t.text.meta.size)
+                                    .text_color(t.colors.text_muted)
+                                    .child(if compact {
+                                        format!("Quiet {minutes}m")
+                                    } else {
+                                        format!("Quiet for {minutes} min")
+                                    })
+                            })),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .flex_none()
+                            .w(t.layout.icon_button * 2.)
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("sidebar-stop-slot-{id}"))
+                                    .w(t.layout.icon_button)
+                                    .flex_none()
+                                    .when(
+                                        shell.thread_stop_target(id).is_some()
+                                            || shell
+                                                .engine
+                                                .window_threads()
+                                                .get(&id)
+                                                .is_some_and(|work| work.busy),
+                                        |slot| {
+                                            slot.child(
+                                                labelled_button(
+                                                    SharedString::from(format!("stop-thread-{id}")),
+                                                    "■",
                                                     cx,
-                                                );
-                                            },
-                                        ),
-                                    )
-                                },
-                            ),
-                        )
-                        .child(row_menu),
-                );
+                                                )
+                                                .debug_selector(|| "sidebar-thread-stop".into())
+                                                .w(t.layout.icon_button)
+                                                .accessibility_label("Stop thread")
+                                                .tooltip("Stop thread")
+                                                .on_click(move |_, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(StopThread { thread: Some(id) }),
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                        },
+                                    ),
+                            )
+                            .child(row_menu),
+                    );
             let keyboard_focus = row_focus.clone();
             rows.push(
                 div()
@@ -284,7 +285,8 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                     .tab_index(0)
                     .role(gpui::accesskit::Role::Button)
                     .aria_label(thread.title.clone())
-                    .when(quiet.is_none(), |row| row.pl(t.space.0[3]).pr(t.space.0[3]))
+                    .pl(t.space.0[3])
+                    .pr(t.space.0[3])
                     .rounded(t.radius.control)
                     .debug_selector(|| "sidebar-thread-row".into())
                     .group(SharedString::from(format!("thread-row-{id}")))

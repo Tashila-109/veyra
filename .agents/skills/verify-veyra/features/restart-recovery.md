@@ -131,7 +131,15 @@ expired = poll('restart-expired',lambda d: d['selected_thread']['id']==pending
 assert expired['composer']['dock'] is None
 capture('restart-expired-initial')
 capture('restart-expired')
-crashed = create('restart-crash','Long reply',scenario='long-reply')
+records = [json.loads(line) for line in (SOURCE/'bash-echo.jsonl').read_text().splitlines()]
+for record in records:
+    if record.get('line',{}).get('type')=='result': record['after_ms']=60000
+stage_records(records)
+crashed = create('restart-crash','Store the result before crashing',scenario=None)
+result = poll('restart-stored-result-before-crash',lambda d:any(item['kind']=='tool' and item['done']
+    and item['text']=='veyra-probe' for item in d['transcript']['items']))
+stored_tool = next(item for item in result['transcript']['items'] if item['kind']=='tool')
+assert stored_tool['tool_status']=='Done'
 ctl('restart-crash-working','wait',crashed,'Working')
 ctl('restart-crash-queue-text','text','queued before crash')
 action('restart-crash-queue-send','Send')
@@ -147,6 +155,9 @@ recovered = poll('restart-crash-held',lambda d: d['selected_thread']['id']==cras
     and d['selected_thread']['status']=='Held')
 assert recovered['selected_thread']['wait_reason']=='Held because Veyra closed while this ran'
 assert sql("select count(*) from turns where thread_id='"+crashed+"' and state='queued'")=='1'
+assert next(item for item in recovered['transcript']['items'] if item['id']==stored_tool['id'])['body']['Tool']['result']==stored_tool['body']['Tool']['result']
+assert next(item for item in recovered['transcript']['items'] if item['id']==stored_tool['id'])['text']=='veyra-probe'
+assert all(not re.search(r' · [0-9]+s$',item['outcome']) for item in recovered['transcript']['items'] if item['outcome'])
 capture('restart-crash-held')
 assert sql("select count(*) from threads where live_pid is not null or live_pgid is not null") == '0'
 action('restart-discard','DiscardQueued')
@@ -161,6 +172,14 @@ poll('restart-earlier-hidden',lambda d:all(row['kind']!='thread' for row in d['s
 root,child,task = create_family('child recovery',child='running')
 poll('restart-child-running',lambda d:d['selected_thread']['status']=='Done'
     and d['transcript']['family_card']['rows'][0]['status']=='Working')
+action('restart-family-quit','Quit')
+family_sheet = poll('restart-family-quit-sheet',lambda d:d['quit_sheet']['open'])
+project = sql("select name from projects where id=(select project_id from threads where id='"+child+"')")
+root_title = sql("select title from threads where id='"+root+"'")
+child_title = sql("select title from threads where id='"+child+"'")
+assert any(project+' · '+root_title+' / '+child_title==line for line in family_sheet['quit_sheet']['threads'])
+capture('restart-family-quit-sheet')
+ctl('restart-family-quit-cancel','keys','escape')
 select('restart-child-before-crash',child)
 pid = identity()
 groups = [int(x) for x in sql('select live_pgid from threads where live_pgid is not null').splitlines()]
@@ -223,6 +242,9 @@ PY
 ## Observable success
 
 `restart-sheet.json` and its PNG show quit_sheet.open and the busy thread title.
+`restart-family-quit-sheet.json` and its PNG name the child's project and root title.
+`restart-stored-result-before-crash.json` and `restart-crash-held.json` retain the same successful tool result, and the recovered outcome has no elapsed segment.
+`restart-stored-terminal.png` shows the fixture span in its labelled terminal block.
 `restart-cancelled.json` remains Working.
 The process checks show every owned provider group gone before orderly relaunch.
 `restart-held.json`, its PNG and SQLite show Interrupted, Held with Restarted and one queued turn.
@@ -248,7 +270,10 @@ Both Archive and ArchiveKeepChildren and the top-level tasks key are named here;
       "restart-after-ctl-database.txt",
       "restart-after-crash-database.txt",
       "restart-database-kept.json",
-      "restart-stored-terminal.png"
+      "restart-stored-terminal.png",
+      "restart-family-quit-sheet.png",
+      "restart-family-quit-sheet.json",
+      "restart-stored-result-before-crash.json"
     ]
   },
   "pairs": {}

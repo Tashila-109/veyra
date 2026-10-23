@@ -94,7 +94,7 @@ fn limit_notice(
     reached: Option<&str>,
     spend_reached: bool,
     spend: Option<&wire::SpendLimit>,
-) -> String {
+) -> Notice {
     let mut reset = window.and_then(|(_, w)| w.resets_at);
     let mut text = if spend_reached {
         reset = spend.and_then(|s| s.resets_at);
@@ -126,12 +126,10 @@ fn limit_notice(
         text
     };
     text.push('.');
-    if let Some(reset) = reset {
-        let reset =
-            crate::platform::utc_timestamp(reset).unwrap_or_else(|| format!("{reset} (Unix time)"));
-        text.push_str(&format!(" Resets at {reset}."));
+    Notice {
+        text,
+        reset_at: reset,
     }
-    text
 }
 enum RequestReply {
     Decision,
@@ -571,13 +569,18 @@ impl Codec {
                     && self.limit_level.is_none_or(|reported| level > reported)
                 {
                     self.limit_level = Some(level);
-                    decoded.events.push(Self::notice(&limit_notice(
+                    let notice = limit_notice(
                         level,
                         window,
                         reached,
                         spend_reached,
                         limits.individual_limit.as_ref(),
-                    )));
+                    );
+                    decoded.events.push(if notice.reset_at.is_some() {
+                        ProviderEvent::Session(SessionEvent::TimedNotice(notice))
+                    } else {
+                        Self::notice(&notice.text)
+                    });
                 }
                 return Ok(());
             }
@@ -1633,6 +1636,40 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn codex_fixture_separate_message_items_keep_their_keys() {
+        let mut codec = early_request_codec();
+        let source = include_str!("../../tests/fixtures/codex/ok-reply.jsonl");
+        let frame = source
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|row| {
+                row["line"]["method"] == "item/completed"
+                    && row["line"]["params"]["item"]["type"] == "agentMessage"
+            })
+            .unwrap();
+        let first: wire::Item =
+            serde_json::from_value(frame["line"]["params"]["item"].clone()).unwrap();
+        let mut events = Vec::new();
+        codec.item("native-turn", &first, true, &mut events);
+        let mut second = frame["line"]["params"]["item"].clone();
+        second["id"] = json!("second-message");
+        codec.item(
+            "native-turn",
+            &serde_json::from_value(second).unwrap(),
+            true,
+            &mut events,
+        );
+        let keys: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::TextDelta { key, .. } => Some(key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+    }
     fn early_request_codec() -> Codec {
         let mut codec = resumed();
         codec
@@ -1823,11 +1860,10 @@ mod limit_tests {
             .unwrap()
             .events
             .into_iter()
-            .map(|event| {
-                let ProviderEvent::Session(SessionEvent::Notice { text }) = event else {
-                    panic!("expected a usage notice")
-                };
-                text
+            .map(|event| match event {
+                ProviderEvent::Session(SessionEvent::TimedNotice(notice)) => notice.text,
+                ProviderEvent::Session(SessionEvent::Notice { text }) => text,
+                _ => panic!("expected a usage notice"),
             })
             .collect()
     }
@@ -1849,9 +1885,7 @@ mod limit_tests {
         let _ = texts(&mut codec, lane_zero(json!(false), 1));
         assert_eq!(
             texts(&mut codec, lane_zero(json!(false), 95)),
-            [
-                "Codex is near its usage limit: primary window (7 days), 95% used. Resets at 2026-10-20 05:05:36 UTC."
-            ]
+            ["Codex is near its usage limit: primary window (7 days), 95% used."]
         );
     }
     #[test]
@@ -1876,13 +1910,11 @@ mod limit_tests {
         for (limits, expected) in [
             (
                 json!({"secondary":{"usedPercent":95,"windowDurationMins":300,"resetsAt":1792472736}}),
-                "Codex is near its usage limit: secondary window (5 hours), 95% used. Resets at 2026-10-20 05:0\
-                    5:36 UTC.",
+                "Codex is near its usage limit: secondary window (5 hours), 95% used.",
             ),
             (
                 json!({"primary":{"usedPercent":100,"windowDurationMins":30,"resetsAt":1792472736}}),
-                "Codex reached its usage limit: primary window (30 minutes), 100% used. Resets at 2026-10-20 05\
-                    :05:36 UTC.",
+                "Codex reached its usage limit: primary window (30 minutes), 100% used.",
             ),
             (
                 json!({"secondary":{"usedPercent":90}}),
@@ -1891,7 +1923,7 @@ mod limit_tests {
             (
                 json!({"spendControlReached":true,"individualLimit":{"limit":"100","used":"100","remainingPerce\
                     nt":0,"resetsAt":1792472736}}),
-                "Codex reached its spend limit. Resets at 2026-10-20 05:05:36 UTC.",
+                "Codex reached its spend limit.",
             ),
             (
                 json!({"rateLimitReachedType":"workspace_member_credits_depleted"}),
@@ -1905,6 +1937,53 @@ mod limit_tests {
                 ),
                 [expected]
             );
+        }
+    }
+    #[test]
+    fn codex_fixture_notice_keeps_typed_reset() {
+        let mut codec = codec();
+        let source = include_str!("../../tests/fixtures/codex/retry-and-limits.jsonl");
+        let wire = source
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["line"]["method"] == "account/rateLimits/updated")
+            .unwrap();
+        let mut frame = wire["line"].clone();
+        frame["params"]["rateLimits"]["primary"]["resetsAt"] = json!(1792472736);
+        let decoded = codec.value(frame).unwrap();
+        assert!(matches!(decoded.events.as_slice(),
+            [ProviderEvent::Session(SessionEvent::TimedNotice(Notice { text, reset_at: Some(1792472736) }))]
+                if text == "Codex is near its usage limit: primary window, 95% used."));
+    }
+    #[test]
+    fn codex_limit_reset_uses_the_selected_window_or_spend_instant() {
+        for (limits, expected) in [
+            (
+                json!({"secondary":{"usedPercent":95,"resetsAt":111},
+                "primary":{"usedPercent":1,"resetsAt":222}}),
+                Some(111),
+            ),
+            (
+                json!({"primary":{"usedPercent":100,"resetsAt":222}}),
+                Some(222),
+            ),
+            (
+                json!({"spendControlReached":true,"individualLimit":{"resetsAt":333},
+                "primary":{"usedPercent":95,"resetsAt":222}}),
+                Some(333),
+            ),
+            (json!({"secondary":{"usedPercent":95}}), None),
+        ] {
+            let decoded = codec()
+                .value(json!({"method":"account/rateLimits/updated",
+                "params":{"rateLimits":limits}}))
+                .unwrap();
+            let instant = match decoded.events.as_slice() {
+                [ProviderEvent::Session(SessionEvent::TimedNotice(notice))] => notice.reset_at,
+                [ProviderEvent::Session(SessionEvent::Notice { .. })] => None,
+                _ => panic!("missing usage notice"),
+            };
+            assert_eq!(instant, expected);
         }
     }
     fn codec() -> Codec {

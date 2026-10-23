@@ -263,6 +263,7 @@ impl Actor {
                                     "Veyra closed while storage was blocked. Thread {thread} may have lost \
                                         {what}. Check the provider conversation before sending more work."
                                 ),
+                                reset_at: None,
                             }),
                         },
                     );
@@ -986,7 +987,17 @@ impl Actor {
                     cli_version,
                 });
             }
-            ProviderEvent::Session(SessionEvent::Notice { text }) => {
+            ProviderEvent::Session(
+                event @ (SessionEvent::Notice { .. } | SessionEvent::TimedNotice(_)),
+            ) => {
+                let notice = match event {
+                    SessionEvent::Notice { text } => Notice {
+                        text,
+                        reset_at: None,
+                    },
+                    SessionEvent::TimedNotice(notice) => notice,
+                    _ => unreachable!(),
+                };
                 if let Some(turn) = notice_turn(&self.projection, &c, thread, "session") {
                     commands::add_item(
                         &self.projection,
@@ -996,7 +1007,7 @@ impl Actor {
                             thread,
                             turn,
                             seq: 0,
-                            body: ItemBody::Notice(Notice { text }),
+                            body: ItemBody::Notice(notice),
                         },
                     );
                 }

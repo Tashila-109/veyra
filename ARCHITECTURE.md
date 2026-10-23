@@ -203,6 +203,11 @@ The actor never waits for provider I/O.
 The actor trims stored tool output to its last 10,000 characters.
 The actor publishes window thread wait reasons, busy flags and pending-admission turn ids after reconciliation, then updates only threads whose thread, turn, request or live rows changed.
 ChangeEvent boxes its large ThreadCreated and RequestOpened/RequestClosed row payloads to keep UiEvent compact; the window stores their unchanged row values.
+
+Each Engine::subscribe creates an unbounded UI-event channel, so events accumulate without capacity backpressure while its window consumer stalls.
+Provider stdin uses an unbounded Outbound channel whose writer drains frames into the child pipe; frames accumulate without a capacity limit while that writer stalls.
+While storage is blocked, the actor appends provider messages to an unbounded VecDeque and retries them in order after storage recovers, retaining the remainder if storage blocks again.
+These queues have no application capacity bound.
 Engine::window_threads reads that snapshot, including the pending-admission turn id for window Stop targeting.
 ThreadView::turn_busy includes a running row or any admission state, Pending or Refused; live::busy adds Starting and background work, and live::busy_threads supplies the shared walk for shutdown holds and needs_awake.
 Every actor message is timed, and a message over 50 ms logs its kind and duration.
@@ -489,6 +494,9 @@ Child frames feed the pending root Task or Agent tool's bounded output tail inst
 Unknown or finished child parents are ignored, and snapshots retain a running tool's tail.
 Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
+Usage limits carry their reset instant in Unix seconds through SessionEvent::TimedNotice and the stored Notice.reset_at field.
+Ordinary SessionEvent::Notice values retain text only and store reset_at as None.
+A missing reset_at field loads as None and is omitted on serialization, so older rows and ordinary notice bytes stay unchanged.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
 
 ## Shell drawer ownership
@@ -659,15 +667,18 @@ Null, false and unknown reached kinds do not count as a reached limit.
 The 90 percent threshold is Veyra's implementation choice for a near-limit warning; 100 percent or a reached flag is the reached level.
 A session reports each level at most once and never reports a lower level after a higher one, even after a usage reset.
 Near notices name the highest-usage primary or secondary window, its duration and used percentage when supplied; reached notices name the reported usage, credit or spend limit.
-The notice includes the selected window's reset timestamp, or the individual spend limit's timestamp for a spend warning, when supplied, formatted in UTC through the platform module with an explicit Unix-time fallback if conversion fails.
+The notice stores the selected window's reset timestamp, or the individual spend limit's timestamp for a spend warning, as optional Unix seconds beside the words before the time.
+The transcript computes the remaining time on each render; a stored notice without a reset instant renders its stored text unchanged.
 
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
-An outside cwd and a model-written reason are separate labeled, muted quoted elements rather than strings embedded in Veyra's consequence text.
+A command approval with a known folder shows it in a separate labeled, muted quote; a reported outside cwd takes precedence over the project folder.
+CommandCwd::NotVerified instead shows the unverified-location consequence and no folder quote.
+The model-written reason has its own labeled quote, and command previews omit raw request JSON.
 The working-folder quote stays beside the consequence above the scrolling details, with its path in a vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
-ToolCall stores a serde-defaulted veyra_label flag: only Codex's fixed labels are unquoted, while provider-named tools and older stored rows stay quoted.
-Both kinds use the bounded display projection; web search and image viewing have Veyra labels.
+ToolCall retains its serde-defaulted veyra_label flag for stored compatibility.
+Transcript tool titles use unquoted bounded display text for both Veyra and provider names, followed by a distinct command, search target or other main argument when present.
 Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers.
 Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them.
 Multiline command consequences name the line count, including blank lines, above the scrolling details.
@@ -682,7 +693,8 @@ Questions retain provider question ids and send answers by those ids; cancellati
 AgentMessage delivery and question fields are typed separately from server requests.
 A valid async questions list becomes ItemBody::AsyncQuestions with the original message text and each title, option list and optional selected index; SQLite's existing item JSON stores that additive shape without a migration.
 The transcript renders additional agent message content above the cards with the same item-id markdown cache and shared reply_markdown helper as AssistantText, preserving its full text and paragraphs.
-Empty messages or messages equal to the trimmed question titles are omitted.
+Empty messages and lines that repeat a trimmed question title or its bullet options are omitted, while additional message paragraphs remain.
+Completed empty assistant items have no transcript row.
 Each card quotes its provider title and option labels and explains that choosing sends a message, first stops active work and continues queued messages.
 ChooseAsyncOption is a gpui action, bound to Command-1 through Command-9 and reachable through the debug driver; the engine validates its item, question and option identity and refuses a repeated choice.
 One transaction persists the selected index and ordinary User turn.
@@ -692,7 +704,7 @@ The active session drains before the new prompt is sent; a choice deliberately c
 Card eligibility is a projection of item order: any later UserText item in the same thread closes every remaining choice, including after a typed answer.
 The engine rejects choices on such cards, and the window disables their controls; no new stored closed flag or migration is needed.
 An unnamed Command-1 through Command-9 action additionally requires a card in the thread's latest turn; explicit item actions retain their item/question/option identity.
-The question stays in the transcript with Sent text and disabled option controls after its selection.
+The question stays in the transcript with Answered beside its quoted choice and disabled option buttons after selection.
 An MCP elicitation is classified by codex_approval_kind first, then by a message naming serverName and a quoted or unquoted tool with an optional question mark.
 It docks with the server and tool, offers no thread grant, and answers only action accept, decline or cancel without persisting provider grant metadata.
 Other MCP forms are declined with a notice, and unsupported server requests get -32601.
@@ -763,6 +775,8 @@ Foreign text, reasoning, tool and plan updates still track the foreign prompt bu
 Each prompt retains only the title and input of its dropped tool_call starts, keyed by native tool id, until the Provider turn emits ToolStarted or the prompt ends.
 The first subsequent tool frame uses its nonempty title or the retained title, and the retained input when present, for ToolStarted; no dropped text, reasoning, plan or output is replayed.
 Once foreign work runs as a Provider turn, its subsequent content is emitted there.
+A prompt retains a ReplySegment with its number, open state and seen state; consecutive message chunks share a key, and tool, thought, plan or request boundaries close that segment before a later reply gets another key.
+The first reply keeps its earlier key shape, so stored rows need no conversion.
 Task reports select the last assistant text item, so dropped content cannot replace a child's own reply.
 The human's answer uses the original native request id; if the displayed turn ends first, finish queues a native cancelled reply and the actor expires the request with that turn.
 After the Veyra prompt ends, still-open foreign prompts immediately open one Provider turn in event order after its TurnEnded, without waiting for another frame.
@@ -1071,6 +1085,7 @@ Project and thread rows do not shrink inside the scroll column.
 SidebarScroll retains the scroll handle and last revealed selection; a changed selection scrolls its immediate row into view during layout.
 An unarchived child whose root is archived becomes a top-level row and keeps its own status.
 OpenThreadMenu exposes Stop thread, Archive and, for a root with unarchived children, Archive, keep child threads.
+A row menu closes after its own actions, family controls or a selection change, and quiet rows retain their siblings' title padding and Stop slot.
 All resizing paths dispatch SetSidebarWidth.
 The header reads title, status/elapsed time, project and a separate Git branch task on the tokio runtime.
 The header's Command-J button toggles the selected thread's shell drawer; Chat remains the only agent surface.
@@ -1092,9 +1107,11 @@ Other view changes and Quit call `forget_branch` to cancel the task and clear th
 Dropping the Shell also cancels the task, and its reply checks the selection identity.
 The centred transcript uses a window-owned MessageScrollerState over gpui ListState and selectable Markdown TextView.
 The transcript and its expansion behavior live in ui/transcript.rs.
-The Started N agents card, singular Started 1 agent, is the first derived list row and lists every child, including archived children whose Open is disabled.
+Started N agents cards, singular Started 1 agent, group children after the parent turn that started them, including archived children whose Open is disabled.
+The projection finds that turn from the start_thread request key and tool argument, falling back to the latest parent turn no later than the child's first task start.
 Each row uses its child's own status glyph and words, SelectThread as Open, and StopThread as Stop only while the shared stop_target rule names a turn and the child is unarchived.
-TaskCard rows show Task from the parent provider; Task and Wake turns label the parent title and distinct reporting children respectively.
+TaskCard rows precede the other items of their own turn and show Task from the parent provider.
+Task and Wake turns label the parent title and distinct reporting children respectively, using the same row gap before their content.
 A Delivered task labels only its named source assistant row Report delivered, including when queued tasks settle with a later task's reply; later identical user text cannot move the badge.
 A task without a recorded source shows no delivery badge, including older stored tasks and a child stopped before producing an assistant item.
 The row renderer and dump use the same report_delivered predicate over the task's stored link.
@@ -1102,27 +1119,33 @@ Turn::recency orders the transcript, ThreadView.last, failure cause and Retry by
 The actor attaches a session notice to a running turn when one exists, otherwise the latest started turn; queued and never-started turns cannot take a notice.
 Startup storage-loss notices use the same rule on the reconciled rows, so an attempted-start turn recovered as Interrupted can take its notice because it keeps its attempted start time.
 When no eligible turn exists, the shared notice selector logs the thread id and notice kind without the notice text.
-ReplyLineBreaks applies to assistant reply rows and uses the kit's Markdown AST hook to turn prose soft breaks into rendered line breaks, preserving lists, emphasis, tables and code, with the original Markdown retained for source copying.
+ReplyLineBreaks applies to assistant reply rows and uses the kit's Markdown AST hook to turn prose soft breaks into rendered line breaks, preserving lists, emphasis, tables and code, with the projected Markdown retained for source copying before the line-break transformation.
+The stored item retains its original text separately from this display projection.
 AppState caches each thread's ordered item ids and row positions, rebuilding them on item insertion, turn metadata and snapshots.
 It fills shared markdown source strings for assistant and reasoning rows before they enter the cached order, refreshing only the changed item and removing archived rows.
 The row renderer receives that row's cached markdown source without rebuilding it.
 The list reads items and turns directly from the projection instead of cloning the transcript on every render.
-The first family card inserts before existing list rows; text remeasurement and expansion translate cached item positions past that row.
+New family cards insert at their derived turn positions; text remeasurement and expansion translate cached item positions past every preceding family card.
 AppState::text_rows selects only a text-only pump batch's changed rows in the open thread for remeasurement.
 Other batches still remeasure the list for structural, outcome and queue-label changes.
 The inline streaming caret remains part of the markdown source, so a growing assistant row still takes the kit's full-replacement parse path.
 Failed tools show their last nonempty output line, truncated to one row at its width.
 The window and dump share row_outcome, which annotates only each ended turn's final item.
-The failed banner's own turn is captioned Failed alone because the banner already shows its cause; historical failed turns retain the cause in their caption.
+The failure card follows the final item of its failed turn, whose outcome caption reads Failed because the card shows its cause.
+Historical failed turns retain the cause in their caption.
+Elapsed time renders in a separate outcome segment, and an outcome reconciled after Veyra closed has no elapsed segment.
 A user scroll detaches following; new text, requests and tool rows preserve that state.
 Scrolling within text.read.line_height of the bottom or choosing Latest reattaches.
 Latest appears only while following is detached and content remains below.
 Expanding a row remeasures it without moving its top anchor.
 Streamed text and tool input remain unbounded outside the 4 MiB wire-line cap.
-The failed view uses the latest nonqueued turn and shows its cause, Retry and Open Terminal on the project folder.
+The failed view uses the latest nonqueued turn and places its cause, Retry and Open Terminal on the project folder after that turn's content.
+Queued wait words sit directly below their own user bubble.
+Each transcript item has paragraph spacing, and a stored TerminalSpan uses a bordered block, terminal text and the label This turn ran in the terminal.
 It renders the provider’s failure cause and any next step in that cause without appending a generic sign-in footer.
 Claude, Codex and Grok sign-in failures include their sign-in instruction in the cause, so it appears once; a 403’s own wording is never supplemented with login advice.
-header::status_text supplies the header, family card and sidebar tooltip with user-facing status words, including Needs you; Status::words retains dump spellings.
+header::status_text supplies shared user-facing status words, including Needs you, for the header, family card and sidebar tooltip; Status::words retains dump spellings.
+The header overrides them with Starting and the thread's own provider while the engine's published wait reason is Starting.
 Retry probes again; once the thread's provider is Ready it clears any hold and resends the failed turn's own user item as a new turn.
 A newer queued message remains queued and is never reused as the Retry prompt.
 Send also clears a hold when the thread has no queued turn.
@@ -1131,8 +1154,10 @@ The composer uses TextareaState and provider/model/effort/permission chips.
 Typed gpui action payloads reject malformed ids and enum values at dispatch, with a visible error.
 On New thread, OpenProviderPicker and its key open the provider menu through a controlled kit popover.
 An open menu rebuilds its readiness labels when probing begins and when each reply arrives.
-Not-ready providers disable Send with their repair command.
+Not-ready providers disable Send with their repair command, which stays below the composer when its provider menu opens.
+A signed-out failure card shows the provider's one sign-in instruction from its cause.
 Codex and Grok use the same picker and composer, with model labels and effort choices read from their probes.
+The selected model chip uses the catalog display name and falls back to the stored value when the catalog lacks it.
 Grok uses its initialize catalog, with Default-only model and effort menus when modelState is absent; switching providers clears both selections and resets the permission mode to the new provider’s run mode of the stored Settings default.
 Codex's commands, file changes, permissions, MCP approvals, questions and retry/limit notices use the existing dock, question card and transcript rows.
 A Claude root's Codex child uses the same task card, breadcrumb and family projection.
@@ -1175,11 +1200,11 @@ The working-folder quote uses the 16px label line height and the scrolling dock 
 Other quotes inherit their parent line height and keep natural height; async card titles use the transcript row’s 24px read line height.
 Question text scrolls from one 20px line up to the 240px composer cap beneath its fixed label; the combined question region keeps a 44px minimum for label, gap and one text line.
 Up to four options use one column; larger lists use three columns.
-Option captions wrap without visual truncation inside buttons of at least 28px; overflowing lists scroll in a 28–240px bounded viewport with the same overflow-only scrollbar.
+Option captions wrap to two lines with an ellipsis inside buttons of at least 28px; overflowing lists scroll in a 28–240px bounded viewport with the same overflow-only scrollbar.
 Shell owns QuestionScroll separately, keyed by the docked RequestId and question index; a changed target replaces both its text and option-list handles, and repainting the same target keeps their offsets.
 Shell owns both approval handles and replaces them when the docked request id changes, so each new request opens at the top with its full marked path available by scrolling and no elision.
 The stable folder element id does not own that reset.
-The dock shows 1 of N for multiple pending requests.
+The dock shows 1 of N for multiple pending requests and a separate Question 1 of N count within a multi-question request.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
 Consent buttons carry their displayed request id, and question choices also carry the displayed question index.
 Shell::dock_target selects the request and question index for dock rendering, consent buttons, the debug dump and keyboard handlers.
@@ -1215,11 +1240,13 @@ Content, raised card and floating colour roles form the dark elevation ladder; l
 Floating sheets use the floating radius and shadow, and the kit's popup shadow is enabled.
 The platform reads Reduce Transparency, Increase Contrast and Reduce Motion from NSWorkspace at launch and window activation.
 Either transparency or contrast flag forces Solid without changing the stored choice, and Settings names the forcing flag.
-While forced, its background row selects Solid and disables both choices; SetWindowBackground and Command-Option-B leave the stored choice unchanged.
+While forced, its background row selects Solid and disables both choices, and the native Toggle Window Background menu action is unavailable.
+SetWindowBackground and Command-Option-B leave the stored choice unchanged.
 Clearing the flag restores that choice.
 Increase Contrast raises borders to a component contrast colour and uses the text colour for muted roles.
 Reduce Motion sets gpui's reduce-motion flag and snaps every motion token, including the spinner, to zero.
-The working glyph remains still and the one-second status clock continues to update elapsed time.
+The working glyph remains still.
+The one-second status clock repaints while work runs or the selected transcript contains a timed notice, keeping elapsed and relative reset text current.
 Theme values and roles live in ui/theme.rs.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
 Window geometry comes from the theme and can be overridden by the window manager.
@@ -1229,18 +1256,22 @@ Family status includes unarchived children, so pending background work prevents 
 The banner contains the family root title, derived by collapsing whitespace in its first user message and taking the first 80 characters, and a status word.
 It excludes assistant, tool and later user text.
 Its root-id tag lets a click activate the window and select the root or the first child needing attention.
-`scripts/bundle-app.sh` builds a macOS app bundle with dev.veyra.app identity and signs it ad hoc, because macOS refuses notification authorization to an unsigned bundle.
+`scripts/bundle-app.sh` builds a macOS app bundle with dev.veyra.app identity, copies Veyra.icns into Contents/Resources and names it in CFBundleIconFile.
+It signs the bundle ad hoc because macOS refuses notification authorization to an unsigned bundle.
 System permission and native banner clicks require operator verification.
 The debug-only DebugNotificationResponse action passes a banner tag to the same notification_response handler as the native callback, allowing stale-tag routing checks without OS delivery.
 
 Provider display text uses the engine's pure text::display_line projection, with its own 400-character input cap, a trailing ellipsis when cut, collapsed whitespace and removed Unicode format and default-ignorable characters.
-Dock reasons, transcript provider tool names, async card titles and options, and family/plan labels use that projection with quotes and the existing truncation mark; reasons have their own labeled, muted element.
+Dock reasons, async card titles and options, and family/plan labels use that projection with quotes and the existing truncation mark; reasons have their own labeled, muted element.
+Transcript tool titles use the same cleanup without quotes.
+The shared display_text projection removes invisible format characters and draws at most three consecutive combining marks while retaining paragraph breaks.
 Literal consent paths and approval tool names instead retain their full marked consent projection in both action text and labeled quotes; commands retain their marked text with heredoc newlines.
 The debug dump exposes provider_text entries in approval docks and display_questions plus choices_active on async items beside the unchanged raw body.
 Those fields use the same display projection as rendering, while raw options remain available for exact protocol assertions.
 The debug tool_label and dock grant_caption fields share the row and grant-button rendering helpers.
 The debug-only DebugScrollApproval action moves the actual details handle used by wheel scrolling; details_scroll exposes its offset and maximum only when the scroll state belongs to the currently docked request, without changing consent state.
 Raw option strings remain in the stored card and are selected by validated indices for UserText, so display cleanup cannot change the sent message.
+The answer bubble uses the card's cleaned one-line option text while storage and outbound protocol bytes remain exact.
 Commands and argument previews retain their code styling with visible Unicode markers; their underlying consent identities keep the exact bytes.
 
 ## Debug protocol and verification trust
@@ -1318,9 +1349,8 @@ The following clarifications and remaining differences are checked against the c
   In that case ambient children retain any application-inherited value beside the shell PATH; failed shells retain both inherited values (`provider/env.rs`).
 - Design 11’s captures use collision-safe numbered names and additionally mask account metadata, Grok identity/hostname, commands, server connection details, URL paths and queries, and email shapes (`record.rs`).
 - Clarification of design 9: Provider-text presentation distinguishes marked literal consent text from one-line projected labels.
-  Chosen async option messages retain raw bytes, so a bidi override can still affect their user bubble.
-  That rendering rule remains unresolved (`text.rs`, `ui/provider_text.rs`, `ui/transcript.rs`).
-- Clarification of design 9: Dock layout keeps decision buttons visible, bounds outside-folder text to three lines, scrolls long details and question text independently, and never truncates option captions.
+  Chosen async option messages retain raw bytes for storage and sending, and their user bubbles use the same cleaned text as the card (`text.rs`, `ui/provider_text.rs`, `ui/transcript.rs`).
+- Clarification of design 9: Dock layout keeps decision buttons visible, bounds outside-folder text to three lines, scrolls long details and question text independently, and bounds option captions to two lines with an ellipsis.
   The input grows into the space its docks leave and remains scrollable under pressure (`ui/composer.rs`, `ui/provider_text.rs`, `ui/mod.rs`).
 - Clarification of design 12: Ordinary tests use explicit isolated provider environments in debug and release; only ignored live tests resolve installed CLIs.
   Terminal throughput measurements must name their grid, which the debug launch override can fix (`provider/env.rs`, `ui/mod.rs`).

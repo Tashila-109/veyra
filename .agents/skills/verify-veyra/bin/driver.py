@@ -254,6 +254,42 @@ def region_capture(target, pid, window):
             save(target.stem+'-region-guards',{'attempts':attempts})
             if attempt == 2: raise
             time.sleep(.1)
+def measured_pair(labels, take, rectangle=(24,60,960,740)):
+    """Retake both halves at one placement if either half needed the owned-window fallback."""
+    attempts = []
+    for attempt in range(3):
+        for label in labels:
+            rectangle, placed = take(label,rectangle)
+            if placed: break
+        else:
+            save(labels[0]+'-pair-placement',{'attempts':attempts,'rectangle':rectangle,'passed':True})
+            return
+        attempts.append({'attempt':attempt+1,'fallback_half':label,'rectangle':rectangle,
+            'discarded':list(labels)})
+        for label in labels:
+            (PROOF/(label+'.png')).unlink(missing_ok=True)
+        save(labels[0]+'-pair-placement',{'attempts':attempts,'passed':False})
+        assert attempt < 2, 'measurement placement did not settle within three attempts'
+def measured_pair_self_test():
+    """Plant fallback on one half only; neither retained image may predate that placement."""
+    labels = ['pair-test-coarse','pair-test-inverse']
+    for fallback_half in labels:
+        calls, retained = [], {}
+        def take(label,rectangle):
+            calls.append((label,tuple(rectangle)))
+            placed = label == fallback_half and len(calls) <= 2
+            rectangle = (24,421,960,740) if placed else rectangle
+            retained[label] = (len(calls),tuple(rectangle))
+            (PROOF/(label+'.png')).write_bytes(bytes([len(calls)]))
+            return rectangle,placed
+        measured_pair(labels,take)
+        assert [label for label,_ in calls][-2:] == labels, calls
+        assert retained[labels[0]][0] > (1 if fallback_half == labels[0] else 2), retained
+        assert retained[labels[0]][1] == retained[labels[1]][1] == (24,421,960,740), retained
+        assert all((PROOF/(label+'.png')).read_bytes() == bytes([retained[label][0]]) for label in labels)
+        save(fallback_half+'-self-test',{'calls':calls,'retained':retained})
+        for label in labels: (PROOF/(label+'.png')).unlink()
+    print('PASS measured_pair_self_test: fallback on either half discards both and retakes one rectangle')
 def guarded_capture(name):
     assert not locked()
     window = (PROOF/'window-id').read_text().strip()

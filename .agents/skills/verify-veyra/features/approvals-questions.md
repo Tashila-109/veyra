@@ -49,7 +49,15 @@ assert LANE == 'fake'
 check = DATA/'project'/'veyra-check.txt'
 check.unlink(missing_ok=True)
 action('approval-mode','SetDefaultMode',{'mode':'ask_first'})
-thread = create('approval-deny','Run touch veyra-check.txt',scenario='approval-deny')
+records = [json.loads(line) for line in (SOURCE/'approval-deny.jsonl').read_text().splitlines()]
+records.insert(4,{'type':'emit_inbound','line':{'type':'assistant','session_id':'<id:session>',
+    'parent_tool_use_id':None,'message':{'content':[{'type':'tool_use','id':'denied-tool','name':'Bash',
+        'input':{'command':'touch veyra-check.txt'}}]}}})
+records.insert(7,{'type':'emit_inbound','line':{'type':'user','session_id':'<id:session>',
+    'parent_tool_use_id':None,'message':{'content':[{'type':'tool_result','tool_use_id':'denied-tool',
+        'is_error':True,'content':'The request was denied.'}]}}})
+stage_records(records)
+thread = create('approval-deny','Run touch veyra-check.txt',scenario=None)
 dock = poll('approval-deny-dock',lambda d: d['composer']['dock'] is not None)
 assert dock['composer']['dock']['request']['kind']['Approval']['action']['target']['command'] == 'touch veyra-check.txt'
 assert dock['selected_thread']['status'] == 'NeedsYou'
@@ -58,7 +66,9 @@ action('approval-deny-focus','FocusDock')
 poll('approval-deny-focused',lambda d: d['composer']['dock']['focused'])
 capture('approval-deny-focused')
 ctl('approval-deny-key','keys','secondary-.')
-ctl('approval-deny-done','wait',thread,'Done')
+denied = ctl('approval-deny-done','wait',thread,'Done')
+assert next(row for row in denied['transcript']['items'] if row['kind']=='tool')['tool_status']=='Denied by you'
+capture('approval-denied-tool')
 assert not check.exists()
 records = [json.loads(line) for line in (SOURCE/'approval-allow.jsonl').read_text().splitlines()]
 reply = [json.loads(line) for line in (SOURCE/'ok-reply.jsonl').read_text().splitlines()][3:]
@@ -177,6 +187,27 @@ capture('approval-new-long-command')
 action('approval-new-long-command-deny','Deny',{'request':dock['request']['id']})
 ctl('approval-new-long-command-done','wait',thread,'Done')
 
+records = [json.loads(line) for line in (SOURCE/'question.jsonl').read_text().splitlines()]
+question_input = records[4]['line']['request']['input']['questions']
+second_question = json.loads(json.dumps(question_input[0]))
+second_question['question'] = 'Which report should follow?'
+question_input.append(second_question)
+records[5]['line']['response']['response']['updatedInput'] = {
+    'questions':question_input,
+    'answers':{question_input[0]['question']:question_input[0]['options'][0]['label'],
+        second_question['question']:second_question['options'][0]['label']}}
+stage_records(records)
+counted = create('question-within-request','Answer two questions in one request',scenario=None)
+first = poll('question-within-first',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert first['count']==1 and first['question_count']=='1 of 2'
+action('question-within-focus','FocusDock')
+ctl('question-within-first-answer','keys','1')
+second = poll('question-within-second',lambda d:d['composer']['dock'] is not None
+    and d['composer']['dock']['question_index']==1)['composer']['dock']
+assert second['count']==1 and second['question_count']=='2 of 2'
+capture('question-within-request')
+ctl('question-within-second-answer','keys','1')
+ctl('question-within-done','wait',counted,'Done')
 question = create('question','Choose a route',scenario='question')
 poll('question-dock',lambda d: d['composer']['dock'] is not None)
 capture('question')
@@ -279,12 +310,25 @@ dump = poll('codex-command',lambda d:d['composer']['dock'] is not None)
 dock = dump['composer']['dock']
 assert dock['action_text']=='touch veyra-check.txt' and dump['selected_thread']['status']=='NeedsYou'
 assert dock['consequence']=='Codex will use the project folder as its working folder.'
-assert dock['provider_text']==[{'kind':'reason','label':"Codex's reason (model-written)",'text':'“Create the requested file”'}]
+assert dock['provider_text']==[{'kind':'working_folder','label':'Working folder','text':'“'+os.path.realpath(DATA/'project')+'”'}, {'kind':'reason','label':"Codex's reason (model-written)",'text':'“Create the requested file”'}]
 assert dock['request']['kind']['Approval']['action']['target']['reason']=={'text':'Create the requested file','truncated':False}
 capture('codex-command')
 action('codex-command-once','AllowOnce',{'request':dock['request']['id']})
 ctl('codex-command-done','wait',thread,'Done')
 assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))=='AllowOnce'
+
+records = codex_records('approval-command')
+position = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/commandExecution/requestApproval')
+records[position+1]['line']['result']['decision']='decline'
+records.insert(position,{'type':'emit_inbound','line':{'method':'item/started','params':{
+    'threadId':'<id:session>','turnId':'native-turn','item':{'type':'commandExecution','id':'action',
+        'command':'touch veyra-check.txt','status':'inProgress'}}}})
+thread = create_codex('codex-denied-tool',records=records)
+dock = poll('codex-denied-tool-dock',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+action('codex-denied-tool-answer','Deny',{'request':dock['request']['id']})
+denied = ctl('codex-denied-tool-done','wait',thread,'Done')
+assert next(row for row in denied['transcript']['items'] if row['kind']=='tool')['tool_status']=='Denied by you'
+capture('codex-denied-tool')
 
 records = codex_records('approval-command')
 index = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/commandExecution/requestApproval')
@@ -381,7 +425,7 @@ for record in records:
 thread = create_codex('codex-reason-spoof',records=records)
 spoof = poll('codex-reason-spoof',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert spoof['consequence']=='Codex will use the project folder as its working folder.'
-assert spoof['provider_text']==[{'kind':'reason','label':"Codex's reason (model-written)",'text':'“Requested change Veyra checked this command OK”'}]
+assert spoof['provider_text']==[{'kind':'working_folder','label':'Working folder','text':'“'+os.path.realpath(DATA/'project')+'”'}, {'kind':'reason','label':"Codex's reason (model-written)",'text':'“Requested change Veyra checked this command OK”'}]
 capture('codex-reason-quoted')
 action('codex-reason-allow','AllowOnce',{'request':spoof['request']['id']})
 ctl('codex-reason-done','wait',thread,'Done')
@@ -447,11 +491,14 @@ assert sql("select coalesce(hold_reason,'none') from threads where id='"+thread+
 assert sql("select count(*) from turns where thread_id='"+thread+"'")=='2'
 assert all('User' in json.loads(row) for row in sql("select origin_json from turns where thread_id='"+thread+"'").splitlines())
 assert sql("select count(*) from requests where thread_id='"+thread+"' and state='expired'")=='1'
-assert any(item['kind']=='user' and item['text']==exact_option for item in chosen['transcript']['items'])
+assert any(item['kind']=='user' and item['text']=='Violet' and item['body']['UserText']==exact_option for item in chosen['transcript']['items'])
 answered = next(item for item in chosen['transcript']['items'] if item['id']==question['id'])
 assert answered['body']['AsyncQuestions']['questions'][0]['selected']==0
 assert answered['text']==question['text']
 assert answered['choices_active'] is False
+items = chosen['transcript']['items']
+assert next(i for i,row in enumerate(items) if row['id']==question['id']) < next(i for i,row in enumerate(items) if row['kind']=='user' and row['body']['UserText']==exact_option)
+assert not any(row['kind']=='assistant' and not row['text'].strip() for row in items)
 capture('codex-async-question-chosen')
 action('codex-card-repeat','ChooseAsyncOption',{'item':question['id'],'question':0,'option':1})
 ctl('codex-card-repeat-key','keys','secondary-2')
@@ -522,7 +569,14 @@ assert LANE == 'fake'
 check = DATA/'project/veyra-check.txt'
 check.unlink(missing_ok=True)
 for label,scenario,decision in [('deny','approval-deny','Deny'),('allow','approval-allow','AllowOnce')]:
-    thread = create_grok('grok-approval-'+label,scenario=scenario,prompt="Run only printf 'veyra\\n' > veyra-check.txt; "+label+' this request')
+    records = grok_records(scenario)
+    if decision=='Deny':
+        position = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='session/request_permission')
+        params = records[position]['line']['params']
+        records.insert(position,{'type':'emit_inbound','line':{'jsonrpc':'2.0','method':'session/update',
+            'params':{'sessionId':params['sessionId'],'_meta':params['_meta'],
+                'update':dict(params['toolCall'],sessionUpdate='tool_call',status='pending')}}})
+    thread = create_grok('grok-approval-'+label,records=records,prompt="Run only printf 'veyra\\n' > veyra-check.txt; "+label+' this request')
     dock = poll('grok-approval-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
     assert dock['action_text']=="printf 'veyra\\n' > veyra-check.txt"
     assert dock['allow_once_enabled'] and dock['allow_in_thread_enabled']
@@ -532,6 +586,7 @@ for label,scenario,decision in [('deny','approval-deny','Deny'),('allow','approv
     ctl('grok-approval-'+label+'-done','wait',thread,'Interrupted' if decision=='Deny' else 'Done')
     if decision=='Deny':
         assert json.loads(sql("select outcome_json from turns where thread_id='"+thread+"' order by rowid desc limit 1"))=={'Interrupted':{'reason':'Stopped after you denied a request'}}
+        assert next(row for row in ctl('grok-denied-tool','dump')['transcript']['items'] if row['kind']=='tool')['tool_status']=='Denied by you'
         capture('grok-approval-denied')
     assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))==decision
     assert check.exists()==(decision=='AllowOnce')
@@ -643,7 +698,8 @@ The dock renders the typed request, not provider wire, so Codex's four- and nine
 The dock-region matrix also includes Grok and the Deny-only reason and disabled buttons.
 The GPUI matrices also check disjoint visible regions, contained text for every region, the docked editor inside its input viewport and every dock/composer button inside both theme window sizes for every dock kind (scrolling choices are clipped to their viewport).
 One held-and-queued case per theme window size and provider checks Discard queued alongside Continue.
-Caption checks shape each complete option label at its actual font and width, so truncation cannot pass as containment.
+Caption checks shape each option at its actual font and width with the same two-line bound as rendering.
+The focused long-option test also checks the rendered ellipsis and one complete button at the smallest window.
 The draft test scrolls to the last of 40 lines and proves the original text and normal input growth survive closing the dock.
 Question text keeps at least one 20px line, caps at 240px, and scrolls independently of its label and options; both its text and option-list handles reset for each request and question index.
 The shared scrollbar uses a 16px logical thumb minimum so even a one-line track has visible thumb travel.
@@ -665,8 +721,8 @@ A grant in the project permits the identical command there; the same command in 
 SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
 File and permission denials, the Violet answer and both MCP decisions are persisted.
 The reason PNG shows a single quoted provider line, under its own label and apart from the consequence.
-The async-question PNG shows the complete two-paragraph markdown reply above the quoted sanitized title, option controls and choice consequence; its captured UserText preserves the option's exact bidi-bearing bytes.
-The chosen PNG retains the question, shows Sent Violet and disables both controls.
+The async-question PNG shows the complete two-paragraph markdown reply above the quoted sanitized title, option controls and choice consequence; its stored UserText preserves the option's exact bidi-bearing bytes while its bubble displays Violet.
+The chosen PNG retains the question, shows Answered beside Violet and disables both controls.
 Command-1 chooses the latest-turn card.
 The typed-answer PNG leaves its option unselected and closes both controls; a later key or explicit stale choice starts no third turn.
 The strict fixture requires its pending request cancellation before interrupt and Violet as ordinary user input; SQLite records two User turns, the expired request and no hold.
@@ -693,7 +749,7 @@ The next digit answers it without refocusing; `questions-done.json` and SQLite s
 
 ### Dump fields
 
-`composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index`.
+`composer.stop_visible` describes the empty running composer; `dock` holds its `request`, `position`, `count`, `focused` and `question_index` and `question_count`.
 Approval answer chords appear only with dock focus; otherwise its hint shows the FocusDock chord.
 Approval dock action_text, consequence and preview report the same typed target, one-line effect and bounded arguments rendered in the window.
 Consent command, preview and path displays mark Unicode controls and invisible formats as ⟨U+XXXX⟩; command newlines remain for heredocs.
@@ -710,7 +766,7 @@ Approval docks report `allow_once_enabled`, `allow_in_thread_enabled` and `conse
 A Deny-only request keeps both allow buttons disabled, shows its reason above the details and leaves Deny enabled.
 Questions share the same unfocused FocusDock prompt.
 Up to four options use one column and larger lists use three columns.
-Captions wrap without visual truncation; overflowing lists use the same bounded scrollbar.
+Captions wrap to two lines with an ellipsis; overflowing lists use the same bounded scrollbar.
 The request and question index own independent text and option-list scroll resets.
 A pending dock leaves the message input every available pixel up to 240px, with a 48px minimum and a scrollable draft.
 Answering one request keeps dock focus while requests remain.
@@ -748,7 +804,10 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "approval-mcp.png",
       "approval-long-command.png",
       "approval-long-command-end.png",
-      "approval-new-long-command.png"
+      "approval-new-long-command.png",
+      "question-within-request.png",
+      "question-within-second.json",
+      "approval-denied-tool.png"
     ],
     "approvals-questions-codex": [
       "codex-command.json",
@@ -765,7 +824,8 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "codex-card-done.json",
       "codex-reason-quoted.png",
       "codex-long-working-folder.png",
-      "codex-long-working-folder-end.png"
+      "codex-long-working-folder-end.png",
+      "codex-denied-tool.png"
     ],
     "approvals-questions-grok": [
       "grok-approval-deny.png",

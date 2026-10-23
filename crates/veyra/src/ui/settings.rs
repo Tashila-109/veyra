@@ -68,6 +68,7 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                         .text_size(t.text.h2.size)
                         .line_height(t.text.h2.line_height)
                         .font_weight(t.text.h2.weight)
+                        .debug_selector(|| "settings-default-heading".into())
                         .child("Default mode for new threads"),
                 )
                 .child(div().h_flex().gap(t.layout.segment_padding).children(
@@ -136,17 +137,18 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                                         .into()
                                 }),
                         ),
-                ),
+                )
+                .when_some(notice, |this, notice| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "settings-error".into())
+                            .text_size(t.text.meta.size)
+                            .line_height(t.text.meta.line_height)
+                            .text_color(t.colors.danger)
+                            .child(notice),
+                    )
+                }),
         )
-        .when_some(notice, |this, notice| {
-            this.child(
-                div()
-                    .text_size(t.text.meta.size)
-                    .line_height(t.text.meta.line_height)
-                    .text_color(t.colors.danger)
-                    .child(notice),
-            )
-        })
 }
 
 pub(super) fn background_button(

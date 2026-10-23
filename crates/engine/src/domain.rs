@@ -214,6 +214,8 @@ pub struct PlanStep {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Notice {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<i64>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSpan {
@@ -767,4 +769,28 @@ pub fn async_question_active<'a>(item: &Item, items: impl IntoIterator<Item = &'
                 && later.seq > item.seq
                 && matches!(later.body, ItemBody::UserText(_))
         })
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::{ItemBody, Notice};
+    #[test]
+    fn stored_notice_without_reset_loads_and_serializes_unchanged() {
+        let old = r#"{"text":"Stored words stay exact."}"#;
+        let notice: Notice = serde_json::from_str(old).unwrap();
+        assert_eq!(notice.text, "Stored words stay exact.");
+        assert_eq!(notice.reset_at, None);
+        assert_eq!(serde_json::to_string(&notice).unwrap(), old);
+        let stored_body = r#"{"Notice":{"text":"Stored words stay exact."}}"#;
+        let body: ItemBody = serde_json::from_str(stored_body).unwrap();
+        assert_eq!(body, ItemBody::Notice(notice));
+        assert_eq!(serde_json::to_string(&body).unwrap(), stored_body);
+        let timed = Notice {
+            text: "Usage limit.".into(),
+            reset_at: Some(12345),
+        };
+        let encoded = serde_json::to_string(&timed).unwrap();
+        assert_eq!(encoded, r#"{"text":"Usage limit.","reset_at":12345}"#);
+        assert_eq!(serde_json::from_str::<Notice>(&encoded).unwrap(), timed);
+    }
 }

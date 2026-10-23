@@ -544,7 +544,7 @@ fn shell_spawn_reason(error: &io::Error) -> String {
     match (error.kind(), error.raw_os_error()) {
         (io::ErrorKind::NotFound, _) => "not found".into(),
         (io::ErrorKind::PermissionDenied, _) => "permission denied".into(),
-        (_, Some(8 | 86 | 88)) => "not a program this Mac can run".into(),
+        _ if platform::is_incompatible_executable(error) => "not a program this Mac can run".into(),
         (_, code) => {
             let message = error.to_string();
             let suffix = code.map(|code| format!(" (os error {code})"));

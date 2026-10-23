@@ -112,6 +112,13 @@ for scenario, status in [('probe-signed-out','signed_out'),('probe-no-account','
     assert probe['composer']['send_enabled'] == (status=='ready')
     if status=='signed_out':
         assert 'claude auth login' in probe['composer']['disabled_reason']
+        assert probe['composer']['disabled_reason'].count('Sign in')==1
+        capture('new-thread-signed-out-hint')
+        action('new-thread-signed-out-menu','OpenProviderPicker')
+        menu = poll('new-thread-signed-out-menu',lambda d:d['composer']['provider_picker_open'])
+        assert menu['composer']['disabled_reason']==probe['composer']['disabled_reason']
+        capture('new-thread-signed-out-menu')
+        action('new-thread-signed-out-menu-close','PickProvider',{'provider':'claude'})
     assert sql('select count(*) from threads')=='0'
 assert sql('select count(*) from threads') == '0'
 for provider in ['codex','grok','claude']:
@@ -127,6 +134,7 @@ assert ctl('new-thread-effort','dump')['composer']['effort'] == model['supported
 choice = no_account['providers'][0]['models'][1]
 action('new-thread-model-action','PickModel',{'model':choice['value']})
 assert ctl('new-thread-model-action-after','dump')['composer']['model'] == choice['value']
+capture('new-thread-model-display-name')
 effort = choice['supportedEffortLevels'][1]
 action('new-thread-effort-action','PickEffort',{'effort':effort})
 assert ctl('new-thread-effort-action-after','dump')['composer']['effort'] == effort
@@ -350,7 +358,10 @@ Settings keeps all three defaults; a new Grok composer applies Accept edits as A
       "new-thread-provider-menu.png",
       "new-thread-provider-menu-ready.png",
       "new-thread-ready.png",
-      "new-thread.png"
+      "new-thread.png",
+      "new-thread-signed-out-hint.png",
+      "new-thread-signed-out-menu.png",
+      "new-thread-model-display-name.png"
     ],
     "new-thread-codex": [
       "codex-new-thread-missing.json",

@@ -863,16 +863,19 @@ fn claude_retry_limit_fallback_notices() {
     let notices: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            ProviderEvent::Session(SessionEvent::Notice { text }) => Some(text.as_str()),
+            ProviderEvent::Session(SessionEvent::Notice { text }) => Some((text.as_str(), None)),
+            ProviderEvent::Session(SessionEvent::TimedNotice(notice)) => {
+                Some((notice.text.as_str(), notice.reset_at))
+            }
             _ => None,
         })
         .collect();
     assert_eq!(
         notices,
         [
-            "Claude is retrying the API (attempt 2) in 1000 ms.",
-            "Claude usage limit: rejected; resets at 12345.",
-            "Claude is falling back to another model."
+            ("Claude is retrying the API (attempt 2) in 1000 ms.", None),
+            ("Claude usage limit: rejected.", Some(12345)),
+            ("Claude is falling back to another model.", None)
         ]
     );
     assert_eq!(outcomes(&events), vec![TurnOutcome::Completed]);

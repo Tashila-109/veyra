@@ -260,6 +260,8 @@ Translucent captures use `screencapture -x -R x,y,w,h` of the exact on-screen wi
 They require `bin/backdrop.swift` behind Veyra, with its run-owned pid and window ids in `backdrop-windows.json`.
 Immediately before and after each region capture, the helper checks that Veyra is frontmost, its bounds equal the rectangle, the rectangle is wholly covered by one backdrop window on one display, and no other on-screen window above Veyra intersects it.
 A changed guard discards the capture; the helper makes at most three attempts in total.
+A measured coarse and inverse pair uses one placement.
+If the owned-window fallback places either half, discard both and retake both at that rectangle within three pair attempts, keeping every guard and the exact pair check.
 The Settings page places a second run-owned backdrop above Veyra and requires the guard to reject it without retaining a PNG.
 Veyra must stay frontmost during captures.
 A changed visible state with an identical PNG fails; Evidence also compares named state pairs.
@@ -378,6 +380,23 @@ for group in $groups; do kill -KILL -- "-$group" 2>/dev/null || true; done
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - "$PROOF" "$groups" "$pids" <<'PY'
 import ctypes, errno, json, os, pathlib, struct, subprocess, sys, time
 proof = pathlib.Path(sys.argv[1])
+backdrop_file = proof/'notifications-backdrop-pid'
+if backdrop_file.exists():
+    backdrop_pid = int(backdrop_file.read_text())
+    try: os.kill(backdrop_pid,15)
+    except ProcessLookupError: pass
+    end = time.monotonic()+5
+    def backdrop_gone():
+        status = subprocess.run(['ps','-o','stat=','-p',str(backdrop_pid)],capture_output=True,text=True).stdout.strip()
+        return not status or status.startswith('Z')
+    while not backdrop_gone() and time.monotonic()<end: time.sleep(.05)
+    if not backdrop_gone():
+        try: os.kill(backdrop_pid,9)
+        except ProcessLookupError: pass
+        end = time.monotonic()+5
+        while not backdrop_gone() and time.monotonic()<end: time.sleep(.05)
+    assert backdrop_gone(), 'owned notification backdrop remains'
+    (proof/'notifications-backdrop-cleanup.json').write_text(json.dumps({'pid':backdrop_pid,'stopped':True})+'\n')
 parents = {int(pid) for pid in (proof/'owned-app-pids').read_text().split()}
 groups = {int(group) for group in sys.argv[2].split()}
 def groups_gone():

@@ -99,12 +99,39 @@ impl PromptWork {
         }
     }
 }
+#[derive(Default)]
+struct ReplySegment {
+    number: u32,
+    open: bool,
+    seen: bool,
+}
+impl ReplySegment {
+    fn key(&self, prompt: &str) -> NativeItemKey {
+        NativeItemKey(if self.number == 0 {
+            format!("{prompt}/reply")
+        } else {
+            format!("{prompt}/reply/{}", self.number)
+        })
+    }
+    fn next(&mut self, prompt: &str) -> NativeItemKey {
+        if !self.open && self.seen {
+            self.number += 1;
+        }
+        self.open = true;
+        self.seen = true;
+        self.key(prompt)
+    }
+    fn close(&mut self, prompt: &str) -> Option<NativeItemKey> {
+        std::mem::take(&mut self.open).then(|| self.key(prompt))
+    }
+}
 struct Prompt {
     origin: PromptOrigin,
     accepted: bool,
     first_frame: Option<Instant>,
     completion: Option<PromptCompletion>,
     tool_starts: BTreeMap<String, ToolCall>,
+    reply_segment: ReplySegment,
 }
 struct PromptCompletion {
     deadline: Instant,
@@ -499,6 +526,7 @@ impl Codec {
                 first_frame: Some(Instant::now() + Duration::from_secs(60)),
                 completion: None,
                 tool_starts: BTreeMap::new(),
+                reply_segment: ReplySegment::default(),
             },
         );
         self.set_work(Some(PromptWork::Veyra {
@@ -534,6 +562,7 @@ impl Codec {
             first_frame: None,
             completion: None,
             tool_starts: BTreeMap::new(),
+            reply_segment: ReplySegment::default(),
         });
         if self.work().is_none() {
             let turn = self.begin_provider();
@@ -896,12 +925,17 @@ impl Codec {
             return Ok(());
         }
         let key = |suffix: &str| NativeItemKey(format!("{id}/{suffix}"));
+        if !matches!(update, Update::Message(_))
+            && let Some(key) = self.prompts.get_mut(&id).unwrap().reply_segment.close(&id)
+        {
+            Self::event(decoded, owner, TurnEvent::ItemEnded { key });
+        }
         match update {
             Update::Message(Content::Text { text }) => Self::event(
                 decoded,
                 owner,
                 TurnEvent::TextDelta {
-                    key: key("reply"),
+                    key: self.prompts.get_mut(&id).unwrap().reply_segment.next(&id),
                     text,
                     streamed: true,
                 },
@@ -1160,13 +1194,22 @@ impl Codec {
             Some(PromptWork::Provider { .. }) => self.prompts.keys().next().cloned(),
             _ => None,
         });
-        let Some(_) = self.prompt(prompt_id.as_deref(), decoded) else {
+        let Some(prompt_id) = self.prompt(prompt_id.as_deref(), decoded) else {
             decoded
                 .replies
                 .push(self.peer.error(id, -32600, "Request has no active prompt"));
             return Ok(());
         };
         let owner = self.active().unwrap();
+        if let Some(key) = self
+            .prompts
+            .get_mut(&prompt_id)
+            .unwrap()
+            .reply_segment
+            .close(&prompt_id)
+        {
+            Self::event(decoded, owner, TurnEvent::ItemEnded { key });
+        }
         Self::event(
             decoded,
             owner,
@@ -1446,6 +1489,69 @@ fn tool_output(raw: &Value, content: &[Value]) -> Option<String> {
 #[cfg(test)]
 mod wire_tests {
     use super::*;
+    #[test]
+    fn grok_fixture_text_chunks_keep_tool_boundaries() {
+        let turn = TurnId::new();
+        let prompt = turn.to_string();
+        let mut codec = Codec::new(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: "/project".into(),
+                native: None,
+                root: false,
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+            },
+            1,
+            None,
+            false,
+        );
+        codec.state = SessionState::Ready {
+            native: NativeSessionId("veyra-grok-session".into()),
+            active: None,
+        };
+        codec.start(turn, "reply".into()).unwrap();
+        let source = include_str!("../../tests/fixtures/grok/tool-title.jsonl");
+        let frames: Vec<Value> = source
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| {
+                record["type"] == "emit_inbound" && record["line"]["method"] == "session/update"
+            })
+            .map(|record| {
+                serde_json::from_str(&record["line"].to_string().replace("<id:prompt1>", &prompt))
+                    .unwrap()
+            })
+            .collect();
+        let message = frames
+            .iter()
+            .find(|frame| frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .unwrap();
+        let first = codec.value(message.clone()).unwrap();
+        let chunk = codec.value(message.clone()).unwrap();
+        let boundary = codec.value(frames[0].clone()).unwrap();
+        let last = codec.value(message.clone()).unwrap();
+        let text_key = |decoded: &Decoded| {
+            decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event: TurnEvent::TextDelta { key, .. },
+                        ..
+                    } => Some(key.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(text_key(&first), text_key(&chunk));
+        assert_ne!(text_key(&first), text_key(&last));
+        assert!(boundary.events.iter().any(|event| matches!(event,
+            ProviderEvent::Turn { event: TurnEvent::ItemEnded { key }, .. } if *key == text_key(&first))));
+    }
     #[test]
     fn grok_wire_unknown_kinds_have_fallbacks() {
         let value = json!("future_kind");

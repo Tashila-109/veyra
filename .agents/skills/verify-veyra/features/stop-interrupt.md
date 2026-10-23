@@ -101,7 +101,63 @@ ctl('stop-sidebar-working','wait',thread,'Working')
 action('stop-sidebar-row','StopThread',{'thread':thread})
 ctl('stop-sidebar-interrupted','wait',thread,'Interrupted')
 poll('stop-sessions-ended',lambda d: not d['awake'] and sql('select count(*) from threads where live_pgid is not null')=='0')
-# Fake approval banner decision while Finder is frontmost.
+# Fake approval banner decision while the owned backdrop is frontmost.
+import plistlib
+backdrop_bundle = DATA/'notifications-backdrop.app'
+backdrop_executable = backdrop_bundle/'Contents/MacOS/backdrop'
+backdrop_executable.parent.mkdir(parents=True)
+shutil.copy2(PROOF/'backdrop',backdrop_executable)
+backdrop_pid_file = DATA/'notifications-backdrop.pid'
+with (backdrop_bundle/'Contents/Info.plist').open('wb') as file:
+    plistlib.dump({'CFBundleIdentifier':'dev.veyra.verify.backdrop.'+RUN,
+        'CFBundleName':'Veyra verification backdrop','CFBundleExecutable':'backdrop',
+        'CFBundlePackageType':'APPL','LSUIElement':True,
+        'VeyraBackdropPidFile':str(backdrop_pid_file)},file)
+backdrop_output = PROOF/'notifications-backdrop.stdout'
+def backdrop_command(label,command):
+    result = subprocess.run(command,capture_output=True,text=True)
+    (PROOF/(label+'.stdout')).write_text(result.stdout)
+    (PROOF/(label+'.stderr')).write_text(result.stderr)
+    save(label+'-command',{'command':command,'exit':result.returncode})
+    assert result.returncode==0, f'owned backdrop helper failed; see {label}.stderr'
+    return result
+backdrop_command('notifications-backdrop-sign',['codesign','--force','--sign','-',str(backdrop_bundle)])
+backdrop_command('notifications-backdrop-open',['open','-n','--stdout',str(backdrop_output),
+    '--stderr',str(PROOF/'notifications-backdrop.stderr'),str(backdrop_bundle)])
+end = time.monotonic()+10
+while not backdrop_pid_file.exists():
+    assert time.monotonic()<end, 'owned backdrop did not write its pid'
+    time.sleep(.05)
+backdrop_pid = int(backdrop_pid_file.read_text())
+proc = ctypes.CDLL('/usr/lib/libproc.dylib',use_errno=True)
+proc.proc_pidpath.argtypes = [ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
+proc.proc_pidpath.restype = ctypes.c_int
+executable_buffer = ctypes.create_string_buffer(4096)
+assert proc.proc_pidpath(backdrop_pid,executable_buffer,len(executable_buffer))>0, 'backdrop executable unavailable'
+backdrop_path = pathlib.Path(os.fsdecode(executable_buffer.value)).resolve()
+assert backdrop_path==backdrop_executable.resolve(), 'backdrop pid does not name the scratch bundle executable'
+save('notifications-backdrop-ownership',{'pid':backdrop_pid,'executable':str(backdrop_path),
+    'bundle':str(backdrop_bundle.resolve()),'pid_file':str(backdrop_pid_file.resolve())})
+(PROOF/'notifications-backdrop-pid').write_text(str(backdrop_pid)+'\n')
+with (PROOF/'backdrop-owned-pids').open('a') as file: file.write(str(backdrop_pid)+'\n')
+end = time.monotonic()+10
+while not backdrop_output.exists() or 'backdrop ready ' not in backdrop_output.read_text():
+    os.kill(backdrop_pid,0)
+    assert time.monotonic()<end, 'owned backdrop was not ready'
+    time.sleep(.05)
+def activate_owned_backdrop(label):
+    os.kill(backdrop_pid,0)
+    backdrop_command(label+'-open',['open',str(backdrop_bundle)])
+    source = ('import AppKit\n'
+        f'let pid: Int32 = {backdrop_pid}\n'
+        'let end = Date().addingTimeInterval(5)\n'
+        'while NSWorkspace.shared.frontmostApplication?.processIdentifier != pid && Date() < end { '
+        'RunLoop.current.run(until: Date().addingTimeInterval(0.05)) }\n'
+        'guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { exit(2) }\n'
+        'print(pid)\n')
+    result = backdrop_command(label,['swift','-e',source])
+    assert int(result.stdout.strip())==backdrop_pid
+    save(label,{'frontmost_pid':backdrop_pid,'owned_backdrop_pid':backdrop_pid})
 thread = create('notifications-approval','A background approval',scenario='approval-deny')
 poll('notifications-approval-open',lambda d: d['composer']['dock'] is not None)
 action('notifications-approval-deny','Deny')
@@ -113,7 +169,7 @@ thread = create('notifications-away','A delayed approval',scenario=None)
 action('notifications-away-activate','ActivateWindow')
 active = poll('notifications-active',lambda d: d['window_active'])
 posted = active['notifications']['posted']
-subprocess.run(['open','-a','Finder'],check=True)
+activate_owned_backdrop('notifications-approval-backdrop-frontmost')
 poll('notifications-inactive',lambda d: not d['window_active'])
 needs = poll('notifications-needs-you',lambda d: d['selected_thread']['status']=='NeedsYou')
 assert needs['notifications']['posted']==posted+1
@@ -143,7 +199,7 @@ stage_records(records)
 thread = create('notifications-background','A turn with background work',scenario=None)
 poll('notifications-background-working',lambda d: d['selected_thread']['status']=='Working' and d['awake'])
 posted = ctl('notifications-background-before','dump')['notifications']['posted']
-subprocess.run(['open','-a','Finder'],check=True)
+activate_owned_backdrop('notifications-background-backdrop-frontmost')
 poll('notifications-background-inactive',lambda d: not d['window_active'])
 foreground_ended('notifications-background',thread)
 busy = ctl('notifications-background','dump')
@@ -188,7 +244,11 @@ The debug-only DebugStallUi action remains available for that lane.
       "stop-expired.json",
       "notifications-background.json",
       "notifications-older-selected.json",
-      "notifications-older-response.png"
+      "notifications-older-response.png",
+      "notifications-approval-backdrop-frontmost.json",
+      "notifications-background-backdrop-frontmost.json",
+      "notifications-inactive.json",
+      "notifications-background-inactive.json"
     ]
   },
   "pairs": {}

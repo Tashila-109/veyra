@@ -813,9 +813,11 @@ impl Codec {
                 "Claude cleared this conversation. The CLI no longer sees the messages above this notice.".into())),
             Frame::RateLimitEvent { rate_limit_info } => {
                 if rate_limit_info.status != "allowed" {
-                    let reset = rate_limit_info.resets_at.map_or_else(|| "unknown".into(), |at| at.to_string());
-                    decoded.events.push(Self::notice(format!(
-                        "Claude usage limit: {}; resets at {}.", rate_limit_info.status, reset)));
+                    let notice = Notice {
+                        text: format!("Claude usage limit: {}.", rate_limit_info.status),
+                        reset_at: rate_limit_info.resets_at.and_then(|at| i64::try_from(at).ok()),
+                    };
+                    decoded.events.push(ProviderEvent::Session(SessionEvent::TimedNotice(notice)));
                 }
             }
             Frame::ControlRequest(request) => {
@@ -1420,6 +1422,30 @@ impl Codec {
 mod tests {
     use super::*;
     use crate::tests::Scratch;
+    #[test]
+    fn claude_fixture_notice_keeps_typed_reset() {
+        let source = include_str!("../../tests/fixtures/claude/notices.jsonl");
+        let mut codec = codec();
+        let notices: Vec<_> = source
+            .lines()
+            .filter_map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                (record["type"] == "emit_inbound").then_some(record["line"].clone())
+            })
+            .flat_map(|line| codec.value(line).unwrap().events)
+            .filter_map(|event| match event {
+                ProviderEvent::Session(SessionEvent::TimedNotice(notice)) => Some(notice),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            [Notice {
+                text: "Claude usage limit: rejected.".into(),
+                reset_at: Some(12345)
+            }]
+        );
+    }
     fn codec() -> Codec {
         Codec::new(
             NativeSessionId("fixture-session".into()),

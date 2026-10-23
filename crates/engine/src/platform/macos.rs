@@ -122,23 +122,6 @@ pub fn ignore_terminate() {
     }
 }
 
-pub fn utc_timestamp(seconds: i64) -> Option<String> {
-    let seconds: libc::time_t = seconds;
-    let mut time: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::gmtime_r(&seconds, &mut time) }.is_null() {
-        return None;
-    }
-    Some(format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
-        i64::from(time.tm_year) + 1900,
-        time.tm_mon + 1,
-        time.tm_mday,
-        time.tm_hour,
-        time.tm_min,
-        time.tm_sec
-    ))
-}
-
 pub fn own_group(cmd: &mut tokio::process::Command) {
     use std::os::unix::process::CommandExt;
     cmd.as_std_mut().process_group(0);
@@ -361,6 +344,13 @@ pub fn hold_awake(pid: u32) -> io::Result<AwakeGuard> {
         .stderr(Stdio::null())
         .spawn()
         .map(AwakeGuard)
+}
+
+pub fn is_incompatible_executable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOEXEC | libc::EBADARCH | libc::EBADMACHO)
+    )
 }
 
 pub fn is_executable(path: &Path) -> bool {
@@ -936,22 +926,6 @@ pub fn relay_stdio(connection: UnixStream, authentication: &[u8]) -> io::Result<
         if poll.iter().any(|fd| fd.revents & libc::POLLNVAL != 0) {
             return Err(io::Error::other("MCP relay descriptor closed"));
         }
-    }
-}
-
-#[cfg(test)]
-mod timestamp_tests {
-    #[test]
-    fn reset_timestamp_is_utc_and_handles_out_of_range_values() {
-        assert_eq!(
-            super::utc_timestamp(-1).as_deref(),
-            Some("1969-12-31 23:59:59 UTC")
-        );
-        assert_eq!(
-            super::utc_timestamp(951782400).as_deref(),
-            Some("2000-02-29 00:00:00 UTC")
-        );
-        assert!(super::utc_timestamp(i64::MAX).is_none());
     }
 }
 

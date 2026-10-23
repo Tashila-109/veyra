@@ -299,8 +299,9 @@ impl AppState {
                 } else {
                     self.markdown_text.remove(&id);
                 }
+                let visible = transcript::item_visible(&item);
                 let old = self.items.entry(thread).or_default().insert(id, item);
-                if old.is_none() {
+                if old.is_none_or(|old| transcript::item_visible(&old) != visible) {
                     self.sort_transcript(thread);
                 }
             }
@@ -435,7 +436,11 @@ impl AppState {
             .collect();
         imports.sort_unstable();
         imports.dedup();
-        let mut ids: Vec<_> = items.keys().copied().collect();
+        let mut ids: Vec<_> = items
+            .values()
+            .filter(|item| transcript::item_visible(item))
+            .map(|item| item.id)
+            .collect();
         ids.sort_by_key(|id| {
             let item = &items[id];
             let ordinal = self
@@ -450,6 +455,7 @@ impl AppState {
                     .get(&item.turn)
                     .map(Turn::recency)
                     .unwrap_or((true, i64::MAX, 0)),
+                !matches!(item.body, ItemBody::TaskCard(_)),
                 item.seq,
             )
         });
@@ -470,14 +476,23 @@ impl AppState {
         self.transcript_len(thread) + self.family_offset(thread)
     }
     fn family_offset(&self, thread: ThreadId) -> usize {
-        usize::from(!transcript::family_children(self, thread).is_empty())
+        transcript::family_cards(self, thread).len()
     }
     fn transcript_position(&self, thread: ThreadId, item: ItemId) -> Option<usize> {
         self.item_order
             .get(&thread)?
             .positions
             .get(&item)
-            .map(|index| *index + self.family_offset(thread))
+            .map(|index| {
+                *index
+                    + transcript::family_rows(self, thread)
+                        .iter()
+                        .enumerate()
+                        .filter(|(offset, (_, position))| {
+                            position.saturating_sub(*offset) <= *index
+                        })
+                        .count()
+            })
     }
     fn transcript_item(&self, thread: ThreadId, index: usize) -> Option<&Item> {
         let id = self.item_order.get(&thread)?.ids.get(index)?;
@@ -802,10 +817,16 @@ impl Shell {
                             .map(|thread| (thread.root(), shell.state.family_status(thread.root())))
                             .collect();
                         let text_rows = shell.state.text_rows(&batch, shell.view.chat());
-                        let previous_family_offset = shell
+                        let previous_families = shell
                             .view
                             .chat()
-                            .map_or(0, |thread| shell.state.family_offset(thread));
+                            .map(|thread| {
+                                transcript::family_rows(&shell.state, thread)
+                                    .into_iter()
+                                    .map(|(turn, _)| turn)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
                         shell.state.apply_all(batch);
                         if old_background != shell.state.settings.window_background {
                             let mut look =
@@ -830,13 +851,16 @@ impl Shell {
                             .chat()
                             .map(|thread| shell.state.transcript_rows(thread))
                             .unwrap_or_default();
-                        let family_offset = shell
+                        let family_rows = shell
                             .view
                             .chat()
-                            .map_or(0, |thread| shell.state.family_offset(thread));
+                            .map(|thread| transcript::family_rows(&shell.state, thread))
+                            .unwrap_or_default();
                         shell.scroller.update(cx, |state, cx| {
-                            if family_offset > previous_family_offset {
-                                state.prepend(cx);
+                            for (turn, index) in &family_rows {
+                                if !previous_families.contains(turn) {
+                                    state.insert(*index, cx);
+                                }
                             }
                             if count > state.item_count() {
                                 state.append(count - state.item_count(), cx);
@@ -866,7 +890,10 @@ impl Shell {
                 cx.background_executor().timer(cadence).await;
                 if this
                     .update(cx, |shell, cx| {
-                        if header::cadence_due(&shell.state.statuses) {
+                        let timed_notice = shell.view.chat().and_then(|thread| shell.state.items.get(&thread))
+                            .is_some_and(|items| items.values().any(|item|
+                                matches!(&item.body, ItemBody::Notice(notice) if notice.reset_at.is_some())));
+                        if header::cadence_due(&shell.state.statuses) || timed_notice {
                             cx.notify();
                         }
                     })
@@ -1187,6 +1214,7 @@ impl Shell {
         self.branch.clear();
     }
     fn show(&mut self, view: MainView) {
+        self.thread_menu = None;
         #[cfg(debug_assertions)]
         if self.view.chat() != view.chat() {
             self.state.visible_perf = VisiblePerf {
@@ -1414,6 +1442,39 @@ impl Shell {
             }
         };
         self.send_command(command, window, cx);
+    }
+    fn working_folder(&self) -> Option<&std::path::Path> {
+        self.view
+            .chat()
+            .and_then(|thread| {
+                self.state
+                    .threads
+                    .get(&thread)
+                    .map(|thread| thread.cwd.as_path())
+            })
+            .or_else(|| {
+                self.project.and_then(|project| {
+                    self.state
+                        .projects
+                        .get(&project)
+                        .map(|project| project.path.as_path())
+                })
+            })
+    }
+    fn header_status(&self, thread: ThreadId) -> String {
+        self.state
+            .threads
+            .get(&thread)
+            .and_then(|row| {
+                header::starting_text(
+                    row.provider,
+                    self.engine
+                        .window_threads()
+                        .get(&thread)
+                        .and_then(|row| row.wait_reason),
+                )
+            })
+            .unwrap_or_else(|| self.state.header_status(thread))
     }
     fn thread_label(&self, thread: &Thread) -> String {
         let project = self
@@ -1846,7 +1907,7 @@ impl Shell {
                     "id":thread.id, "title":thread.title, "lineage":thread.lineage,
                     "native_id":thread.native.as_ref().map(|native| &native.0),
                     "cli_version":thread.cli_version, "config":thread.config,
-                    "status":status.words(), "header_status":self.state.header_status(thread.id),
+                    "status":status.words(), "header_status":self.header_status(thread.id),
                     "quiet_minutes":self.state.quiet_minutes(thread.id),
                     "breadcrumb":self.state.parent(thread.id).map(|parent| serde_json::json!({"thread\
                         ":parent.id,"title":parent.title,"linked":!parent.archived})),
@@ -1917,7 +1978,11 @@ impl Shell {
                     })
                     .map(|reason| reason.to_string())
                     .into();
+                if matches!(item.body, ItemBody::UserText(_)) {
+                    row["text"] = transcript::user_text(item, Some(&self.state)).into();
+                }
                 if let ItemBody::Tool(tool) = &item.body {
+                    row["tool_status"] = transcript::tool_status(item, Some(&self.state)).into();
                     row["failed_last_line"] = transcript::failed_tool_last_line(tool).into();
                 }
                 if matches!(item.body, ItemBody::AsyncQuestions { .. }) {
@@ -1971,10 +2036,14 @@ impl Shell {
                     "allow_once_enabled":consent.allow_once,
                     "allow_in_thread_enabled":consent.allow_in_thread,
                     "consent_reason":consent.reason,
-                    "provider_text":approval.map(|action| composer::approval_quotes(action,
-                        self.chosen_provider().label())).unwrap_or_default(),
+                    "provider_text":approval.map(|action| composer::approval_display_quotes(action,
+                        self.chosen_provider().label(), self.working_folder())).unwrap_or_default(),
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
-                    "question_index":target.question});
+                    "question_index":target.question,
+                    "question_count":match &request.kind {
+                        RequestKind::Question { questions } =>
+                            Some(format!("{} of {}", target.question + 1, questions.len())),
+                        _ => None }});
                 if self.approval_scroll.request == Some(request.id) {
                     dock["details_scroll"] = serde_json::json!({"offset_y":f32::from(
                         self.approval_scroll.handle.offset().y), "max_offset_y":f32::from(
@@ -1990,6 +2059,16 @@ impl Shell {
         let perf = self.engine.perf();
         let mut transcript = self.scroller.read(cx).dump();
         transcript["items"] = serde_json::json!(self.dump_transcript());
+        transcript["family_cards"] = self
+            .view
+            .chat()
+            .map(|thread| {
+                transcript::family_rows(&self.state, thread)
+                    .iter()
+                    .map(|(turn, index)| serde_json::json!({"turn":turn,"row":index}))
+                    .collect::<Vec<_>>()
+            })
+            .into();
         transcript["family_card"] = self.view.chat().filter(|thread|self.state.family_offset(*thread)>0)
             .map(|thread|serde_json::json!({"title":transcript::family_title(transcript::family_children(
                 &self.state,thread).len()),
@@ -2146,6 +2225,7 @@ impl Render for Shell {
                 shell.continue_queue(true, window, cx)
             }))
             .on_action(cx.listener(|shell, action: &StopThread, window, cx| {
+                shell.thread_menu = None;
                 if let Some(thread) = action.thread.or_else(|| shell.view.chat()) {
                     shell.send_command(Command::StopThread { thread }, window, cx);
                 }
@@ -2249,25 +2329,26 @@ impl Render for Shell {
                     .unwrap_or_else(|| settings::next_mode(shell.state.settings.default_mode));
                 shell.send_command(Command::SetDefaultMode { mode }, window, cx);
             }))
-            .on_action(
-                cx.listener(|shell, action: &SetWindowBackground, window, cx| {
-                    if cx.global::<Theme>().look.forced_by().is_some() {
-                        return;
-                    }
-                    let background =
-                        action
-                            .background
-                            .unwrap_or(match shell.state.settings.window_background {
+            .when(cx.global::<Theme>().look.forced_by().is_none(), |root| {
+                root.on_action(
+                    cx.listener(|shell, action: &SetWindowBackground, window, cx| {
+                        if cx.global::<Theme>().look.forced_by().is_some() {
+                            return;
+                        }
+                        let background = action.background.unwrap_or(
+                            match shell.state.settings.window_background {
                                 veyra_engine::domain::WindowBackground::Translucent => {
                                     veyra_engine::domain::WindowBackground::Solid
                                 }
                                 veyra_engine::domain::WindowBackground::Solid => {
                                     veyra_engine::domain::WindowBackground::Translucent
                                 }
-                            });
-                    shell.send_command(Command::SetWindowBackground { background }, window, cx);
-                }),
-            )
+                            },
+                        );
+                        shell.send_command(Command::SetWindowBackground { background }, window, cx);
+                    }),
+                )
+            })
             .on_action(cx.listener(|shell, _: &OpenProviderPicker, window, cx| {
                 if shell.view == MainView::NewThread {
                     shell.set_provider_picker(shell.provider_picker.is_none(), window, cx);
@@ -2769,6 +2850,7 @@ mod tests {
         AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
         Styled, Window, div,
     };
+    use gpui_kit::prelude::FluentBuilder;
     use std::collections::{BTreeMap, BTreeSet};
     use veyra_engine::{
         domain::*,
@@ -2804,10 +2886,20 @@ mod tests {
                 text.clone(),
             );
             with_docked_shell(&mut test, |shell, cx, _, _| {
-                shell.update(cx, |shell, _| {
+                shell.update(cx, |shell, cx| {
                     let (_, turn) =
                         configure_dock_thread(shell, ProviderKind::Claude, false, false);
                     shell.state.requests.clear();
+                    shell.state.apply(UiEvent::Change {
+                        counter: None,
+                        event: ChangeEvent::ItemAdded(Item {
+                            id: ItemId::new(),
+                            thread: shell.view.chat().unwrap(),
+                            turn,
+                            seq: 1,
+                            body: ItemBody::UserText("Fixture prompt".into()),
+                        }),
+                    });
                     shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
                         at: 1,
                         started: Some(0),
@@ -2815,6 +2907,9 @@ mod tests {
                             message: message.into(),
                         },
                     };
+                    shell.scroller.update(cx, |state, cx| {
+                        state.reset(shell.state.transcript_rows(shell.view.chat().unwrap()), cx)
+                    });
                 });
                 draw(cx);
                 let lines = text.lines();
@@ -2939,7 +3034,7 @@ mod tests {
             dispatched: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
         }
         impl Render for ActionCapture {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let dispatched = self.dispatched.clone();
                 let allowed = self.dispatched.clone();
                 let denied = self.dispatched.clone();
@@ -2963,9 +3058,14 @@ mod tests {
                     .capture_action(move |_: &super::ToggleShellDrawer, _, _| {
                         switched.borrow_mut().push("ToggleShellDrawer");
                     })
-                    .capture_action(move |_: &super::SetWindowBackground, _, _| {
-                        background.borrow_mut().push("SetWindowBackground");
-                    })
+                    .when(
+                        cx.global::<super::Theme>().look.forced_by().is_none(),
+                        |root| {
+                            root.capture_action(move |_: &super::SetWindowBackground, _, _| {
+                                background.borrow_mut().push("SetWindowBackground");
+                            })
+                        },
+                    )
                     .child(self.shell.clone())
             }
         }
@@ -3507,8 +3607,8 @@ mod tests {
                     });
                     assert!(!super::transcript::report_delivered(&shell.state, &later));
                     let rows = shell.dump_transcript();
-                    assert_eq!(rows.len(), 1);
-                    assert_eq!(rows[0]["report_delivered"], false);
+                    assert_eq!(rows.len(), usize::from(!text.is_empty() || !done));
+                    assert!(rows.iter().all(|row| row["report_delivered"] == false));
                 }
             });
         });
@@ -4527,7 +4627,7 @@ mod tests {
                             ..Default::default()
                         }],
                         Some(caption.size.width),
-                        None,
+                        Some(2),
                     )
                     .unwrap()
                     .iter()
@@ -4539,6 +4639,15 @@ mod tests {
             });
             if !contains(button, caption)
                 || caption.size.height + gpui::Pixels::from(0.1) < required
+                || caption.size.height
+                    > cx.update(|window, cx| {
+                        cx.global::<super::Theme>()
+                            .text
+                            .label
+                            .line_height
+                            .to_pixels(window.rem_size())
+                            * 2.
+                    }) + gpui::Pixels::from(0.1)
             {
                 issues.push(format!(
                     "option {index} hides caption: button={button:?}, \
@@ -5897,6 +6006,11 @@ mod tests {
                 });
                 cx.dispatch_action(flags);
                 draw(cx);
+                assert!(
+                    !cx.update(|window, cx| window
+                        .is_action_available(&super::SetWindowBackground::default(), cx)),
+                    "native menu background toggle is enabled while Solid is forced"
+                );
                 cx.read(|cx| {
                     assert!(super::settings::background_button(Solid, "Solid", cx).is_selected());
                     assert!(
@@ -7436,7 +7550,7 @@ mod tests {
         assert!(super::sidebar::nested(&state, &state.threads[&child]));
         assert!(super::sidebar::can_keep_children(&state, root));
         assert_eq!(state.family_status(root), Status::Working { since: 1000 });
-        assert_eq!(state.transcript_position(root, item), Some(1));
+        assert_eq!(state.transcript_position(root, item), Some(0));
         assert_eq!(state.transcript_rows(root), 2);
         let batch = vec![UiEvent::TextAppended {
             thread: root,
@@ -7448,7 +7562,7 @@ mod tests {
         }];
         assert_eq!(
             state.text_rows(&batch, Some(root)),
-            Some(BTreeSet::from([1]))
+            Some(BTreeSet::from([0]))
         );
         let report_item = ItemId::new();
         let task = TaskId::new();
@@ -8558,6 +8672,562 @@ mod tests {
             assert!(!shell.read_with(cx, |shell, _| {
                 shell.drawers[&shell.view.chat().unwrap()].open
             }));
+        });
+    }
+    #[cfg(debug_assertions)]
+    fn display_fixture_rows(
+        shell: &mut super::Shell,
+        cx: &mut Context<super::Shell>,
+        bodies: Vec<ItemBody>,
+    ) -> (ThreadId, TurnId, Vec<ItemId>) {
+        let (thread, turn) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+        shell.state.requests.clear();
+        shell.state.items.remove(&thread);
+        shell.state.item_order.remove(&thread);
+        let mut ids = Vec::new();
+        for (index, body) in bodies.into_iter().enumerate() {
+            let id = ItemId::new();
+            ids.push(id);
+            shell.state.apply(UiEvent::Change {
+                counter: None,
+                event: ChangeEvent::ItemAdded(Item {
+                    id,
+                    thread,
+                    turn,
+                    seq: index as u32,
+                    body,
+                }),
+            });
+        }
+        shell.scroller.update(cx, |state, cx| {
+            state.reset(shell.state.transcript_rows(thread), cx)
+        });
+        cx.notify();
+        (thread, turn, ids)
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn stored_terminal_span_renders_labelled_block(cx: &mut gpui::TestAppContext) {
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        let fixture: ItemBody = serde_json::from_str(
+            r#"{"TerminalSpan":{"text":"Stored shell transcript\nfixture output"}}"#,
+        )
+        .unwrap();
+        with_docked_shell(&mut test, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                display_fixture_rows(shell, cx, vec![fixture]);
+            });
+            draw(cx);
+            let block = cx.debug_bounds("stored-terminal-span").unwrap();
+            let label = cx.debug_bounds("stored-terminal-label").unwrap();
+            let output = cx.debug_bounds("stored-terminal-text").unwrap();
+            assert!(label.top() >= block.top() && label.bottom() <= output.top());
+            assert!(output.bottom() <= block.bottom());
+            assert!(text.lines().contains("This turn ran in the terminal"));
+            let line = cx.update(|window, cx| {
+                cx.global::<super::Theme>()
+                    .text
+                    .terminal
+                    .line_height
+                    .to_pixels(window.rem_size())
+            });
+            assert_eq!(output.size.height, line * 2.);
+            let dump = shell.read_with(cx, |shell, _| shell.dump_transcript());
+            assert_eq!(dump[0]["kind"], "terminal_span");
+            assert_eq!(dump[0]["text"], "Stored shell transcript\nfixture output");
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn failure_card_follows_the_failed_turns_prompt(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (_, turn, _) = display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::UserText("Read this prompt first".into())],
+                );
+                shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
+                    outcome: TurnOutcome::Failed {
+                        message: "Fixture failure".into(),
+                    },
+                    started: Some(0),
+                    at: 100,
+                };
+            });
+            draw(cx);
+            let prompt = cx.debug_bounds("user-bubble").unwrap();
+            let failure = cx.debug_bounds("failure-card").unwrap();
+            assert!(
+                failure.top() >= prompt.bottom(),
+                "failure precedes prompt: {failure:?} / {prompt:?}"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn separate_reply_items_have_paragraph_spacing(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let ids = shell.update(cx, |shell, cx| {
+                display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![
+                        ItemBody::AssistantText {
+                            text: "First part.".into(),
+                            done: true,
+                        },
+                        ItemBody::AssistantText {
+                            text: "Second part.".into(),
+                            done: true,
+                        },
+                    ],
+                )
+                .2
+            });
+            draw(cx);
+            let first_selector = Box::leak(format!("transcript-body-{}", ids[0]).into_boxed_str());
+            let second_selector = Box::leak(format!("transcript-body-{}", ids[1]).into_boxed_str());
+            let first = cx.debug_bounds(first_selector).unwrap();
+            let second = cx.debug_bounds(second_selector).unwrap();
+            let gap = cx.update(|_, cx| cx.global::<super::Theme>().space.0[5]);
+            assert!(second.top() - first.bottom() >= gap);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn row_menu_closes_for_own_family_and_selection_actions(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, child, _) = shell.update(cx, add_family);
+            let actions: Vec<Box<dyn gpui::Action>> = vec![
+                Box::new(super::StopThread { thread: Some(root) }),
+                Box::new(super::Archive { thread: Some(root) }),
+                Box::new(super::ArchiveKeepChildren { thread: Some(root) }),
+                Box::new(super::StopThread {
+                    thread: Some(child),
+                }),
+                Box::new(super::SelectThread {
+                    thread: Some(child),
+                }),
+                Box::new(super::NewThread),
+            ];
+            for action in actions {
+                cx.dispatch_action(super::OpenThreadMenu { thread: Some(root) });
+                draw(cx);
+                assert!(shell.read_with(cx, |shell, _| shell.thread_menu.is_some()));
+                cx.update(|window, cx| window.dispatch_action(action, cx));
+                draw(cx);
+                assert!(shell.read_with(cx, |shell, _| shell.thread_menu.is_none()));
+                shell.update(cx, |shell, cx| {
+                    shell.show(super::MainView::Chat(root));
+                    cx.notify();
+                });
+            }
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn settings_error_shares_the_settings_column(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            cx.dispatch_action(super::OpenSettings);
+            shell.update(cx, |shell, cx| {
+                shell.notice = Some("Fixture settings error".into());
+                cx.notify();
+            });
+            draw(cx);
+            let heading = cx.debug_bounds("settings-default-heading").unwrap();
+            let error = cx.debug_bounds("settings-error").unwrap();
+            assert_eq!(error.left(), heading.left());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn signed_out_hint_keeps_its_position_beneath_an_open_menu(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.providers[0].readiness = Readiness::SignedOut;
+                shell.project = shell.state.projects.keys().next().copied();
+                shell.show(super::MainView::NewThread);
+                cx.notify();
+            });
+            draw(cx);
+            let before = cx.debug_bounds("composer-disabled-reason").unwrap();
+            assert!(before.top() >= cx.debug_bounds("composer-input").unwrap().bottom());
+            cx.dispatch_action(super::OpenProviderPicker);
+            draw(cx);
+            let after = cx.debug_bounds("composer-disabled-reason").unwrap();
+            assert_eq!(before.origin, after.origin);
+            assert!(shell.read_with(cx, |shell, _| shell.provider_picker.is_some()));
+            let reason = shell.read_with(cx, |shell, _| shell.disabled_reason().unwrap());
+            assert_eq!(reason.matches("Sign in").count(), 1);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn question_counter_counts_inside_one_request(cx: &mut gpui::TestAppContext) {
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        with_docked_shell(&mut test, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Question {
+                    questions: vec![
+                        Question {
+                            text: "Choose".into(),
+                            options: vec!["Violet".into(), "Blue".into()],
+                        };
+                        2
+                    ],
+                };
+                shell.question_draft = Some((
+                    shell.state.requests[0].id,
+                    vec![Answer {
+                        text: "Violet".into(),
+                    }],
+                ));
+                cx.notify();
+            });
+            draw(cx);
+            assert!(cx.debug_bounds("question-count").is_some());
+            assert!(text.lines().contains("2 of 2"));
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.dump_composer(cx))["dock"]["question_count"],
+                "2 of 2"
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn long_option_uses_two_lines_and_an_ellipsis(cx: &mut gpui::TestAppContext) {
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        with_docked_shell(&mut test, |shell, cx, _, _| {
+            let minimum = cx.update(|_, cx| cx.global::<super::Theme>().layout.window_min);
+            cx.simulate_resize(minimum);
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Question {
+                    questions: vec![Question {
+                        text: "Choose one".into(),
+                        options: vec![
+                            format!(
+                                "{}tail sentinel",
+                                "A long option with useful words ".repeat(7)
+                            ),
+                            "Short".into(),
+                        ],
+                    }],
+                };
+                cx.notify();
+            });
+            draw(cx);
+            let caption = cx.debug_bounds("dock-option-caption-0").unwrap();
+            let limit = cx.update(|window, cx| {
+                cx.global::<super::Theme>()
+                    .text
+                    .label
+                    .line_height
+                    .to_pixels(window.rem_size())
+                    * 2.
+            });
+            assert_eq!(caption.size.height, limit);
+            let first = cx.debug_bounds("dock-option-0").unwrap();
+            let viewport = cx.debug_bounds("dock-options").unwrap();
+            assert!(first.top() >= viewport.top() && first.bottom() <= viewport.bottom());
+            assert!(text.lines().iter().any(|line| line.starts_with("1  ")
+                && line.ends_with('…')
+                && !line.contains("tail sentinel")));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn model_chip_uses_the_catalog_display_name(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.show(super::MainView::NewThread);
+                shell.config.model = Some("catalog-id".into());
+                shell.providers[0].models = vec![veyra_engine::provider::Model {
+                    value: "catalog-id".into(),
+                    display_name: "Readable model".into(),
+                    effort_levels: vec![],
+                }];
+                cx.notify();
+            });
+            draw(cx);
+            assert!(cx.debug_bounds("caption-Readable model").is_some());
+            assert!(cx.debug_bounds("caption-catalog-id").is_none());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn quiet_row_title_and_stop_align_with_sibling_rows(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (quiet, sibling) = shell.update(cx, |shell, cx| {
+                let (root, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.state.threads.get_mut(&root).unwrap().title = "Quiet row".into();
+                let sibling = ThreadId::new();
+                let mut row = shell.state.threads[&root].clone();
+                row.id = sibling;
+                row.title = "Sibling row".into();
+                shell.state.threads.insert(sibling, row);
+                let turn = TurnId::new();
+                shell.state.turns.insert(
+                    turn,
+                    Turn {
+                        id: turn,
+                        thread: sibling,
+                        ordinal: 1,
+                        origin: TurnOrigin::Provider,
+                        state: TurnState::Running { since: 1 },
+                    },
+                );
+                for thread in [root, sibling] {
+                    shell
+                        .state
+                        .statuses
+                        .insert(thread, Status::Working { since: 1 });
+                }
+                shell
+                    .state
+                    .last_activity
+                    .insert(root, veyra_engine::actor::now() - 600_000);
+                shell
+                    .state
+                    .last_activity
+                    .insert(sibling, veyra_engine::actor::now());
+                cx.notify();
+                (root, sibling)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.debug_bounds("caption-Quiet row").unwrap().left(),
+                cx.debug_bounds("caption-Sibling row").unwrap().left()
+            );
+            let quiet_selector = Box::leak(format!("sidebar-stop-slot-{quiet}").into_boxed_str());
+            let sibling_selector =
+                Box::leak(format!("sidebar-stop-slot-{sibling}").into_boxed_str());
+            assert_eq!(
+                cx.debug_bounds(quiet_selector).unwrap().left(),
+                cx.debug_bounds(sibling_selector).unwrap().left()
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn family_and_task_cards_stay_with_their_turns(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (parent, first, _) = display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::UserText("Earlier turn".into())],
+                );
+                shell.state.turns.get_mut(&first).unwrap().state = TurnState::Ended {
+                    started: Some(1000),
+                    at: 2000,
+                    outcome: TurnOutcome::Completed,
+                };
+                let (_, child, child_turn) = add_family(shell, cx);
+                shell.state.turns.get_mut(&child_turn).unwrap().state =
+                    TurnState::Running { since: 3500 };
+                let second = TurnId::new();
+                shell.state.turns.insert(
+                    second,
+                    Turn {
+                        id: second,
+                        thread: parent,
+                        ordinal: 2,
+                        origin: TurnOrigin::Provider,
+                        state: TurnState::Running { since: 3000 },
+                    },
+                );
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemAdded(Item {
+                        id: ItemId::new(),
+                        thread: parent,
+                        turn: second,
+                        seq: 2,
+                        body: ItemBody::UserText("Start a child now".into()),
+                    }),
+                });
+                let task = TaskId::new();
+                shell.state.tasks.insert(
+                    task,
+                    Task {
+                        id: task,
+                        parent,
+                        child,
+                        turn: child_turn,
+                        request_key: "start_thread:fixture".into(),
+                        state: TaskState::Running,
+                    },
+                );
+                for (seq, body) in [
+                    (1, ItemBody::UserText("Child prompt".into())),
+                    (2, ItemBody::TaskCard(task)),
+                ] {
+                    shell.state.apply(UiEvent::Change {
+                        counter: None,
+                        event: ChangeEvent::ItemAdded(Item {
+                            id: ItemId::new(),
+                            thread: child,
+                            turn: child_turn,
+                            seq,
+                            body,
+                        }),
+                    });
+                }
+                let cards = super::transcript::family_rows(&shell.state, parent);
+                assert_eq!(cards, [(Some(second), 2)]);
+                assert!(matches!(
+                    shell.state.transcript_item(child, 0).unwrap().body,
+                    ItemBody::TaskCard(_)
+                ));
+                assert!(matches!(
+                    shell.state.transcript_item(child, 1).unwrap().body,
+                    ItemBody::UserText(_)
+                ));
+            });
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn async_options_render_buttons_and_an_answered_choice(cx: &mut gpui::TestAppContext) {
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        with_docked_shell(&mut test, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::AsyncQuestions {
+                        text: "A preface".into(),
+                        questions: vec![AsyncQuestion {
+                            title: "Choose".into(),
+                            options: vec!["Violet".into(), "Blue".into()],
+                            selected: Some(0),
+                        }],
+                    }],
+                );
+            });
+            draw(cx);
+            let option = cx.debug_bounds("async-option-0").unwrap();
+            let answered = cx.debug_bounds("answered-choice").unwrap();
+            assert!(
+                option.size.height
+                    >= cx.update(|_, cx| cx.global::<super::Theme>().layout.icon_button)
+            );
+            assert!(answered.top() >= option.bottom());
+            assert!(cx.debug_bounds("async-option-1").is_some());
+            assert!(text.lines().contains("Answered: “Violet”"));
+        });
+    }
+    #[gpui::test]
+    fn quit_thread_labels_include_the_project_and_child_root(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (root, child, _) = add_family(shell, cx);
+                assert_eq!(
+                    shell.thread_label(&shell.state.threads[&root]),
+                    "Project · Root title"
+                );
+                assert_eq!(
+                    shell.thread_label(&shell.state.threads[&child]),
+                    "Project · Root title / File reporter"
+                );
+            });
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn wake_and_task_turn_labels_share_their_content_spacing(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, child, root_item, child_item) = shell.update(cx, |shell, cx| {
+                let (root, wake, items) = display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::AssistantText {
+                        text: "Parent reply".into(),
+                        done: true,
+                    }],
+                );
+                let (_, child, turn) = add_family(shell, cx);
+                let task = TaskId::new();
+                shell.state.tasks.insert(
+                    task,
+                    Task {
+                        id: task,
+                        parent: root,
+                        child,
+                        turn,
+                        request_key: "start_thread:spacing".into(),
+                        state: TaskState::Running,
+                    },
+                );
+                shell.state.turns.get_mut(&wake).unwrap().origin =
+                    TurnOrigin::Wake { tasks: vec![task] };
+                shell.state.turns.get_mut(&turn).unwrap().origin = TurnOrigin::Task { task };
+                let child_item = ItemId::new();
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemAdded(Item {
+                        id: child_item,
+                        thread: child,
+                        turn,
+                        seq: 1,
+                        body: ItemBody::AssistantText {
+                            text: "Child reply".into(),
+                            done: true,
+                        },
+                    }),
+                });
+                shell.show(super::MainView::Chat(child));
+                shell.scroller.update(cx, |state, cx| {
+                    state.reset(shell.state.transcript_rows(child), cx)
+                });
+                (root, child, items[0], child_item)
+            });
+            draw(cx);
+            let child_selector =
+                Box::leak(format!("transcript-body-{child_item}").into_boxed_str());
+            let task_gap = cx.debug_bounds(child_selector).unwrap().top()
+                - cx.debug_bounds("turn-label").unwrap().bottom();
+            shell.update(cx, |shell, cx| {
+                assert_eq!(shell.view.chat(), Some(child));
+                shell.show(super::MainView::Chat(root));
+                shell.scroller.update(cx, |state, cx| {
+                    state.reset(shell.state.transcript_rows(root), cx)
+                });
+                cx.notify();
+            });
+            draw(cx);
+            let root_selector = Box::leak(format!("transcript-body-{root_item}").into_boxed_str());
+            let wake_gap = cx.debug_bounds(root_selector).unwrap().top()
+                - cx.debug_bounds("turn-label").unwrap().bottom();
+            assert_eq!(wake_gap, task_gap);
+            assert_eq!(
+                wake_gap,
+                cx.update(|_, cx| cx.global::<super::Theme>().space.0[3])
+            );
         });
     }
 }

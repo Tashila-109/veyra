@@ -52,6 +52,9 @@ rows = [row for row in working['sidebar']['rows'] if row['kind']=='thread']
 assert next(row for row in rows if row['id']==root)['row_status']=='Working'
 assert next(row for row in rows if row['id']==child)['depth']==1
 assert working['transcript']['family_card']['title']=='Started 1 agent'
+cards = working['transcript']['family_cards']
+assert len(cards)==1 and cards[0]['turn']==working['transcript']['items'][0]['turn']
+assert cards[0]['row']>0
 assert working['transcript']['family_card']['rows'][0]['stop_action']=='veyra::StopThread'
 assert [row['id'] for row in rows].index(child)==[row['id'] for row in rows].index(root)+1
 assert sql("select parent_thread_id||'|'||root_thread_id||'|'||relationship from threads where id='"+child+"'")==root+'|'+root+'|subagent'
@@ -63,9 +66,12 @@ assert parent==str(cli)
 save('multi-peer',{'cli_pid':cli,'relay_pid':int(relay[0]),'relay_parent':int(parent)})
 assert not list((DATA/'run').glob('*/mcp.json'))
 capture('multi-tree-working')
+action('multi-selection-menu','OpenThreadMenu',{'thread':root})
 opened = select('multi-child-task',child)
+assert opened['sidebar']['menu_thread'] is None
 assert opened['selected_thread']['breadcrumb']=={'thread':root,'title':'report family','linked':True}
 assert any(item['kind']=='task_card' and item['text']=='Task from Claude Code' for item in opened['transcript']['items'])
+assert opened['transcript']['items'][0]['kind']=='task_card'
 assert any(item['turn_label']=='Task from “report family”' for item in opened['transcript']['items'])
 assert any(item['kind']=='user' and item['text'].startswith('Your last message is your report') and 'You cannot start child threads.' in item['text'] for item in opened['transcript']['items'])
 poll('multi-visible-counted',lambda d:d['perf']['visible']['thread']==child and d['perf']['visible']['applied_batches']>0)
@@ -109,6 +115,7 @@ assert next(row for row in menu['sidebar']['rows'] if row.get('id')==root)['arch
 capture('multi-menu')
 action('multi-card-stop','StopThread',{'thread':child})
 held = poll('multi-child-stop-held',lambda d:d['selected_thread']['status']=='Held' and pending_wake(root))
+assert held['sidebar']['menu_thread'] is None
 assert held['selected_thread']['hold']=='child_report'
 assert held['transcript']['family_card']['rows'][0]['status']=='Interrupted'
 assert held['transcript']['family_card']['rows'][0]['stop_action'] is None
@@ -145,8 +152,10 @@ action('multi-parent-stop-continue','Continue')
 family_delivered('multi-parent-stop-delivered',root,task)
 root,child,task = create_family('archive one child',child='running')
 poll('multi-child-archive-started',lambda d:d['transcript']['family_card']['rows'][0]['status']=='Working')
+action('multi-archive-child-menu','OpenThreadMenu',{'thread':child})
 action('multi-archive-child','Archive',{'thread':child})
 held = poll('multi-child-archive-held',lambda d:d['selected_thread']['status']=='Held' and pending_wake(root))
+assert held['sidebar']['menu_thread'] is None
 assert held['selected_thread']['hold']=='child_report'
 assert sql("select archived_at is not null from threads where id='"+child+"'")=='1'
 assert sql("select archived_at is null from threads where id='"+root+"'")=='1'
@@ -418,7 +427,8 @@ The visible-count, selection-reset and turn-reset dumps accompany the family dri
 OpenThreadMenu, Archive and ArchiveKeepChildren accept a thread id; the latter keeps a root's children running.
 Each thread and selected_thread has lineage, and top-level tasks carries task state, delivery and its nullable source item id.
 The child breadcrumb includes its root title and whether its SelectThread link is available; parent_attention names a parent that needs you.
-`transcript.family_card` carries the first derived list row, Started N agents, and its Open and Stop actions.
+`transcript.family_card` retains the aggregate child controls for compatibility.
+`transcript.family_cards` reports each card's originating turn and rendered row after that turn, with the same Started N agents controls.
 Task and Wake rows carry turn_label and task_card text; report_delivered marks only the assistant row named by a Delivered task's source; a null source produces no badge.
 `selected_thread.quiet_minutes` and header_status share Quiet for N min without changing status.
 `awake` reports the engine's idle-sleep guard.

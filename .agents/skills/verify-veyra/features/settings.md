@@ -157,6 +157,7 @@ If the guard records intersecting windows, the recipe makes one further placemen
 The cursor stays untouched, every window still counts, and no available rectangle leaves the original guard failure intact.
 The Translucent review set at the human gate needs the same owned-window placement and one-time fallback.
 The measurement uses guarded region captures in every mode over the coarse backdrop and its inverse, with one completed chat, an unfocused composer and an idle fake shell drawer held in the same state.
+If either half needs the placement fallback, it discards both halves and retakes the pair at that rectangle within three attempts.
 It records luminance means and standard deviations, pixel differences and hashes for the sidebar, content, header, transcript, composer and drawer, with no capture outside the owned backdrop rectangle.
 The whole-content statistic excludes only the two outer right-hand 12×12-point squares clipped by the native rounded corners, scaled to the capture backing scale.
 Every differing pixel in the full content rectangle must lie inside those squares; the four named content regions retain exact equality without a tolerance.
@@ -309,8 +310,8 @@ def stop_backdrop(process):
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
-def measure_capture(label):
-    place_glass_window(label)
+def measure_capture(label, rectangle):
+    place_glass_window(label,rectangle)
     frame = ctl(label+'-before-frame','dump')['perf']['repaints']
     action(label+'-activate','ActivateWindow')
     poll(label+'-rendered',lambda d:d['perf']['repaints']>frame)
@@ -324,10 +325,14 @@ def measure_capture(label):
                 for counter in ['frame_requests','repaints']: tab.pop(counter)
         for key in ['view','look','sidebar','selected_thread','composer_text','composer','drawer','focus']:
             assert before[key]==after[key], 'measurement state changed: '+key
+    placed = False
     try: take(label)
     except AssertionError as error:
         if 'intersecting windows:' not in str(error): raise
         retry_clear_glass(label,error,take)
+        placed = True
+    guards = json.loads((PROOF/(label+'-region-guards.json')).read_text())
+    return guards['before']['rectangle'],placed
 def luminance_stats(pixels, included=None):
     values = pixels.astype(float) @ np.array([.2126,.7152,.0722])
     if included is not None: values = np.ma.array(values,mask=~included)
@@ -459,14 +464,14 @@ try:
         action('measure-flags-'+mode,'DebugDisplayOptions',dict(reduce_motion=True,**flags))
         state = poll('measure-look-'+mode,lambda d:d['look']['background']==
             ('translucent' if mode=='translucent' else 'solid') and d['look']['reduce_motion'])
-        labels = []
-        for inverted in [False,True]:
-            label = 'settings-measure-'+mode+('-inverse' if inverted else '-coarse')
+        labels = ['settings-measure-'+mode+suffix for suffix in ['-coarse','-inverse']]
+        def take_half(label,rectangle):
+            global backdrop
             stop_backdrop(backdrop)
-            backdrop,records = start_backdrop(label,inverted)
+            backdrop,records = start_backdrop(label,label.endswith('-inverse'))
             save('backdrop-windows',records)
-            measure_capture(label)
-            labels.append(label)
+            return measure_capture(label,rectangle)
+        measured_pair(labels,take_half)
         measurements.append(compare_backdrops(mode,labels,state))
     save('settings-backdrop-measurements',measurements)
     drawer_keys('settings-glass-drawer-close','cmd-w','drawer','composer')
@@ -511,7 +516,9 @@ PY_BACKGROUND
       "settings-relaunch.json",
       "settings.png",
       "settings-existing.json",
-      "settings-new.json"
+      "settings-new.json",
+      "settings-command-error.png",
+      "settings-command-error.json"
     ],
     "settings-background": [
       "settings-solid.png",
