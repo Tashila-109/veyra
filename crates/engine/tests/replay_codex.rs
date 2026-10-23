@@ -144,7 +144,8 @@ fn codex_elicitation_declined() {
     let e = standard("elicitation", Inputs::default());
     assert_eq!(requests(&e).len(), 0);
     assert!(e.iter().any(
-        |e| matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="Codex reque\
+        |e| matches!(e,
+        ProviderEvent::Session(SessionEvent::Notice(veyra_engine::domain::Notice { text, .. })) if text=="Codex reque\
         sted an MCP form that Veyra cannot display; it was declined.")
     ));
     assert_eq!(text(&e), "ok");
@@ -184,7 +185,8 @@ fn codex_resume_not_found_falls_back() {
         Inputs::default(),
     );
     assert!(e.iter().any(
-        |e| matches!(e,ProviderEvent::Session(SessionEvent::Notice{text}) if text=="The earlie\
+        |e| matches!(e,
+        ProviderEvent::Session(SessionEvent::Notice(veyra_engine::domain::Notice { text, .. })) if text=="The earlie\
         r conversation could not be resumed; this is a new session")
     ));
     assert_eq!(text(&e), "ok");
@@ -308,7 +310,7 @@ fn codex_mcp_tool_approval_docks() {
     }
     assert!(
         !e.iter()
-            .any(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice { .. })))
+            .any(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice(_))))
     );
     assert_eq!(text(&e), "ok");
 }
@@ -341,7 +343,10 @@ fn codex_retry_and_limit_notices() {
     let n: Vec<_> = e
         .iter()
         .filter_map(|e| match e {
-            ProviderEvent::Session(SessionEvent::Notice { text }) => Some(text.as_str()),
+            ProviderEvent::Session(SessionEvent::Notice(veyra_engine::domain::Notice {
+                text,
+                ..
+            })) => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -770,7 +775,7 @@ fn codex_low_usage_adds_no_notice() {
     let e = standard("rate-limit-low", Inputs::default());
     assert_eq!(
         e.iter()
-            .filter(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice { .. })))
+            .filter(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice(_))))
             .count(),
         0
     );
@@ -781,7 +786,7 @@ fn codex_repeated_near_limit_adds_one_notice() {
     let e = standard("rate-limit-repeated", Inputs::default());
     assert_eq!(
         e.iter()
-            .filter(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice { .. })))
+            .filter(|e| matches!(e, ProviderEvent::Session(SessionEvent::Notice(_))))
             .count(),
         1
     );

@@ -890,9 +890,8 @@ impl Shell {
                 cx.background_executor().timer(cadence).await;
                 if this
                     .update(cx, |shell, cx| {
-                        let timed_notice = shell.view.chat().and_then(|thread| shell.state.items.get(&thread))
-                            .is_some_and(|items| items.values().any(|item|
-                                matches!(&item.body, ItemBody::Notice(notice) if notice.reset_at.is_some())));
+                        let timed_notice =
+                            shell.needs_notice_clock(veyra_engine::actor::now() / 1000);
                         if header::cadence_due(&shell.state.statuses) || timed_notice {
                             cx.notify();
                         }
@@ -1935,6 +1934,17 @@ impl Shell {
                 })
             })
             .collect()
+    }
+    fn needs_notice_clock(&self, now_seconds: i64) -> bool {
+        self.view
+            .chat()
+            .and_then(|thread| self.state.items.get(&thread))
+            .is_some_and(|items| {
+                items.values().any(|item| {
+                    matches!(&item.body, ItemBody::Notice(notice)
+                if notice.reset_at.is_some_and(|reset| reset > now_seconds))
+                })
+            })
     }
     #[cfg(debug_assertions)]
     #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
@@ -3155,6 +3165,106 @@ mod tests {
         cx.update(|window, _| window.activate_window());
         draw(cx);
         check(shell, cx, dispatched, sender);
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn queued_wait_words_follow_their_own_bubble(cx: &mut gpui::TestAppContext) {
+        use gpui::VisualContext;
+        struct QueuedTranscript(Entity<super::Shell>);
+        impl Render for QueuedTranscript {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    super::transcript::render_with_wait(
+                        shell,
+                        Some(WaitReason::TurnRunning.to_string()),
+                        cx,
+                    )
+                })
+            }
+        }
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (thread, child, _) = add_family(shell, cx);
+                shell.state.threads.remove(&child);
+                let turn = TurnId::new();
+                let item = ItemId::new();
+                shell.state.turns.insert(
+                    turn,
+                    Turn {
+                        id: turn,
+                        thread,
+                        ordinal: 2,
+                        origin: TurnOrigin::User { item },
+                        state: TurnState::Queued,
+                    },
+                );
+                shell.state.items.insert(
+                    thread,
+                    BTreeMap::from([(
+                        item,
+                        Item {
+                            id: item,
+                            thread,
+                            turn,
+                            seq: 1,
+                            body: ItemBody::UserText("Queued prompt".into()),
+                        },
+                    )]),
+                );
+                shell
+                    .state
+                    .statuses
+                    .insert(thread, Status::Working { since: 1 });
+                shell.state.sort_transcript(thread);
+                shell.scroller.update(cx, |state, cx| {
+                    state.reset(shell.state.transcript_rows(thread), cx)
+                });
+                cx.notify();
+            });
+            cx.replace_root_view(|_, _| QueuedTranscript(shell.clone()));
+            draw(cx);
+            let bubble = cx.debug_bounds("user-bubble").unwrap();
+            let wait = cx
+                .debug_bounds("queued-message-wait")
+                .expect("production queued wait row is visible");
+            assert!(wait.top() >= bubble.bottom());
+            assert_eq!(wait.right(), bubble.right());
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn notice_clock_stops_after_reset_and_when_transcript_is_hidden(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, _| {
+                let thread = shell.view.chat().unwrap();
+                let turn = *shell.state.turns.keys().next().unwrap();
+                let item = ItemId::new();
+                shell.state.items.insert(
+                    thread,
+                    BTreeMap::from([(
+                        item,
+                        Item {
+                            id: item,
+                            thread,
+                            turn,
+                            seq: 1,
+                            body: ItemBody::Notice(veyra_engine::domain::Notice {
+                                text: "Limit".into(),
+                                reset_at: Some(100),
+                            }),
+                        },
+                    )]),
+                );
+                assert!(shell.needs_notice_clock(99));
+                assert!(!shell.needs_notice_clock(100));
+                assert!(!shell.needs_notice_clock(101));
+                shell.view = super::MainView::Settings { back: Some(thread) };
+                assert!(!shell.needs_notice_clock(99));
+                shell.view = super::MainView::Chat(ThreadId::new());
+                assert!(!shell.needs_notice_clock(99));
+            });
+        });
     }
 
     #[test]
@@ -5972,8 +6082,88 @@ mod tests {
     }
 
     #[cfg(debug_assertions)]
+    fn assert_background_buttons_disabled_through_real_clicks(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::component::StyledExt;
+        use veyra_engine::domain::WindowBackground::{Solid, Translucent};
+        struct Buttons(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+        impl Render for Buttons {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .v_flex()
+                    .children([(Solid, "Solid"), (Translucent, "Translucent")].map(
+                        |(background, label)| {
+                            let clicks = self.0.clone();
+                            super::settings::background_button(background, label, cx)
+                                .on_click(move |_, _, _| clicks.borrow_mut().push(label))
+                        },
+                    ))
+            }
+        }
+        cx.update(gpui_kit::init);
+        let clicks = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            cx.set_global(super::theme::Look {
+                overridden: true,
+                ..Default::default()
+            });
+            super::Theme::apply(super::Appearance::Dark, window, cx);
+            Buttons(clicks.clone())
+        });
+        for options in [
+            veyra_engine::platform::DisplayOptions::default(),
+            veyra_engine::platform::DisplayOptions {
+                reduce_transparency: true,
+                ..Default::default()
+            },
+            veyra_engine::platform::DisplayOptions {
+                increase_contrast: true,
+                ..Default::default()
+            },
+        ] {
+            cx.update(|window, cx| {
+                cx.set_global(super::theme::Look {
+                    requested: Translucent,
+                    options,
+                    overridden: true,
+                });
+                super::Theme::apply(super::Appearance::Dark, window, cx);
+            });
+            draw(cx);
+            println!(
+                "public accessibility tree available: {}",
+                cx.update(|window, _| window.debug_a11y_tree_json().is_some())
+            );
+            clicks.borrow_mut().clear();
+            for selector in ["caption-Solid", "caption-Translucent"] {
+                let center = cx.debug_bounds(selector).unwrap().center();
+                cx.simulate_click(center, gpui::Modifiers::none());
+                draw(cx);
+            }
+            if options.reduce_transparency || options.increase_contrast {
+                assert!(
+                    clicks.borrow().is_empty(),
+                    "disabled production buttons reached handlers under {options:?}"
+                );
+            } else {
+                assert_eq!(
+                    clicks.borrow().as_slice(),
+                    ["Solid", "Translucent"],
+                    "both click probes must be live"
+                );
+            }
+        }
+        cx.update(|window, cx| {
+            cx.set_global(super::theme::Look {
+                overridden: true,
+                ..Default::default()
+            });
+            super::Theme::apply(super::Appearance::Dark, window, cx);
+        });
+    }
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn forced_solid_keeps_background_choice_and_blocks_every_entry(cx: &mut gpui::TestAppContext) {
+        assert_background_buttons_disabled_through_real_clicks(cx);
         use gpui_kit::base::Selectable;
         use veyra_engine::domain::WindowBackground::{Solid, Translucent};
         with_docked_shell(cx, |shell, cx, dispatched, _| {
@@ -9029,6 +9219,68 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn family_start_key_wins_over_the_later_timestamp_fallback(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (parent, first, _) = display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::Tool(ToolItem {
+                        approval: None,
+                        interruption: None,
+                        call: ToolCall {
+                            name: "start_thread".into(),
+                            veyra_label: true,
+                            arguments: serde_json::json!({"client_request_id":"explicit"}),
+                            input_summary: None,
+                        },
+                        result: None,
+                        output_tail: String::new(),
+                    })],
+                );
+                shell.state.turns.get_mut(&first).unwrap().state =
+                    TurnState::Running { since: 1000 };
+                let (_, child, child_turn) = add_family(shell, cx);
+                shell.state.turns.get_mut(&child_turn).unwrap().state =
+                    TurnState::Running { since: 3500 };
+                let later = TurnId::new();
+                shell.state.turns.insert(
+                    later,
+                    Turn {
+                        id: later,
+                        thread: parent,
+                        ordinal: 2,
+                        origin: TurnOrigin::Provider,
+                        state: TurnState::Running { since: 3000 },
+                    },
+                );
+                let task = TaskId::new();
+                shell.state.tasks.insert(
+                    task,
+                    Task {
+                        id: task,
+                        parent,
+                        child,
+                        turn: child_turn,
+                        request_key: "start_thread:explicit".into(),
+                        state: TaskState::Running,
+                    },
+                );
+                assert_eq!(
+                    super::transcript::family_cards(&shell.state, parent)[0].turn,
+                    Some(first)
+                );
+                let task = shell.state.tasks.get_mut(&task).unwrap();
+                task.request_key = "legacy-unrelated".into();
+                assert_eq!(
+                    super::transcript::family_cards(&shell.state, parent)[0].turn,
+                    Some(later)
+                );
+            });
+        });
+    }
     #[cfg(debug_assertions)]
     #[gpui::test]
     fn family_and_task_cards_stay_with_their_turns(cx: &mut gpui::TestAppContext) {

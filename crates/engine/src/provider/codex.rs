@@ -576,11 +576,9 @@ impl Codec {
                         spend_reached,
                         limits.individual_limit.as_ref(),
                     );
-                    decoded.events.push(if notice.reset_at.is_some() {
-                        ProviderEvent::Session(SessionEvent::TimedNotice(notice))
-                    } else {
-                        Self::notice(&notice.text)
-                    });
+                    decoded
+                        .events
+                        .push(ProviderEvent::Session(SessionEvent::Notice(notice)));
                 }
                 return Ok(());
             }
@@ -1154,6 +1152,11 @@ impl Codec {
             }
             return;
         }
+        let tool = native_turn
+            .as_deref()
+            .zip(params.get("itemId").and_then(Value::as_str))
+            .filter(|(_, item)| !item.is_empty())
+            .map(|(turn, item)| Self::key(turn, item));
         self.requests.insert(
             key.clone(),
             Request {
@@ -1167,6 +1170,7 @@ impl Codec {
         decoded.events.push(ProviderEvent::Turn {
             turn: owner.id(),
             event: TurnEvent::RequestOpened {
+                tool,
                 native: NativeRequestRef(key),
                 kind,
             },
@@ -1280,7 +1284,10 @@ impl Codec {
         self.peer.eof();
     }
     fn notice(text: &str) -> ProviderEvent {
-        ProviderEvent::Session(SessionEvent::Notice { text: text.into() })
+        ProviderEvent::Session(SessionEvent::Notice(crate::domain::Notice {
+            text: text.into(),
+            reset_at: None,
+        }))
     }
 }
 fn cancel(reply: &RequestReply) -> Value {
@@ -1637,6 +1644,43 @@ mod tests {
         );
     }
     #[test]
+    fn codex_fixture_approval_carries_its_item_key_and_missing_id_stays_unlinked() {
+        let source = include_str!("../../tests/fixtures/codex/approval-command.jsonl");
+        let request = source
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| {
+                record["type"] == "emit_inbound"
+                    && record["line"]["method"] == "item/commandExecution/requestApproval"
+            })
+            .unwrap()["line"]
+            .clone();
+        for known in [false, true] {
+            let mut codec = early_request_codec();
+            let mut frame = request.clone();
+            frame["params"]["threadId"] = json!("old-thread");
+            frame["params"]["turnId"] = json!("native-turn");
+            frame["params"]["itemId"] = if known {
+                json!("invocation")
+            } else {
+                json!("")
+            };
+            let decoded = codec.value(frame).unwrap();
+            let link = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event: TurnEvent::RequestOpened { tool, .. },
+                        ..
+                    } => Some(tool.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(link, known.then(|| Codec::key("native-turn", "invocation")));
+        }
+    }
+    #[test]
     fn codex_fixture_separate_message_items_keep_their_keys() {
         let mut codec = early_request_codec();
         let source = include_str!("../../tests/fixtures/codex/ok-reply.jsonl");
@@ -1861,8 +1905,7 @@ mod limit_tests {
             .events
             .into_iter()
             .map(|event| match event {
-                ProviderEvent::Session(SessionEvent::TimedNotice(notice)) => notice.text,
-                ProviderEvent::Session(SessionEvent::Notice { text }) => text,
+                ProviderEvent::Session(SessionEvent::Notice(notice)) => notice.text,
                 _ => panic!("expected a usage notice"),
             })
             .collect()
@@ -1952,7 +1995,7 @@ mod limit_tests {
         frame["params"]["rateLimits"]["primary"]["resetsAt"] = json!(1792472736);
         let decoded = codec.value(frame).unwrap();
         assert!(matches!(decoded.events.as_slice(),
-            [ProviderEvent::Session(SessionEvent::TimedNotice(Notice { text, reset_at: Some(1792472736) }))]
+            [ProviderEvent::Session(SessionEvent::Notice(Notice { text, reset_at: Some(1792472736) }))]
                 if text == "Codex is near its usage limit: primary window, 95% used."));
     }
     #[test]
@@ -1979,8 +2022,7 @@ mod limit_tests {
                 "params":{"rateLimits":limits}}))
                 .unwrap();
             let instant = match decoded.events.as_slice() {
-                [ProviderEvent::Session(SessionEvent::TimedNotice(notice))] => notice.reset_at,
-                [ProviderEvent::Session(SessionEvent::Notice { .. })] => None,
+                [ProviderEvent::Session(SessionEvent::Notice(notice))] => notice.reset_at,
                 _ => panic!("missing usage notice"),
             };
             assert_eq!(instant, expected);

@@ -129,25 +129,20 @@ while not backdrop_pid_file.exists():
     assert time.monotonic()<end, 'owned backdrop did not write its pid'
     time.sleep(.05)
 backdrop_pid = int(backdrop_pid_file.read_text())
-proc = ctypes.CDLL('/usr/lib/libproc.dylib',use_errno=True)
-proc.proc_pidpath.argtypes = [ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
-proc.proc_pidpath.restype = ctypes.c_int
-executable_buffer = ctypes.create_string_buffer(4096)
-assert proc.proc_pidpath(backdrop_pid,executable_buffer,len(executable_buffer))>0, 'backdrop executable unavailable'
-backdrop_path = pathlib.Path(os.fsdecode(executable_buffer.value)).resolve()
-assert backdrop_path==backdrop_executable.resolve(), 'backdrop pid does not name the scratch bundle executable'
+backdrop_path = verify_owned_backdrop(backdrop_pid,backdrop_executable)
 save('notifications-backdrop-ownership',{'pid':backdrop_pid,'executable':str(backdrop_path),
     'bundle':str(backdrop_bundle.resolve()),'pid_file':str(backdrop_pid_file.resolve())})
 (PROOF/'notifications-backdrop-pid').write_text(str(backdrop_pid)+'\n')
 with (PROOF/'backdrop-owned-pids').open('a') as file: file.write(str(backdrop_pid)+'\n')
 end = time.monotonic()+10
 while not backdrop_output.exists() or 'backdrop ready ' not in backdrop_output.read_text():
-    os.kill(backdrop_pid,0)
+    verify_owned_backdrop(backdrop_pid,backdrop_executable)
     assert time.monotonic()<end, 'owned backdrop was not ready'
     time.sleep(.05)
 def activate_owned_backdrop(label):
-    os.kill(backdrop_pid,0)
-    backdrop_command(label+'-open',['open',str(backdrop_bundle)])
+    verify_owned_backdrop(backdrop_pid,backdrop_executable)
+    reopen_owned_backdrop(backdrop_pid,backdrop_executable,
+        lambda: backdrop_command(label+'-open',['open',str(backdrop_bundle)]))
     source = ('import AppKit\n'
         f'let pid: Int32 = {backdrop_pid}\n'
         'let end = Date().addingTimeInterval(5)\n'

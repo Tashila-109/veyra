@@ -66,7 +66,13 @@ if LANE == 'live':
     print('PASS live streamed reply; Working to Done; stored reply and native metadata')
     sys.exit(0)
 records = [json.loads(line) for line in (SOURCE/'ok-reply.jsonl').read_text().splitlines()]
-records[2]['after_ms']=3000
+initialize_request = next(record for record in records if record.get('type')=='expect_outbound'
+    and record.get('line',{}).get('type')=='control_request'
+    and record['line']['request'].get('subtype')=='initialize')
+initialize_response = next(record for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('type')=='control_response'
+    and record['line']['response'].get('request_id')==initialize_request['line']['request_id'])
+initialize_response['after_ms']=3000
 stage_records(records)
 starting_thread = create('chat-starting','Wait for the CLI to start',scenario=None)
 starting = poll('chat-starting',lambda d:d['selected_thread']['wait_reason']=='Waits for the CLI to start')
@@ -311,7 +317,8 @@ for scenario, words in [
 
 
 records = [json.loads(line) for line in (SOURCE/'bash-echo.jsonl').read_text().splitlines()]
-position = next(i for i,r in enumerate(records) if r.get('line',{}).get('type')=='result')
+position = next(i for i,r in enumerate(records) if r.get('type')=='emit_inbound'
+    and r.get('line',{}).get('type')=='result')
 records[position]['after_ms']=60000
 records.insert(position,{'type':'emit_inbound','line':{'type':'assistant','session_id':'<id:session>',
     'parent_tool_use_id':None,'message':{'content':[{'type':'tool_use','id':'still-open-tool',
@@ -413,8 +420,10 @@ tool = next(item for item in done['transcript']['items'] if item['kind']=='tool'
 assert tool['tool_label']=='example / lookup' and tool['body']['Tool']['call']['veyra_label'] is False
 capture('codex-provider-tool-row')
 records = codex_records('ok-reply')
-position = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='turn/completed')
-second = next(json.loads(json.dumps(r)) for r in records if r.get('line',{}).get('method')=='item/completed'
+position = next(i for i,r in enumerate(records) if r.get('type')=='emit_inbound'
+    and r.get('line',{}).get('method')=='turn/completed')
+second = next(json.loads(json.dumps(r)) for r in records if r.get('type')=='emit_inbound'
+    and r.get('line',{}).get('method')=='item/completed'
     and r['line']['params']['item'].get('type')=='agentMessage')
 second['line']['params']['item'].update(id='paragraph-two',text='A second paragraph: a'+'\u0301'*6)
 records.insert(position,second)
@@ -492,8 +501,10 @@ assert sql("select count(*) from turns where thread_id='"+thread+"' and origin_j
 assert [item['text'] for item in background['transcript']['items'] if item['kind']=='assistant']==['foreground','background reply']
 capture('grok-background-done')
 records = grok_records('tool-title')
-position = next(i for i,r in enumerate(records) if r.get('line',{}).get('params',{}).get('update',{}).get('sessionUpdate')=='tool_call')
-message = next(json.loads(json.dumps(r)) for r in records if r.get('line',{}).get('params',{}).get('update',{}).get('sessionUpdate')=='agent_message_chunk')
+position = next(i for i,r in enumerate(records) if r.get('type')=='emit_inbound'
+    and r.get('line',{}).get('params',{}).get('update',{}).get('sessionUpdate')=='tool_call')
+message = next(json.loads(json.dumps(r)) for r in records if r.get('type')=='emit_inbound'
+    and r.get('line',{}).get('params',{}).get('update',{}).get('sessionUpdate')=='agent_message_chunk')
 message['line']['params']['update']['content']['text']='Before the tool.'
 records.insert(position,message)
 thread = create_grok('grok-tool-title',records=records,prompt='Run pwd')

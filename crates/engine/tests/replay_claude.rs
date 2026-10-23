@@ -211,7 +211,7 @@ fn claude_resume_not_found_starts_new_session() {
     let events = replay("resume-not-found", true);
     let notice = "The earlier conversation could not be resumed; this is a new session";
     assert!(events.iter().any(|event| matches!(
-        event, ProviderEvent::Session(SessionEvent::Notice { text }) if text == notice
+        event, ProviderEvent::Session(SessionEvent::Notice(veyra_engine::domain::Notice { text, .. })) if text == notice
     )));
     let native = events
         .iter()
@@ -828,7 +828,10 @@ fn claude_compact_and_clear_add_notices() {
     let notices: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            ProviderEvent::Session(SessionEvent::Notice { text }) => Some(text.as_str()),
+            ProviderEvent::Session(SessionEvent::Notice(veyra_engine::domain::Notice {
+                text,
+                ..
+            })) => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -852,7 +855,7 @@ fn claude_bad_lines_keep_session() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, ProviderEvent::Session(SessionEvent::Notice { .. })))
+            .filter(|event| matches!(event, ProviderEvent::Session(SessionEvent::Notice(_))))
             .count(),
         1
     );
@@ -863,8 +866,7 @@ fn claude_retry_limit_fallback_notices() {
     let notices: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            ProviderEvent::Session(SessionEvent::Notice { text }) => Some((text.as_str(), None)),
-            ProviderEvent::Session(SessionEvent::TimedNotice(notice)) => {
+            ProviderEvent::Session(SessionEvent::Notice(notice)) => {
                 Some((notice.text.as_str(), notice.reset_at))
             }
             _ => None,

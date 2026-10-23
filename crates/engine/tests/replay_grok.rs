@@ -1232,7 +1232,7 @@ fn grok_accept_edits_docks_inside_and_outside() {
         .iter()
         .filter_map(|event| match event {
             ProviderEvent::Turn {
-                event: TurnEvent::RequestOpened { native, kind },
+                event: TurnEvent::RequestOpened { native, kind, .. },
                 ..
             } => Some((native, kind)),
             _ => None,

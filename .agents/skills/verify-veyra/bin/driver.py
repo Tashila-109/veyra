@@ -728,3 +728,82 @@ def family_delivered(name, root, task):
         and any(row['id']==root and row['status']=='Done' for row in d['sidebar']['rows'] if row['kind']=='thread'))
 def pending_wake(root):
     return sql("select count(*) from tasks where parent_thread_id='"+root+"' and delivery='pending'")=='1'
+
+def _backdrop_executable(pid):
+    proc = ctypes.CDLL('/usr/lib/libproc.dylib',use_errno=True)
+    proc.proc_pidpath.argtypes = [ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
+    proc.proc_pidpath.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(4096)
+    if proc.proc_pidpath(pid,buffer,len(buffer)) > 0:
+        return pathlib.Path(os.fsdecode(buffer.value)).resolve()
+    error = ctypes.get_errno()
+    if error in (errno.ESRCH,errno.ENOENT): return None
+    raise OSError(error,'owned backdrop executable unavailable')
+
+def verify_owned_backdrop(pid, executable):
+    expected = pathlib.Path(executable).resolve()
+    assert expected.is_relative_to(DATA.resolve()), 'backdrop executable is outside scratch'
+    actual = _backdrop_executable(pid)
+    assert actual is not None, 'owned backdrop has died'
+    assert actual == expected, 'backdrop pid does not name the scratch bundle executable'
+    return actual
+
+def reopen_owned_backdrop(pid, executable, reopen):
+    verify_owned_backdrop(pid,executable)
+    result = reopen()
+    verify_owned_backdrop(pid,executable)
+    return result
+
+def stop_owned_backdrop(pid, executable):
+    for sig in (signal.SIGTERM,signal.SIGKILL):
+        if _backdrop_executable(pid) is None: return
+        verify_owned_backdrop(pid,executable)
+        try: os.kill(pid,sig)
+        except ProcessLookupError: return
+        end = time.monotonic()+5
+        while time.monotonic()<end:
+            if _backdrop_executable(pid) is None: return
+            time.sleep(.05)
+    assert _backdrop_executable(pid) is None, 'owned notification backdrop remains'
+
+def backdrop_pid_self_test():
+    from unittest.mock import patch
+    pid = 42424242
+    expected = (DATA/'notifications-backdrop.app/Contents/MacOS/backdrop').resolve()
+    foreign = (DATA/'other-executable').resolve()
+    def rejects(call):
+        try: call()
+        except AssertionError: return
+        raise AssertionError('unsafe backdrop operation was accepted')
+    with patch(__name__+'._backdrop_executable',return_value=expected), patch('os.kill') as kill:
+        verify_owned_backdrop(pid,expected)
+        kill.assert_not_called()
+    for actual in (None,foreign):
+        with patch(__name__+'._backdrop_executable',return_value=actual), patch('os.kill') as kill:
+            rejects(lambda: verify_owned_backdrop(pid,expected))
+            opened = []
+            rejects(lambda: reopen_owned_backdrop(pid,expected,lambda: opened.append(True)))
+            assert not opened, 'dead or foreign backdrop was reopened'
+            if actual is None: stop_owned_backdrop(pid,expected)
+            else: rejects(lambda: stop_owned_backdrop(pid,expected))
+            kill.assert_not_called()
+    with patch(__name__+'._backdrop_executable',side_effect=[expected,foreign]), patch('os.kill') as kill:
+        opened = []
+        rejects(lambda: reopen_owned_backdrop(pid,expected,lambda: opened.append(True)))
+        assert opened == [True], 'live backdrop was not reopened'
+        kill.assert_not_called()
+    with patch(__name__+'._backdrop_executable',return_value=expected) as path, patch('os.kill') as kill:
+        reopened = reopen_owned_backdrop(pid,expected,lambda: 'opened')
+        assert reopened == 'opened' and path.call_count == 2
+        kill.assert_not_called()
+    with patch(__name__+'._backdrop_executable',side_effect=[expected,foreign]), patch('os.kill') as kill:
+        rejects(lambda: stop_owned_backdrop(pid,expected))
+        kill.assert_not_called()
+    with patch(__name__+'._backdrop_executable',side_effect=[expected,expected,None]), patch('os.kill') as kill:
+        stop_owned_backdrop(pid,expected)
+        kill.assert_called_once_with(pid,signal.SIGTERM)
+    with patch(__name__+'._backdrop_executable',side_effect=[expected,expected,expected,foreign]), \
+            patch('os.kill') as kill, patch('time.monotonic',side_effect=[0,6]), patch('time.sleep'):
+        rejects(lambda: stop_owned_backdrop(pid,expected))
+        kill.assert_called_once_with(pid,signal.SIGTERM)
+    print('backdrop pid self-test: executable ownership, before/after reopen, dead refusal and each signal passed')

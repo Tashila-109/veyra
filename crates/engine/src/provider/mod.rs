@@ -98,10 +98,7 @@ pub enum SessionEvent {
         pgid: u32,
         capabilities: Vec<String>,
     },
-    Notice {
-        text: String,
-    },
-    TimedNotice(Notice),
+    Notice(Notice),
     BackgroundWork {
         pending: bool,
     },
@@ -154,6 +151,7 @@ pub enum TurnEvent {
     RequestOpened {
         native: NativeRequestRef,
         kind: RequestKind,
+        tool: Option<NativeItemKey>,
     },
     TurnEnded {
         outcome: TurnOutcome,

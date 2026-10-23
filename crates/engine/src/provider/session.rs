@@ -584,9 +584,12 @@ fn start_provider_task(
                     {
                         Ok(mut next) => {
                             next.io.child.watch(&cleanup);
-                            let notice = ProviderEvent::Session(SessionEvent::Notice {
-                                text: "The earlier conversation could not be resumed; this is a new session".into(),
-                            });
+                            let notice = ProviderEvent::Session(SessionEvent::Notice(
+                                crate::domain::Notice {
+                                    text: "The earlier conversation could not be resumed; this is a new session".into(),
+                                    reset_at: None,
+                                },
+                            ));
                             if !emit(&out, thread, epoch, notice).await {
                                 return false;
                             }
@@ -924,9 +927,11 @@ async fn run_one(
             line = lines.next() => match line {
                 Ok(Some(Line::Oversize(length))) => {
                     tracing::info!(length, provider = provider.name(), "skipped oversized provider line");
-                    if !emit(out, thread, epoch, ProviderEvent::Session(SessionEvent::Notice {
-                        text: format!("{} sent a line larger than 4 MiB; Veyra skipped it.", provider.name())
-                    })).await { consumer_gone = true; break; }
+                    let notice = ProviderEvent::Session(SessionEvent::Notice(crate::domain::Notice {
+                        text: format!("{} sent a line larger than 4 MiB; Veyra skipped it.", provider.name()),
+                        reset_at: None,
+                    }));
+                    if !emit(out, thread, epoch, notice).await { consumer_gone = true; break; }
                 }
                 Ok(Some(Line::Text(line))) => {
                     let wire = match serde_json::from_str::<serde_json::Value>(&line) {

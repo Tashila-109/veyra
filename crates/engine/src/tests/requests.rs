@@ -66,6 +66,7 @@ fn question_answer_is_persisted_and_requires_every_answer() {
     f.event(turn_event(
         f.running(),
         TurnEvent::RequestOpened {
+            tool: None,
             native: NativeRequestRef("question".into()),
             kind: RequestKind::Question {
                 questions: vec![Question {
@@ -467,4 +468,114 @@ fn sanitized_option_display_does_not_change_the_user_message() {
             .items_for(f.thread)
             .any(|item| item.turn == answer && item.body == ItemBody::UserText(exact.into()))
     );
+}
+
+#[test]
+fn invocation_approval_links_survive_both_event_orders_and_repeated_commands() {
+    for request_first in [false, true] {
+        let mut f = Fixture::new(LiveState::Running);
+        for (index, decision) in [Decision::Deny, Decision::AllowOnce]
+            .into_iter()
+            .enumerate()
+        {
+            let key = NativeItemKey(format!("invocation-{index}"));
+            let started = TurnEvent::ToolStarted {
+                key: key.clone(),
+                call: ToolCall {
+                    name: "Bash".into(),
+                    veyra_label: false,
+                    arguments: json!({"command":"same command"}),
+                    input_summary: None,
+                },
+            };
+            let opened = TurnEvent::RequestOpened {
+                tool: Some(key.clone()),
+                native: NativeRequestRef(format!("approval-{index}")),
+                kind: RequestKind::Approval {
+                    action: ProposedAction::new(
+                        "Bash".into(),
+                        ApprovalTarget::Command {
+                            command: "same command".into(),
+                            cwd: CommandCwd::ProjectFolder,
+                            reason: None,
+                            preview: ApprovalPreview::new(String::new()),
+                        },
+                    ),
+                },
+            };
+            let events = if request_first {
+                [opened, started]
+            } else {
+                [started, opened]
+            };
+            for event in events {
+                f.event(turn_event(f.running(), event));
+            }
+            let loaded = f.loaded();
+            let request = loaded
+                .requests
+                .values()
+                .find(|request| request.native.0 == format!("approval-{index}"))
+                .unwrap()
+                .id;
+            f.command(Command::Respond {
+                request,
+                decision: decision.clone(),
+            })
+            .unwrap();
+            f.event(turn_event(
+                f.running(),
+                TurnEvent::ToolFinished {
+                    key,
+                    ok: false,
+                    output_tail: Some("failed independently".into()),
+                },
+            ));
+            let loaded = f.loaded();
+            assert_eq!(
+                loaded.requests[&request].state,
+                RequestState::Answered(decision)
+            );
+            let linked: Vec<_> = loaded
+                .items_for(f.thread)
+                .filter_map(|item| match &item.body {
+                    ItemBody::Tool(tool) if tool.approval == Some(request) => Some(tool),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(linked.len(), 1, "each decision belongs to one invocation");
+            assert!(!linked[0].result.as_ref().unwrap().ok);
+        }
+        let loaded = f.loaded();
+        let links: std::collections::BTreeSet<_> = loaded
+            .items_for(f.thread)
+            .filter_map(|item| match &item.body {
+                ItemBody::Tool(tool) => tool.approval,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links.len(), 2);
+    }
+}
+
+#[test]
+fn command_reason_is_hydrated_at_construction_and_legacy_loading() {
+    let target = ApprovalTarget::Command {
+        command: "printf check".into(),
+        cwd: CommandCwd::ProjectFolder,
+        reason: None,
+        preview: ApprovalPreview::new(r#"{"description":"Explain this request"}"#.into()),
+    };
+    let action = ProposedAction::new("Bash".into(), target);
+    let ApprovalTarget::Command { reason, .. } = &action.target else {
+        unreachable!()
+    };
+    assert_eq!(reason.as_ref().unwrap().text, "Explain this request");
+    let mut stored = serde_json::to_value(&action).unwrap();
+    stored["target"].as_object_mut().unwrap().remove("reason");
+    let loaded: ProposedAction = serde_json::from_value(stored).unwrap();
+    let ApprovalTarget::Command { reason, .. } = loaded.target else {
+        unreachable!()
+    };
+    assert_eq!(reason.unwrap().text, "Explain this request");
 }

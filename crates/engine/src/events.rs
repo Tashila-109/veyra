@@ -56,6 +56,7 @@ impl ChangeEvent {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // Change dominates stream-2000; boxing allocates per Change.
 pub enum UiEvent {
     RecoveryNotice(String),
     Change {

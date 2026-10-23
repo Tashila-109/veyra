@@ -91,7 +91,7 @@ def launch_gates(found):
     raise AssertionError('Launch never calls start()')
 
 def gate_check():
-    """Run driver.gate_self_test() in a scratch checkout, because the driver reads a run's records at import."""
+    """Run driver self-tests in a scratch checkout, because the driver reads a run's records at import."""
     root = pathlib.Path(tempfile.mkdtemp(prefix='veyra-gate-',dir='/tmp'))
     try:
         (root/'crates/veyra').mkdir(parents=True)
@@ -99,7 +99,7 @@ def gate_check():
         (root/'target/verify-veyra/gatecheck').mkdir(parents=True)
         (root/'target/verify-veyra/gatecheck/lane').write_text('live\n')
         try:
-            result = subprocess.run([sys.executable,'-c','import driver; driver.gate_self_test()'],cwd=root,
+            result = subprocess.run([sys.executable,'-c','import driver; driver.gate_self_test(); driver.measured_pair_self_test(); driver.backdrop_pid_self_test()'],cwd=root,
                 capture_output=True,text=True,timeout=30,env=dict(os.environ,RUN='gatecheck',
                 PYTHONPATH=str(SKILL/'bin'),PYTHONDONTWRITEBYTECODE='1',VEYRA_VERIFY_TMP=str(root)+'/data-'))
         except subprocess.TimeoutExpired:
@@ -108,6 +108,19 @@ def gate_check():
         return result.stdout.strip()
     finally:
         shutil.rmtree(root)
+
+def driver_self_test_dispatch_check():
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+    driver = SimpleNamespace(**{name:Mock() for name in
+        ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test')})
+    def run(command, **options):
+        exec(command[2],{})
+        return SimpleNamespace(returncode=0,stdout='',stderr='')
+    with patch.dict(sys.modules,driver=driver), patch('subprocess.run',side_effect=run):
+        gate_check()
+    for name in ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test'):
+        getattr(driver,name).assert_called_once_with()
 
 def verdict(record, counted, late=False):
     """The only place a run's status is decided, after Cleanup has run. None asks for another attempt.
@@ -196,6 +209,7 @@ def checks(found):
     launch_gates(found)
     guards_in_place(found)
     verdict_check()
+    driver_self_test_dispatch_check()
     return (f'{len(found)} shell blocks and {blocks} Python heredocs compile across {len(page_names())} pages; '
         'the fixed sections exist; Launch calls gate() before start(); start() asserts its relaunch refusal and '
         'Cleanup its drain; the 30 s drain, stale-screenshot and covered-window guard texts are present; the verdict '

@@ -345,6 +345,8 @@ fn startup_completes_interrupted_transcript_items() {
             done: false,
         },
         ItemBody::Tool(ToolItem {
+            approval: None,
+            interruption: None,
             call: ToolCall {
                 veyra_label: false,
                 name: "Bash".into(),
@@ -904,5 +906,66 @@ fn startup_recovery_clears_stored_process_ids() {
     assert_eq!(
         actor.projection.threads[&f.thread].hold,
         Some(HoldReason::Restarted)
+    );
+}
+
+#[test]
+fn legacy_tool_rows_round_trip_without_new_fields_and_keep_interruption_cause() {
+    let ordinary = concat!(
+        r#"{"call":{"name":"Bash","veyra_label":false,"arguments":{"command":"same command"},"#,
+        r#""input_summary":null},"result":{"ok":false,"output_tail":"ordinary failure"},"output_tail":""}"#,
+    );
+    let interrupted = ordinary.replace(
+        "ordinary failure",
+        "The turn ended before this tool returned",
+    );
+    for (stored, expected) in [
+        (ordinary, None),
+        (interrupted.as_str(), Some(ToolInterruption::TurnEnded)),
+    ] {
+        let row: ToolItem = serde_json::from_str(stored).unwrap();
+        assert_eq!(row.approval, None);
+        assert_eq!(row.interruption, None);
+        assert_eq!(row.interruption_cause(), expected);
+        assert_eq!(serde_json::to_string(&row).unwrap(), stored);
+    }
+}
+
+#[test]
+fn ending_turn_stores_typed_tool_interruption_and_original_words() {
+    let mut f = Fixture::new(LiveState::Running);
+    f.event(turn_event(
+        f.running(),
+        TurnEvent::ToolStarted {
+            key: NativeItemKey("open".into()),
+            call: ToolCall {
+                name: "Bash".into(),
+                veyra_label: false,
+                arguments: serde_json::json!({}),
+                input_summary: None,
+            },
+        },
+    ));
+    f.event(turn_event(
+        f.running(),
+        TurnEvent::TurnEnded {
+            park: false,
+            outcome: TurnOutcome::Interrupted {
+                reason: "Stopped by you".into(),
+            },
+        },
+    ));
+    let loaded = f.loaded();
+    let tool = loaded
+        .items_for(f.thread)
+        .find_map(|item| match &item.body {
+            ItemBody::Tool(tool) => Some(tool),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(tool.interruption, Some(ToolInterruption::TurnEnded));
+    assert_eq!(
+        tool.result.as_ref().unwrap().output_tail.as_deref(),
+        Some("The turn ended before this tool returned")
     );
 }

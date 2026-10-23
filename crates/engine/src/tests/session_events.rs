@@ -494,9 +494,12 @@ fn session_notice_attaches_to_latest_turn() {
     else {
         panic!()
     };
-    f.event(ProviderEvent::Session(SessionEvent::Notice {
-        text: "new session".into(),
-    }));
+    f.event(ProviderEvent::Session(SessionEvent::Notice(
+        crate::domain::Notice {
+            text: "new session".into(),
+            reset_at: None,
+        },
+    )));
     let loaded = f.loaded();
     let notice = loaded
         .items
@@ -2455,9 +2458,12 @@ mod held_prompts {
             }
             HeldCancellation::StorageBlocked => {
                 f.actor.fail_write = true;
-                f.event(ProviderEvent::Session(SessionEvent::Notice {
-                    text: "storage write".into(),
-                }));
+                f.event(ProviderEvent::Session(SessionEvent::Notice(
+                    crate::domain::Notice {
+                        text: "storage write".into(),
+                        reset_at: None,
+                    },
+                )));
             }
         }
         {

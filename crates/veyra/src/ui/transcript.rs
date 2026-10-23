@@ -14,7 +14,10 @@ use gpui_kit::component::text::{
 };
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::*;
-pub(super) fn notice_text(notice: &Notice, now_seconds: i64) -> String {
+pub(super) fn notice_text(notice: &veyra_engine::domain::Notice, now: i64) -> String {
+    veyra_engine::text::display_text(&notice_words(notice, now))
+}
+fn notice_words(notice: &Notice, now_seconds: i64) -> String {
     let Some(reset) = notice.reset_at else {
         return notice.text.clone();
     };
@@ -276,35 +279,14 @@ pub(super) fn tool_status(item: &Item, state: Option<&super::AppState>) -> &'sta
     if tool.result.as_ref().is_some_and(|result| result.ok) {
         return "Done";
     }
-    let denied = state.is_some_and(|state| {
-        state.requests.iter().any(|request| {
-            if request.turn != item.turn || request.state != RequestState::Answered(Decision::Deny)
-            {
-                return false;
-            }
-            let RequestKind::Approval { action } = &request.kind else {
-                return false;
-            };
-            match &action.target {
-                ApprovalTarget::Command { command, .. } => {
-                    tool.call
-                        .arguments
-                        .get("command")
-                        .and_then(|value| value.as_str())
-                        .or(tool.call.input_summary.as_deref())
-                        == Some(command.as_str())
-                }
-                ApprovalTarget::File { path, .. } => ["file_path", "path", "notebook_path"]
-                    .into_iter()
-                    .any(|key| {
-                        tool.call
-                            .arguments
-                            .get(key)
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|value| std::path::Path::new(value) == path)
-                    }),
-                ApprovalTarget::Tool { .. } => tool.call.name == action.tool,
-            }
+    let denied = tool.approval.is_some_and(|approval| {
+        state.is_some_and(|state| {
+            state.requests.iter().any(|request| {
+                request.id == approval
+                    && request.turn == item.turn
+                    && request.thread == item.thread
+                    && request.state == RequestState::Answered(Decision::Deny)
+            })
         })
     });
     if denied {
@@ -312,9 +294,8 @@ pub(super) fn tool_status(item: &Item, state: Option<&super::AppState>) -> &'sta
     }
     match &tool.result {
         None => "Working",
-        Some(result)
-            if result.output_tail.as_deref()
-                == Some("The turn ended before this tool returned")
+        Some(_)
+            if tool.interruption_cause().is_some()
                 && state.is_some_and(|state| {
                     state.turns.get(&item.turn).is_some_and(|turn| {
                         matches!(
@@ -520,7 +501,7 @@ fn row_with_state(
                             .text_size(t.text.label.size)
                             .line_height(t.text.label.line_height)
                             .text_color(t.colors.danger)
-                            .child(line.to_owned()),
+                            .child(veyra_engine::text::display_text(line)),
                     )
                 })
                 .when(expanded, |row| {
@@ -581,7 +562,23 @@ fn row_with_state(
     }
     row.into_any_element()
 }
+struct OutcomeLine {
+    words: String,
+    elapsed_seconds: Option<u64>,
+}
+impl OutcomeLine {
+    fn formatted(&self) -> String {
+        self.elapsed_seconds.map_or_else(
+            || self.words.clone(),
+            |seconds| format!("{} · {seconds}s", self.words),
+        )
+    }
+}
+#[cfg(test)]
 pub fn turn_outcome_line(turn: &Turn) -> Option<String> {
+    turn_outcome_parts(turn).map(|outcome| outcome.formatted())
+}
+fn turn_outcome_parts(turn: &Turn) -> Option<OutcomeLine> {
     let TurnState::Ended {
         outcome,
         started,
@@ -596,10 +593,14 @@ pub fn turn_outcome_line(turn: &Turn) -> Option<String> {
         .filter(|_| !recovered)
         .map(|started| at.saturating_sub(started) / 1000);
     let words = outcome.words();
-    Some(match (outcome, seconds) {
-        (TurnOutcome::Completed, Some(seconds)) => format!("{words} · {seconds}s"),
-        (TurnOutcome::Interrupted { .. }, Some(seconds)) => format!("{words} · {seconds}s"),
-        _ => words,
+    Some(OutcomeLine {
+        words,
+        elapsed_seconds: match outcome {
+            TurnOutcome::Completed | TurnOutcome::Interrupted { .. } => {
+                seconds.map(|seconds| seconds.max(0) as u64)
+            }
+            TurnOutcome::Failed { .. } => None,
+        },
     })
 }
 fn tool_output(tool: &ToolItem) -> Option<String> {
@@ -642,6 +643,13 @@ pub(super) fn row_outcome(
     next: Option<&Item>,
     state: &super::AppState,
 ) -> Option<String> {
+    row_outcome_parts(item, next, state).map(|outcome| outcome.formatted())
+}
+fn row_outcome_parts(
+    item: &Item,
+    next: Option<&Item>,
+    state: &super::AppState,
+) -> Option<OutcomeLine> {
     if next.is_some_and(|next| next.turn == item.turn) {
         return None;
     }
@@ -649,9 +657,12 @@ pub(super) fn row_outcome(
         .failed_turn(item.thread)
         .is_some_and(|turn| turn.id == item.turn)
     {
-        return Some("Failed".into());
+        return Some(OutcomeLine {
+            words: "Failed".into(),
+            elapsed_seconds: None,
+        });
     }
-    state.turns.get(&item.turn).and_then(turn_outcome_line)
+    state.turns.get(&item.turn).and_then(turn_outcome_parts)
 }
 pub fn failed_tool_last_line(tool: &ToolItem) -> Option<&str> {
     let result = tool.result.as_ref().filter(|result| !result.ok)?;
@@ -664,6 +675,9 @@ pub fn failed_tool_last_line(tool: &ToolItem) -> Option<&str> {
         .map(str::trim_end)
 }
 fn tool_input(call: &ToolCall) -> String {
+    veyra_engine::text::display_text(&tool_input_words(call))
+}
+fn tool_input_words(call: &ToolCall) -> String {
     if let Some(summary) = &call.input_summary {
         return summary.clone();
     }
@@ -706,7 +720,7 @@ pub(super) fn family_cards(state: &super::AppState, parent: ThreadId) -> Vec<Fam
             .values()
             .filter(|task| task.parent == parent && task.child == child.id)
             .min_by_key(|task| state.turns.get(&task.turn).map(|turn| turn.ordinal));
-        let source = task.and_then(|task| task.request_key.strip_prefix("start_thread:")).and_then(|key|
+        let source = task.and_then(|task| task.start_request().map(|request| request.client_request_id)).and_then(|key|
             state.items.get(&parent).into_iter().flat_map(|items| items.values()).find(|item|
                 matches!(&item.body, ItemBody::Tool(tool) if tool.call.arguments.get("client_request_id")
                     .and_then(|value| value.as_str()) == Some(key)))).map(|item| item.turn);
@@ -897,7 +911,8 @@ fn wait_row(reason: String, cx: &App) -> Div {
 }
 fn failure_card(message: &str, cx: &App) -> AnyElement {
     let t = cx.global::<Theme>();
-    let (cause, stderr) = message.split_once('\n').unwrap_or((message, ""));
+    let message = veyra_engine::text::display_text(message);
+    let (cause, stderr) = message.split_once('\n').unwrap_or((&message, ""));
     div()
         .v_flex()
         .w_full()
@@ -939,17 +954,10 @@ fn failure_card(message: &str, cx: &App) -> AnyElement {
         )
         .into_any_element()
 }
-fn outcome_row(outcome: String, cx: &App) -> Div {
+fn outcome_row(outcome: OutcomeLine, cx: &App) -> Div {
     let t = cx.global::<Theme>();
-    let (words, elapsed) = outcome
-        .rsplit_once(" · ")
-        .filter(|(_, tail)| {
-            tail.strip_suffix('s')
-                .is_some_and(|seconds| seconds.parse::<u64>().is_ok())
-        })
-        .map_or((outcome.as_str(), None), |(words, elapsed)| {
-            (words, Some(elapsed))
-        });
+    let words = veyra_engine::text::display_text(&outcome.words);
+    let elapsed = outcome.elapsed_seconds.map(|seconds| format!("{seconds}s"));
     div()
         .h_flex()
         .gap(t.space.0[3])
@@ -969,17 +977,6 @@ fn outcome_row(outcome: String, cx: &App) -> Div {
         })
 }
 pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
-    #[cfg(debug_assertions)]
-    if let Some(open) = &mut shell.state.transcript_open
-        && shell.view.chat() == Some(open.thread)
-        && open.installed
-        && open.milliseconds.is_none()
-    {
-        open.milliseconds = Some(open.requested.elapsed().as_secs_f64() * 1000.);
-    }
-    let t = cx.global::<Theme>();
-    let thread = shell.view.chat();
-    let entity = cx.entity();
     let wait_reason = shell
         .view
         .chat()
@@ -991,6 +988,24 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .and_then(|state| state.wait_reason)
         })
         .map(|reason| reason.to_string());
+    render_with_wait(shell, wait_reason, cx)
+}
+pub(super) fn render_with_wait(
+    shell: &mut Shell,
+    wait_reason: Option<String>,
+    cx: &Context<Shell>,
+) -> AnyElement {
+    #[cfg(debug_assertions)]
+    if let Some(open) = &mut shell.state.transcript_open
+        && shell.view.chat() == Some(open.thread)
+        && open.installed
+        && open.milliseconds.is_none()
+    {
+        open.milliseconds = Some(open.requested.elapsed().as_secs_f64() * 1000.);
+    }
+    let t = cx.global::<Theme>();
+    let thread = shell.view.chat();
+    let entity = cx.entity();
     let content = div()
         .v_flex()
         .relative()
@@ -1031,7 +1046,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                                 let next = thread.and_then(|thread| {
                                     shell.state.transcript_item(thread, index + 1)
                                 });
-                                let outcome = row_outcome(item, next, &shell.state);
+                                let outcome = row_outcome_parts(item, next, &shell.state);
                                 let first = index == 0
                                     || thread
                                         .and_then(|thread| {
@@ -1172,6 +1187,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> impl IntoElement {
                 .h(t.layout.fade)
                 .bg(t.composer_fade()),
         )
+        .into_any_element()
 }
 fn tool_label(call: &ToolCall) -> String {
     let name = veyra_engine::text::display_line(&call.name, false).text;
@@ -1244,7 +1260,13 @@ mod tests {
         struct Outcome;
         impl Render for Outcome {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                super::outcome_row("Stopped after you denied a request · 2s".into(), cx)
+                super::outcome_row(
+                    super::OutcomeLine {
+                        words: "Stopped after you denied a request".into(),
+                        elapsed_seconds: Some(2),
+                    },
+                    cx,
+                )
             }
         }
         cx.update(gpui_kit::init);
@@ -1260,6 +1282,136 @@ mod tests {
         let elapsed = cx.debug_bounds("outcome-elapsed").unwrap();
         assert!(elapsed.left() > words.right());
         assert_eq!(elapsed.top(), words.top());
+    }
+    #[test]
+    fn every_tool_input_and_notice_projection_clamps_marks_without_mutating_raw() {
+        let raw = "e\u{301}\u{302}\u{303}\u{304}\u{305}\u{306}\u{307}";
+        let shown = "e\u{301}\u{302}\u{303}";
+        let mut call = ToolCall {
+            name: "Read".into(),
+            veyra_label: false,
+            arguments: serde_json::json!({"path":raw}),
+            input_summary: None,
+        };
+        assert_eq!(super::tool_input(&call), format!("path: {shown}"));
+        assert_eq!(call.arguments["path"], raw);
+        call.input_summary = Some(raw.into());
+        assert_eq!(super::tool_input(&call), shown);
+        assert_eq!(call.input_summary.as_deref(), Some(raw));
+        let notice = Notice {
+            text: raw.into(),
+            reset_at: None,
+        };
+        assert_eq!(super::notice_text(&notice, 0), shown);
+        assert_eq!(notice.text, raw);
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn outcome_words_that_look_like_elapsed_stay_words(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::{prelude::*, *};
+        struct Outcome;
+        impl Render for Outcome {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                super::outcome_row(
+                    super::OutcomeLine {
+                        words: "Provider says · 7s".into(),
+                        elapsed_seconds: None,
+                    },
+                    cx,
+                )
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+            Outcome
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("outcome-words").is_some());
+        assert!(cx.debug_bounds("outcome-elapsed").is_none());
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn rendered_tool_notice_failure_and_outcome_each_clamp_marks(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::{prelude::*, *};
+        struct Probe;
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let raw = |base| format!("{base}{}", "\u{0301}".repeat(7));
+                let tool = Item {
+                    id: ItemId::new(),
+                    thread: ThreadId::new(),
+                    turn: TurnId::new(),
+                    seq: 1,
+                    body: ItemBody::Tool(ToolItem {
+                        approval: None,
+                        interruption: None,
+                        call: ToolCall {
+                            name: "Read".into(),
+                            veyra_label: false,
+                            arguments: serde_json::json!({"input":raw("i")}),
+                            input_summary: None,
+                        },
+                        output_tail: String::new(),
+                        result: Some(ToolResult {
+                            ok: false,
+                            output_tail: Some(raw("f")),
+                        }),
+                    }),
+                };
+                let notice = Item {
+                    id: ItemId::new(),
+                    thread: tool.thread,
+                    turn: tool.turn,
+                    seq: 2,
+                    body: ItemBody::Notice(Notice {
+                        text: raw("n"),
+                        reset_at: None,
+                    }),
+                };
+                div()
+                    .v_flex()
+                    .w(cx.global::<super::Theme>().layout.transcript_max)
+                    .child(super::row(&tool, true, None, false, cx))
+                    .child(super::row(&notice, false, None, false, cx))
+                    .child(super::failure_card(&raw("c"), cx))
+                    .child(super::outcome_row(
+                        super::OutcomeLine {
+                            words: raw("o"),
+                            elapsed_seconds: None,
+                        },
+                        cx,
+                    ))
+            }
+        }
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        test.update(gpui_kit::init);
+        let (_, cx) = test.add_window_view(|window, cx| {
+            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+            Probe
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let lines = text.lines();
+        for base in ["i", "f", "n", "c", "o"] {
+            let shown = format!("{base}{}", "\u{0301}".repeat(3));
+            let excess = format!("{base}{}", "\u{0301}".repeat(4));
+            assert!(
+                lines.iter().any(|line| line.contains(&shown)),
+                "missing rendered path {base}: {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|line| line.contains(&excess)),
+                "unclamped rendered path {base}: {lines:?}"
+            );
+        }
     }
     #[test]
     fn timed_notice_renders_relative_time_and_keeps_legacy_words() {
@@ -1323,6 +1475,8 @@ mod tests {
             ("plain\noutput", "plain\noutput"),
         ] {
             let tool = ToolItem {
+                approval: None,
+                interruption: None,
                 call: ToolCall {
                     name: "Read".into(),
                     veyra_label: false,
@@ -1366,12 +1520,14 @@ mod tests {
     #[test]
     fn denied_tools_name_the_exact_human_decision_for_each_provider() {
         for name in ["Bash", "Command", "run_terminal_command"] {
-            let item = Item {
+            let mut item = Item {
                 id: ItemId::new(),
                 thread: ThreadId::new(),
                 turn: TurnId::new(),
                 seq: 1,
                 body: ItemBody::Tool(ToolItem {
+                    approval: None,
+                    interruption: None,
                     call: ToolCall {
                         name: name.into(),
                         veyra_label: false,
@@ -1385,9 +1541,14 @@ mod tests {
                     }),
                 }),
             };
+            let request = RequestId::new();
+            let ItemBody::Tool(tool) = &mut item.body else {
+                unreachable!()
+            };
+            tool.approval = Some(request);
             let mut state = super::super::AppState::default();
             state.requests.push(Request {
-                id: RequestId::new(),
+                id: request,
                 thread: item.thread,
                 turn: item.turn,
                 native: NativeRequestRef("fixture".into()),
@@ -1405,6 +1566,25 @@ mod tests {
                 },
             });
             assert_eq!(super::tool_status(&item, Some(&state)), "Denied by you");
+            let mut allowed = state.requests[0].clone();
+            allowed.id = RequestId::new();
+            allowed.state = RequestState::Answered(Decision::AllowOnce);
+            let allowed_id = allowed.id;
+            state.requests.push(allowed);
+            let ItemBody::Tool(tool) = &mut item.body else {
+                unreachable!()
+            };
+            tool.approval = Some(allowed_id);
+            assert_eq!(super::tool_status(&item, Some(&state)), "Failed");
+            let ItemBody::Tool(tool) = &mut item.body else {
+                unreachable!()
+            };
+            tool.approval = None;
+            assert_eq!(super::tool_status(&item, Some(&state)), "Failed");
+            let ItemBody::Tool(tool) = &mut item.body else {
+                unreachable!()
+            };
+            tool.approval = Some(request);
             let RequestKind::Approval { action } = &mut state.requests[0].kind else {
                 unreachable!()
             };
@@ -1412,8 +1592,57 @@ mod tests {
                 unreachable!()
             };
             *command = "different command".into();
-            assert_eq!(super::tool_status(&item, Some(&state)), "Failed");
+            assert_eq!(super::tool_status(&item, Some(&state)), "Denied by you");
         }
+    }
+    #[test]
+    fn typed_interruption_renders_stopped_without_parsing_result_words() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let mut state = super::super::AppState::default();
+        state.turns.insert(
+            turn,
+            Turn {
+                id: turn,
+                thread,
+                ordinal: 1,
+                origin: TurnOrigin::Provider,
+                state: TurnState::Ended {
+                    started: Some(1),
+                    at: 2,
+                    outcome: TurnOutcome::Interrupted {
+                        reason: "Stopped by you".into(),
+                    },
+                },
+            },
+        );
+        let mut item = Item {
+            id: ItemId::new(),
+            thread,
+            turn,
+            seq: 1,
+            body: ItemBody::Tool(ToolItem {
+                approval: None,
+                interruption: Some(veyra_engine::domain::ToolInterruption::TurnEnded),
+                call: ToolCall {
+                    name: "Command".into(),
+                    veyra_label: true,
+                    arguments: serde_json::json!({}),
+                    input_summary: None,
+                },
+                output_tail: String::new(),
+                result: Some(ToolResult {
+                    ok: false,
+                    output_tail: Some("Different provider words".into()),
+                }),
+            }),
+        };
+        assert_eq!(super::tool_status(&item, Some(&state)), "Stopped");
+        let ItemBody::Tool(tool) = &mut item.body else {
+            unreachable!()
+        };
+        tool.interruption = None;
+        assert_eq!(super::tool_status(&item, Some(&state)), "Failed");
     }
     #[test]
     fn completed_tool_stays_done_while_only_open_tools_read_stopped() {
@@ -1438,6 +1667,8 @@ mod tests {
             turn: turn.id,
             seq: 1,
             body: ItemBody::Tool(ToolItem {
+                approval: None,
+                interruption: None,
                 call: ToolCall {
                     name: "Command".into(),
                     veyra_label: true,
@@ -1524,42 +1755,6 @@ mod tests {
             .insert(thread, [(card.id, card)].into_iter().collect());
         assert_eq!(super::user_text(&answer, Some(&state)), "Violet next");
         assert_eq!(answer.body, ItemBody::UserText(raw.into()));
-    }
-    #[cfg(debug_assertions)]
-    #[gpui::test]
-    fn queued_wait_words_follow_their_own_bubble(cx: &mut gpui::TestAppContext) {
-        use gpui_kit::{prelude::*, *};
-        struct Waiting(Item);
-        impl Render for Waiting {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                let t = cx.global::<super::Theme>();
-                div()
-                    .v_flex()
-                    .w(t.layout.transcript_min)
-                    .gap(t.space.0[2])
-                    .child(super::row(&self.0, false, None, false, cx))
-                    .child(super::wait_row("Waiting for the current turn".into(), cx))
-            }
-        }
-        cx.update(gpui_kit::init);
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
-            Waiting(Item {
-                id: ItemId::new(),
-                thread: ThreadId::new(),
-                turn: TurnId::new(),
-                seq: 1,
-                body: ItemBody::UserText("Queued prompt".into()),
-            })
-        });
-        cx.update(|window, cx| {
-            window.refresh();
-            window.draw(cx).clear(cx);
-        });
-        let bubble = cx.debug_bounds("user-bubble").unwrap();
-        let wait = cx.debug_bounds("queued-message-wait").unwrap();
-        assert!(wait.top() >= bubble.bottom());
-        assert_eq!(wait.right(), bubble.right());
     }
     #[cfg(debug_assertions)]
     #[gpui::test]
@@ -1967,6 +2162,8 @@ mod tests {
             turn: TurnId::new(),
             seq: 0,
             body: ItemBody::Tool(ToolItem {
+                approval: None,
+                interruption: None,
                 call: ToolCall {
                     veyra_label: false,
                     name: "Bash".into(),
@@ -2032,6 +2229,8 @@ mod tests {
     fn running_subagent_tail_is_visible_before_result() {
         for name in ["Task", "Agent"] {
             let mut tool = ToolItem {
+                approval: None,
+                interruption: None,
                 call: ToolCall {
                     veyra_label: false,
                     name: name.into(),
@@ -2136,6 +2335,8 @@ mod tests {
     #[test]
     fn failed_tool_last_line() {
         let mut tool = ToolItem {
+            approval: None,
+            interruption: None,
             call: ToolCall {
                 veyra_label: false,
                 name: "Bash".into(),

@@ -494,8 +494,8 @@ Child frames feed the pending root Task or Agent tool's bounded output tail inst
 Unknown or finished child parents are ignored, and snapshots retain a running tool's tail.
 Expanded tool rows show the live tail while running and prefer the result tail after completion.
 Compact, reset, retry, usage-limit and model-fallback frames add notices in Veyra's words.
-Usage limits carry their reset instant in Unix seconds through SessionEvent::TimedNotice and the stored Notice.reset_at field.
-Ordinary SessionEvent::Notice values retain text only and store reset_at as None.
+SessionEvent::Notice(Notice) carries both ordinary notices and usage limits, with an optional reset instant in Unix seconds in Notice.reset_at.
+Ordinary notices have reset_at None.
 A missing reset_at field loads as None and is omitted on serialization, so older rows and ordinary notice bytes stay unchanged.
 Only a resume-not-found stderr class starts a fresh native session; other errors retain the native id for Retry.
 
@@ -668,14 +668,18 @@ The 90 percent threshold is Veyra's implementation choice for a near-limit warni
 A session reports each level at most once and never reports a lower level after a higher one, even after a usage reset.
 Near notices name the highest-usage primary or secondary window, its duration and used percentage when supplied; reached notices name the reported usage, credit or spend limit.
 The notice stores the selected window's reset timestamp, or the individual spend limit's timestamp for a spend warning, as optional Unix seconds beside the words before the time.
-The transcript computes the remaining time on each render; a stored notice without a reset instant renders its stored text unchanged.
+The transcript computes the remaining time on each render and applies the shared display projection to the notice.
+A stored notice without a reset instant keeps its words and gains no time suffix.
 
 Command and file approvals answer accept or decline; cancellation answers cancel before turn/interrupt.
 Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
 A command approval with a known folder shows it in a separate labeled, muted quote; a reported outside cwd takes precedence over the project folder.
 CommandCwd::NotVerified instead shows the unverified-location consequence and no folder quote.
-The model-written reason has its own labeled quote, and command previews omit raw request JSON.
+The model-written reason is a typed ApprovalPreview hydrated at action construction or legacy deserialization and has its own labeled quote.
+Command previews omit only the separately displayed command, cwd, reason or description and the named internal thread, turn, item, tool-call, timestamp, environment and request-kind keys.
+Every other field remains in the marked preview, including sandbox options, and truncated previews keep their cut notice.
+An incomplete JSON preview remains visible as stored text.
 The working-folder quote stays beside the consequence above the scrolling details, with its path in a vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
 ToolCall retains its serde-defaulted veyra_label flag for stored compatibility.
 Transcript tool titles use unquoted bounded display text for both Veyra and provider names, followed by a distinct command, search target or other main argument when present.
@@ -1107,8 +1111,17 @@ Other view changes and Quit call `forget_branch` to cancel the task and clear th
 Dropping the Shell also cancels the task, and its reply checks the selection identity.
 The centred transcript uses a window-owned MessageScrollerState over gpui ListState and selectable Markdown TextView.
 The transcript and its expansion behavior live in ui/transcript.rs.
+ToolItem has optional approval: RequestId and interruption: ToolInterruption fields, defaulted and omitted when absent so older stored tool rows retain their serialized bytes.
+TurnEvent::RequestOpened carries an optional tool: NativeItemKey within the provider session; the actor resolves that key to the individual tool item and persists its approval link.
+The transcript reads the linked request's decision rather than matching commands across invocations.
+A decision label requires the matching request row in the current window subscription.
+Initial subscriptions and thread snapshots do not restore historical request rows, so a previously denied failed tool shows Failed after relaunch even when its stored approval link remains.
+A legacy tool without an approval link shows its own Done, Working or Failed status.
+The engine recognizes its older interrupted-tool marker without adding a stored field, and that marker shows Stopped when the owning turn is Interrupted.
+ToolInterruption::TurnEnded represents an open tool closed when its turn ended, independently of the visible explanation.
 Started N agents cards, singular Started 1 agent, group children after the parent turn that started them, including archived children whose Open is disabled.
-The projection finds that turn from the start_thread request key and tool argument, falling back to the latest parent turn no later than the child's first task start.
+Task::start_request exposes an engine-owned StartThreadRequest view over the compatible stored start_thread key.
+The projection finds the parent turn from that typed client request id and the tool argument, falling back to the latest parent turn no later than the child's first task start.
 Each row uses its child's own status glyph and words, SelectThread as Open, and StopThread as Stop only while the shared stop_target rule names a turn and the child is unarchived.
 TaskCard rows precede the other items of their own turn and show Task from the parent provider.
 Task and Wake turns label the parent title and distinct reporting children respectively, using the same row gap before their content.
@@ -1133,6 +1146,7 @@ Failed tools show their last nonempty output line, truncated to one row at its w
 The window and dump share row_outcome, which annotates only each ended turn's final item.
 The failure card follows the final item of its failed turn, whose outcome caption reads Failed because the card shows its cause.
 Historical failed turns retain the cause in their caption.
+OutcomeLine keeps words and optional elapsed seconds separate until rendering, while the debug dump formats them as one line.
 Elapsed time renders in a separate outcome segment, and an outcome reconciled after Veyra closed has no elapsed segment.
 A user scroll detaches following; new text, requests and tool rows preserve that state.
 Scrolling within text.read.line_height of the bottom or choosing Latest reattaches.
@@ -1246,7 +1260,8 @@ Clearing the flag restores that choice.
 Increase Contrast raises borders to a component contrast colour and uses the text colour for muted roles.
 Reduce Motion sets gpui's reduce-motion flag and snaps every motion token, including the spinner, to zero.
 The working glyph remains still.
-The one-second status clock repaints while work runs or the selected transcript contains a timed notice, keeping elapsed and relative reset text current.
+The one-second status clock repaints while work runs or the selected Chat transcript contains a notice whose reset instant is still in the future.
+An expired reset or a hidden transcript no longer requests notice-clock repaints.
 Theme values and roles live in ui/theme.rs.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
 Window geometry comes from the theme and can be overridden by the window manager.
@@ -1265,6 +1280,8 @@ Provider display text uses the engine's pure text::display_line projection, with
 Dock reasons, async card titles and options, and family/plan labels use that projection with quotes and the existing truncation mark; reasons have their own labeled, muted element.
 Transcript tool titles use the same cleanup without quotes.
 The shared display_text projection removes invisible format characters and draws at most three consecutive combining marks while retaining paragraph breaks.
+Expanded tool input, notices and failed-tool previews use that projection without changing their stored text.
+Consent projections retain the first three combining marks and show each additional mark as a visible ⟨U+XXXX⟩ marker, preserving every character.
 Literal consent paths and approval tool names instead retain their full marked consent projection in both action text and labeled quotes; commands retain their marked text with heredoc newlines.
 The debug dump exposes provider_text entries in approval docks and display_questions plus choices_active on async items beside the unchanged raw body.
 Those fields use the same display projection as rendering, while raw options remain available for exact protocol assertions.
@@ -1304,6 +1321,8 @@ No wait server command exists.
 [verify-veyra](.agents/skills/verify-veyra/SKILL.md) owns the fresh-shell launch, driver, capture, evidence and cleanup procedure.
 Its fake checks isolate data and use only the fake CLI; explicitly authorized live checks record actual provider wires.
 Proof stays outside disposable scratch, and driver and cleanup actions target only processes this run started.
+The notification backdrop records its own pid, and shared driver helpers verify its executable against the scratch bundle before reactivation, after each open and immediately before every Cleanup signal.
+A dead recorded backdrop fails reactivation rather than starting an unrecorded replacement.
 Solid captures use a window capture and require the owned window to remain on-screen and frontmost.
 Translucent captures use the window's exact on-screen rectangle over run-owned backdrop windows.
 Immediately before and after each region capture, the driver checks frontmost identity, unchanged bounds, full coverage by one backdrop window on one display, and no intersecting on-screen window above Veyra.
@@ -1482,6 +1501,8 @@ Clippy disallows arbitrary JSON values outside documented wire-format allowances
 A passing test fails the check unless the supplied evidence file names its reason; an absent or failing listed test makes that entry stale and fails the check.
 Tests inside production source files retain manual red receipts.
 The verify-veyra pages cover the real window, launch and relaunch row preservation, readiness without threads, streaming and background status, failure and Retry, default-mode persistence, header-branch clearing and cleanup.
+The runner's check-only mode runs the gate, measured-pair and mocked backdrop ownership self-tests, and checks their dispatch with stubbed calls.
+The ownership self-test starts no process and mocks every signal.
 App-launch's release check proves that release has no driver, using string scans with a debug positive control, ctl refusal and socket checks.
 Its macOS sandbox allows only the release Veyra executable and denies every child executable, including installed-provider probes; an unavailable sandbox, invalid profile or missing exec-denial receipt fails the check.
 Approvals-questions, stop-interrupt and restart-recovery cover the dock, queue controls, banners, keep-awake, quit sheet and startup recovery.

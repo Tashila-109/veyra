@@ -293,6 +293,8 @@ struct ControlRequest {
 #[derive(Deserialize, Default)]
 struct ToolRequest {
     #[serde(default)]
+    tool_use_id: Option<String>,
+    #[serde(default)]
     subtype: String,
     #[serde(default)]
     tool_name: String,
@@ -817,19 +819,21 @@ impl Codec {
                         text: format!("Claude usage limit: {}.", rate_limit_info.status),
                         reset_at: rate_limit_info.resets_at.and_then(|at| i64::try_from(at).ok()),
                     };
-                    decoded.events.push(ProviderEvent::Session(SessionEvent::TimedNotice(notice)));
+                    decoded.events.push(ProviderEvent::Session(SessionEvent::Notice(notice)));
                 }
             }
             Frame::ControlRequest(request) => {
                 if self.seen_requests.insert(request.request_id.clone())
                     && let Some(kind) = self.request(&request)
                 {
+                    let tool = request.request.tool_use_id.as_ref()
+                        .and_then(|id| self.tools.get(id)).map(|tool| tool.key.clone());
                     self.requests.insert(request.request_id.clone(), PendingRequest {
                         input: request.request.input,
                         kind: kind.clone(),
                     });
                     events.push(TurnEvent::RequestOpened {
-                        native: NativeRequestRef(request.request_id), kind,
+                        tool, native: NativeRequestRef(request.request_id), kind,
                     });
                 } else {
                     decoded.replies.push(Self::unsupported_request(request.request_id));
@@ -1102,7 +1106,10 @@ impl Codec {
         }
     }
     fn notice(text: String) -> ProviderEvent {
-        ProviderEvent::Session(SessionEvent::Notice { text })
+        ProviderEvent::Session(SessionEvent::Notice(crate::domain::Notice {
+            text,
+            reset_at: None,
+        }))
     }
     fn tool(&mut self, id: String, name: &str, key: NativeItemKey) {
         let subagent = matches!(name, "Task" | "Agent")
@@ -1123,9 +1130,12 @@ impl Codec {
                 if !system.session_id.is_empty() && system.session_id != self.native.0 {
                     decoded
                         .events
-                        .push(ProviderEvent::Session(SessionEvent::Notice {
-                            text: "Claude started a new session".into(),
-                        }));
+                        .push(ProviderEvent::Session(SessionEvent::Notice(
+                            crate::domain::Notice {
+                                text: "Claude started a new session".into(),
+                                reset_at: None,
+                            },
+                        )));
                     self.native = NativeSessionId(system.session_id);
                 }
                 let version =
@@ -1423,6 +1433,54 @@ mod tests {
     use super::*;
     use crate::tests::Scratch;
     #[test]
+    fn claude_fixture_approval_carries_the_matching_tool_key_when_present() {
+        let source = include_str!("../../tests/fixtures/claude/approval-deny.jsonl");
+        let mut request = source
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| {
+                record["type"] == "emit_inbound" && record["line"]["type"] == "control_request"
+            })
+            .unwrap()["line"]
+            .clone();
+        for known in [false, true] {
+            let mut codec = codec();
+            codec.start(TurnId::new(), "approve".into());
+            let frame = json!({"type":"assistant", "message":{"id":"message", "content":[
+                {"type":"tool_use", "id":"invocation", "name":"Bash", "input":{"command":"touch veyra-check.txt"}}]}});
+            let started = codec.value(frame).unwrap();
+            let expected = started
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event: TurnEvent::ToolStarted { key, .. },
+                        ..
+                    } => Some(key.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            request["request"]["tool_use_id"] = if known {
+                json!("invocation")
+            } else {
+                Value::Null
+            };
+            let decoded = codec.value(request.clone()).unwrap();
+            let link = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event: TurnEvent::RequestOpened { tool, .. },
+                        ..
+                    } => Some(tool.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(link, known.then_some(expected));
+        }
+    }
+    #[test]
     fn claude_fixture_notice_keeps_typed_reset() {
         let source = include_str!("../../tests/fixtures/claude/notices.jsonl");
         let mut codec = codec();
@@ -1434,7 +1492,11 @@ mod tests {
             })
             .flat_map(|line| codec.value(line).unwrap().events)
             .filter_map(|event| match event {
-                ProviderEvent::Session(SessionEvent::TimedNotice(notice)) => Some(notice),
+                ProviderEvent::Session(SessionEvent::Notice(notice))
+                    if notice.reset_at.is_some() =>
+                {
+                    Some(notice)
+                }
                 _ => None,
             })
             .collect();
@@ -1444,6 +1506,40 @@ mod tests {
                 text: "Claude usage limit: rejected.".into(),
                 reset_at: Some(12345)
             }]
+        );
+    }
+    #[test]
+    fn claude_fixture_plain_notices_stay_plain() {
+        let source = include_str!("../../tests/fixtures/claude/notices.jsonl");
+        let mut codec = codec();
+        let notices: Vec<_> = source
+            .lines()
+            .filter_map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                (record["type"] == "emit_inbound").then_some(record["line"].clone())
+            })
+            .flat_map(|line| codec.value(line).unwrap().events)
+            .filter_map(|event| match event {
+                ProviderEvent::Session(SessionEvent::Notice(notice))
+                    if !notice.text.starts_with("Claude usage limit") =>
+                {
+                    Some(notice)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                Notice {
+                    text: "Claude is retrying the API (attempt 2) in 1000 ms.".into(),
+                    reset_at: None
+                },
+                Notice {
+                    text: "Claude is falling back to another model.".into(),
+                    reset_at: None
+                },
+            ]
         );
     }
     fn codec() -> Codec {
@@ -2233,7 +2329,8 @@ mod tests {
         let wire = json!({"type":"system", "subtype":"init", "session_id":"replacement"});
         let decoded = codec.line(&wire.to_string()).unwrap();
         assert!(matches!(&decoded.events[0],
-            ProviderEvent::Session(SessionEvent::Notice { text }) if text == "Claude started a new session"
+            ProviderEvent::Session(SessionEvent::Notice(crate::domain::Notice { text, .. }))
+                if text == "Claude started a new session"
         ));
         assert!(matches!(&decoded.events[1],
             ProviderEvent::Session(SessionEvent::Ready { native, cli_version: None, .. })

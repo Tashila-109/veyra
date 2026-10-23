@@ -475,9 +475,12 @@ fn recovered_child_without_a_queue_is_interrupted() {
 fn blocked_changes_are_written_during_quit() {
     let mut f = Fixture::new(LiveState::Running);
     f.actor.fail_write = true;
-    f.event(ProviderEvent::Session(SessionEvent::Notice {
-        text: "The provider finished a filesystem check".into(),
-    }));
+    f.event(ProviderEvent::Session(SessionEvent::Notice(
+        crate::domain::Notice {
+            text: "The provider finished a filesystem check".into(),
+            reset_at: None,
+        },
+    )));
     assert!(!f.loaded().items_for(f.thread).any(
         |item| matches!(&item.body,ItemBody::Notice(n) if n.text=="The p\
         rovider finished a filesystem check")
@@ -966,9 +969,12 @@ fn storage_loss_notice_survives_a_process_end() {
     .unwrap();
     f.save(rows);
     f.actor.fail_write = true;
-    f.event(ProviderEvent::Session(SessionEvent::Notice {
-        text: "unwritten provider notice".into(),
-    }));
+    f.event(ProviderEvent::Session(SessionEvent::Notice(
+        crate::domain::Notice {
+            text: "unwritten provider notice".into(),
+            reset_at: None,
+        },
+    )));
     assert!(root.join("run/storage-blocked.json").exists());
     let (out, _rx) = mpsc::channel(16);
     let recovered = Actor::new(
@@ -1120,9 +1126,12 @@ fn storage_tool_refusals_name_a_recovery_call() {
         ),
         &["storage", "retry", "start_thread", "retry-me"],
     );
-    f.event(ProviderEvent::Session(SessionEvent::Notice {
-        text: "blocked notice".into(),
-    }));
+    f.event(ProviderEvent::Session(SessionEvent::Notice(
+        crate::domain::Notice {
+            text: "blocked notice".into(),
+            reset_at: None,
+        },
+    )));
     refusal(
         call(&mut f, caller, "list_providers", json!({})),
         &["storage", "list_providers", "{}"],
@@ -1275,9 +1284,10 @@ fn quit_retries_retained_changes_after_the_write_lock_clears() {
         actor.handle(EngineMsg::Provider {
             thread: f.thread,
             epoch: actor.live[&f.thread].epoch,
-            event: ProviderEvent::Session(SessionEvent::Notice {
+            event: ProviderEvent::Session(SessionEvent::Notice(crate::domain::Notice {
                 text: "retained across quit retries".into(),
-            }),
+                reset_at: None,
+            })),
         });
     }
     assert!(root.join("run/storage-blocked.json").exists());
@@ -1326,9 +1336,12 @@ fn session_notice_follows_later_started_prompt() {
         if queued {
             f.user("Queued after the running prompt");
         }
-        f.event(ProviderEvent::Session(SessionEvent::Notice {
-            text: "Notice during the admitted prompt".into(),
-        }));
+        f.event(ProviderEvent::Session(SessionEvent::Notice(
+            crate::domain::Notice {
+                text: "Notice during the admitted prompt".into(),
+                reset_at: None,
+            },
+        )));
         let loaded = f.loaded();
         let notice = loaded
             .items_for(f.thread)
@@ -1508,9 +1521,12 @@ fn notices_skip_queued_turns_after_the_latest_started_prompt() {
                 },
             },
         );
-        f.event(ProviderEvent::Session(SessionEvent::Notice {
-            text: "Provider notice".into(),
-        }));
+        f.event(ProviderEvent::Session(SessionEvent::Notice(
+            crate::domain::Notice {
+                text: "Provider notice".into(),
+                reset_at: None,
+            },
+        )));
         let loaded = f.loaded();
         let notice = loaded
             .items_for(f.thread)
@@ -1526,9 +1542,12 @@ fn notices_skip_queued_turns_after_the_latest_started_prompt() {
     }
     let mut f = Fixture::new(LiveState::Idle);
     f.user("Only queued work");
-    f.event(ProviderEvent::Session(SessionEvent::Notice {
-        text: "No started turn".into(),
-    }));
+    f.event(ProviderEvent::Session(SessionEvent::Notice(
+        crate::domain::Notice {
+            text: "No started turn".into(),
+            reset_at: None,
+        },
+    )));
     assert!(
         !f.loaded()
             .items_for(f.thread)
@@ -1761,9 +1780,12 @@ fn session_notice_without_started_turn_logs_identity_only() {
         let logs = CapturedLogs::default();
         let text = "Private session notice body";
         tracing::subscriber::with_default(logs.clone(), || {
-            f.event(ProviderEvent::Session(SessionEvent::Notice {
-                text: text.into(),
-            }));
+            f.event(ProviderEvent::Session(SessionEvent::Notice(
+                crate::domain::Notice {
+                    text: text.into(),
+                    reset_at: None,
+                },
+            )));
         });
         assert!(
             !f.loaded()
@@ -1779,9 +1801,12 @@ fn session_notice_without_started_turn_logs_identity_only() {
             },
         );
         tracing::subscriber::with_default(logs.clone(), || {
-            f.event(ProviderEvent::Session(SessionEvent::Notice {
-                text: text.into(),
-            }));
+            f.event(ProviderEvent::Session(SessionEvent::Notice(
+                crate::domain::Notice {
+                    text: text.into(),
+                    reset_at: None,
+                },
+            )));
         });
         assert!(
             f.loaded()

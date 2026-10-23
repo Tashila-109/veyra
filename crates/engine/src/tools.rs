@@ -247,7 +247,14 @@ fn request_key(tool: Tool, id: &str) -> Result<String, CommandError> {
             "client_request_id must be nonempty; call {tool} with a new client_request_id"
         )));
     }
-    Ok(format!("{tool}:{id}"))
+    Ok(if tool == "start_thread" {
+        StartThreadRequest {
+            client_request_id: id,
+        }
+        .key()
+    } else {
+        format!("{tool}:{id}")
+    })
 }
 fn owned_child(p: &Projection, caller: ThreadId, child: ThreadId) -> Result<&Thread, CommandError> {
     p.threads

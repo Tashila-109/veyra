@@ -767,8 +767,12 @@ impl Codec {
                         if let Some(mcp) = &self.mcp {
                             mcp.revoke();
                         }
-                        decoded.events.push(ProviderEvent::Session(SessionEvent::Notice {
-                        text:"The earlier conversation could not be resumed; this is a new session".into() }));
+                        decoded.events.push(ProviderEvent::Session(SessionEvent::Notice(
+                            crate::domain::Notice {
+                                text: "The earlier conversation could not be resumed; this is a new session".into(),
+                                reset_at: None,
+                            },
+                        )));
                         decoded.controls.push(self.open(OpenTarget::New, retry)?);
                     }
                     Err(error) => {
@@ -1068,6 +1072,7 @@ impl Codec {
                 .push(self.peer.error(id, -32600, "Request id already used"));
             return Ok(());
         }
+        let mut requested_tool = None;
         let parsed = match decode::<RequestMethod>(json!(method))? {
             RequestMethod::Permission => {
                 let permission: Permission = decode(params.clone())?;
@@ -1076,6 +1081,7 @@ impl Codec {
                 {
                     None
                 } else {
+                    requested_tool = Some(permission.tool_call.tool_call_id.clone());
                     let allow = permission
                         .options
                         .iter()
@@ -1214,6 +1220,8 @@ impl Codec {
             decoded,
             owner,
             TurnEvent::RequestOpened {
+                tool: requested_tool
+                    .map(|id| NativeItemKey(format!("{}/{prompt_id}/tool/{id}", owner.target()))),
                 native: NativeRequestRef(native.clone()),
                 kind: kind.clone(),
             },
@@ -1489,6 +1497,128 @@ fn tool_output(raw: &Value, content: &[Value]) -> Option<String> {
 #[cfg(test)]
 mod wire_tests {
     use super::*;
+    fn boundary_codec() -> (Codec, TurnId) {
+        let turn = TurnId::new();
+        let mut codec = Codec::new(
+            SessionSpec {
+                thread: ThreadId::new(),
+                cwd: "/project".into(),
+                native: None,
+                root: false,
+                config: ThreadConfig {
+                    model: None,
+                    effort: None,
+                    mode: PermissionMode::AskFirst,
+                },
+            },
+            1,
+            None,
+            false,
+        );
+        codec.state = SessionState::Ready {
+            native: NativeSessionId("veyra-grok-session".into()),
+            active: None,
+        };
+        codec.start(turn, "reply".into()).unwrap();
+        (codec, turn)
+    }
+    fn fixture_frame(source: &str, predicate: impl Fn(&Value) -> bool, turn: TurnId) -> Value {
+        let mut frame = source
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["type"] == "emit_inbound")
+            .map(|record| record["line"].clone())
+            .find(predicate)
+            .unwrap();
+        frame["params"]["_meta"]["promptId"] = json!(turn.to_string());
+        frame
+    }
+    #[test]
+    fn grok_fixture_thought_plan_permission_and_question_each_close_text() {
+        for boundary in ["thought", "plan", "permission", "question"] {
+            let (mut codec, turn) = boundary_codec();
+            let message = fixture_frame(
+                include_str!("../../tests/fixtures/grok/tool-title.jsonl"),
+                |frame| frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk",
+                turn,
+            );
+            let before = codec.value(message.clone()).unwrap();
+            let frame = match boundary {
+                "thought" => fixture_frame(
+                    include_str!("../../tests/fixtures/grok/foreign-tool-span.jsonl"),
+                    |frame| frame["params"]["update"]["sessionUpdate"] == "agent_thought_chunk",
+                    turn,
+                ),
+                "plan" => fixture_frame(
+                    include_str!("../../tests/fixtures/grok/plan-entry-defaults.jsonl"),
+                    |frame| frame["params"]["update"]["sessionUpdate"] == "plan",
+                    turn,
+                ),
+                "permission" => fixture_frame(
+                    include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
+                    |frame| frame["method"] == "session/request_permission",
+                    turn,
+                ),
+                _ => fixture_frame(
+                    include_str!("../../tests/fixtures/grok/question.jsonl"),
+                    |frame| frame["method"] == "_x.ai/ask_user_question",
+                    turn,
+                ),
+            };
+            let boundary_events = codec.value(frame).unwrap();
+            let after = codec.value(message).unwrap();
+            let text_key = |decoded: &Decoded| {
+                decoded
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        ProviderEvent::Turn {
+                            event: TurnEvent::TextDelta { key, .. },
+                            ..
+                        } => Some(key.clone()),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let before = text_key(&before);
+            assert!(
+                boundary_events.events.iter().any(|event| matches!(event,
+                ProviderEvent::Turn { event: TurnEvent::ItemEnded { key }, .. } if key == &before)),
+                "{boundary} did not close the preceding reply"
+            );
+            assert_ne!(
+                before,
+                text_key(&after),
+                "{boundary} joined separate reply items"
+            );
+        }
+    }
+    #[test]
+    fn grok_fixture_permission_carries_only_its_native_tool_key() {
+        let (mut codec, turn) = boundary_codec();
+        let frame = fixture_frame(
+            include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
+            |frame| frame["method"] == "session/request_permission",
+            turn,
+        );
+        let expected = NativeItemKey(format!("{turn}/{turn}/tool/create-check"));
+        let decoded = codec.value(frame).unwrap();
+        assert!(decoded.events.iter().any(|event| matches!(event,
+            ProviderEvent::Turn { event: TurnEvent::RequestOpened { tool: Some(key), .. }, .. } if key == &expected)));
+        let frame = fixture_frame(
+            include_str!("../../tests/fixtures/grok/question.jsonl"),
+            |frame| frame["method"] == "_x.ai/ask_user_question",
+            turn,
+        );
+        let decoded = codec.value(frame).unwrap();
+        assert!(decoded.events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Turn {
+                event: TurnEvent::RequestOpened { tool: None, .. },
+                ..
+            }
+        )));
+    }
     #[test]
     fn grok_fixture_text_chunks_keep_tool_boundaries() {
         let turn = TurnId::new();

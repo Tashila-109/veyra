@@ -5,6 +5,7 @@ static INVISIBLE_FORMAT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[\p{Cf}\p{Default_Ignorable_Code_Point}]").expect("Unicode display properties")
 });
 static EXCESS_MARKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\p{M}{4,}").unwrap());
+static MARK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\p{M}").unwrap());
 pub fn display_text(text: &str) -> String {
     let visible = INVISIBLE_FORMAT.replace_all(text, "");
     EXCESS_MARKS
@@ -49,10 +50,17 @@ pub fn consent_line(text: &str) -> String {
 }
 fn consent_projection(text: &str, preserve: impl Fn(char) -> bool) -> String {
     let mut projected = String::new();
+    let mut marks = 0;
     for ch in text.chars() {
+        marks = if MARK.is_match(ch.encode_utf8(&mut [0; 4])) {
+            marks + 1
+        } else {
+            0
+        };
         if preserve(ch) {
             projected.push(ch);
-        } else if ch.is_control()
+        } else if marks > 3
+            || ch.is_control()
             || matches!(ch, '\u{2028}' | '\u{2029}')
             || INVISIBLE_FORMAT.is_match(ch.encode_utf8(&mut [0; 4]))
         {
@@ -62,7 +70,7 @@ fn consent_projection(text: &str, preserve: impl Fn(char) -> bool) -> String {
             projected.push(ch);
         }
     }
-    display_text(&projected)
+    projected
 }
 
 #[cfg(test)]
@@ -74,9 +82,93 @@ mod tests {
         let expected = format!("a{}b{}", "\u{0301}".repeat(3), "\u{0323}".repeat(3));
         assert_eq!(display_text(&raw), expected);
         assert_eq!(display_line(&raw, false).text, expected);
-        assert_eq!(consent_multiline(&raw), expected);
+        let consent = format!(
+            "a{}{}b{}{}",
+            "\u{0301}".repeat(3),
+            "⟨U+0301⟩".repeat(4),
+            "\u{0323}".repeat(3),
+            "⟨U+0323⟩".repeat(2)
+        );
+        assert_eq!(consent_multiline(&raw), consent);
+        assert_eq!(consent_line(&raw), consent);
         assert_eq!(display_text("Vio\u{202e}let\nnext"), "Violet\nnext");
         assert_eq!(raw.chars().count(), 14);
+    }
+    #[test]
+    fn consent_seven_marks_keeps_original_request_and_sent_bytes() {
+        use crate::{
+            domain::*,
+            provider::{ProviderEvent, TurnEvent, claude::Codec},
+        };
+        let raw = format!("printf e{}", "\u{0301}".repeat(7));
+        assert_eq!(
+            consent_multiline(&raw),
+            format!("printf e{}{}", "\u{0301}".repeat(3), "⟨U+0301⟩".repeat(4))
+        );
+        let mut codec = Codec::new(
+            NativeSessionId("fixture".into()),
+            1,
+            std::path::Path::new("/project"),
+        );
+        let sent = codec.start(TurnId::new(), raw.clone()).unwrap();
+        assert_eq!(
+            sent.controls[0].value()["message"]["content"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            raw.as_bytes()
+        );
+        let decoded = codec
+            .value(
+                serde_json::json!({"type":"control_request", "request_id":"marks",
+            "request":{"subtype":"can_use_tool", "tool_name":"Bash", "input":{"command":raw}}}),
+            )
+            .unwrap();
+        let command = decoded
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Turn {
+                    event:
+                        TurnEvent::RequestOpened {
+                            kind: RequestKind::Approval { action },
+                            ..
+                        },
+                    ..
+                } => {
+                    if let ApprovalTarget::Command { command, .. } = &action.target {
+                        Some(command)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(command.as_bytes(), raw.as_bytes());
+        let reply = codec
+            .answer(NativeRequestRef("marks".into()), Decision::AllowOnce)
+            .unwrap();
+        assert_eq!(
+            reply["response"]["response"],
+            serde_json::json!({"behavior":"allow"})
+        );
+        codec.value(serde_json::json!({"type":"control_request", "request_id":"answer",
+            "request":{"subtype":"can_use_tool", "tool_name":"AskUserQuestion", "input":{
+                "questions":[{"question":"Which command?", "options":[{"label":raw},{"label":"Skip"}]}]}}})).unwrap();
+        let reply = codec
+            .answer(
+                NativeRequestRef("answer".into()),
+                Decision::Answers(vec![Answer { text: raw.clone() }]),
+            )
+            .unwrap();
+        assert_eq!(
+            reply["response"]["response"]["updatedInput"]["answers"]["Which command?"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            raw.as_bytes()
+        );
     }
     #[test]
     fn provider_text_collapses_whitespace_and_has_its_own_cap() {

@@ -65,7 +65,9 @@ Launch, Doctor, app-launch's first section, Evidence and Cleanup always run; a s
 The tree's identity, its HEAD, `git status --short`, the diff's SHA-256 and each untracked file's SHA-256, is saved at the start and checked after Launch's build and after Cleanup.
 `--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, and checks that Launch calls `gate()` before its first `start()`.
 It reads `start()`'s relaunch refusal (`foreign = foreign_veyra()` then `assert not foreign`, before the launch) and Cleanup's `assert not other_markers` and `retry_exiting=True` calls as Python structure, and checks only that the 30 s drain, stale-screenshot and covered-window guard texts are present.
-It tables the verdict, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers, failing if that self-test runs past 30 seconds.
+It tables the verdict, runs `measured_pair_self_test`, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers, failing if the self-tests run past 30 seconds.
+It also runs `backdrop_pid_self_test` with mocked executable reads, signals and time; the test starts and stops no process.
+The page and Cleanup share executable verification, refuse to reopen a dead backdrop, recheck after every open and verify the scratch executable immediately before each signal.
 
 ## Selection
 
@@ -383,19 +385,10 @@ proof = pathlib.Path(sys.argv[1])
 backdrop_file = proof/'notifications-backdrop-pid'
 if backdrop_file.exists():
     backdrop_pid = int(backdrop_file.read_text())
-    try: os.kill(backdrop_pid,15)
-    except ProcessLookupError: pass
-    end = time.monotonic()+5
-    def backdrop_gone():
-        status = subprocess.run(['ps','-o','stat=','-p',str(backdrop_pid)],capture_output=True,text=True).stdout.strip()
-        return not status or status.startswith('Z')
-    while not backdrop_gone() and time.monotonic()<end: time.sleep(.05)
-    if not backdrop_gone():
-        try: os.kill(backdrop_pid,9)
-        except ProcessLookupError: pass
-        end = time.monotonic()+5
-        while not backdrop_gone() and time.monotonic()<end: time.sleep(.05)
-    assert backdrop_gone(), 'owned notification backdrop remains'
+    from driver import stop_owned_backdrop
+    ownership = json.loads((proof/'notifications-backdrop-ownership.json').read_text())
+    assert ownership['pid'] == backdrop_pid
+    stop_owned_backdrop(backdrop_pid,ownership['executable'])
     (proof/'notifications-backdrop-cleanup.json').write_text(json.dumps({'pid':backdrop_pid,'stopped':True})+'\n')
 parents = {int(pid) for pid in (proof/'owned-app-pids').read_text().split()}
 groups = {int(group) for group in sys.argv[2].split()}

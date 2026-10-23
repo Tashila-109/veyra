@@ -211,6 +211,8 @@ fn seed_large_snapshot(db: &mut Connection, path: &std::path::Path) -> ThreadId 
                     done: true,
                 },
                 _ => ItemBody::Tool(ToolItem {
+                    approval: None,
+                    interruption: None,
                     call: ToolCall {
                         veyra_label: false,
                         name: "Read".into(),

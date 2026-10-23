@@ -289,7 +289,7 @@ fn grok_flat_question_docks_and_accepts_labels() {
             .find_map(|event| match event {
                 ProviderEvent::Turn {
                     turn: Some(id),
-                    event: TurnEvent::RequestOpened { native, kind },
+                    event: TurnEvent::RequestOpened { native, kind, .. },
                 } if *id == turn => Some((native.clone(), kind)),
                 _ => None,
             })
@@ -1114,6 +1114,7 @@ fn grok_accept_edits_docks_every_permission_without_reply() {
                                 TurnEvent::RequestOpened {
                                     native,
                                     kind: RequestKind::Approval { action },
+                                    ..
                                 },
                         } if *owner == turn => Some((native, action)),
                         _ => None,
@@ -1211,6 +1212,7 @@ fn grok_provider_permission_without_prompt_docks_and_answers() {
                     TurnEvent::RequestOpened {
                         native,
                         kind: RequestKind::Approval { action },
+                        ..
                     },
             } if action.tool == "Execute `pwd`" => Some(native.clone()),
             _ => None,

@@ -87,13 +87,9 @@ pub(super) fn approval_text(
         ),
     };
     let command = matches!(action.target, ApprovalTarget::Command { .. });
-    let structured_command = command && preview.text.trim_start().starts_with(['{', '[']);
-    let mut preview_text = if structured_command {
-        String::new()
-    } else {
-        consent_multiline(&preview.text)
-    };
-    if preview.truncated && !structured_command {
+    let filtered = command.then(|| command_preview(&preview.text));
+    let mut preview_text = consent_multiline(filtered.as_deref().unwrap_or(&preview.text));
+    if preview.truncated {
         let cap = veyra_engine::domain::TOOL_OUTPUT_CHARS;
         let limit = format!("{},{:03}", cap / 1000, cap % 1000);
         preview_text.push_str(&format!("\nPreview cut after {limit} characters."));
@@ -101,15 +97,47 @@ pub(super) fn approval_text(
     (label, consequence, preview_text)
 }
 
+#[allow(clippy::disallowed_types)] // Approval wire previews retain unknown JSON fields for consent.
+fn command_preview(text: &str) -> String {
+    const SHOWN_OR_INTERNAL: &[&str] = &[
+        "command",
+        "cwd",
+        "reason",
+        "description",
+        "threadId",
+        "thread_id",
+        "turnId",
+        "turn_id",
+        "itemId",
+        "item_id",
+        "toolCallId",
+        "tool_call_id",
+        "startedAtMs",
+        "started_at",
+        "timestamp",
+        "timestamps",
+        "environmentId",
+        "environment_id",
+        "kind",
+        "requestKind",
+        "request_kind",
+    ];
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return text.to_owned();
+    };
+    if let Some(fields) = value.as_object_mut() {
+        fields.retain(|key, _| !SHOWN_OR_INTERNAL.contains(&key.as_str()));
+        if fields.is_empty() {
+            return String::new();
+        }
+    }
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_owned())
+}
+
 pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<QuotedText> {
     let mut values = Vec::new();
     match &action.target {
-        ApprovalTarget::Command {
-            cwd,
-            reason,
-            preview,
-            ..
-        } => {
+        ApprovalTarget::Command { cwd, reason, .. } => {
             if let CommandCwd::Directory(path) = cwd {
                 values.push(QuotedText::from_quoted(
                     QuoteKind::WorkingFolder,
@@ -117,27 +145,12 @@ pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<Qu
                     format!("“{}”", consent_line(&path.to_string_lossy())),
                 ));
             }
-            #[derive(serde::Deserialize)]
-            struct CommandReason {
-                description: Option<String>,
-                reason: Option<String>,
-            }
-            let fallback = serde_json::from_str::<CommandReason>(&preview.text)
-                .ok()
-                .and_then(|value| value.description.or(value.reason));
             if let Some(reason) = reason {
                 values.push(QuotedText::new(
                     QuoteKind::Reason,
                     format!("{provider}'s reason (model-written)"),
                     &reason.text,
                     reason.truncated,
-                ));
-            } else if let Some(reason) = fallback {
-                values.push(QuotedText::new(
-                    QuoteKind::Reason,
-                    format!("{provider}'s reason (model-written)"),
-                    &reason,
-                    false,
                 ));
             }
         }
@@ -1368,12 +1381,76 @@ mod consent_display_tests {
 #[cfg(test)]
 mod command_preview_tests {
     #[test]
-    fn command_preview_shows_folder_and_reason_without_request_json() {
-        use veyra_engine::{domain::*, provider::ProviderKind};
-        let action = ProposedAction {
+    fn command_reason_display_uses_only_the_typed_field() {
+        use veyra_engine::domain::*;
+        let mut action = ProposedAction {
             tool: "Bash".into(),
             consent: Default::default(),
             target: ApprovalTarget::Command {
+                command: "printf check".into(),
+                cwd: CommandCwd::ProjectFolder,
+                reason: None,
+                preview: ApprovalPreview::new(
+                    r#"{"description":"Do not promote display JSON"}"#.into(),
+                ),
+            },
+        };
+        assert!(super::approval_quotes(&action, "Claude Code").is_empty());
+        let ApprovalTarget::Command { reason, .. } = &mut action.target else {
+            unreachable!()
+        };
+        *reason = Some(ApprovalPreview::new("Typed reason".into()));
+        let quotes = super::approval_quotes(&action, "Claude Code");
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].text, "“Typed reason”");
+    }
+    #[test]
+    fn command_preview_keeps_every_unknown_and_sandbox_field_and_cut_notice() {
+        use veyra_engine::{domain::*, provider::ProviderKind};
+        let mut action = ProposedAction::new(
+            "Bash".into(),
+            ApprovalTarget::Command {
+                command: "printf check".into(),
+                cwd: CommandCwd::ProjectFolder,
+                reason: None,
+                preview: ApprovalPreview::new(
+                    serde_json::json!({"command":"printf check", "cwd":"/project",
+                "threadId":"internal", "reason":"Check", "unknownCapability":"write everything",
+                "dangerouslyDisableSandbox":true, "nested":{"command":"material"}})
+                    .to_string(),
+                ),
+            },
+        );
+        let (_, _, preview) = super::approval_text(&action, ProviderKind::Codex);
+        for field in [
+            "unknownCapability",
+            "write everything",
+            "dangerouslyDisableSandbox",
+            "true",
+            "material",
+        ] {
+            assert!(
+                preview.contains(field),
+                "missing approval field {field}: {preview}"
+            );
+        }
+        assert!(!preview.contains("internal"));
+        let ApprovalTarget::Command { preview, .. } = &mut action.target else {
+            unreachable!()
+        };
+        preview.truncated = true;
+        let (_, _, preview) = super::approval_text(&action, ProviderKind::Codex);
+        assert!(
+            preview.contains("cut"),
+            "truncation must stay visible: {preview}"
+        );
+    }
+    #[test]
+    fn command_preview_shows_folder_and_reason_without_request_json() {
+        use veyra_engine::{domain::*, provider::ProviderKind};
+        let action = ProposedAction::new(
+            "Bash".into(),
+            ApprovalTarget::Command {
                 command: "printf check".into(),
                 cwd: CommandCwd::ProjectFolder,
                 reason: None,
@@ -1385,7 +1462,7 @@ mod command_preview_tests {
                     .into(),
                 ),
             },
-        };
+        );
         let (command, _, preview) = super::approval_text(&action, ProviderKind::Grok);
         assert_eq!(command, "printf check");
         assert!(preview.is_empty());

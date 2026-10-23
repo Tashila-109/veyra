@@ -8,6 +8,7 @@ pub(super) fn approval(f: &mut Fixture, tool: &str, command: &str) -> RequestId 
     f.event(turn_event(
         f.running(),
         TurnEvent::RequestOpened {
+            tool: None,
             native: NativeRequestRef(format!("request-{}", before.len())),
             kind: RequestKind::Approval {
                 action: ProposedAction {

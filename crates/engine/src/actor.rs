@@ -94,6 +94,7 @@ pub struct Actor {
     #[cfg(debug_assertions)]
     delta_counts: BTreeMap<ItemId, u64>,
     item_keys: BTreeMap<(ThreadId, u32, TurnId, NativeItemKey), ItemId>,
+    tool_approvals: BTreeMap<(ThreadId, u32, TurnId, NativeItemKey), RequestId>,
     idle_since: BTreeMap<ThreadId, Millis>,
     last_ui: Instant,
     flush_scheduled: bool,
@@ -232,6 +233,7 @@ impl Actor {
             #[cfg(debug_assertions)]
             delta_counts: BTreeMap::new(),
             item_keys: BTreeMap::new(),
+            tool_approvals: BTreeMap::new(),
             idle_since,
             last_ui: Instant::now(),
             flush_scheduled: false,
@@ -802,6 +804,8 @@ impl Actor {
         self.accepted_turns.retain(|turn| !ended.contains(turn));
         self.item_keys
             .retain(|(_, _, turn, _), id| !ended.contains(turn) && !completed.contains(id));
+        self.tool_approvals
+            .retain(|(_, _, turn, _), _| !ended.contains(turn));
         self.buffers.retain(|id, _| {
             !completed.contains(id)
                 && !self
@@ -987,17 +991,7 @@ impl Actor {
                     cli_version,
                 });
             }
-            ProviderEvent::Session(
-                event @ (SessionEvent::Notice { .. } | SessionEvent::TimedNotice(_)),
-            ) => {
-                let notice = match event {
-                    SessionEvent::Notice { text } => Notice {
-                        text,
-                        reset_at: None,
-                    },
-                    SessionEvent::TimedNotice(notice) => notice,
-                    _ => unreachable!(),
-                };
+            ProviderEvent::Session(SessionEvent::Notice(notice)) => {
                 if let Some(turn) = notice_turn(&self.projection, &c, thread, "session") {
                     commands::add_item(
                         &self.projection,
@@ -1210,12 +1204,18 @@ impl Actor {
                 }
             }
             TurnEvent::ToolStarted { key, call } => {
+                let approval = self
+                    .tool_approvals
+                    .get(&(thread, epoch, turn.id, key.clone()))
+                    .copied();
                 let item = Item {
                     id: ItemId::new(),
                     thread,
                     turn: turn.id,
                     seq: 0,
                     body: ItemBody::Tool(ToolItem {
+                        approval,
+                        interruption: None,
                         call,
                         result: None,
                         output_tail: String::new(),
@@ -1283,7 +1283,7 @@ impl Actor {
                     body: ItemBody::Plan(steps),
                 },
             ),
-            TurnEvent::RequestOpened { native, kind } => {
+            TurnEvent::RequestOpened { native, kind, tool } => {
                 let granted = kind
                     .grant_key()
                     .is_some_and(|key| self.projection.grants.contains(&(thread, key.clone())));
@@ -1299,6 +1299,22 @@ impl Actor {
                         RequestState::Pending
                     },
                 };
+                if let Some(key) = tool {
+                    let index = (thread, epoch, turn.id, key);
+                    self.tool_approvals.insert(index.clone(), r.id);
+                    if let Some(id) = self.item_keys.get(&index)
+                        && let Some(mut item) = c
+                            .items
+                            .get(id)
+                            .or_else(|| self.projection.items.get(id))
+                            .cloned()
+                        && let ItemBody::Tool(tool) = &mut item.body
+                    {
+                        tool.approval = Some(r.id);
+                        c.events.push(Ev::ItemAdded(item.clone()));
+                        c.items.insert(item.id, item);
+                    }
+                }
                 if granted {
                     c.events.push(Ev::RequestClosed(Box::new(r.clone())));
                     c.effects.push(Effect::Control {
@@ -1477,9 +1493,10 @@ impl Actor {
                     *done = true
                 }
                 ItemBody::Tool(tool) => {
+                    tool.interruption = Some(ToolInterruption::TurnEnded);
                     tool.result = Some(ToolResult {
                         ok: false,
-                        output_tail: Some("The turn ended before this tool returned".into()),
+                        output_tail: Some(ToolInterruption::TurnEnded.message().into()),
                     });
                 }
                 _ => {}

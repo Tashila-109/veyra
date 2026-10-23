@@ -200,6 +200,32 @@ pub struct ToolItem {
     pub result: Option<ToolResult>,
     #[serde(default)]
     pub output_tail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<RequestId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption: Option<ToolInterruption>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolInterruption {
+    TurnEnded,
+}
+impl ToolInterruption {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::TurnEnded => "The turn ended before this tool returned",
+        }
+    }
+}
+impl ToolItem {
+    pub fn interruption_cause(&self) -> Option<ToolInterruption> {
+        self.interruption.or_else(|| {
+            self.result.as_ref().and_then(|result| {
+                (!result.ok
+                    && result.output_tail.as_deref() == Some(ToolInterruption::TurnEnded.message()))
+                .then_some(ToolInterruption::TurnEnded)
+            })
+        })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -352,10 +378,29 @@ impl ProposedAction {
         self
     }
     pub fn new(tool: String, target: ApprovalTarget) -> Self {
-        Self {
+        let mut action = Self {
             tool,
             target,
             consent: ApprovalConsent::default(),
+        };
+        action.hydrate_reason();
+        action
+    }
+    fn hydrate_reason(&mut self) {
+        if let ApprovalTarget::Command {
+            reason, preview, ..
+        } = &mut self.target
+            && reason.is_none()
+        {
+            #[derive(Deserialize)]
+            struct Reason {
+                description: Option<String>,
+                reason: Option<String>,
+            }
+            *reason = serde_json::from_str::<Reason>(&preview.text)
+                .ok()
+                .and_then(|value| value.description.or(value.reason))
+                .map(ApprovalPreview::new);
         }
     }
 }
@@ -471,11 +516,13 @@ impl<'de> Deserialize<'de> for ProposedAction {
                 (tool, target, ApprovalConsent::default())
             }
         };
-        Ok(Self {
+        let mut action = Self {
             tool,
             target,
             consent,
-        })
+        };
+        action.hydrate_reason();
+        Ok(action)
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,6 +560,21 @@ pub struct Task {
     pub turn: TurnId,
     pub request_key: String,
     pub state: TaskState,
+}
+pub struct StartThreadRequest<'a> {
+    pub client_request_id: &'a str,
+}
+impl StartThreadRequest<'_> {
+    pub fn key(&self) -> String {
+        format!("start_thread:{}", self.client_request_id)
+    }
+}
+impl Task {
+    pub fn start_request(&self) -> Option<StartThreadRequest<'_>> {
+        self.request_key
+            .strip_prefix("start_thread:")
+            .map(|client_request_id| StartThreadRequest { client_request_id })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
@@ -774,6 +836,23 @@ pub fn async_question_active<'a>(item: &Item, items: impl IntoIterator<Item = &'
 #[cfg(test)]
 mod notice_tests {
     use super::{ItemBody, Notice};
+    #[test]
+    fn task_start_request_view_retains_legacy_stored_key_bytes() {
+        use super::*;
+        let id = "00000000-0000-4000-8000-000000000001";
+        let stored = format!(
+            concat!(
+                "{{\"id\":\"{id}\",\"parent\":\"{id}\",\"child\":\"{id}\",\"turn\":\"{id}\",",
+                "\"request_key\":\"start_thread:original\",\"state\":\"Running\"}}"
+            ),
+            id = id
+        );
+        let task: Task = serde_json::from_str(&stored).unwrap();
+        let key = task.start_request().unwrap();
+        assert_eq!(key.client_request_id, "original");
+        assert_eq!(key.key(), "start_thread:original");
+        assert_eq!(serde_json::to_string(&task).unwrap(), stored);
+    }
     #[test]
     fn stored_notice_without_reset_loads_and_serializes_unchanged() {
         let old = r#"{"text":"Stored words stay exact."}"#;

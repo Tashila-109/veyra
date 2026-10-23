@@ -50,10 +50,17 @@ check = DATA/'project'/'veyra-check.txt'
 check.unlink(missing_ok=True)
 action('approval-mode','SetDefaultMode',{'mode':'ask_first'})
 records = [json.loads(line) for line in (SOURCE/'approval-deny.jsonl').read_text().splitlines()]
-records.insert(4,{'type':'emit_inbound','line':{'type':'assistant','session_id':'<id:session>',
+approval_request = next(record for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('type')=='control_request'
+    and record['line']['request'].get('subtype')=='can_use_tool'
+    and record['line']['request'].get('tool_name')=='Bash')
+records.insert(records.index(approval_request),{'type':'emit_inbound','line':{'type':'assistant','session_id':'<id:session>',
     'parent_tool_use_id':None,'message':{'content':[{'type':'tool_use','id':'denied-tool','name':'Bash',
         'input':{'command':'touch veyra-check.txt'}}]}}})
-records.insert(7,{'type':'emit_inbound','line':{'type':'user','session_id':'<id:session>',
+approval_request['line']['request']['tool_use_id']='denied-tool'
+result_record = next(record for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('type')=='result')
+records.insert(records.index(result_record),{'type':'emit_inbound','line':{'type':'user','session_id':'<id:session>',
     'parent_tool_use_id':None,'message':{'content':[{'type':'tool_result','tool_use_id':'denied-tool',
         'is_error':True,'content':'The request was denied.'}]}}})
 stage_records(records)
@@ -188,11 +195,18 @@ action('approval-new-long-command-deny','Deny',{'request':dock['request']['id']}
 ctl('approval-new-long-command-done','wait',thread,'Done')
 
 records = [json.loads(line) for line in (SOURCE/'question.jsonl').read_text().splitlines()]
-question_input = records[4]['line']['request']['input']['questions']
+question_request = next(record for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('type')=='control_request'
+    and record['line']['request'].get('subtype')=='can_use_tool'
+    and record['line']['request'].get('tool_name')=='AskUserQuestion')
+question_input = question_request['line']['request']['input']['questions']
 second_question = json.loads(json.dumps(question_input[0]))
 second_question['question'] = 'Which report should follow?'
 question_input.append(second_question)
-records[5]['line']['response']['response']['updatedInput'] = {
+question_response = next(record for record in records if record.get('type')=='expect_outbound'
+    and record.get('line',{}).get('type')=='control_response'
+    and record['line']['response'].get('request_id')==question_request['line']['request_id'])
+question_response['line']['response']['response']['updatedInput'] = {
     'questions':question_input,
     'answers':{question_input[0]['question']:question_input[0]['options'][0]['label'],
         second_question['question']:second_question['options'][0]['label']}}
@@ -284,6 +298,64 @@ ctl('question-nine-choice','keys','9')
 done = ctl('question-nine-done','wait',nine,'Done')
 assert done['composer']['dock'] is None
 assert any(item['kind']=='user' and labels[8] in item['text'] for item in done['transcript']['items'])
+records = [json.loads(line) for line in (SOURCE/'ok-reply.jsonl').read_text().splitlines()]
+initial_frame = next(record for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('type')=='system' and record['line'].get('subtype')=='init')
+records.insert(records.index(initial_frame),{'type':'emit_inbound','line':{'type':'assistant','message':{'id':'search-message',
+    'content':[{'type':'tool_use','id':'search-tool','name':'Grep','input':{'pattern':'slice-four-search-target'}}]}}})
+stage_records(records)
+search = create('search-target','Search for the requested target',scenario=None)
+searched = ctl('search-target-done','wait',search,'Done')
+assert any(row['kind']=='tool' and row['tool_label']=='Grep · slice-four-search-target' for row in searched['transcript']['items'])
+capture('search-target')
+records = [json.loads(line) for line in (SOURCE/'question.jsonl').read_text().splitlines()]
+question_request = next(record for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('type')=='control_request'
+    and record['line']['request'].get('subtype')=='can_use_tool'
+    and record['line']['request'].get('tool_name')=='AskUserQuestion')
+question_wire = question_request['line']['request']['input']['questions'][0]
+question_wire['question']='Choose one at the smallest window'
+long_option = 'A long option with useful words '*7+'tail sentinel'
+question_wire['options']=[{'label':long_option},{'label':'Short'}]
+question_response = next(record for record in records if record.get('type')=='expect_outbound'
+    and record.get('line',{}).get('type')=='control_response'
+    and record['line']['response'].get('request_id')==question_request['line']['request_id'])
+question_response['line']['response']['response']['updatedInput']={'questions':[question_wire],
+    'answers':{question_wire['question']:'Short'}}
+stage_records(records)
+small = create('question-smallest-ellipsis','Choose a route',scenario=None)
+poll('question-smallest-open',lambda d:d['composer']['dock'] is not None)
+placement_tool = shutil.which('yabai')
+assert placement_tool, 'smallest-window native proof needs the owned-window placement tool'
+owned_pid = int((PROOF/'pid').read_text())
+owned_window = int((PROOF/'window-id').read_text())
+def question_frame():
+    result = subprocess.run([placement_tool,'-m','query','--windows','--window',str(owned_window)],capture_output=True,text=True)
+    (PROOF/'question-smallest-placement.stderr').write_text(result.stderr)
+    assert result.returncode==0, 'owned question window unavailable'
+    row=json.loads(result.stdout)
+    assert row['id']==owned_window and row['pid']==owned_pid, 'refused a foreign question window'
+    return row
+before=question_frame()
+if not before['is-floating']:
+    result=subprocess.run([placement_tool,'-m','window',str(owned_window),'--toggle','float'],capture_output=True,text=True)
+    assert result.returncode==0
+question_frame()
+result=subprocess.run([placement_tool,'-m','window',str(owned_window),'--resize','abs:760:560'],capture_output=True,text=True)
+assert result.returncode==0
+end=time.monotonic()+5
+while True:
+    after=question_frame()
+    if after['frame']['w']==760 and after['frame']['h']==560: break
+    assert time.monotonic()<end, 'owned window did not reach the theme minimum'
+    time.sleep(.05)
+save('question-smallest-placement',{'pid':owned_pid,'window':owned_window,'before':before['frame'],'after':after['frame']})
+capture('question-smallest-ellipsis')
+action('question-smallest-answer','AnswerQuestion',{'request':ctl('question-smallest-current','dump')['composer']['dock']['request']['id'],'question':0,'option':1})
+ctl('question-smallest-done','wait',small,'Done')
+question_frame()
+result=subprocess.run([placement_tool,'-m','window',str(owned_window),'--resize',f"abs:{int(before['frame']['w'])}:{int(before['frame']['h'])}"],capture_output=True,text=True)
+assert result.returncode==0
 save('approvals-done',ctl('approvals-final','dump'))
 poll('approvals-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null')=='0')
 page_done('approvals-questions')
@@ -318,9 +390,28 @@ ctl('codex-command-done','wait',thread,'Done')
 assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))=='AllowOnce'
 
 records = codex_records('approval-command')
-position = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='item/commandExecution/requestApproval')
-records[position+1]['line']['result']['decision']='decline'
-records.insert(position,{'type':'emit_inbound','line':{'method':'item/started','params':{
+request = next(record['line']['params'] for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('method')=='item/commandExecution/requestApproval')
+raw_marks='e'+'\u0301'*7
+request.update(unknownCapability='write everything',dangerouslyDisableSandbox=True,
+    command='printf '+raw_marks)
+extra = create_codex('codex-extra-fields',records=records)
+extra_dock = poll('codex-extra-fields',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert 'unknownCapability' in extra_dock['preview'] and 'write everything' in extra_dock['preview']
+assert 'dangerouslyDisableSandbox' in extra_dock['preview'] and 'true' in extra_dock['preview']
+assert extra_dock['action_text']=='printf e'+'\u0301'*3+'⟨U+0301⟩'*4
+assert extra_dock['request']['kind']['Approval']['action']['target']['command']=='printf '+raw_marks
+capture('codex-extra-fields')
+action('codex-extra-fields-answer','AllowOnce',{'request':extra_dock['request']['id']})
+ctl('codex-extra-fields-done','wait',extra,'Done')
+
+records = codex_records('approval-command')
+approval_request = next(record for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('method')=='item/commandExecution/requestApproval')
+approval_response = next(record for record in records if record.get('type')=='expect_outbound'
+    and record.get('line',{}).get('id')==approval_request['line']['id'] and 'result' in record['line'])
+approval_response['line']['result']['decision']='decline'
+records.insert(records.index(approval_request),{'type':'emit_inbound','line':{'method':'item/started','params':{
     'threadId':'<id:session>','turnId':'native-turn','item':{'type':'commandExecution','id':'action',
         'command':'touch veyra-check.txt','status':'inProgress'}}}})
 thread = create_codex('codex-denied-tool',records=records)
@@ -571,7 +662,8 @@ check.unlink(missing_ok=True)
 for label,scenario,decision in [('deny','approval-deny','Deny'),('allow','approval-allow','AllowOnce')]:
     records = grok_records(scenario)
     if decision=='Deny':
-        position = next(i for i,r in enumerate(records) if r.get('line',{}).get('method')=='session/request_permission')
+        position = next(i for i,r in enumerate(records) if r.get('type')=='emit_inbound'
+            and r.get('line',{}).get('method')=='session/request_permission')
         params = records[position]['line']['params']
         records.insert(position,{'type':'emit_inbound','line':{'jsonrpc':'2.0','method':'session/update',
             'params':{'sessionId':params['sessionId'],'_meta':params['_meta'],
@@ -807,7 +899,10 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "approval-new-long-command.png",
       "question-within-request.png",
       "question-within-second.json",
-      "approval-denied-tool.png"
+      "approval-denied-tool.png",
+      "search-target.png",
+      "question-smallest-ellipsis.png",
+      "question-smallest-placement.json"
     ],
     "approvals-questions-codex": [
       "codex-command.json",
@@ -825,7 +920,8 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "codex-reason-quoted.png",
       "codex-long-working-folder.png",
       "codex-long-working-folder-end.png",
-      "codex-denied-tool.png"
+      "codex-denied-tool.png",
+      "codex-extra-fields.png"
     ],
     "approvals-questions-grok": [
       "grok-approval-deny.png",
