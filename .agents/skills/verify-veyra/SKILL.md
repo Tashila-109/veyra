@@ -1,7 +1,6 @@
 ---
 name: verify-veyra
-description: Verify Veyra's native macOS window and CLI after UI, launch, logging, data-folder, or debug-driver changes.
-Launch an isolated instance, drive gpui actions through veyra ctl, capture the window, and preserve evidence after cleanup.
+description: Verify Veyra's native macOS window and CLI after UI, launch, logging, data-folder, or debug-driver changes. Launch an isolated instance, drive gpui actions through veyra ctl, capture the window, and preserve evidence after cleanup.
 ---
 
 # Verify Veyra
@@ -260,7 +259,7 @@ Solid captures use `screencapture -x -o -l WINDOW` and keep the existing on-scre
 Translucent captures use `screencapture -x -R x,y,w,h` of the exact on-screen window rectangle.
 They require `bin/backdrop.swift` behind Veyra, with its run-owned pid and window ids in `backdrop-windows.json`.
 Immediately before and after each region capture, the helper checks that Veyra is frontmost, its bounds equal the rectangle, the rectangle is wholly covered by one backdrop window on one display, and no other on-screen window above Veyra intersects it.
-A changed guard discards the capture and retries at most three times.
+A changed guard discards the capture; the helper makes at most three attempts in total.
 The Settings page places a second run-owned backdrop above Veyra and requires the guard to reject it without retaining a PNG.
 Veyra must stay frontmost during captures.
 A changed visible state with an identical PNG fails; Evidence also compares named state pairs.

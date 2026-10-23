@@ -540,6 +540,9 @@ fn take_foreground_kill(
         None
     }
 }
+fn shell_spawn_reason(error: &io::Error) -> String {
+    io::Error::from(error.kind()).to_string()
+}
 fn run(
     cwd: std::path::PathBuf,
     size: PtySize,
@@ -593,7 +596,7 @@ fn run(
     let child = pair.slave.spawn_command(command).map_err(|error| {
         let reason = error
             .downcast_ref::<io::Error>()
-            .map(ToString::to_string)
+            .map(shell_spawn_reason)
             .unwrap_or_else(|| "the selected shell is missing or is not executable".into());
         ProviderError::Protocol(format!("The shell could not start: {reason}"))
     })?;
@@ -779,6 +782,91 @@ fn read(mut reader: Box<dyn Read + Send>, terminal: &Terminal) -> io::Result<()>
 mod tests {
     use super::*;
     #[test]
+    fn native_quit_releases_registry_before_shell_hangup() {
+        let root = std::path::Path::new("/tmp").join(format!(
+            "veyra-shell-quit-{}",
+            crate::domain::ThreadId::new()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _scratch = crate::tests::Scratch(root.clone());
+        let shell = root.join("shell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\ntrap '' HUP\nprintf ready\\n\nwhile [ ! -f exit ]; do /bin/sleep .01; done\nexit 0\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("700")
+                .arg(&shell)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let engine = crate::Engine::start_with_env(
+            runtime.handle(),
+            crate::data_dir::DataDir::at(root.join("data")).unwrap(),
+            ChildEnv::isolated().with_variable("SHELL", shell.as_os_str()),
+        )
+        .unwrap();
+        let handle = engine
+            .open_shell(
+                crate::domain::ThreadId::new(),
+                root.clone(),
+                PtySize::default(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.status() != ShellStatus::Running {
+            assert!(Instant::now() < deadline, "scripted shell did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pid = handle.pid().unwrap();
+        let terminal = handle.terminal.clone();
+        let (sent, observed) = std::sync::mpsc::channel();
+        *engine.inner.state.quit_signal_hook.lock().unwrap() = Some(Box::new(move || {
+            std::fs::write(root.join("exit"), "").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let ready = loop {
+                if !platform::is_alive(pid).unwrap()
+                    && terminal.pid.try_lock().is_ok_and(|owned| owned.is_none())
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            sent.send(ready).unwrap();
+        }));
+        let quitting = engine.clone();
+        let quitting_runtime = runtime.handle().clone();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            quitting_runtime.block_on(quitting.on_app_quit());
+            finished.send(()).unwrap();
+        });
+        let reaped_without_registry = observed.recv_timeout(Duration::from_secs(4)).unwrap();
+        completion
+            .recv_timeout(Duration::from_secs(4))
+            .expect("native quit timed out");
+        worker.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.status().is_finished() || platform::is_alive(pid).unwrap() {
+            assert!(Instant::now() < deadline, "owned shell did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        runtime.block_on(engine.shutdown_wait());
+        assert!(engine.inner.groups.lock().unwrap().is_empty());
+        assert!(
+            reaped_without_registry,
+            "quit held the registry across shell hangup: reap blocked on registry"
+        );
+    }
+
+    #[test]
     fn failed_shell_spawn_has_a_plain_start_reason() {
         let root = std::path::Path::new("/tmp").join(format!(
             "veyra-shell-spawn-{}",
@@ -803,6 +891,16 @@ mod tests {
             }
         );
         assert!(handle.pid().is_none());
+    }
+
+    #[test]
+    fn failed_shell_os_errors_have_plain_reasons() {
+        let error = io::Error::from_raw_os_error(13);
+        assert_eq!(shell_spawn_reason(&error), "permission denied");
+        assert_eq!(
+            shell_spawn_reason(&io::ErrorKind::NotFound.into()),
+            "entity not found"
+        );
     }
 
     #[test]

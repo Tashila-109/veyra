@@ -22,6 +22,7 @@ Use Stop on a family card row to stop that child, then read the report before Co
 The row menu offers Stop thread and Archive, and a root with children also offers Archive, keep child threads.
 OpenThreadMenu is ⌘⌥⇧M, Archive is ⌘⇧A, and ArchiveKeepChildren is ⌘⌥⇧A.
 The breadcrumb and card Open use SelectThread; card Stop uses StopThread.
+A focused sidebar thread row binds Return and Space to `veyra::ActivateThreadRow` in the `VeyraSidebarRow` key context; that action selects its own thread.
 
 ## Driving it with veyra ctl
 

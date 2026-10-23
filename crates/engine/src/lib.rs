@@ -59,6 +59,8 @@ struct EngineInner {
 }
 #[derive(Default)]
 pub(crate) struct RuntimeState {
+    #[cfg(test)]
+    quit_signal_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub awake: AtomicBool,
     pub terminal_colors: Mutex<terminal::Colors>,
     pub terminals: Mutex<std::collections::BTreeMap<ThreadId, Vec<provider::TerminalHandle>>>,
@@ -323,7 +325,12 @@ impl Engine {
             .map(|handle| &handle.terminal)
             .filter_map(|terminal| terminal.pid().map(|pid| (pid, terminal.clone())))
             .collect();
-        for &group in self.inner.groups.lock().unwrap().iter() {
+        let groups: Vec<_> = self.inner.groups.lock().unwrap().iter().copied().collect();
+        #[cfg(test)]
+        if let Some(hook) = self.inner.state.quit_signal_hook.lock().unwrap().take() {
+            hook();
+        }
+        for group in groups {
             if let Some(terminal) = terminals.get(&group) {
                 terminal.hangup();
             } else {

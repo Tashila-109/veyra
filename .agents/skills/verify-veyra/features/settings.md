@@ -7,6 +7,7 @@ Covers: crates/veyra/src/ui/settings.rs crates/veyra/src/ui/new_thread.rs crates
 
 - `settings-background`: `veyra::SetWindowBackground`, its ⌘⌥B cycle and relaunch preserve the device choice.
 - `settings-display-options`: `look` names each forced Solid flag and Reduce Motion without modifying macOS settings.
+The forced Window background row selects Solid and disables both choices; its action and ⌘⌥B keep the stored choice, which returns when the flags clear.
 
 - `settings-entry`: ⌘, and the menu action open one in-window Settings view.
 - `settings-modes`: Full access is the fresh stored default; all three choices publish SettingsChanged.
@@ -150,7 +151,8 @@ The background choice is stored independently of the permission default.
 This section starts only run-owned backdrop windows and always closes them, including its deliberate occluder.
 Reduce Transparency, Increase Contrast and Reduce Motion are driven by `veyra::DebugDisplayOptions` without changing macOS settings.
 Before each glass capture and after relaunch, the recipe asks yabai only about the run's owned pid and recorded window id, floats that window if managed, and places it at 24,60 with 960×740 bounds.
-It changes no other window, config, rule, space or layout setting; an unavailable service or untracked window leaves the guards to decide.
+Floating a tiled window lets yabai re-tile its neighbours; the recipe changes no config, rule, space or layout setting.
+An unavailable service or untracked window leaves the guards to decide.
 If the guard records intersecting windows, the recipe makes one further placement on the same backdrop display, clearing all recorded bounds and keeping 960×740 whenever it fits.
 The cursor stays untouched, every window still counts, and no available rectangle leaves the original guard failure intact.
 The Translucent review set at the human gate needs the same owned-window placement and one-time fallback.
@@ -411,6 +413,14 @@ try:
             and d['look']['forced_by']==reason)
         assert forced['look']['stored']=='translucent'
         assert sql('select window_background from settings') == 'translucent'
+        for entry in ['action','key']:
+            if entry=='action':
+                action('background-forced-action-'+label,'SetWindowBackground',{'background':'solid'})
+            else:
+                ctl('background-forced-key-'+label,'keys','secondary-alt-b')
+            unchanged = ctl('settings-forced-'+label+'-'+entry,'dump')
+            assert unchanged['look']==forced['look'], (label,entry,unchanged['look'])
+            assert sql('select window_background from settings') == 'translucent'
         capture('settings-forced-'+label)
     action('display-options-motion','DebugDisplayOptions',{'reduce_motion':True})
     motion = poll('settings-reduced-motion',lambda d:d['look']['reduce_motion']
@@ -444,6 +454,7 @@ try:
     for mode,background,flags in [('translucent','translucent',{}),('solid','solid',{}),
         ('reduce-transparency','translucent',{'reduce_transparency':True}),
         ('increase-contrast','translucent',{'increase_contrast':True})]:
+        action('measure-unforce-'+mode,'DebugDisplayOptions',{})
         action('measure-background-'+mode,'SetWindowBackground',{'background':background})
         action('measure-flags-'+mode,'DebugDisplayOptions',dict(reduce_motion=True,**flags))
         state = poll('measure-look-'+mode,lambda d:d['look']['background']==

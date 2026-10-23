@@ -3,8 +3,9 @@ use super::{
     composer::labelled_button,
     theme::Theme,
 };
-use gpui_kit::base::Selectable;
+use gpui_kit::base::{Disableable, Selectable};
 use gpui_kit::component::StyledExt;
+use gpui_kit::component::button::Button;
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::{PermissionMode, Settings, WindowBackground};
 
@@ -116,25 +117,7 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                             (WindowBackground::Solid, "Solid"),
                         ]
                         .into_iter()
-                        .map(|(background, label)| {
-                            labelled_button(label, label, cx)
-                                .selected(background == settings.window_background)
-                                .when(background == settings.window_background, |button| {
-                                    button
-                                        .bg(t.plate(t.colors.card))
-                                        .border(t.layout.border)
-                                        .border_color(t.colors.border)
-                                        .shadow(t.plate_highlight())
-                                })
-                                .on_click(move |_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(SetWindowBackground {
-                                            background: Some(background),
-                                        }),
-                                        cx,
-                                    )
-                                })
-                        }),
+                        .map(|(background, label)| background_button(background, label, cx)),
                     ),
                 )
                 .child(
@@ -162,6 +145,33 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                     .line_height(t.text.meta.line_height)
                     .text_color(t.colors.danger)
                     .child(notice),
+            )
+        })
+}
+
+pub(super) fn background_button(
+    background: WindowBackground,
+    label: &'static str,
+    cx: &App,
+) -> Button {
+    let t = cx.global::<Theme>();
+    let selected = background == t.look.background();
+    labelled_button(label, label, cx)
+        .selected(selected)
+        .disabled(t.look.forced_by().is_some())
+        .when(selected, |button| {
+            button
+                .bg(t.plate(t.colors.card))
+                .border(t.layout.border)
+                .border_color(t.colors.border)
+                .shadow(t.plate_highlight())
+        })
+        .on_click(move |_, window, cx| {
+            window.dispatch_action(
+                Box::new(SetWindowBackground {
+                    background: Some(background),
+                }),
+                cx,
             )
         })
 }

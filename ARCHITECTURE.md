@@ -226,16 +226,13 @@ StartTurn effects name the turn until install builds its text from committed ite
 
 The send-to-reply path is ordered as follows.
 
-1.
-CreateThread stores the thread and user item with a queued turn.
-2.
-The Spawn effect starts the session on its own process group.
+1. CreateThread stores the thread and user item with a queued turn.
+2. The Spawn effect starts the session on its own process group.
 While the thread is still Starting, an exit before Ready fails the oldest queued turn.
 A session that started adds a Stopped hold only if another turn remains queued, preserving any earlier hold; without queued work it adds no hold.
 An asynchronous binary-resolution failure reports ResolutionFailed and retains the Stopped hold while Starting; provider crashes and sign-out follow the ordinary Exited rule.
 Spawner::spawn returns a SessionHandle immediately; there is no synchronous spawn-error result.
-3.
-Claude publishes Ready on a matched initialize reply or system/init; Codex publishes it on a successful thread/start or thread/resume reply, with the returned thread id and cliVersion, after any not-found fallback or active-writer retry.
+3. Claude publishes Ready on a matched initialize reply or system/init; Codex publishes it on a successful thread/start or thread/resume reply, with the returned thread id and cliVersion, after any not-found fallback or active-writer retry.
 Grok publishes Ready on a successful session/new, session/resume or session/load reply with its native session id and initialize version.
 Ready changes Starting to Structured.
 4. start_changed makes the queued turn Running, records pending admission and dispatches StartTurn with committed prompt text.
@@ -254,10 +251,8 @@ A Refused admission names no turn, so window Stop has no target unless a Running
 A refusal replaces Pending admission with Refused until the next CLI turn end; the first correlated turn event confirms an admitted prompt and restores its Running row if CLI work displaced it.
 The Provider end applies start_changed, which retries eligible queued work once pending admission has resolved.
 The Claude codec also emits Ready on system/init, so an early system/init can open the Ready gate before the initialize reply.
-5.
-The codec normalizes deltas; the actor buffers text and counts actual stream deltas before flushing.
-6.
-Item and turn completion persist final rows, free streaming buffers and publish the engine-owned status.
+5. The codec normalizes deltas; the actor buffers text and counts actual stream deltas before flushing.
+6. Item and turn completion persist final rows, free streaming buffers and publish the engine-owned status.
 
 Text coalesces per item, normally flushing to the UI at most once per 16 ms.
 Requests, item completion and turn completion flush pending UI text immediately.
@@ -539,6 +534,8 @@ One foreground grace-kill site checks that the recorded group still exists befor
 Observing the group gone clears the target, so a reused group number is never revisited.
 The child guard signals its owned group before waiting on unwind and never signals it after a successful reap.
 The reap and hangup paths hold the same pid mutex, and reaping clears both the terminal pid and group registration.
+When both shell locks are needed, the pid mutex precedes the group registry.
+Native quit copies the group registry and releases its lock before calling any terminal, so it never takes a pid mutex while holding that registry.
 Reader and writer joins share the same bounded cleanup deadline; an escaped process retaining the PTY cannot keep the handle live indefinitely.
 Such a process is outside the shell group, and a detached reader ends when it eventually releases the PTY.
 A deadline warning can name its pid, never its arguments.
@@ -1069,6 +1066,7 @@ The sidebar puts Add project and New thread in its top action group and Settings
 The header retains identity, status and the drawer button.
 The sidebar reads projects in creation order, then each root and its children on a one-pixel guide, with the root glyph derived from family_status.
 A thread row is one selection target with a fixed action space, a Stop control only while work can be stopped, and a menu revealed by pointer hover or keyboard focus.
+A focused thread row uses ActivateThreadRow for Return and Space in the VeyraSidebarRow context, bound in ui/actions.rs.
 Project and thread rows do not shrink inside the scroll column.
 SidebarScroll retains the scroll handle and last revealed selection; a changed selection scrolls its immediate row into view during layout.
 An unarchived child whose root is archived becomes a top-level row and keeps its own status.
@@ -1217,6 +1215,8 @@ Content, raised card and floating colour roles form the dark elevation ladder; l
 Floating sheets use the floating radius and shadow, and the kit's popup shadow is enabled.
 The platform reads Reduce Transparency, Increase Contrast and Reduce Motion from NSWorkspace at launch and window activation.
 Either transparency or contrast flag forces Solid without changing the stored choice, and Settings names the forcing flag.
+While forced, its background row selects Solid and disables both choices; SetWindowBackground and Command-Option-B leave the stored choice unchanged.
+Clearing the flag restores that choice.
 Increase Contrast raises borders to a component contrast colour and uses the text colour for muted roles.
 Reduce Motion sets gpui's reduce-motion flag and snaps every motion token, including the spinner, to zero.
 The working glyph remains still and the one-second status clock continues to update elapsed time.
@@ -1276,7 +1276,7 @@ Proof stays outside disposable scratch, and driver and cleanup actions target on
 Solid captures use a window capture and require the owned window to remain on-screen and frontmost.
 Translucent captures use the window's exact on-screen rectangle over run-owned backdrop windows.
 Immediately before and after each region capture, the driver checks frontmost identity, unchanged bounds, full coverage by one backdrop window on one display, and no intersecting on-screen window above Veyra.
-A changed guard discards the file and retries at most three times.
+A changed guard discards the file; the driver makes at most three attempts in total.
 The Settings page plants a run-owned occluding window and requires rejection without a retained capture.
 Release ignores the debug reap filter and can signal any validated orphan, so the skill keeps release checks away from another run's deliberate orphan.
 Dump's awake reports whether the actor retains the guard, without checking the child or OS assertion after spawn.
@@ -1524,3 +1524,6 @@ The display and theme tests cover forced Solid, every reduced-motion token and b
 The synthetic theme-apply test checks the retained Look projection across appearance changes; the native guarded captures establish the actual window material.
 Drawer regressions cover a held drag cancelled by shrink and restoration of the chosen height after the composer shrinks.
 The failed-shell spawn regression uses a real failing spawn, and the group guard regression requires signalling before reaping and no signal afterward.
+
+The native_quit_releases_registry_before_shell_hangup regression lets a scripted shell exit at the native signal pass and bounds both reap observation and quit completion.
+The forced_solid_keeps_background_choice_and_blocks_every_entry regression checks effective selection, click, action and key refusal under each forcing flag, with unforced controls.

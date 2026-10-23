@@ -40,11 +40,7 @@ Use a fresh Launch with VEYRA_VERIFY_LANE=live, the exported RUN, Doctor and new
 Create project file `permission-input.txt` with the text `veyra permission probe` before sending.
 Replace RUN in this one prompt with the exported run identity:
 
-> Read permission-input.txt and report its content.
-Run echo veyra-permission-probe.
-Write permission-project.txt in this project containing veyra permission probe.
-Write /tmp/veyra-outside-RUN.txt containing veyra permission probe.
-Describe each step and wait for required approvals.
+> Read permission-input.txt and report its content. Run echo veyra-permission-probe. Write permission-project.txt in this project containing veyra permission probe. Write /tmp/veyra-outside-RUN.txt containing veyra permission probe. Describe each step and wait for required approvals.
 
 Select each offered mode with PickPermission, send through Send, and preserve every dock and decision with dump and capture.
 For Grok’s Accept edits cell, use `veyra ctl action veyra::PickPermission '{"mode":"accept_edits"}'` before Send to create a thread stored in Accept edits.

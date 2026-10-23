@@ -234,7 +234,7 @@ def region_snapshot(pid, window, backdrop, rectangle=None):
         'backdrop_window':background['kCGWindowNumber'],'backdrop_bounds':bounds(background),
         'display':displays[0],'frontmost':True,'intersecting_above':0}
 def region_capture(target, pid, window):
-    """Discard a region capture when any guard changes, and retry at most three times."""
+    """Discard a region capture when any guard changes; make at most three attempts in total."""
     backdrop = json.loads((PROOF/'backdrop-windows.json').read_text())
     attempts = []
     for attempt in range(3):

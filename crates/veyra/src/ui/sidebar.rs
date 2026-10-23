@@ -279,6 +279,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
             rows.push(
                 div()
                     .id(SharedString::from(format!("thread-{id}")))
+                    .key_context("VeyraSidebarRow")
                     .track_focus(&row_focus)
                     .tab_index(0)
                     .role(gpui::accesskit::Role::Button)
@@ -307,12 +308,11 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&row_focus, cx)
                     })
-                    .on_key_down(move |event, window, cx| {
-                        if keyboard_focus.is_focused(window)
-                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                        {
+                    .on_action(move |_: &ActivateThreadRow, window, cx| {
+                        if keyboard_focus.is_focused(window) {
                             window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx);
-                            cx.stop_propagation();
+                        } else {
+                            cx.propagate();
                         }
                     })
                     .on_click(move |_, window, cx| {

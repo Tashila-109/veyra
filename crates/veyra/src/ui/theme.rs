@@ -560,17 +560,26 @@ impl Theme {
 }
 impl Motion {
     fn tokens_mut(&mut self) -> [&mut Transition; 9] {
-        let [menu_in, menu_out] = &mut self.menu;
+        let Self {
+            hover,
+            press,
+            collapse,
+            drawer,
+            menu: [menu_in, menu_out],
+            resize,
+            stream_reveal,
+            spinner,
+        } = self;
         [
-            &mut self.hover,
-            &mut self.press,
-            &mut self.collapse,
-            &mut self.drawer,
+            hover,
+            press,
+            collapse,
+            drawer,
             menu_in,
             menu_out,
-            &mut self.resize,
-            &mut self.stream_reveal,
-            &mut self.spinner,
+            resize,
+            stream_reveal,
+            spinner,
         ]
     }
 }
@@ -711,36 +720,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reduce_motion_snaps_every_token() {
-        for appearance in [Appearance::Dark, Appearance::Light] {
-            let mut normal = Theme::new(appearance);
-            assert!(
-                normal
-                    .motion
-                    .tokens_mut()
-                    .iter()
-                    .all(|token| !token.duration.is_zero())
-            );
-            let mut reduced = Theme::with_look(
-                appearance,
-                Look {
-                    options: DisplayOptions {
-                        reduce_motion: true,
+    #[gpui::test]
+    fn reduce_motion_snaps_every_token(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            gpui_kit::init(cx);
+            for appearance in [Appearance::Dark, Appearance::Light] {
+                let mut normal = Theme::new(appearance);
+                assert!(
+                    normal
+                        .motion
+                        .tokens_mut()
+                        .iter()
+                        .all(|token| !token.duration.is_zero())
+                );
+                let mut reduced = Theme::with_look(
+                    appearance,
+                    Look {
+                        options: DisplayOptions {
+                            reduce_motion: true,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-            );
-            assert!(
-                reduced
-                    .motion
-                    .tokens_mut()
-                    .iter()
-                    .all(|token| token.duration.is_zero())
-            );
-            assert_eq!(reduced.motion.spinner.duration, Duration::ZERO);
-        }
+                );
+                assert!(
+                    reduced
+                        .motion
+                        .tokens_mut()
+                        .iter()
+                        .all(|token| token.duration.is_zero())
+                );
+                assert_eq!(reduced.motion.spinner.duration, Duration::ZERO);
+                for reduce_motion in [false, true, false] {
+                    cx.set_global(Look {
+                        options: DisplayOptions {
+                            reduce_motion,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                    Theme::apply(appearance, window, cx);
+                    assert_eq!(cx.reduce_motion(), reduce_motion);
+                }
+            }
+        });
     }
 
     #[gpui::test]

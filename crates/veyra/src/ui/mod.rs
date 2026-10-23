@@ -651,6 +651,8 @@ pub struct Shell {
     #[cfg(test)]
     sent_interrupts: Vec<StopTarget>,
     #[cfg(test)]
+    sent_backgrounds: Vec<veyra_engine::domain::WindowBackground>,
+    #[cfg(test)]
     sent_archives: Vec<(ThreadId, bool)>,
     #[cfg(debug_assertions)]
     repaints: u64,
@@ -904,6 +906,8 @@ impl Shell {
             #[cfg(test)]
             sent_responses: Default::default(),
             #[cfg(test)]
+            sent_backgrounds: Default::default(),
+            #[cfg(test)]
             sent_interrupts: Vec::new(),
             #[cfg(test)]
             sent_archives: Vec::new(),
@@ -1140,6 +1144,10 @@ impl Shell {
                 thread: *thread,
                 turn: *turn,
             });
+        }
+        #[cfg(test)]
+        if let Command::SetWindowBackground { background } = &command {
+            self.sent_backgrounds.push(*background);
         }
         let reply = self.engine.send(command);
         cx.spawn_in(window, async move |this, cx| {
@@ -2243,6 +2251,9 @@ impl Render for Shell {
             }))
             .on_action(
                 cx.listener(|shell, action: &SetWindowBackground, window, cx| {
+                    if cx.global::<theme::Look>().forced_by().is_some() {
+                        return;
+                    }
                     let background =
                         action
                             .background
@@ -3245,6 +3256,43 @@ mod tests {
                     TurnState::Running { since: 1 }
                 );
             });
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn sidebar_row_return_and_space_select_the_focused_thread(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let child = shell.update(cx, |shell, cx| {
+                let (parent, child, _) = add_family(shell, cx);
+                shell.state.requests.clear();
+                shell.state.threads.get_mut(&child).unwrap().title = "Keyboard row".into();
+                shell.show(super::MainView::Chat(parent));
+                cx.notify();
+                child
+            });
+            for chord in ["enter", "space"] {
+                cx.dispatch_action(super::OpenSettings);
+                draw(cx);
+                let position = cx.debug_bounds("caption-Keyboard row").unwrap().center();
+                cx.simulate_event(gpui::MouseDownEvent {
+                    position,
+                    button: gpui::MouseButton::Left,
+                    click_count: 1,
+                    ..Default::default()
+                });
+                draw(cx);
+                assert!(shell.read_with(cx, |shell, _| matches!(
+                    shell.view,
+                    super::MainView::Settings { .. }
+                )));
+                cx.simulate_keystrokes(chord);
+                draw(cx);
+                assert_eq!(
+                    shell.read_with(cx, |shell, _| shell.view.chat()),
+                    Some(child)
+                );
+            }
         });
     }
 
@@ -5812,6 +5860,89 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn forced_solid_keeps_background_choice_and_blocks_every_entry(cx: &mut gpui::TestAppContext) {
+        use gpui_kit::base::Selectable;
+        use veyra_engine::domain::WindowBackground::{Solid, Translucent};
+        with_docked_shell(cx, |shell, cx, _, _| {
+            cx.dispatch_action(super::OpenSettings);
+            draw(cx);
+            cx.dispatch_action(super::DebugDisplayOptions::default());
+            draw(cx);
+            let solid = cx.debug_bounds("caption-Solid").unwrap().center();
+            cx.simulate_click(solid, gpui::Modifiers::none());
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_backgrounds.clone()),
+                [Solid]
+            );
+            for flags in [
+                super::DebugDisplayOptions {
+                    reduce_transparency: true,
+                    ..Default::default()
+                },
+                super::DebugDisplayOptions {
+                    increase_contrast: true,
+                    ..Default::default()
+                },
+            ] {
+                shell.update(cx, |shell, _| {
+                    shell.state.settings.window_background = Translucent;
+                    shell.sent_backgrounds.clear();
+                });
+                cx.dispatch_action(flags);
+                draw(cx);
+                cx.read(|cx| {
+                    assert!(super::settings::background_button(Solid, "Solid", cx).is_selected());
+                    assert!(
+                        !super::settings::background_button(Translucent, "Translucent", cx)
+                            .is_selected()
+                    );
+                });
+                for selector in ["caption-Solid", "caption-Translucent"] {
+                    let button = cx.debug_bounds(selector).unwrap().center();
+                    cx.simulate_click(button, gpui::Modifiers::none());
+                    draw(cx);
+                }
+                cx.dispatch_action(super::SetWindowBackground {
+                    background: Some(Solid),
+                });
+                draw(cx);
+                cx.simulate_keystrokes("secondary-alt-b");
+                draw(cx);
+                assert!(
+                    shell.read_with(cx, |shell, _| shell.sent_backgrounds.is_empty()),
+                    "forced Solid setting remained interactive"
+                );
+                assert_eq!(
+                    shell.read_with(cx, |shell, _| shell.state.settings.window_background),
+                    Translucent
+                );
+                cx.dispatch_action(super::DebugDisplayOptions::default());
+                draw(cx);
+                cx.read(|cx| {
+                    assert_eq!(cx.global::<super::Theme>().look.background(), Translucent);
+                    assert!(
+                        super::settings::background_button(Translucent, "Translucent", cx)
+                            .is_selected()
+                    );
+                    assert!(!super::settings::background_button(Solid, "Solid", cx).is_selected());
+                });
+            }
+            cx.dispatch_action(super::SetWindowBackground {
+                background: Some(Solid),
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-alt-b");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sent_backgrounds.clone()),
+                [Solid, Solid]
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn grok_deny_only_dock_disables_both_allows_and_keeps_deny(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let responses = shell.read_with(cx, |shell, _| shell.sent_responses.clone());
@@ -8184,16 +8315,6 @@ mod tests {
             draw(cx);
             let bounds = cx.debug_bounds("shell-drawer").unwrap();
             assert!(bounds.size.height < maximum);
-            shell.read_with(cx, |shell, cx| {
-                eprintln!(
-                    "SHRUNK viewport={:?} composition={:?} chosen={:?} displayed={:?} actual={:?}",
-                    shell.drawer_viewport,
-                    shell.composition_height,
-                    shell.drawers[&shell.view.chat().unwrap()].height,
-                    shell.displayed_drawer_height(shell.view.chat().unwrap(), cx),
-                    bounds
-                )
-            });
             let position = gpui::point(
                 gpui::Pixels::from(500.),
                 bounds.top() + gpui::Pixels::from(2.),
