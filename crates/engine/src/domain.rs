@@ -399,7 +399,7 @@ impl ProposedAction {
                 .ok()
                 .and_then(|value| value.description.or(value.reason))
                 .map(|text| {
-                    let mut preview = ApprovalPreview::new(text);
+                    let mut preview = ApprovalReason::new(text);
                     preview.hydrated = true;
                     preview
                 });
@@ -413,8 +413,8 @@ pub enum ApprovalTarget {
         command: String,
         #[serde(default)]
         cwd: CommandCwd,
-        #[serde(default, skip_serializing_if = "ApprovalPreview::unstored_reason")]
-        reason: Option<ApprovalPreview>,
+        #[serde(default, skip_serializing_if = "ApprovalReason::unstored_reason")]
+        reason: Option<ApprovalReason>,
         preview: ApprovalPreview,
     },
     File {
@@ -460,10 +460,6 @@ pub enum ApprovalExplanation {
 pub struct ApprovalPreview {
     pub text: String,
     pub truncated: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub explanation: Option<ApprovalExplanation>,
-    #[serde(skip)]
-    hydrated: bool,
 }
 impl ApprovalPreview {
     pub fn new(mut text: String) -> Self {
@@ -477,12 +473,28 @@ impl ApprovalPreview {
         Self {
             text,
             truncated: cut.is_some(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalReason {
+    #[serde(flatten)]
+    pub preview: ApprovalPreview,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<ApprovalExplanation>,
+    #[serde(skip)]
+    hydrated: bool,
+}
+impl ApprovalReason {
+    pub fn new(text: String) -> Self {
+        Self {
+            preview: ApprovalPreview::new(text),
             explanation: None,
             hydrated: false,
         }
     }
     fn unstored_reason(reason: &Option<Self>) -> bool {
-        reason.as_ref().is_none_or(|preview| preview.hydrated)
+        reason.as_ref().is_none_or(|reason| reason.hydrated)
     }
 }
 impl<'de> Deserialize<'de> for ProposedAction {
@@ -869,6 +881,35 @@ mod notice_tests {
         ));
     }
     #[test]
+    fn explicit_approval_reasons_preserve_stored_json_bytes() {
+        use super::*;
+        for explanation in [
+            "",
+            ",\"explanation\":\"description\"",
+            ",\"explanation\":\"reason\"",
+        ] {
+            let stored = format!(
+                concat!(
+                    "{{\"tool\":\"Command\",\"target\":{{\"kind\":\"command\",",
+                    "\"command\":\"printf check\",\"cwd\":\"project_folder\",",
+                    "\"reason\":{{\"text\":\"Stored words\",\"truncated\":false{explanation}}},",
+                    "\"preview\":{{\"text\":\"{{}}\",\"truncated\":false}}}}}}"
+                ),
+                explanation = explanation
+            );
+            let action: ProposedAction = serde_json::from_str(&stored).unwrap();
+            let ApprovalTarget::Command {
+                reason, preview, ..
+            } = &action.target
+            else {
+                panic!("command")
+            };
+            assert_eq!(reason.as_ref().unwrap().preview.text, "Stored words");
+            assert_eq!(preview.text, "{}");
+            assert_eq!(serde_json::to_string(&action).unwrap(), stored);
+        }
+    }
+    #[test]
     fn legacy_reason_hydration_preserves_stored_bytes() {
         use super::*;
         for preview in [
@@ -889,7 +930,7 @@ mod notice_tests {
                 panic!("command target")
             };
             assert_eq!(
-                reason.as_ref().map(|preview| preview.text.as_str()),
+                reason.as_ref().map(|reason| reason.preview.text.as_str()),
                 if preview.contains("description") {
                     Some("Legacy description")
                 } else if preview.contains("reason") {

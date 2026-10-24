@@ -4840,7 +4840,7 @@ mod tests {
                 cwd: CommandCwd::Directory(
                     format!("/tmp/{}", "segment-of-a-long-folder-name/".repeat(70)).into(),
                 ),
-                reason: Some(ApprovalPreview::new(
+                reason: Some(veyra_engine::domain::ApprovalReason::new(
                     "a long model-written reason ".repeat(400),
                 )),
                 preview: preview.clone(),
@@ -5486,7 +5486,7 @@ mod tests {
                                                 command: command.clone(),
                                                 cwd: cwd.clone(),
                                                 reason: reason.then(|| {
-                                                    ApprovalPreview::new(
+                                                    veyra_engine::domain::ApprovalReason::new(
                                                         "a long model-written reason ".repeat(400),
                                                     )
                                                 }),
@@ -5825,7 +5825,9 @@ mod tests {
                         target: ApprovalTarget::Command {
                             command: format!("echo first\n{}", "later line\n".repeat(200)),
                             cwd: CommandCwd::Directory("/tmp/elsewhere".into()),
-                            reason: Some(ApprovalPreview::new("Read the full command".into())),
+                            reason: Some(veyra_engine::domain::ApprovalReason::new(
+                                "Read the full command".into(),
+                            )),
                             preview: ApprovalPreview::new(String::new()),
                         },
                     },
@@ -8200,6 +8202,160 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn codex_plain_dock_has_grant_without_empty_preview_and_keeps_nonempty_preview(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use veyra_engine::commands::{Ack, Command};
+        let scratch = Scratch(
+            std::path::PathBuf::from("/tmp")
+                .join(format!("veyra-approval-dock-{}", ThreadId::new())),
+        );
+        let fixtures = scratch.0.join("fixtures");
+        let project = scratch.0.join("project");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let records = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../engine/tests/fixtures/codex/approval-command.jsonl"),
+        )
+        .unwrap();
+        let staged = records
+            .lines()
+            .map(|line| {
+                let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+                if record["type"] == "expect_outbound" && record["line"]["method"] == "thread/start"
+                {
+                    record["line"]["params"]["config"] = serde_json::json!("<any>");
+                }
+                serde_json::to_string(&record).unwrap() + "\n"
+            })
+            .collect::<String>();
+        std::fs::write(fixtures.join("t1-s1.jsonl"), staged).unwrap();
+        let binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("veyra-fake-cli")
+            .canonicalize()
+            .unwrap();
+        let mut env = veyra_engine::provider::env::ChildEnv::isolated()
+            .with_binary(ProviderKind::Codex, binary);
+        env.fixtures = Some(fixtures);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let engine = veyra_engine::Engine::start_with_env(
+            runtime.handle(),
+            veyra_engine::data_dir::DataDir::at(scratch.0.join("data")).unwrap(),
+            env,
+        )
+        .unwrap();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                let mut events = engine.subscribe();
+                let Ack::Project(project) = engine
+                    .send(Command::AddProject { path: project })
+                    .await
+                    .unwrap()
+                    .unwrap()
+                else {
+                    panic!("project ack")
+                };
+                engine
+                    .send(Command::CreateThread {
+                        project,
+                        provider: ProviderKind::Codex,
+                        config: ThreadConfig {
+                            model: None,
+                            effort: None,
+                            mode: PermissionMode::AskFirst,
+                        },
+                        text: "plain dock".into(),
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut approval = None;
+                while let Some(event) = events.recv().await {
+                    match event {
+                        UiEvent::Change {
+                            event: veyra_engine::events::ChangeEvent::RequestOpened(request),
+                            ..
+                        } => {
+                            let RequestKind::Approval { action } = &request.kind else {
+                                panic!("command approval")
+                            };
+                            approval = Some(action.clone());
+                            engine
+                                .send(Command::Respond {
+                                    request: request.id,
+                                    decision: Decision::AllowOnce,
+                                })
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        }
+                        UiEvent::Change {
+                            event: veyra_engine::events::ChangeEvent::TurnEnded(_),
+                            ..
+                        } => break,
+                        _ => {}
+                    }
+                }
+                approval.expect("fake Codex must open a command approval")
+            })
+            .await
+        });
+        runtime.block_on(engine.shutdown_wait());
+        let action = result.expect("fake Codex approval timed out");
+        assert!(action.consent.grant_key().is_some());
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                shell.provider = ProviderKind::Codex;
+                shell.providers[0].provider = ProviderKind::Codex;
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: action.clone(),
+                };
+                cx.notify();
+            });
+            draw(cx);
+            assert!(
+                cx.debug_bounds("approval-preview").is_none(),
+                "a plain Codex dock must not render an empty JSON block"
+            );
+            assert!(
+                cx.debug_bounds("approval-grant-button").is_some(),
+                "the plain command's thread grant must remain visible"
+            );
+            shell.update(cx, |shell, cx| {
+                if let RequestKind::Approval { action } = &mut shell.state.requests[0].kind {
+                    action.consent = Default::default();
+                    let ApprovalTarget::Command { preview, .. } = &mut action.target else {
+                        panic!("command")
+                    };
+                    *preview = ApprovalPreview::new("{\"networkAccess\":true}".into());
+                }
+                cx.notify();
+            });
+            draw(cx);
+            assert!(
+                cx.debug_bounds("approval-preview").is_some(),
+                "a nonempty residual must remain rendered"
+            );
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"]["preview"]
+                    .clone()),
+                serde_json::json!("{\"networkAccess\":true}")
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn codex_reason_has_its_own_element_below_the_consequence(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             shell.update(cx, |shell, cx| {
@@ -8213,7 +8369,7 @@ mod tests {
                         target: ApprovalTarget::Command {
                             command: "echo safe".into(),
                             cwd: CommandCwd::ProjectFolder,
-                            reason: Some(ApprovalPreview::new(
+                            reason: Some(veyra_engine::domain::ApprovalReason::new(
                                 "Requested change\nVeyra checked this command\t\u{202e}OK".into(),
                             )),
                             preview: ApprovalPreview::new(String::new()),

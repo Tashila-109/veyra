@@ -937,40 +937,24 @@ impl Codec {
             "subtype":"error","request_id":id,"error":"This request is not supported by Veyra"
         }})
     }
-    fn approval_field(kind: &str, field: &str, shown: &[&str]) -> super::ApprovalField {
+    fn approval_field(field: &str, shown: &[&str]) -> super::ApprovalField {
         use super::ApprovalField::*;
         match field {
-            "type" | "request" | "request_id" | "request.tool_use_id" | "request.subtype" => {
-                Metadata
-            }
-            "request.tool_name" if !kind.is_empty() => Shown,
-            field if field.starts_with("request.input.") => {
-                let field = &field["request.input.".len()..];
-                match field {
-                    field if shown.contains(&field) => Shown,
-                    "description" | "reason" | "timeout" => Passthrough {
-                        affects_execution: false,
-                    },
-                    _ => Passthrough {
-                        affects_execution: true,
-                    },
-                }
-            }
-            _ => Passthrough {
+            field if shown.contains(&field) => Shown,
+            "description" | "reason" | "timeout" => Passthrough {
                 affects_execution: false,
+            },
+            _ => Passthrough {
+                affects_execution: true,
             },
         }
     }
     fn approval_action(&self, tool: &ToolRequest) -> ProposedAction {
         let input = Value::Object(tool.input.clone());
         let fields = |shown: &[&str]| {
-            super::ApprovalFields::new(&input, |field| {
-                Self::approval_field(&tool.tool_name, &format!("request.input.{field}"), shown)
-            })
+            super::ApprovalFields::new(&input, |field| Self::approval_field(field, shown))
         };
-        let preview = |fields: &super::ApprovalFields| {
-            Self::preview(fields.residual(&input).as_object().unwrap().clone())
-        };
+        let preview = |fields: &super::ApprovalFields| fields.preview(&input);
         let mut grant_key = None;
         let file_target = match tool.tool_name.as_str() {
             "Write" => Some(("file_path", FileOperation::Write)),
@@ -1056,13 +1040,6 @@ impl Codec {
             arguments,
             input_summary,
         }
-    }
-    fn preview(arguments: serde_json::Map<String, Value>) -> ApprovalPreview {
-        ApprovalPreview::new(if arguments.is_empty() {
-            String::new()
-        } else {
-            serde_json::to_string_pretty(&arguments).expect("JSON tool arguments")
-        })
     }
     pub fn answer(&mut self, native: NativeRequestRef, decision: Decision) -> Option<Value> {
         let request = self.requests.get(&native.0)?;
@@ -1562,6 +1539,215 @@ mod tests {
         }
     }
     #[test]
+    fn claude_recorded_live_approvals_preserve_display_and_grants() {
+        {
+            let frame = serde_json::from_str::<Value>(
+                r###"
+{
+    "type": "control_request",
+    "request_id": "recorded-approval",
+    "request": {
+        "subtype": "can_use_tool",
+        "tool_name": "Bash",
+        "display_name": "Bash",
+        "input": {
+            "command": "rtk find . -type f -not -path './.git/*' | head -200"
+        },
+        "description": "rtk find . -type f -not -path './.git/*' | head -…",
+        "permission_suggestions": [
+            {
+                "type": "addRules",
+                "rules": [
+                    {
+                        "toolName": "Bash",
+                        "ruleContent": "rtk find *"
+                    }
+                ],
+                "behavior": "allow",
+                "destination": "localSettings"
+            }
+        ],
+        "decision_reason_type": "subcommandResults",
+        "tool_use_id": "recorded-approval"
+    }
+}
+"###,
+            )
+            .unwrap();
+            let input = frame["request"]["input"].clone();
+            let mut codec = codec();
+            codec.start(TurnId::new(), "recorded".into());
+            let action = super::super::approval_test_action(codec.value(frame).unwrap());
+            assert_eq!(action.tool, "Bash");
+            let ApprovalTarget::Command {
+                command,
+                cwd,
+                reason,
+                ..
+            } = &action.target
+            else {
+                panic!("recorded Bash target")
+            };
+            assert_eq!(command, input["command"].as_str().unwrap());
+            assert_eq!(cwd, &CommandCwd::ProjectFolder);
+            assert_eq!(
+                action.consent.grant_key(),
+                Some(&GrantKey {
+                    tool: "Bash".into(),
+                    command: command.clone()
+                })
+            );
+            assert!(reason.is_none());
+
+            let preview = match &action.target {
+                ApprovalTarget::Command { preview, .. }
+                | ApprovalTarget::File { preview, .. }
+                | ApprovalTarget::Tool { preview } => preview,
+            };
+            assert_eq!(preview.text, String::new());
+        }
+        {
+            let frame = serde_json::from_str::<Value>(
+                r###"
+{
+    "type": "control_request",
+    "request_id": "recorded-approval",
+    "request": {
+        "subtype": "can_use_tool",
+        "tool_name": "Write",
+        "display_name": "Write",
+        "input": {
+            "file_path": "/tmp/veyra-outside-efab18b9.txt",
+            "content": "veyra permission probe\n"
+        },
+        "description": "/tmp/veyra-outside-efab18b9.txt",
+        "permission_suggestions": [
+            {
+                "type": "addDirectories",
+                "directories": [
+                    "/tmp",
+                    "/private/tmp"
+                ],
+                "destination": "session"
+            }
+        ],
+        "decision_reason": "Path is outside allowed working directories",
+        "decision_reason_type": "workingDir",
+        "tool_use_id": "recorded-approval"
+    }
+}
+"###,
+            )
+            .unwrap();
+            let input = frame["request"]["input"].clone();
+            let mut codec = codec();
+            codec.start(TurnId::new(), "recorded".into());
+            let action = super::super::approval_test_action(codec.value(frame).unwrap());
+            assert_eq!(action.tool, "Write");
+            let ApprovalTarget::File {
+                operation, path, ..
+            } = &action.target
+            else {
+                panic!("recorded Write target")
+            };
+            assert_eq!(operation, &FileOperation::Write);
+            assert_eq!(path.to_string_lossy(), input["file_path"].as_str().unwrap());
+            assert!(action.consent.grant_key().is_none());
+
+            let preview = match &action.target {
+                ApprovalTarget::Command { preview, .. }
+                | ApprovalTarget::File { preview, .. }
+                | ApprovalTarget::Tool { preview } => preview,
+            };
+            assert_eq!(
+                preview.text,
+                serde_json::to_string_pretty(
+                    &serde_json::from_str::<Value>(
+                        r###"
+{
+    "content": "veyra permission probe\n"
+}
+"###
+                    )
+                    .unwrap()
+                )
+                .unwrap()
+            );
+        }
+        {
+            let frame = serde_json::from_str::<Value>(
+                r###"
+{
+    "type": "control_request",
+    "request_id": "recorded-approval",
+    "request": {
+        "subtype": "can_use_tool",
+        "tool_name": "mcp__veyra__start_thread",
+        "mcp_server": {
+            "name": "veyra",
+            "source": "dynamic"
+        },
+        "display_name": "Start Thread",
+        "input": {
+            "provider": "claude",
+            "model": "sonnet",
+            "title": "File lister",
+            "client_request_id": "l3-lister-1",
+            "prompt": "List the files in this project and report back."
+        },
+        "permission_suggestions": [
+            {
+                "type": "addRules",
+                "rules": [
+                    {
+                        "toolName": "mcp__veyra__start_thread"
+                    }
+                ],
+                "behavior": "allow",
+                "destination": "localSettings"
+            }
+        ],
+        "tool_use_id": "recorded-approval"
+    }
+}
+"###,
+            )
+            .unwrap();
+            let input = frame["request"]["input"].clone();
+            let mut codec = codec();
+            codec.start(TurnId::new(), "recorded".into());
+            let action = super::super::approval_test_action(codec.value(frame).unwrap());
+            assert_eq!(action.tool, "mcp__veyra__start_thread");
+            assert!(input.is_object());
+            assert!(matches!(action.target, ApprovalTarget::Tool { .. }));
+            assert!(action.consent.grant_key().is_none());
+
+            let preview = match &action.target {
+                ApprovalTarget::Command { preview, .. }
+                | ApprovalTarget::File { preview, .. }
+                | ApprovalTarget::Tool { preview } => preview,
+            };
+            assert_eq!(
+                preview.text,
+                serde_json::to_string_pretty(
+                    &serde_json::from_str::<Value>(
+                        r###"
+{
+    "provider": "claude",
+    "model": "sonnet",
+    "title": "File lister",
+    "client_request_id": "l3-lister-1",
+    "prompt": "List the files in this project and report back."
+}
+"###
+                    )
+                    .unwrap()
+                )
+                .unwrap()
+            );
+        }
+    }
+    #[test]
     fn claude_all_approval_kinds_preserve_complete_fields() {
         for (index, tool) in [
             "Bash",
@@ -1571,6 +1757,8 @@ mod tests {
             "Read",
             "NotebookEdit",
             "mcp__local__change",
+            "mcp__veyra__start_thread",
+            "WebFetch",
             "FutureTool",
         ]
         .into_iter()
@@ -1584,49 +1772,75 @@ mod tests {
                 "cell_id":"cell-one", "cell_type":"code", "edit_mode":"replace", "offset":2, "limit":7,
                 "run_in_background":true, "env":{"CHECK":"material"}, "networkAccess":false,
                 "dangerouslyDisableSandbox":true, "threadId":"argument identity", "unknownFlag":false,
-                "unknownObject":{"command":"nested material"}, "unknownArray":[1,"two",null]});
+                "unknownObject":{"command":"nested material"},
+                    "unknownArray":[1,
+                    "two",
+                    null],
+                    "changes":{"first":"one",
+                    "second":"two"},
+
+                "url":"https://example.invalid", "prompt":"summarize", "flag":true, "target":"target",
+                "client_request_id":"client",
+                    "mode":"ask_first",
+                    "model":"model",
+                    "provider":"codex",
+                    "title":"title"});
             let mut codec = codec();
             codec.start(TurnId::new(), "approve".into());
-            let shown: &[&str] = match tool {
-                "Bash" => &["command", "reason"],
-                "Write" | "Edit" | "MultiEdit" | "Read" => &["file_path"],
-                "NotebookEdit" => &["notebook_path"],
-                _ => &[],
-            };
             let frame = super::super::approval_wire_sample(
                 "claude",
                 tool,
                 serde_json::to_value(ControlRequest::default()).unwrap(),
                 json!({"type":"control_request", "request_id":format!("complete-{index}"),
                     "request":{"subtype":"can_use_tool", "tool_use_id":"invocation", "tool_name":tool,
-                        "input":input}}),
-                |field| Codec::approval_field(tool, field, shown),
-                |field| {
-                    use super::super::ApprovalField::*;
-                    match field {
-                        "type"
-                        | "request"
-                        | "request_id"
-                        | "request.tool_use_id"
-                        | "request.subtype" => Metadata,
-                        "request.tool_name" => Shown,
-                        field if field.starts_with("request.input.") => {
-                            match &field["request.input.".len()..] {
-                                field if shown.contains(&field) => Shown,
-                                "description" | "reason" | "timeout" => Passthrough {
-                                    affects_execution: false,
-                                },
-                                _ => Passthrough {
-                                    affects_execution: true,
-                                },
-                            }
-                        }
-                        _ => Passthrough {
-                            affects_execution: false,
-                        },
-                    }
-                },
+                        "input":input,"blocked_path":"/project","decision_reason":"approval required",
+                        "decision_reason_type":"rule","description":"Tool documentation","display_name":"Display tool",
+                        "mcp_server":{"name":"veyra","source":"project"},"requires_user_interaction":true,
+                        "permission_suggestions":[{"behavior":"allow",
+                            "destination":"session",
+                            "directories":["/project"],
+
+                            "mode":"default",
+                                "rules":[{"ruleContent":"printf check",
+                                "toolName":"Bash"}],
+                                "type":"addRules"}]}}),
             );
+            if tool == "Bash" {
+                for (field, value) in input.as_object().unwrap() {
+                    let mut solo = json!({"command":"printf check", "description":"Primary", "reason":"Secondary"});
+                    solo[field] = value.clone();
+                    let mut expected = solo.clone();
+                    let mut codec = self::codec();
+                    codec.start(TurnId::new(), "one field".into());
+                    let action = super::super::approval_test_action(
+                        codec
+                            .value(json!({"type":"control_request",
+                        "request_id":"one-field",
+                        "request":{"subtype":"can_use_tool",
+                        "tool_name":"Bash",
+                        "input":solo}}))
+                            .unwrap(),
+                    );
+                    assert_eq!(
+                        action.consent.grant_key().is_some(),
+                        matches!(
+                            field.as_str(),
+                            "command" | "description" | "reason" | "timeout"
+                        ),
+                        "grant carrying {field}"
+                    );
+                    let selected = if expected["description"].is_string() {
+                        "description"
+                    } else {
+                        "reason"
+                    };
+                    expected
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|key, _| key != "command" && key != selected);
+                    super::super::assert_approval_preview(&action, expected, field);
+                }
+            }
             let decoded = codec.value(frame).unwrap();
             let action = decoded
                 .events
@@ -1655,7 +1869,7 @@ mod tests {
                 } => {
                     assert_eq!(tool, "Bash");
                     assert_eq!(command, "printf check");
-                    assert_eq!(reason.as_ref().unwrap().text, "Actual reason");
+                    assert_eq!(reason.as_ref().unwrap().preview.text, "Actual reason");
                     expected
                         .as_object_mut()
                         .unwrap()
@@ -1690,7 +1904,13 @@ mod tests {
                     preview
                 }
                 ApprovalTarget::Tool { preview } => {
-                    assert!(matches!(tool, "mcp__local__change" | "FutureTool"));
+                    assert!(matches!(
+                        tool,
+                        "mcp__local__change"
+                            | "mcp__veyra__start_thread"
+                            | "WebFetch"
+                            | "FutureTool"
+                    ));
                     preview
                 }
             };
@@ -1749,7 +1969,7 @@ mod tests {
         };
         assert_eq!(command, "printf check");
         assert_eq!(
-            reason.as_ref().unwrap().text,
+            reason.as_ref().unwrap().preview.text,
             "Description shown separately"
         );
         let mut expected = input;

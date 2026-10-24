@@ -22,7 +22,6 @@ enum ApprovalField {
 
 struct ApprovalFields {
     fields: std::collections::BTreeMap<String, ApprovalField>,
-    object: bool,
 }
 
 impl ApprovalFields {
@@ -34,7 +33,6 @@ impl ApprovalFields {
                 .flat_map(|fields| fields.keys())
                 .map(|key| (key.clone(), classify(key)))
                 .collect(),
-            object: value.is_object(),
         }
     }
     fn residual(&self, value: &serde_json::Value) -> serde_json::Value {
@@ -44,16 +42,25 @@ impl ApprovalFields {
         }
         residual
     }
+    fn preview(&self, value: &serde_json::Value) -> ApprovalPreview {
+        let residual = self.residual(value);
+        ApprovalPreview::new(
+            if residual.as_object().is_some_and(|fields| fields.is_empty()) {
+                String::new()
+            } else {
+                serde_json::to_string_pretty(&residual).expect("JSON approval arguments")
+            },
+        )
+    }
     fn permits_grant(&self) -> bool {
-        self.object
-            && !self.fields.values().any(|field| {
-                matches!(
-                    field,
-                    ApprovalField::Passthrough {
-                        affects_execution: true
-                    }
-                )
-            })
+        !self.fields.values().any(|field| {
+            matches!(
+                field,
+                ApprovalField::Passthrough {
+                    affects_execution: true
+                }
+            )
+        })
     }
 }
 
@@ -63,8 +70,6 @@ fn approval_wire_sample(
     kind: &str,
     wire: serde_json::Value,
     sample: serde_json::Value,
-    classify: impl Fn(&str) -> ApprovalField,
-    expected: impl Fn(&str) -> ApprovalField,
 ) -> serde_json::Value {
     fn check(
         wire: &serde_json::Value,
@@ -108,22 +113,97 @@ fn approval_wire_sample(
     }
     let mut paths = Vec::new();
     check(&wire, &sample, "", &mut paths);
-    for path in &paths {
-        assert_eq!(classify(path), expected(path), "{codec}/{kind}/{path}");
-    }
     eprintln!(
         "APPROVAL_FIELDS {}",
-        serde_json::json!({"codec":codec,"kind":kind,"fields":paths.iter()
-        .map(|path| (path.clone(), format!("{:?}", expected(path)))).collect::<std::collections::BTreeMap<_, _>>()})
+        serde_json::json!({"codec":codec,"kind":kind,"fields":paths,"wire":wire})
     );
     sample
 }
 
+#[cfg(test)]
+#[test]
+fn grant_documentation_names_the_supported_fields_and_background_boundary() {
+    let architecture = include_str!("../../../../ARCHITECTURE.md");
+    for (prefix, fields) in [
+        (
+            "Claude offers an exact-command thread grant",
+            &["command", "description", "reason", "timeout"][..],
+        ),
+        (
+            "Codex offers a command grant",
+            &[
+                "threadId",
+                "turnId",
+                "itemId",
+                "startedAtMs",
+                "environmentId",
+                "kind",
+                "commandActions",
+                "availableDecisions",
+                "proposedExecpolicyAmendment",
+            ][..],
+        ),
+        (
+            "A request with rawInput.variant Bash",
+            &[
+                "description",
+                "reason",
+                "is_background:false",
+                "true or invalid",
+            ][..],
+        ),
+    ] {
+        let rule = architecture
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .expect("grant rule must remain documented");
+        for field in fields {
+            assert!(rule.contains(field), "grant rule omits {field}: {rule}");
+        }
+    }
+}
+
+#[cfg(test)]
+fn assert_approval_preview(action: &ProposedAction, expected: serde_json::Value, field: &str) {
+    let preview = match &action.target {
+        ApprovalTarget::Command { preview, .. }
+        | ApprovalTarget::File { preview, .. }
+        | ApprovalTarget::Tool { preview } => preview,
+    };
+    let text = if expected.as_object().is_some_and(|fields| fields.is_empty()) {
+        String::new()
+    } else {
+        serde_json::to_string_pretty(&expected).unwrap()
+    };
+    assert_eq!(preview.text, text, "preview carrying {field}");
+    assert!(!preview.truncated);
+}
+
+#[cfg(test)]
+fn approval_test_action(decoded: Decoded) -> ProposedAction {
+    assert!(decoded.replies.is_empty());
+    decoded
+        .events
+        .into_iter()
+        .find_map(|event| match event {
+            ProviderEvent::Turn {
+                event:
+                    TurnEvent::RequestOpened {
+                        kind: RequestKind::Approval { action },
+                        ..
+                    },
+                ..
+            } => Some(action),
+            _ => None,
+        })
+        .expect("approval must open")
+}
+
 fn approval_explanation<'a>(
     fields: impl IntoIterator<Item = (&'static str, Option<&'a str>)>,
-) -> Option<(&'static str, ApprovalPreview)> {
+) -> Option<(&'static str, ApprovalReason)> {
     fields.into_iter().find_map(|(field, text)| {
-        let mut preview = ApprovalPreview::new(text?.into());
+        let mut preview = ApprovalReason::new(text?.into());
         preview.explanation = Some(if field == "description" {
             ApprovalExplanation::Description
         } else {

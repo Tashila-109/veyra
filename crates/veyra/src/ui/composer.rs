@@ -117,8 +117,8 @@ pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<Qu
                             format!("{provider}'s reason (model-written)")
                         }
                     },
-                    &reason.text,
-                    reason.truncated,
+                    &reason.preview.text,
+                    reason.preview.truncated,
                 ));
             }
         }
@@ -1367,7 +1367,9 @@ mod command_preview_tests {
         let ApprovalTarget::Command { reason, .. } = &mut action.target else {
             unreachable!()
         };
-        *reason = Some(ApprovalPreview::new("Typed reason".into()));
+        *reason = Some(veyra_engine::domain::ApprovalReason::new(
+            "Typed reason".into(),
+        ));
         let quotes = super::approval_quotes(&action, "Claude Code");
         assert_eq!(quotes.len(), 1);
         assert_eq!(quotes[0].text, "“Typed reason”");
@@ -1475,7 +1477,9 @@ mod command_preview_tests {
                 ApprovalTarget::Command {
                     command: "printf check".into(),
                     cwd: CommandCwd::NotVerified,
-                    reason: Some(ApprovalPreview::new("Description shown separately".into())),
+                    reason: Some(veyra_engine::domain::ApprovalReason::new(
+                        "Description shown separately".into(),
+                    )),
                     preview: ApprovalPreview::new(residual.into()),
                 },
             );

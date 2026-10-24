@@ -577,5 +577,5 @@ fn command_reason_is_codec_owned_at_construction_and_hydrated_on_legacy_loading(
     let ApprovalTarget::Command { reason, .. } = loaded.target else {
         unreachable!()
     };
-    assert_eq!(reason.unwrap().text, "Explain this request");
+    assert_eq!(reason.unwrap().preview.text, "Explain this request");
 }

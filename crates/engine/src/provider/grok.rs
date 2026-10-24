@@ -1067,29 +1067,27 @@ impl Codec {
         }
         Ok(())
     }
-    fn approval_field(kind: &str, field: &str, shown: &[&str]) -> super::ApprovalField {
+    fn approval_field(
+        kind: &str,
+        field: &str,
+        value: &Value,
+        shown: &[&str],
+    ) -> super::ApprovalField {
         use super::ApprovalField::*;
         match field {
-            "toolCall.title" | "options" | "options[].kind" => Shown,
-            field if field.starts_with("toolCall.rawInput.") => {
-                let field = &field["toolCall.rawInput.".len()..];
-                match field {
-                    field if shown.contains(&field) => Shown,
-                    "description" | "reason" | "timeout" | "is_background" => Passthrough {
-                        affects_execution: false,
-                    },
-                    "variant" => Passthrough {
-                        affects_execution: kind != "Bash",
-                    },
-                    _ => Passthrough {
-                        affects_execution: true,
-                    },
-                }
-            }
-            "toolCall.rawInput" => Passthrough {
+            field if shown.contains(&field) => Shown,
+            "description" | "reason" | "timeout" => Passthrough {
                 affects_execution: false,
             },
-            _ => Metadata,
+            "is_background" => Passthrough {
+                affects_execution: value.as_bool() != Some(false),
+            },
+            "variant" => Passthrough {
+                affects_execution: kind != "Bash",
+            },
+            _ => Passthrough {
+                affects_execution: true,
+            },
         }
     }
     fn request(
@@ -1147,7 +1145,8 @@ impl Codec {
                                 permission.tool_call.raw_input["variant"]
                                     .as_str()
                                     .unwrap_or_default(),
-                                &format!("toolCall.rawInput.{field}"),
+                                field,
+                                &permission.tool_call.raw_input[field],
                                 &shown,
                             )
                         });
@@ -1156,7 +1155,7 @@ impl Codec {
                         tool: "Bash".into(),
                         command: command.into(),
                     });
-                    let residual = fields.residual(&permission.tool_call.raw_input);
+                    let preview = fields.preview(&permission.tool_call.raw_input);
                     let target = if let Some(command) = command {
                         ApprovalTarget::Command {
                             command: command.into(),
@@ -1166,12 +1165,10 @@ impl Codec {
                                 CommandCwd::NotVerified
                             },
                             reason: reason.map(|(_, preview)| preview),
-                            preview: ApprovalPreview::new(serde_json::to_string_pretty(&residual)?),
+                            preview,
                         }
                     } else {
-                        ApprovalTarget::Tool {
-                            preview: ApprovalPreview::new(serde_json::to_string_pretty(&residual)?),
-                        }
+                        ApprovalTarget::Tool { preview }
                     };
                     let mut action = ProposedAction::new(permission.tool_call.title, target)
                         .with_grant(grant_key);
@@ -1728,6 +1725,121 @@ mod wire_tests {
         }
     }
     #[test]
+    fn grok_recorded_live_foreground_grant_does_not_cover_background() {
+        let mut frame = serde_json::from_str::<Value>(
+            r###"
+{
+    "jsonrpc": "2.0",
+    "id": "recorded-approval",
+    "method": "session/request_permission",
+    "params": {
+        "sessionId": "veyra-grok-session",
+        "toolCall": {
+            "toolCallId": "recorded-approval",
+            "kind": "execute",
+            "title": "Execute `printf 'veyra\\n' > veyra-check.txt`",
+            "rawInput": {
+                "variant": "Bash",
+                "command": "printf 'veyra\\n' > veyra-check.txt",
+                "description": "Write veyra newline to check file",
+                "is_background": false
+            },
+            "_meta": {
+                "x.ai/tool": {
+                    "version": 1,
+                    "name": "run_terminal_command",
+                    "kind": "execute",
+                    "namespace": "grok_build",
+                    "label": "Run Command",
+                    "read_only": false,
+                    "input": {
+                        "command": "printf 'veyra\\n' > veyra-check.txt",
+                        "description": "Write veyra newline to check file"
+                    }
+                },
+                "x.ai/requestingSessionId": "<id:session>"
+            }
+        },
+        "options": [
+            {
+                "optionId": "always-allow",
+                "name": "Yes, and don't ask again for bash commands",
+                "kind": "allow_always"
+            },
+            {
+                "optionId": "allow-once",
+                "name": "Yes, proceed",
+                "kind": "allow_once"
+            },
+            {
+                "optionId": "reject-once",
+                "name": "No, and tell Grok what to do differently",
+                "kind": "reject_once"
+            },
+            {
+                "optionId": "reject-always",
+                "name": "No, and don't ask again for this command",
+                "kind": "reject_always"
+            }
+        ]
+    }
+}
+"###,
+        )
+        .unwrap();
+        let command = frame["params"]["toolCall"]["rawInput"]["command"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (mut codec, _) = boundary_codec();
+        let action = super::super::approval_test_action(codec.value(frame.clone()).unwrap());
+        assert_eq!(
+            action.consent.grant_key(),
+            Some(&GrantKey {
+                tool: "Bash".into(),
+                command: command.clone()
+            }),
+            "explicit foreground must retain the thread grant"
+        );
+        let ApprovalTarget::Command {
+            command: shown,
+            cwd,
+            reason,
+            preview,
+        } = &action.target
+        else {
+            panic!("recorded command target")
+        };
+        assert_eq!(shown, &command);
+        assert_eq!(cwd, &CommandCwd::ProjectFolder);
+        assert_eq!(
+            reason.as_ref().unwrap().preview.text,
+            "Write veyra newline to check file"
+        );
+        assert_eq!(
+            reason.as_ref().unwrap().explanation,
+            Some(ApprovalExplanation::Description)
+        );
+        assert_eq!(
+            preview.text,
+            serde_json::to_string_pretty(&json!({"variant":"Bash","is_background":false})).unwrap()
+        );
+        frame["id"] = json!("recorded-background");
+        frame["params"]["toolCall"]["rawInput"]["is_background"] = json!(true);
+        let background = super::super::approval_test_action(codec.value(frame).unwrap());
+        assert!(
+            background.consent.grant_key().is_none(),
+            "foreground grant must not cover background execution"
+        );
+        let ApprovalTarget::Command { preview, .. } = &background.target else {
+            panic!("background command")
+        };
+        assert_eq!(
+            preview.text,
+            serde_json::to_string_pretty(&json!({"variant":"Bash","is_background":true})).unwrap()
+        );
+    }
+    #[test]
     fn grok_all_approval_kinds_preserve_complete_fields() {
         for (index, (variant, command)) in [
             ("Bash", json!("printf check")),
@@ -1754,6 +1866,19 @@ mod wire_tests {
             frame["id"] = json!(format!("complete-{index}"));
             frame["params"]["toolCall"]["rawInput"] = input.clone();
             frame["params"]["toolCall"]["title"] = json!(variant);
+            frame["params"]["toolCall"]["kind"] = json!("execute");
+            frame["params"]["toolCall"]["locations"] = json!([{"path":"/project/file"}]);
+            frame["params"]["toolCall"]["_meta"] = json!({"x.ai/requestingSessionId":"internal-session",
+                "x.ai/tool":{"input":{"command":"printf check","description":"Tool documentation"},
+                    "kind":"execute",
+                        "label":"Run Command",
+                        "name":"run_terminal_command",
+                        "namespace":"grok_build",
+                        "read_only":false,
+                        "version":1}});
+            for option in frame["params"]["options"].as_array_mut().unwrap() {
+                option["name"] = json!("Consent option");
+            }
             frame["params"]["toolCall"]["status"] = json!("pending");
             frame["params"]["toolCall"]["rawOutput"] =
                 json!({"internalOutput":"not approval input"});
@@ -1761,11 +1886,6 @@ mod wire_tests {
                 json!([{"type":"text", "text":"internal content"}]);
             frame["params"]["_meta"]["promptIndex"] = json!(1);
             frame["params"]["_meta"]["isReplay"] = json!(false);
-            let shown: &[&str] = if index == 0 {
-                &["command", "reason"]
-            } else {
-                &[]
-            };
             frame["params"] = super::super::approval_wire_sample(
                 "grok",
                 variant,
@@ -1775,34 +1895,43 @@ mod wire_tests {
                 })
                 .unwrap(),
                 frame["params"].clone(),
-                |field| Codec::approval_field(variant, field, shown),
-                |field| {
-                    use super::super::ApprovalField::*;
-                    match field {
-                        "toolCall.title" | "options" | "options[].kind" => Shown,
-                        "toolCall.rawInput" => Passthrough {
-                            affects_execution: false,
-                        },
-                        field if field.starts_with("toolCall.rawInput.") => {
-                            match &field["toolCall.rawInput.".len()..] {
-                                field if shown.contains(&field) => Shown,
-                                "description" | "reason" | "timeout" | "is_background" => {
-                                    Passthrough {
-                                        affects_execution: false,
-                                    }
-                                }
-                                "variant" => Passthrough {
-                                    affects_execution: index != 0,
-                                },
-                                _ => Passthrough {
-                                    affects_execution: true,
-                                },
-                            }
-                        }
-                        _ => Metadata,
-                    }
-                },
             );
+            if index == 0 {
+                for (field, value) in input.as_object().unwrap() {
+                    let mut solo = json!({"variant":"Bash",
+                        "command":"printf check",
+                        "description":"Primary",
+                        "reason":"Secondary"});
+                    solo[field] = value.clone();
+                    let mut expected = solo.clone();
+                    let (mut codec, turn) = boundary_codec();
+                    let mut frame = fixture_frame(
+                        include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
+                        |frame| frame["method"] == "session/request_permission",
+                        turn,
+                    );
+                    frame["params"]["toolCall"]["rawInput"] = solo;
+                    let action = super::super::approval_test_action(codec.value(frame).unwrap());
+                    assert_eq!(
+                        action.consent.grant_key().is_some(),
+                        matches!(
+                            field.as_str(),
+                            "variant" | "command" | "description" | "reason" | "timeout"
+                        ),
+                        "grant carrying {field}"
+                    );
+                    let selected = if expected["description"].is_string() {
+                        "description"
+                    } else {
+                        "reason"
+                    };
+                    expected
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|key, _| key != "command" && key != selected);
+                    super::super::assert_approval_preview(&action, expected, field);
+                }
+            }
             let decoded = codec.value(frame).unwrap();
             let action = decoded
                 .events
@@ -1832,7 +1961,7 @@ mod wire_tests {
                     assert_eq!(variant, "Bash");
                     assert_eq!(command, "printf check");
                     assert_eq!(cwd, &CommandCwd::NotVerified);
-                    assert_eq!(reason.as_ref().unwrap().text, "Actual reason");
+                    assert_eq!(reason.as_ref().unwrap().preview.text, "Actual reason");
                     expected
                         .as_object_mut()
                         .unwrap()
@@ -1895,7 +2024,7 @@ mod wire_tests {
         assert_eq!(command, "printf check");
         assert_eq!(cwd, &CommandCwd::NotVerified);
         assert_eq!(
-            reason.as_ref().unwrap().text,
+            reason.as_ref().unwrap().preview.text,
             "Description shown separately"
         );
         let mut expected = input;

@@ -985,12 +985,19 @@ impl Codec {
             _ => {}
         }
     }
-    fn approval_field(kind: &str, field: &str, shown: &[&str]) -> super::ApprovalField {
+    fn approval_field(elicitation: bool, field: &str, shown: &[&str]) -> super::ApprovalField {
         use super::ApprovalField::*;
-        let elicitation = kind == "mcpServer/elicitation/request";
         match field {
-            "threadId" | "turnId" | "itemId" | "startedAtMs" => Metadata,
-            field if elicitation && (field == "_meta" || field.starts_with("_meta.")) => Metadata,
+            "threadId"
+            | "turnId"
+            | "itemId"
+            | "startedAtMs"
+            | "environmentId"
+            | "kind"
+            | "commandActions"
+            | "availableDecisions"
+            | "proposedExecpolicyAmendment" => Metadata,
+            "_meta" if elicitation => Metadata,
             field if shown.contains(&field) => Shown,
             "reason" | "description" => Passthrough {
                 affects_execution: false,
@@ -1035,23 +1042,13 @@ impl Codec {
             ));
             return;
         }
-        let approval_kind = match &request {
-            wire::Request::Command { .. } => "item/commandExecution/requestApproval",
-            wire::Request::File { .. } => "item/fileChange/requestApproval",
-            wire::Request::Permissions { .. } => "item/permissions/requestApproval",
-            wire::Request::Elicitation { .. } => "mcpServer/elicitation/request",
-            _ => "",
-        };
+        let elicitation = matches!(request, wire::Request::Elicitation { .. });
         let fields = |shown: &[&str]| {
             super::ApprovalFields::new(&params, |field| {
-                Self::approval_field(approval_kind, field, shown)
+                Self::approval_field(elicitation, field, shown)
             })
         };
-        let preview = |fields: &super::ApprovalFields| {
-            ApprovalPreview::new(
-                serde_json::to_string_pretty(&fields.residual(&params)).unwrap_or_default(),
-            )
-        };
+        let preview = |fields: &super::ApprovalFields| fields.preview(&params);
         let approval = |tool: String, target| RequestKind::Approval {
             action: ProposedAction::new(tool, target),
         };
@@ -1819,8 +1816,90 @@ mod tests {
             panic!("Codex command must have a typed command target")
         };
         assert_eq!(
-            preview.text, "{}",
+            preview.text, "",
             "wire metadata must not enter the dock preview"
+        );
+    }
+    #[test]
+    fn codex_recorded_live_command_preserves_display_and_grant() {
+        let frame = serde_json::from_str::<Value>(
+            r###"
+{
+    "method": "item/commandExecution/requestApproval",
+    "id": "recorded-approval",
+    "params": {
+        "kind": "command",
+        "threadId": "old-thread",
+        "turnId": "native-turn",
+        "itemId": "recorded-approval",
+        "startedAtMs": 1792512172985,
+        "environmentId": "local",
+        "command": "/bin/zsh -lc 'touch veyra-check.txt'",
+        "cwd": "/project",
+        "commandActions": [
+            {
+                "type": "unknown",
+                "command": "touch veyra-check.txt"
+            }
+        ],
+        "proposedExecpolicyAmendment": [
+            "touch",
+            "veyra-check.txt"
+        ],
+        "availableDecisions": [
+            "accept",
+            {
+                "acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": [
+                        "touch",
+                        "veyra-check.txt"
+                    ]
+                }
+            },
+            "cancel"
+        ]
+    }
+}
+"###,
+        )
+        .unwrap();
+        let command = frame["params"]["command"].as_str().unwrap().to_owned();
+        let mut codec = early_request_codec();
+        let action = super::super::approval_test_action(codec.value(frame).unwrap());
+        assert_eq!(
+            action.consent.grant_key(),
+            Some(&GrantKey {
+                tool: "Command".into(),
+                command: command.clone()
+            }),
+            "live metadata must retain the project command grant"
+        );
+        let ApprovalTarget::Command {
+            command: shown,
+            cwd,
+            reason,
+            preview,
+        } = &action.target
+        else {
+            panic!("recorded command target")
+        };
+        assert_eq!(shown, &command);
+        assert_eq!(cwd, &CommandCwd::ProjectFolder);
+        assert!(reason.is_none());
+        assert!(
+            preview.text.is_empty(),
+            "recorded metadata must leave no preview block: {:?}",
+            preview.text
+        );
+        let reply = codec
+            .answer(
+                NativeRequestRef("\"recorded-approval\"".into()),
+                Decision::AllowInThread,
+            )
+            .unwrap();
+        assert_eq!(
+            reply["result"]["decision"], "accept",
+            "thread grants must not select a policy amendment"
         );
     }
     #[test]
@@ -1845,11 +1924,6 @@ mod tests {
                 }),
             }
             .unwrap();
-            let shown: &[&str] = match index {
-                0 => &["command", "cwd", "reason"],
-                3 => &["serverName"],
-                _ => &[],
-            };
             let params = json!({"threadId":"old-thread", "turnId":"native-turn", "itemId":"invocation",
                 "startedAtMs":1,
                 "command":"printf check", "cwd":"/project", "reason":"Actual reason",
@@ -1858,36 +1932,74 @@ mod tests {
                 "changes":[{"path":"/project/file","kind":"update","diff":"whole diff"}],
                 "serverName":"veyra", "message":"Allow the veyra MCP server to run tool list_providers",
                 "mode":"form", "requestedSchema":{"type":"object","properties":{}},
-                "_meta":{"codex_approval_kind":"mcp_tool_call","unknownMeta":false},
+                "_meta":{"codex_approval_kind":"mcp_tool_call","unknownMeta":false,"persist":false,
+                    "tool_description":"Tool documentation","tool_params":{},"tool_params_display":"{}"},
                 "env":{"CHECK":"material"}, "networkAccess":false, "dangerouslyDisableSandbox":true,
                 "sandboxPolicy":{"type":"workspaceWrite"}, "availableDecisions":["accept","decline"],
+                "kind":"command",
+                    "environmentId":"local",
+                    "commandActions":[{"type":"unknown",
+                    "command":"printf check"}],
+
+                "proposedExecpolicyAmendment":["printf","check"],
                 "unknownFlag":false, "unknownObject":{"command":"nested material"},
                 "unknownArray":[1,"two",null]});
-            let params = super::super::approval_wire_sample(
-                "codex",
-                method,
-                wire,
-                params,
-                |field| Codec::approval_field(method, field, shown),
-                |field| {
-                    use super::super::ApprovalField::*;
-                    match field {
-                        "threadId" | "turnId" | "itemId" | "startedAtMs" => Metadata,
-                        field
-                            if index == 3 && (field == "_meta" || field.starts_with("_meta.")) =>
-                        {
-                            Metadata
-                        }
-                        field if shown.contains(&field) => Shown,
-                        "reason" | "description" => Passthrough {
-                            affects_execution: false,
-                        },
-                        _ => Passthrough {
-                            affects_execution: true,
-                        },
-                    }
-                },
-            );
+            let params = super::super::approval_wire_sample("codex", method, wire, params);
+            if index == 0 {
+                for (field, value) in params.as_object().unwrap() {
+                    let mut solo = json!({"threadId":"old-thread",
+                        "turnId":"native-turn",
+                        "command":"printf check",
+                        "cwd":"/project",
+                        "reason":"Primary"});
+                    solo[field] = value.clone();
+                    let mut expected = solo.clone();
+                    let mut codec = early_request_codec();
+                    let action = super::super::approval_test_action(
+                        codec
+                            .value(json!({"id":"one-field","method":method,"params":solo}))
+                            .unwrap(),
+                    );
+                    assert_eq!(
+                        action.consent.grant_key().is_some(),
+                        matches!(
+                            field.as_str(),
+                            "threadId"
+                                | "turnId"
+                                | "itemId"
+                                | "startedAtMs"
+                                | "kind"
+                                | "environmentId"
+                                | "commandActions"
+                                | "availableDecisions"
+                                | "proposedExecpolicyAmendment"
+                                | "command"
+                                | "cwd"
+                                | "reason"
+                                | "description"
+                        ),
+                        "grant carrying {field}"
+                    );
+                    expected.as_object_mut().unwrap().retain(|key, _| {
+                        !matches!(
+                            key.as_str(),
+                            "threadId"
+                                | "turnId"
+                                | "itemId"
+                                | "startedAtMs"
+                                | "kind"
+                                | "environmentId"
+                                | "commandActions"
+                                | "availableDecisions"
+                                | "proposedExecpolicyAmendment"
+                                | "command"
+                                | "cwd"
+                                | "reason"
+                        )
+                    });
+                    super::super::assert_approval_preview(&action, expected, field);
+                }
+            }
             let decoded = codec
                 .value(json!({"id":format!("complete-{index}"), "method":method,
                 "params":params}))
@@ -1912,7 +2024,15 @@ mod tests {
             expected.as_object_mut().unwrap().retain(|field, _| {
                 !matches!(
                     field.as_str(),
-                    "threadId" | "turnId" | "itemId" | "startedAtMs"
+                    "threadId"
+                        | "turnId"
+                        | "itemId"
+                        | "startedAtMs"
+                        | "environmentId"
+                        | "kind"
+                        | "commandActions"
+                        | "availableDecisions"
+                        | "proposedExecpolicyAmendment"
                 )
             });
             if index == 3 {
@@ -1931,7 +2051,7 @@ mod tests {
                     assert_eq!(tool, "Command");
                     assert_eq!(command, "printf check");
                     assert_eq!(cwd, &CommandCwd::ProjectFolder);
-                    assert_eq!(reason.as_ref().unwrap().text, "Actual reason");
+                    assert_eq!(reason.as_ref().unwrap().preview.text, "Actual reason");
                     expected
                         .as_object_mut()
                         .unwrap()
@@ -2016,7 +2136,10 @@ mod tests {
                 panic!("command approval")
             };
             assert_eq!(command, "touch veyra-check.txt");
-            assert_eq!(reason.as_ref().unwrap().text, "Create the requested file");
+            assert_eq!(
+                reason.as_ref().unwrap().preview.text,
+                "Create the requested file"
+            );
             assert_eq!(
                 location,
                 &if cwd.as_str().is_some_and(|path| !path.is_empty()) {

@@ -369,7 +369,7 @@ pub(super) enum Request {
     #[serde(rename = "item/commandExecution/requestApproval")]
     Command {
         #[serde(default)]
-        params: CommandApproval,
+        params: Box<CommandApproval>,
     },
     #[serde(rename = "item/fileChange/requestApproval")]
     File {
@@ -407,7 +407,7 @@ impl Request {
     }
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub(super) struct CommandApproval {
     #[serde(flatten)]
     pub scope: Scope,
@@ -415,6 +415,11 @@ pub(super) struct CommandApproval {
     pub cwd: Option<String>,
     pub reason: Option<String>,
     pub description: Option<Value>,
+    pub kind: Option<Value>,
+    pub environment_id: Option<Value>,
+    pub command_actions: Option<Value>,
+    pub proposed_execpolicy_amendment: Option<Value>,
+    pub available_decisions: Option<Value>,
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]

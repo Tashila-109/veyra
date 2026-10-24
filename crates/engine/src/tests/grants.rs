@@ -476,3 +476,75 @@ fn codex_material_fields_offer_no_grant_and_changed_requests_dock() {
         }
     }
 }
+
+#[test]
+fn grok_foreground_grant_cannot_answer_a_later_background_command() {
+    let mut f = Fixture::new(LiveState::Running);
+    let mut codec = crate::provider::grok::Codec::new(
+        SessionSpec {
+            thread: f.thread,
+            cwd: "/project".into(),
+            config: config(),
+            native: None,
+            root: false,
+        },
+        1,
+        None,
+        false,
+    );
+    codec.initialize();
+    codec.value(json!({"id":1,"result":{}})).unwrap();
+    codec
+        .value(json!({"id":2,"result":{"sessionId":"native"}}))
+        .unwrap();
+    codec.start(f.running().unwrap(), "grant".into()).unwrap();
+    for (id, background) in [("foreground", false), ("same", false), ("background", true)] {
+        let decoded = codec.value(json!({"id":id,"method":"session/request_permission","params":{
+            "sessionId":"native","toolCall":{"toolCallId":id,"title":"Execute command","rawInput":{
+                "variant":"Bash","command":"printf check","is_background":background}},
+            "options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}})).unwrap();
+        for event in decoded.events {
+            f.event(event);
+        }
+        let request = f
+            .loaded()
+            .requests
+            .values()
+            .find(|request| request.native == NativeRequestRef(format!("\"{id}\"")))
+            .unwrap()
+            .clone();
+        if id == "foreground" {
+            assert!(
+                request.kind.grant_key().is_some(),
+                "explicit foreground must offer its thread grant"
+            );
+            f.command(Command::Respond {
+                request: request.id,
+                decision: Decision::AllowInThread,
+            })
+            .unwrap();
+            f.controls.try_recv().unwrap();
+        } else if background {
+            assert!(request.kind.grant_key().is_none());
+            assert_eq!(
+                request.state,
+                RequestState::Pending,
+                "foreground grant authorized background execution"
+            );
+            assert!(f.controls.try_recv().is_err());
+            assert!(f.drain().iter().any(|event| matches!(event,
+                UiEvent::Change {event:crate::events::ChangeEvent::RequestOpened(opened),
+                ..} if opened.id==request.id)));
+        } else {
+            assert_eq!(request.state, RequestState::Answered(Decision::AllowOnce));
+            assert!(matches!(
+                f.controls.try_recv().unwrap(),
+                SessionControl::Answer {
+                    reply: Decision::AllowOnce,
+                    ..
+                }
+            ));
+        }
+        f.drain();
+    }
+}

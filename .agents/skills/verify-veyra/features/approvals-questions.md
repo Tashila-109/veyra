@@ -60,7 +60,7 @@ thread = create('claude-command-unverified-cwd','Review the command folder',scen
 dock = poll('claude-command-unverified-cwd',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert dock['request']['kind']['Approval']['action']['target']['cwd']=='not_verified'
 assert dock['consequence']=='Claude Code will run this command at a location that is not verified.'
-assert json.loads(dock['preview'])=={'cwd':'/elsewhere/other-project','reason':'Additional reason'}
+assert json.loads(dock['preview'] or '{}')=={'cwd':'/elsewhere/other-project','reason':'Additional reason'}
 assert dock['provider_text']==[{'kind':'reason','label':"Claude Code's description",'text':'“Description shown separately”'}]
 assert not dock['allow_in_thread_enabled']
 capture('claude-command-unverified-cwd')
@@ -139,7 +139,7 @@ for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve(
     assert dock['action_text'] == 'Write '+target
     assert dock['consequence'] == 'Claude Code writes a file '+place+' the project folder.'
     assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
-    assert json.loads(dock['preview']) == {'content':'veyra check'}
+    assert json.loads(dock['preview'] or '{}') == {'content':'veyra check'}
     capture('approval-write-'+place)
     action('approval-write-'+place+'-focus','FocusDock')
     ctl('approval-write-'+place+'-allow','keys','secondary-enter')
@@ -159,7 +159,7 @@ for label, tool, arguments in [
     thread = create('approval-'+label,'Approve the tool arguments',scenario=None)
     dump = poll('approval-'+label,lambda d: d['composer']['dock'] is not None)
     dock = dump['composer']['dock']
-    preview = json.loads(dock['preview'])
+    preview = json.loads(dock['preview'] or '{}')
     if label == 'notebook-edit':
         assert dock['action_text'] == tool+' '+arguments['notebook_path']
         assert dock['consequence'] == 'Claude Code edits a file inside the project folder.'
@@ -417,7 +417,8 @@ thread = create_codex('codex-command-description',records=records)
 dock = poll('codex-command-description',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert dock['provider_text'][-1]=={'kind':'reason','label':"Codex's description",'text':'“Description shown separately”'}
 assert dock['request']['kind']['Approval']['action']['target']['reason']['explanation']=='description'
-assert 'description' not in json.loads(dock['preview'])
+assert dock['preview']=='', 'A fully mapped command must have no preview block'
+assert 'description' not in json.loads(dock['preview'] or '{}')
 capture('codex-command-description')
 action('codex-command-description-answer','AllowOnce',{'request':dock['request']['id']})
 ctl('codex-command-description-done','wait',thread,'Done')
@@ -432,11 +433,11 @@ extra = create_codex('codex-extra-fields',records=records)
 extra_dock = poll('codex-extra-fields',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert 'unknownCapability' in extra_dock['preview'] and 'write everything' in extra_dock['preview']
 assert 'dangerouslyDisableSandbox' in extra_dock['preview'] and 'true' in extra_dock['preview']
-assert json.loads(extra_dock['preview'])['env']=={'CHECK':'material'}
-assert json.loads(extra_dock['preview'])['networkAccess'] is True
-assert json.loads(extra_dock['preview'])['description']=='Additional description'
+assert json.loads(extra_dock['preview'] or '{}')['env']=={'CHECK':'material'}
+assert json.loads(extra_dock['preview'] or '{}')['networkAccess'] is True
+assert json.loads(extra_dock['preview'] or '{}')['description']=='Additional description'
 assert any(quote['kind']=='reason' and 'Create the requested file' in quote['text'] for quote in extra_dock['provider_text'])
-assert all(key not in json.loads(extra_dock['preview']) for key in ('threadId','turnId','itemId'))
+assert all(key not in json.loads(extra_dock['preview'] or '{}') for key in ('threadId','turnId','itemId'))
 assert not extra_dock['allow_in_thread_enabled']
 assert extra_dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
 assert extra_dock['action_text']=='printf e'+'\u0301'*3+'⟨U+0301⟩'*4
@@ -475,7 +476,8 @@ first = poll('codex-grant-in-project',lambda d:d['composer']['dock'] is not None
 grant = first['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant')
 assert grant is not None, 'A plain project-folder Codex command with wire metadata must offer a thread grant'
 assert grant['command']=='touch veyra-check.txt'
-assert 'startedAtMs' not in json.loads(first['preview']), 'Wire timestamps must not enter the dock preview'
+assert first['preview']=='', 'A plain project-folder command must have no preview block'
+assert 'startedAtMs' not in json.loads(first['preview'] or '{}'), 'Wire timestamps must not enter the dock preview'
 capture('codex-grant-in-project')
 action('codex-grant-project','AllowInThread',{'request':first['request']['id']})
 other = poll('codex-command-other-cwd',lambda d:d['composer']['dock'] is not None and d['composer']['dock']['request']['id']!=first['request']['id'])['composer']['dock']
@@ -735,7 +737,7 @@ thread = create_grok('grok-command-unverified-cwd',records=records,prompt='Revie
 dock = poll('grok-command-unverified-cwd',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert dock['request']['kind']['Approval']['action']['target']['cwd']=='not_verified'
 assert dock['consequence']=='Grok will run this command at a location that is not verified.'
-preview = json.loads(dock['preview'])
+preview = json.loads(dock['preview'] or '{}')
 assert preview['cwd']=='/elsewhere/other-project' and preview['reason']=='Additional reason'
 assert preview['env']=={'CHECK':'material'} and preview['networkAccess'] is True
 assert preview['dangerouslyDisableSandbox'] is True and 'toolCallId' not in preview
@@ -757,14 +759,14 @@ assert selected['composer']['mode']=='ask_first'
 assert selected['composer']['offered_modes']==['ask_first','full_access']
 dock = poll('grok-accept-edits-inside',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert json.loads(dock['request']['native'])=='edit-inside' and dock['action_text']=='Edit inside'
-assert json.loads(dock['preview'])['file_path']=='inside.txt'
+assert json.loads(dock['preview'] or '{}')['file_path']=='inside.txt'
 assert not (DATA/'project/inside.txt').exists()
 assert sql("select count(*) from requests where thread_id='"+thread+"'")=='1'
 capture('grok-accept-edits-inside')
 action('grok-accept-edits-allow-inside','AllowOnce',{'request':dock['request']['id']})
 dock = poll('grok-accept-edits-outside',lambda d:d['composer']['dock'] is not None and json.loads(d['composer']['dock']['request']['native'])=='edit-outside')['composer']['dock']
 assert (DATA/'project/inside.txt').exists()
-assert json.loads(dock['preview'])['file_path']=='/veyra-outside/file.txt'
+assert json.loads(dock['preview'] or '{}')['file_path']=='/veyra-outside/file.txt'
 assert sql("select count(*) from requests where thread_id='"+thread+"'")=='2'
 assert json.loads(dock['request']['native'])=='edit-outside' and dock['action_text']=='Edit outside'
 capture('grok-accept-edits-outside')
