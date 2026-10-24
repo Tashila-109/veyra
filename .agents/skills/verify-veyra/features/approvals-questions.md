@@ -429,7 +429,9 @@ request = next(record['line']['params'] for record in records if record.get('typ
 request['environmentId']='remote'
 thread = create_codex('codex-command-nonlocal-environment',records=records)
 dock = poll('codex-command-nonlocal-environment',lambda d:d['composer']['dock'] is not None)['composer']['dock']
-assert json.loads(dock['preview'] or '{}')=={'environmentId':'remote'}
+assert json.loads(dock['preview'] or '{}')=={'cwd':os.path.realpath(DATA/'project'),'environmentId':'remote'}
+assert dock['consequence']=='Codex will run this command at a location that is not verified.'
+assert not any(value['kind']=='working_folder' for value in dock['provider_text'])
 assert dock['request']['kind']['Approval']['action'].get('consent') is None
 assert dock['allow_once_enabled'] and not dock['allow_in_thread_enabled'] and dock['grant_caption'] is None
 capture('codex-command-nonlocal-environment')
@@ -524,10 +526,19 @@ done = ctl('codex-question-done','wait',thread,'Done')
 assert done['composer']['dock'] is None
 assert any(item['kind']=='user' and 'Violet' in item['text'] for item in done['transcript']['items'])
 assert 'Violet' in sql("select decision_json from requests where thread_id='"+thread+"'")
-thread = create_codex('codex-mcp',scenario='mcp-tool-approval')
+records = codex_records('mcp-tool-approval')
+request = next(record['line']['params'] for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('method')=='mcpServer/elicitation/request')
+request['message']='Allow the veyra MCP server to run tool "probe_echo"?'
+request['_meta']['tool_params']={'text':'recorded-text'}
+request['_meta']['tool_params_display']=[{'name':'text','value':'recorded-text','display_name':'text'}]
+thread = create_codex('codex-mcp',records=records)
 for label,decision in [('first','AllowOnce'),('second','Deny')]:
     dock = poll('codex-mcp-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
-    assert dock['action_text']=='veyra / list_providers'
+    assert dock['action_text']=='veyra / '+('probe_echo' if label=='first' else 'list_providers')
+    if label=='first':
+        assert json.loads(dock['preview'])['_meta']=={'tool_params':{'text':'recorded-text'},
+            'tool_params_display':[{'name':'text','value':'recorded-text','display_name':'text'}]}
     assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
     if label=='second':
         action('codex-mcp-second-focus','FocusDock')
@@ -909,7 +920,7 @@ Description labels are “Claude Code's description”, “Codex's description�
 `claude-command-unverified-cwd.png` shows an unverified-location consequence, the literal unresolved cwd and no thread grant.
 The Codex extra-fields PNG keeps its environment, network and sandbox values visible with the thread-grant button absent.
 `codex-grant-in-project.png` shows the normal project-folder thread-grant offer with wire timestamps absent from the preview.
-`codex-command-nonlocal-environment.png` keeps the non-local environment visible and has no thread-grant control.
+`codex-command-nonlocal-environment.png` keeps the non-local environment and literal cwd visible, says the location is not verified, and has no working-folder quote or thread-grant control.
 `grok-search-replace.png` retains the edit's variant, file path, old and new strings and replace_all value; it has no thread-grant control.
 The async-question PNG shows the complete two-paragraph markdown reply above the quoted sanitized title, option controls and choice consequence; its stored UserText preserves the option's exact bidi-bearing bytes while its bubble displays Violet.
 The chosen PNG retains the question, shows Answered beside Violet and disables both controls.

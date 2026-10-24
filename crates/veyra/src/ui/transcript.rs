@@ -191,7 +191,7 @@ pub(super) fn markdown_text(item: &Item) -> Option<SharedString> {
 struct ReplyLineBreaks;
 fn soft_break_offsets(node: &markdown_ast::Node, source: &str, offsets: &mut Vec<usize>) {
     if let markdown_ast::Node::Text(text) = node {
-        if text.value.contains(['\n', '\r'])
+        if (text.value.contains('\n') || text.value.contains('\r'))
             && let Some(position) = node.position()
         {
             let raw = &source[position.start.offset..position.end.offset];
@@ -2041,38 +2041,46 @@ mod tests {
             }
         }
         cx.update(gpui_kit::init);
-        let item = Item {
-            id: ItemId::new(),
-            thread: ThreadId::new(),
-            turn: TurnId::new(),
-            seq: 0,
-            body: ItemBody::AssistantText {
-                text: "first line\n**second line**\nthird line".into(),
-                done: true,
-            },
-        };
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
-            Reply(item)
-        });
-        let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
-        let line = cx.update(|window, _| theme.text.read.line_height.to_pixels(window.rem_size()));
-        for _ in 0..3 {
-            cx.run_until_parked();
-            cx.draw(
-                Point::default(),
-                size(
-                    AvailableSpace::Definite(theme.layout.transcript_min),
-                    AvailableSpace::Definite(theme.layout.window_default.height),
-                ),
-                |_, _| div().child(view.clone()),
+        for text in [
+            "first line\n**second line**\nthird line",
+            "first line\r\n**second line**\r\nthird line",
+            "first line\r**second line**\rthird line",
+            "é first line\n**第二行**\nτρίτη line",
+        ] {
+            let item = Item {
+                id: ItemId::new(),
+                thread: ThreadId::new(),
+                turn: TurnId::new(),
+                seq: 0,
+                body: ItemBody::AssistantText {
+                    text: text.into(),
+                    done: true,
+                },
+            };
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                super::Theme::apply(crate::ui::theme::Appearance::Dark, window, cx);
+                Reply(item)
+            });
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            let line =
+                cx.update(|window, _| theme.text.read.line_height.to_pixels(window.rem_size()));
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.draw(
+                    Point::default(),
+                    size(
+                        AvailableSpace::Definite(theme.layout.transcript_min),
+                        AvailableSpace::Definite(theme.layout.window_default.height),
+                    ),
+                    |_, _| div().child(view.clone()),
+                );
+            }
+            let height = cx.debug_bounds("reply-lines").unwrap().size.height;
+            assert!(
+                height >= line * 3.,
+                "three provider lines collapsed: {height:?}"
             );
         }
-        let height = cx.debug_bounds("reply-lines").unwrap().size.height;
-        assert!(
-            height >= line * 3.,
-            "three provider lines collapsed: {height:?}"
-        );
     }
     #[test]
     fn tool_input_formats_arguments_without_a_stored_summary() {
