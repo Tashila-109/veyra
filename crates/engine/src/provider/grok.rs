@@ -1067,23 +1067,15 @@ impl Codec {
         }
         Ok(())
     }
-    fn approval_field(
-        kind: &str,
-        field: &str,
-        value: &Value,
-        shown: &[&str],
-    ) -> super::ApprovalField {
+    fn approval_field(field: &str, value: &Value, shown: &[&str]) -> super::ApprovalField {
         use super::ApprovalField::*;
         match field {
             field if shown.contains(&field) => Shown,
-            "description" | "reason" | "timeout" => Passthrough {
+            "description" | "reason" | "timeout" | "variant" => Passthrough {
                 affects_execution: false,
             },
             "is_background" => Passthrough {
                 affects_execution: value.as_bool() != Some(false),
-            },
-            "variant" => Passthrough {
-                affects_execution: kind != "Bash",
             },
             _ => Passthrough {
                 affects_execution: true,
@@ -1142,9 +1134,6 @@ impl Codec {
                     let fields =
                         super::ApprovalFields::new(&permission.tool_call.raw_input, |field| {
                             Self::approval_field(
-                                permission.tool_call.raw_input["variant"]
-                                    .as_str()
-                                    .unwrap_or_default(),
                                 field,
                                 &permission.tool_call.raw_input[field],
                                 &shown,
@@ -1840,10 +1829,116 @@ mod wire_tests {
         );
     }
     #[test]
+    fn grok_recorded_search_replace_preserves_every_edit_argument() {
+        let frame = serde_json::from_str::<Value>(
+            r###"{
+  "jsonrpc": "2.0",
+  "id": "recorded-edit",
+  "method": "session/request_permission",
+  "params": {
+    "sessionId": "veyra-grok-session",
+    "toolCall": {
+      "toolCallId": "recorded-edit",
+      "kind": "edit",
+      "title": "Edit `<cwd>/permission-project.txt`",
+      "rawInput": {
+        "variant": "SearchReplace",
+        "file_path": "<cwd>/permission-project.txt",
+        "old_string": "",
+        "new_string": "veyra permission probe\n",
+        "replace_all": false
+      },
+      "_meta": {
+        "x.ai/tool": {
+          "version": 1,
+          "name": "search_replace",
+          "kind": "edit",
+          "namespace": "grok_build",
+          "label": "Edit",
+          "read_only": false,
+          "input": {
+            "path": "<cwd>/permission-project.txt"
+          }
+        },
+        "x.ai/requestingSessionId": "veyra-grok-session"
+      }
+    },
+    "options": [
+      {
+        "optionId": "allow-edits-session",
+        "name": "Yes, allow all edits during this session",
+        "kind": "allow_always"
+      },
+      {
+        "optionId": "allow-once",
+        "name": "Yes",
+        "kind": "allow_once"
+      },
+      {
+        "optionId": "reject-once",
+        "name": "No, and tell Grok what to do differently",
+        "kind": "reject_once"
+      }
+    ]
+  }
+}"###,
+        )
+        .unwrap();
+        let (mut codec, _) = boundary_codec();
+        let action = super::super::approval_test_action(codec.value(frame).unwrap());
+        assert_eq!(action.tool, "Edit `<cwd>/permission-project.txt`");
+        assert!(action.consent.grant_key().is_none());
+        assert!(matches!(action.target, ApprovalTarget::Tool { .. }));
+        super::super::assert_approval_preview(
+            &action,
+            json!({
+                "variant":"SearchReplace", "file_path":"<cwd>/permission-project.txt",
+                "old_string":"", "new_string":"veyra permission probe\n", "replace_all":false
+            }),
+            "recorded SearchReplace",
+        );
+        let reply = codec
+            .answer(
+                NativeRequestRef("\"recorded-edit\"".into()),
+                Decision::AllowOnce,
+            )
+            .unwrap();
+        assert_eq!(
+            reply["result"]["outcome"],
+            json!({"outcome":"selected","optionId":"allow-once"})
+        );
+    }
+    #[test]
+    fn grok_invalid_background_stays_visible_and_withholds_grant() {
+        for background in [json!("false"), json!(0), Value::Null, json!([]), json!({})] {
+            let (mut codec, turn) = boundary_codec();
+            let mut frame = fixture_frame(
+                include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
+                |frame| frame["method"] == "session/request_permission",
+                turn,
+            );
+            frame["params"]["toolCall"]["rawInput"] = json!({
+                "variant":"Bash", "command":"printf check", "is_background":background
+            });
+            let action = super::super::approval_test_action(codec.value(frame).unwrap());
+            assert!(action.consent.grant_key().is_none(), "{background}");
+            let ApprovalTarget::Command { cwd, .. } = &action.target else {
+                panic!("invalid background command")
+            };
+            assert_eq!(cwd, &CommandCwd::NotVerified);
+            super::super::assert_approval_preview(
+                &action,
+                json!({"variant":"Bash", "is_background":background}),
+                "is_background",
+            );
+        }
+    }
+    #[test]
     fn grok_all_approval_kinds_preserve_complete_fields() {
         for (index, (variant, command)) in [
             ("Bash", json!("printf check")),
             ("Edit", json!(42)),
+            ("SearchReplace", Value::Null),
             ("mcp__local__change", json!({"nested":"command"})),
             ("FutureTool", Value::Null),
         ]
@@ -1860,7 +1955,7 @@ mod wire_tests {
                 "description":{"nested":"not a string"}, "reason":"Actual reason", "timeout":1500,
                 "is_background":true, "file_path":"relative/file", "path":"relative/file",
                 "notebook_path":"relative/file", "content":"whole file", "old_string":"old",
-                "new_string":"new", "env":{"CHECK":"material"}, "networkAccess":false,
+                "new_string":"new", "replace_all":false, "env":{"CHECK":"material"}, "networkAccess":false,
                 "dangerouslyDisableSandbox":true, "itemId":"argument identity", "unknownFlag":false,
                 "unknownObject":{"command":"nested material"}, "unknownArray":[1,"two",null]});
             frame["id"] = json!(format!("complete-{index}"));

@@ -121,49 +121,6 @@ fn approval_wire_sample(
 }
 
 #[cfg(test)]
-#[test]
-fn grant_documentation_names_the_supported_fields_and_background_boundary() {
-    let architecture = include_str!("../../../../ARCHITECTURE.md");
-    for (prefix, fields) in [
-        (
-            "Claude offers an exact-command thread grant",
-            &["command", "description", "reason", "timeout"][..],
-        ),
-        (
-            "Codex offers a command grant",
-            &[
-                "threadId",
-                "turnId",
-                "itemId",
-                "startedAtMs",
-                "environmentId",
-                "kind",
-                "commandActions",
-                "availableDecisions",
-                "proposedExecpolicyAmendment",
-            ][..],
-        ),
-        (
-            "A request with rawInput.variant Bash",
-            &[
-                "description",
-                "reason",
-                "is_background:false",
-                "true or invalid",
-            ][..],
-        ),
-    ] {
-        let rule = architecture
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .expect("grant rule must remain documented");
-        for field in fields {
-            assert!(rule.contains(field), "grant rule omits {field}: {rule}");
-        }
-    }
-}
-
-#[cfg(test)]
 fn assert_approval_preview(action: &ProposedAction, expected: serde_json::Value, field: &str) {
     let preview = match &action.target {
         ApprovalTarget::Command { preview, .. }

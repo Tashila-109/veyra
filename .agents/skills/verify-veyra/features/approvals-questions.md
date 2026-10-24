@@ -426,6 +426,19 @@ ctl('codex-command-description-done','wait',thread,'Done')
 records = codex_records('approval-command')
 request = next(record['line']['params'] for record in records if record.get('type')=='emit_inbound'
     and record.get('line',{}).get('method')=='item/commandExecution/requestApproval')
+request['environmentId']='remote'
+thread = create_codex('codex-command-nonlocal-environment',records=records)
+dock = poll('codex-command-nonlocal-environment',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert json.loads(dock['preview'] or '{}')=={'environmentId':'remote'}
+assert dock['request']['kind']['Approval']['action'].get('consent') is None
+assert dock['allow_once_enabled'] and not dock['allow_in_thread_enabled'] and dock['grant_caption'] is None
+capture('codex-command-nonlocal-environment')
+action('codex-command-nonlocal-environment-answer','AllowOnce',{'request':dock['request']['id']})
+ctl('codex-command-nonlocal-environment-done','wait',thread,'Done')
+
+records = codex_records('approval-command')
+request = next(record['line']['params'] for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('method')=='item/commandExecution/requestApproval')
 raw_marks='e'+'\u0301'*7
 request.update(unknownCapability='write everything',dangerouslyDisableSandbox=True,
     env={'CHECK':'material'},networkAccess=True,description='Additional description',command='printf '+raw_marks)
@@ -745,6 +758,21 @@ assert any(quote['kind']=='reason' and quote['label']=="Grok's description" and 
 capture('grok-command-unverified-cwd')
 action('grok-command-unverified-cwd-answer','Deny',{'request':dock['request']['id']})
 ctl('grok-command-unverified-cwd-done','wait',thread,'Interrupted')
+records = grok_records('approval-deny')
+permission = next(record['line']['params']['toolCall'] for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('method')=='session/request_permission')
+edit_input = {'variant':'SearchReplace','file_path':str(DATA/'project/permission-project.txt'),
+    'old_string':'','new_string':'veyra permission probe\n','replace_all':False}
+permission.update(kind='edit',title='Edit permission-project.txt',rawInput=edit_input)
+thread = create_grok('grok-search-replace',records=records,prompt='Review every edit argument')
+dock = poll('grok-search-replace',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert dock['action_text']=='Edit permission-project.txt'
+assert json.loads(dock['preview'] or '{}')==edit_input
+assert dock['request']['kind']['Approval']['action'].get('consent') is None
+assert dock['allow_once_enabled'] and not dock['allow_in_thread_enabled'] and dock['grant_caption'] is None
+capture('grok-search-replace')
+action('grok-search-replace-answer','Deny',{'request':dock['request']['id']})
+ctl('grok-search-replace-done','wait',thread,'Interrupted')
 stage_records(grok_records('approval-accept-edits'))
 action('grok-accept-edits-new','NewThread')
 action('grok-accept-edits-provider','PickProvider',{'provider':'grok'})
@@ -881,6 +909,8 @@ Description labels are “Claude Code's description”, “Codex's description�
 `claude-command-unverified-cwd.png` shows an unverified-location consequence, the literal unresolved cwd and no thread grant.
 The Codex extra-fields PNG keeps its environment, network and sandbox values visible with the thread-grant button absent.
 `codex-grant-in-project.png` shows the normal project-folder thread-grant offer with wire timestamps absent from the preview.
+`codex-command-nonlocal-environment.png` keeps the non-local environment visible and has no thread-grant control.
+`grok-search-replace.png` retains the edit's variant, file path, old and new strings and replace_all value; it has no thread-grant control.
 The async-question PNG shows the complete two-paragraph markdown reply above the quoted sanitized title, option controls and choice consequence; its stored UserText preserves the option's exact bidi-bearing bytes while its bubble displays Violet.
 The chosen PNG retains the question, shows Answered beside Violet and disables both controls.
 Command-1 chooses the latest-turn card.
@@ -977,6 +1007,7 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "codex-command.json",
       "codex-command.png",
       "codex-command-description.png",
+      "codex-command-nonlocal-environment.png",
       "codex-grant-in-project.png",
       "codex-command-other-cwd.png",
       "codex-file.png",
@@ -996,6 +1027,7 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
     ],
     "approvals-questions-grok": [
       "grok-command-unverified-cwd.png",
+      "grok-search-replace.png",
       "grok-approval-deny.png",
       "grok-approval-allow.png",
       "grok-deny-only.json",

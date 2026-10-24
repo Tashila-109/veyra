@@ -478,6 +478,67 @@ fn codex_material_fields_offer_no_grant_and_changed_requests_dock() {
 }
 
 #[test]
+fn codex_nonlocal_environment_cannot_reuse_a_local_grant() {
+    let mut f = Fixture::new(LiveState::Running);
+    let runtime = f.runtime.handle().clone();
+    let _entered = runtime.enter();
+    let mut codec = codex_grant_codec(&f);
+    for (index, environment) in [json!("local"), json!("local"), json!("remote"), json!(null)]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("environment-{index}");
+        let decoded = codec
+            .value(
+                json!({"id":id,"method":"item/commandExecution/requestApproval",
+            "params":{"threadId":"codex-thread","turnId":"native-turn","itemId":id,
+                "command":"printf check","cwd":"/tmp","environmentId":environment}}),
+            )
+            .unwrap();
+        for event in decoded.events {
+            f.event(event);
+        }
+        let request = f
+            .loaded()
+            .requests
+            .values()
+            .find(|request| request.native == NativeRequestRef(format!("\"{id}\"")))
+            .unwrap()
+            .clone();
+        if index == 0 {
+            assert!(request.kind.grant_key().is_some());
+            f.command(Command::Respond {
+                request: request.id,
+                decision: Decision::AllowInThread,
+            })
+            .unwrap();
+            f.controls.try_recv().unwrap();
+        } else if index == 1 {
+            assert_eq!(request.state, RequestState::Answered(Decision::AllowOnce));
+            assert!(matches!(
+                f.controls.try_recv().unwrap(),
+                SessionControl::Answer {
+                    reply: Decision::AllowOnce,
+                    ..
+                }
+            ));
+        } else {
+            assert!(request.kind.grant_key().is_none(), "{environment}");
+            assert_eq!(
+                request.state,
+                RequestState::Pending,
+                "local grant authorized {environment}"
+            );
+            assert!(f.controls.try_recv().is_err());
+            assert!(f.drain().iter().any(|event| matches!(event,
+                UiEvent::Change {event:crate::events::ChangeEvent::RequestOpened(opened), ..}
+                    if opened.id == request.id)));
+        }
+        f.drain();
+    }
+}
+
+#[test]
 fn grok_foreground_grant_cannot_answer_a_later_background_command() {
     let mut f = Fixture::new(LiveState::Running);
     let mut codec = crate::provider::grok::Codec::new(

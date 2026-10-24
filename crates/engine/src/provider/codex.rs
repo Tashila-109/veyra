@@ -985,18 +985,23 @@ impl Codec {
             _ => {}
         }
     }
-    fn approval_field(elicitation: bool, field: &str, shown: &[&str]) -> super::ApprovalField {
+    fn approval_field(
+        elicitation: bool,
+        field: &str,
+        value: &Value,
+        shown: &[&str],
+    ) -> super::ApprovalField {
         use super::ApprovalField::*;
         match field {
             "threadId"
             | "turnId"
             | "itemId"
             | "startedAtMs"
-            | "environmentId"
             | "kind"
             | "commandActions"
             | "availableDecisions"
             | "proposedExecpolicyAmendment" => Metadata,
+            "environmentId" if value.as_str() == Some("local") => Metadata,
             "_meta" if elicitation => Metadata,
             field if shown.contains(&field) => Shown,
             "reason" | "description" => Passthrough {
@@ -1045,7 +1050,7 @@ impl Codec {
         let elicitation = matches!(request, wire::Request::Elicitation { .. });
         let fields = |shown: &[&str]| {
             super::ApprovalFields::new(&params, |field| {
-                Self::approval_field(elicitation, field, shown)
+                Self::approval_field(elicitation, field, &params[field], shown)
             })
         };
         let preview = |fields: &super::ApprovalFields| fields.preview(&params);
@@ -1901,6 +1906,54 @@ mod tests {
             reply["result"]["decision"], "accept",
             "thread grants must not select a policy amendment"
         );
+    }
+    #[test]
+    fn codex_environment_value_controls_preview_and_grant() {
+        for environment in [
+            json!("local"),
+            json!("remote"),
+            json!("LOCAL"),
+            json!(""),
+            Value::Null,
+            json!(false),
+            json!(42),
+            json!(["local"]),
+            json!({"name":"local"}),
+        ] {
+            let mut codec = early_request_codec();
+            let action = super::super::approval_test_action(
+                codec
+                    .value(json!({
+                        "id":"environment", "method":"item/commandExecution/requestApproval",
+                        "params":{"threadId":"old-thread", "turnId":"native-turn",
+                            "command":"printf check", "cwd":"/project", "environmentId":environment}
+                    }))
+                    .unwrap(),
+            );
+            let local = environment == json!("local");
+            assert_eq!(action.consent.grant_key().is_some(), local, "{environment}");
+            let ApprovalTarget::Command {
+                command,
+                cwd,
+                reason,
+                ..
+            } = &action.target
+            else {
+                panic!("environment command")
+            };
+            assert_eq!(command, "printf check");
+            assert_eq!(cwd, &CommandCwd::ProjectFolder);
+            assert!(reason.is_none());
+            super::super::assert_approval_preview(
+                &action,
+                if local {
+                    json!({})
+                } else {
+                    json!({"environmentId":environment})
+                },
+                "environmentId",
+            );
+        }
     }
     #[test]
     fn codex_all_approval_kinds_preserve_complete_fields() {
