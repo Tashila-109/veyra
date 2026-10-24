@@ -13,6 +13,126 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalField {
+    Shown,
+    Metadata,
+    Passthrough { affects_execution: bool },
+}
+
+struct ApprovalFields {
+    fields: std::collections::BTreeMap<String, ApprovalField>,
+    object: bool,
+}
+
+impl ApprovalFields {
+    fn new(value: &serde_json::Value, classify: impl Fn(&str) -> ApprovalField) -> Self {
+        Self {
+            fields: value
+                .as_object()
+                .into_iter()
+                .flat_map(|fields| fields.keys())
+                .map(|key| (key.clone(), classify(key)))
+                .collect(),
+            object: value.is_object(),
+        }
+    }
+    fn residual(&self, value: &serde_json::Value) -> serde_json::Value {
+        let mut residual = value.clone();
+        if let Some(fields) = residual.as_object_mut() {
+            fields.retain(|key, _| matches!(self.fields[key], ApprovalField::Passthrough { .. }));
+        }
+        residual
+    }
+    fn permits_grant(&self) -> bool {
+        self.object
+            && !self.fields.values().any(|field| {
+                matches!(
+                    field,
+                    ApprovalField::Passthrough {
+                        affects_execution: true
+                    }
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+fn approval_wire_sample(
+    codec: &str,
+    kind: &str,
+    wire: serde_json::Value,
+    sample: serde_json::Value,
+    classify: impl Fn(&str) -> ApprovalField,
+    expected: impl Fn(&str) -> ApprovalField,
+) -> serde_json::Value {
+    fn check(
+        wire: &serde_json::Value,
+        sample: &serde_json::Value,
+        path: &str,
+        paths: &mut Vec<String>,
+    ) {
+        if let Some(fields) = wire.as_object() {
+            for (key, value) in fields {
+                let path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let actual = sample
+                    .get(key)
+                    .unwrap_or_else(|| panic!("wire field needs a sample: {path}"));
+                assert!(!actual.is_null(), "wire field must be planted: {path}");
+                paths.push(path.clone());
+                check(value, actual, &path, paths);
+            }
+            for key in sample
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| !fields.contains_key(*key))
+            {
+                paths.push(if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                });
+            }
+        } else if let Some(first) = wire.as_array().and_then(|values| values.first()) {
+            check(first, &sample[0], &format!("{path}[]"), paths);
+        } else if wire.is_null()
+            && let Some(fields) = sample.as_object()
+        {
+            paths.extend(fields.keys().map(|key| format!("{path}.{key}")));
+        }
+    }
+    let mut paths = Vec::new();
+    check(&wire, &sample, "", &mut paths);
+    for path in &paths {
+        assert_eq!(classify(path), expected(path), "{codec}/{kind}/{path}");
+    }
+    eprintln!(
+        "APPROVAL_FIELDS {}",
+        serde_json::json!({"codec":codec,"kind":kind,"fields":paths.iter()
+        .map(|path| (path.clone(), format!("{:?}", expected(path)))).collect::<std::collections::BTreeMap<_, _>>()})
+    );
+    sample
+}
+
+fn approval_explanation<'a>(
+    fields: impl IntoIterator<Item = (&'static str, Option<&'a str>)>,
+) -> Option<(&'static str, ApprovalPreview)> {
+    fields.into_iter().find_map(|(field, text)| {
+        let mut preview = ApprovalPreview::new(text?.into());
+        preview.explanation = Some(if field == "description" {
+            ApprovalExplanation::Description
+        } else {
+            ApprovalExplanation::Reason
+        });
+        Some((field, preview))
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {

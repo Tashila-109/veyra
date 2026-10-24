@@ -50,6 +50,23 @@ check = DATA/'project'/'veyra-check.txt'
 check.unlink(missing_ok=True)
 action('approval-mode','SetDefaultMode',{'mode':'ask_first'})
 records = [json.loads(line) for line in (SOURCE/'approval-deny.jsonl').read_text().splitlines()]
+request = next(record['line']['request'] for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('type')=='control_request'
+    and record['line']['request'].get('subtype')=='can_use_tool')
+request['input'].update(cwd='/elsewhere/other-project',description='Description shown separately',
+    reason='Additional reason')
+stage_records(records)
+thread = create('claude-command-unverified-cwd','Review the command folder',scenario=None)
+dock = poll('claude-command-unverified-cwd',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert dock['request']['kind']['Approval']['action']['target']['cwd']=='not_verified'
+assert dock['consequence']=='Claude Code will run this command at a location that is not verified.'
+assert json.loads(dock['preview'])=={'cwd':'/elsewhere/other-project','reason':'Additional reason'}
+assert dock['provider_text']==[{'kind':'reason','label':"Claude Code's description",'text':'“Description shown separately”'}]
+assert not dock['allow_in_thread_enabled']
+capture('claude-command-unverified-cwd')
+action('claude-command-unverified-cwd-answer','Deny',{'request':dock['request']['id']})
+ctl('claude-command-unverified-cwd-done','wait',thread,'Done')
+records = [json.loads(line) for line in (SOURCE/'approval-deny.jsonl').read_text().splitlines()]
 approval_request = next(record for record in records if record.get('type')=='emit_inbound'
     and record.get('line',{}).get('type')=='control_request'
     and record['line']['request'].get('subtype')=='can_use_tool'
@@ -385,11 +402,25 @@ dock = dump['composer']['dock']
 assert dock['action_text']=='touch veyra-check.txt' and dump['selected_thread']['status']=='NeedsYou'
 assert dock['consequence']=='Codex will use the project folder as its working folder.'
 assert dock['provider_text']==[{'kind':'working_folder','label':'Working folder','text':'“'+os.path.realpath(DATA/'project')+'”'}, {'kind':'reason','label':"Codex's reason (model-written)",'text':'“Create the requested file”'}]
-assert dock['request']['kind']['Approval']['action']['target']['reason']=={'text':'Create the requested file','truncated':False}
+assert dock['request']['kind']['Approval']['action']['target']['reason']=={'text':'Create the requested file','truncated':False,'explanation':'reason'}
 capture('codex-command')
 action('codex-command-once','AllowOnce',{'request':dock['request']['id']})
 ctl('codex-command-done','wait',thread,'Done')
 assert json.loads(sql("select decision_json from requests where thread_id='"+thread+"'"))=='AllowOnce'
+
+records = codex_records('approval-command')
+request = next(record['line']['params'] for record in records if record.get('type')=='emit_inbound'
+    and record.get('line',{}).get('method')=='item/commandExecution/requestApproval')
+request.pop('reason')
+request['description']='Description shown separately'
+thread = create_codex('codex-command-description',records=records)
+dock = poll('codex-command-description',lambda d:d['composer']['dock'] is not None)['composer']['dock']
+assert dock['provider_text'][-1]=={'kind':'reason','label':"Codex's description",'text':'“Description shown separately”'}
+assert dock['request']['kind']['Approval']['action']['target']['reason']['explanation']=='description'
+assert 'description' not in json.loads(dock['preview'])
+capture('codex-command-description')
+action('codex-command-description-answer','AllowOnce',{'request':dock['request']['id']})
+ctl('codex-command-description-done','wait',thread,'Done')
 
 records = codex_records('approval-command')
 request = next(record['line']['params'] for record in records if record.get('type')=='emit_inbound'
@@ -406,6 +437,8 @@ assert json.loads(extra_dock['preview'])['networkAccess'] is True
 assert json.loads(extra_dock['preview'])['description']=='Additional description'
 assert any(quote['kind']=='reason' and 'Create the requested file' in quote['text'] for quote in extra_dock['provider_text'])
 assert all(key not in json.loads(extra_dock['preview']) for key in ('threadId','turnId','itemId'))
+assert not extra_dock['allow_in_thread_enabled']
+assert extra_dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
 assert extra_dock['action_text']=='printf e'+'\u0301'*3+'⟨U+0301⟩'*4
 assert extra_dock['request']['kind']['Approval']['action']['target']['command']=='printf '+raw_marks
 capture('codex-extra-fields')
@@ -439,7 +472,10 @@ same['line']['id']='same-directory'
 records[index+2:index+2] = [other,{'type':'expect_outbound','line':{'id':'other-directory','result':{'decision':'decline'}}},same,{'type':'expect_outbound','line':{'id':'same-directory','result':{'decision':'accept'}}}]
 thread = create_codex('codex-command-grants',records=records,prompt='Allow this command only in the project folder')
 first = poll('codex-grant-in-project',lambda d:d['composer']['dock'] is not None)['composer']['dock']
-assert first['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant')['command']=='touch veyra-check.txt'
+grant = first['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant')
+assert grant is not None, 'A plain project-folder Codex command with wire metadata must offer a thread grant'
+assert grant['command']=='touch veyra-check.txt'
+assert 'startedAtMs' not in json.loads(first['preview']), 'Wire timestamps must not enter the dock preview'
 capture('codex-grant-in-project')
 action('codex-grant-project','AllowInThread',{'request':first['request']['id']})
 other = poll('codex-command-other-cwd',lambda d:d['composer']['dock'] is not None and d['composer']['dock']['request']['id']!=first['request']['id'])['composer']['dock']
@@ -703,7 +739,7 @@ preview = json.loads(dock['preview'])
 assert preview['cwd']=='/elsewhere/other-project' and preview['reason']=='Additional reason'
 assert preview['env']=={'CHECK':'material'} and preview['networkAccess'] is True
 assert preview['dangerouslyDisableSandbox'] is True and 'toolCallId' not in preview
-assert any(quote['kind']=='reason' and 'Description shown separately' in quote['text'] for quote in dock['provider_text'])
+assert any(quote['kind']=='reason' and quote['label']=="Grok's description" and 'Description shown separately' in quote['text'] for quote in dock['provider_text'])
 capture('grok-command-unverified-cwd')
 action('grok-command-unverified-cwd-answer','Deny',{'request':dock['request']['id']})
 ctl('grok-command-unverified-cwd-done','wait',thread,'Interrupted')
@@ -837,6 +873,12 @@ A grant in the project permits the identical command there; the same command in 
 SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
 File and permission denials, the Violet answer and both MCP decisions are persisted.
 The reason PNG shows a single quoted provider line, under its own label and apart from the consequence.
+The codec marks reasons separately from descriptions. Reason labels retain “Codex's reason (model-written)” and the corresponding provider name.
+Description labels are “Claude Code's description”, “Codex's description” and “Grok's description”.
+`codex-command-description.png` shows the description fallback without a reason, and the additional reason remains visible beside a selected description in the Claude and Grok residual previews.
+`claude-command-unverified-cwd.png` shows an unverified-location consequence, the literal unresolved cwd and no thread grant.
+The Codex extra-fields PNG keeps its environment, network and sandbox values visible with the thread-grant button absent.
+`codex-grant-in-project.png` shows the normal project-folder thread-grant offer with wire timestamps absent from the preview.
 The async-question PNG shows the complete two-paragraph markdown reply above the quoted sanitized title, option controls and choice consequence; its stored UserText preserves the option's exact bidi-bearing bytes while its bubble displays Violet.
 The chosen PNG retains the question, shows Answered beside Violet and disables both controls.
 Command-1 chooses the latest-turn card.
@@ -900,6 +942,7 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
 {
   "required": {
     "approvals-questions": [
+      "claude-command-unverified-cwd.png",
       "approval-deny.png",
       "approval-allow.png",
       "question.png",
@@ -931,6 +974,8 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
     "approvals-questions-codex": [
       "codex-command.json",
       "codex-command.png",
+      "codex-command-description.png",
+      "codex-grant-in-project.png",
       "codex-command-other-cwd.png",
       "codex-file.png",
       "codex-permissions.png",
@@ -948,6 +993,7 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "codex-extra-fields.png"
     ],
     "approvals-questions-grok": [
+      "grok-command-unverified-cwd.png",
       "grok-approval-deny.png",
       "grok-approval-allow.png",
       "grok-deny-only.json",

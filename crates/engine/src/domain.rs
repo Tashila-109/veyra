@@ -378,13 +378,11 @@ impl ProposedAction {
         self
     }
     pub fn new(tool: String, target: ApprovalTarget) -> Self {
-        let mut action = Self {
+        Self {
             tool,
             target,
             consent: ApprovalConsent::default(),
-        };
-        action.hydrate_reason();
-        action
+        }
     }
     fn hydrate_reason(&mut self) {
         if let ApprovalTarget::Command {
@@ -400,7 +398,11 @@ impl ProposedAction {
             *reason = serde_json::from_str::<Reason>(&preview.text)
                 .ok()
                 .and_then(|value| value.description.or(value.reason))
-                .map(ApprovalPreview::new);
+                .map(|text| {
+                    let mut preview = ApprovalPreview::new(text);
+                    preview.hydrated = true;
+                    preview
+                });
         }
     }
 }
@@ -411,7 +413,7 @@ pub enum ApprovalTarget {
         command: String,
         #[serde(default)]
         cwd: CommandCwd,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "ApprovalPreview::unstored_reason")]
         reason: Option<ApprovalPreview>,
         preview: ApprovalPreview,
     },
@@ -448,10 +450,20 @@ pub enum TargetLocation {
     NotVerified,
 }
 pub const TOOL_OUTPUT_CHARS: usize = 10_000;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalExplanation {
+    Reason,
+    Description,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalPreview {
     pub text: String,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<ApprovalExplanation>,
+    #[serde(skip)]
+    hydrated: bool,
 }
 impl ApprovalPreview {
     pub fn new(mut text: String) -> Self {
@@ -465,7 +477,12 @@ impl ApprovalPreview {
         Self {
             text,
             truncated: cut.is_some(),
+            explanation: None,
+            hydrated: false,
         }
+    }
+    fn unstored_reason(reason: &Option<Self>) -> bool {
+        reason.as_ref().is_none_or(|preview| preview.hydrated)
     }
 }
 impl<'de> Deserialize<'de> for ProposedAction {
@@ -565,11 +582,6 @@ pub struct StartThreadRequest<'a> {
     pub client_request_id: &'a str,
 }
 const START_THREAD_PREFIX: &str = "start_thread:";
-impl StartThreadRequest<'_> {
-    pub fn key(&self) -> String {
-        format!("{START_THREAD_PREFIX}{}", self.client_request_id)
-    }
-}
 impl Task {
     pub fn start_request(&self) -> Option<StartThreadRequest<'_>> {
         self.request_key
@@ -838,6 +850,63 @@ pub fn async_question_active<'a>(item: &Item, items: impl IntoIterator<Item = &'
 mod notice_tests {
     use super::{ItemBody, Notice};
     #[test]
+    fn new_command_explanations_do_not_hydrate_residual_json() {
+        use super::*;
+        let action = ProposedAction::new(
+            "Command".into(),
+            ApprovalTarget::Command {
+                command: "printf check".into(),
+                cwd: CommandCwd::ProjectFolder,
+                reason: None,
+                preview: ApprovalPreview::new(
+                    r#"{"description":"Only the codec may select this"}"#.into(),
+                ),
+            },
+        );
+        assert!(matches!(
+            action.target,
+            ApprovalTarget::Command { reason: None, .. }
+        ));
+    }
+    #[test]
+    fn legacy_reason_hydration_preserves_stored_bytes() {
+        use super::*;
+        for preview in [
+            r#"{"description":"Legacy description","reason":"Legacy reason"}"#,
+            r#"{"reason":"Legacy reason"}"#,
+            "{incomplete",
+        ] {
+            let stored = format!(
+                concat!(
+                    "{{\"tool\":\"Command\",\"target\":{{\"kind\":\"command\",",
+                    "\"command\":\"printf check\",\"cwd\":\"project_folder\",",
+                    "\"preview\":{{\"text\":{},\"truncated\":false}}}}}}"
+                ),
+                serde_json::to_string(preview).unwrap()
+            );
+            let action: ProposedAction = serde_json::from_str(&stored).unwrap();
+            let ApprovalTarget::Command { reason, .. } = &action.target else {
+                panic!("command target")
+            };
+            assert_eq!(
+                reason.as_ref().map(|preview| preview.text.as_str()),
+                if preview.contains("description") {
+                    Some("Legacy description")
+                } else if preview.contains("reason") {
+                    Some("Legacy reason")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(serde_json::to_string(&action).unwrap(), stored);
+            assert_eq!(
+                serde_json::to_string(&serde_json::from_str::<ProposedAction>(&stored).unwrap())
+                    .unwrap(),
+                stored
+            );
+        }
+    }
+    #[test]
     fn task_start_request_view_retains_legacy_stored_key_bytes() {
         use super::*;
         let id = "00000000-0000-4000-8000-000000000001";
@@ -851,7 +920,6 @@ mod notice_tests {
         let task: Task = serde_json::from_str(&stored).unwrap();
         let key = task.start_request().unwrap();
         assert_eq!(key.client_request_id, "original");
-        assert_eq!(key.key(), "start_thread:original");
         assert_eq!(serde_json::to_string(&task).unwrap(), stored);
     }
     #[test]

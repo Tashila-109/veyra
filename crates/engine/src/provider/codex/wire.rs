@@ -3,11 +3,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct Scope {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
+    pub item_id: Option<Value>,
+    pub started_at_ms: Option<Value>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(tag = "method")]
@@ -404,7 +406,7 @@ impl Request {
         }
     }
 }
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct CommandApproval {
     #[serde(flatten)]
@@ -412,14 +414,15 @@ pub(super) struct CommandApproval {
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub reason: Option<String>,
+    pub description: Option<Value>,
 }
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct FileApproval {
     #[serde(flatten)]
     pub scope: Scope,
 }
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct PermissionsApproval {
     #[serde(flatten)]
@@ -445,7 +448,7 @@ pub(super) struct Question {
 pub(super) struct QuestionOption {
     pub label: Option<String>,
 }
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct Elicitation {
     #[serde(flatten)]
@@ -455,12 +458,12 @@ pub(super) struct Elicitation {
     #[serde(rename = "_meta")]
     pub meta: Option<ElicitationMeta>,
 }
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct ElicitationMeta {
     pub codex_approval_kind: Option<ApprovalKind>,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ApprovalKind {
     McpToolCall,

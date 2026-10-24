@@ -559,7 +559,7 @@ fn invocation_approval_links_survive_both_event_orders_and_repeated_commands() {
 }
 
 #[test]
-fn command_reason_is_hydrated_at_construction_and_legacy_loading() {
+fn command_reason_is_codec_owned_at_construction_and_hydrated_on_legacy_loading() {
     let target = ApprovalTarget::Command {
         command: "printf check".into(),
         cwd: CommandCwd::ProjectFolder,
@@ -570,7 +570,7 @@ fn command_reason_is_hydrated_at_construction_and_legacy_loading() {
     let ApprovalTarget::Command { reason, .. } = &action.target else {
         unreachable!()
     };
-    assert_eq!(reason.as_ref().unwrap().text, "Explain this request");
+    assert!(reason.is_none());
     let mut stored = serde_json::to_value(&action).unwrap();
     stored["target"].as_object_mut().unwrap().remove("reason");
     let loaded: ProposedAction = serde_json::from_value(stored).unwrap();

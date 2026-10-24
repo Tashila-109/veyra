@@ -318,7 +318,7 @@ The Claude codec turns each approval into ProposedAction, a tool label and provi
 Command preserves exact command text; File carries its operation, literal target path, location and preview; Tool carries its argument preview.
 File previews include content and edit strings, and other tool previews include every argument as pretty-printed text.
 Each codec builds the residual approval preview from the fields it did not map into separately displayed typed values.
-Claude command previews omit command and the description or reason selected for the reason quote; an additional reason or description and an unrecognized cwd remain in the preview.
+Claude command previews omit command and the selected description or reason; an additional explanation and an unrecognized cwd remain in the preview. A Bash request carrying cwd has CommandCwd::NotVerified because the Claude codec does not resolve that argument; without it the process starts in the project folder.
 Each preview retains at most TOOL_OUTPUT_CHARS, the same 10,000-character cap as tool output, and carries a truncation flag rendered as a cut notice.
 Write, Edit, MultiEdit and Read use file_path; NotebookEdit uses notebook_path.
 A missing target or a conflicting file_path, path or notebook_path becomes a Tool action showing every argument without a file-location claim.
@@ -331,7 +331,7 @@ Legacy stored command rows load as Command; rows with optional legacy input load
 AllowOnce, AllowInThread and Deny answer approvals; AnswerQuestion collects one answer per question.
 Claude offers an exact-command thread grant only for a Bash Command action whose input keys are command, description or timeout.
 Claude inputs with any other field always dock without a grant offer.
-Codex offers a command grant only when the request names exactly the thread's project cwd; another or unverified cwd always docks without a grant.
+Codex offers a command grant only when the request names exactly the thread's project cwd and contains only threadId, turnId, itemId, command, cwd, reason or description. Any other field, including sandbox, environment or network options, prevents both the offer and reuse of an existing grant; another or unverified cwd also docks without a grant.
 CommandCwd stores ProjectFolder, the other literal cwd, or NotVerified beside the exact command, and the dock uses it for the consequence text.
 The grants table remains keyed by thread, tool and command.
 StopThread and Interrupt expire pending requests, and the provider queues cancel replies before interrupt.
@@ -677,9 +677,10 @@ Command approvals preserve the exact command and the typed cwd consequence.
 The project-cwd consequence names the working folder.
 A command approval with a known folder shows it in a separate labeled, muted quote; a reported outside cwd takes precedence over the project folder.
 CommandCwd::NotVerified instead shows the unverified-location consequence and no folder quote.
-The model-written reason is a typed ApprovalPreview selected by the codec or hydrated at legacy action construction or deserialization and has its own labeled quote.
-Each codec omits only the fields it mapped into the command, a shown working folder or the selected reason, plus its own wire identity fields.
-Codex removes threadId, turnId and itemId from its params preview, and removes cwd only when CommandCwd names a shown folder; Claude and Grok take their previews from tool input, outside the wrapper that carries their invocation ids.
+A command explanation is a typed ApprovalPreview whose optional ApprovalExplanation distinguishes Reason from Description. Each codec chooses the field and its priority through the shared provider selector: Claude and Grok prefer description, while Codex prefers reason and falls back to description. New ProposedAction construction never promotes preview JSON into an explanation.
+Reasons keep the provider's “reason (model-written)” label; descriptions use “Claude Code's description”, “Codex's description” or “Grok's description”. Older explicit reasons lack the optional metadata and retain their existing reason label. Only deserialization hydrates a missing legacy reason from description or reason in the stored preview, with the same historical priority and label. A nonserialized hydrated flag suppresses that derived field when serializing, so a previously absent reason stays absent and stored preview bytes remain unchanged.
+Each codec classifies approval fields as shown, wire metadata or passthrough. The same classification filters the preview and withholds a thread grant when passthrough fields can change what runs. Unknown arguments withhold grants; explanation text and the existing timeout/background controls do not change the granted command identity.
+Codex omits threadId, turnId, itemId and startedAtMs, removes cwd only when CommandCwd names a shown folder, and maps an MCP serverName into the tool title while omitting its wire _meta. Wire metadata never withholds a grant. Claude and Grok take their previews from tool input, outside the wrapper that carries their invocation ids, routing fields and consent options.
 Grok leaves an unrecognized cwd in its preview and selects description before reason, retaining the other explanation.
 Every unmapped field remains in the preview, including environment, network and sandbox options, and truncated previews keep their cut notice.
 The window applies the consent projection to the received preview without decoding JSON or omitting keys.
@@ -695,7 +696,7 @@ A changed request id, including closing the dock, replaces both handles; repaint
 An always-visible kit scrollbar exposes actual overflow.
 The thread-grant button shows the first line of the marked command, shortened to its available width; execution, native replies and stored grant identities retain the original bytes.
 The UI takes ProviderKind for provider-specific behavior; display labels do not select behavior.
-Only the exact project cwd may use the existing command grant; every other cwd requires a human decision.
+Only the exact project cwd and the recognized command-request fields may use the existing command grant; every other cwd or additional field requires a human decision.
 Permissions approvals grant the requested profile for the turn, while Deny and Stop send an empty permissions object.
 Questions retain provider question ids and send answers by those ids; cancellation sends an empty answers object.
 AgentMessage delivery and question fields are typed separately from server requests.

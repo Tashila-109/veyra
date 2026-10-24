@@ -404,3 +404,75 @@ fn codex_grant_same_command_and_cwd_is_automatic() {
         }
     ));
 }
+
+#[test]
+fn codex_material_fields_offer_no_grant_and_changed_requests_dock() {
+    for (field, before, after) in [
+        ("dangerouslyDisableSandbox", json!(false), json!(true)),
+        ("sandbox", json!("read-only"), json!("danger-full-access")),
+        (
+            "sandboxPolicy",
+            json!({"type":"readOnly"}),
+            json!({"type":"dangerFullAccess"}),
+        ),
+        ("env", json!({"CHECK":"first"}), json!({"CHECK":"changed"})),
+        (
+            "environment",
+            json!({"CHECK":"first"}),
+            json!({"CHECK":"changed"}),
+        ),
+        ("networkAccess", json!(false), json!(true)),
+        ("network", json!({"enabled":false}), json!({"enabled":true})),
+        ("unknownCapability", json!(null), json!({"allow":true})),
+    ] {
+        let mut f = Fixture::new(LiveState::Running);
+        let runtime = f.runtime.handle().clone();
+        let _entered = runtime.enter();
+        let mut codec = codex_grant_codec(&f);
+        let first = codex_approval(&mut f, &mut codec, "plain", "/tmp");
+        f.command(Command::Respond {
+            request: first,
+            decision: Decision::AllowInThread,
+        })
+        .unwrap();
+        f.controls.try_recv().unwrap();
+        f.drain();
+        for (index, value) in [before, after].into_iter().enumerate() {
+            let id = format!("changed-{index}");
+            let mut params = json!({"threadId":"codex-thread", "turnId":"native-turn", "itemId":id,
+                "command":"rm -rf build", "cwd":"/tmp"});
+            params[field] = value;
+            let decoded = codec
+                .value(
+                    json!({"id":id, "method":"item/commandExecution/requestApproval",
+                "params":params}),
+                )
+                .unwrap();
+            for event in decoded.events {
+                f.event(event);
+            }
+            let request = f
+                .loaded()
+                .requests
+                .values()
+                .find(|request| request.native == NativeRequestRef(format!("\"{id}\"")))
+                .unwrap()
+                .clone();
+            assert!(
+                request.kind.grant_key().is_none(),
+                "{field} offered an incomplete grant"
+            );
+            assert_eq!(
+                request.state,
+                RequestState::Pending,
+                "{field} reused a prior grant"
+            );
+            assert!(
+                f.controls.try_recv().is_err(),
+                "{field} automatically answered"
+            );
+            assert!(f.drain().iter().any(|event| matches!(event, UiEvent::Change {
+                event:crate::events::ChangeEvent::RequestOpened(opened), .. } if opened.id == request.id)));
+        }
+    }
+}

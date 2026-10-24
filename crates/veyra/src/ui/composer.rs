@@ -15,8 +15,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::{
-    AcceptedDecision, ApprovalTarget, CommandCwd, Decision, FileOperation, ProposedAction,
-    RequestKind, TargetLocation, WaitReason,
+    AcceptedDecision, ApprovalExplanation, ApprovalTarget, CommandCwd, Decision, FileOperation,
+    ProposedAction, RequestKind, TargetLocation, WaitReason,
 };
 use veyra_engine::text::{consent_line, consent_multiline};
 
@@ -109,7 +109,14 @@ pub(super) fn approval_quotes(action: &ProposedAction, provider: &str) -> Vec<Qu
             if let Some(reason) = reason {
                 values.push(QuotedText::new(
                     QuoteKind::Reason,
-                    format!("{provider}'s reason (model-written)"),
+                    match reason.explanation {
+                        Some(ApprovalExplanation::Description) => {
+                            format!("{provider}'s description")
+                        }
+                        Some(ApprovalExplanation::Reason) | None => {
+                            format!("{provider}'s reason (model-written)")
+                        }
+                    },
                     &reason.text,
                     reason.truncated,
                 ));
@@ -1482,6 +1489,37 @@ mod command_preview_tests {
             );
             assert_eq!(quotes.len(), 1);
             assert_eq!(quotes[0].text, "“Description shown separately”");
+        }
+    }
+}
+
+#[cfg(test)]
+mod explanation_label_tests {
+    #[test]
+    fn approval_explanation_labels_follow_codec_source_and_legacy_rows() {
+        use veyra_engine::domain::ProposedAction;
+        for provider in ["Claude Code", "Codex", "Grok"] {
+            for (source, label) in [
+                (Some("description"), format!("{provider}'s description")),
+                (
+                    Some("reason"),
+                    format!("{provider}'s reason (model-written)"),
+                ),
+                (None, format!("{provider}'s reason (model-written)")),
+            ] {
+                let mut value = serde_json::json!({"tool":"Command", "target":{
+                    "kind":"command", "command":"printf check", "cwd":"not_verified",
+                    "reason":{"text":"Provider words", "truncated":false},
+                    "preview":{"text":"{}", "truncated":false}}});
+                if let Some(source) = source {
+                    value["target"]["reason"]["explanation"] = source.into();
+                }
+                let action: ProposedAction = serde_json::from_value(value).unwrap();
+                let quotes = super::approval_quotes(&action, provider);
+                assert_eq!(quotes.len(), 1);
+                assert_eq!(quotes[0].label, label);
+                assert_eq!(quotes[0].text, "“Provider words”");
+            }
         }
     }
 }

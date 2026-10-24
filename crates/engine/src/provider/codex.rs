@@ -985,6 +985,21 @@ impl Codec {
             _ => {}
         }
     }
+    fn approval_field(kind: &str, field: &str, shown: &[&str]) -> super::ApprovalField {
+        use super::ApprovalField::*;
+        let elicitation = kind == "mcpServer/elicitation/request";
+        match field {
+            "threadId" | "turnId" | "itemId" | "startedAtMs" => Metadata,
+            field if elicitation && (field == "_meta" || field.starts_with("_meta.")) => Metadata,
+            field if shown.contains(&field) => Shown,
+            "reason" | "description" => Passthrough {
+                affects_execution: false,
+            },
+            _ => Passthrough {
+                affects_execution: true,
+            },
+        }
+    }
     fn request(&mut self, id: Value, request: wire::Request, params: Value, decoded: &mut Decoded) {
         let key = id.to_string();
         if !self.seen_requests.insert(key.clone()) {
@@ -1020,17 +1035,22 @@ impl Codec {
             ));
             return;
         }
-        let preview = |shown: &[&str]| {
-            let mut residual = params.clone();
-            if let Some(fields) = residual.as_object_mut() {
-                for key in ["threadId", "turnId", "itemId"]
-                    .into_iter()
-                    .chain(shown.iter().copied())
-                {
-                    fields.remove(key);
-                }
-            }
-            ApprovalPreview::new(serde_json::to_string_pretty(&residual).unwrap_or_default())
+        let approval_kind = match &request {
+            wire::Request::Command { .. } => "item/commandExecution/requestApproval",
+            wire::Request::File { .. } => "item/fileChange/requestApproval",
+            wire::Request::Permissions { .. } => "item/permissions/requestApproval",
+            wire::Request::Elicitation { .. } => "mcpServer/elicitation/request",
+            _ => "",
+        };
+        let fields = |shown: &[&str]| {
+            super::ApprovalFields::new(&params, |field| {
+                Self::approval_field(approval_kind, field, shown)
+            })
+        };
+        let preview = |fields: &super::ApprovalFields| {
+            ApprovalPreview::new(
+                serde_json::to_string_pretty(&fields.residual(&params)).unwrap_or_default(),
+            )
         };
         let approval = |tool: String, target| RequestKind::Approval {
             action: ProposedAction::new(tool, target),
@@ -1056,13 +1076,21 @@ impl Codec {
                 } else {
                     CommandCwd::NotVerified
                 };
+                let reason = super::approval_explanation([
+                    ("reason", command.reason.as_deref()),
+                    (
+                        "description",
+                        command.description.as_ref().and_then(Value::as_str),
+                    ),
+                ]);
                 let mut shown = vec!["command"];
                 if !matches!(location, CommandCwd::NotVerified) {
                     shown.push("cwd");
                 }
-                if command.reason.is_some() {
-                    shown.push("reason");
+                if let Some((field, _)) = &reason {
+                    shown.push(field);
                 }
+                let fields = fields(&shown);
                 (
                     RequestKind::Approval {
                         action: ProposedAction::new(
@@ -1070,14 +1098,16 @@ impl Codec {
                             ApprovalTarget::Command {
                                 command: text.into(),
                                 cwd: location,
-                                reason: command.reason.clone().map(ApprovalPreview::new),
-                                preview: preview(&shown),
+                                reason: reason.map(|(_, preview)| preview),
+                                preview: preview(&fields),
                             },
                         )
-                        .with_grant(in_project.then(|| GrantKey {
-                            tool: "Command".into(),
-                            command: text.into(),
-                        })),
+                        .with_grant(
+                            (in_project && fields.permits_grant()).then(|| GrantKey {
+                                tool: "Command".into(),
+                                command: text.into(),
+                            }),
+                        ),
                     },
                     RequestReply::Decision,
                 )
@@ -1086,7 +1116,7 @@ impl Codec {
                 approval(
                     "File change".into(),
                     ApprovalTarget::Tool {
-                        preview: preview(&[]),
+                        preview: preview(&fields(&[])),
                     },
                 ),
                 RequestReply::Decision,
@@ -1104,7 +1134,7 @@ impl Codec {
                     approval(
                         "Permissions".into(),
                         ApprovalTarget::Tool {
-                            preview: preview(&[]),
+                            preview: preview(&fields(&[])),
                         },
                     ),
                     RequestReply::Permissions(serde_json::to_value(profile).unwrap()),
@@ -1141,7 +1171,7 @@ impl Codec {
                             elicitation.server_name.as_deref().unwrap_or("MCP")
                         ),
                         ApprovalTarget::Tool {
-                            preview: preview(&[]),
+                            preview: preview(&fields(&["serverName"])),
                         },
                     ),
                     RequestReply::Elicitation,
@@ -1704,6 +1734,226 @@ mod tests {
         }
     }
     #[test]
+    fn codex_explanation_source_and_residual_are_codec_owned() {
+        for (index, (description, reason, selected, source)) in [
+            (json!("Description"), json!("Reason"), "Reason", "reason"),
+            (
+                json!("Description"),
+                Value::Null,
+                "Description",
+                "description",
+            ),
+            (json!({"nested":"keep"}), json!(""), "", "reason"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut codec = early_request_codec();
+            let decoded = codec.value(json!({"id":format!("explanation-{index}"),
+                "method":"item/commandExecution/requestApproval", "params":{
+                "threadId":"old-thread", "turnId":"native-turn", "itemId":"invocation",
+                "command":"printf check", "cwd":"/project", "description":description, "reason":reason}})).unwrap();
+            let action = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event:
+                            TurnEvent::RequestOpened {
+                                kind: RequestKind::Approval { action },
+                                ..
+                            },
+                        ..
+                    } => Some(action),
+                    _ => None,
+                })
+                .unwrap();
+            let encoded = serde_json::to_value(action).unwrap();
+            assert_eq!(encoded["target"]["reason"]["text"], selected);
+            assert_eq!(encoded["target"]["reason"]["explanation"], source);
+            let residual: Value =
+                serde_json::from_str(encoded["target"]["preview"]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                residual,
+                if source == "description" {
+                    json!({"reason":reason})
+                } else {
+                    json!({"description":description})
+                }
+            );
+        }
+    }
+    #[test]
+    fn codex_project_command_timestamp_preserves_thread_grant() {
+        let mut codec = early_request_codec();
+        let decoded = codec
+            .value(json!({"id":"timestamp-grant", "method":"item/commandExecution/requestApproval",
+                "params":{"threadId":"old-thread", "turnId":"native-turn", "itemId":"invocation",
+                    "command":"printf check", "cwd":"/project", "reason":"Actual reason", "startedAtMs":1}}))
+            .unwrap();
+        let action = decoded
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Turn {
+                    event:
+                        TurnEvent::RequestOpened {
+                            kind: RequestKind::Approval { action },
+                            ..
+                        },
+                    ..
+                } => Some(action),
+                _ => None,
+            })
+            .expect("Codex command must open an approval");
+        assert_eq!(
+            action.consent.grant_key(),
+            Some(&GrantKey {
+                tool: "Command".into(),
+                command: "printf check".into(),
+            }),
+            "wire timestamps must preserve the plain project-folder command's thread grant"
+        );
+        let ApprovalTarget::Command { preview, .. } = &action.target else {
+            panic!("Codex command must have a typed command target")
+        };
+        assert_eq!(
+            preview.text, "{}",
+            "wire metadata must not enter the dock preview"
+        );
+    }
+    #[test]
+    fn codex_all_approval_kinds_preserve_complete_fields() {
+        for (index, (method, tool)) in [
+            ("item/commandExecution/requestApproval", "Command"),
+            ("item/fileChange/requestApproval", "File change"),
+            ("item/permissions/requestApproval", "Permissions"),
+            ("mcpServer/elicitation/request", "veyra / list_providers"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut codec = early_request_codec();
+            let wire = match index {
+                0 => serde_json::to_value(wire::CommandApproval::default()),
+                1 => serde_json::to_value(wire::FileApproval::default()),
+                2 => serde_json::to_value(wire::PermissionsApproval::default()),
+                _ => serde_json::to_value(wire::Elicitation {
+                    meta: Some(wire::ElicitationMeta::default()),
+                    ..Default::default()
+                }),
+            }
+            .unwrap();
+            let shown: &[&str] = match index {
+                0 => &["command", "cwd", "reason"],
+                3 => &["serverName"],
+                _ => &[],
+            };
+            let params = json!({"threadId":"old-thread", "turnId":"native-turn", "itemId":"invocation",
+                "startedAtMs":1,
+                "command":"printf check", "cwd":"/project", "reason":"Actual reason",
+                "description":{"nested":"not a string"}, "grantRoot":"/grant/root",
+                "permissions":{"filesystem":{"write":["/grant/root"]},"network":{"enabled":true}},
+                "changes":[{"path":"/project/file","kind":"update","diff":"whole diff"}],
+                "serverName":"veyra", "message":"Allow the veyra MCP server to run tool list_providers",
+                "mode":"form", "requestedSchema":{"type":"object","properties":{}},
+                "_meta":{"codex_approval_kind":"mcp_tool_call","unknownMeta":false},
+                "env":{"CHECK":"material"}, "networkAccess":false, "dangerouslyDisableSandbox":true,
+                "sandboxPolicy":{"type":"workspaceWrite"}, "availableDecisions":["accept","decline"],
+                "unknownFlag":false, "unknownObject":{"command":"nested material"},
+                "unknownArray":[1,"two",null]});
+            let params = super::super::approval_wire_sample(
+                "codex",
+                method,
+                wire,
+                params,
+                |field| Codec::approval_field(method, field, shown),
+                |field| {
+                    use super::super::ApprovalField::*;
+                    match field {
+                        "threadId" | "turnId" | "itemId" | "startedAtMs" => Metadata,
+                        field
+                            if index == 3 && (field == "_meta" || field.starts_with("_meta.")) =>
+                        {
+                            Metadata
+                        }
+                        field if shown.contains(&field) => Shown,
+                        "reason" | "description" => Passthrough {
+                            affects_execution: false,
+                        },
+                        _ => Passthrough {
+                            affects_execution: true,
+                        },
+                    }
+                },
+            );
+            let decoded = codec
+                .value(json!({"id":format!("complete-{index}"), "method":method,
+                "params":params}))
+                .unwrap();
+            let action = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event:
+                            TurnEvent::RequestOpened {
+                                kind: RequestKind::Approval { action },
+                                ..
+                            },
+                        ..
+                    } => Some(action),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(action.tool, tool);
+            let mut expected = params;
+            expected.as_object_mut().unwrap().retain(|field, _| {
+                !matches!(
+                    field.as_str(),
+                    "threadId" | "turnId" | "itemId" | "startedAtMs"
+                )
+            });
+            if index == 3 {
+                expected
+                    .as_object_mut()
+                    .unwrap()
+                    .retain(|field, _| !matches!(field.as_str(), "_meta" | "serverName"));
+            }
+            let preview = match &action.target {
+                ApprovalTarget::Command {
+                    command,
+                    cwd,
+                    reason,
+                    preview,
+                } => {
+                    assert_eq!(tool, "Command");
+                    assert_eq!(command, "printf check");
+                    assert_eq!(cwd, &CommandCwd::ProjectFolder);
+                    assert_eq!(reason.as_ref().unwrap().text, "Actual reason");
+                    expected
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|field, _| !matches!(field.as_str(), "command" | "cwd" | "reason"));
+                    preview
+                }
+                ApprovalTarget::Tool { preview } => {
+                    assert_ne!(tool, "Command");
+                    assert!(action.consent.grant_key().is_none());
+                    preview
+                }
+                other => panic!("unexpected target: {other:?}"),
+            };
+            assert!(!preview.truncated);
+            assert_eq!(
+                preview.text,
+                serde_json::to_string_pretty(&expected).unwrap(),
+                "{method}"
+            );
+        }
+    }
+    #[test]
     fn codex_fixture_approval_preview_keeps_every_unmapped_field() {
         let frame = include_str!("../../tests/fixtures/codex/approval-command.jsonl")
             .lines()
@@ -1727,7 +1977,14 @@ mod tests {
             params.insert("networkAccess".into(), json!(true));
             params.insert("dangerouslyDisableSandbox".into(), json!(true));
             let mut expected = params.clone();
-            for field in ["threadId", "turnId", "itemId", "command", "reason"] {
+            for field in [
+                "threadId",
+                "turnId",
+                "itemId",
+                "startedAtMs",
+                "command",
+                "reason",
+            ] {
                 expected.remove(field);
             }
             if cwd.as_str().is_some_and(|path| !path.is_empty()) {

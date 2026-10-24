@@ -285,12 +285,14 @@ pub(crate) struct InitializeReply {
     pub capabilities: Vec<String>,
 }
 #[derive(Deserialize, Default)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(default)]
 struct ControlRequest {
     request_id: String,
     request: ToolRequest,
 }
 #[derive(Deserialize, Default)]
+#[cfg_attr(test, derive(Serialize))]
 struct ToolRequest {
     #[serde(default)]
     tool_use_id: Option<String>,
@@ -925,22 +927,8 @@ impl Codec {
             }
             Some(RequestKind::Question { questions })
         } else {
-            let action = self.approval_action(tool);
-            let grant_key = match &action.target {
-                ApprovalTarget::Command { command, .. }
-                    if tool.input.keys().all(|key| {
-                        ["command", "description", "timeout"].contains(&key.as_str())
-                    }) =>
-                {
-                    Some(GrantKey {
-                        tool: action.tool.clone(),
-                        command: command.clone(),
-                    })
-                }
-                _ => None,
-            };
             Some(RequestKind::Approval {
-                action: action.with_grant(grant_key),
+                action: self.approval_action(tool),
             })
         }
     }
@@ -949,8 +937,41 @@ impl Codec {
             "subtype":"error","request_id":id,"error":"This request is not supported by Veyra"
         }})
     }
+    fn approval_field(kind: &str, field: &str, shown: &[&str]) -> super::ApprovalField {
+        use super::ApprovalField::*;
+        match field {
+            "type" | "request" | "request_id" | "request.tool_use_id" | "request.subtype" => {
+                Metadata
+            }
+            "request.tool_name" if !kind.is_empty() => Shown,
+            field if field.starts_with("request.input.") => {
+                let field = &field["request.input.".len()..];
+                match field {
+                    field if shown.contains(&field) => Shown,
+                    "description" | "reason" | "timeout" => Passthrough {
+                        affects_execution: false,
+                    },
+                    _ => Passthrough {
+                        affects_execution: true,
+                    },
+                }
+            }
+            _ => Passthrough {
+                affects_execution: false,
+            },
+        }
+    }
     fn approval_action(&self, tool: &ToolRequest) -> ProposedAction {
-        let mut arguments = tool.input.clone();
+        let input = Value::Object(tool.input.clone());
+        let fields = |shown: &[&str]| {
+            super::ApprovalFields::new(&input, |field| {
+                Self::approval_field(&tool.tool_name, &format!("request.input.{field}"), shown)
+            })
+        };
+        let preview = |fields: &super::ApprovalFields| {
+            Self::preview(fields.residual(&input).as_object().unwrap().clone())
+        };
+        let mut grant_key = None;
         let file_target = match tool.tool_name.as_str() {
             "Write" => Some(("file_path", FileOperation::Write)),
             "Edit" | "MultiEdit" => Some(("file_path", FileOperation::Edit)),
@@ -981,38 +1002,44 @@ impl Codec {
             .and_then(Value::as_str)
             .filter(|_| tool.tool_name == "Bash")
         {
-            arguments.remove("command");
-            let reason = ["description", "reason"].into_iter().find_map(|field| {
-                tool.input
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .map(|text| (field, ApprovalPreview::new(text.into())))
-            });
+            let reason = super::approval_explanation(
+                ["description", "reason"]
+                    .map(|field| (field, tool.input.get(field).and_then(Value::as_str))),
+            );
+            let mut shown = vec!["command"];
             if let Some((field, _)) = &reason {
-                arguments.remove(*field);
+                shown.push(field);
             }
+            let fields = fields(&shown);
+            grant_key = fields.permits_grant().then(|| GrantKey {
+                tool: tool.tool_name.clone(),
+                command: command.into(),
+            });
             ApprovalTarget::Command {
                 command: command.into(),
-                cwd: Default::default(),
+                cwd: if tool.input.contains_key("cwd") {
+                    CommandCwd::NotVerified
+                } else {
+                    CommandCwd::ProjectFolder
+                },
                 reason: reason.map(|(_, preview)| preview),
-                preview: Self::preview(arguments),
+                preview: preview(&fields),
             }
         } else if let Some((field, operation, path)) = file_target {
-            arguments.remove(field);
             let path = std::path::PathBuf::from(path);
             let location = target_location(&self.cwd, &path);
             ApprovalTarget::File {
                 operation,
                 path,
                 location,
-                preview: Self::preview(arguments),
+                preview: preview(&fields(&[field])),
             }
         } else {
             ApprovalTarget::Tool {
-                preview: Self::preview(arguments),
+                preview: preview(&fields(&[])),
             }
         };
-        ProposedAction::new(tool.tool_name.clone(), target)
+        ProposedAction::new(tool.tool_name.clone(), target).with_grant(grant_key)
     }
     fn tool_call(name: String, arguments: Value) -> ToolCall {
         let input_summary = if name == "Bash" {
@@ -1441,6 +1468,240 @@ impl Codec {
 mod tests {
     use super::*;
     use crate::tests::Scratch;
+    #[test]
+    fn claude_unresolved_bash_folder_never_claims_project() {
+        for cwd in [
+            json!("/elsewhere"),
+            json!("relative"),
+            json!(""),
+            Value::Null,
+            json!(42),
+        ] {
+            let mut codec = codec();
+            codec.start(TurnId::new(), "approve".into());
+            let (action, grant) = approval(
+                &mut codec,
+                "folder",
+                "Bash",
+                json!({"command":"printf check", "cwd":cwd}),
+            );
+            let ApprovalTarget::Command {
+                cwd: location,
+                preview,
+                ..
+            } = action.target
+            else {
+                panic!("command target")
+            };
+            assert_eq!(location, CommandCwd::NotVerified);
+            assert_eq!(
+                serde_json::from_str::<Value>(&preview.text).unwrap(),
+                json!({"cwd":cwd})
+            );
+            assert!(grant.is_none());
+        }
+        let mut codec = codec();
+        codec.start(TurnId::new(), "approve".into());
+        let (action, grant) = approval(
+            &mut codec,
+            "no-folder",
+            "Bash",
+            json!({"command":"printf check"}),
+        );
+        assert!(matches!(
+            action.target,
+            ApprovalTarget::Command {
+                cwd: CommandCwd::ProjectFolder,
+                ..
+            }
+        ));
+        assert!(grant.is_some());
+    }
+    #[test]
+    fn claude_explanation_source_and_residual_are_codec_owned() {
+        for (index, (description, reason, selected, source)) in [
+            (
+                json!("Description"),
+                json!("Reason"),
+                "Description",
+                "description",
+            ),
+            (
+                json!({"nested":"keep"}),
+                json!("Reason"),
+                "Reason",
+                "reason",
+            ),
+            (Value::Null, json!(""), "", "reason"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut codec = codec();
+            codec.start(TurnId::new(), "approve".into());
+            let (action, _) = approval(
+                &mut codec,
+                &format!("explanation-{index}"),
+                "Bash",
+                json!({"command":"printf check", "description":description, "reason":reason}),
+            );
+            let encoded = serde_json::to_value(&action).unwrap();
+            assert_eq!(encoded["target"]["reason"]["text"], selected);
+            assert_eq!(encoded["target"]["reason"]["explanation"], source);
+            let residual: Value =
+                serde_json::from_str(encoded["target"]["preview"]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                residual,
+                if source == "description" {
+                    json!({"reason":reason})
+                } else {
+                    json!({"description":description})
+                }
+            );
+        }
+    }
+    #[test]
+    fn claude_all_approval_kinds_preserve_complete_fields() {
+        for (index, tool) in [
+            "Bash",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Read",
+            "NotebookEdit",
+            "mcp__local__change",
+            "FutureTool",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let input = json!({"command":"printf check", "description":{"nested":"not a string"},
+                "reason":"Actual reason", "timeout":1500, "cwd":"relative/folder",
+                "file_path":"relative/file", "path":"relative/file", "notebook_path":"relative/file",
+                "content":"whole file", "old_string":"old", "new_string":"new", "replace_all":true,
+                "edits":[{"old_string":"first", "new_string":"second"}], "new_source":"cell source",
+                "cell_id":"cell-one", "cell_type":"code", "edit_mode":"replace", "offset":2, "limit":7,
+                "run_in_background":true, "env":{"CHECK":"material"}, "networkAccess":false,
+                "dangerouslyDisableSandbox":true, "threadId":"argument identity", "unknownFlag":false,
+                "unknownObject":{"command":"nested material"}, "unknownArray":[1,"two",null]});
+            let mut codec = codec();
+            codec.start(TurnId::new(), "approve".into());
+            let shown: &[&str] = match tool {
+                "Bash" => &["command", "reason"],
+                "Write" | "Edit" | "MultiEdit" | "Read" => &["file_path"],
+                "NotebookEdit" => &["notebook_path"],
+                _ => &[],
+            };
+            let frame = super::super::approval_wire_sample(
+                "claude",
+                tool,
+                serde_json::to_value(ControlRequest::default()).unwrap(),
+                json!({"type":"control_request", "request_id":format!("complete-{index}"),
+                    "request":{"subtype":"can_use_tool", "tool_use_id":"invocation", "tool_name":tool,
+                        "input":input}}),
+                |field| Codec::approval_field(tool, field, shown),
+                |field| {
+                    use super::super::ApprovalField::*;
+                    match field {
+                        "type"
+                        | "request"
+                        | "request_id"
+                        | "request.tool_use_id"
+                        | "request.subtype" => Metadata,
+                        "request.tool_name" => Shown,
+                        field if field.starts_with("request.input.") => {
+                            match &field["request.input.".len()..] {
+                                field if shown.contains(&field) => Shown,
+                                "description" | "reason" | "timeout" => Passthrough {
+                                    affects_execution: false,
+                                },
+                                _ => Passthrough {
+                                    affects_execution: true,
+                                },
+                            }
+                        }
+                        _ => Passthrough {
+                            affects_execution: false,
+                        },
+                    }
+                },
+            );
+            let decoded = codec.value(frame).unwrap();
+            let action = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event:
+                            TurnEvent::RequestOpened {
+                                kind: RequestKind::Approval { action },
+                                ..
+                            },
+                        ..
+                    } => Some(action),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(action.tool, tool);
+            assert!(action.consent.grant_key().is_none());
+            let mut expected = input;
+            let preview = match &action.target {
+                ApprovalTarget::Command {
+                    command,
+                    reason,
+                    preview,
+                    ..
+                } => {
+                    assert_eq!(tool, "Bash");
+                    assert_eq!(command, "printf check");
+                    assert_eq!(reason.as_ref().unwrap().text, "Actual reason");
+                    expected
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|field, _| !matches!(field.as_str(), "command" | "reason"));
+                    preview
+                }
+                ApprovalTarget::File {
+                    operation,
+                    path,
+                    location,
+                    preview,
+                } => {
+                    assert_eq!(path, &std::path::PathBuf::from("relative/file"));
+                    assert_eq!(location, &TargetLocation::NotVerified);
+                    assert_eq!(
+                        *operation,
+                        match tool {
+                            "Write" => FileOperation::Write,
+                            "Read" => FileOperation::Read,
+                            _ => FileOperation::Edit,
+                        }
+                    );
+                    let shown_path = if tool == "NotebookEdit" {
+                        "notebook_path"
+                    } else {
+                        "file_path"
+                    };
+                    expected
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|field, _| field != shown_path);
+                    preview
+                }
+                ApprovalTarget::Tool { preview } => {
+                    assert!(matches!(tool, "mcp__local__change" | "FutureTool"));
+                    preview
+                }
+            };
+            assert!(!preview.truncated);
+            assert_eq!(
+                preview.text,
+                serde_json::to_string_pretty(&expected).unwrap(),
+                "{tool}"
+            );
+        }
+    }
     #[test]
     fn claude_fixture_approval_preview_keeps_every_unmapped_field() {
         let mut frame = include_str!("../../tests/fixtures/claude/approval-deny.jsonl")

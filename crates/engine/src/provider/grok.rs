@@ -159,6 +159,7 @@ struct Request {
     owner: ActiveTurn,
 }
 #[derive(Default, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, rename_all = "camelCase")]
 struct Permission {
     session_id: String,
@@ -168,12 +169,14 @@ struct Permission {
     meta: Meta,
 }
 #[derive(Default, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, rename_all = "camelCase")]
 struct PermissionOption {
     option_id: String,
     kind: OptionKind,
 }
 #[derive(Default, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, rename_all = "camelCase")]
 struct Meta {
     prompt_index: Option<i64>,
@@ -181,6 +184,7 @@ struct Meta {
     is_replay: bool,
 }
 #[derive(Default, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(default, rename_all = "camelCase")]
 struct Tool {
     tool_call_id: String,
@@ -325,6 +329,7 @@ enum Content {
     Unknown,
 }
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "snake_case")]
 enum OptionKind {
     AllowOnce,
@@ -349,6 +354,7 @@ enum UpdateKind {
     Unknown,
 }
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "snake_case")]
 enum ToolStatus {
     Pending,
@@ -1061,6 +1067,31 @@ impl Codec {
         }
         Ok(())
     }
+    fn approval_field(kind: &str, field: &str, shown: &[&str]) -> super::ApprovalField {
+        use super::ApprovalField::*;
+        match field {
+            "toolCall.title" | "options" | "options[].kind" => Shown,
+            field if field.starts_with("toolCall.rawInput.") => {
+                let field = &field["toolCall.rawInput.".len()..];
+                match field {
+                    field if shown.contains(&field) => Shown,
+                    "description" | "reason" | "timeout" | "is_background" => Passthrough {
+                        affects_execution: false,
+                    },
+                    "variant" => Passthrough {
+                        affects_execution: kind != "Bash",
+                    },
+                    _ => Passthrough {
+                        affects_execution: true,
+                    },
+                }
+            }
+            "toolCall.rawInput" => Passthrough {
+                affects_execution: false,
+            },
+            _ => Metadata,
+        }
+    }
     fn request(
         &mut self,
         id: Value,
@@ -1096,41 +1127,37 @@ impl Codec {
                         .find(|o| o.kind == OptionKind::RejectOnce)
                         .map(|o| o.option_id.clone());
                     let command = permission.tool_call.raw_input["command"].as_str();
-                    let exact_command = permission.tool_call.raw_input["variant"].as_str()
-                        == Some("Bash")
-                        && permission
-                            .tool_call
-                            .raw_input
-                            .as_object()
-                            .is_some_and(|args| {
-                                args.keys().all(|key| {
-                                    matches!(
-                                        key.as_str(),
-                                        "variant"
-                                            | "command"
-                                            | "description"
-                                            | "is_background"
-                                            | "timeout"
-                                    )
-                                })
-                            });
+                    let reason =
+                        command.and_then(|_| {
+                            super::approval_explanation(["description", "reason"].map(|field| {
+                                (field, permission.tool_call.raw_input[field].as_str())
+                            }))
+                        });
+                    let mut shown = Vec::new();
+                    if command.is_some() {
+                        shown.push("command");
+                    }
+                    if let Some((field, _)) = &reason {
+                        shown.push(field);
+                    }
+                    let bash = permission.tool_call.raw_input["variant"].as_str() == Some("Bash");
+                    let fields =
+                        super::ApprovalFields::new(&permission.tool_call.raw_input, |field| {
+                            Self::approval_field(
+                                permission.tool_call.raw_input["variant"]
+                                    .as_str()
+                                    .unwrap_or_default(),
+                                &format!("toolCall.rawInput.{field}"),
+                                &shown,
+                            )
+                        });
+                    let exact_command = bash && fields.permits_grant();
                     let grant_key = command.filter(|_| exact_command).map(|command| GrantKey {
                         tool: "Bash".into(),
                         command: command.into(),
                     });
-                    let mut residual = permission.tool_call.raw_input.clone();
+                    let residual = fields.residual(&permission.tool_call.raw_input);
                     let target = if let Some(command) = command {
-                        let reason = ["description", "reason"].into_iter().find_map(|field| {
-                            permission.tool_call.raw_input[field]
-                                .as_str()
-                                .map(|text| (field, ApprovalPreview::new(text.into())))
-                        });
-                        if let Some(fields) = residual.as_object_mut() {
-                            fields.remove("command");
-                            if let Some((field, _)) = &reason {
-                                fields.remove(*field);
-                            }
-                        }
                         ApprovalTarget::Command {
                             command: command.into(),
                             cwd: if exact_command {
@@ -1143,9 +1170,7 @@ impl Codec {
                         }
                     } else {
                         ApprovalTarget::Tool {
-                            preview: ApprovalPreview::new(serde_json::to_string_pretty(
-                                &permission.tool_call.raw_input,
-                            )?),
+                            preview: ApprovalPreview::new(serde_json::to_string_pretty(&residual)?),
                         }
                     };
                     let mut action = ProposedAction::new(permission.tool_call.title, target)
@@ -1644,6 +1669,189 @@ mod wire_tests {
                 ..
             }
         )));
+    }
+    #[test]
+    fn grok_explanation_source_and_residual_are_codec_owned() {
+        for (description, reason, selected, source) in [
+            (
+                json!("Description"),
+                json!("Reason"),
+                "Description",
+                "description",
+            ),
+            (
+                json!({"nested":"keep"}),
+                json!("Reason"),
+                "Reason",
+                "reason",
+            ),
+            (Value::Null, json!(""), "", "reason"),
+        ] {
+            let (mut codec, turn) = boundary_codec();
+            let mut frame = fixture_frame(
+                include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
+                |frame| frame["method"] == "session/request_permission",
+                turn,
+            );
+            frame["params"]["toolCall"]["rawInput"] = json!({"command":"printf check",
+                "variant":"Bash", "description":description, "reason":reason});
+            let decoded = codec.value(frame).unwrap();
+            let action = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event:
+                            TurnEvent::RequestOpened {
+                                kind: RequestKind::Approval { action },
+                                ..
+                            },
+                        ..
+                    } => Some(action),
+                    _ => None,
+                })
+                .unwrap();
+            let encoded = serde_json::to_value(action).unwrap();
+            assert_eq!(encoded["target"]["reason"]["text"], selected);
+            assert_eq!(encoded["target"]["reason"]["explanation"], source);
+            let residual: Value =
+                serde_json::from_str(encoded["target"]["preview"]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                residual,
+                if source == "description" {
+                    json!({"variant":"Bash", "reason":reason})
+                } else {
+                    json!({"variant":"Bash", "description":description})
+                }
+            );
+        }
+    }
+    #[test]
+    fn grok_all_approval_kinds_preserve_complete_fields() {
+        for (index, (variant, command)) in [
+            ("Bash", json!("printf check")),
+            ("Edit", json!(42)),
+            ("mcp__local__change", json!({"nested":"command"})),
+            ("FutureTool", Value::Null),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut codec, turn) = boundary_codec();
+            let mut frame = fixture_frame(
+                include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
+                |frame| frame["method"] == "session/request_permission",
+                turn,
+            );
+            let input = json!({"variant":variant, "command":command, "cwd":"relative/folder",
+                "description":{"nested":"not a string"}, "reason":"Actual reason", "timeout":1500,
+                "is_background":true, "file_path":"relative/file", "path":"relative/file",
+                "notebook_path":"relative/file", "content":"whole file", "old_string":"old",
+                "new_string":"new", "env":{"CHECK":"material"}, "networkAccess":false,
+                "dangerouslyDisableSandbox":true, "itemId":"argument identity", "unknownFlag":false,
+                "unknownObject":{"command":"nested material"}, "unknownArray":[1,"two",null]});
+            frame["id"] = json!(format!("complete-{index}"));
+            frame["params"]["toolCall"]["rawInput"] = input.clone();
+            frame["params"]["toolCall"]["title"] = json!(variant);
+            frame["params"]["toolCall"]["status"] = json!("pending");
+            frame["params"]["toolCall"]["rawOutput"] =
+                json!({"internalOutput":"not approval input"});
+            frame["params"]["toolCall"]["content"] =
+                json!([{"type":"text", "text":"internal content"}]);
+            frame["params"]["_meta"]["promptIndex"] = json!(1);
+            frame["params"]["_meta"]["isReplay"] = json!(false);
+            let shown: &[&str] = if index == 0 {
+                &["command", "reason"]
+            } else {
+                &[]
+            };
+            frame["params"] = super::super::approval_wire_sample(
+                "grok",
+                variant,
+                serde_json::to_value(Permission {
+                    options: vec![PermissionOption::default()],
+                    ..Default::default()
+                })
+                .unwrap(),
+                frame["params"].clone(),
+                |field| Codec::approval_field(variant, field, shown),
+                |field| {
+                    use super::super::ApprovalField::*;
+                    match field {
+                        "toolCall.title" | "options" | "options[].kind" => Shown,
+                        "toolCall.rawInput" => Passthrough {
+                            affects_execution: false,
+                        },
+                        field if field.starts_with("toolCall.rawInput.") => {
+                            match &field["toolCall.rawInput.".len()..] {
+                                field if shown.contains(&field) => Shown,
+                                "description" | "reason" | "timeout" | "is_background" => {
+                                    Passthrough {
+                                        affects_execution: false,
+                                    }
+                                }
+                                "variant" => Passthrough {
+                                    affects_execution: index != 0,
+                                },
+                                _ => Passthrough {
+                                    affects_execution: true,
+                                },
+                            }
+                        }
+                        _ => Metadata,
+                    }
+                },
+            );
+            let decoded = codec.value(frame).unwrap();
+            let action = decoded
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Turn {
+                        event:
+                            TurnEvent::RequestOpened {
+                                kind: RequestKind::Approval { action },
+                                ..
+                            },
+                        ..
+                    } => Some(action),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(action.tool, variant);
+            assert!(action.consent.grant_key().is_none());
+            let mut expected = input;
+            let preview = match &action.target {
+                ApprovalTarget::Command {
+                    command,
+                    cwd,
+                    reason,
+                    preview,
+                } => {
+                    assert_eq!(variant, "Bash");
+                    assert_eq!(command, "printf check");
+                    assert_eq!(cwd, &CommandCwd::NotVerified);
+                    assert_eq!(reason.as_ref().unwrap().text, "Actual reason");
+                    expected
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|field, _| !matches!(field.as_str(), "command" | "reason"));
+                    preview
+                }
+                ApprovalTarget::Tool { preview } => {
+                    assert_ne!(variant, "Bash");
+                    preview
+                }
+                other => panic!("unexpected target: {other:?}"),
+            };
+            assert!(!preview.truncated);
+            assert_eq!(
+                preview.text,
+                serde_json::to_string_pretty(&expected).unwrap(),
+                "{variant}"
+            );
+        }
     }
     #[test]
     fn grok_fixture_approval_preview_keeps_every_unmapped_field() {
