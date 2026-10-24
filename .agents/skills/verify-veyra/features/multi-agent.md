@@ -1,6 +1,6 @@
 # Child threads
 
-Status: passed, 2026-10-24, 2672dee, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 561dceec), 64c8c0899385cd4a618f91937abc08251b70ef718602e91c650820c8d96fc2b8
+Status: passed, 2026-10-24, 90327b9, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN b4c41aec), a905be627e5706227f5bf2c82ce1645c47fd0ce8d3905bc299f6812b6b717534
 Covers: crates/veyra/src/relay.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
 
 ## Sub-features

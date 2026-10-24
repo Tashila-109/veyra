@@ -1,6 +1,6 @@
 # App launch
 
-Status: passed, 2026-10-24, 2672dee, none (fake CLI RUN 561dceec), 28e0b339e5e3c5d96858d95c4e733d5653963c42038cb75c68a8455cb039b25e
+Status: passed, 2026-10-24, 90327b9, none (fake CLI RUN b4c41aec), 28e0b339e5e3c5d96858d95c4e733d5653963c42038cb75c68a8455cb039b25e
 Covers: crates/engine/src/data_dir.rs crates/veyra/src/ui/new_thread.rs
 
 ## Sub-features

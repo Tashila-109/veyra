@@ -1,6 +1,6 @@
 # Settings
 
-Status: passed, 2026-10-24, 2672dee, human display-settings lane not run (fake CLI RUN 561dceec), fdb45f558f37cd52102be2bf0bf71c166f82585bd587e78a095fe1d606f5f33b
+Status: passed, 2026-10-24, 90327b9, human display-settings lane not run (fake CLI RUN b4c41aec), 56f3a368e54dd7a4fbe25113c88bf7b71f54ce0e887ca2cacfc7d7e524a3cdd5
 Covers: crates/veyra/src/ui/settings.rs crates/veyra/src/ui/new_thread.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
 
 ## Sub-features
