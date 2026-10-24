@@ -1,4 +1,5 @@
 use gpui_kit::component::{Theme as KitTheme, ThemeMode};
+use gpui_kit::prelude::*;
 use gpui_kit::{
     App, Background, BoxShadow, FontWeight, Global, Hsla, Pixels, Point, Rems, Rgba, SharedString,
     Size, Window, WindowAppearance, WindowBackgroundAppearance, linear_color_stop, linear_gradient,
@@ -82,6 +83,10 @@ pub struct Colors {
     pub text: Hsla,
     pub text_muted: Hsla,
     pub text_faint: Hsla,
+    pub icon: Hsla,
+    pub placeholder: Hsla,
+    pub danger_wash: Hsla,
+    pub warning_wash: Hsla,
     pub solid: Hsla,
     pub on_solid: Hsla,
     pub accent: Hsla,
@@ -116,6 +121,10 @@ impl Colors {
             text: rgb(0xe7e8ea).into(),
             text_muted: rgb(0xaaabad).into(),
             text_faint: rgb(0x909193).into(),
+            icon: rgb(0xaaabad).into(),
+            placeholder: rgb(0xaaabad).into(),
+            danger_wash: wash(rgb(0xf88a82).into(), rgb(0x0a0b0c).into(), 19. / 255.),
+            warning_wash: wash(rgb(0xe6ba60).into(), rgb(0x0a0b0c).into(), 19. / 255.),
             solid: rgb(0xf1f1f3).into(),
             on_solid: rgb(0x0a0b0c).into(),
             accent: rgb(0x8b7cf6).into(),
@@ -150,6 +159,10 @@ impl Colors {
             text: rgb(0x272729).into(),
             text_muted: rgb(0x5c5d5e).into(),
             text_faint: rgb(0x656667).into(),
+            icon: rgb(0x5c5d5e).into(),
+            placeholder: rgb(0x5c5d5e).into(),
+            danger_wash: wash(rgb(0xa82d2e).into(), rgb(0xffffff).into(), 14. / 255.),
+            warning_wash: wash(rgb(0x7f5d04).into(), rgb(0xffffff).into(), 14. / 255.),
             solid: rgb(0x1d1d1f).into(),
             on_solid: rgb(0xffffff).into(),
             accent: rgb(0x5b43e8).into(),
@@ -166,6 +179,18 @@ impl Colors {
             term_selection: rgba(0x00000021).into(),
         }
     }
+}
+
+fn wash(foreground: Hsla, background: Hsla, alpha: f32) -> Hsla {
+    let fg = foreground.to_rgb();
+    let bg = background.to_rgb();
+    Rgba {
+        r: fg.r * alpha + bg.r * (1. - alpha),
+        g: fg.g * alpha + bg.g * (1. - alpha),
+        b: fg.b * alpha + bg.b * (1. - alpha),
+        a: 1.,
+    }
+    .into()
 }
 
 #[derive(Clone)]
@@ -192,6 +217,7 @@ pub struct TypeScale {
     pub ui_font: SharedString,
     pub mono_font: SharedString,
     pub meta: TypeRole,
+    pub micro: TypeRole,
     pub label: TypeRole,
     pub ui: TypeRole,
     pub read: TypeRole,
@@ -267,7 +293,22 @@ pub struct Layout {
     pub small_icon_button: Pixels,
     pub icon: Pixels,
     pub small_icon: Pixels,
-    pub icon_stroke: Pixels,
+    pub icon_stroke: f32,
+    pub focus_ring: Pixels,
+    pub focus_inset: Pixels,
+    pub row_gap: Pixels,
+    pub group_gap: Pixels,
+    pub resize_band: Pixels,
+    pub palette_width: Pixels,
+    pub palette_max_height: Pixels,
+    pub toast_width: Pixels,
+    pub toast_inset: Pixels,
+    pub toasts_shown: usize,
+    pub row_inset: Pixels,
+    pub control_gap: Pixels,
+    pub section_gap: Pixels,
+    pub floating_inset: Pixels,
+    pub list_gap: Pixels,
     pub status_glyph: Pixels,
     pub provider_mark: Pixels,
     pub drawer_tabs: Pixels,
@@ -345,7 +386,7 @@ impl Theme {
             colors,
             shadows: Shadows {
                 raised: if dark {
-                    vec![]
+                    vec![shadow(4., 12., 0x00000044)]
                 } else {
                     vec![shadow(1., 2., 0x0000001a)]
                 },
@@ -360,11 +401,12 @@ impl Theme {
                 ui_font: "Geist".into(),
                 mono_font: "Geist Mono".into(),
                 meta: role(11., 16., FontWeight::NORMAL),
+                micro: role(10., 12., FontWeight::MEDIUM),
                 label: role(12., 16., FontWeight::NORMAL),
                 ui: role(13., 20., FontWeight::NORMAL),
                 read: role(14., 24., FontWeight::NORMAL),
                 h3: role(16., 24., FontWeight::SEMIBOLD),
-                h2: role(18., 28., FontWeight::MEDIUM),
+                h2: role(18., 28., FontWeight::SEMIBOLD),
                 h1: role(20., 28., FontWeight::SEMIBOLD),
                 code: role(12., 20., FontWeight::NORMAL),
                 diff: role(12., 20., FontWeight::NORMAL),
@@ -429,8 +471,23 @@ impl Theme {
                 small_icon_button: px(24.),
                 icon: px(16.),
                 small_icon: px(14.),
-                icon_stroke: px(1.5),
-                status_glyph: px(12.),
+                icon_stroke: 2. / 24.,
+                focus_ring: px(2.),
+                focus_inset: px(1.),
+                row_gap: px(2.),
+                group_gap: px(12.),
+                resize_band: px(8.),
+                palette_width: px(560.),
+                palette_max_height: px(344.),
+                toast_width: px(360.),
+                toast_inset: px(16.),
+                toasts_shown: 3,
+                row_inset: px(6.),
+                control_gap: px(8.),
+                section_gap: px(24.),
+                floating_inset: px(4.),
+                list_gap: px(2.),
+                status_glyph: px(16.),
                 provider_mark: px(14.),
                 drawer_tabs: px(32.),
                 drawer_min: px(134.),
@@ -506,6 +563,8 @@ impl Theme {
             theme.colors.border_strong = theme.colors.border;
             theme.colors.text_muted = theme.colors.text;
             theme.colors.text_faint = theme.colors.text;
+            theme.colors.icon = theme.colors.text_muted;
+            theme.colors.placeholder = theme.colors.text_muted;
         }
         if look.options.reduce_motion {
             for token in theme.motion.tokens_mut() {
@@ -521,6 +580,16 @@ impl Theme {
             color.a = self.glass_coverage;
         }
         color
+    }
+
+    pub fn focus_ring(&self) -> impl IntoElement {
+        gpui_kit::div()
+            .debug_selector(|| "focus-ring".into())
+            .absolute()
+            .inset(self.layout.focus_inset)
+            .border(self.layout.focus_ring)
+            .border_color(self.colors.accent)
+            .rounded(self.radius.control - self.layout.focus_inset)
     }
 
     pub fn plate(&self, fill: Hsla) -> Background {
@@ -887,6 +956,19 @@ mod tests {
                 }
             }
             let c = &t.colors;
+            for theme in [&t, &high] {
+                let c = &theme.colors;
+                assert_eq!(c.icon, c.text_muted);
+                assert_eq!(c.placeholder, c.text_muted);
+                for background in [c.bg, c.shell, c.card, c.floating] {
+                    assert!(contrast(c.icon, background, background) >= 3.);
+                }
+                for background in [c.danger_wash, c.warning_wash] {
+                    for foreground in [c.text, c.text_muted] {
+                        assert!(contrast(foreground, background, c.bg) >= 4.5);
+                    }
+                }
+            }
             let pairs = [
                 ("text/bg", c.text, c.bg, c.bg, 4.5),
                 ("text/shell", c.text, c.shell, c.bg, 4.5),

@@ -2,6 +2,7 @@ use super::{
     Shell,
     actions::*,
     composer::{button_text, labelled_button},
+    icons,
     theme::Theme,
 };
 use gpui_kit::base::Selectable;
@@ -15,21 +16,16 @@ pub(super) struct SidebarScroll {
     selected: std::cell::Cell<Option<ThreadId>>,
     row_focus: std::cell::RefCell<BTreeMap<ThreadId, FocusHandle>>,
 }
+#[cfg(any(debug_assertions, test))]
 pub fn glyph(status: &Status) -> &'static str {
-    match status {
-        Status::Working { .. } => "◔",
-        Status::Failed => "×",
-        Status::Done { .. } => "✓",
-        Status::NeedsYou | Status::Held => "◇",
-        Status::Interrupted => "×",
-        _ => "·",
-    }
+    icons::status_path(status)
 }
 pub(super) fn glyph_color(status: &Status, theme: &Theme) -> Hsla {
     match status {
         Status::Working { .. } => theme.colors.accent,
         Status::Failed => theme.colors.danger,
         Status::Done { .. } => theme.colors.success,
+        Status::NeedsYou => theme.colors.warning,
         _ => theme.colors.text_muted,
     }
 }
@@ -146,11 +142,11 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                 .row_focus
                 .borrow_mut()
                 .entry(id)
-                .or_insert_with(|| cx.focus_handle())
+                .or_insert_with(|| cx.focus_handle().tab_stop(true))
                 .clone();
             let row_focused = row_focus.contains_focused(window, cx);
             let status = row_status(&shell.state, thread);
-            let tooltip = super::header::status_text(&status);
+            let tooltip = super::header::status_text_at(&status, shell.clock.elapsed_at);
             let menu = shell
                 .thread_menu
                 .as_ref()
@@ -198,13 +194,12 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                     .min_w_0()
                     .items_center()
                     .gap(t.space.0[3])
-                    .child(
-                        div()
-                            .w(t.layout.status_glyph)
-                            .flex_none()
-                            .text_color(glyph_color(&status, t))
-                            .child(glyph(&status)),
-                    )
+                    .child(icons::status_mark(
+                        &status,
+                        shell.clock.phase,
+                        t.layout.status_glyph,
+                        glyph_color(&status, t),
+                    ))
                     .child(
                         div()
                             .h_flex()
@@ -216,6 +211,13 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                             .pr(t.space.0[3])
                             .child(
                                 button_text(thread.title.clone().into(), cx)
+                                    .text_size(t.text.ui.size)
+                                    .line_height(t.text.ui.line_height)
+                                    .font_weight(if shell.view.chat() == Some(id) {
+                                        FontWeight::MEDIUM
+                                    } else {
+                                        t.text.ui.weight
+                                    })
                                     .flex_1()
                                     .min_w(t.layout.small_icon_button),
                             )
@@ -294,9 +296,13 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                     .w_full()
                     .flex_none()
                     .min_w_0()
+                    .relative()
                     .when(shell.view.chat() == Some(id), |row| row.bg(t.colors.sel))
                     .hover(|style| style.bg(t.colors.hover))
-                    .focus_visible(|style| style.bg(t.colors.sel))
+                    .when(
+                        row_focus.is_focused(window) && window.last_input_was_keyboard(),
+                        |row| row.child(t.focus_ring()),
+                    )
                     .when(nested(&shell.state, thread), |row| {
                         row.ml(t.layout.agent_margin)
                             .pl(t.space.0[3])
@@ -404,6 +410,30 @@ mod tests {
     use super::next_needs_you;
     use std::collections::BTreeMap;
     use veyra_engine::domain::{Status, ThreadId};
+    #[test]
+    fn status_marks_differ_by_shape() {
+        let statuses = [
+            Status::Working { since: 0 },
+            Status::NeedsYou,
+            Status::Done { took: 0 },
+            Status::Failed,
+            Status::Idle,
+            Status::Held,
+            Status::Interrupted,
+        ];
+        let paths: std::collections::BTreeSet<_> = statuses.iter().map(super::glyph).collect();
+        assert_eq!(paths.len(), statuses.len());
+        for appearance in [
+            super::super::theme::Appearance::Dark,
+            super::super::theme::Appearance::Light,
+        ] {
+            let theme = super::super::theme::Theme::new(appearance);
+            assert_eq!(
+                super::glyph_color(&Status::NeedsYou, &theme),
+                theme.colors.warning
+            );
+        }
+    }
     #[test]
     fn next_needs_you_order() {
         let root = ThreadId::new();

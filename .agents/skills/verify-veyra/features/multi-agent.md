@@ -13,6 +13,8 @@ Covers: crates/veyra/src/relay.rs crates/engine/src/mcp.rs crates/engine/src/too
 - Archive hides a family; ArchiveKeepChildren keeps running children as top-level rows with an unlinked breadcrumb.
 - Quiet for N min appears after ten silent minutes without changing Working, including an unselected child.
 - Assistant soft line breaks, emphasis, lists and code remain visible.
+- Sidebar, header and family rows use distinct Veyra status marks, with Needs you in warning.
+- Keyboard focus paints an inset accent ring independently of the selected row's plate.
 
 ## How to get to it (user POV)
 
@@ -80,12 +82,21 @@ capture('multi-child-task')
 family_delivered('multi-delivered',root,task)
 select('multi-family-done',root)
 completed = poll('multi-family-done',lambda d:d['transcript']['family_card']['rows'][0]['status']=='Done')
-assert completed['transcript']['family_card']['rows'][0]['glyph']=='✓'
+assert completed['transcript']['family_card']['rows'][0]['glyph']=='marks/done.svg'
 assert completed['transcript']['family_card']['rows'][0]['stop_action'] is None
 assert completed['perf']['visible']=={'thread':root,'applied_batches':0,'max_batch_gap_ms':0.0}
 assert any(item['turn_label']=='Reports from 1 child thread' for item in completed['transcript']['items'])
 assert sql("select (select started_at from turns where id=tasks.wake_turn)>=(select ended_at from turns where thread_id=tasks.parent_thread_id and ordinal=1) from tasks where id='"+task+"'")=='1'
 capture('multi-family-done')
+focus_sequence = []
+for index in range(16):
+    ctl('multi-row-focus-key-'+str(index),'keys','shift-tab')
+    focused = ctl('multi-row-focus-'+str(index),'dump')
+    assert focused['selected_thread']['id']==root
+    focus_sequence.append({'step':index,'focus':focused['focus'],'selected_thread':root})
+    capture('multi-row-focus-'+str(index))
+save('multi-row-focus-sequence',focus_sequence)
+select('multi-row-focus-return',root)
 select('multi-report-delivered',child)
 poll('multi-report-delivered',lambda d:any(item['report_delivered'] for item in d['transcript']['items']))
 capture('multi-report-delivered')
@@ -453,6 +464,23 @@ The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and bl
       "multi-tree-working.png",
       "multi-child-task.png",
       "multi-family-done.png",
+      "multi-row-focus-0.png",
+      "multi-row-focus-1.png",
+      "multi-row-focus-2.png",
+      "multi-row-focus-3.png",
+      "multi-row-focus-4.png",
+      "multi-row-focus-5.png",
+      "multi-row-focus-6.png",
+      "multi-row-focus-7.png",
+      "multi-row-focus-8.png",
+      "multi-row-focus-9.png",
+      "multi-row-focus-10.png",
+      "multi-row-focus-11.png",
+      "multi-row-focus-12.png",
+      "multi-row-focus-13.png",
+      "multi-row-focus-14.png",
+      "multi-row-focus-15.png",
+      "multi-row-focus-sequence.json",
       "multi-report-delivered.png",
       "multi-child-parent-needs.png",
       "multi-menu.png",

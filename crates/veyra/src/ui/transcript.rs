@@ -804,12 +804,12 @@ fn family_card(shell: &Shell, children: &[ThreadId], cx: &App) -> AnyElement {
                 .h_flex()
                 .items_center()
                 .gap(t.space.0[3])
-                .child(
-                    div()
-                        .w(t.layout.status_glyph)
-                        .text_color(super::sidebar::glyph_color(&status, t))
-                        .child(super::sidebar::glyph(&status)),
-                )
+                .child(super::icons::status_mark(
+                    &status,
+                    shell.clock.phase,
+                    t.layout.status_glyph,
+                    super::sidebar::glyph_color(&status, t),
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -820,7 +820,10 @@ fn family_card(shell: &Shell, children: &[ThreadId], cx: &App) -> AnyElement {
                     div()
                         .text_size(t.text.meta.size)
                         .text_color(t.colors.text_muted)
-                        .child(super::header::status_text(&status)),
+                        .child(super::header::status_text_at(
+                            &status,
+                            shell.clock.elapsed_at,
+                        )),
                 )
                 .child(
                     labelled_button(SharedString::from(format!("child-open-{id}")), "Open", cx)

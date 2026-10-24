@@ -2,6 +2,7 @@ use super::{
     MainView, Shell,
     actions::{SelectThread, ToggleShellDrawer},
     composer::labelled_button,
+    icons,
     theme::Theme,
 };
 use gpui_kit::component::StyledExt;
@@ -19,11 +20,14 @@ pub(super) fn starting_text(
         .then(|| format!("Starting {}", provider.label()))
 }
 pub(super) fn status_text(status: &Status) -> String {
+    status_text_at(status, veyra_engine::actor::now())
+}
+pub(super) fn status_text_at(status: &Status, now: Millis) -> String {
     match status {
         Status::Working { since } => format!(
             "Working · {}s",
             if *since > 0 {
-                (veyra_engine::actor::now() - since).max(0) / 1000
+                (now - since).max(0) / 1000
             } else {
                 0
             }
@@ -143,6 +147,9 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                 .debug_selector(|| "header-title".into())
                 .min_w_0()
                 .truncate()
+                .text_size(t.text.ui.size)
+                .line_height(t.text.ui.line_height)
+                .font_weight(FontWeight::MEDIUM)
                 .child(title),
         )
         .when_some(attention, |header, attention| {
@@ -157,10 +164,22 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
             this.child(
                 div()
                     .debug_selector(|| "header-status".into())
+                    .h_flex()
+                    .items_center()
+                    .gap(t.layout.control_gap)
                     .flex_none()
                     .whitespace_nowrap()
                     .text_size(t.text.meta.size)
                     .text_color(t.colors.text_muted)
+                    .when_some(shell.view.chat(), |row, thread| {
+                        let status = shell.state.status(thread);
+                        row.child(icons::status_mark(
+                            &status,
+                            shell.clock.phase,
+                            t.layout.status_glyph,
+                            super::sidebar::glyph_color(&status, t),
+                        ))
+                    })
                     .child(text),
             )
         })

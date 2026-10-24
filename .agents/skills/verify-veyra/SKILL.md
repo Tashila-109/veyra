@@ -312,6 +312,10 @@ PY
 ```
 
 Inspect the PNGs themselves for Geist, the 240 px initial sidebar, 44 px header, upper-third new-thread block, centred chat column and composer, collapsed tools/reasoning, failure cause and Settings copy.
+Read the status-mark captures at full size: Working is an open accent arc, Needs you a filled warning diamond,
+Done a success check, Failed a danger cross, Idle a muted dot, Held two muted pause bars and Interrupted a muted square.
+Read the sidebar, header and family card separately. The row-focus sequence on multi-agent shows the inset accent
+ring apart from the selected plate; keyboard focus adds no selection wash. Provider and family marks are Veyra drawings.
 The transcript caps at 752 px, the composer at 784 px, with 40 px gutters.
 Yabai can override the requested 1280 by 800 outer bounds; use Doctor's actual bounds.
 Do not count native typing, pointer dragging, IME or a manual theme change as driver proof.

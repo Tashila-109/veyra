@@ -17,7 +17,8 @@ Covers: crates/veyra/src/ui/provider_text.rs crates/engine/src/provider/** crate
 Use new-thread's Ready Claude and selected project.
 Type `reply with the word ok`, then Send or ⌘↵.
 The header shows the title, status with elapsed time, project and branch.
-The sidebar has Working, Done, Failed and Idle glyphs.
+The sidebar and header show Veyra's Working arc, Done check, Failed cross and Idle dot.
+The arc steps on the one shared clock and stays still under Reduce Motion; the elapsed words still advance.
 The chat centres user bubbles and assistant markdown in one column, with a still caret while text streams.
 Reasoning and tool rows start collapsed; `ToggleItem` opens their detail, retaining the last 10,000 characters of tool output.
 ⌘⇧I toggles the latest reasoning/tool detail.

@@ -4,6 +4,7 @@ pub mod actions;
 mod composer;
 mod drawer;
 mod header;
+mod icons;
 mod new_thread;
 mod notify;
 mod provider_text;
@@ -660,7 +661,22 @@ struct QuestionScroll {
     handle: ScrollHandle,
     options: ScrollHandle,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClockMode {
+    Working(std::time::Duration),
+    Seconds,
+}
+
+#[derive(Default)]
+struct StatusClock {
+    phase: u8,
+    elapsed_at: Millis,
+    mode: Option<ClockMode>,
+    task: Option<gpui_kit::Task<()>>,
+}
+
 pub struct Shell {
+    clock: StatusClock,
     #[cfg(test)]
     sent_responses: std::rc::Rc<std::cell::RefCell<Vec<(RequestId, Decision)>>>,
     #[cfg(test)]
@@ -884,26 +900,8 @@ impl Shell {
             }
         })
         .detach();
-        let cadence = std::time::Duration::from_secs(1);
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(cadence).await;
-                if this
-                    .update(cx, |shell, cx| {
-                        let timed_notice =
-                            shell.needs_notice_clock(veyra_engine::actor::now() / 1000);
-                        if header::cadence_due(&shell.state.statuses) || timed_notice {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
         let mut shell = Self {
+            clock: StatusClock::default(),
             #[cfg(debug_assertions)]
             repaints: 0,
             drawers: BTreeMap::new(),
@@ -1473,7 +1471,17 @@ impl Shell {
                         .and_then(|row| row.wait_reason),
                 )
             })
-            .unwrap_or_else(|| self.state.header_status(thread))
+            .unwrap_or_else(|| {
+                if !matches!(self.state.status(thread), Status::Working { .. }) {
+                    return self.state.header_status(thread);
+                }
+                let mut text =
+                    header::status_text_at(&self.state.status(thread), self.clock.elapsed_at);
+                if let Some(minutes) = self.state.quiet_minutes(thread) {
+                    text.push_str(&format!(" · Quiet for {minutes} min"));
+                }
+                text
+            })
     }
     fn thread_label(&self, thread: &Thread) -> String {
         let project = self
@@ -1946,6 +1954,62 @@ impl Shell {
                 })
             })
     }
+    fn clock_mode(&self, cx: &App) -> Option<ClockMode> {
+        let working = header::cadence_due(&self.state.statuses);
+        let duration = cx.global::<Theme>().motion.spinner.duration;
+        if working && !duration.is_zero() {
+            Some(ClockMode::Working(duration))
+        } else if working || self.needs_notice_clock(veyra_engine::actor::now() / 1000) {
+            Some(ClockMode::Seconds)
+        } else {
+            None
+        }
+    }
+    fn sync_clock(&mut self, cx: &mut Context<Self>) {
+        let mode = self.clock_mode(cx);
+        if self.clock.mode == mode {
+            return;
+        }
+        self.clock.task = None;
+        self.clock.mode = mode;
+        self.clock.phase = 0;
+        self.clock.elapsed_at = veyra_engine::actor::now();
+        let Some(mode) = mode else { return };
+        let origin = cx.background_executor().now();
+        let epoch = self.clock.elapsed_at;
+        self.clock.task = Some(cx.spawn(async move |this, cx| {
+            let mut phase = 0;
+            loop {
+                let delay = match mode {
+                    ClockMode::Working(turn) => turn * (phase + 1) / 12 - turn * phase / 12,
+                    ClockMode::Seconds => std::time::Duration::from_secs(1),
+                };
+                cx.background_executor().timer(delay).await;
+                phase = (phase + 1) % 12;
+                let now = cx.background_executor().now();
+                let keep = this.update(cx, |shell, cx| {
+                    if shell.clock_mode(cx) != Some(mode) {
+                        shell.clock.mode = None;
+                        shell.clock.task = None;
+                        cx.notify();
+                        return false;
+                    }
+                    if matches!(mode, ClockMode::Working(_)) {
+                        shell.clock.phase = phase as u8;
+                    }
+                    if phase == 0 || mode == ClockMode::Seconds {
+                        shell.clock.elapsed_at =
+                            epoch + now.duration_since(origin).as_millis() as Millis;
+                    }
+                    cx.notify();
+                    true
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
     #[cfg(debug_assertions)]
     #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
     fn dump_transcript(&self) -> Vec<serde_json::Value> {
@@ -2141,6 +2205,7 @@ impl Focusable for Shell {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_clock(cx);
         self.sync_drawers(cx);
         self.drawer_viewport = window.viewport_size().height;
         self.cancel_changed_drawer_drag(cx);
@@ -2786,7 +2851,7 @@ pub fn run(
 ) {
     let events = engine.subscribe();
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(icons::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
             #[cfg(debug_assertions)]
@@ -2971,10 +3036,17 @@ mod tests {
     fn sidebar_tooltip_uses_shared_status_display(_: &mut gpui::TestAppContext) {
         assert!(
             include_str!("sidebar.rs")
-                .contains("let tooltip = super::header::status_text(&status);")
+                .contains("super::header::status_text_at(&status, shell.clock.elapsed_at)")
         );
         assert!(include_str!("sidebar.rs").contains("Tooltip::new(tooltip.clone())"));
-        assert_eq!(super::header::status_text(&Status::NeedsYou), "Needs you");
+        assert_eq!(
+            super::header::status_text_at(&Status::NeedsYou, 3000),
+            "Needs you"
+        );
+        assert_eq!(
+            super::header::status_text_at(&Status::Working { since: 1000 }, 3000),
+            "Working · 2s"
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -3028,6 +3100,191 @@ mod tests {
             });
         }
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn working_mark_steps_twelve_per_turn(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let turn = std::time::Duration::from_secs(1);
+            let epoch = shell.update(cx, |shell, cx| {
+                cx.set_global(super::Theme::new(super::Appearance::Dark));
+                shell.state.statuses = (0..5)
+                    .map(|_| (ThreadId::new(), Status::Working { since: 1 }))
+                    .collect();
+                shell.sync_clock(cx);
+                shell.clock.elapsed_at
+            });
+            cx.run_until_parked();
+            for step in 1..=24 {
+                let phase = (step - 1) % 12;
+                let delay = turn * (phase + 1) / 12 - turn * phase / 12;
+                cx.background_executor
+                    .advance_clock(delay - std::time::Duration::from_nanos(1));
+                cx.run_until_parked();
+                assert_eq!(
+                    shell.read_with(cx, |shell, _| shell.clock.phase),
+                    phase as u8
+                );
+                cx.background_executor
+                    .advance_clock(std::time::Duration::from_nanos(1));
+                cx.run_until_parked();
+                shell.read_with(cx, |shell, _| {
+                    assert_eq!(shell.clock.phase, (step % 12) as u8);
+                    assert_eq!(shell.clock.elapsed_at, epoch + (step / 12 * 1000) as i64);
+                    assert!(shell.clock.task.is_some());
+                });
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn working_clock_stops_when_idle(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                cx.set_global(super::Theme::new(super::Appearance::Dark));
+                shell
+                    .state
+                    .statuses
+                    .insert(ThreadId::new(), Status::Working { since: 1 });
+                shell.sync_clock(cx);
+            });
+            cx.run_until_parked();
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_nanos(83_333_333));
+            cx.run_until_parked();
+            assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
+            let epoch = shell.update(cx, |shell, cx| {
+                shell
+                    .state
+                    .statuses
+                    .values_mut()
+                    .for_each(|status| *status = Status::Idle);
+                shell.sync_clock(cx);
+                assert!(shell.clock.task.is_none());
+                shell.clock.elapsed_at
+            });
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_secs(10));
+            cx.run_until_parked();
+            shell.read_with(cx, |shell, _| {
+                assert!(shell.clock.mode.is_none());
+                assert!(shell.clock.task.is_none());
+                assert_eq!(shell.clock.phase, 0);
+                assert_eq!(shell.clock.elapsed_at, epoch);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn reduce_motion_keeps_working_mark_still(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let epoch = shell.update(cx, |shell, cx| {
+                let mut look = cx.global::<super::theme::Look>().to_owned();
+                look.options.reduce_motion = true;
+                cx.set_global(super::Theme::with_look(super::Appearance::Dark, look));
+                shell.state.statuses = (0..5)
+                    .map(|_| (ThreadId::new(), Status::Working { since: 1 }))
+                    .collect();
+                shell.sync_clock(cx);
+                assert!(shell.clock.mode == Some(super::ClockMode::Seconds));
+                shell.clock.elapsed_at
+            });
+            cx.run_until_parked();
+            for step in 1..=12 {
+                let turn = std::time::Duration::from_secs(1);
+                cx.background_executor
+                    .advance_clock(turn * step / 12 - turn * (step - 1) / 12);
+                cx.run_until_parked();
+                shell.read_with(cx, |shell, _| {
+                    assert_eq!(shell.clock.phase, 0);
+                    assert_eq!(
+                        shell.clock.elapsed_at,
+                        epoch + if step == 12 { 1000 } else { 0 }
+                    );
+                });
+            }
+            shell.update(cx, |shell, cx| {
+                cx.set_global(super::Theme::new(super::Appearance::Dark));
+                shell.sync_clock(cx);
+            });
+            cx.run_until_parked();
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_nanos(83_333_333));
+            cx.run_until_parked();
+            assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
+            shell.update(cx, |shell, cx| {
+                let mut look = cx.global::<super::theme::Look>().to_owned();
+                look.options.reduce_motion = true;
+                cx.set_global(super::Theme::with_look(super::Appearance::Dark, look));
+                shell.sync_clock(cx);
+                assert_eq!(shell.clock.phase, 0);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn row_focus_differs_from_selection(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let root = shell.update(cx, |shell, cx| {
+                let (root, child, _) = add_family(shell, cx);
+                shell.state.requests.clear();
+                shell
+                    .state
+                    .statuses
+                    .values_mut()
+                    .for_each(|status| *status = Status::Idle);
+                shell.state.threads.get_mut(&child).unwrap().title = "Focus target".into();
+                shell.show(super::MainView::Chat(root));
+                cx.notify();
+                root
+            });
+            draw(cx);
+            let mut reached = false;
+            for _ in 0..50 {
+                cx.update(|window, cx| window.focus_next(cx));
+                cx.simulate_keystrokes("right");
+                draw(cx);
+                let title = cx.debug_bounds("caption-Focus target").unwrap();
+                reached = cx.debug_bounds("focus-ring").is_some_and(|ring| {
+                    ring.top() <= title.top() && ring.bottom() >= title.bottom()
+                });
+                if reached {
+                    break;
+                }
+            }
+            assert!(reached, "thread row is absent from keyboard traversal");
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.view.chat()),
+                Some(root)
+            );
+            draw(cx);
+            let title = cx.debug_bounds("caption-Focus target").unwrap();
+            let ring = cx
+                .debug_bounds("focus-ring")
+                .expect("focused row lost its ring");
+            assert!(ring.top() <= title.top() && ring.bottom() >= title.bottom());
+            cx.update(|window, cx| {
+                let t = cx.global::<super::Theme>();
+                let ring = ring.scale(window.scale_factor());
+                let quad = window
+                    .painted_quads()
+                    .into_iter()
+                    .find(|quad| quad.bounds == ring && quad.border_color == t.colors.accent)
+                    .expect("focused row did not paint its accent ring");
+                assert!(quad.background.is_transparent());
+                assert_eq!(
+                    quad.border_widths.top,
+                    t.layout.focus_ring.scale(window.scale_factor())
+                );
+                assert!(
+                    !window.painted_quads().iter().any(|quad| {
+                        quad.bounds.contains(&ring.center())
+                            && quad.background == t.colors.sel.into()
+                    }),
+                    "unselected focused row painted selection"
+                );
+            });
+        });
     }
 
     fn with_docked_shell(

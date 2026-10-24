@@ -1071,7 +1071,8 @@ VisiblePerf resets its count, gap and previous-batch timestamp on selection chan
 AppState clears only its previous-batch timestamp on any TurnStarted, preserving its lifetime batch count and largest gap.
 Debug-only TranscriptOpen records the Snapshot request identity and time, marks its installation, and ui::transcript::render stamps the first render of that installed snapshot.
 The dump exposes perf.visible and perf.transcript_open_ms, which is null until an open and replaced on every open.
-A theme-cadence task refreshes Working time once a second while any thread is Working, including an unselected row.
+One shared clock steps the Working mark 12 times per spinner turn while any thread is Working and Reduce Motion is off, including an unselected row.
+Elapsed words update at the turn boundary; under Reduce Motion the clock uses the seconds cadence alone.
 AppState keeps a per-thread activity clock from TextAppended, ItemAdded, ItemCompleted and RequestOpened; TurnStarted resets it to that turn's start.
 quiet_for derives Quiet for N min after ten minutes without activity while Working, with no unfinished tool row and no pending dock request.
 The header and sidebar retain the title beside that hint and reserve its full text width, truncating the title when space is narrow; the engine status remains Working.
@@ -1267,7 +1268,9 @@ Clearing the flag restores that choice.
 Increase Contrast raises borders to a component contrast colour and uses the text colour for muted roles.
 Reduce Motion sets gpui's reduce-motion flag and snaps every motion token, including the spinner, to zero.
 The working glyph remains still.
-The one-second status clock repaints while work runs or the selected Chat transcript contains a notice whose reset instant is still in the future.
+The shared status clock steps 12 times per spinner turn while any thread is Working and Reduce Motion is off, updating elapsed words at the turn boundary.
+Under Reduce Motion it uses the seconds cadence alone.
+With no Working thread, it uses the seconds cadence only while the selected Chat transcript contains a notice whose reset instant is still in the future, and otherwise stops at rest.
 An expired reset or a hidden transcript no longer requests notice-clock repaints.
 Theme values and roles live in ui/theme.rs.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.

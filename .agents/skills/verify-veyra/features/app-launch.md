@@ -126,7 +126,7 @@ assert row
 database('initial','full_access')
 stop('before-migration')
 import uuid
-root,child,task,turn,wake,report = [str(uuid.uuid4()) for _ in range(6)]
+root,child,task,turn,wake,report,idle = [str(uuid.uuid4()) for _ in range(7)]
 with sqlite3.connect(DB) as db:
     db.execute('pragma foreign_keys=on')
     db.execute('alter table settings drop column window_background')
@@ -134,11 +134,13 @@ with sqlite3.connect(DB) as db:
     db.execute('pragma user_version=2')
     project = db.execute('select id from projects order by id').fetchone()[0]
     config = json.dumps({'model':None,'effort':None,'mode':'full_access'})
-    for thread,parent,title in [(root,None,'Migration parent'),(child,root,'Migration child')]:
+    for thread,parent,title in [(root,None,'Migration parent'),(child,root,'Migration child'),
+            (idle,None,'Idle mark')]:
         db.execute("""insert into threads(id,project_id,title,parent_thread_id,relationship,root_thread_id,
             provider,config_json,cwd,view,import_pending,created_at)
             values(?,?,?,?,?,?,'claude',?,?,'chat',0,1)""",
-            (thread,project,title,parent,'subagent' if parent else None,root,config,str(DATA/'project')))
+            (thread,project,title,parent,'subagent' if parent else None,root if parent else thread,
+                config,str(DATA/'project')))
     for identifier,thread,origin in [(turn,child,{'Task':{'task':task}}),(wake,root,{'Wake':{'tasks':[task]}})]:
         db.execute("""insert into turns(id,thread_id,ordinal,origin_json,state,outcome_json,queued_at,started_at,ended_at)
             values(?,?,1,?,'ended',?,1,1,2)""",(identifier,thread,json.dumps(origin),json.dumps('Completed')))
@@ -158,6 +160,12 @@ settled = next(t for t in dump['tasks'] if t['id']==task)['state']['Settled']
 assert settled['summary'] == 'Legacy report' and settled['source'] is None
 assert 'Delivered' in settled['delivery']
 assert sql(f"select source_item_id is null from tasks where id='{task}'") == '1'
+action('app-idle-mark-select','SelectThread',{'thread':idle})
+idle_view = poll('app-idle-mark',lambda d:d['selected_thread'] is not None
+    and d['selected_thread']['id']==idle and d['selected_thread']['status']=='Idle')
+assert idle_view['selected_thread']['status']=='Idle'
+assert idle_view['transcript']['items']==[]
+capture('app-idle-mark')
 action('migration-select-child','SelectThread',{'thread':child})
 poll('migration-transcript',lambda d: d['selected_thread'] and d['selected_thread']['id']==child
     and len(d['transcript']['items'])==1)
@@ -169,7 +177,7 @@ with sqlite3.connect(DB) as db:
     db.execute('delete from tasks where id=?',(task,))
     db.execute('delete from items where id=?',(report,))
     db.execute('delete from turns where id in (?,?)',(turn,wake))
-    for thread in [child,root]: db.execute('delete from threads where id=?',(thread,))
+    for thread in [child,root,idle]: db.execute('delete from threads where id=?',(thread,))
 start('after-migration-cleanup')
 assert sql('select count(*) from threads') == '0'
 assert sql('select id,path,name from projects order by id') == row
@@ -346,6 +354,8 @@ PY
       "second-launch.txt"
     ],
     "app-launch": [
+      "app-idle-mark.json",
+      "app-idle-mark.png",
       "initial-database.txt",
       "after-migration-database.txt",
       "persisted-project.txt",
