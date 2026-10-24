@@ -2078,7 +2078,7 @@ mod tests {
             let height = cx.debug_bounds("reply-lines").unwrap().size.height;
             assert!(
                 height >= line * 3.,
-                "three provider lines collapsed: {height:?}"
+                "three provider lines collapsed for {text:?}: {height:?}"
             );
         }
     }

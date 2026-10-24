@@ -985,7 +985,13 @@ impl Codec {
             _ => {}
         }
     }
-    fn approval_field(field: &str, value: &Value, shown: &[&str]) -> super::ApprovalField {
+    const ELICITATION_METADATA_FIELDS: [&str; 3] =
+        ["codex_approval_kind", "persist", "tool_description"];
+    fn approval_field(
+        field: &str,
+        local_environment: bool,
+        shown: &[&str],
+    ) -> super::ApprovalField {
         use super::ApprovalField::*;
         match field {
             "threadId"
@@ -996,7 +1002,7 @@ impl Codec {
             | "commandActions"
             | "availableDecisions"
             | "proposedExecpolicyAmendment" => Metadata,
-            "environmentId" if value.as_str() == Some("local") => Metadata,
+            "environmentId" if local_environment => Metadata,
             field if shown.contains(&field) => Shown,
             "reason" | "description" => Passthrough {
                 affects_execution: false,
@@ -1049,19 +1055,17 @@ impl Codec {
         }
         let elicitation = matches!(request, wire::Request::Elicitation { .. });
         if elicitation && let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) {
-            meta.retain(|field, _| {
-                !matches!(
-                    field.as_str(),
-                    "codex_approval_kind" | "persist" | "tool_description"
-                )
-            });
+            meta.retain(|field, _| !Self::ELICITATION_METADATA_FIELDS.contains(&field.as_str()));
             if meta.is_empty() {
                 params.as_object_mut().unwrap().remove("_meta");
             }
         }
+        let local_environment = params
+            .get("environmentId")
+            .is_none_or(|value| value.as_str() == Some("local"));
         let fields = |shown: &[&str]| {
             super::ApprovalFields::new(&params, |field| {
-                Self::approval_field(field, &params[field], shown)
+                Self::approval_field(field, local_environment, shown)
             })
         };
         let preview = |fields: &super::ApprovalFields| fields.preview(&params);
@@ -1082,10 +1086,7 @@ impl Codec {
                     .cwd
                     .as_deref()
                     .is_some_and(|cwd| Some(cwd) == self.spec.cwd.to_str());
-                let nonlocal_environment = params
-                    .get("environmentId")
-                    .is_some_and(|value| value.as_str() != Some("local"));
-                let location = if nonlocal_environment {
+                let location = if !local_environment {
                     CommandCwd::NotVerified
                 } else if in_project {
                     CommandCwd::ProjectFolder
@@ -1109,6 +1110,12 @@ impl Codec {
                     shown.push(field);
                 }
                 let fields = fields(&shown);
+                let grant = (matches!(location, CommandCwd::ProjectFolder)
+                    && fields.permits_grant())
+                .then(|| GrantKey {
+                    tool: "Command".into(),
+                    command: text.into(),
+                });
                 (
                     RequestKind::Approval {
                         action: ProposedAction::new(
@@ -1120,12 +1127,7 @@ impl Codec {
                                 preview: preview(&fields),
                             },
                         )
-                        .with_grant(
-                            (in_project && fields.permits_grant()).then(|| GrantKey {
-                                tool: "Command".into(),
-                                command: text.into(),
-                            }),
-                        ),
+                        .with_grant(grant),
                     },
                     RequestReply::Decision,
                 )
@@ -1926,7 +1928,7 @@ mod tests {
     #[test]
     fn codex_recorded_mcp_approval_keeps_tool_arguments() {
         let frame = json!({
-            "method":"mcpServer/elicitation/request", "id":"recorded-approval",
+            "method":"mcpServer/elicitation/request", "id":0,
             "params":{
                 "threadId":"old-thread", "turnId":"native-turn", "serverName":"veyra",
                 "mode":"form",
@@ -1945,15 +1947,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .retain(|field, _| !matches!(field.as_str(), "threadId" | "turnId" | "serverName"));
-        expected["_meta"]
-            .as_object_mut()
-            .unwrap()
-            .retain(|field, _| {
-                !matches!(
-                    field.as_str(),
-                    "codex_approval_kind" | "persist" | "tool_description"
-                )
-            });
+        expected["_meta"] = json!({
+            "tool_params":{"text":"recorded-text"},
+            "tool_params_display":[{"name":"text","value":"recorded-text","display_name":"text"}]
+        });
         let mut codec = early_request_codec();
         let action = super::super::approval_test_action(codec.value(frame).unwrap());
         assert_eq!(action.tool, "veyra / probe_echo");
@@ -1964,15 +1961,38 @@ mod tests {
             "MCP tool arguments and display fields",
         );
         let reply = codec
-            .answer(
-                NativeRequestRef("\"recorded-approval\"".into()),
-                Decision::AllowOnce,
-            )
+            .answer(NativeRequestRef("0".into()), Decision::AllowOnce)
             .unwrap();
-        assert_eq!(
-            reply,
-            json!({"id":"recorded-approval","result":{"action":"accept"}})
+        assert_eq!(reply, json!({"id":0,"result":{"action":"accept"}}));
+    }
+    #[test]
+    fn codex_mcp_wire_only_meta_leaves_no_preview() {
+        let meta: serde_json::Map<_, _> = Codec::ELICITATION_METADATA_FIELDS
+            .into_iter()
+            .zip([
+                json!("mcp_tool_call"),
+                json!(["session", "always"]),
+                json!("Tool documentation"),
+            ])
+            .map(|(field, value)| (field.to_owned(), value))
+            .collect();
+        let mut codec = early_request_codec();
+        let action = super::super::approval_test_action(
+            codec
+                .value(json!({
+                    "id":"wire-only", "method":"mcpServer/elicitation/request",
+                    "params":{"threadId":"old-thread", "turnId":"native-turn",
+                        "serverName":"veyra", "_meta":meta}
+                }))
+                .unwrap(),
         );
+        assert_eq!(action.tool, "veyra / tool call");
+        assert!(action.consent.grant_key().is_none());
+        let ApprovalTarget::Tool { preview } = &action.target else {
+            panic!("MCP tool target")
+        };
+        assert!(preview.text.is_empty(), "wire-only metadata: {preview:?}");
+        assert!(!preview.truncated);
     }
     #[test]
     fn codex_environment_value_controls_preview_and_grant() {
@@ -2170,15 +2190,9 @@ mod tests {
                     .as_object_mut()
                     .unwrap()
                     .retain(|field, _| field != "serverName");
-                expected["_meta"]
-                    .as_object_mut()
-                    .unwrap()
-                    .retain(|field, _| {
-                        !matches!(
-                            field.as_str(),
-                            "codex_approval_kind" | "persist" | "tool_description"
-                        )
-                    });
+                expected["_meta"] = json!({
+                    "unknownMeta":false, "tool_params":{}, "tool_params_display":"{}"
+                });
             }
             let preview = match &action.target {
                 ApprovalTarget::Command {
