@@ -1,7 +1,7 @@
 use gpui_kit::component::Icon;
 use gpui_kit::{
-    AssetSource, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Radians, Result,
-    SharedString, Styled, div,
+    AssetSource, Hsla, IntoElement, ParentElement, Pixels, Radians, Result, SharedString, Styled,
+    div,
 };
 use std::borrow::Cow;
 use veyra_engine::domain::Status;
@@ -122,63 +122,90 @@ pub fn status_path(status: &Status) -> &'static str {
     }
 }
 
-pub(super) struct StatusMark {
-    path: &'static str,
-    rotation: Radians,
+trait MarkArgument: Copy {
+    const APPLY: fn(Icon, Self) -> Icon;
+    #[cfg(test)]
+    fn call(self) -> MarkCall;
+}
+
+impl MarkArgument for &'static str {
+    const APPLY: fn(Icon, Self) -> Icon = Icon::path;
+    #[cfg(test)]
+    fn call(self) -> MarkCall {
+        MarkCall::Path(self)
+    }
+}
+
+impl MarkArgument for Radians {
+    const APPLY: fn(Icon, Self) -> Icon = Icon::rotate;
+    #[cfg(test)]
+    fn call(self) -> MarkCall {
+        MarkCall::Rotation(self)
+    }
+}
+
+impl MarkArgument for Hsla {
+    const APPLY: fn(Icon, Self) -> Icon = Icon::text_color;
+    #[cfg(test)]
+    fn call(self) -> MarkCall {
+        MarkCall::Color(self)
+    }
+}
+
+fn paint_argument<T: MarkArgument>(mark: Icon, argument: T) -> Icon {
+    #[cfg(test)]
+    MARK_CALLS.with_borrow_mut(|calls| calls.push(argument.call()));
+    (T::APPLY)(mark, argument)
+}
+
+pub(super) fn status_mark(
+    status: &Status,
+    phase: u8,
     size: Pixels,
     color: Hsla,
-}
-
-impl StatusMark {
-    fn path(mut self, path: &'static str) -> Self {
-        self.path = path;
-        self
-    }
-
-    fn rotate(mut self, rotation: Radians) -> Self {
-        self.rotation = rotation;
-        self
-    }
-}
-
-impl IntoElement for StatusMark {
-    type Element = <gpui_kit::Div as IntoElement>::Element;
-
-    fn into_element(self) -> Self::Element {
-        div()
-            .size(self.size)
-            .flex_none()
-            .debug_selector(|| {
-                format!(
-                    "status-mark:{}:{:.6}:{:?}",
-                    self.path, self.rotation.0, self.color
-                )
-            })
-            .child(
-                Icon::default()
-                    .path(self.path)
-                    .size(self.size)
-                    .text_color(self.color)
-                    .rotate(self.rotation),
-            )
-    }
-}
-
-pub(super) fn status_mark(status: &Status, phase: u8, size: Pixels, color: Hsla) -> StatusMark {
-    StatusMark {
-        path: "",
-        rotation: gpui_kit::radians(0.),
-        size,
-        color,
-    }
-    .path(status_path(status))
-    .rotate(gpui_kit::radians(
-        if matches!(status, Status::Working { .. }) {
+) -> impl IntoElement {
+    let mark = paint_argument(Icon::default(), status_path(status));
+    let mark = paint_argument(
+        mark,
+        gpui_kit::radians(if matches!(status, Status::Working { .. }) {
             phase as f32 * std::f32::consts::TAU / WORKING_STEPS_PER_TURN as f32
         } else {
             0.
-        },
-    ))
+        }),
+    );
+    let mark = paint_argument(mark, color);
+    div().size(size).flex_none().child(mark.size(size))
+}
+
+#[cfg(test)]
+enum MarkCall {
+    Path(&'static str),
+    Rotation(Radians),
+    Color(Hsla),
+}
+
+#[cfg(test)]
+thread_local! {
+    static MARK_CALLS: std::cell::RefCell<Vec<MarkCall>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(super) fn take_painted_marks() -> Vec<(&'static str, Radians, Hsla)> {
+    let calls = MARK_CALLS.with_borrow_mut(std::mem::take);
+    assert_eq!(calls.len() % 3, 0);
+    calls
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|calls| match calls {
+            [
+                MarkCall::Path(path),
+                MarkCall::Rotation(rotation),
+                MarkCall::Color(color),
+            ] => (*path, *rotation, *color),
+            _ => panic!("a status mark must apply path, rotation and color once"),
+        })
+        .collect()
 }
 
 #[cfg(test)]

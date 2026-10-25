@@ -1322,6 +1322,7 @@ The keys_dispatches_down_then_up_per_keystroke unit test guards that order.
 The native keyboard proof opens a composer chip through key release; terminal input handles key-down only, so adding key-up emits no extra terminal bytes.
 Dump reads identity, theme, view, engine status rows, selected native id/configuration/failure and rendered header status and branch, items, composer, readiness, settings and pump counters.
 Each sidebar thread and selected thread includes lineage, and tasks includes each received task row with its state, delivery and optional report source.
+Each sidebar thread row retains its status and reports its applicable select_action, menu_action, stop_action, archive_action and archive_keep_children_action.
 Debug-only item delta_count counts actual text-stream deltas in the current process and survives transcript snapshots; it is not persisted across app restarts.
 Debug counts are removed when their items leave the projection or the thread is archived.
 The driver adds the engine's schema_version without opening the database.
@@ -1579,6 +1580,7 @@ Window tests cover rail movement and bounds, observed composer/drawer/none focus
 The guarded shell-drawer page exercises native subscriptions, every drawer key from its required surface, close and archive consent, hidden output, restart, missing folders, orderly quit, crash hangup and one flood using owned fixtures.
 Engine tests exercise the direct on_app_quit cleanup hook with live shells.
 DebugDragShellDrawer dispatches synthetic mouse-down, held-left movement and mouse-up through the window rail handlers for the native recipe.
+DebugDragSidebar and DebugDoubleClickSidebar exist only in debug builds and dispatch synthetic mouse events through the current window's sidebar band to drag it or reset its width on double-click without moving the system cursor.
 Synthetic clicks and control keys do not establish native pointer delivery, IME or the user's real shell plugins.
 Real provider behavior still requires separately authorized live verification.
 

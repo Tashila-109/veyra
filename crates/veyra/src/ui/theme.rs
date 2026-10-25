@@ -926,14 +926,8 @@ mod tests {
         let shell: Hsla = over(painted.sidebar_fill().to_rgb(), desktop).into();
         for (name, background) in [
             ("plain tint on worst desktop", shell),
-            (
-                "opaque hover plate",
-                Hsla::from(over(c.hover.to_rgb(), c.shell.to_rgb())),
-            ),
-            (
-                "opaque selected plate",
-                Hsla::from(over(c.sel.to_rgb(), c.shell.to_rgb())),
-            ),
+            ("opaque hover plate", theme.sidebar_plate(c.hover)),
+            ("opaque selected plate", theme.sidebar_plate(c.sel)),
         ] {
             for (role, foreground, floor) in [
                 ("text", c.text, 4.5),

@@ -3349,24 +3349,28 @@ mod tests {
         cx.run_until_parked();
     }
 
-    fn assert_rendered_mark(
+    fn assert_painted_mark(
         cx: &mut gpui::VisualTestContext,
         path: &str,
         rotation: f32,
         color: gpui::Hsla,
     ) {
-        let selector = format!("status-mark:{path}:{rotation:.6}:{color:?}");
-        assert!(
-            cx.debug_bounds(Box::leak(selector.into_boxed_str()))
-                .is_some(),
-            "missing rendered mark {path} at {rotation} in {color:?}"
-        );
+        super::icons::take_painted_marks();
+        draw(cx);
+        let painted = super::icons::take_painted_marks();
+        assert!(!painted.is_empty(), "the window drew no status marks");
+        for mark in painted {
+            assert_eq!(
+                mark,
+                (path, gpui::radians(rotation), color),
+                "wrong mark paint calls"
+            );
+        }
     }
 
     fn assert_working_rotation(cx: &mut gpui::VisualTestContext, phase: u32) {
-        draw(cx);
         let color = cx.update(|_, cx| cx.global::<super::Theme>().colors.accent);
-        assert_rendered_mark(
+        assert_painted_mark(
             cx,
             "marks/working.svg",
             phase as f32 * std::f32::consts::TAU / 12.,
@@ -3414,8 +3418,7 @@ mod tests {
                         shell.state.statuses = BTreeMap::from([(thread, status)]);
                         cx.notify();
                     });
-                    draw(cx);
-                    assert_rendered_mark(cx, path, 0., color);
+                    assert_painted_mark(cx, path, 0., color);
                 }
             }
         });
@@ -3501,7 +3504,7 @@ mod tests {
             });
             draw(cx);
             let color = cx.update(|_, cx| cx.global::<super::Theme>().colors.text_muted);
-            assert_rendered_mark(cx, "marks/idle.svg", 0., color);
+            assert_painted_mark(cx, "marks/idle.svg", 0., color);
         });
     }
 
@@ -3943,6 +3946,26 @@ mod tests {
                     }
                 ));
                 assert!(!shell.needs_notice_clock(199));
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemAdded(Item {
+                        id: ItemId::new(),
+                        thread,
+                        turn,
+                        seq: 2,
+                        body: ItemBody::Notice(veyra_engine::domain::Notice {
+                            text: "Archive".into(),
+                            reset_at: Some(300),
+                        }),
+                    }),
+                });
+                assert!(shell.state.notice_resets.contains_key(&thread));
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ThreadArchived { thread },
+                });
+                assert!(!shell.state.notice_resets.contains_key(&thread));
+                assert!(!shell.needs_notice_clock(299));
             });
         });
     }
