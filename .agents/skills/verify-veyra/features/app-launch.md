@@ -6,6 +6,7 @@ Covers: crates/engine/src/data_dir.rs crates/veyra/src/ui/new_thread.rs
 ## Sub-features
 
 - `launch-window`: one native window, Geist, sidebar, header and upper-third new-thread composer.
+Read the empty-state element, trailing Add project and New thread icon buttons, and the gear-and-Settings foot aligned with the rows' inset.
 - `launch-ready`: exact ready line with this run's pid and data folder while `login_path` is still `pending` in the fake lane.
 - `launch-identity`: live pid, build revision, data folder, schema_version and system appearance.
 - `launch-database`: migration 4, WAL, eight tables and Full access default.
@@ -226,7 +227,7 @@ printf 'exit=%s\n' "$rc" >>"$REL_PROOF/ctl.txt"
 test "$rc" = 2
 grep -qx 'usage: veyra \[mcp\]' "$REL_PROOF/ctl.txt"
 : >"$REL_PROOF/strings.txt"
-for name in control.sock VEYRA_CLAUDE_BIN VEYRA_CODEX_BIN VEYRA_GROK_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD VEYRA_REAP_PIDS DebugNotificationResponse; do
+for name in control.sock VEYRA_CLAUDE_BIN VEYRA_CODEX_BIN VEYRA_GROK_BIN VEYRA_FAKE_FIXTURES VEYRA_RECORD VEYRA_REAP_PIDS DebugNotificationResponse DebugDragSidebar DebugDoubleClickSidebar; do
     release=$(/usr/bin/strings -a target/release/veyra | grep -c "$name" || true)
     debug=$(/usr/bin/strings -a target/debug/veyra | grep -c "$name" || true)
     printf 'release %s count=%s\ndebug %s count=%s\n' "$name" "$release" "$name" "$debug" \

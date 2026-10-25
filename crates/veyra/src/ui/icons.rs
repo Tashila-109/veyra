@@ -1,7 +1,12 @@
 use gpui_kit::component::Icon;
-use gpui_kit::{AssetSource, Hsla, Pixels, Result, SharedString, Styled};
+use gpui_kit::{
+    AssetSource, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, Radians, Result,
+    SharedString, Styled, div,
+};
 use std::borrow::Cow;
 use veyra_engine::domain::Status;
+
+pub(super) const WORKING_STEPS_PER_TURN: u32 = 12;
 
 gpui_kit::assets::icon_assets!(
     ControlAssets,
@@ -117,18 +122,63 @@ pub fn status_path(status: &Status) -> &'static str {
     }
 }
 
-pub fn status_mark(status: &Status, phase: u8, size: Pixels, color: Hsla) -> Icon {
-    Icon::default()
-        .path(status_path(status))
-        .size(size)
-        .text_color(color)
-        .rotate(gpui_kit::radians(
-            if matches!(status, Status::Working { .. }) {
-                phase as f32 * std::f32::consts::TAU / 12.
-            } else {
-                0.
-            },
-        ))
+pub(super) struct StatusMark {
+    path: &'static str,
+    rotation: Radians,
+    size: Pixels,
+    color: Hsla,
+}
+
+impl StatusMark {
+    fn path(mut self, path: &'static str) -> Self {
+        self.path = path;
+        self
+    }
+
+    fn rotate(mut self, rotation: Radians) -> Self {
+        self.rotation = rotation;
+        self
+    }
+}
+
+impl IntoElement for StatusMark {
+    type Element = <gpui_kit::Div as IntoElement>::Element;
+
+    fn into_element(self) -> Self::Element {
+        div()
+            .size(self.size)
+            .flex_none()
+            .debug_selector(|| {
+                format!(
+                    "status-mark:{}:{:.6}:{:?}",
+                    self.path, self.rotation.0, self.color
+                )
+            })
+            .child(
+                Icon::default()
+                    .path(self.path)
+                    .size(self.size)
+                    .text_color(self.color)
+                    .rotate(self.rotation),
+            )
+    }
+}
+
+pub(super) fn status_mark(status: &Status, phase: u8, size: Pixels, color: Hsla) -> StatusMark {
+    StatusMark {
+        path: "",
+        rotation: gpui_kit::radians(0.),
+        size,
+        color,
+    }
+    .path(status_path(status))
+    .rotate(gpui_kit::radians(
+        if matches!(status, Status::Working { .. }) {
+            phase as f32 * std::f32::consts::TAU / WORKING_STEPS_PER_TURN as f32
+        } else {
+            0.
+        },
+    ))
 }
 
 #[cfg(test)]

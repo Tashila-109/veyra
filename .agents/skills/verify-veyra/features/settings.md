@@ -16,6 +16,8 @@ The forced Window background row selects Solid and disables both choices; its ac
 - `settings-exit`: Escape, SelectThread and SelectProject leave Settings through actions.
 - `settings-focus-transition`: NewThread immediately after Escape reaches the rendered composer through both its action and key.
 - `settings-header-branch`: Chat shows the run-owned branch; Settings and NewThread clear it.
+- `settings-sidebar-band`: `veyra::DebugDragSidebar` and `veyra::DebugDoubleClickSidebar` synthesize pointer events in the owned window, without moving the real cursor; `sidebar.width` proves the drag and reset.
+- `settings-glass-coverage`: `look.glass_coverage` reports the tint coverage in force, 0.80 in dark and 0.88 in light when Translucent, and 1 in Solid.
 
 ## How to get to it (user POV)
 
@@ -67,6 +69,16 @@ initial = poll('settings-first',lambda d: d['view']=='settings')
 assert initial['view'] == 'settings' and initial['settings']['default_mode'] == 'full_access'
 assert initial['selected_thread']['config']['mode'] == 'full_access'
 assert initial['header_branch'] == ''
+action('settings-sidebar-baseline','ResetSidebar')
+sidebar_before = poll('settings-sidebar-before',lambda d:d['sidebar']['width']==240)
+action('settings-sidebar-drag','DebugDragSidebar',{'pixels':40})
+sidebar_dragged = poll('settings-sidebar-dragged',lambda d:d['sidebar']['width']==280)
+assert sidebar_dragged['view']=='settings'
+capture('settings-sidebar-dragged')
+action('settings-sidebar-double-click','DebugDoubleClickSidebar')
+sidebar_reset = poll('settings-sidebar-reset',lambda d:d['sidebar']['width']==240)
+assert sidebar_reset['view']=='settings'
+capture('settings-sidebar-reset')
 capture('settings-full-access')
 ctl('settings-invalid-mode','action','veyra::SetDefaultMode',json.dumps({'mode':'invalid'}),
     expected=1,stderr_contains='veyra ctl driver error:')
@@ -156,7 +168,9 @@ An unavailable service or untracked window leaves the guards to decide.
 If the guard records intersecting windows, the recipe makes one further placement on the same backdrop display, clearing all recorded bounds and keeping 960×740 whenever it fits.
 The cursor stays untouched, every window still counts, and no available rectangle leaves the original guard failure intact.
 The Translucent review set at the human gate needs the same owned-window placement and one-time fallback.
-The measurement uses guarded region captures in every mode over the coarse backdrop and its inverse, with one completed chat, an unfocused composer and an idle fake shell drawer held in the same state.
+The plane measurement uses guarded region captures for Translucent and `-l` window captures for Solid and forced Solid over the coarse backdrop and its inverse, with one completed chat, an unfocused composer and an idle fake shell drawer held in the same state.
+The same rectangle and all region guards surround each measurement, including each Solid window capture.
+The operator's separate Settings pairs use the same capture methods in dark and light, after the lead approves the manual appearance step.
 If either half needs the placement fallback, it discards both halves and retakes the pair at that rectangle within three attempts.
 It records luminance means and standard deviations, pixel differences and hashes for the sidebar, content, header, transcript, composer and drawer, with no capture outside the owned backdrop rectangle.
 The whole-content statistic excludes only the two outer right-hand 12×12-point squares clipped by the native rounded corners, scaled to the capture backing scale.
@@ -318,7 +332,24 @@ def measure_capture(label, rectangle):
     time.sleep(.25)
     def take(name):
         before = ctl(name+'-before-measurement','dump')
-        region_capture(PROOF/(name+'.png'),identity(),int((PROOF/'window-id').read_text()))
+        pid,window = identity(),int((PROOF/'window-id').read_text())
+        if before['look']['background']=='translucent':
+            region_capture(PROOF/(name+'.png'),pid,window)
+        else:
+            backdrop = json.loads((PROOF/'backdrop-windows.json').read_text())
+            target = PROOF/(name+'.png')
+            target.unlink(missing_ok=True)
+            try:
+                guard_before = region_snapshot(pid,window,backdrop)
+                subprocess.run(['screencapture','-x','-o','-l',str(window),str(target)],check=True)
+                guard_after = region_snapshot(pid,window,backdrop,guard_before['rectangle'])
+                assert guard_before==guard_after, 'measurement window guards changed'
+            except BaseException as error:
+                target.unlink(missing_ok=True)
+                save(name+'-region-guards',{'attempts':[{'attempt':1,'error':str(error)}]})
+                raise
+            save(name+'-region-guards',{'attempts':[],'before':guard_before,'after':guard_after,
+                'capture_method':'window -l'})
         after = ctl(name+'-after-measurement','dump')
         for state in [before,after]:
             for tab in state['drawer']['tabs']:
@@ -391,6 +422,7 @@ try:
     action('background-translucent','SetWindowBackground',{'background':'translucent'})
     glass = poll('settings-translucent',lambda d:d['look']['background']=='translucent')
     assert glass['look']['stored']=='translucent' and glass['look']['forced_by'] is None
+    assert abs(glass['look']['glass_coverage']-{'dark':0.80,'light':0.88}[glass['appearance']])<.000001
     assert sql('select window_background from settings') == 'translucent'
     capture('settings-translucent')
     ctl('background-toggle-solid','keys','secondary-alt-b')
@@ -503,6 +535,8 @@ PY_BACKGROUND
 - `settings-late-branch-after.json` and its PNG assert Settings keeps an empty header after the delayed branch child finishes.
 - `settings-header-chat.json` shows `header_branch: fixture-branch`; Settings and NewThread dumps assert it is empty.
 - `settings-branch-return.png` captures that chat before reopening Settings, so the next Full access capture differs visibly even when the selected row is below the sidebar viewport.
+- `settings-sidebar-before.json`, `settings-sidebar-dragged.json` and `settings-sidebar-reset.json` show 240 → 280 → 240 through the actual band; the two PNGs show the changed geometry and restored seam.
+- The glass dump reports `look.glass_coverage`; hovered and selected sidebar rows paint opaque plates, and the forced Increase Contrast capture keeps helper text distinct from body text.
 - `drive.log` records commands, replies and exits; the text request while Settings is focused exits 1 instead of editing a hidden composer.
 
 ### Evidence contract
@@ -518,7 +552,12 @@ PY_BACKGROUND
       "settings-existing.json",
       "settings-new.json",
       "settings-command-error.png",
-      "settings-command-error.json"
+      "settings-command-error.json",
+      "settings-sidebar-before.json",
+      "settings-sidebar-dragged.json",
+      "settings-sidebar-reset.json",
+      "settings-sidebar-dragged.png",
+      "settings-sidebar-reset.png"
     ],
     "settings-background": [
       "settings-solid.png",
@@ -556,6 +595,10 @@ PY_BACKGROUND
       [
         "settings-full-access",
         "settings"
+      ],
+      [
+        "settings-sidebar-dragged",
+        "settings-sidebar-reset"
       ]
     ],
     "settings-background": [

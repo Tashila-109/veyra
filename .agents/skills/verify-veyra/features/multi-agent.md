@@ -9,6 +9,8 @@ Covers: crates/veyra/src/relay.rs crates/engine/src/mcp.rs crates/engine/src/too
 - The root shows Started N agents, with the singular Started 1 agent, each child's glyph and status, Open and Stop while that child's shared turn target exists.
 - The child opens independently, with its Task from Claude Code card and Task from the root title label.
 - The breadcrumb links back to an unarchived root, and a parent request adds Claude Code needs you.
+Read the full-width child plates with content indented inside them, aligned Stop and menu icons, compact row and project-group gaps, project headers marked by weight, the foot rule while rows continue, and the lineage mark on a kept child.
+The top strip's needs-you count runs NextNeedsYou and carries that action's chord in its tooltip.
 - Child and parent StopThread preserve a held wake until Continue; accepted wakes label Reports from N child threads and Report delivered.
 - Archive hides a family; ArchiveKeepChildren keeps running children as top-level rows with an unlinked breadcrumb.
 - Quiet for N min appears after ten silent minutes without changing Working, including an unselected child.
@@ -51,8 +53,14 @@ working = poll('multi-tree-working',lambda d:d['transcript']['family_card'] is n
     and d['transcript']['family_card']['rows'][0]['status']=='Working'
     and d['transcript']['family_card']['rows'][0]['stop_action']=='veyra::StopThread')
 rows = [row for row in working['sidebar']['rows'] if row['kind']=='thread']
+for row in rows:
+    assert row['select_action']=='veyra::SelectThread'
+    assert row['menu_action']=='veyra::OpenThreadMenu'
+    assert row['archive_action']=='veyra::Archive'
+    assert row['status'] and row['row_status']
 assert next(row for row in rows if row['id']==root)['row_status']=='Working'
 assert next(row for row in rows if row['id']==child)['depth']==1
+assert next(row for row in rows if row['id']==child)['stop_action']=='veyra::StopThread'
 assert working['transcript']['family_card']['title']=='Started 1 agent'
 cards = working['transcript']['family_cards']
 assert len(cards)==1 and cards[0]['turn']==working['transcript']['items'][0]['turn']
@@ -116,6 +124,10 @@ root,child,task = create_family('parent needs you',parent='attention',child='run
 poll('multi-parent-request',lambda d:d['selected_thread']['status']=='NeedsYou')
 opened = select('multi-child-parent-needs',child)
 assert opened['selected_thread']['parent_attention']=='Claude Code needs you'
+action('multi-needs-count-jump','NextNeedsYou')
+jumped = poll('multi-needs-count-target',lambda d:d['selected_thread']['id']==root)
+assert any(row.get('id')==root and row['status']=='NeedsYou' for row in jumped['sidebar']['rows'])
+opened = select('multi-child-parent-needs',child)
 capture('multi-child-parent-needs')
 select('multi-breadcrumb-return',root)
 action('multi-deny-parent','Deny')
@@ -186,6 +198,9 @@ poll('multi-kept-sidebar',lambda d:any(row.get('id')==child and row['depth']==0 
 kept = select('multi-kept-child',child)
 assert kept['selected_thread']['status']=='Working'
 assert kept['selected_thread']['breadcrumb']=={'thread':root,'title':'keep the child','linked':False}
+kept_row = next(row for row in kept['sidebar']['rows'] if row.get('id')==child)
+assert kept_row['depth']==0 and kept_row['stop_action']=='veyra::StopThread'
+assert kept_row['menu_action']=='veyra::OpenThreadMenu'
 assert sql("select archived_at is null from threads where id='"+child+"'")=='1'
 capture('multi-kept-child')
 action('multi-stop-kept','StopThread',{'thread':child})
@@ -399,6 +414,10 @@ PYGROK
 ```
 
 ## Observable success
+
+`sidebar.rows` retains each thread's status and SelectThread, OpenThreadMenu, StopThread, Archive and optional ArchiveKeepChildren actions.
+`multi-child-parent-needs.png` shows the needs-you count, and `multi-needs-count-target.json` proves its action reaches the requesting root.
+`multi-child-task.png` shows the child content inside a full-width plate; `multi-kept-child.png` shows the lineage mark after the root is archived.
 
 Thread rows keep the theme’s fixed height instead of shrinking as the list grows, and selecting the first or last of forty rows scrolls it into view.
 `sidebar_overflow_keeps_row_height_and_reveals_selection` (`crates/veyra/src/ui/mod.rs`) renders that forty-row sidebar in a window, so this page no longer creates forty threads.

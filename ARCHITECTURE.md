@@ -1254,7 +1254,8 @@ The quit sheet overlays the existing window content.
 The Theme global owns all colours, geometry, type, radii and motion tokens.
 The Look global carries the stored background choice and macOS display flags.
 The full-height sidebar is the glass plane; the header, transcript, composer, drawer and other main views stay on an opaque content plane.
-Translucent uses gpui's Blurred window background and the sidebar's shell tint at coverage 0.96 in dark and 0.98 in light.
+Translucent uses gpui's Blurred window background and the sidebar's shell tint at coverage 0.80 in dark and 0.88 in light.
+Sidebar hover and selected plates composite their washes once over opaque shell and paint the result opaque.
 Solid uses Opaque and the opaque shell tint.
 Theme::apply restores that window background on each appearance change instead of leaving the kit's background reset in force.
 It also makes the kit root's background transparent in effective Translucent, so the kit does not cover the sidebar's glass tint, and restores an opaque root in Solid or forced Solid.
@@ -1265,12 +1266,13 @@ Either transparency or contrast flag forces Solid without changing the stored ch
 While forced, its background row selects Solid and disables both choices, and the native Toggle Window Background menu action is unavailable.
 SetWindowBackground and Command-Option-B leave the stored choice unchanged.
 Clearing the flag restores that choice.
-Increase Contrast raises borders to a component contrast colour and uses the text colour for muted roles.
+Increase Contrast raises borders to a component contrast colour and keeps a distinct muted text step that passes 7:1 against bg, card and shell.
 Reduce Motion sets gpui's reduce-motion flag and snaps every motion token, including the spinner, to zero.
 The working glyph remains still.
 The shared status clock steps 12 times per spinner turn while any thread is Working and Reduce Motion is off, updating elapsed words at the turn boundary.
 Under Reduce Motion it uses the seconds cadence alone.
-With no Working thread, it uses the seconds cadence only while the selected Chat transcript contains a notice whose reset instant is still in the future, and otherwise stops at rest.
+AppState indexes notice resets by deadline and item id per thread when an item changes or a transcript snapshot installs, and removes the index on archive.
+With no Working thread, the clock reads the selected Chat thread's last indexed deadline and uses the seconds cadence only while that deadline is in the future, otherwise stopping at rest.
 An expired reset or a hidden transcript no longer requests notice-clock repaints.
 Theme values and roles live in ui/theme.rs.
 Geist and Geist Mono are bundled from Vercel's official release with its OFL beside them.
@@ -1355,7 +1357,7 @@ The composer dock adds action_text, consequence and preview from the same format
 Its allow_once_enabled, allow_in_thread_enabled and consent_reason use the same typed consent as the rendered controls.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
 The debug-only veyra::DebugDisplayOptions action overrides the three display flags without changing macOS settings.
-The look dump reports the stored choice, effective background, flags and forcing reason.
+The look dump reports the stored choice, effective background, flags, forcing reason and sidebar tint coverage in force as `look.glass_coverage`.
 The debug-only `veyra::DebugAgeQuiet` action accepts a thread id and minutes, subtracts those minutes from that Working thread's quiet activity timestamp, and repaints; the next activity event replaces it with the real timestamp.
 It changes no engine status or turn timing, and `header::quiet_for` remains the display rule.
 

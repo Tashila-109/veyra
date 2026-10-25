@@ -19,9 +19,6 @@ pub(super) fn starting_text(
     (wait == Some(veyra_engine::domain::WaitReason::Starting))
         .then(|| format!("Starting {}", provider.label()))
 }
-pub(super) fn status_text(status: &Status) -> String {
-    status_text_at(status, veyra_engine::actor::now())
-}
 pub(super) fn status_text_at(status: &Status, now: Millis) -> String {
     match status {
         Status::Working { since } => format!(
@@ -149,7 +146,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                 .truncate()
                 .text_size(t.text.ui.size)
                 .line_height(t.text.ui.line_height)
-                .font_weight(FontWeight::MEDIUM)
+                .font_weight(t.text.title_weight)
                 .child(title),
         )
         .when_some(attention, |header, attention| {
@@ -206,7 +203,7 @@ mod tests {
     #[test]
     fn needs_you_header_uses_readable_words() {
         assert_eq!(
-            super::status_text(&veyra_engine::domain::Status::NeedsYou),
+            super::status_text_at(&veyra_engine::domain::Status::NeedsYou, 0),
             "Needs you"
         );
     }

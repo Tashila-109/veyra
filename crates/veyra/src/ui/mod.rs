@@ -113,6 +113,7 @@ struct AppState {
     turns: BTreeMap<TurnId, Turn>,
     tasks: BTreeMap<TaskId, veyra_engine::domain::Task>,
     items: BTreeMap<ThreadId, BTreeMap<ItemId, Item>>,
+    notice_resets: BTreeMap<ThreadId, BTreeSet<(i64, ItemId)>>,
     item_order: BTreeMap<ThreadId, TranscriptOrder>,
     markdown_text: BTreeMap<ItemId, SharedString>,
     #[cfg(debug_assertions)]
@@ -203,6 +204,7 @@ impl AppState {
                     }
                     self.last_activity.remove(thread);
                     self.item_order.remove(thread);
+                    self.notice_resets.remove(thread);
                     if let Some(items) = self.items.remove(thread) {
                         for id in items.keys() {
                             self.markdown_text.remove(id);
@@ -295,6 +297,10 @@ impl AppState {
             } => {
                 let thread = item.thread;
                 let id = item.id;
+                let reset = match &item.body {
+                    ItemBody::Notice(notice) => notice.reset_at,
+                    _ => None,
+                };
                 if let Some(text) = transcript::markdown_text(&item) {
                     self.markdown_text.insert(id, text);
                 } else {
@@ -302,6 +308,18 @@ impl AppState {
                 }
                 let visible = transcript::item_visible(&item);
                 let old = self.items.entry(thread).or_default().insert(id, item);
+                let resets = self.notice_resets.entry(thread).or_default();
+                if let Some(Item {
+                    body: ItemBody::Notice(notice),
+                    ..
+                }) = &old
+                    && let Some(reset) = notice.reset_at
+                {
+                    resets.remove(&(reset, id));
+                }
+                if let Some(reset) = reset {
+                    resets.insert((reset, id));
+                }
                 if old.is_none_or(|old| transcript::item_visible(&old) != visible) {
                     self.sort_transcript(thread);
                 }
@@ -407,6 +425,16 @@ impl AppState {
                 self.markdown_text.insert(item.id, text);
             }
         }
+        self.notice_resets.insert(
+            thread,
+            items
+                .values()
+                .filter_map(|item| match &item.body {
+                    ItemBody::Notice(notice) => notice.reset_at.map(|reset| (reset, item.id)),
+                    _ => None,
+                })
+                .collect(),
+        );
         self.items.insert(thread, items);
         self.sort_transcript(thread);
         #[cfg(debug_assertions)]
@@ -543,8 +571,8 @@ impl AppState {
             !self.pending_requests(thread).is_empty(),
         )
     }
-    fn header_status(&self, thread: ThreadId) -> String {
-        let mut text = header::status_text(&self.status(thread));
+    fn header_status(&self, thread: ThreadId, now: Millis) -> String {
+        let mut text = header::status_text_at(&self.status(thread), now);
         if let Some(minutes) = self.quiet_minutes(thread) {
             text.push_str(&format!(" · Quiet for {minutes} min"));
         }
@@ -675,6 +703,12 @@ struct StatusClock {
     task: Option<gpui_kit::Task<()>>,
 }
 
+#[derive(Clone, Copy)]
+struct SidebarDrag {
+    origin: Pixels,
+    width: Pixels,
+}
+
 pub struct Shell {
     clock: StatusClock,
     #[cfg(test)]
@@ -712,7 +746,7 @@ pub struct Shell {
     question_draft: Option<(RequestId, Vec<Answer>)>,
     sidebar_width: Pixels,
     sidebar_scroll: sidebar::SidebarScroll,
-    resizing: bool,
+    resizing: Option<SidebarDrag>,
     notice: Option<SharedString>,
     engine: Engine,
     runtime: tokio::runtime::Handle,
@@ -937,7 +971,7 @@ impl Shell {
             sent_archives: Vec::new(),
             sidebar_width: cx.global::<Theme>().layout.sidebar_default,
             sidebar_scroll: Default::default(),
-            resizing: false,
+            resizing: None,
             notice: None,
             engine,
             runtime,
@@ -1471,17 +1505,7 @@ impl Shell {
                         .and_then(|row| row.wait_reason),
                 )
             })
-            .unwrap_or_else(|| {
-                if !matches!(self.state.status(thread), Status::Working { .. }) {
-                    return self.state.header_status(thread);
-                }
-                let mut text =
-                    header::status_text_at(&self.state.status(thread), self.clock.elapsed_at);
-                if let Some(minutes) = self.state.quiet_minutes(thread) {
-                    text.push_str(&format!(" · Quiet for {minutes} min"));
-                }
-                text
-            })
+            .unwrap_or_else(|| self.state.header_status(thread, self.clock.elapsed_at))
     }
     fn thread_label(&self, thread: &Thread) -> String {
         let project = self
@@ -1522,6 +1546,14 @@ impl Shell {
     }
     fn family_stop_visible(&self, child: &Thread) -> bool {
         !child.archived && self.thread_stop_target(child.id).is_some()
+    }
+    fn row_can_stop(&self, thread: ThreadId) -> bool {
+        self.thread_stop_target(thread).is_some()
+            || self
+                .engine
+                .window_threads()
+                .get(&thread)
+                .is_some_and(|work| work.busy)
     }
     fn shown_stop(&self, cx: &App) -> Option<StopTarget> {
         self.rendered_stop
@@ -1878,7 +1910,8 @@ impl Shell {
         let mut rows = Vec::new();
         for project in self.state.projects.values() {
             rows.push(serde_json::json!({
-                "kind":"project", "id":project.id, "name":project.name, "path":project.path
+                "kind":"project", "id":project.id, "name":project.name, "path":project.path,
+                "select_action":"veyra::SelectProject"
             }));
             for thread in self
                 .state
@@ -1896,6 +1929,11 @@ impl Shell {
                     "row_status":sidebar::row_status(&self.state,thread).words(),
                     "depth":usize::from(sidebar::nested(&self.state,thread)),
                     "quiet_minutes":self.state.quiet_minutes(thread.id),
+                    "select_action":"veyra::SelectThread", "menu_action":"veyra::OpenThreadMenu",
+                    "stop_action":self.row_can_stop(thread.id).then_some("veyra::StopThread"),
+                    "archive_action":"veyra::Archive",
+                    "archive_keep_children_action":sidebar::can_keep_children(&self.state,thread.id)
+                        .then_some("veyra::ArchiveKeepChildren"),
                     "archive_keep_children":sidebar::can_keep_children(&self.state,thread.id)
                 }));
             }
@@ -1943,16 +1981,63 @@ impl Shell {
             })
             .collect()
     }
+    #[cfg(debug_assertions)]
+    fn debug_sidebar_pointer(
+        &self,
+        pixels: f32,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !pixels.is_finite() {
+            return;
+        }
+        let position = point(
+            self.sidebar_width + cx.global::<Theme>().layout.resize_band / 2.,
+            window.viewport_size().height / 2.,
+        );
+        let end = position + point(Pixels::from(pixels), Pixels::ZERO);
+        cx.spawn_in(window, async move |_, cx| {
+            let _ = cx.update(|window, cx| {
+                window.dispatch_event(
+                    PlatformInput::MouseDown(MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        click_count,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                if pixels != 0. {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: end,
+                            pressed_button: Some(MouseButton::Left),
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                }
+                window.dispatch_event(
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        position: end,
+                        button: MouseButton::Left,
+                        click_count,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
     fn needs_notice_clock(&self, now_seconds: i64) -> bool {
         self.view
             .chat()
-            .and_then(|thread| self.state.items.get(&thread))
-            .is_some_and(|items| {
-                items.values().any(|item| {
-                    matches!(&item.body, ItemBody::Notice(notice)
-                if notice.reset_at.is_some_and(|reset| reset > now_seconds))
-                })
-            })
+            .and_then(|thread| self.state.notice_resets.get(&thread))
+            .and_then(BTreeSet::last)
+            .is_some_and(|(reset, _)| *reset > now_seconds)
     }
     fn clock_mode(&self, cx: &App) -> Option<ClockMode> {
         let working = header::cadence_due(&self.state.statuses);
@@ -1981,11 +2066,14 @@ impl Shell {
             let mut phase = 0;
             loop {
                 let delay = match mode {
-                    ClockMode::Working(turn) => turn * (phase + 1) / 12 - turn * phase / 12,
+                    ClockMode::Working(turn) => {
+                        turn * (phase + 1) / icons::WORKING_STEPS_PER_TURN
+                            - turn * phase / icons::WORKING_STEPS_PER_TURN
+                    }
                     ClockMode::Seconds => std::time::Duration::from_secs(1),
                 };
                 cx.background_executor().timer(delay).await;
-                phase = (phase + 1) % 12;
+                phase = (phase + 1) % icons::WORKING_STEPS_PER_TURN;
                 let now = cx.background_executor().now();
                 let keep = this.update(cx, |shell, cx| {
                     if shell.clock_mode(cx) != Some(mode) {
@@ -2160,6 +2248,7 @@ impl Shell {
                 "reduce_transparency":cx.global::<Theme>().look.options.reduce_transparency,
                 "increase_contrast":cx.global::<Theme>().look.options.increase_contrast,
                 "reduce_motion":cx.global::<Theme>().look.options.reduce_motion,
+                "glass_coverage":cx.global::<Theme>().sidebar_fill().a,
                 "forced_by":cx.global::<Theme>().look.forced_by()},
             "header_branch":self.branch, "drawer":self.drawer_dump(cx),
             "focus":if self.active_shell().is_some_and(|tab|tab.view.read(cx).focused()) {
@@ -2664,41 +2753,31 @@ impl Render for Shell {
                         shell.drawer_resizing = None;
                     }
                 }
-                if shell.resizing && event.pressed_button == Some(MouseButton::Left) {
-                    window.dispatch_action(
-                        Box::new(SetSidebarWidth {
-                            width: f32::from(event.position.x),
-                        }),
-                        cx,
-                    );
+                if let Some(drag) = shell.resizing {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        window.dispatch_action(
+                            Box::new(SetSidebarWidth {
+                                width: f32::from(drag.width + event.position.x - drag.origin),
+                            }),
+                            cx,
+                        );
+                    } else {
+                        shell.resizing = None;
+                    }
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|shell, _, _, _| {
-                    shell.resizing = false;
+                    shell.resizing = None;
                     shell.drawer_resizing = None;
                 }),
             )
             .child(sidebar::render(self, window, cx))
             .child(
                 div()
-                    .id("sidebar-resize")
-                    .w(theme.layout.border)
-                    .h_full()
-                    .flex_none()
-                    .bg(theme.colors.border)
-                    .cursor(CursorStyle::ResizeLeftRight)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|shell, _, _, cx| {
-                            shell.resizing = true;
-                            cx.stop_propagation();
-                        }),
-                    ),
-            )
-            .child(
-                div()
+                    .relative()
+                    .debug_selector(|| "content-plane".into())
                     .v_flex()
                     .flex_1()
                     .min_w_0()
@@ -2713,7 +2792,42 @@ impl Render for Shell {
                         }
                         MainView::Chat(_) => transcript::render(self, cx).into_any_element(),
                     })
-                    .children(self.render_drawer(window, cx)),
+                    .children(self.render_drawer(window, cx))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .w(theme.layout.border)
+                            .h_full()
+                            .bg(theme.colors.border),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-resize")
+                            .debug_selector(|| "sidebar-resize".into())
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .w(theme.layout.resize_band)
+                            .h_full()
+                            .cursor(CursorStyle::ResizeLeftRight)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, event: &MouseDownEvent, window, cx| {
+                                    if event.click_count == 2 {
+                                        shell.resizing = None;
+                                        window.dispatch_action(Box::new(ResetSidebar), cx);
+                                    } else {
+                                        shell.resizing = Some(SidebarDrag {
+                                            origin: event.position.x,
+                                            width: shell.sidebar_width,
+                                        });
+                                    }
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    ),
             );
         let root = root.children(self.render_shell_close_sheet(cx));
         let root = root.when(self.quit_sheet, |root| {
@@ -2735,6 +2849,16 @@ impl Render for Shell {
         let root = root.on_action(cx.listener(|shell, _: &DebugFocusShellDrawer, window, cx| {
             shell.focus_shell(window, cx);
         }));
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|shell, action: &DebugDragSidebar, window, cx| {
+            shell.debug_sidebar_pointer(action.pixels, 1, window, cx);
+        }));
+        #[cfg(debug_assertions)]
+        let root = root.on_action(
+            cx.listener(|shell, _: &DebugDoubleClickSidebar, window, cx| {
+                shell.debug_sidebar_pointer(0., 2, window, cx);
+            }),
+        );
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(
             |shell, action: &DebugDragShellDrawer, window, cx| {
@@ -3091,6 +3215,129 @@ mod tests {
         });
     }
 
+    fn opaque_sidebar_plate(theme: &super::Theme, wash: gpui::Hsla) -> gpui::Hsla {
+        let foreground = gpui::Rgba::from(wash);
+        let background = gpui::Rgba::from(theme.colors.shell);
+        gpui::Rgba {
+            r: foreground.r * foreground.a + background.r * (1. - foreground.a),
+            g: foreground.g * foreground.a + background.g * (1. - foreground.a),
+            b: foreground.b * foreground.a + background.b * (1. - foreground.a),
+            a: 1.,
+        }
+        .into()
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn sidebar_rows_keep_full_width_and_opaque_plates(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, child) = shell.update(cx, |shell, cx| {
+                let (root, child, _) = add_family(shell, cx);
+                shell.state.statuses.clear();
+                shell.show(super::MainView::Chat(child));
+                (root, child)
+            });
+            for appearance in [super::Appearance::Dark, super::Appearance::Light] {
+                let theme = super::Theme::new(appearance);
+                shell.update(cx, |_, cx| {
+                    cx.set_global(theme.clone());
+                    cx.notify();
+                });
+                draw(cx);
+                let settings_caption = cx.debug_bounds("caption-Settings").unwrap();
+                assert_eq!(
+                    settings_caption.left(),
+                    theme.layout.row_inset * 2. + theme.layout.icon + theme.layout.control_gap,
+                    "Settings foot caption is centered"
+                );
+                let root_slot = cx
+                    .debug_bounds(Box::leak(
+                        format!("sidebar-stop-slot-{root}").into_boxed_str(),
+                    ))
+                    .unwrap();
+                let child_slot = cx
+                    .debug_bounds(Box::leak(
+                        format!("sidebar-stop-slot-{child}").into_boxed_str(),
+                    ))
+                    .unwrap();
+                assert_eq!(root_slot.left(), child_slot.left());
+                let row = cx.debug_bounds("sidebar-thread-row").unwrap();
+                assert_eq!(row.left(), theme.layout.row_inset);
+                assert_eq!(
+                    row.size.width,
+                    shell.read_with(cx, |shell, _| shell.sidebar_width)
+                        - theme.layout.row_inset * 2.
+                );
+                cx.update(|window, _| {
+                    let expected = opaque_sidebar_plate(&theme, theme.colors.sel);
+                    assert!(
+                        window
+                            .painted_quads()
+                            .iter()
+                            .any(|quad| quad.bounds == row.scale(window.scale_factor())
+                                && quad.background == expected.into())
+                    );
+                });
+                let position = gpui::point(
+                    row.left() + theme.layout.row_inset + theme.layout.status_glyph / 2.,
+                    root_slot.center().y,
+                );
+                cx.simulate_mouse_move(position, None, gpui::Modifiers::default());
+                draw(cx);
+                cx.update(|window, _| {
+                    let expected = opaque_sidebar_plate(&theme, theme.colors.hover);
+                    assert!(window.painted_quads().iter().any(|quad| {
+                        quad.bounds.contains(&position.scale(window.scale_factor()))
+                            && quad.background == expected.into()
+                    }));
+                });
+            }
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn sidebar_band_drags_without_a_jump_and_double_click_resets(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let layout = cx.update(|_, cx| cx.global::<super::Theme>().layout.clone());
+            let start = gpui::point(
+                layout.sidebar_default + layout.resize_band / 2.,
+                layout.header * 2.,
+            );
+            let end = start + gpui::point(layout.sidebar_step * 2., gpui::Pixels::ZERO);
+            cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_move(
+                end,
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sidebar_width),
+                layout.sidebar_default + layout.sidebar_step * 2.
+            );
+            let position = end;
+            cx.simulate_event(gpui::MouseDownEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 2,
+                ..Default::default()
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 2,
+                ..Default::default()
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sidebar_width),
+                layout.sidebar_default
+            );
+        });
+    }
+
     fn draw(cx: &mut gpui::VisualTestContext) {
         for _ in 0..2 {
             cx.run_until_parked();
@@ -3102,14 +3349,89 @@ mod tests {
         cx.run_until_parked();
     }
 
+    fn assert_rendered_mark(
+        cx: &mut gpui::VisualTestContext,
+        path: &str,
+        rotation: f32,
+        color: gpui::Hsla,
+    ) {
+        let selector = format!("status-mark:{path}:{rotation:.6}:{color:?}");
+        assert!(
+            cx.debug_bounds(Box::leak(selector.into_boxed_str()))
+                .is_some(),
+            "missing rendered mark {path} at {rotation} in {color:?}"
+        );
+    }
+
+    fn assert_working_rotation(cx: &mut gpui::VisualTestContext, phase: u32) {
+        draw(cx);
+        let color = cx.update(|_, cx| cx.global::<super::Theme>().colors.accent);
+        assert_rendered_mark(
+            cx,
+            "marks/working.svg",
+            phase as f32 * std::f32::consts::TAU / 12.,
+            color,
+        );
+    }
+
+    #[gpui::test]
+    fn status_marks_differ_by_shape(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let thread = shell.update(cx, |shell, _| {
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                thread
+            });
+            for appearance in [super::Appearance::Dark, super::Appearance::Light] {
+                let theme = super::Theme::new(appearance);
+                for (status, path, color) in [
+                    (
+                        Status::Working { since: 0 },
+                        "marks/working.svg",
+                        theme.colors.accent,
+                    ),
+                    (
+                        Status::NeedsYou,
+                        "marks/needs-you.svg",
+                        theme.colors.warning,
+                    ),
+                    (
+                        Status::Done { took: 0 },
+                        "marks/done.svg",
+                        theme.colors.success,
+                    ),
+                    (Status::Failed, "marks/failed.svg", theme.colors.danger),
+                    (Status::Idle, "marks/idle.svg", theme.colors.text_muted),
+                    (Status::Held, "marks/held.svg", theme.colors.text_muted),
+                    (
+                        Status::Interrupted,
+                        "marks/interrupted.svg",
+                        theme.colors.text_muted,
+                    ),
+                ] {
+                    shell.update(cx, |shell, cx| {
+                        cx.set_global(theme.clone());
+                        shell.state.statuses = BTreeMap::from([(thread, status)]);
+                        cx.notify();
+                    });
+                    draw(cx);
+                    assert_rendered_mark(cx, path, 0., color);
+                }
+            }
+        });
+    }
+
     #[gpui::test]
     fn working_mark_steps_twelve_per_turn(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let turn = std::time::Duration::from_secs(1);
             let epoch = shell.update(cx, |shell, cx| {
                 cx.set_global(super::Theme::new(super::Appearance::Dark));
-                shell.state.statuses = (0..5)
-                    .map(|_| (ThreadId::new(), Status::Working { since: 1 }))
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.state.statuses = std::iter::once(thread)
+                    .chain((0..4).map(|_| ThreadId::new()))
+                    .map(|thread| (thread, Status::Working { since: 1 }))
                     .collect();
                 shell.sync_clock(cx);
                 shell.clock.elapsed_at
@@ -3125,6 +3447,7 @@ mod tests {
                     shell.read_with(cx, |shell, _| shell.clock.phase),
                     phase as u8
                 );
+                assert_working_rotation(cx, phase);
                 cx.background_executor
                     .advance_clock(std::time::Duration::from_nanos(1));
                 cx.run_until_parked();
@@ -3133,6 +3456,7 @@ mod tests {
                     assert_eq!(shell.clock.elapsed_at, epoch + (step / 12 * 1000) as i64);
                     assert!(shell.clock.task.is_some());
                 });
+                assert_working_rotation(cx, step % 12);
             }
         });
     }
@@ -3142,10 +3466,12 @@ mod tests {
         with_docked_shell(cx, |shell, cx, _, _| {
             shell.update(cx, |shell, cx| {
                 cx.set_global(super::Theme::new(super::Appearance::Dark));
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
                 shell
                     .state
                     .statuses
-                    .insert(ThreadId::new(), Status::Working { since: 1 });
+                    .insert(thread, Status::Working { since: 1 });
                 shell.sync_clock(cx);
             });
             cx.run_until_parked();
@@ -3153,6 +3479,7 @@ mod tests {
                 .advance_clock(std::time::Duration::from_nanos(83_333_333));
             cx.run_until_parked();
             assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
+            assert_working_rotation(cx, 1);
             let epoch = shell.update(cx, |shell, cx| {
                 shell
                     .state
@@ -3172,6 +3499,9 @@ mod tests {
                 assert_eq!(shell.clock.phase, 0);
                 assert_eq!(shell.clock.elapsed_at, epoch);
             });
+            draw(cx);
+            let color = cx.update(|_, cx| cx.global::<super::Theme>().colors.text_muted);
+            assert_rendered_mark(cx, "marks/idle.svg", 0., color);
         });
     }
 
@@ -3182,8 +3512,11 @@ mod tests {
                 let mut look = cx.global::<super::theme::Look>().to_owned();
                 look.options.reduce_motion = true;
                 cx.set_global(super::Theme::with_look(super::Appearance::Dark, look));
-                shell.state.statuses = (0..5)
-                    .map(|_| (ThreadId::new(), Status::Working { since: 1 }))
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.state.statuses = std::iter::once(thread)
+                    .chain((0..4).map(|_| ThreadId::new()))
+                    .map(|thread| (thread, Status::Working { since: 1 }))
                     .collect();
                 shell.sync_clock(cx);
                 assert!(shell.clock.mode == Some(super::ClockMode::Seconds));
@@ -3202,6 +3535,7 @@ mod tests {
                         epoch + if step == 12 { 1000 } else { 0 }
                     );
                 });
+                assert_working_rotation(cx, 0);
             }
             shell.update(cx, |shell, cx| {
                 cx.set_global(super::Theme::new(super::Appearance::Dark));
@@ -3212,6 +3546,7 @@ mod tests {
                 .advance_clock(std::time::Duration::from_nanos(83_333_333));
             cx.run_until_parked();
             assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
+            assert_working_rotation(cx, 1);
             shell.update(cx, |shell, cx| {
                 let mut look = cx.global::<super::theme::Look>().to_owned();
                 look.options.reduce_motion = true;
@@ -3219,6 +3554,7 @@ mod tests {
                 shell.sync_clock(cx);
                 assert_eq!(shell.clock.phase, 0);
             });
+            assert_working_rotation(cx, 0);
         });
     }
 
@@ -3279,7 +3615,8 @@ mod tests {
                 assert!(
                     !window.painted_quads().iter().any(|quad| {
                         quad.bounds.contains(&ring.center())
-                            && quad.background == t.colors.sel.into()
+                            && (quad.background == t.colors.sel.into()
+                                || quad.background == opaque_sidebar_plate(t, t.colors.sel).into())
                     }),
                     "unselected focused row painted selection"
                 );
@@ -3531,23 +3868,20 @@ mod tests {
             shell.update(cx, |shell, _| {
                 let thread = shell.view.chat().unwrap();
                 let turn = *shell.state.turns.keys().next().unwrap();
-                let item = ItemId::new();
-                shell.state.items.insert(
+                let mut item = Item {
+                    id: ItemId::new(),
                     thread,
-                    BTreeMap::from([(
-                        item,
-                        Item {
-                            id: item,
-                            thread,
-                            turn,
-                            seq: 1,
-                            body: ItemBody::Notice(veyra_engine::domain::Notice {
-                                text: "Limit".into(),
-                                reset_at: Some(100),
-                            }),
-                        },
-                    )]),
-                );
+                    turn,
+                    seq: 1,
+                    body: ItemBody::Notice(veyra_engine::domain::Notice {
+                        text: "Limit".into(),
+                        reset_at: Some(100),
+                    }),
+                };
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemAdded(item.clone()),
+                });
                 assert!(shell.needs_notice_clock(99));
                 assert!(!shell.needs_notice_clock(100));
                 assert!(!shell.needs_notice_clock(101));
@@ -3555,6 +3889,60 @@ mod tests {
                 assert!(!shell.needs_notice_clock(99));
                 shell.view = super::MainView::Chat(ThreadId::new());
                 assert!(!shell.needs_notice_clock(99));
+                shell.view = super::MainView::Chat(thread);
+                let mut second = item.clone();
+                second.id = ItemId::new();
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemAdded(second.clone()),
+                });
+                item.body = ItemBody::Notice(veyra_engine::domain::Notice {
+                    text: "Reset".into(),
+                    reset_at: None,
+                });
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemCompleted(item),
+                });
+                assert!(shell.needs_notice_clock(99));
+                second.body = ItemBody::AssistantText {
+                    text: "Ready".into(),
+                    done: true,
+                };
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemCompleted(second.clone()),
+                });
+                assert!(!shell.needs_notice_clock(99));
+                second.body = ItemBody::Notice(veyra_engine::domain::Notice {
+                    text: "Later".into(),
+                    reset_at: Some(200),
+                });
+                let request = shell.state.begin_snapshot(thread);
+                assert!(shell.state.finish_snapshot(
+                    thread,
+                    request,
+                    ThreadSnapshot {
+                        items: vec![second],
+                        buffered_text: BTreeMap::new(),
+                        delta_counts: BTreeMap::new(),
+                        counter: 1,
+                    }
+                ));
+                assert!(shell.needs_notice_clock(199));
+                assert!(!shell.needs_notice_clock(200));
+                let request = shell.state.begin_snapshot(thread);
+                assert!(shell.state.finish_snapshot(
+                    thread,
+                    request,
+                    ThreadSnapshot {
+                        items: vec![],
+                        buffered_text: BTreeMap::new(),
+                        delta_counts: BTreeMap::new(),
+                        counter: 2,
+                    }
+                ));
+                assert!(!shell.needs_notice_clock(199));
             });
         });
     }
@@ -4061,7 +4449,7 @@ mod tests {
             );
             assert!(
                 shell
-                    .read_with(cx, |shell, _| shell.state.header_status(child))
+                    .read_with(cx, |shell, _| shell.header_status(child))
                     .contains("Working")
             );
         });
@@ -4688,7 +5076,6 @@ mod tests {
         ("dock-option-8", "dock-option-caption-8"),
     ];
 
-    #[cfg(debug_assertions)]
     fn configure_dock_thread(
         shell: &mut super::Shell,
         provider: ProviderKind,

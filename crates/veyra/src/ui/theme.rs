@@ -104,8 +104,12 @@ pub struct Colors {
 }
 impl Colors {
     pub fn dark() -> Self {
+        let bg = rgb(0x0a0b0c).into();
+        let danger = rgb(0xf88a82).into();
+        let warning = rgb(0xe6ba60).into();
+        let sel: Hsla = rgba(0xffffff13).into();
         Self {
-            bg: rgb(0x0a0b0c).into(),
+            bg,
             shell: rgb(0x0f1011).into(),
             card: rgb(0x141416).into(),
             floating: rgb(0x1e1d20).into(),
@@ -113,7 +117,7 @@ impl Colors {
             overlay: rgb(0x1a1b1c).into(),
             raised: rgb(0x222224).into(),
             hover: rgba(0xffffff0b).into(),
-            sel: rgba(0xffffff13).into(),
+            sel,
             bubble: rgba(0xffffff0f).into(),
             code_wash: rgba(0xffffff0f).into(),
             border: rgba(0xffffff11).into(),
@@ -123,14 +127,20 @@ impl Colors {
             text_faint: rgb(0x909193).into(),
             icon: rgb(0xaaabad).into(),
             placeholder: rgb(0xaaabad).into(),
-            danger_wash: wash(rgb(0xf88a82).into(), rgb(0x0a0b0c).into(), 19. / 255.),
-            warning_wash: wash(rgb(0xe6ba60).into(), rgb(0x0a0b0c).into(), 19. / 255.),
+            danger_wash: blend(Hsla { a: sel.a, ..danger }, bg),
+            warning_wash: blend(
+                Hsla {
+                    a: sel.a,
+                    ..warning
+                },
+                bg,
+            ),
             solid: rgb(0xf1f1f3).into(),
             on_solid: rgb(0x0a0b0c).into(),
             accent: rgb(0x8b7cf6).into(),
             accent_selection: rgba(0x8b7cf652).into(),
-            danger: rgb(0xf88a82).into(),
-            warning: rgb(0xe6ba60).into(),
+            danger,
+            warning,
             success: rgb(0x7bc897).into(),
             diff_add: rgb(0x7bc897).into(),
             diff_del: rgb(0xf88a82).into(),
@@ -142,8 +152,12 @@ impl Colors {
         }
     }
     pub fn light() -> Self {
+        let bg = rgb(0xffffff).into();
+        let danger = rgb(0xa82d2e).into();
+        let warning = rgb(0x7f5d04).into();
+        let sel: Hsla = rgba(0x0000000e).into();
         Self {
-            bg: rgb(0xffffff).into(),
+            bg,
             shell: rgb(0xf6f6f8).into(),
             card: rgb(0xffffff).into(),
             floating: rgb(0xffffff).into(),
@@ -151,7 +165,7 @@ impl Colors {
             overlay: rgb(0xffffff).into(),
             raised: rgb(0xffffff).into(),
             hover: rgba(0x00000008).into(),
-            sel: rgba(0x0000000e).into(),
+            sel,
             bubble: rgba(0x0000000a).into(),
             code_wash: rgba(0x0000000b).into(),
             border: rgba(0x00000017).into(),
@@ -161,14 +175,20 @@ impl Colors {
             text_faint: rgb(0x656667).into(),
             icon: rgb(0x5c5d5e).into(),
             placeholder: rgb(0x5c5d5e).into(),
-            danger_wash: wash(rgb(0xa82d2e).into(), rgb(0xffffff).into(), 14. / 255.),
-            warning_wash: wash(rgb(0x7f5d04).into(), rgb(0xffffff).into(), 14. / 255.),
+            danger_wash: blend(Hsla { a: sel.a, ..danger }, bg),
+            warning_wash: blend(
+                Hsla {
+                    a: sel.a,
+                    ..warning
+                },
+                bg,
+            ),
             solid: rgb(0x1d1d1f).into(),
             on_solid: rgb(0xffffff).into(),
             accent: rgb(0x5b43e8).into(),
             accent_selection: rgba(0x5b43e838).into(),
-            danger: rgb(0xa82d2e).into(),
-            warning: rgb(0x7f5d04).into(),
+            danger,
+            warning,
             success: rgb(0x267147).into(),
             diff_add: rgb(0x267147).into(),
             diff_del: rgb(0xa82d2e).into(),
@@ -181,9 +201,10 @@ impl Colors {
     }
 }
 
-fn wash(foreground: Hsla, background: Hsla, alpha: f32) -> Hsla {
+fn blend(foreground: Hsla, background: Hsla) -> Hsla {
     let fg = foreground.to_rgb();
     let bg = background.to_rgb();
+    let alpha = fg.a;
     Rgba {
         r: fg.r * alpha + bg.r * (1. - alpha),
         g: fg.g * alpha + bg.g * (1. - alpha),
@@ -214,6 +235,7 @@ pub struct TypeRole {
 #[derive(Clone)]
 pub struct TypeScale {
     pub base: Pixels,
+    pub title_weight: FontWeight,
     pub ui_font: SharedString,
     pub mono_font: SharedString,
     pub meta: TypeRole,
@@ -397,6 +419,7 @@ impl Theme {
                 },
             },
             text: TypeScale {
+                title_weight: FontWeight::MEDIUM,
                 base: px(TYPE_BASE),
                 ui_font: "Geist".into(),
                 mono_font: "Geist Mono".into(),
@@ -495,7 +518,7 @@ impl Theme {
                 drawer_tab: px(72.),
             },
             look: Look::default(),
-            glass_coverage: if dark { 0.96 } else { 0.98 },
+            glass_coverage: if dark { 0.80 } else { 0.88 },
         }
     }
     pub fn apply(appearance: Appearance, window: &mut Window, cx: &mut App) {
@@ -561,8 +584,11 @@ impl Theme {
                 Appearance::Light => rgb(0x777779).into(),
             };
             theme.colors.border_strong = theme.colors.border;
-            theme.colors.text_muted = theme.colors.text;
-            theme.colors.text_faint = theme.colors.text;
+            theme.colors.text_muted = match appearance {
+                Appearance::Dark => rgb(0xb8b9bb).into(),
+                Appearance::Light => rgb(0x4e4f50).into(),
+            };
+            theme.colors.text_faint = theme.colors.text_muted;
             theme.colors.icon = theme.colors.text_muted;
             theme.colors.placeholder = theme.colors.text_muted;
         }
@@ -593,20 +619,16 @@ impl Theme {
     }
 
     pub fn plate(&self, fill: Hsla) -> Background {
-        let wash = self.colors.hover.to_rgb();
-        let base = fill.to_rgb();
-        let top: Hsla = Rgba {
-            r: wash.r * wash.a + base.r * (1. - wash.a),
-            g: wash.g * wash.a + base.g * (1. - wash.a),
-            b: wash.b * wash.a + base.b * (1. - wash.a),
-            a: 1.,
-        }
-        .into();
+        let top = blend(self.colors.hover, fill);
         linear_gradient(
             180.,
             linear_color_stop(top, 0.),
             linear_color_stop(fill, 0.5),
         )
+    }
+
+    pub fn sidebar_plate(&self, wash: Hsla) -> Hsla {
+        blend(wash, self.colors.shell)
     }
 
     pub fn plate_highlight(&self) -> Vec<BoxShadow> {
@@ -890,7 +912,10 @@ mod tests {
         });
     }
 
-    fn sidebar_contrast_passes(theme: &Theme, coverage: f32) -> bool {
+    fn sidebar_contrast_failure(
+        theme: &Theme,
+        coverage: f32,
+    ) -> Option<(&'static str, &'static str, f32)> {
         let c = &theme.colors;
         let desktop = match theme.appearance {
             Appearance::Dark => rgb(0xffffff),
@@ -899,36 +924,84 @@ mod tests {
         let mut painted = theme.clone();
         painted.glass_coverage = coverage;
         let shell: Hsla = over(painted.sidebar_fill().to_rgb(), desktop).into();
-        [
-            shell,
-            Hsla::from(over(c.hover.to_rgb(), shell.to_rgb())),
-            Hsla::from(over(c.sel.to_rgb(), shell.to_rgb())),
-        ]
-        .into_iter()
-        .all(|background| {
-            [
-                (c.text, 4.5),
-                (c.text_muted, 4.5),
-                (c.text_faint, 4.5),
-                (c.accent, 3.),
-                (c.danger, 3.),
-                (c.success, 3.),
-                (c.warning, 3.),
-            ]
-            .into_iter()
-            .all(|(foreground, floor)| contrast(foreground, background, shell) >= floor)
-        })
+        for (name, background) in [
+            ("plain tint on worst desktop", shell),
+            (
+                "opaque hover plate",
+                Hsla::from(over(c.hover.to_rgb(), c.shell.to_rgb())),
+            ),
+            (
+                "opaque selected plate",
+                Hsla::from(over(c.sel.to_rgb(), c.shell.to_rgb())),
+            ),
+        ] {
+            for (role, foreground, floor) in [
+                ("text", c.text, 4.5),
+                ("text_muted", c.text_muted, 4.5),
+                ("icon", c.icon, 3.),
+                ("accent", c.accent, 3.),
+                ("danger", c.danger, 3.),
+                ("success", c.success, 3.),
+                ("warning", c.warning, 3.),
+            ] {
+                let ratio = contrast(foreground, background, background);
+                if ratio < floor {
+                    return Some((role, name, ratio));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn washes_follow_base_tokens() {
+        for colors in [Colors::dark(), Colors::light()] {
+            let background = colors.bg.to_rgb();
+            for (foreground, wash) in [
+                (colors.danger, colors.danger_wash),
+                (colors.warning, colors.warning_wash),
+            ] {
+                let foreground = foreground.to_rgb();
+                let wash = wash.to_rgb();
+                for (actual, foreground, background) in [
+                    (wash.r, foreground.r, background.r),
+                    (wash.g, foreground.g, background.g),
+                    (wash.b, foreground.b, background.b),
+                ] {
+                    let expected = foreground * colors.sel.a + background * (1. - colors.sel.a);
+                    assert!((actual - expected).abs() < 0.000001);
+                }
+                assert_eq!(wash.a, 1.);
+            }
+        }
     }
 
     #[test]
     fn theme_contrast() {
-        for appearance in [Appearance::Dark, Appearance::Light] {
-            let t = Theme::new(appearance);
+        let coverages = [Appearance::Dark, Appearance::Light].map(|appearance| {
+            let theme = Theme::new(appearance);
             let coverage = (35..=50)
                 .map(|step| step as f32 * 0.02)
-                .find(|coverage| sidebar_contrast_passes(&t, *coverage))
+                .find(|coverage| {
+                    if let Some((role, background, ratio)) =
+                        sidebar_contrast_failure(&theme, *coverage)
+                    {
+                        println!(
+                            "{} coverage={coverage:.2} rejected foreground={role} \
+                             background={background} ratio={ratio:.4}",
+                            appearance.name()
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .expect("no passing glass tint");
             println!("{} glass_coverage={coverage:.2}", appearance.name());
+            (appearance, coverage)
+        });
+        for (appearance, coverage) in coverages {
+            let t = Theme::new(appearance);
             assert!(
                 (t.glass_coverage - coverage).abs() < 0.001,
                 "{appearance:?} stored glass coverage {} should be {coverage:.2}",
@@ -944,6 +1017,8 @@ mod tests {
                     ..Default::default()
                 },
             );
+            assert_ne!(high.colors.text_muted, high.colors.text);
+            assert_ne!(high.colors.text_faint, high.colors.text);
             for background in [
                 high.colors.bg,
                 high.colors.card,
@@ -952,7 +1027,7 @@ mod tests {
             ] {
                 assert!(contrast(high.colors.border, background, background) >= 3.);
                 for foreground in [high.colors.text_muted, high.colors.text_faint] {
-                    assert!(contrast(foreground, background, background) >= 4.5);
+                    assert!(contrast(foreground, background, background) >= 7.);
                 }
             }
             let c = &t.colors;

@@ -1,12 +1,17 @@
 use super::{
     Shell,
     actions::*,
-    composer::{button_text, labelled_button},
+    composer::{button_text, labelled_button_with},
     icons,
     theme::Theme,
 };
-use gpui_kit::base::Selectable;
-use gpui_kit::component::{StyledExt, popover::Popover};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{
+    Icon, StyledExt,
+    button::{Button, ButtonCustomVariant, ButtonVariants},
+    empty::Empty,
+    popover::Popover,
+};
 use gpui_kit::{prelude::*, *};
 use std::collections::BTreeMap;
 use veyra_engine::domain::{Status, ThreadId};
@@ -16,7 +21,7 @@ pub(super) struct SidebarScroll {
     selected: std::cell::Cell<Option<ThreadId>>,
     row_focus: std::cell::RefCell<BTreeMap<ThreadId, FocusHandle>>,
 }
-#[cfg(any(debug_assertions, test))]
+#[cfg(debug_assertions)]
 pub fn glyph(status: &Status) -> &'static str {
     icons::status_path(status)
 }
@@ -97,6 +102,42 @@ pub(super) fn can_keep_children(state: &super::AppState, root: ThreadId) -> bool
             .values()
             .any(|thread| thread.root() == root && thread.id != root && !thread.archived)
 }
+
+fn button_style(cx: &App) -> ButtonCustomVariant {
+    let t = cx.global::<Theme>();
+    ButtonCustomVariant::new(cx)
+        .foreground(t.colors.icon)
+        .hover(t.sidebar_plate(t.colors.hover))
+        .active(t.sidebar_plate(t.colors.sel))
+}
+
+fn icon_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    icon: Icon,
+    hover_color: Hsla,
+    cx: &App,
+) -> Button {
+    let t = cx.global::<Theme>();
+    let id = id.into();
+    let label = label.into();
+    Button::new(id.clone())
+        .group(id.clone())
+        .custom(button_style(cx))
+        .size(t.layout.icon_button)
+        .p_0()
+        .rounded(t.radius.control)
+        .accessibility_label(label.clone())
+        .tooltip(label)
+        .text_color(t.colors.icon)
+        .child(
+            div()
+                .text_color(t.colors.icon)
+                .group_hover(id, |style| style.text_color(hover_color))
+                .child(icon),
+        )
+}
+
 pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl IntoElement {
     let t = cx.global::<Theme>();
     shell.sidebar_scroll.row_focus.borrow_mut().retain(|id, _| {
@@ -108,12 +149,26 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
     });
     let mut rows = Vec::new();
     let mut selected_row = None;
-    for project in shell.state.projects.values() {
+    for (index, project) in shell.state.projects.values().enumerate() {
         let id = project.id;
+        let group = SharedString::from(format!("project-{id}"));
         rows.push(
-            labelled_button(
-                SharedString::from(format!("project-{id}")),
+            labelled_button_with(
+                group.clone(),
                 project.name.clone(),
+                div()
+                    .h_flex()
+                    .min_w_0()
+                    .gap(t.layout.control_gap)
+                    .group_hover(group.clone(), |style| style.text_color(t.colors.text))
+                    .child(Icon::new(IconName::Folder).size(t.layout.icon))
+                    .child(button_text(project.name.clone().into(), cx).font_weight(
+                        if shell.project == Some(project.id) {
+                            t.text.title_weight
+                        } else {
+                            t.text.label.weight
+                        },
+                    )),
                 cx,
             )
             .w_full()
@@ -121,7 +176,14 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
             .child(div().flex_1())
             .h(t.layout.project_row)
             .flex_none()
-            .selected(shell.project == Some(project.id))
+            .pl(t.layout.row_inset)
+            .pr(t.layout.row_inset)
+            .text_color(t.colors.text_muted)
+            .custom(button_style(cx))
+            .group(group)
+            .when(index > 0, |row| {
+                row.mt(t.layout.group_gap - t.layout.row_gap)
+            })
             .on_click(move |_, window, cx| {
                 window.dispatch_action(Box::new(SelectProject { project: Some(id) }), cx)
             })
@@ -161,11 +223,14 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                     popover.track_focus(&menu.focus_handle(cx))
                 })
                 .trigger(
-                    labelled_button(
+                    icon_button(
                         SharedString::from(format!("thread-menu-trigger-{id}")),
-                        "…",
+                        "Thread actions",
+                        Icon::new(IconName::Ellipsis).size(t.layout.small_icon),
+                        t.colors.text,
                         cx,
                     )
+                    .size(t.layout.small_icon_button)
                     .debug_selector(|| "sidebar-thread-menu".into())
                     .accessibility_label("Thread actions")
                     .tooltip("Thread actions")
@@ -187,97 +252,122 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                 .content(move |_, _, cx| {
                     super::composer::floating_panel(cx).children(menu.clone())
                 });
-            let content =
-                div()
-                    .h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .gap(t.space.0[3])
-                    .child(icons::status_mark(
-                        &status,
-                        shell.clock.phase,
-                        t.layout.status_glyph,
-                        glyph_color(&status, t),
-                    ))
-                    .child(
-                        div()
-                            .h_flex()
-                            .items_center()
-                            .min_w_0()
-                            .debug_selector(|| "sidebar-thread-title".into())
-                            .flex_1()
-                            .pl(t.space.0[3])
-                            .pr(t.space.0[3])
-                            .child(
-                                button_text(thread.title.clone().into(), cx)
-                                    .text_size(t.text.ui.size)
-                                    .line_height(t.text.ui.line_height)
-                                    .font_weight(if shell.view.chat() == Some(id) {
-                                        FontWeight::MEDIUM
-                                    } else {
-                                        t.text.ui.weight
-                                    })
-                                    .flex_1()
-                                    .min_w(t.layout.small_icon_button),
-                            )
-                            .children(quiet.map(|minutes| {
-                                let compact = shell.sidebar_width < t.layout.sidebar_default;
-                                div()
-                                    .debug_selector(|| "sidebar-quiet".into())
-                                    .flex_none()
-                                    .whitespace_nowrap()
-                                    .min_w(t.layout.status_glyph * 6.)
-                                    .text_size(t.text.meta.size)
-                                    .text_color(t.colors.text_muted)
-                                    .child(if compact {
-                                        format!("Quiet {minutes}m")
-                                    } else {
-                                        format!("Quiet for {minutes} min")
-                                    })
-                            })),
-                    )
-                    .child(
-                        div()
-                            .h_flex()
-                            .items_center()
-                            .flex_none()
-                            .w(t.layout.icon_button * 2.)
-                            .child(
-                                div()
-                                    .debug_selector(move || format!("sidebar-stop-slot-{id}"))
-                                    .w(t.layout.icon_button)
-                                    .flex_none()
-                                    .when(
-                                        shell.thread_stop_target(id).is_some()
-                                            || shell
-                                                .engine
-                                                .window_threads()
-                                                .get(&id)
-                                                .is_some_and(|work| work.busy),
-                                        |slot| {
-                                            slot.child(
-                                                labelled_button(
-                                                    SharedString::from(format!("stop-thread-{id}")),
-                                                    "■",
-                                                    cx,
-                                                )
-                                                .debug_selector(|| "sidebar-thread-stop".into())
-                                                .w(t.layout.icon_button)
-                                                .accessibility_label("Stop thread")
-                                                .tooltip("Stop thread")
-                                                .on_click(move |_, window, cx| {
-                                                    window.dispatch_action(
-                                                        Box::new(StopThread { thread: Some(id) }),
-                                                        cx,
-                                                    );
-                                                }),
+            let content = div()
+                .h_flex()
+                .w_full()
+                .h_full()
+                .min_w_0()
+                .items_center()
+                .gap(t.space.0[3])
+                .when(nested(&shell.state, thread), |content| {
+                    content
+                        .pl(t.layout.agent_margin)
+                        .border_l(t.layout.guide)
+                        .border_color(t.colors.border)
+                })
+                .child(icons::status_mark(
+                    &status,
+                    shell.clock.phase,
+                    t.layout.status_glyph,
+                    glyph_color(&status, t),
+                ))
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .min_w_0()
+                        .debug_selector(|| "sidebar-thread-title".into())
+                        .flex_1()
+                        .pl(t.space.0[3])
+                        .pr(t.space.0[3])
+                        .when(
+                            thread.root() != thread.id && !nested(&shell.state, thread),
+                            |title| {
+                                title.child(
+                                    div()
+                                        .id(SharedString::from(format!("lineage-{id}")))
+                                        .debug_selector(|| "sidebar-lineage".into())
+                                        .flex_none()
+                                        .child(
+                                            Icon::default()
+                                                .path("marks/lineage.svg")
+                                                .size(t.layout.small_icon)
+                                                .text_color(t.colors.icon),
+                                        )
+                                        .tooltip(|window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new(
+                                                "From archived parent",
                                             )
-                                        },
-                                    ),
-                            )
-                            .child(row_menu),
-                    );
+                                            .build(window, cx)
+                                        }),
+                                )
+                            },
+                        )
+                        .child(
+                            button_text(thread.title.clone().into(), cx)
+                                .text_size(t.text.ui.size)
+                                .line_height(t.text.ui.line_height)
+                                .font_weight(if shell.view.chat() == Some(id) {
+                                    t.text.title_weight
+                                } else {
+                                    t.text.ui.weight
+                                })
+                                .flex_1()
+                                .min_w(t.layout.small_icon_button),
+                        )
+                        .children(quiet.map(|minutes| {
+                            let compact = shell.sidebar_width < t.layout.sidebar_default;
+                            div()
+                                .debug_selector(|| "sidebar-quiet".into())
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .min_w(t.layout.status_glyph * 6.)
+                                .text_size(t.text.meta.size)
+                                .text_color(t.colors.text_muted)
+                                .child(if compact {
+                                    format!("Quiet {minutes}m")
+                                } else {
+                                    format!("Quiet for {minutes} min")
+                                })
+                        })),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .flex_none()
+                        .w(t.layout.small_icon_button * 2.)
+                        .child(
+                            div()
+                                .debug_selector(move || format!("sidebar-stop-slot-{id}"))
+                                .w(t.layout.small_icon_button)
+                                .flex_none()
+                                .when(shell.row_can_stop(id), |slot| {
+                                    slot.child(
+                                        icon_button(
+                                            SharedString::from(format!("stop-thread-{id}")),
+                                            "Stop thread",
+                                            Icon::new(IconName::Square).size(t.layout.small_icon),
+                                            t.colors.danger,
+                                            cx,
+                                        )
+                                        .debug_selector(|| "sidebar-thread-stop".into())
+                                        .size(t.layout.small_icon_button)
+                                        .accessibility_label("Stop thread")
+                                        .tooltip("Stop thread")
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                window.dispatch_action(
+                                                    Box::new(StopThread { thread: Some(id) }),
+                                                    cx,
+                                                );
+                                            },
+                                        ),
+                                    )
+                                }),
+                        )
+                        .child(row_menu),
+                );
             let keyboard_focus = row_focus.clone();
             rows.push(
                 div()
@@ -287,8 +377,8 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                     .tab_index(0)
                     .role(gpui::accesskit::Role::Button)
                     .aria_label(thread.title.clone())
-                    .pl(t.space.0[3])
-                    .pr(t.space.0[3])
+                    .pl(t.layout.row_inset)
+                    .pr(t.layout.row_inset)
                     .rounded(t.radius.control)
                     .debug_selector(|| "sidebar-thread-row".into())
                     .group(SharedString::from(format!("thread-row-{id}")))
@@ -297,18 +387,14 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                     .flex_none()
                     .min_w_0()
                     .relative()
-                    .when(shell.view.chat() == Some(id), |row| row.bg(t.colors.sel))
-                    .hover(|style| style.bg(t.colors.hover))
+                    .when(shell.view.chat() == Some(id), |row| {
+                        row.bg(t.sidebar_plate(t.colors.sel))
+                    })
+                    .hover(|style| style.bg(t.sidebar_plate(t.colors.hover)))
                     .when(
                         row_focus.is_focused(window) && window.last_input_was_keyboard(),
                         |row| row.child(t.focus_ring()),
                     )
-                    .when(nested(&shell.state, thread), |row| {
-                        row.ml(t.layout.agent_margin)
-                            .pl(t.space.0[3])
-                            .border_l(t.layout.guide)
-                            .border_color(t.colors.border)
-                    })
                     .tooltip(move |window, cx| {
                         gpui_kit::component::tooltip::Tooltip::new(tooltip.clone())
                             .build(window, cx)
@@ -338,6 +424,13 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
     } else if shell.view.chat().is_none() {
         shell.sidebar_scroll.selected.set(None);
     }
+    let needs_you = ordered_threads(&shell.state)
+        .into_iter()
+        .filter(|thread| shell.state.status(*thread) == Status::NeedsYou)
+        .count();
+    let rows_continue = shell.sidebar_scroll.handle.max_offset().y
+        + shell.sidebar_scroll.handle.offset().y
+        > Pixels::ZERO;
     div()
         .v_flex()
         .w(shell.sidebar_width)
@@ -349,8 +442,8 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
             div()
                 .h_flex()
                 .flex_none()
-                .p(t.space.0[4])
-                .gap(t.space.0[1])
+                .p(t.layout.row_inset)
+                .gap(t.layout.control_gap)
                 .when(
                     shell.sidebar_scroll.handle.offset().y < Pixels::ZERO,
                     |strip| {
@@ -359,17 +452,71 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                             .border_color(t.colors.border)
                     },
                 )
-                .child(
-                    labelled_button("add-project", "+ Project", cx)
-                        .flex_1()
+                .when(needs_you > 0, |strip| {
+                    strip.child(
+                        labelled_button_with(
+                            "needs-you",
+                            "Next thread needing you",
+                            div()
+                                .h_flex()
+                                .items_center()
+                                .gap(t.layout.row_inset)
+                                .child(icons::status_mark(
+                                    &Status::NeedsYou,
+                                    0,
+                                    t.layout.small_icon,
+                                    t.colors.warning,
+                                ))
+                                .child(
+                                    button_text(
+                                        format!(
+                                            "{needs_you} {} you",
+                                            if needs_you == 1 { "needs" } else { "need" }
+                                        )
+                                        .into(),
+                                        cx,
+                                    )
+                                    .text_color(t.colors.text_muted),
+                                ),
+                            cx,
+                        )
+                        .pl(t.layout.row_inset)
+                        .pr(t.layout.row_inset)
+                        .custom(button_style(cx))
+                        .tooltip_with_action(
+                            "Next thread needing you",
+                            &NextNeedsYou,
+                            Some("Veyra"),
+                        )
                         .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(AddProject::default()), cx)
+                            window.dispatch_action(Box::new(NextNeedsYou), cx)
                         }),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    icon_button(
+                        "add-project",
+                        "Add project",
+                        Icon::new(IconName::FolderPlus).size(t.layout.icon),
+                        t.colors.text,
+                        cx,
+                    )
+                    .tooltip_with_action("Add project", &AddProject::default(), Some("Veyra"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(AddProject::default()), cx)
+                    }),
                 )
                 .child(
-                    labelled_button("new-thread", "+ Thread", cx)
-                        .flex_1()
-                        .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
+                    icon_button(
+                        "new-thread",
+                        "New thread",
+                        Icon::new(IconName::SquarePen).size(t.layout.icon),
+                        t.colors.text,
+                        cx,
+                    )
+                    .tooltip_with_action("New thread", &NewThread, Some("Veyra"))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewThread), cx)),
                 ),
         )
         .child(
@@ -381,27 +528,60 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                 .min_h_0()
                 .flex_1()
                 .overflow_y_scroll()
-                .py(t.space.0[4])
-                .pl(t.space.0[0])
-                .pr(t.space.0[0])
-                .gap(t.space.0[3])
+                .py(t.layout.row_inset)
+                .pl(t.layout.row_inset)
+                .pr(t.layout.row_inset)
+                .gap(t.layout.row_gap)
                 .when(rows.is_empty(), |this| {
                     this.child(
-                        div()
+                        Empty::new()
+                            .p(t.layout.row_inset)
+                            .rounded(t.radius.control)
                             .text_size(t.text.meta.size)
-                            .text_color(t.colors.text_faint)
+                            .text_color(t.colors.text_muted)
                             .child("Your projects appear here."),
                     )
                 })
                 .children(rows),
         )
         .child(
-            labelled_button("settings", "Settings  ⌘,", cx)
-                .m(t.space.0[4])
+            div()
                 .flex_none()
-                .justify_start()
-                .selected(matches!(shell.view, super::MainView::Settings { .. }))
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx)),
+                .p(t.layout.row_inset)
+                .when(rows_continue, |foot| {
+                    foot.border_t(t.layout.border).border_color(t.colors.border)
+                })
+                .child(
+                    labelled_button_with(
+                        "settings",
+                        "Settings",
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .justify_start()
+                            .items_center()
+                            .gap(t.layout.control_gap)
+                            .group_hover("sidebar-settings", |style| {
+                                style.text_color(t.colors.text)
+                            })
+                            .child(Icon::new(IconName::Settings).size(t.layout.icon))
+                            .child(button_text("Settings".into(), cx).text_size(t.text.ui.size)),
+                        cx,
+                    )
+                    .w_full()
+                    .h(t.layout.thread_row)
+                    .pl(t.layout.row_inset)
+                    .pr(t.layout.row_inset)
+                    .justify_start()
+                    .when(
+                        matches!(shell.view, super::MainView::Settings { .. }),
+                        |button| button.bg(t.sidebar_plate(t.colors.sel)),
+                    )
+                    .custom(button_style(cx))
+                    .group("sidebar-settings")
+                    .tooltip_with_action("Settings", &OpenSettings, Some("Veyra"))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx)),
+                ),
         )
 }
 
@@ -410,30 +590,6 @@ mod tests {
     use super::next_needs_you;
     use std::collections::BTreeMap;
     use veyra_engine::domain::{Status, ThreadId};
-    #[test]
-    fn status_marks_differ_by_shape() {
-        let statuses = [
-            Status::Working { since: 0 },
-            Status::NeedsYou,
-            Status::Done { took: 0 },
-            Status::Failed,
-            Status::Idle,
-            Status::Held,
-            Status::Interrupted,
-        ];
-        let paths: std::collections::BTreeSet<_> = statuses.iter().map(super::glyph).collect();
-        assert_eq!(paths.len(), statuses.len());
-        for appearance in [
-            super::super::theme::Appearance::Dark,
-            super::super::theme::Appearance::Light,
-        ] {
-            let theme = super::super::theme::Theme::new(appearance);
-            assert_eq!(
-                super::glyph_color(&Status::NeedsYou, &theme),
-                theme.colors.warning
-            );
-        }
-    }
     #[test]
     fn next_needs_you_order() {
         let root = ThreadId::new();

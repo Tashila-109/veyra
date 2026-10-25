@@ -5,7 +5,14 @@ use veyra_engine::{
 };
 
 #[cfg(debug_assertions)]
-actions!(veyra, [ActivateWindow, DebugFocusShellDrawer]);
+actions!(
+    veyra,
+    [
+        ActivateWindow,
+        DebugFocusShellDrawer,
+        DebugDoubleClickSidebar
+    ]
+);
 
 actions!(
     veyra,
@@ -411,5 +418,13 @@ mod tests {
 #[schemars(crate = "::gpui::private::schemars")]
 #[action(namespace = veyra)]
 pub struct DebugDragShellDrawer {
+    pub pixels: f32,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugDragSidebar {
     pub pixels: f32,
 }
