@@ -1,7 +1,6 @@
 use gpui_kit::component::Icon;
 use gpui_kit::{
-    AssetSource, Hsla, IntoElement, ParentElement, Pixels, Radians, Result, SharedString, Styled,
-    div,
+    AssetSource, Hsla, IntoElement, ParentElement, Pixels, Result, SharedString, Styled, div,
 };
 use std::borrow::Cow;
 use veyra_engine::domain::Status;
@@ -122,95 +121,52 @@ pub fn status_path(status: &Status) -> &'static str {
     }
 }
 
-trait MarkArgument: Copy {
-    const APPLY: fn(Icon, Self) -> Icon;
-    #[cfg(test)]
-    fn call(self) -> MarkCall;
-}
-
-impl MarkArgument for &'static str {
-    const APPLY: fn(Icon, Self) -> Icon = Icon::path;
-    #[cfg(test)]
-    fn call(self) -> MarkCall {
-        MarkCall::Path(self)
-    }
-}
-
-impl MarkArgument for Radians {
-    const APPLY: fn(Icon, Self) -> Icon = Icon::rotate;
-    #[cfg(test)]
-    fn call(self) -> MarkCall {
-        MarkCall::Rotation(self)
-    }
-}
-
-impl MarkArgument for Hsla {
-    const APPLY: fn(Icon, Self) -> Icon = Icon::text_color;
-    #[cfg(test)]
-    fn call(self) -> MarkCall {
-        MarkCall::Color(self)
-    }
-}
-
-fn paint_argument<T: MarkArgument>(mark: Icon, argument: T) -> Icon {
-    #[cfg(test)]
-    MARK_CALLS.with_borrow_mut(|calls| calls.push(argument.call()));
-    (T::APPLY)(mark, argument)
-}
-
 pub(super) fn status_mark(
     status: &Status,
     phase: u8,
     size: Pixels,
     color: Hsla,
 ) -> impl IntoElement {
-    let mark = paint_argument(Icon::default(), status_path(status));
-    let mark = paint_argument(
-        mark,
-        gpui_kit::radians(if matches!(status, Status::Working { .. }) {
-            phase as f32 * std::f32::consts::TAU / WORKING_STEPS_PER_TURN as f32
-        } else {
-            0.
-        }),
-    );
-    let mark = paint_argument(mark, color);
+    let mark = Icon::default()
+        .path(status_path(status))
+        .rotate(gpui_kit::radians(
+            if matches!(status, Status::Working { .. }) {
+                phase as f32 * std::f32::consts::TAU / WORKING_STEPS_PER_TURN as f32
+            } else {
+                0.
+            },
+        ))
+        .text_color(color);
     div().size(size).flex_none().child(mark.size(size))
-}
-
-#[cfg(test)]
-enum MarkCall {
-    Path(&'static str),
-    Rotation(Radians),
-    Color(Hsla),
-}
-
-#[cfg(test)]
-thread_local! {
-    static MARK_CALLS: std::cell::RefCell<Vec<MarkCall>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-pub(super) fn take_painted_marks() -> Vec<(&'static str, Radians, Hsla)> {
-    let calls = MARK_CALLS.with_borrow_mut(std::mem::take);
-    assert_eq!(calls.len() % 3, 0);
-    calls
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|calls| match calls {
-            [
-                MarkCall::Path(path),
-                MarkCall::Rotation(rotation),
-                MarkCall::Color(color),
-            ] => (*path, *rotation, *color),
-            _ => panic!("a status mark must apply path, rotation and color once"),
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_paths_are_distinct() {
+        let paths = [
+            (Status::Working { since: 0 }, "marks/working.svg"),
+            (Status::NeedsYou, "marks/needs-you.svg"),
+            (Status::Done { took: 0 }, "marks/done.svg"),
+            (Status::Failed, "marks/failed.svg"),
+            (Status::Idle, "marks/idle.svg"),
+            (Status::Held, "marks/held.svg"),
+            (Status::Interrupted, "marks/interrupted.svg"),
+        ];
+        for (status, path) in &paths {
+            assert_eq!(status_path(status), *path);
+        }
+        assert_eq!(
+            paths
+                .iter()
+                .map(|(status, _)| status_path(status))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            paths.len()
+        );
+    }
 
     #[test]
     fn icon_paths_resolve() {

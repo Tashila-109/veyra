@@ -38,6 +38,214 @@ The quiet check ages the unselected child's quiet clock by ten minutes with the 
 With `VEYRA_VERIFY_REAL_QUIET=1`, which `bin/run --real-quiet` sets, it waits for the actual ten-minute clock instead.
 `header::quiet_for` stays the one rule for both, and `debug_age_quiet_moves_only_the_quiet_clock` checks that the action moves only the quiet clock.
 
+### Painted status marks
+
+This fake-only scene uses Pillow to read the guarded window PNGs.
+It saves the stopped disposable database, seeds one family with seven children, and restores the database while stopped afterwards.
+It restores and checks the three entry display flags before the family lifecycle continues.
+Five statuses come from stored turns and a held queue; Working and NeedsYou enter through Send and the fake provider.
+All children have the same title, so the header mark keeps the same position across selections.
+The comparisons use only the 16 px mark cells, with bounds and pixel hashes saved in `mark-pixels.json`.
+Every pair of statuses must differ by foreground shape in the sidebar, header and family card.
+The Working cells must change across captured clock steps with motion forced on, and remain identical across more than one second under Reduce Motion.
+The assertion self-test requires identical cells to fail the same distinction assertion used by the page.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+set -eu
+RUN=${RUN:?export the RUN that Launch printed}
+PROOF=target/verify-veyra/$RUN
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYMARKS'
+from driver import *
+from PIL import Image
+import itertools, uuid
+
+def require_distinct(left, right, label):
+    assert left != right, 'identical painted mark regions: '+label
+
+def mark_assertion_self_test():
+    identical = bytes([0,0,255,255]) * 256
+    try:
+        require_distinct(identical, identical, 'self-test')
+    except AssertionError as error:
+        assert str(error) == 'identical painted mark regions: self-test'
+    else:
+        raise AssertionError('identical-region comparison accepted its negative control')
+    require_distinct(identical, bytes(len(identical)), 'positive control')
+
+def mark_cell(image, rectangle):
+    cell = image.crop(rectangle).convert('RGB')
+    assert cell.size == (16,16), (rectangle,cell.size)
+    background = cell.getpixel((0,0))
+    shape = bytes(int(max(abs(a-b) for a,b in zip(pixel,background)) > 24)
+        for pixel in cell.getdata())
+    assert 3 < sum(shape) < 180, ('empty or contaminated mark cell',rectangle,sum(shape))
+    return cell.tobytes(), shape
+
+def working_cell(image, rectangle):
+    area = image.crop(rectangle).convert('RGB')
+    points = [(x,y) for y in range(area.height) for x in range(area.width)
+        if (lambda c:c[2]-c[1]>35 and c[2]-c[0]>35)(area.getpixel((x,y)))]
+    assert points, ('no Working ink',rectangle)
+    xs,ys = zip(*points)
+    x = rectangle[0]+round((min(xs)+max(xs)+1)/2)-8
+    y = rectangle[1]+round((min(ys)+max(ys)+1)/2)-8
+    return (x,y,x+16,y+16)
+
+mark_assertion_self_test()
+save('mark-assertion-self-test',{'identical_regions_rejected':True,'different_regions_accepted':True})
+prepare()
+assert LANE == 'fake'
+saved_look = ctl('marks-options-before','dump')['look']
+stop('marks-before-seed')
+backup = PROOF/'marks-before.sqlite'
+with sqlite3.connect(DB) as source, sqlite3.connect(backup) as destination:
+    source.backup(destination)
+statuses = ['Working','NeedsYou','Done','Failed','Idle','Held','Interrupted']
+root,project,parent_turn = [str(uuid.uuid4()) for _ in range(3)]
+children = dict(zip(statuses,sorted(str(uuid.uuid4()) for _ in statuses)))
+parent_item = str(uuid.uuid4())
+with sqlite3.connect(DB) as db:
+    db.execute('pragma foreign_keys=off')
+    for table in ['requests','grants','tasks','items','turns','threads','projects']:
+        db.execute('delete from '+table)
+    db.execute('insert into projects values(?,?,?,1)',(project,str(DATA/'project'),'Marks'))
+    config = json.dumps({'model':None,'effort':None,'mode':'ask_first'})
+    for index,(identifier,parent,title) in enumerate([(root,None,'Marks')]+
+            [(children[status],root,'Mark') for status in statuses]):
+        db.execute("""insert into threads(id,project_id,title,parent_thread_id,relationship,
+            root_thread_id,provider,config_json,cwd,hold_reason,view,import_pending,created_at)
+            values(?,?,?,?,?,?,'claude',?,?,?,'chat',0,?)""",
+            (identifier,project,title,parent,'subagent' if parent else None,root,config,
+                str(DATA/'project'),'stopped' if identifier==children['Held'] else None,index+1))
+    db.execute("""insert into turns(id,thread_id,ordinal,origin_json,state,outcome_json,
+        queued_at,started_at,ended_at) values(?,?,1,?,'ended',?,1,1,2)""",
+        (parent_turn,root,json.dumps({'User':{'item':parent_item}}),json.dumps('Completed')))
+    db.execute("""insert into items values(?,?,?,1,'user_text',?,1)""",
+        (parent_item,root,parent_turn,json.dumps({'UserText':'Marks'})))
+    for status in statuses:
+        child = children[status]
+        task = str(uuid.uuid4())
+        db.execute("""insert into tasks(id,parent_thread_id,child_thread_id,turn_id,request_key,
+            state,outcome_json,summary,delivery,wake_turn) values(?,?,?,?,?,'settled',?,'Mark','delivered',?)""",
+            (task,root,child,parent_turn,'mark '+status,json.dumps('Completed'),parent_turn))
+        if status in ['Done','Failed','Held','Interrupted']:
+            outcome = {'Done':'Completed','Failed':{'Failed':{'message':'Mark failed'}},
+                'Interrupted':{'Interrupted':{'reason':'Mark interrupted'}},'Held':None}[status]
+            db.execute("""insert into turns(id,thread_id,ordinal,origin_json,state,outcome_json,
+                queued_at,started_at,ended_at) values(?,?,1,?,?,?,?,?,?)""",
+                (str(uuid.uuid4()),child,json.dumps({'Task':{'task':task}}),
+                    'queued' if status=='Held' else 'ended',json.dumps(outcome) if outcome else None,
+                    1,None if status=='Held' else 1,None if status=='Held' else 2))
+start('marks-seeded')
+action('marks-solid','SetWindowBackground',{'background':'solid'})
+action('marks-reduced','DebugDisplayOptions',{'reduce_motion':True})
+for status,scenario in [('Working','long-reply'),('NeedsYou','approval-deny')]:
+    action('marks-select-'+status,'SelectThread',{'thread':children[status]})
+    poll('marks-selected-'+status,lambda d:d['selected_thread'] and d['selected_thread']['id']==children[status])
+    stage(scenario)
+    ctl('marks-text-'+status,'text','Mark')
+    action('marks-send-'+status,'Send')
+    poll('marks-entered-'+status,lambda d:d['selected_thread']['status']==status)
+action('marks-root-select','SelectThread',{'thread':root})
+poll('marks-family',lambda d:d['transcript']['family_card'] is not None
+    and [row['status'] for row in d['transcript']['family_card']['rows']]==statuses)
+capture('marks-family-statuses')
+family_image = Image.open(PROOF/'marks-family-statuses.png').convert('RGB')
+width,height = family_image.size
+assert width >= 760 and height >= 560
+card_left = round(240+(width-240-752)/2)
+sidebar_working = working_cell(family_image,(26,120,45,500))
+family_working = working_cell(family_image,(card_left+10,70,card_left+32,600))
+for status in statuses:
+    action('marks-header-select-'+status,'SelectThread',{'thread':children[status]})
+    poll('marks-header-'+status,lambda d:d['selected_thread'] and d['selected_thread']['id']==children[status]
+        and d['selected_thread']['status']==status)
+    capture('marks-header-'+status)
+header_image = Image.open(PROOF/'marks-header-Working.png').convert('RGB')
+header_working = working_cell(header_image,(260,8,700,36))
+receipt = {'statuses':statuses,'captures':['marks-family-statuses']+['marks-header-'+s for s in statuses],
+    'regions':{},'pairs':[],'motion':{},'self_test_passed':True,'passed':False}
+def record_cells(site, cells):
+    receipt['regions'][site] = {status:{'capture':name,'rectangle':rectangle,
+        'png_sha256':hashlib.sha256((PROOF/(name+'.png')).read_bytes()).hexdigest(),
+        'rgb_sha256':hashlib.sha256(raw).hexdigest(),'shape_sha256':hashlib.sha256(shape).hexdigest()}
+        for status,(name,rectangle,raw,shape) in cells.items()}
+    save('mark-pixels',receipt)
+    for left,right in itertools.combinations(statuses,2):
+        require_distinct(cells[left][3],cells[right][3],site+' '+left+' / '+right)
+        receipt['pairs'].append({'site':site,'left':left,'right':right,'different':True})
+        save('mark-pixels',receipt)
+for site,origin,stride in [('sidebar',sidebar_working,34),('family-card',family_working,36)]:
+    cells = {}
+    for index,status in enumerate(statuses):
+        rectangle = (origin[0],origin[1]+stride*index,origin[2],origin[3]+stride*index)
+        raw,shape = mark_cell(family_image,rectangle)
+        cells[status] = ('marks-family-statuses',rectangle,raw,shape)
+    record_cells(site,cells)
+record_cells('header',{status:('marks-header-'+status,header_working,
+    *mark_cell(Image.open(PROOF/('marks-header-'+status+'.png')),header_working)) for status in statuses})
+action('marks-motion-root-select','SelectThread',{'thread':root})
+poll('marks-motion-root',lambda d:d['selected_thread'] and d['selected_thread']['id']==root)
+stage('long-reply')
+ctl('marks-motion-root-text','text','Marks')
+action('marks-motion-root-send','Send')
+poll('marks-motion-root-working',lambda d:d['selected_thread']['status']=='Working')
+capture('marks-motion-locate')
+motion_image = Image.open(PROOF/'marks-motion-locate.png').convert('RGB')
+motion_regions = {'sidebar':working_cell(motion_image,(26,120,45,500)),
+    'header':working_cell(motion_image,(260,8,700,36)),
+    'family-card':working_cell(motion_image,(card_left+10,70,card_left+32,600))}
+for reduced,count in [(False,6),(True,3)]:
+    label = 'reduced' if reduced else 'animated'
+    action('marks-'+label,'DebugDisplayOptions',{'reduce_motion':reduced})
+    poll('marks-'+label+'-applied',lambda d:d['look']['reduce_motion']==reduced)
+    samples = {site:[] for site in motion_regions}
+    captures = []
+    began = time.monotonic()
+    for step in range(count):
+        time.sleep(.37)
+        name = 'marks-'+label+'-'+str(step)
+        capture(name)
+        captures.append({'name':name,'seconds':time.monotonic()-began,
+            'png_sha256':hashlib.sha256((PROOF/(name+'.png')).read_bytes()).hexdigest()})
+        receipt['captures'].append(name)
+        image = Image.open(PROOF/(name+'.png')).convert('RGB')
+        for site,rectangle in motion_regions.items():
+            raw,_ = mark_cell(image,rectangle)
+            samples[site].append(hashlib.sha256(raw).hexdigest())
+    receipt['motion'][label] = {'regions':motion_regions,'samples':samples,'seconds':time.monotonic()-began,
+        'reduce_motion':reduced,'captures':captures}
+    save('mark-pixels',receipt)
+    for site,hashes in samples.items():
+        if reduced:
+            assert len(set(hashes))==1, 'Reduce Motion changed painted mark: '+site
+        else:
+            require_distinct(hashes,[hashes[0]]*len(hashes),'Working clock steps '+site)
+    if reduced: assert receipt['motion'][label]['seconds'] > 1
+receipt['captures'].append('marks-motion-locate')
+receipt['passed'] = True
+save('mark-pixels',receipt)
+for identifier in [root,children['Working'],children['NeedsYou']]:
+    action('marks-stop-'+identifier,'StopThread',{'thread':identifier})
+poll('marks-provider-groups-ended',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
+stop('marks-restore-database')
+for suffix in ['-wal','-shm']:
+    DB.with_name(DB.name+suffix).unlink(missing_ok=True)
+shutil.copy2(backup,DB)
+start('marks-restored')
+option_names = ['reduce_motion','reduce_transparency','increase_contrast']
+action('marks-display-reset','DebugDisplayOptions',{key:saved_look[key] for key in option_names})
+poll('marks-options-restored',lambda d:all(d['look'][key]==saved_look[key] for key in option_names))
+action('marks-solid-restored','SetWindowBackground',{'background':'solid'})
+page_done('multi-agent-painted-marks')
+print('PASS 63 painted status pairs, three animated and three reduced-motion mark regions')
+PYMARKS
+```
+
+### Family lifecycle
+
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
 if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
@@ -479,6 +687,16 @@ The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and bl
 ```json
 {
   "required": {
+    "multi-agent-painted-marks": [
+      "mark-pixels.json", "mark-assertion-self-test.json", "marks-family-statuses.png",
+      "marks-header-Working.png", "marks-header-NeedsYou.png", "marks-header-Done.png",
+      "marks-header-Failed.png", "marks-header-Idle.png", "marks-header-Held.png",
+      "marks-header-Interrupted.png", "marks-motion-locate.png", "marks-animated-0.png",
+      "marks-animated-1.png", "marks-animated-2.png", "marks-animated-3.png",
+      "marks-animated-4.png", "marks-animated-5.png", "marks-reduced-0.png",
+      "marks-reduced-1.png", "marks-reduced-2.png", "marks-options-before.json",
+      "marks-options-restored.json"
+    ],
     "multi-agent": [
       "multi-tree-working.png",
       "multi-child-task.png",

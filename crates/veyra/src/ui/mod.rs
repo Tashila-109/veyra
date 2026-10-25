@@ -3349,83 +3349,8 @@ mod tests {
         cx.run_until_parked();
     }
 
-    fn assert_painted_mark(
-        cx: &mut gpui::VisualTestContext,
-        path: &str,
-        rotation: f32,
-        color: gpui::Hsla,
-    ) {
-        super::icons::take_painted_marks();
-        draw(cx);
-        let painted = super::icons::take_painted_marks();
-        assert!(!painted.is_empty(), "the window drew no status marks");
-        for mark in painted {
-            assert_eq!(
-                mark,
-                (path, gpui::radians(rotation), color),
-                "wrong mark paint calls"
-            );
-        }
-    }
-
-    fn assert_working_rotation(cx: &mut gpui::VisualTestContext, phase: u32) {
-        let color = cx.update(|_, cx| cx.global::<super::Theme>().colors.accent);
-        assert_painted_mark(
-            cx,
-            "marks/working.svg",
-            phase as f32 * std::f32::consts::TAU / 12.,
-            color,
-        );
-    }
-
     #[gpui::test]
-    fn status_marks_differ_by_shape(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, _, _| {
-            let thread = shell.update(cx, |shell, _| {
-                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
-                shell.state.requests.clear();
-                thread
-            });
-            for appearance in [super::Appearance::Dark, super::Appearance::Light] {
-                let theme = super::Theme::new(appearance);
-                for (status, path, color) in [
-                    (
-                        Status::Working { since: 0 },
-                        "marks/working.svg",
-                        theme.colors.accent,
-                    ),
-                    (
-                        Status::NeedsYou,
-                        "marks/needs-you.svg",
-                        theme.colors.warning,
-                    ),
-                    (
-                        Status::Done { took: 0 },
-                        "marks/done.svg",
-                        theme.colors.success,
-                    ),
-                    (Status::Failed, "marks/failed.svg", theme.colors.danger),
-                    (Status::Idle, "marks/idle.svg", theme.colors.text_muted),
-                    (Status::Held, "marks/held.svg", theme.colors.text_muted),
-                    (
-                        Status::Interrupted,
-                        "marks/interrupted.svg",
-                        theme.colors.text_muted,
-                    ),
-                ] {
-                    shell.update(cx, |shell, cx| {
-                        cx.set_global(theme.clone());
-                        shell.state.statuses = BTreeMap::from([(thread, status)]);
-                        cx.notify();
-                    });
-                    assert_painted_mark(cx, path, 0., color);
-                }
-            }
-        });
-    }
-
-    #[gpui::test]
-    fn working_mark_steps_twelve_per_turn(cx: &mut gpui::TestAppContext) {
+    fn working_clock_steps_twelve_per_turn(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let turn = std::time::Duration::from_secs(1);
             let epoch = shell.update(cx, |shell, cx| {
@@ -3450,7 +3375,7 @@ mod tests {
                     shell.read_with(cx, |shell, _| shell.clock.phase),
                     phase as u8
                 );
-                assert_working_rotation(cx, phase);
+                draw(cx);
                 cx.background_executor
                     .advance_clock(std::time::Duration::from_nanos(1));
                 cx.run_until_parked();
@@ -3459,7 +3384,7 @@ mod tests {
                     assert_eq!(shell.clock.elapsed_at, epoch + (step / 12 * 1000) as i64);
                     assert!(shell.clock.task.is_some());
                 });
-                assert_working_rotation(cx, step % 12);
+                draw(cx);
             }
         });
     }
@@ -3482,7 +3407,7 @@ mod tests {
                 .advance_clock(std::time::Duration::from_nanos(83_333_333));
             cx.run_until_parked();
             assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
-            assert_working_rotation(cx, 1);
+            draw(cx);
             let epoch = shell.update(cx, |shell, cx| {
                 shell
                     .state
@@ -3503,13 +3428,11 @@ mod tests {
                 assert_eq!(shell.clock.elapsed_at, epoch);
             });
             draw(cx);
-            let color = cx.update(|_, cx| cx.global::<super::Theme>().colors.text_muted);
-            assert_painted_mark(cx, "marks/idle.svg", 0., color);
         });
     }
 
     #[gpui::test]
-    fn reduce_motion_keeps_working_mark_still(cx: &mut gpui::TestAppContext) {
+    fn reduce_motion_keeps_working_clock_phase_still(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let epoch = shell.update(cx, |shell, cx| {
                 let mut look = cx.global::<super::theme::Look>().to_owned();
@@ -3538,7 +3461,7 @@ mod tests {
                         epoch + if step == 12 { 1000 } else { 0 }
                     );
                 });
-                assert_working_rotation(cx, 0);
+                draw(cx);
             }
             shell.update(cx, |shell, cx| {
                 cx.set_global(super::Theme::new(super::Appearance::Dark));
@@ -3549,7 +3472,7 @@ mod tests {
                 .advance_clock(std::time::Duration::from_nanos(83_333_333));
             cx.run_until_parked();
             assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
-            assert_working_rotation(cx, 1);
+            draw(cx);
             shell.update(cx, |shell, cx| {
                 let mut look = cx.global::<super::theme::Look>().to_owned();
                 look.options.reduce_motion = true;
@@ -3557,7 +3480,7 @@ mod tests {
                 shell.sync_clock(cx);
                 assert_eq!(shell.clock.phase, 0);
             });
-            assert_working_rotation(cx, 0);
+            draw(cx);
         });
     }
 
