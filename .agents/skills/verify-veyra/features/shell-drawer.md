@@ -1,6 +1,6 @@
 # Shell drawer
 
-Status: passed, 2026-10-25, 11bf6ac, human login-shell lane not run (fake CLI RUN 8571f407), c168c97ff413418c765436557fc2e0cc76ba1110acc2625cfe405286c751e04f
+Status: passed, 2026-10-26, bd8a083, human login-shell lane not run (fake CLI RUN 8577dad2), 3d89fe1f6f52c66f6084dd77f0d3435e1737a1b6ab669e6e5405354a09b9abae
 Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/terminal_view.rs crates/veyra/src/ui/header.rs crates/veyra/src/ui/actions.rs crates/engine/src/terminal.rs crates/engine/src/lib.rs crates/engine/src/platform/** crates/engine/src/provider/env.rs crates/engine/tests/fixtures/tui/**
 
 ## Sub-features
