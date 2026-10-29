@@ -1,11 +1,10 @@
 use super::{
     actions::{SetDefaultMode, SetWindowBackground},
-    composer::labelled_button,
+    composer::{Button, labelled_button},
     theme::Theme,
 };
 use gpui_kit::base::{Disableable, Selectable};
 use gpui_kit::component::StyledExt;
-use gpui_kit::component::button::Button;
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::{PermissionMode, Settings, WindowBackground};
 
@@ -48,10 +47,82 @@ fn description(mode: PermissionMode) -> &'static str {
     }
 }
 pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> impl IntoElement {
+    use gpui_kit::component::group_box::GroupBoxVariant;
+    use gpui_kit::component::setting::{SettingGroup, SettingItem, SettingPage};
     let t = cx.global::<Theme>();
+    let hidden = StyleRefinement {
+        display: Some(Display::None),
+        ..Default::default()
+    };
+    let mode = SettingItem::render(move |_, _, cx| {
+        let t = cx.global::<Theme>();
+        let control =
+            segment_track(cx).children(MODES.into_iter().enumerate().map(|(index, mode)| {
+                labelled_button(("default-mode", index), mode_label(mode), cx)
+                    .h(t.layout.segment_button)
+                    .selected(mode == settings.default_mode)
+                    .when(mode == settings.default_mode, |button| {
+                        button
+                            .bg(t.plate(t.colors.card))
+                            .border(t.layout.border)
+                            .border_color(t.colors.border)
+                            .shadow(t.plate_highlight())
+                    })
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(SetDefaultMode { mode: Some(mode) }), cx)
+                    })
+            }));
+        setting_row(
+            "settings-default-heading",
+            "Default mode for new threads",
+            format!(
+                "{} Applies to threads you create from now on.",
+                description(settings.default_mode)
+            ),
+            control,
+            cx,
+        )
+    });
+    let background = SettingItem::render(|_, _, cx| {
+        let t = cx.global::<Theme>();
+        let control = segment_track(cx).children(
+            [
+                (WindowBackground::Translucent, "Translucent"),
+                (WindowBackground::Solid, "Solid"),
+            ]
+            .into_iter()
+            .map(|(background, label)| background_button(background, label, cx)),
+        );
+        let description = t
+            .look
+            .forced_by()
+            .map(|flag| format!("Solid is required by {flag}. Your choice is saved."))
+            .unwrap_or_else(|| {
+                "Translucent shows the desktop through the sidebar. Solid paints it.".into()
+            });
+        setting_row(
+            "settings-background-heading",
+            "Window background",
+            description,
+            control,
+            cx,
+        )
+    });
+    let mut group = SettingGroup::new().item(mode).item(background);
+    if let Some(notice) = notice {
+        group = group.item(SettingItem::render(move |_, _, cx| {
+            let t = cx.global::<Theme>();
+            div()
+                .debug_selector(|| "settings-error".into())
+                .text_size(t.text.ui.size)
+                .text_color(t.colors.danger)
+                .child(notice.clone())
+        }));
+    }
     div()
         .v_flex()
         .flex_1()
+        .min_h_0()
         .items_center()
         .px(t.layout.gutter)
         .pt(t.space.0[9])
@@ -60,95 +131,79 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                 .v_flex()
                 .w_full()
                 .max_w(t.layout.composer_max)
-                .pl(t.space.0[5])
-                .pr(t.space.0[5])
-                .gap(t.space.0[5])
+                .min_h_0()
+                .flex_1()
                 .child(
-                    div()
-                        .text_size(t.text.h2.size)
-                        .line_height(t.text.h2.line_height)
-                        .font_weight(t.text.h2.weight)
-                        .debug_selector(|| "settings-default-heading".into())
-                        .child("Default mode for new threads"),
-                )
-                .child(div().h_flex().gap(t.layout.segment_padding).children(
-                    MODES.into_iter().enumerate().map(|(index, mode)| {
-                        labelled_button(("default-mode", index), mode_label(mode), cx)
-                            .selected(mode == settings.default_mode)
-                            .when(mode == settings.default_mode, |button| {
-                                button
-                                    .bg(t.plate(t.colors.card))
-                                    .border(t.layout.border)
-                                    .border_color(t.colors.border)
-                                    .shadow(t.plate_highlight())
-                            })
-                            .on_click(move |_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(SetDefaultMode { mode: Some(mode) }),
-                                    cx,
-                                )
-                            })
-                    }),
-                ))
-                .child(
-                    div()
-                        .text_size(t.text.read.size)
-                        .line_height(t.text.read.line_height)
-                        .child(description(settings.default_mode)),
-                )
-                .child(
-                    div()
-                        .text_size(t.text.meta.size)
-                        .line_height(t.text.meta.line_height)
-                        .text_color(t.colors.text_muted)
-                        .child("Applies to threads you create from now on"),
-                )
-                .child(
-                    div()
-                        .mt(t.space.0[7])
-                        .text_size(t.text.h2.size)
-                        .line_height(t.text.h2.line_height)
-                        .font_weight(t.text.h2.weight)
-                        .child("Window background"),
-                )
-                .child(
-                    div().h_flex().gap(t.layout.segment_padding).children(
-                        [
-                            (WindowBackground::Translucent, "Translucent"),
-                            (WindowBackground::Solid, "Solid"),
-                        ]
-                        .into_iter()
-                        .map(|(background, label)| background_button(background, label, cx)),
-                    ),
-                )
-                .child(
-                    div()
-                        .text_size(t.text.meta.size)
-                        .line_height(t.text.meta.line_height)
-                        .text_color(t.colors.text_muted)
-                        .child(
-                            t.look
-                                .forced_by()
-                                .map(|flag| {
-                                    format!("Solid is required by {flag}. Your choice is saved.")
-                                })
-                                .unwrap_or_else(|| {
-                                    "Translucent shows your desktop softly through the sidebar."
-                                        .into()
-                                }),
+                    gpui_kit::component::setting::Settings::new("device-settings")
+                        .sidebar_width(Pixels::ZERO)
+                        .sidebar_size_range(Pixels::ZERO..Pixels::ZERO)
+                        .sidebar_style(&hidden)
+                        .header_style(&hidden)
+                        .with_group_variant(GroupBoxVariant::Fill)
+                        .page(
+                            SettingPage::new("Settings")
+                                .header_style(&hidden)
+                                .group(group),
                         ),
-                )
-                .when_some(notice, |this, notice| {
-                    this.child(
-                        div()
-                            .debug_selector(|| "settings-error".into())
-                            .text_size(t.text.meta.size)
-                            .line_height(t.text.meta.line_height)
-                            .text_color(t.colors.danger)
-                            .child(notice),
-                    )
-                }),
+                ),
         )
+}
+
+fn setting_row(
+    selector: &'static str,
+    label: &'static str,
+    description: String,
+    control: Div,
+    cx: &App,
+) -> Div {
+    let t = cx.global::<Theme>();
+    div()
+        .v_flex()
+        .w_full()
+        .min_w_0()
+        .gap(t.space.0[3])
+        .child(
+            div()
+                .h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .justify_between()
+                .gap(t.space.0[3])
+                .child(
+                    div()
+                        .debug_selector(move || selector.into())
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_normal()
+                        .text_size(t.text.ui.size)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label),
+                )
+                .child(control.flex_none()),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
+                .text_size(t.text.ui.size)
+                .line_height(t.text.ui.line_height)
+                .text_color(t.colors.text_muted)
+                .child(description),
+        )
+}
+
+fn segment_track(cx: &App) -> Div {
+    let t = cx.global::<Theme>();
+    div()
+        .h_flex()
+        .items_center()
+        .h(t.layout.segment_height)
+        .p(t.layout.segment_padding)
+        .gap(t.layout.segment_padding)
+        .rounded(t.radius.track)
+        .bg(t.colors.raised)
 }
 
 pub(super) fn background_button(

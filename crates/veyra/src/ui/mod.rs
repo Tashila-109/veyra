@@ -18,7 +18,7 @@ use actions::*;
 use gpui_kit::component::{
     StyledExt,
     input::{InputEvent, TextareaState},
-    menu::PopupMenu,
+    menu::{PopupMenu, PopupMenuItem},
 };
 use gpui_kit::{prelude::*, *};
 use std::{
@@ -682,12 +682,20 @@ struct ApprovalScroll {
     request: Option<RequestId>,
     handle: ScrollHandle,
     folder_handle: ScrollHandle,
+    reason_handle: ScrollHandle,
+}
+#[derive(Default)]
+struct DockedInputLayout {
+    text: SharedString,
+    width: Pixels,
+    height: Pixels,
 }
 #[derive(Default)]
 struct QuestionScroll {
     target: Option<DockTarget>,
     handle: ScrollHandle,
     options: ScrollHandle,
+    cursor: usize,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClockMode {
@@ -709,16 +717,25 @@ struct SidebarDrag {
     width: Pixels,
 }
 
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct ControlFocus(Option<String>);
+#[cfg(debug_assertions)]
+impl Global for ControlFocus {}
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct PaintedControls(BTreeMap<String, Bounds<Pixels>>);
+#[cfg(debug_assertions)]
+impl Global for PaintedControls {}
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct PaintedControlLabels(BTreeMap<String, SharedString>);
+#[cfg(debug_assertions)]
+impl Global for PaintedControlLabels {}
+
 pub struct Shell {
     clock: StatusClock,
-    #[cfg(test)]
-    sent_responses: std::rc::Rc<std::cell::RefCell<Vec<(RequestId, Decision)>>>,
-    #[cfg(test)]
-    sent_interrupts: Vec<StopTarget>,
-    #[cfg(test)]
-    sent_backgrounds: Vec<veyra_engine::domain::WindowBackground>,
-    #[cfg(test)]
-    sent_archives: Vec<(ThreadId, bool)>,
+    capture: TestCapture,
     #[cfg(debug_assertions)]
     repaints: u64,
     drawers: BTreeMap<ThreadId, drawer::Drawer>,
@@ -728,8 +745,15 @@ pub struct Shell {
     drawer_viewport: Pixels,
     composition_height: Pixels,
     #[cfg(debug_assertions)]
-    drawer_rail: Option<(ThreadId, Bounds<Pixels>)>,
+    composer_input_bounds: std::cell::Cell<Bounds<Pixels>>,
     #[cfg(debug_assertions)]
+    composer_surface_bounds: std::cell::Cell<Bounds<Pixels>>,
+    #[cfg(debug_assertions)]
+    composer_width_override: Option<Pixels>,
+    #[cfg(debug_assertions)]
+    composer_dock_bounds: std::cell::Cell<Bounds<Pixels>>,
+    #[cfg(debug_assertions)]
+    drawer_rail: Option<(ThreadId, Bounds<Pixels>)>,
     composer_focused: bool,
     quit_drawer_focus: bool,
     focus: FocusHandle,
@@ -737,6 +761,7 @@ pub struct Shell {
     approval_scroll: ApprovalScroll,
     question_scroll: QuestionScroll,
     input_docked: bool,
+    docked_input: DockedInputLayout,
     dock_focused: bool,
     rendered_stop: Option<StopTarget>,
     quit_focus: FocusHandle,
@@ -810,6 +835,9 @@ impl Shell {
                     cx.set_global(look);
                     Theme::apply(Appearance::from_window(window.appearance()), window, cx);
                 }
+            } else {
+                shell.resizing = None;
+                shell.drawer_resizing = None;
             }
             cx.notify();
         })
@@ -945,8 +973,15 @@ impl Shell {
             drawer_viewport: window.viewport_size().height,
             composition_height: Pixels::ZERO,
             #[cfg(debug_assertions)]
-            drawer_rail: None,
+            composer_input_bounds: Default::default(),
             #[cfg(debug_assertions)]
+            composer_surface_bounds: Default::default(),
+            #[cfg(debug_assertions)]
+            composer_width_override: None,
+            #[cfg(debug_assertions)]
+            composer_dock_bounds: Default::default(),
+            #[cfg(debug_assertions)]
+            drawer_rail: None,
             composer_focused: false,
             quit_drawer_focus: false,
             focus,
@@ -954,6 +989,7 @@ impl Shell {
             approval_scroll: ApprovalScroll::default(),
             question_scroll: QuestionScroll::default(),
             input_docked: false,
+            docked_input: DockedInputLayout::default(),
             dock_focused: false,
             rendered_stop: None,
             quit_focus: cx.focus_handle(),
@@ -961,14 +997,7 @@ impl Shell {
             window_active: window.is_window_active(),
             notifications_posted: 0,
             question_draft: None,
-            #[cfg(test)]
-            sent_responses: Default::default(),
-            #[cfg(test)]
-            sent_backgrounds: Default::default(),
-            #[cfg(test)]
-            sent_interrupts: Vec::new(),
-            #[cfg(test)]
-            sent_archives: Vec::new(),
+            capture: Default::default(),
             sidebar_width: cx.global::<Theme>().layout.sidebar_default,
             sidebar_scroll: Default::default(),
             resizing: None,
@@ -1011,7 +1040,6 @@ impl Shell {
             cx.notify();
         })
         .detach();
-        #[cfg(debug_assertions)]
         {
             shell.composer_focused = shell.input.focus_handle(cx).is_focused(window);
             cx.on_focus(&shell.input.focus_handle(cx), window, |shell, _, cx| {
@@ -1036,14 +1064,40 @@ impl Shell {
                 self.provider_picker_labels = rows.iter().map(|(_, label)| label.clone()).collect();
             }
             let focus = self.focus.clone();
-            let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
+            let selected = self.chosen_provider();
+            let menu = PopupMenu::build(window, cx, move |mut menu, _, cx| {
                 menu = menu.action_context(focus);
                 for (provider, label) in rows {
-                    menu = menu.menu(
-                        label,
-                        Box::new(PickProvider {
+                    let (name, readiness) = label.split_once(" · ").unwrap();
+                    let (name, readiness) = (name.to_owned(), readiness.to_owned());
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            let t = cx.global::<Theme>();
+                            div()
+                                .h_flex()
+                                .items_center()
+                                .gap(t.layout.control_gap)
+                                .child(name.clone())
+                                .child(div().flex_1())
+                                .child(div().size(t.space.0[2]).rounded(t.radius.full).bg(
+                                    if readiness == "Ready" {
+                                        t.colors.success
+                                    } else {
+                                        t.colors.warning
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(t.text.meta.size)
+                                        .text_color(t.colors.text_muted)
+                                        .child(readiness.clone()),
+                                )
+                        })
+                        .icon(composer::provider_mark(provider, cx))
+                        .checked(provider == selected)
+                        .action(Box::new(PickProvider {
                             provider: Some(provider),
-                        }),
+                        })),
                     );
                 }
                 menu
@@ -1068,15 +1122,31 @@ impl Shell {
             .filter(|id| self.state.threads.get(id).is_some_and(|row| !row.archived))
             .map(|id| {
                 let keep = sidebar::can_keep_children(&self.state, id);
+                let stop = self.row_can_stop(id);
                 let focus = self.focus.clone();
                 let menu = PopupMenu::build(window, cx, move |menu, _, _| {
                     let menu = menu
                         .action_context(focus)
-                        .menu("Stop thread", Box::new(StopThread { thread: Some(id) }))
-                        .menu("Archive", Box::new(Archive { thread: Some(id) }));
+                        .menu_with_icon_and_disabled(
+                            if stop {
+                                "Stop thread"
+                            } else {
+                                "Stop thread · No work to stop"
+                            },
+                            gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Square),
+                            Box::new(StopThread { thread: Some(id) }),
+                            !stop,
+                        )
+                        .separator()
+                        .menu_with_icon(
+                            "Archive",
+                            gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Archive),
+                            Box::new(Archive { thread: Some(id) }),
+                        );
                     if keep {
-                        menu.menu(
+                        menu.menu_with_icon(
                             "Archive, keep child threads",
+                            gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Archive),
                             Box::new(ArchiveKeepChildren { thread: Some(id) }),
                         )
                     } else {
@@ -1182,31 +1252,7 @@ impl Shell {
         );
     }
     fn send_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(test)]
-        if let Command::ArchiveThread {
-            thread,
-            keep_children,
-        } = &command
-        {
-            self.sent_archives.push((*thread, *keep_children));
-        }
-        #[cfg(test)]
-        if let Command::Respond { request, decision } = &command {
-            self.sent_responses
-                .borrow_mut()
-                .push((*request, decision.clone()));
-        }
-        #[cfg(test)]
-        if let Command::Interrupt { thread, turn } = &command {
-            self.sent_interrupts.push(StopTarget {
-                thread: *thread,
-                turn: *turn,
-            });
-        }
-        #[cfg(test)]
-        if let Command::SetWindowBackground { background } = &command {
-            self.sent_backgrounds.push(*background);
-        }
+        self.capture.record(&command);
         let reply = self.engine.send(command);
         cx.spawn_in(window, async move |this, cx| {
             let result = reply.await;
@@ -1586,11 +1632,97 @@ impl Shell {
             .map_or(0, |(_, answers)| answers.len());
         Some(DockTarget { request, question })
     }
+    fn composer_placeholder(&self) -> String {
+        let Some(thread) = self.view.chat().and_then(|id| self.state.threads.get(&id)) else {
+            return "Describe the task".into();
+        };
+        if thread.hold.is_some() {
+            "Write now, it waits for Continue".into()
+        } else if matches!(
+            self.state.status(thread.id),
+            Status::Working { .. } | Status::NeedsYou
+        ) {
+            "Queue a follow-up".into()
+        } else {
+            format!("Reply to {}", thread.provider.label())
+        }
+    }
     fn pending_request(&self, request: Option<RequestId>) -> Option<&Request> {
         let thread = self.view.chat()?;
         self.state.requests.iter().find(|row| {
             Some(row.id) == request && row.thread == thread && row.state == RequestState::Pending
         })
+    }
+    fn measure_docked_input(&mut self, window: &Window, cx: &App) {
+        let text = self.input.read(cx).value();
+        let width = self.input.read(cx).input_bounds().size.width;
+        if self.docked_input.text == text
+            && self.docked_input.width == width
+            && self.docked_input.height > Pixels::ZERO
+        {
+            return;
+        }
+        let t = cx.global::<Theme>();
+        let rows = window
+            .text_system()
+            .shape_text(
+                text.clone(),
+                t.text.read.size.to_pixels(window.rem_size()),
+                &[TextRun {
+                    len: text.len(),
+                    font: font(t.text.ui_font.clone()),
+                    color: t.colors.text,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                Some(width.max(t.layout.border)),
+                Some(10),
+            )
+            .map(|lines| {
+                lines
+                    .iter()
+                    .map(|line| line.wrap_boundaries().len() + 1)
+                    .sum::<usize>()
+            })
+            .unwrap_or(1)
+            .max(1);
+        self.docked_input = DockedInputLayout {
+            text,
+            width,
+            height: (t.text.read.line_height.to_pixels(window.rem_size()) * rows as f32
+                + t.space.0[3] * 2.)
+                .clamp(t.layout.composer_min_height, t.layout.composer_max_height),
+        };
+    }
+    fn move_option(&mut self, target: Option<DockTarget>, down: bool, cx: &mut Context<Self>) {
+        if !self.dock_focused
+            || target != self.dock_target()
+            || self.question_scroll.target != target
+        {
+            return;
+        }
+        let Some(RequestKind::Question { questions }) = target
+            .and_then(|target| self.pending_request(Some(target.request)))
+            .map(|request| &request.kind)
+        else {
+            return;
+        };
+        let count = target
+            .and_then(|target| questions.get(target.question))
+            .map_or(0, |q| q.options.len());
+        if count == 0 {
+            return;
+        }
+        self.question_scroll.cursor = if down {
+            (self.question_scroll.cursor + 1).min(count - 1)
+        } else {
+            self.question_scroll.cursor.saturating_sub(1)
+        };
+        self.question_scroll
+            .options
+            .scroll_to_item(self.question_scroll.cursor);
+        cx.notify();
     }
     fn respond(
         &mut self,
@@ -1688,7 +1820,10 @@ impl Shell {
                 div()
                     .absolute()
                     .inset_0()
-                    .left(self.sidebar_width + t.layout.border)
+                    .when(
+                        t.look.background() == WindowBackground::Translucent,
+                        |scrim| scrim.left(self.sidebar_width + t.layout.border),
+                    )
                     .bg(t.colors.scrim),
             )
             .child(
@@ -1703,11 +1838,19 @@ impl Shell {
                     .border(t.layout.border)
                     .border_color(t.colors.border_strong)
                     .child(div().text_size(t.text.h2.size).child("Quit Veyra?"))
-                    .child("Quitting stops these threads:")
+                    .child({
+                        let shells = self.running_shells().len();
+                        let threads = self.busy_threads().len().saturating_sub(shells);
+                        format!(
+                            "Quitting stops {threads} thread{} and {shells} shell command{}.",
+                            if threads == 1 { "" } else { "s" },
+                            if shells == 1 { "" } else { "s" }
+                        )
+                    })
                     .children(
                         self.busy_threads()
                             .into_iter()
-                            .map(|title| div().child(title)),
+                            .map(|title| composer::sheet_row(&title, cx)),
                     )
                     .child(
                         div()
@@ -1715,15 +1858,17 @@ impl Shell {
                             .justify_end()
                             .gap(t.space.0[3])
                             .child(
-                                composer::labelled_button("cancel-quit", "Cancel", cx).on_click(
-                                    |_, window, cx| {
+                                composer::labelled_button("cancel-quit", "Cancel", cx)
+                                    .outline()
+                                    .child(shortcut_chip::<CancelQuit>(cx))
+                                    .on_click(|_, window, cx| {
                                         window.dispatch_action(Box::new(CancelQuit), cx)
-                                    },
-                                ),
+                                    }),
                             )
                             .child(
                                 composer::labelled_button("confirm-quit", "Quit", cx)
-                                    .primary()
+                                    .danger()
+                                    .child(shortcut_chip::<ConfirmQuit>(cx))
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(Box::new(ConfirmQuit), cx)
                                     }),
@@ -2173,11 +2318,30 @@ impl Shell {
     #[allow(clippy::disallowed_types)] // The debug dump serializes the window projection to wire JSON.
     fn dump_composer(&self, cx: &App) -> serde_json::Value {
         let reason = self.disabled_reason();
+        let bounds = self.composer_input_bounds.get();
+        let input_bounds = [
+            f32::from(bounds.left()),
+            f32::from(bounds.top()),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        ];
+        let surface = self.composer_surface_bounds.get();
+        let surface_bounds = [
+            f32::from(surface.left()),
+            f32::from(surface.top()),
+            f32::from(surface.size.width),
+            f32::from(surface.size.height),
+        ];
         serde_json::json!({
             "provider":self.chosen_provider(), "mode":self.chosen_provider().run_mode(self.composer_config().mode),
             "permission_picker_open":self.permission_picker_open,
             "offered_modes":self.chosen_provider().offered_modes(),
             "model":self.composer_config().model, "effort":self.composer_config().effort,
+            "placeholder":self.composer_placeholder(), "focused":self.composer_focused,
+            "input_bounds":input_bounds,
+            "surface_bounds":surface_bounds,
+            "width_override":self.composer_width_override.map(f32::from),
+            "control_focus":cx.try_global::<ControlFocus>().and_then(|focus|focus.0.as_ref()),
             "send_enabled":reason.is_none(), "disabled_reason":reason,
             "provider_picker_open":self.provider_picker.is_some(),
             "provider_picker_labels":self.provider_picker.as_ref().map(|_| &self.provider_picker_labels),
@@ -2190,7 +2354,14 @@ impl Shell {
                 };
                 let consent = composer::request_consent(&request.kind);
                 let text = approval.map(|action| composer::approval_text(action, self.chosen_provider()));
+                let bounds = self.composer_dock_bounds.get();
+                let theme = cx.global::<Theme>();
                 let mut dock = serde_json::json!({"request":request, "position":1,
+                    "bounds":[f32::from(bounds.left()),f32::from(bounds.top()),
+                        f32::from(bounds.size.width),f32::from(bounds.size.height)],
+                    "content_inset":f32::from(theme.space.0[3]),
+                    "focus_inset":f32::from(theme.layout.focus_inset),
+                    "focus_border":f32::from(theme.layout.focus_ring),
                     "action_text":text.as_ref().map(|(label, _, _)| label),
                     "consequence":text.as_ref().map(|(_, consequence, _)| consequence),
                     "preview":text.as_ref().map(|(_, _, preview)| preview),
@@ -2201,7 +2372,7 @@ impl Shell {
                     "provider_text":approval.map(|action| composer::approval_display_quotes(action,
                         self.chosen_provider().label(), self.working_folder())).unwrap_or_default(),
                     "count":self.state.pending_requests(request.thread).len(), "focused":self.dock_focused,
-                    "question_index":target.question,
+                    "question_index":target.question, "option_cursor":self.question_scroll.cursor,
                     "question_count":match &request.kind {
                         RequestKind::Question { questions } =>
                             Some(format!("{} of {}", target.question + 1, questions.len())),
@@ -2220,6 +2391,69 @@ impl Shell {
     pub fn dump(&self, data_dir: &std::path::Path, cx: &App) -> serde_json::Value {
         let perf = self.engine.perf();
         let mut transcript = self.scroller.read(cx).dump();
+        let theme = cx.global::<Theme>();
+        let controls = cx
+            .try_global::<PaintedControls>()
+            .into_iter()
+            .flat_map(|controls| controls.0.iter())
+            .map(|(id, bounds)| {
+                (
+                    id,
+                    [
+                        f32::from(bounds.origin.x),
+                        f32::from(bounds.origin.y),
+                        f32::from(bounds.size.width),
+                        f32::from(bounds.size.height),
+                    ],
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let control_labels = cx
+            .try_global::<PaintedControlLabels>()
+            .into_iter()
+            .flat_map(|labels| labels.0.iter())
+            .collect::<BTreeMap<_, _>>();
+        let colors = [
+            ("bg", theme.colors.bg),
+            ("accent", theme.colors.accent),
+            ("warning", theme.colors.warning),
+            ("danger", theme.colors.danger),
+            ("success", theme.colors.success),
+            ("text", theme.colors.text),
+            ("text_muted", theme.colors.text_muted),
+            ("icon", theme.colors.icon),
+            ("card", theme.colors.card),
+            ("raised", theme.colors.raised),
+            ("solid", theme.colors.solid),
+            ("on_solid", theme.colors.on_solid),
+            (
+                "button_primary_foreground",
+                gpui_kit::component::Theme::global(cx).button_primary_foreground,
+            ),
+            (
+                "button_danger_foreground",
+                gpui_kit::component::Theme::global(cx).button_danger_foreground,
+            ),
+            ("code_wash", theme.colors.code_wash),
+            ("danger_wash", theme.colors.danger_wash),
+            ("warning_wash", theme.colors.warning_wash),
+            ("border", theme.colors.border),
+            ("floating", theme.colors.floating),
+        ]
+        .into_iter()
+        .map(|(name, color)| {
+            let color = Rgba::from(color);
+            (
+                name,
+                [color.r, color.g, color.b, color.a].map(|channel| (channel * 255.).round() as u8),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+        transcript["layout"] = serde_json::json!({
+            "column_max":f32::from(theme.layout.transcript_max),
+            "gutter":f32::from(theme.layout.gutter),
+            "status_glyph":f32::from(theme.layout.status_glyph),
+            "family_row_pitch":f32::from(theme.layout.icon_button + theme.space.0[3])});
         transcript["items"] = serde_json::json!(self.dump_transcript());
         transcript["family_cards"] = self
             .view
@@ -2243,18 +2477,24 @@ impl Shell {
             "pid":std::process::id(), "build_rev":env!("VEYRA_BUILD_REV"), "data_dir":data_dir,
             "login_path":self.engine.login_path_status(),
             "appearance":cx.global::<Theme>().appearance.name(), "view":self.view_name(),
-            "look":{"background":cx.global::<Theme>().look.background(),
+            "look":{"background":cx.global::<Theme>().look.background(),"controls":controls,
+                "control_labels":control_labels,
+                "header_title":header::title_text(self),
                 "stored":self.state.settings.window_background,
                 "reduce_transparency":cx.global::<Theme>().look.options.reduce_transparency,
                 "increase_contrast":cx.global::<Theme>().look.options.increase_contrast,
                 "reduce_motion":cx.global::<Theme>().look.options.reduce_motion,
                 "glass_coverage":cx.global::<Theme>().sidebar_fill().a,
-                "forced_by":cx.global::<Theme>().look.forced_by()},
+                "forced_by":cx.global::<Theme>().look.forced_by(), "colors":colors},
             "header_branch":self.branch, "drawer":self.drawer_dump(cx),
             "focus":if self.active_shell().is_some_and(|tab|tab.view.read(cx).focused()) {
                 "drawer"
             } else if self.composer_focused { "composer" } else { "none" },
-            "sidebar":{"width":f32::from(self.sidebar_width), "rows":self.dump_rows(), "menu_thread\
+            "sidebar":{"width":f32::from(self.sidebar_width),
+                "layout":{"header":f32::from(theme.layout.header),
+                    "row_pitch":f32::from(theme.layout.thread_row + theme.layout.list_gap),
+                    "small_icon":f32::from(theme.layout.small_icon)},
+                "rows":self.dump_rows(), "menu_thread\
                 ":self.thread_menu.as_ref().map(|(id,_)|id)},
             "selected_thread":self.dump_selected(), "transcript":transcript,
             "composer_text":self.input.read(cx).value().to_string(),
@@ -2296,19 +2536,33 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_clock(cx);
         self.sync_drawers(cx);
+        self.composer_focused = self.input.focus_handle(cx).is_focused(window);
         self.drawer_viewport = window.viewport_size().height;
         self.cancel_changed_drawer_drag(cx);
         #[cfg(debug_assertions)]
         {
             self.repaints += 1;
+            cx.set_global(ControlFocus::default());
+            cx.set_global(PaintedControls::default());
+            cx.set_global(PaintedControlLabels::default());
         }
         let theme = cx.global::<Theme>().clone();
+        let placeholder = self.composer_placeholder();
+        if self.input.read(cx).presentation().placeholder().as_ref() != placeholder {
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder(placeholder, window, cx)
+            });
+        }
         let dock_target = self.dock_target();
+        if dock_target.is_some() {
+            self.measure_docked_input(window, cx);
+        }
         if self.question_scroll.target != dock_target {
             self.question_scroll = QuestionScroll {
                 target: dock_target,
                 handle: ScrollHandle::new(),
                 options: ScrollHandle::new(),
+                cursor: 0,
             };
         }
         let dock_request = dock_target.map(|target| target.request);
@@ -2327,6 +2581,7 @@ impl Render for Shell {
                 request: dock_request,
                 handle: ScrollHandle::new(),
                 folder_handle: ScrollHandle::new(),
+                reason_handle: ScrollHandle::new(),
             };
         }
         let dock_question = dock_target.map(|target| target.question);
@@ -2460,6 +2715,28 @@ impl Render for Shell {
                     window.focus(&shell.dock_focus, cx);
                 }
             }))
+            .on_action(cx.listener(move |shell, _: &MoveOptionUp, _, cx| {
+                shell.move_option(dock_target, false, cx);
+            }))
+            .on_action(cx.listener(move |shell, _: &MoveOptionDown, _, cx| {
+                shell.move_option(dock_target, true, cx);
+            }))
+            .on_action(
+                cx.listener(move |shell, _: &AnswerFocusedOption, window, cx| {
+                    if shell.dock_focused
+                        && dock_target == shell.dock_target()
+                        && shell.question_scroll.target == dock_target
+                    {
+                        shell.answer_question(
+                            dock_request,
+                            dock_question,
+                            shell.question_scroll.cursor,
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
             .on_action(cx.listener(|shell, _: &FocusComposer, window, cx| {
                 shell.input.update(cx, |input, cx| input.focus(window, cx));
             }))
@@ -2522,12 +2799,12 @@ impl Render for Shell {
                 shell.recheck(false, window, cx)
             }))
             .on_action(cx.listener(|shell, _: &Retry, window, cx| shell.recheck(true, window, cx)))
-            .on_action(cx.listener(|shell, _: &OpenTerminal, _, cx| {
-                if let Some(thread) = shell.view.selected()
-                    && let Err(error) =
-                        veyra_engine::platform::open_terminal_app(&shell.state.threads[&thread].cwd)
-                {
-                    shell.notice(error.to_string(), cx);
+            .on_action(cx.listener(|shell, _: &OpenTerminal, window, cx| {
+                if let Some(thread) = shell.view.chat() {
+                    if !shell.drawers.get(&thread).is_some_and(|drawer| drawer.open) {
+                        shell.toggle_drawer(window, cx);
+                    }
+                    shell.focus_shell(window, cx);
                 }
             }))
             .on_action(cx.listener(|shell, action: &PickPermission, window, cx| {
@@ -2703,7 +2980,7 @@ impl Render for Shell {
             .on_action(cx.listener(|shell, action: &SetSidebarWidth, _, cx| {
                 let layout = &cx.global::<Theme>().layout;
                 shell.sidebar_width =
-                    px(action.width).clamp(layout.sidebar_min, layout.sidebar_max);
+                    Pixels::from(action.width).clamp(layout.sidebar_min, layout.sidebar_max);
                 cx.notify();
             }))
             .on_action(cx.listener(|shell, _: &NarrowSidebar, window, cx| {
@@ -2734,44 +3011,65 @@ impl Render for Shell {
                     cx,
                 );
             }))
-            .on_mouse_move(cx.listener(|shell, event: &MouseMoveEvent, window, cx| {
-                shell.cancel_changed_drawer_drag(cx);
-                if let Some(drawer::Drag {
-                    thread,
-                    origin,
-                    height,
-                    ..
-                }) = shell.drawer_resizing
-                {
-                    if event.pressed_button == Some(MouseButton::Left) {
-                        let (min, max) = shell.drawer_height_bounds(cx);
-                        if let Some(drawer) = shell.drawers.get_mut(&thread) {
-                            drawer.height = (height + origin - event.position.y).clamp(min, max);
-                            cx.notify();
-                        }
-                    } else {
-                        shell.drawer_resizing = None;
+            .child(
+                canvas(|_, _, _| (), {
+                    let shell = cx.entity().downgrade();
+                    move |_, _, window, _| {
+                        let moving = shell.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Capture {
+                                return;
+                            }
+                            let _ = moving.update(cx, |shell, cx| {
+                                shell.cancel_changed_drawer_drag(cx);
+                                if let Some(drawer::Drag {
+                                    thread,
+                                    origin,
+                                    height,
+                                    ..
+                                }) = shell.drawer_resizing
+                                {
+                                    if event.pressed_button == Some(MouseButton::Left) {
+                                        let (min, max) = shell.drawer_height_bounds(cx);
+                                        if let Some(drawer) = shell.drawers.get_mut(&thread) {
+                                            drawer.height = (height + origin - event.position.y)
+                                                .clamp(min, max);
+                                            cx.notify();
+                                        }
+                                    } else {
+                                        shell.drawer_resizing = None;
+                                    }
+                                }
+                                if let Some(drag) = shell.resizing {
+                                    if event.pressed_button == Some(MouseButton::Left) {
+                                        window.dispatch_action(
+                                            Box::new(SetSidebarWidth {
+                                                width: f32::from(
+                                                    drag.width + event.position.x - drag.origin,
+                                                ),
+                                            }),
+                                            cx,
+                                        );
+                                    } else {
+                                        shell.resizing = None;
+                                    }
+                                }
+                            });
+                        });
+                        let released = shell.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture && event.button == MouseButton::Left
+                            {
+                                let _ = released.update(cx, |shell, _| {
+                                    shell.resizing = None;
+                                    shell.drawer_resizing = None;
+                                });
+                            }
+                        });
                     }
-                }
-                if let Some(drag) = shell.resizing {
-                    if event.pressed_button == Some(MouseButton::Left) {
-                        window.dispatch_action(
-                            Box::new(SetSidebarWidth {
-                                width: f32::from(drag.width + event.position.x - drag.origin),
-                            }),
-                            cx,
-                        );
-                    } else {
-                        shell.resizing = None;
-                    }
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|shell, _, _, _| {
-                    shell.resizing = None;
-                    shell.drawer_resizing = None;
-                }),
+                })
+                .absolute()
+                .size_full(),
             )
             .child(sidebar::render(self, window, cx))
             .child(
@@ -2833,6 +3131,15 @@ impl Render for Shell {
         let root = root.when(self.quit_sheet, |root| {
             root.child(self.render_quit_sheet(cx))
         });
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(|shell, action: &DebugComposerWidth, _, cx| {
+            let maximum = cx.global::<Theme>().layout.composer_max;
+            shell.composer_width_override = action
+                .width
+                .filter(|width| width.is_finite() && *width > 0.)
+                .map(|width| Pixels::from(width).min(maximum));
+            cx.notify();
+        }));
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|_, action: &DebugDisplayOptions, window, cx| {
             let mut look = cx.try_global::<theme::Look>().copied().unwrap_or_default();
@@ -2897,6 +3204,41 @@ impl Render for Shell {
                                 position: position - point(Pixels::ZERO, Pixels::from(pixels)),
                                 button: MouseButton::Left,
                                 click_count: 1,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            },
+        ));
+        #[cfg(debug_assertions)]
+        let root = root.on_action(cx.listener(
+            |shell, _: &DebugDoubleClickShellDrawer, window, cx| {
+                let Some((_, bounds)) = shell.drawer_rail.filter(|(thread, _)| {
+                    shell.view.chat() == Some(*thread)
+                        && shell.drawers.get(thread).is_some_and(|drawer| drawer.open)
+                }) else {
+                    return;
+                };
+                let position = bounds.center();
+                cx.spawn_in(window, async move |_, cx| {
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_event(
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                position,
+                                button: MouseButton::Left,
+                                click_count: 2,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::MouseUp(MouseUpEvent {
+                                position,
+                                button: MouseButton::Left,
+                                click_count: 2,
                                 ..Default::default()
                             }),
                             cx,
@@ -3040,6 +3382,56 @@ pub fn run(
         });
 }
 
+#[cfg(not(test))]
+#[derive(Default)]
+pub struct TestCapture;
+#[cfg(not(test))]
+impl TestCapture {
+    fn record(&mut self, _: &Command) {}
+}
+#[cfg(test)]
+#[derive(Default)]
+pub struct TestCapture {
+    sent_responses: std::rc::Rc<std::cell::RefCell<Vec<(RequestId, Decision)>>>,
+    sent_interrupts: Vec<StopTarget>,
+    sent_backgrounds: Vec<veyra_engine::domain::WindowBackground>,
+    sent_archives: Vec<(ThreadId, bool)>,
+}
+#[cfg(test)]
+impl TestCapture {
+    fn record(&mut self, command: &Command) {
+        match command {
+            Command::ArchiveThread {
+                thread,
+                keep_children,
+            } => self.sent_archives.push((*thread, *keep_children)),
+            Command::Respond { request, decision } => self
+                .sent_responses
+                .borrow_mut()
+                .push((*request, decision.clone())),
+            Command::Interrupt { thread, turn } => self.sent_interrupts.push(StopTarget {
+                thread: *thread,
+                turn: *turn,
+            }),
+            Command::SetWindowBackground { background } => self.sent_backgrounds.push(*background),
+            _ => {}
+        }
+    }
+}
+#[cfg(test)]
+impl std::ops::Deref for Shell {
+    type Target = TestCapture;
+    fn deref(&self) -> &TestCapture {
+        &self.capture
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for Shell {
+    fn deref_mut(&mut self) -> &mut TestCapture {
+        &mut self.capture
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_types)] // UI tests inspect debug dump and provider wire JSON.
 mod tests {
@@ -3112,19 +3504,16 @@ mod tests {
                 });
                 draw(cx);
                 let lines = text.lines();
-                assert!(lines.contains(message), "banner lost its cause: {lines:?}");
-                assert!(
-                    lines.contains("The thread failed"),
-                    "banner was not rendered"
-                );
-                let instructions = lines
-                    .iter()
-                    .filter(|line| line.to_ascii_lowercase().contains("sign in"))
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
+                for span in message.split('`') {
+                    assert!(lines.contains(span), "banner lost span {span:?}: {lines:?}");
+                }
+                assert!(cx.debug_bounds("failure-card").is_some());
                 assert_eq!(
-                    instructions,
-                    if instruction { vec![message] } else { vec![] },
+                    lines
+                        .iter()
+                        .map(|line| line.to_ascii_lowercase().matches("sign in").count())
+                        .sum::<usize>(),
+                    usize::from(instruction),
                     "unexpected sign-in text: {lines:?}"
                 );
                 assert!(cx.debug_bounds("caption-Retry").is_some());
@@ -3338,6 +3727,118 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn settings_preserves_sidebar_pointer_resize(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            cx.simulate_resize(gpui::size(
+                gpui::Pixels::from(760.),
+                gpui::Pixels::from(686.),
+            ));
+            cx.dispatch_action(super::OpenSettings);
+            draw(cx);
+            cx.dispatch_action(super::DebugDragSidebar { pixels: 40. });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sidebar_width),
+                gpui::Pixels::from(280.)
+            );
+            cx.dispatch_action(super::DebugDoubleClickSidebar);
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sidebar_width),
+                gpui::Pixels::from(240.)
+            );
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn resize_drag_ends_on_outside_release_and_deactivation(cx: &mut gpui::TestAppContext) {
+        for drawer in [false, true] {
+            for deactivate in [false, true] {
+                with_docked_shell(cx, |shell, cx, _, _| {
+                    cx.simulate_resize(gpui::size(
+                        gpui::Pixels::from(1280.),
+                        gpui::Pixels::from(800.),
+                    ));
+                    if drawer {
+                        shell.update_in(cx, |shell, window, cx| {
+                            configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                            shell.state.requests.clear();
+                            shell.toggle_drawer(window, cx);
+                        });
+                    }
+                    draw(cx);
+                    let position = if drawer {
+                        gpui::point(
+                            gpui::Pixels::from(500.),
+                            cx.debug_bounds("shell-drawer").unwrap().top() + gpui::Pixels::from(2.),
+                        )
+                    } else {
+                        cx.debug_bounds("sidebar-resize").unwrap().center()
+                    };
+                    cx.simulate_mouse_down(
+                        position,
+                        gpui::MouseButton::Left,
+                        gpui::Modifiers::default(),
+                    );
+                    assert!(shell.read_with(cx, |shell, _| if drawer {
+                        shell.drawer_resizing.is_some()
+                    } else {
+                        shell.resizing.is_some()
+                    }));
+                    if deactivate {
+                        cx.deactivate_window();
+                    } else {
+                        cx.simulate_mouse_up(
+                            gpui::point(gpui::Pixels::from(-20.), gpui::Pixels::from(-20.)),
+                            gpui::MouseButton::Left,
+                            gpui::Modifiers::default(),
+                        );
+                    }
+                    draw(cx);
+                    assert!(shell.read_with(cx, |shell, _| shell.resizing.is_none()
+                        && shell.drawer_resizing.is_none()));
+                    let before = shell.read_with(cx, |shell, _| {
+                        (
+                            shell.sidebar_width,
+                            shell
+                                .view
+                                .chat()
+                                .and_then(|thread| shell.drawers.get(&thread))
+                                .map(|drawer| drawer.height),
+                        )
+                    });
+                    cx.update(|window, _| window.activate_window());
+                    draw(cx);
+                    cx.simulate_mouse_move(
+                        position + gpui::point(gpui::Pixels::from(48.), gpui::Pixels::from(48.)),
+                        Some(gpui::MouseButton::Left),
+                        gpui::Modifiers::default(),
+                    );
+                    draw(cx);
+                    assert_eq!(
+                        shell.read_with(cx, |shell, _| (
+                            shell.sidebar_width,
+                            shell
+                                .view
+                                .chat()
+                                .and_then(|thread| shell.drawers.get(&thread))
+                                .map(|drawer| drawer.height)
+                        )),
+                        before
+                    );
+                    cx.simulate_mouse_up(
+                        position,
+                        gpui::MouseButton::Left,
+                        gpui::Modifiers::default(),
+                    );
+                });
+            }
+        }
+    }
+
     fn draw(cx: &mut gpui::VisualTestContext) {
         for _ in 0..2 {
             cx.run_until_parked();
@@ -3347,6 +3848,559 @@ mod tests {
             });
         }
         cx.run_until_parked();
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn dock_observers_report_the_original_boxes(cx: &mut gpui::TestAppContext) {
+        fn values(bounds: gpui::Bounds<gpui::Pixels>) -> serde_json::Value {
+            serde_json::json!([
+                f32::from(bounds.left()),
+                f32::from(bounds.top()),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            ])
+        }
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        consent: Default::default(),
+                        tool: "Fixture tool".into(),
+                        target: ApprovalTarget::Tool {
+                            preview: ApprovalPreview::new("{\"command\":\"echo ok\"}".to_owned()),
+                        },
+                    },
+                };
+                cx.notify();
+            });
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            let mut snapshots = Vec::new();
+            let mut mismatches = Vec::new();
+            for width in [760., 960., 1950.] {
+                cx.simulate_resize(gpui::size(
+                    gpui::Pixels::from(width),
+                    gpui::Pixels::from(740.),
+                ));
+                draw(cx);
+                cx.dispatch_action(super::FocusDock);
+                draw(cx);
+                let frame = cx.debug_bounds("composer-dock").unwrap();
+                let padding = cx
+                    .debug_bounds("focus-ring")
+                    .unwrap()
+                    .dilate(theme.layout.focus_inset);
+                assert_eq!(padding.origin, frame.origin);
+                assert_eq!(padding.size.width, frame.size.width);
+                assert_eq!(frame.bottom() - padding.bottom(), theme.layout.border);
+                let input = cx.debug_bounds("composer-input").unwrap();
+                let dump =
+                    shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx));
+                assert_eq!(dump["composer"]["dock"]["focused"], true);
+                assert_eq!(dump["composer"]["input_bounds"], values(input));
+                let surface = shell.read_with(cx, |shell, _| shell.composer_surface_bounds.get());
+                assert_eq!(dump["composer"]["surface_bounds"], values(surface));
+                cx.update(|window, _| {
+                    let scale = window.scale_factor();
+                    let quad = window
+                        .painted_quads()
+                        .into_iter()
+                        .find(|quad| {
+                            quad.bounds.contains(&input.center().scale(scale))
+                                && quad.corner_radii.top_left == theme.radius.large.scale(scale)
+                                && quad.border_widths.top == theme.layout.border.scale(scale)
+                        })
+                        .expect("composer border was not painted");
+                    assert_eq!(quad.bounds, surface.scale(scale));
+                });
+                for name in ["header-title", "header-status"] {
+                    let bounds = cx.debug_bounds(name).unwrap();
+                    let key = format!("Name(\"{name}\")");
+                    assert_eq!(dump["look"]["controls"][key], values(bounds));
+                }
+                let reported = dump["composer"]["dock"]["bounds"].clone();
+                if reported != values(padding) {
+                    mismatches.push(format!(
+                        "{width}: reported {reported}, padding {}",
+                        values(padding)
+                    ));
+                }
+                snapshots.push(serde_json::json!({
+                    "width":width,"reported":reported,"padding":values(padding),
+                    "border_box":values(frame),"input":values(input),"surface":values(surface),
+                }));
+            }
+            if let Some(path) = std::env::var_os("VEYRA_DOCK_GEOMETRY_PROOF") {
+                std::fs::write(path, serde_json::to_vec_pretty(&snapshots).unwrap()).unwrap();
+            }
+            assert!(mismatches.is_empty(), "{mismatches:?}");
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn stream_geometry_dump_does_not_request_repaints(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (thread, turn) =
+                    configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.state.threads.get_mut(&thread).unwrap().title = "stream 2000 deltas".into();
+                shell
+                    .state
+                    .statuses
+                    .insert(thread, Status::Working { since: 0 });
+                shell.branch = "fixture-branch".into();
+                for (seq, body) in [
+                    ItemBody::UserText("stream 2000 deltas".into()),
+                    ItemBody::AssistantText {
+                        text: "x".repeat(2000),
+                        done: false,
+                    },
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    shell.state.apply(UiEvent::Change {
+                        counter: None,
+                        event: ChangeEvent::ItemAdded(Item {
+                            id: ItemId::new(),
+                            thread,
+                            turn,
+                            seq: seq as u32 + 1,
+                            body,
+                        }),
+                    });
+                }
+                shell.scroller.update(cx, |state, cx| state.reset(2, cx));
+                cx.notify();
+            });
+            let mut snapshots = Vec::new();
+            for width in [760., 960., 1950.] {
+                cx.simulate_resize(gpui::size(
+                    gpui::Pixels::from(width),
+                    gpui::Pixels::from(740.),
+                ));
+                draw(cx);
+                let dump =
+                    shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx));
+                let controls = [
+                    "header-title",
+                    "header-status",
+                    "header-thread-title",
+                    "model",
+                    "effort",
+                ]
+                .map(|name| {
+                    let key = format!("Name(\"{name}\")");
+                    (name, dump["look"]["controls"][key].clone())
+                });
+                let quads = cx.update(|window, _| {
+                    window
+                        .painted_quads()
+                        .into_iter()
+                        .map(|quad| {
+                            format!(
+                                "{:?}",
+                                (
+                                    quad.bounds,
+                                    quad.background,
+                                    quad.border_color,
+                                    quad.corner_radii,
+                                    quad.border_widths,
+                                    quad.content_mask,
+                                )
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                snapshots.push(serde_json::json!({
+                    "width":width,"controls":controls,"input":dump["composer"]["input_bounds"],
+                    "surface":dump["composer"]["surface_bounds"],"quads":quads,
+                }));
+                let before = shell.read_with(cx, |shell, _| shell.repaints);
+                for _ in 0..100 {
+                    shell.read_with(cx, |shell, cx| {
+                        let dump = shell.dump(std::path::Path::new("/tmp"), cx);
+                        assert_eq!(
+                            dump["composer"]["input_bounds"],
+                            snapshots.last().unwrap()["input"]
+                        );
+                    });
+                }
+                cx.run_until_parked();
+                assert_eq!(shell.read_with(cx, |shell, _| shell.repaints), before);
+            }
+            if let Some(path) = std::env::var_os("VEYRA_LAYOUT_PROOF") {
+                std::fs::write(path, serde_json::to_vec_pretty(&snapshots).unwrap()).unwrap();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn docked_input_takes_content_height(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (minimum, maximum, padding) = cx.update(|_, cx| {
+                let t = cx.global::<super::Theme>();
+                (
+                    t.layout.composer_min_height,
+                    t.layout.composer_max_height,
+                    t.space.0[3] * 2.,
+                )
+            });
+            let height = |shell: &gpui::Entity<super::Shell>, cx: &gpui::VisualTestContext| {
+                shell.read_with(cx, |shell, cx| {
+                    shell.input.read(cx).input_bounds().size.height + padding
+                })
+            };
+            assert_eq!(height(&shell, cx), minimum);
+            shell.update_in(cx, |shell, window, cx| {
+                shell.input.update(cx, |input, cx| {
+                    input.set_value("line\n".repeat(5), window, cx)
+                });
+            });
+            draw(cx);
+            let grown = height(&shell, cx);
+            assert!(grown > minimum && grown < maximum);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn wrapped_send_keeps_the_trailing_edge(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (thread, turn) = configure_dock_thread(shell, ProviderKind::Grok, false, false);
+                shell.state.requests.clear();
+                shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(1),
+                    at: 2,
+                };
+                shell
+                    .state
+                    .statuses
+                    .insert(thread, Status::Done { took: 1 });
+                shell.state.threads.get_mut(&thread).unwrap().config.mode =
+                    PermissionMode::AskFirst;
+                cx.notify();
+            });
+            let mut wrapped = 0;
+            for width in [760., 780., 800., 820., 840., 860., 880., 900., 960.] {
+                cx.simulate_resize(gpui::size(
+                    gpui::Pixels::from(width),
+                    gpui::Pixels::from(686.),
+                ));
+                draw(cx);
+                let submit = cx.debug_bounds("composer-submit-button").unwrap();
+                let model = cx.debug_bounds("composer-model").unwrap();
+                let input = shell.read_with(cx, |shell, _| shell.composer_input_bounds.get());
+                if submit.top() >= model.bottom() {
+                    wrapped += 1;
+                    assert_eq!(submit.right(), input.right(), "window width {width}");
+                }
+            }
+            assert!(wrapped > 0, "scene must wrap its toolbar");
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn composer_width_override_wraps_send_without_resizing_the_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (thread, turn) = configure_dock_thread(shell, ProviderKind::Grok, false, false);
+                shell.state.requests.clear();
+                shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(1),
+                    at: 2,
+                };
+                shell
+                    .state
+                    .statuses
+                    .insert(thread, Status::Done { took: 1 });
+                let config = &mut shell.state.threads.get_mut(&thread).unwrap().config;
+                config.mode = PermissionMode::AskFirst;
+                config.model = None;
+                config.effort = None;
+                cx.notify();
+            });
+            for width in [760., 1950.] {
+                cx.simulate_resize(gpui::size(
+                    gpui::Pixels::from(width),
+                    gpui::Pixels::from(686.),
+                ));
+                draw(cx);
+                let before = shell.read_with(cx, |shell, _| shell.composer_surface_bounds.get());
+                cx.dispatch_action(super::DebugComposerWidth { width: Some(440.) });
+                draw(cx);
+                let submit = cx.debug_bounds("composer-submit-button").unwrap();
+                let model = cx.debug_bounds("composer-model").unwrap();
+                let (surface, input, dump) = shell.read_with(cx, |shell, cx| {
+                    (
+                        shell.composer_surface_bounds.get(),
+                        shell.composer_input_bounds.get(),
+                        shell.dump_composer(cx),
+                    )
+                });
+                assert_eq!(f32::from(surface.size.width), 440.);
+                assert_eq!(dump["width_override"], 440.);
+                assert!(submit.top() >= model.bottom(), "window width {width}");
+                assert_eq!(submit.right(), input.right(), "window width {width}");
+                assert_eq!(
+                    cx.update(|window, _| f32::from(window.viewport_size().width)),
+                    width
+                );
+                println!(
+                    "composer window={width} surface={surface:?} send={submit:?} input={input:?}"
+                );
+                cx.dispatch_action(super::DebugComposerWidth::default());
+                draw(cx);
+                assert_eq!(
+                    shell.read_with(cx, |shell, _| shell.composer_surface_bounds.get()),
+                    before
+                );
+                assert!(
+                    shell.read_with(cx, |shell, cx| shell.dump_composer(cx))["width_override"]
+                        .is_null()
+                );
+                for invalid in [0., -1., f32::INFINITY, f32::NAN] {
+                    cx.dispatch_action(super::DebugComposerWidth {
+                        width: Some(invalid),
+                    });
+                    draw(cx);
+                    assert!(
+                        shell.read_with(cx, |shell, _| shell.composer_width_override.is_none())
+                    );
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn header_dump_bounds_follow_the_rendered_labels(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| super::theme::register_fonts(cx).unwrap());
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let thread = shell.update(cx, |shell, _| {
+                configure_dock_thread(shell, ProviderKind::Grok, false, false).0
+            });
+            for width in [760., 1950.] {
+                cx.simulate_resize(gpui::size(
+                    gpui::Pixels::from(width),
+                    gpui::Pixels::from(1385.),
+                ));
+                for view in [
+                    super::MainView::NewThread,
+                    super::MainView::Settings { back: Some(thread) },
+                    super::MainView::Chat(thread),
+                ] {
+                    shell.update(cx, |shell, cx| {
+                        shell.show(view);
+                        cx.notify();
+                    });
+                    draw(cx);
+                    #[cfg(debug_assertions)]
+                    let dump = shell.read_with(cx, |shell, cx| {
+                        shell.dump(std::path::Path::new("/tmp/veyra-header-geometry"), cx)
+                    });
+                    assert_eq!(
+                        cx.update(|window, _| f32::from(window.viewport_size().width)),
+                        width
+                    );
+                    #[cfg(debug_assertions)]
+                    {
+                        let labels = dump["look"]["control_labels"].as_object().unwrap();
+                        assert!(!labels.is_empty());
+                        for (id, label) in labels {
+                            assert!(dump["look"]["controls"][id].is_array());
+                            assert!(!label.as_str().unwrap().trim().is_empty());
+                        }
+                        assert!(labels.values().any(|label| label == "Settings"));
+                        if matches!(view, super::MainView::Settings { .. }) {
+                            for caption in [
+                                "Ask first",
+                                "Accept edits",
+                                "Full access",
+                                "Translucent",
+                                "Solid",
+                            ] {
+                                assert!(labels.values().any(|label| label == caption), "{caption}");
+                            }
+                        } else {
+                            assert!(labels.values().any(|label| label == "Provider default"));
+                        }
+                        assert!(!labels.values().any(|label| label == "Shell drawer"));
+                        let foregrounds = cx.read(|cx| {
+                            let kit = gpui_kit::component::Theme::global(cx);
+                            [
+                                ("button_primary_foreground", kit.button_primary_foreground),
+                                ("button_danger_foreground", kit.button_danger_foreground),
+                            ]
+                        });
+                        for (role, color) in foregrounds {
+                            let color = gpui::Rgba::from(color);
+                            assert_eq!(
+                                dump["look"]["colors"][role],
+                                serde_json::json!(
+                                    [color.r, color.g, color.b, color.a]
+                                        .map(|channel| (channel * 255.).round() as u8)
+                                )
+                            );
+                        }
+                        let mut names = vec!["header-title"];
+                        if view.chat().is_some() {
+                            names.push("header-status");
+                        }
+                        for name in names {
+                            let bounds = cx.debug_bounds(name).unwrap();
+                            assert!(bounds.size.width > gpui::Pixels::ZERO);
+                            assert!(bounds.size.height > gpui::Pixels::ZERO);
+                            assert_eq!(
+                                dump["look"]["controls"][format!("Name({name:?})")],
+                                serde_json::json!([
+                                    f32::from(bounds.left()),
+                                    f32::from(bounds.top()),
+                                    f32::from(bounds.size.width),
+                                    f32::from(bounds.size.height)
+                                ])
+                            );
+                        }
+                    }
+                    let expected = match view {
+                        super::MainView::NewThread => "New thread".to_owned(),
+                        super::MainView::Settings { .. } => "Settings".to_owned(),
+                        super::MainView::Chat(_) => shell
+                            .read_with(cx, |shell, _| shell.state.threads[&thread].title.clone()),
+                    };
+                    assert_eq!(
+                        shell.read_with(cx, |shell, _| super::header::title_text(shell)),
+                        expected
+                    );
+                    #[cfg(debug_assertions)]
+                    assert_eq!(dump["look"]["header_title"], expected);
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "HEADER_GEOMETRY {}",
+                        serde_json::json!({
+                            "viewport_width":width,
+                            "sidebar_width":dump["sidebar"]["width"],
+                            "view":dump["view"],
+                            "title":dump["look"]["header_title"],
+                            "bounds":dump["look"]["controls"]["Name(\"header-title\")"],
+                            "status_bounds":dump["look"]["controls"]["Name(\"header-status\")"]})
+                    );
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn button_variant_foregrounds_match_dump(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let bytes = |color| {
+                let color = gpui::Rgba::from(color);
+                [color.r, color.g, color.b, color.a].map(|channel| (channel * 255.).round() as u8)
+            };
+            for appearance in [super::Appearance::Dark, super::Appearance::Light] {
+                let colors = cx.update(|window, cx| {
+                    super::Theme::apply(appearance, window, cx);
+                    let kit = gpui_kit::component::Theme::global(cx);
+                    serde_json::json!({
+                        "appearance":appearance.name(),
+                        "primary_foreground":bytes(kit.primary_foreground),
+                        "button_primary_foreground":bytes(kit.button_primary_foreground),
+                        "button_danger_foreground":bytes(kit.button_danger_foreground),
+                        "on_solid":bytes(cx.global::<super::Theme>().colors.on_solid)})
+                });
+                println!("BUTTON_VARIANT_FOREGROUNDS {colors}");
+                assert_eq!(
+                    shell.read_with(cx, |_, cx| cx.global::<super::Theme>().appearance),
+                    appearance
+                );
+                #[cfg(debug_assertions)]
+                {
+                    let dump =
+                        shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new(""), cx));
+                    for role in ["button_primary_foreground", "button_danger_foreground"] {
+                        assert_eq!(dump["look"]["colors"][role], colors[role]);
+                    }
+                }
+            }
+            #[cfg(debug_assertions)]
+            {
+                let expected = cx.update(|_, cx| {
+                    gpui_kit::component::Theme::update(cx, |kit| {
+                        kit.primary_foreground = kit.warning;
+                        kit.button_primary_foreground = kit.success;
+                        kit.button_danger_foreground = kit.accent;
+                    });
+                    let kit = gpui_kit::component::Theme::global(cx);
+                    assert_ne!(kit.primary_foreground, kit.button_primary_foreground);
+                    [
+                        bytes(kit.button_primary_foreground),
+                        bytes(kit.button_danger_foreground),
+                    ]
+                });
+                let dump =
+                    shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new(""), cx));
+                assert_eq!(
+                    dump["look"]["colors"]["button_primary_foreground"],
+                    serde_json::json!(expected[0])
+                );
+                assert_eq!(
+                    dump["look"]["colors"]["button_danger_foreground"],
+                    serde_json::json!(expected[1])
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn option_cursor_moves_and_answers(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let request = shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                cx.notify();
+                shell.state.requests[0].id
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-shift-y down down up down enter");
+            draw(cx);
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(
+                    shell.sent_responses.borrow().as_slice(),
+                    [(
+                        request,
+                        Decision::Answers(vec![Answer {
+                            text: "Long".into()
+                        }])
+                    )]
+                );
+                assert!(!shell.dock_focused);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn option_keys_need_dock_focus(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            cx.simulate_keystrokes("down up enter");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.sent_responses.borrow().is_empty()));
+            cx.dispatch_action(super::MoveOptionDown);
+            cx.dispatch_action(super::AnswerFocusedOption);
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.sent_responses.borrow().is_empty()));
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.question_scroll.cursor),
+                0
+            );
+        });
     }
 
     #[gpui::test]
@@ -3375,7 +4429,6 @@ mod tests {
                     shell.read_with(cx, |shell, _| shell.clock.phase),
                     phase as u8
                 );
-                draw(cx);
                 cx.background_executor
                     .advance_clock(std::time::Duration::from_nanos(1));
                 cx.run_until_parked();
@@ -3384,7 +4437,6 @@ mod tests {
                     assert_eq!(shell.clock.elapsed_at, epoch + (step / 12 * 1000) as i64);
                     assert!(shell.clock.task.is_some());
                 });
-                draw(cx);
             }
         });
     }
@@ -3407,7 +4459,6 @@ mod tests {
                 .advance_clock(std::time::Duration::from_nanos(83_333_333));
             cx.run_until_parked();
             assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
-            draw(cx);
             let epoch = shell.update(cx, |shell, cx| {
                 shell
                     .state
@@ -3427,7 +4478,6 @@ mod tests {
                 assert_eq!(shell.clock.phase, 0);
                 assert_eq!(shell.clock.elapsed_at, epoch);
             });
-            draw(cx);
         });
     }
 
@@ -3461,7 +4511,6 @@ mod tests {
                         epoch + if step == 12 { 1000 } else { 0 }
                     );
                 });
-                draw(cx);
             }
             shell.update(cx, |shell, cx| {
                 cx.set_global(super::Theme::new(super::Appearance::Dark));
@@ -3472,7 +4521,6 @@ mod tests {
                 .advance_clock(std::time::Duration::from_nanos(83_333_333));
             cx.run_until_parked();
             assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
-            draw(cx);
             shell.update(cx, |shell, cx| {
                 let mut look = cx.global::<super::theme::Look>().to_owned();
                 look.options.reduce_motion = true;
@@ -3480,7 +4528,6 @@ mod tests {
                 shell.sync_clock(cx);
                 assert_eq!(shell.clock.phase, 0);
             });
-            draw(cx);
         });
     }
 
@@ -6157,7 +7204,7 @@ mod tests {
                                         folder.size.height >= line
                                             && folder.size.height <= line * 3.
                                     };
-                                    height && inside(folder) && folder.bottom() <= details.top()
+                                    height && inside(folder) && folder.top() >= details.bottom()
                                 });
                             let fixed = [
                                 "approval-consequence",
@@ -6289,7 +7336,7 @@ mod tests {
                     folder_viewport.top(),
                     "new folder opens at its top"
                 );
-                assert!(folder_viewport.bottom() <= details.top());
+                assert!(folder_viewport.top() >= details.bottom());
                 assert!(shell.read_with(cx, |shell, _| {
                     shell.approval_scroll.folder_handle.max_offset().y > gpui::Pixels::ZERO
                 }));
@@ -6404,7 +7451,9 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
-    fn outside_working_folder_stays_above_scrolling_details(cx: &mut gpui::TestAppContext) {
+    fn outside_working_folder_and_reason_stay_below_scrolling_details(
+        cx: &mut gpui::TestAppContext,
+    ) {
         with_docked_shell(cx, |shell, cx, _, _| {
             shell.update(cx, |shell, cx| {
                 shell.state.requests.truncate(1);
@@ -6428,8 +7477,8 @@ mod tests {
             let details = cx.debug_bounds("approval-details").unwrap();
             let folder = cx.debug_bounds("approval-working-folder").unwrap();
             assert!(
-                folder.bottom() <= details.top(),
-                "working folder must be visible above the scroll area"
+                folder.top() >= details.bottom(),
+                "working folder must be visible below the scroll area"
             );
             let reason = cx.debug_bounds("approval-provider-reason").unwrap();
             cx.simulate_event(gpui::ScrollWheelEvent {
@@ -6443,10 +7492,8 @@ mod tests {
             });
             draw(cx);
             assert_eq!(cx.debug_bounds("approval-working-folder").unwrap(), folder);
-            assert!(
-                cx.debug_bounds("approval-provider-reason").unwrap().top() < reason.top(),
-                "reason must remain inside scrolling details"
-            );
+            assert_eq!(cx.debug_bounds("approval-provider-reason").unwrap(), reason);
+            assert!(reason.top() >= folder.bottom());
         });
     }
 
@@ -6634,9 +7681,10 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
-    fn question_focus_prompt_matches_approval(cx: &mut gpui::TestAppContext) {
+    fn question_focus_region_replaces_the_focus_prompt(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
-            assert!(cx.debug_bounds("veyra::FocusDock").is_some());
+            assert!(cx.debug_bounds("veyra::FocusDock").is_none());
+            assert!(!shell.read_with(cx, |shell, _| shell.dock_focused));
             cx.simulate_keystrokes("secondary-shift-y");
             draw(cx);
             assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
@@ -6670,7 +7718,7 @@ mod tests {
                 cx.notify();
             });
             draw(cx);
-            assert!(cx.debug_bounds("veyra::AllowInThread").is_none());
+            assert!(cx.debug_bounds("veyra::AllowInThread").is_some());
             cx.simulate_keystrokes("secondary-alt-enter");
             draw(cx);
             assert!(dispatched.borrow().is_empty());
@@ -6704,7 +7752,7 @@ mod tests {
                 ["AllowInThread", "AllowInThread"]
             );
             assert!(!shell.read_with(cx, |shell, _| shell.dock_focused));
-            assert!(cx.debug_bounds("veyra::AllowInThread").is_none());
+            assert!(cx.debug_bounds("veyra::AllowInThread").is_some());
         });
     }
 
@@ -6884,7 +7932,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[gpui::test]
-    fn grok_deny_only_dock_disables_both_allows_and_keeps_deny(cx: &mut gpui::TestAppContext) {
+    fn grok_deny_only_dock_hides_both_allows_and_keeps_deny(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let responses = shell.read_with(cx, |shell, _| shell.sent_responses.clone());
             let request = shell.update(cx, |shell, cx| {
@@ -6910,12 +7958,9 @@ mod tests {
             draw(cx);
             assert!(cx.debug_bounds("approval-consent-reason").is_some());
             for selector in ["approval-allow-button", "approval-grant-button"] {
-                let button = cx.debug_bounds(selector).unwrap().center();
-                cx.simulate_click(button, gpui::Modifiers::none());
-                draw(cx);
                 assert!(
-                    responses.borrow().is_empty(),
-                    "disabled {selector} answered"
+                    cx.debug_bounds(selector).is_none(),
+                    "unavailable {selector} visible"
                 );
             }
             cx.simulate_keystrokes("secondary-shift-y");
@@ -6982,7 +8027,7 @@ mod tests {
                 None
             );
             assert!(cx.debug_bounds("caption-Default model").is_some());
-            assert!(cx.debug_bounds("caption-Effort").is_some());
+            assert!(cx.debug_bounds("caption-Provider default").is_some());
         });
     }
 
@@ -7104,7 +8149,7 @@ mod tests {
             cx.simulate_keystrokes("secondary-alt-e");
             draw(cx);
             assert_eq!(shell.read_with(cx, |s, _| s.config.effort.clone()), None);
-            assert!(cx.debug_bounds("caption-Effort").is_some());
+            assert!(cx.debug_bounds("caption-Provider default").is_some());
         });
     }
 
@@ -7170,14 +8215,14 @@ mod tests {
             cx.run_until_parked();
             draw(cx);
             assert!(
-                cx.debug_bounds("veyra::AllowOnce").is_none(),
-                "composer Return does not allow"
+                cx.debug_bounds("veyra::AllowOnce").is_some(),
+                "shortcut remains visible outside dock focus"
             );
             assert!(
-                cx.debug_bounds("veyra::Deny").is_none(),
-                "composer period does not deny"
+                cx.debug_bounds("veyra::Deny").is_some(),
+                "shortcut remains visible outside dock focus"
             );
-            assert!(cx.debug_bounds("veyra::FocusDock").is_some());
+            assert!(cx.debug_bounds("veyra::FocusDock").is_none());
             cx.simulate_keystrokes("secondary-enter");
             cx.run_until_parked();
             draw(cx);
@@ -7207,7 +8252,7 @@ mod tests {
             cx.run_until_parked();
             draw(cx);
             assert!(!shell.read_with(cx, |shell, _| shell.dock_focused));
-            assert!(cx.debug_bounds("veyra::AllowOnce").is_none());
+            assert!(cx.debug_bounds("veyra::AllowOnce").is_some());
         });
     }
 
@@ -8939,7 +9984,7 @@ mod tests {
             assert_eq!(
                 shell.read_with(cx, |shell, cx| shell.dump_composer(cx)["dock"]["preview"]
                     .clone()),
-                serde_json::json!("{\"networkAccess\":true}")
+                serde_json::json!("networkAccess: true")
             );
         });
     }
@@ -9274,7 +10319,6 @@ mod tests {
                         open: true,
                         height: gpui::Pixels::from(240.),
                         active: 0,
-                        next: 2,
                         tabs: vec![super::drawer::Tab {
                             number: 1,
                             label: "Shell 1".into(),
@@ -9918,9 +10962,14 @@ mod tests {
             let first = cx.debug_bounds("dock-option-0").unwrap();
             let viewport = cx.debug_bounds("dock-options").unwrap();
             assert!(first.top() >= viewport.top() && first.bottom() <= viewport.bottom());
-            assert!(text.lines().iter().any(|line| line.starts_with("1  ")
-                && line.ends_with('…')
-                && !line.contains("tail sentinel")));
+            assert!(text.lines().contains("1"));
+            assert!(
+                text.lines()
+                    .iter()
+                    .any(|line| line.starts_with("A long option")
+                        && line.ends_with('…')
+                        && !line.contains("tail sentinel"))
+            );
         });
     }
     #[cfg(debug_assertions)]
@@ -10261,6 +11310,254 @@ mod tests {
                 wake_gap,
                 cx.update(|_, cx| cx.global::<super::Theme>().space.0[3])
             );
+        });
+    }
+
+    #[gpui::test]
+    fn approval_dock_keeps_padding_with_focus_and_unbroken_text(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
+            for viewport in [theme.layout.window_min, theme.layout.window_default] {
+                cx.simulate_resize(viewport);
+                for focused in [false, true] {
+                    shell.update(cx, |shell, cx| {
+                        shell.provider = ProviderKind::Codex;
+                        shell.providers[0].provider = ProviderKind::Codex;
+                        shell.state.requests.truncate(1);
+                        shell.state.requests[0].id = RequestId::new();
+                        shell.state.requests[0].kind = RequestKind::Approval {
+                            action: ProposedAction {
+                                consent: Default::default(),
+                                tool: "veyra / list_providers".into(),
+                                target: ApprovalTarget::Tool {
+                                    preview: ApprovalPreview::new(format!(
+                                        "{{\"message\":\"{}\",\"mode\":\"form\"}}",
+                                        "unbroken".repeat(300)
+                                    )),
+                                },
+                            },
+                        };
+                        shell.dock_focused = focused;
+                        cx.notify();
+                    });
+                    draw(cx);
+                    shell.read_with(cx, |shell, _cx| {
+                        #[cfg(debug_assertions)]
+                        let input = shell.composer_input_bounds.get();
+                        #[cfg(not(debug_assertions))]
+                        let input = shell.input.read(_cx).input_bounds();
+                        assert!(input.left() >= gpui::Pixels::ZERO);
+                        assert!(input.right() <= viewport.width);
+                        assert!(input.bottom() <= viewport.height);
+                        assert_eq!(shell.approval_scroll.handle.offset().x, gpui::Pixels::ZERO);
+                    });
+                    assert!(theme.space.0[3] > theme.layout.focus_inset + theme.layout.focus_ring);
+                    #[cfg(debug_assertions)]
+                    {
+                        let frame = cx.debug_bounds("composer-dock").unwrap();
+                        for selector in [
+                            "approval-consequence-text",
+                            "approval-action-content",
+                            "approval-preview-content",
+                            "approval-decisions",
+                        ] {
+                            let content = cx.debug_bounds(selector).unwrap();
+                            assert!(content.left() >= frame.left() + theme.space.0[3]);
+                            assert!(content.right() <= frame.right() - theme.space.0[3]);
+                        }
+                        let preview = cx.debug_bounds("approval-preview-content").unwrap();
+                        let line = cx.update(|window, _| {
+                            theme.text.code.line_height.to_pixels(window.rem_size())
+                        });
+                        assert!(preview.size.height > line);
+                        shell.read_with(cx, |shell, cx| {
+                            assert_eq!(shell.approval_scroll.handle.offset().x, gpui::Pixels::ZERO);
+                            let dock = shell.dump_composer(cx)["dock"].clone();
+                            assert_eq!(dock["bounds"][0], f32::from(frame.left()));
+                            assert_eq!(dock["bounds"][2], f32::from(frame.size.width));
+                            assert_eq!(dock["content_inset"], f32::from(theme.space.0[3]));
+                            assert_eq!(dock["focus_border"], f32::from(theme.layout.focus_ring));
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn last_shell_close_reports_focus_while_inactive(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        use std::time::{Duration, Instant};
+        cx.dispatcher.allow_parking();
+        with_docked_shell(cx, |shell, cx, _, _| {
+            struct Shutdown {
+                engine: veyra_engine::Engine,
+                runtime: tokio::runtime::Runtime,
+            }
+            impl Drop for Shutdown {
+                fn drop(&mut self) {
+                    self.runtime.block_on(self.engine.shutdown_wait());
+                }
+            }
+            let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
+            let fixture = data.join("shell.jsonl");
+            std::fs::write(&fixture, concat!(
+                "{\"type\":\"transcript_start\",\"provider\":\"shell\",\"protocol\":\"terminal\",",
+                "\"cli_version\":\"fixture\",\"scenario\":\"shell-background-job\",\"source\":\"scripted\"}\n"
+            )).unwrap();
+            let binary = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("veyra-test-cli");
+            let script = data.join("shell");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nVEYRA_FAKE_FIXTURE='{}' exec '{}' shell\n",
+                    fixture.display(),
+                    binary.display()
+                ),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&script)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let engine = veyra_engine::Engine::start_with_env(
+                runtime.handle(),
+                veyra_engine::data_dir::DataDir::at(data.clone()).unwrap(),
+                veyra_engine::provider::env::ChildEnv::isolated()
+                    .with_variable("SHELL", script.as_os_str()),
+            )
+            .unwrap();
+            let shutdown = Shutdown { engine, runtime };
+            let thread = shell.update(cx, |shell, _| {
+                shell.engine = shutdown.engine.clone();
+                shell.runtime = shutdown.runtime.handle().clone();
+                let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
+                shell.state.requests.clear();
+                shell.state.threads.get_mut(&thread).unwrap().cwd = data.clone();
+                thread
+            });
+            let handle = shutdown
+                .engine
+                .open_shell(
+                    thread,
+                    data.clone(),
+                    veyra_engine::terminal::PtySize::default(),
+                )
+                .unwrap();
+            let wait = |ready: &dyn Fn() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready() {
+                    assert!(Instant::now() < deadline, "fake PTY condition timed out");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            wait(&|| {
+                handle
+                    .emulator()
+                    .lock()
+                    .text()
+                    .join("\n")
+                    .contains("VEYRA_TUI_READY")
+                    && !handle.running_processes().is_empty()
+            });
+            let pid = handle.pid().unwrap();
+            shell.update_in(cx, |shell, window, cx| {
+                let view = cx.new(|cx| {
+                    super::terminal_view::TerminalView::new(Some(handle.clone()), window, cx)
+                });
+                shell.drawers.insert(
+                    thread,
+                    super::drawer::Drawer {
+                        open: true,
+                        height: gpui::Pixels::from(240.),
+                        active: 0,
+                        tabs: vec![super::drawer::Tab {
+                            number: 1,
+                            label: "Fake PTY".into(),
+                            handle: Some(handle.clone()),
+                            view,
+                            error: None,
+                        }],
+                    },
+                );
+                shell.sync_drawers(cx);
+                shell.focus_shell(window, cx);
+                shell.ask_close_shell(thread, 1, window, cx);
+                assert!(shell.close_sheet.is_some());
+            });
+            draw(cx);
+            cx.deactivate_window();
+            draw(cx);
+            cx.update(|window, cx| {
+                window.dispatch_keystroke(gpui::Keystroke::parse("secondary-enter").unwrap(), cx)
+            });
+            draw(cx);
+            shell.update_in(cx, |shell, window, cx| {
+                assert!(!window.is_window_active());
+                assert!(!shell.window_active);
+                assert!(shell.close_sheet.is_none());
+                assert!(shell.drawers[&thread].tabs.is_empty());
+                assert!(!shell.drawers[&thread].open);
+                assert!(shell.input.focus_handle(cx).is_focused(window));
+                assert!(shell.composer_focused);
+                #[cfg(debug_assertions)]
+                {
+                    let dump = shell.dump(&data, cx);
+                    assert_eq!(dump["focus"], "composer");
+                    assert_eq!(dump["composer"]["focused"], true);
+                }
+            });
+            let border = |cx: &mut gpui::VisualTestContext| {
+                #[cfg(debug_assertions)]
+                let observed = shell.read_with(cx, |shell, _| shell.composer_surface_bounds.get());
+                let center =
+                    shell.read_with(cx, |shell, cx| shell.input.read(cx).input_bounds().center());
+                cx.update(|window, cx| {
+                    let theme = cx.global::<super::Theme>();
+                    let quad = window
+                        .painted_quads()
+                        .into_iter()
+                        .find(|quad| {
+                            quad.bounds.contains(&center.scale(window.scale_factor()))
+                                && quad.corner_radii.top_left
+                                    == theme.radius.large.scale(window.scale_factor())
+                                && quad.border_widths.top
+                                    == theme.layout.border.scale(window.scale_factor())
+                        })
+                        .expect("composer border was not painted");
+                    #[cfg(debug_assertions)]
+                    assert_eq!(quad.bounds, observed.scale(window.scale_factor()));
+                    (quad.border_color, theme.colors.border, theme.colors.accent)
+                })
+            };
+            let (ink, quiet, accent) = border(cx);
+            assert_eq!(ink, quiet);
+            assert_ne!(ink, accent);
+            cx.update(|window, _| {
+                window.activate_window();
+                window.refresh();
+            });
+            draw(cx);
+            assert_eq!(border(cx).0, accent);
+            wait(&|| {
+                handle.pid().is_none()
+                    && !veyra_engine::platform::is_alive(pid).unwrap()
+                    && !veyra_engine::platform::group_exists(pid).unwrap()
+            });
         });
     }
 }

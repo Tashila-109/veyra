@@ -35,6 +35,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 prepare()
 assert LANE == 'fake'
 thread = create('stop','A long reply',scenario='long-reply')
@@ -212,6 +213,10 @@ PY
 ```
 
 ## Observable success
+
+On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+
+Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
 
 `stop-held.png` and its dump show the held reason and two queued messages.
 `stop-discarded.json` clears the hold, drops both stale turns and keeps corrected text.

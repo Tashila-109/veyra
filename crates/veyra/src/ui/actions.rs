@@ -10,7 +10,8 @@ actions!(
     [
         ActivateWindow,
         DebugFocusShellDrawer,
-        DebugDoubleClickSidebar
+        DebugDoubleClickSidebar,
+        DebugDoubleClickShellDrawer
     ]
 );
 
@@ -36,6 +37,9 @@ actions!(
         DiscardQueued,
         NextNeedsYou,
         FocusDock,
+        MoveOptionUp,
+        MoveOptionDown,
+        AnswerFocusedOption,
         FocusComposer,
         ScrollTranscriptUp,
         ScrollTranscriptDown,
@@ -164,6 +168,17 @@ pub struct DebugDisplayOptions {
 }
 
 #[cfg(debug_assertions)]
+#[derive(
+    Clone, Default, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action,
+)]
+#[serde(default)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugComposerWidth {
+    pub width: Option<f32>,
+}
+
+#[cfg(debug_assertions)]
 #[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
 #[schemars(crate = "::gpui::private::schemars")]
 #[action(namespace = veyra)]
@@ -267,6 +282,9 @@ pub fn bindings() -> Vec<Binding> {
         binding!(Deny, "secondary-.", Some("VeyraApproval")),
         binding!(FocusDock, "secondary-shift-y", Some("Veyra")),
         binding!(FocusComposer, "escape", Some("VeyraDock")),
+        binding!(MoveOptionUp, "up", Some("VeyraDock")),
+        binding!(MoveOptionDown, "down", Some("VeyraDock")),
+        binding!(AnswerFocusedOption, "enter", Some("VeyraDock")),
         binding!(ScrollTranscriptUp, "pageup", Some("Veyra")),
         binding!(ScrollTranscriptDown, "pagedown", Some("Veyra")),
         binding!(ScrollTranscriptEnd, "secondary-end", Some("Veyra")),
@@ -324,9 +342,8 @@ pub fn shortcut_chip<A: Action + Default>(cx: &App) -> impl IntoElement {
     let t = cx.global::<super::theme::Theme>();
     div()
         .debug_selector(|| A::default().name().into())
-        .text_size(t.text.meta.size)
-        .line_height(t.text.meta.line_height)
-        .text_color(t.colors.text_muted)
+        .text_size(t.text.micro.size)
+        .line_height(t.text.micro.line_height)
         .pl(t.space.0[1])
         .pr(t.space.0[1])
         .rounded(t.radius.inline)
@@ -383,6 +400,22 @@ pub fn init(cx: &mut App) {
     }]);
 }
 
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugDragShellDrawer {
+    pub pixels: f32,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct DebugDragSidebar {
+    pub pixels: f32,
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(debug_assertions)]
@@ -411,20 +444,4 @@ mod tests {
         #[cfg(debug_assertions)]
         assert_eq!(shortcut::<ActivateWindow>(), None);
     }
-}
-
-#[cfg(debug_assertions)]
-#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
-#[schemars(crate = "::gpui::private::schemars")]
-#[action(namespace = veyra)]
-pub struct DebugDragShellDrawer {
-    pub pixels: f32,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Clone, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action)]
-#[schemars(crate = "::gpui::private::schemars")]
-#[action(namespace = veyra)]
-pub struct DebugDragSidebar {
-    pub pixels: f32,
 }

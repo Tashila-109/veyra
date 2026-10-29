@@ -104,6 +104,26 @@ pub fn attach(
                             let mut dump =
                                 shell.update(cx, |shell, cx| shell.dump(&data_dir, cx))?;
                             dump["schema_version"] = json!(request.schema_version);
+                            let viewport = window.viewport_size();
+                            dump["look"]["viewport"] = json!([
+                                f32::from(viewport.width),
+                                f32::from(viewport.height)
+                            ]);
+                            let t = cx.global::<crate::ui::theme::Theme>();
+                            dump["look"]["layout"] = json!({
+                                "header":f32::from(t.layout.header), "gutter":f32::from(t.layout.gutter),
+                                "read_line":f32::from(t.text.read.line_height.to_pixels(window.rem_size())),
+                                "ui_line":f32::from(t.text.ui.line_height.to_pixels(window.rem_size())),
+                                "code_line":f32::from(t.text.code.line_height.to_pixels(window.rem_size())),
+                                "small_icon":f32::from(t.layout.small_icon),
+                                "composer_min_height":f32::from(t.layout.composer_min_height),
+                                "composer_max_height":f32::from(t.layout.composer_max_height),
+                                "composer_toolbar":f32::from(t.layout.composer_toolbar),
+                                "composer_radius":f32::from(t.radius.large),
+                                "control_radius":f32::from(t.radius.control),
+                                "border":f32::from(t.layout.border),
+                                "drawer_default":f32::from(t.layout.drawer_default),
+                                "resize_band":f32::from(t.layout.resize_band)});
                             Ok(dump)
                         }
                         Command::Action { name, data } => {

@@ -100,7 +100,19 @@ impl QuotedText {
             ),
             None => (format!("{selector}-value"), Length::Auto, None, None),
         };
+        let question = matches!(self.kind, QuoteKind::Question);
+        let reason = matches!(self.kind, QuoteKind::Reason);
+        let text = if question {
+            self.text
+                .strip_prefix('“')
+                .and_then(|text| text.strip_suffix('”'))
+                .unwrap_or(&self.text)
+                .to_owned()
+        } else {
+            self.text
+        };
         let value = div()
+            .when(reason, |value| value.flex_1().min_w_0())
             .pl(t.space.0[3])
             .border_l(t.layout.border)
             .border_color(t.colors.border)
@@ -109,7 +121,7 @@ impl QuotedText {
                 div()
                     .flex_none()
                     .debug_selector(move || format!("{selector}-content"))
-                    .child(self.text),
+                    .child(text),
             );
         let value = if let Some((id, viewport, handle, min, max)) = viewport {
             bounded_scroll(id, viewport, handle, value, min, max, cx).into_any_element()
@@ -120,6 +132,7 @@ impl QuotedText {
             .debug_selector(move || selector.into())
             .min_h(region_minimum)
             .v_flex()
+            .when(reason, |row| row.h_flex().items_start())
             .when_some(line_height, |value, height| value.line_height(height))
             .gap(t.space.0[1])
             .text_size(t.text.label.size)
@@ -184,11 +197,11 @@ pub(super) struct QuestionDisplay {
 }
 pub(super) fn question_display(question: &AsyncQuestion) -> QuestionDisplay {
     QuestionDisplay {
-        title: quoted(&question.title, false),
+        title: display_line(&question.title, false).text,
         options: question
             .options
             .iter()
-            .map(|option| quoted(option, false))
+            .map(|option| display_line(option, false).text)
             .collect(),
     }
 }

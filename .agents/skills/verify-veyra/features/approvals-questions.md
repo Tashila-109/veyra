@@ -1,7 +1,7 @@
 # Approvals and questions
 
 Status: passed, 2026-10-26, bd8a083, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 8577dad2), bc61ba12f728dcc7d01a88d9f8a70b14ffcf58ae674f31f48e8ce8a8ff7efa7e
-Covers: crates/veyra/src/ui/provider_text.rs crates/veyra/src/ui/terminal_view.rs crates/engine/src/terminal.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/** crates/engine/tests/fixtures/tui/**
+Covers: crates/veyra/src/ui/header.rs crates/veyra/src/ui/provider_text.rs crates/veyra/src/ui/terminal_view.rs crates/engine/src/terminal.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/** crates/engine/tests/fixtures/tui/**
 
 ## Sub-features
 
@@ -11,22 +11,27 @@ Covers: crates/veyra/src/ui/provider_text.rs crates/veyra/src/ui/terminal_view.r
 - NextNeedsYou selects the request's thread across the sidebar.
 - The request closes as Answered and its answer appears in the transcript.
 
+Every placement step requires the owned window to be unmanaged and floating under the launch's temporary one-shot rule. A managed record fails with `owned window joined the tile tree` before any move or resize. The recipe never toggles floating or re-tiles a window, and needs no empty desktop.
+
 ## How to get to it (user POV)
 
 In Ask first, ask for `touch veyra-check.txt`.
 The request docks above the input, with the command and its consequence.
 Deny is ⌘., Allow once is ⌘↵ and Allow in this thread is ⌘⌥↵ while the dock has focus.
-The dock shows its answer chords only while focused; otherwise it shows ⌘⇧Y to FocusDock.
+The dock always shows its answer chords, dimmed until focused. ⌘⇧Y runs FocusDock.
 Requests do not take focus automatically.
 Composer ⌘↵ sends a nonempty draft and leaves the request pending; an empty draft during a turn dispatches Stop.
 Every button's shortcut_chip reads the same bindings table as the keymap.
+Its ink inherits the button foreground. The focused Allow once capture asserts the kit's primary-button foreground in the trailing keycap region, using the painted control bounds and excluding the caption.
 Buttons answer their displayed request; an expired request or a question index that already advanced sends no answer.
 A question keeps its labeled text in a bounded scroll area above its options.
 Up to four options use one column; larger lists use three columns.
 Captions wrap in their buttons, and overflowing lists scroll with the shared visible scrollbar.
 A pending dock keeps the scrollable message input between 48px and 240px within the shared flex budget; closing the dock restores its normal auto-growing layout.
-Click Focus to use shortcuts or press ⌘⇧Y to FocusDock.
+Press ⌘⇧Y to FocusDock. The region and option cursor use the inset focus ring.
+Every approval capture checks both empty padding bands between the dock's ring and its content, from measured dump geometry at the backing scale. The dock keeps that padding when focused, and approval detail text wraps or ellipsizes inside its available width. The labelled Codex MCP inset mutant removes the left inset for the second MCP scene and must fail the pixel-band check.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
+`veyra::MoveOptionUp`, `veyra::MoveOptionDown` and `veyra::AnswerFocusedOption` bind Up, Down and Return in VeyraDock.
 More than one pending request shows 1 of N.
 Answering one keeps dock focus while another request remains; the last answer returns focus to the composer.
 NextNeedsYou uses ⌘⇧J pending the operator's chord decision.
@@ -44,11 +49,47 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
+from pixels import Paint
+def raw_preview(dock):
+    return json.loads(dock['request']['kind']['Approval']['action']['target']['preview']['text'] or '{}')
 prepare()
 assert LANE == 'fake'
 check = DATA/'project'/'veyra-check.txt'
 check.unlink(missing_ok=True)
 action('approval-mode','SetDefaultMode',{'mode':'ask_first'})
+source = SOURCE/'approval-deny.jsonl'
+source_records = [json.loads(line) for line in source.read_text().splitlines()]
+records = json.loads(json.dumps(source_records))
+changes = []
+def short_command(value, path=''):
+    if isinstance(value,dict):
+        for key,child in value.items():
+            if key=='command':
+                assert isinstance(child,str)
+                changes.append({'path':path+'/'+key,'before':child,'after':'echo ok'})
+                value[key]='echo ok'
+            else: short_command(child,path+'/'+key)
+    elif isinstance(value,list):
+        for index,child in enumerate(value): short_command(child,path+'/'+str(index))
+short_command(records)
+assert changes and all(row['before']=='touch veyra-check.txt' for row in changes)
+derived = '\n'.join(json.dumps(record) for record in records)+'\n'
+(PROOF/'approval-short-command-records.jsonl').write_text(derived)
+save('approval-short-command-diff',{'source':str(source),
+    'source_sha256':hashlib.sha256(source.read_bytes()).hexdigest(),'changes':changes})
+import difflib
+(PROOF/'approval-short-command.diff').write_text(''.join(difflib.unified_diff(
+    source.read_text().splitlines(keepends=True),derived.splitlines(keepends=True),
+    fromfile=str(source),tofile='approval-short-command-records.jsonl')))
+stage_records(records)
+thread = create('approval-short-command','Review this short command',scenario=None)
+short = poll('approval-short-command-dock',lambda d:d['composer']['dock'] is not None)
+assert short['composer']['dock']['request']['kind']['Approval']['action']['target']['command']=='echo ok'
+assert short['composer']['dock']['action_text']=='echo ok'
+capture('approval-short-command')
+action('approval-short-command-deny','Deny',{'request':short['composer']['dock']['request']['id']})
+ctl('approval-short-command-done','wait',thread,'Done')
 records = [json.loads(line) for line in (SOURCE/'approval-deny.jsonl').read_text().splitlines()]
 request = next(record['line']['request'] for record in records if record.get('type')=='emit_inbound'
     and record.get('line',{}).get('type')=='control_request'
@@ -60,7 +101,7 @@ thread = create('claude-command-unverified-cwd','Review the command folder',scen
 dock = poll('claude-command-unverified-cwd',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert dock['request']['kind']['Approval']['action']['target']['cwd']=='not_verified'
 assert dock['consequence']=='Claude Code will run this command at a location that is not verified.'
-assert json.loads(dock['preview'] or '{}')=={'cwd':'/elsewhere/other-project','reason':'Additional reason'}
+assert raw_preview(dock)=={'cwd':'/elsewhere/other-project','reason':'Additional reason'}
 assert dock['provider_text']==[{'kind':'reason','label':"Claude Code's description",'text':'“Description shown separately”'}]
 assert not dock['allow_in_thread_enabled']
 capture('claude-command-unverified-cwd')
@@ -139,7 +180,7 @@ for place, target in [('inside', str((DATA/'project'/'veyra-check.txt').resolve(
     assert dock['action_text'] == 'Write '+target
     assert dock['consequence'] == 'Claude Code writes a file '+place+' the project folder.'
     assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
-    assert json.loads(dock['preview'] or '{}') == {'content':'veyra check'}
+    assert raw_preview(dock) == {'content':'veyra check'}
     capture('approval-write-'+place)
     action('approval-write-'+place+'-focus','FocusDock')
     ctl('approval-write-'+place+'-allow','keys','secondary-enter')
@@ -159,7 +200,7 @@ for label, tool, arguments in [
     thread = create('approval-'+label,'Approve the tool arguments',scenario=None)
     dump = poll('approval-'+label,lambda d: d['composer']['dock'] is not None)
     dock = dump['composer']['dock']
-    preview = json.loads(dock['preview'] or '{}')
+    preview = raw_preview(dock)
     if label == 'notebook-edit':
         assert dock['action_text'] == tool+' '+arguments['notebook_path']
         assert dock['consequence'] == 'Claude Code edits a file inside the project folder.'
@@ -232,12 +273,23 @@ counted = create('question-within-request','Answer two questions in one request'
 first = poll('question-within-first',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert first['count']==1 and first['question_count']=='1 of 2'
 action('question-within-focus','FocusDock')
-ctl('question-within-first-answer','keys','1')
+poll('question-within-cursor-first',lambda d:d['composer']['dock']['focused'] and d['composer']['dock']['option_cursor']==0)
+capture('question-cursor-first')
+ctl('question-within-down','keys','down')
+cursor = poll('question-within-cursor-second',lambda d:d['composer']['dock']['option_cursor']==1)
+capture('question-cursor-second')
+from pixels import option_cursor_paints
+option_cursor_paints(PROOF,'question-cursor-first','question-cursor-second',cursor,
+    question_input[0]['options'][:2] if isinstance(question_input[0]['options'][0],str) else
+    [option['label'] for option in question_input[0]['options'][:2]])
+ctl('question-within-up','keys','up')
+poll('question-within-cursor-back',lambda d:d['composer']['dock']['option_cursor']==0)
+ctl('question-within-first-answer','keys','enter')
 second = poll('question-within-second',lambda d:d['composer']['dock'] is not None
     and d['composer']['dock']['question_index']==1)['composer']['dock']
 assert second['count']==1 and second['question_count']=='2 of 2'
 capture('question-within-request')
-ctl('question-within-second-answer','keys','1')
+ctl('question-within-second-answer','keys','down up enter')
 ctl('question-within-done','wait',counted,'Done')
 question = create('question','Choose a route',scenario='question')
 poll('question-dock',lambda d: d['composer']['dock'] is not None)
@@ -356,9 +408,7 @@ def question_frame():
     assert row['id']==owned_window and row['pid']==owned_pid, 'refused a foreign question window'
     return row
 before=question_frame()
-if not before['is-floating']:
-    result=subprocess.run([placement_tool,'-m','window',str(owned_window),'--toggle','float'],capture_output=True,text=True)
-    assert result.returncode==0
+require_unmanaged(before)
 question_frame()
 result=subprocess.run([placement_tool,'-m','window',str(owned_window),'--resize','abs:760:560'],capture_output=True,text=True)
 assert result.returncode==0
@@ -375,6 +425,14 @@ ctl('question-smallest-done','wait',small,'Done')
 question_frame()
 result=subprocess.run([placement_tool,'-m','window',str(owned_window),'--resize',f"abs:{int(before['frame']['w'])}:{int(before['frame']['h'])}"],capture_output=True,text=True)
 assert result.returncode==0
+result=subprocess.run([placement_tool,'-m','window',str(owned_window),'--move',f"abs:{int(before['frame']['x'])}:{int(before['frame']['y'])}"],capture_output=True,text=True)
+assert result.returncode==0
+end=time.monotonic()+5
+while True:
+    restored=question_frame()
+    if restored['frame']==before['frame']: break
+    assert time.monotonic()<end, 'owned question window did not restore its bounds'
+    time.sleep(.05)
 save('approvals-done',ctl('approvals-final','dump'))
 poll('approvals-sessions-ended',lambda d: sql('select count(*) from threads where live_pgid is not null')=='0')
 page_done('approvals-questions')
@@ -394,6 +452,10 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYCODEX'
 from driver import *
+capture = capture_content
+from pixels import Paint
+def raw_preview(dock):
+    return json.loads(dock['request']['kind']['Approval']['action']['target']['preview']['text'] or '{}')
 prepare()
 assert LANE == 'fake'
 thread = create_codex('codex-command',scenario='approval-command')
@@ -418,7 +480,7 @@ dock = poll('codex-command-description',lambda d:d['composer']['dock'] is not No
 assert dock['provider_text'][-1]=={'kind':'reason','label':"Codex's description",'text':'“Description shown separately”'}
 assert dock['request']['kind']['Approval']['action']['target']['reason']['explanation']=='description'
 assert dock['preview']=='', 'A fully mapped command must have no preview block'
-assert 'description' not in json.loads(dock['preview'] or '{}')
+assert 'description' not in raw_preview(dock)
 capture('codex-command-description')
 action('codex-command-description-answer','AllowOnce',{'request':dock['request']['id']})
 ctl('codex-command-description-done','wait',thread,'Done')
@@ -429,7 +491,7 @@ request = next(record['line']['params'] for record in records if record.get('typ
 request['environmentId']='remote'
 thread = create_codex('codex-command-nonlocal-environment',records=records)
 dock = poll('codex-command-nonlocal-environment',lambda d:d['composer']['dock'] is not None)['composer']['dock']
-assert json.loads(dock['preview'] or '{}')=={'cwd':os.path.realpath(DATA/'project'),'environmentId':'remote'}
+assert raw_preview(dock)=={'cwd':os.path.realpath(DATA/'project'),'environmentId':'remote'}
 assert dock['consequence']=='Codex will run this command at a location that is not verified.'
 assert not any(value['kind']=='working_folder' for value in dock['provider_text'])
 assert dock['request']['kind']['Approval']['action'].get('consent') is None
@@ -448,11 +510,11 @@ extra = create_codex('codex-extra-fields',records=records)
 extra_dock = poll('codex-extra-fields',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert 'unknownCapability' in extra_dock['preview'] and 'write everything' in extra_dock['preview']
 assert 'dangerouslyDisableSandbox' in extra_dock['preview'] and 'true' in extra_dock['preview']
-assert json.loads(extra_dock['preview'] or '{}')['env']=={'CHECK':'material'}
-assert json.loads(extra_dock['preview'] or '{}')['networkAccess'] is True
-assert json.loads(extra_dock['preview'] or '{}')['description']=='Additional description'
+assert raw_preview(extra_dock)['env']=={'CHECK':'material'}
+assert raw_preview(extra_dock)['networkAccess'] is True
+assert raw_preview(extra_dock)['description']=='Additional description'
 assert any(quote['kind']=='reason' and 'Create the requested file' in quote['text'] for quote in extra_dock['provider_text'])
-assert all(key not in json.loads(extra_dock['preview'] or '{}') for key in ('threadId','turnId','itemId'))
+assert all(key not in raw_preview(extra_dock) for key in ('threadId','turnId','itemId'))
 assert not extra_dock['allow_in_thread_enabled']
 assert extra_dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
 assert extra_dock['action_text']=='printf e'+'\u0301'*3+'⟨U+0301⟩'*4
@@ -492,7 +554,7 @@ grant = first['request']['kind']['Approval']['action'].get('consent',{}).get('On
 assert grant is not None, 'A plain project-folder Codex command with wire metadata must offer a thread grant'
 assert grant['command']=='touch veyra-check.txt'
 assert first['preview']=='', 'A plain project-folder command must have no preview block'
-assert 'startedAtMs' not in json.loads(first['preview'] or '{}'), 'Wire timestamps must not enter the dock preview'
+assert 'startedAtMs' not in raw_preview(first), 'Wire timestamps must not enter the dock preview'
 capture('codex-grant-in-project')
 action('codex-grant-project','AllowInThread',{'request':first['request']['id']})
 other = poll('codex-command-other-cwd',lambda d:d['composer']['dock'] is not None and d['composer']['dock']['request']['id']!=first['request']['id'])['composer']['dock']
@@ -532,13 +594,15 @@ request = next(record['line']['params'] for record in records if record.get('typ
 request['message']='Allow the veyra MCP server to run tool "probe_echo"?'
 request['_meta']['tool_params']={'text':'recorded-text'}
 request['_meta']['tool_params_display']=[{'name':'text','value':'recorded-text','display_name':'text'}]
+request['_meta']['extra']='material'
 thread = create_codex('codex-mcp',records=records)
 for label,decision in [('first','AllowOnce'),('second','Deny')]:
     dock = poll('codex-mcp-'+label,lambda d:d['composer']['dock'] is not None)['composer']['dock']
     assert dock['action_text']=='veyra / '+('probe_echo' if label=='first' else 'list_providers')
     if label=='first':
-        assert json.loads(dock['preview'])['_meta']=={'tool_params':{'text':'recorded-text'},
+        assert raw_preview(dock)['_meta']=={'tool_params':{'text':'recorded-text'},'extra':'material',
             'tool_params_display':[{'name':'text','value':'recorded-text','display_name':'text'}]}
+        assert dock['preview']=='Arguments · text: recorded-text\n_meta · extra: material\n_meta · tool_params_display · 1 · display_name: text\n_meta · tool_params_display · 1 · name: text\n_meta · tool_params_display · 1 · value: recorded-text\nmessage: Allow the veyra MCP server to run tool "probe_echo"?\nmode: form\nrequestedSchema · properties: Empty object\nrequestedSchema · type: object'
     assert dock['request']['kind']['Approval']['action'].get('consent',{}).get('Once',{}).get('grant') is None
     if label=='second':
         action('codex-mcp-second-focus','FocusDock')
@@ -639,7 +703,7 @@ card = poll('codex-card-ready',lambda d:d['selected_thread'] is not None
 thread = card['selected_thread']['id']
 question = next(item for item in card['transcript']['items'] if item['kind']=='async_questions')
 assert question['body']['AsyncQuestions']['questions'][0] == {'title':'Should Veyra use Violet or Blue?\n\u200b','options':[exact_option,'Blue'],'selected':None}
-assert question['display_questions'][0]=={'title':'“Should Veyra use Violet or Blue?”','options':['“Violet”','“Blue”']}
+assert question['display_questions'][0]=={'title':'Should Veyra use Violet or Blue?','options':['Violet','Blue']}
 assert question['choices_active'] is True
 assert question['text']==question_message
 assert question['body']['AsyncQuestions']['text']==question_message
@@ -724,6 +788,10 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYGROK'
 from driver import *
+capture = capture_content
+from pixels import Paint
+def raw_preview(dock):
+    return json.loads(dock['request']['kind']['Approval']['action']['target']['preview']['text'] or '{}')
 prepare()
 assert LANE == 'fake'
 check = DATA/'project/veyra-check.txt'
@@ -761,7 +829,7 @@ thread = create_grok('grok-command-unverified-cwd',records=records,prompt='Revie
 dock = poll('grok-command-unverified-cwd',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert dock['request']['kind']['Approval']['action']['target']['cwd']=='not_verified'
 assert dock['consequence']=='Grok will run this command at a location that is not verified.'
-preview = json.loads(dock['preview'] or '{}')
+preview = raw_preview(dock)
 assert preview['cwd']=='/elsewhere/other-project' and preview['reason']=='Additional reason'
 assert preview['env']=={'CHECK':'material'} and preview['networkAccess'] is True
 assert preview['dangerouslyDisableSandbox'] is True and 'toolCallId' not in preview
@@ -778,7 +846,7 @@ permission.update(kind='edit',title='Edit permission-project.txt',rawInput=edit_
 thread = create_grok('grok-search-replace',records=records,prompt='Review every edit argument')
 dock = poll('grok-search-replace',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert dock['action_text']=='Edit permission-project.txt'
-assert json.loads(dock['preview'] or '{}')==edit_input
+assert raw_preview(dock)==edit_input
 assert dock['request']['kind']['Approval']['action'].get('consent') is None
 assert dock['allow_once_enabled'] and not dock['allow_in_thread_enabled'] and dock['grant_caption'] is None
 capture('grok-search-replace')
@@ -798,14 +866,14 @@ assert selected['composer']['mode']=='ask_first'
 assert selected['composer']['offered_modes']==['ask_first','full_access']
 dock = poll('grok-accept-edits-inside',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert json.loads(dock['request']['native'])=='edit-inside' and dock['action_text']=='Edit inside'
-assert json.loads(dock['preview'] or '{}')['file_path']=='inside.txt'
+assert raw_preview(dock)['file_path']=='inside.txt'
 assert not (DATA/'project/inside.txt').exists()
 assert sql("select count(*) from requests where thread_id='"+thread+"'")=='1'
 capture('grok-accept-edits-inside')
 action('grok-accept-edits-allow-inside','AllowOnce',{'request':dock['request']['id']})
 dock = poll('grok-accept-edits-outside',lambda d:d['composer']['dock'] is not None and json.loads(d['composer']['dock']['request']['native'])=='edit-outside')['composer']['dock']
 assert (DATA/'project/inside.txt').exists()
-assert json.loads(dock['preview'] or '{}')['file_path']=='/veyra-outside/file.txt'
+assert raw_preview(dock)['file_path']=='/veyra-outside/file.txt'
 assert sql("select count(*) from requests where thread_id='"+thread+"'")=='2'
 assert json.loads(dock['request']['native'])=='edit-outside' and dock['action_text']=='Edit outside'
 capture('grok-accept-edits-outside')
@@ -872,6 +940,13 @@ PYGROK
 
 ## Observable success
 
+The command draw binding derives `echo ok` at run time from the existing recorded approval through `stage_records`, changing only command fields and retaining the records and diff. It asserts the exact command from `dump`, exactly one painted `$ echo ok`, no backticks or raw JSON in the dock, and the same structure checks as every approval. Other captures retain their exact `dump` assertions and full-size inspection. The short command avoids an OCR identifier error: the retained `veyia` misread is diagnostic evidence, and no fuzzy matching is used.
+The codec owns approval classification. The window lays out every residual field, including unknown `_meta` siblings beside lifted Arguments, and keeps non-object, invalid or truncated previews as text with their cut notice. `codex-mcp-first.png` and its exact dump retain an unknown `extra: material` field; pixel recognition asserts those painted words. Grok's residual `variant` stays visible under the existing security classification.
+
+On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+
+Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
+
 `grok-accept-edits-inside.png` shows the in-project edit dock before any file is written.
 `grok-accept-edits-outside.png` shows the next outside edit dock with its matching rawInput path; SQLite has both human decisions, and inside.txt appears only after Allow once.
 The Grok approval PNGs show the exact redirect command and decisions; the file is absent after Deny and present after Allow once.
@@ -888,7 +963,7 @@ The two question PNGs dock the flat live shape under the running turn and cover 
 The digit-9 reply preserves the ninth route label as the answer in the strict fixture and stored user text.
 The dock renders the typed request, not provider wire, so Codex's four- and nine-option questions share Claude's layout.
 `every_dock_kind_has_disjoint_regions_and_controls_in_window` checks that layout for every dock kind, and `codex_question_answered` (`crates/engine/tests/replay_codex.rs`) replays Codex's question wire to its answer, so this page drives those two Codex docks no longer.
-The dock-region matrix also includes Grok and the Deny-only reason and disabled buttons.
+The dock-region matrix also includes Grok and the Deny-only reason and hidden buttons.
 The GPUI matrices also check disjoint visible regions, contained text for every region, the docked editor inside its input viewport and every dock/composer button inside both theme window sizes for every dock kind (scrolling choices are clipped to their viewport).
 One held-and-queued case per theme window size and provider checks Discard queued alongside Continue.
 Caption checks shape each option at its actual font and width with the same two-line bound as rendering.
@@ -902,7 +977,7 @@ Previews mark control characters too, and literal file and working-folder paths 
 `DebugScrollApproval` changes the same details scroll handle used by the wheel.
 `composer.dock.details_scroll.offset_y` and `max_offset_y` prove an overflowing approval reached its end and the next request opened at zero.
 `approval-long-command-end.png` shows the first approval scrolled; `approval-new-long-command.png` shows the next long command starting with its curl-to-shell line.
-`codex-long-working-folder.png` and `codex-long-working-folder-end.png` show a complete, marked working folder longer than 2,000 characters in its own viewport of at most three text lines above the scrolling details.
+`codex-long-working-folder.png` and `codex-long-working-folder-end.png` show a complete, marked working folder longer than 2,000 characters in its own viewport of at most three text lines below the scrolling details.
 Allow and Deny and the command's first line remain visible when it opens; the model-written reason stays inside the details.
 The GPUI wheel test proves the folder scrolls to its end independently without eliding its path.
 The GPUI height matrix covers both theme sizes, Claude and Codex, every combination of hold, request count, focus, grant, command length, reason, preview and draft height, with project, unverified, short, typical, two-line and long folders.
@@ -913,7 +988,7 @@ The Codex section checks `composer.dock.action_text`, `consequence`, `request.ki
 A grant in the project permits the identical command there; the same command in another directory docks, names that directory and is denied.
 SQLite preserves AllowInThread, Deny and the automatic AllowOnce for those three requests.
 File and permission denials, the Violet answer and both MCP decisions are persisted.
-The reason PNG shows a single quoted provider line, under its own label and apart from the consequence.
+The reason PNG shows a single provider line, under its own label and apart from the consequence.
 The codec marks reasons separately from descriptions. Reason labels retain “Codex's reason (model-written)” and the corresponding provider name.
 Description labels are “Claude Code's description”, “Codex's description” and “Grok's description”.
 `codex-command-description.png` shows the description fallback without a reason, and the additional reason remains visible beside a selected description in the Claude and Grok residual previews.
@@ -921,8 +996,8 @@ Description labels are “Claude Code's description”, “Codex's description�
 The Codex extra-fields PNG keeps its environment, network and sandbox values visible with the thread-grant button absent.
 `codex-grant-in-project.png` shows the normal project-folder thread-grant offer with wire timestamps absent from the preview.
 `codex-command-nonlocal-environment.png` keeps the non-local environment and literal cwd visible, says the location is not verified, and has no working-folder quote or thread-grant control.
-`grok-search-replace.png` retains the edit's variant, file path, old and new strings and replace_all value; it has no thread-grant control.
-The async-question PNG shows the complete two-paragraph markdown reply above the quoted sanitized title, option controls and choice consequence; its stored UserText preserves the option's exact bidi-bearing bytes while its bubble displays Violet.
+`grok-search-replace.png` retains the edit's old and new strings and replace_all value, while its typed path appears once and variant stays in the stored payload; it has no thread-grant control.
+The async-question PNG shows the complete two-paragraph markdown reply above the sanitized title, option controls and choice consequence; its stored UserText preserves the option's exact bidi-bearing bytes while its bubble displays Violet.
 The chosen PNG retains the question, shows Answered beside Violet and disables both controls.
 Command-1 chooses the latest-turn card.
 The typed-answer PNG leaves its option unselected and closes both controls; a later key or explicit stale choice starts no third turn.
@@ -959,13 +1034,13 @@ The dock emits details_scroll, with offset_y and max_offset_y, only after the re
 Poll for its presence after a request change.
 DebugScrollApproval accepts a finite pixels value and scrolls that same handle, without changing the pending request or its decision.
 A new docked request resets to the top.
-The consequence and any outside working folder sit above it.
+The consequence sits above it; the outside working folder and separately scrolling provider reason follow it.
 The folder value has its own vertical scroll, bounded to three label-text lines; replacing both scroll handles on a changed request id opens each request at the top without eliding the marked path.
 Its kit scrollbar stays visible whenever the folder overflows and is absent when the path fits.
 Allow and Deny stay below that area.
 Approval docks report `allow_once_enabled`, `allow_in_thread_enabled` and `consent_reason` from the same consent used by their buttons.
-A Deny-only request keeps both allow buttons disabled, shows its reason above the details and leaves Deny enabled.
-Questions share the same unfocused FocusDock prompt.
+A Deny-only request hides both unavailable allow buttons, shows its reason above the details and leaves Deny enabled.
+Questions share the FocusDock chord and the focused region's inset ring, with no focus-prompt button.
 Up to four options use one column and larger lists use three columns.
 Captions wrap to two lines with an ellipsis; overflowing lists use the same bounded scrollbar.
 The request and question index own independent text and option-list scroll resets.
@@ -974,9 +1049,9 @@ Answering one request keeps dock focus while requests remain.
 `notifications.posted` counts banner requests; `quit_sheet.open` and `threads` describe the quit sheet.
 
 A cut preview ends with a notice.
-The command or file path, the model-written reason and the bounded preview share the details scroll area, capped at 240px and shrinking to the window height left by the fixed controls.
+The command or file path and bounded preview share the details scroll area, capped at 240px and shrinking to the window height left by the fixed controls. The labelled reason follows the folder in its own bounded scroll area.
 The transcript gives up space first, and the details keep at least the command's first line.
-Disabled allow buttons show no answer chord, and their key or action cannot send a response.
+Hidden allow buttons show no answer chord, and their key or action cannot send a response.
 Their quoted text scrolls within a one-line minimum and 240px maximum, independently of the label and options.
 
 ### Evidence contract
@@ -985,6 +1060,11 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
 {
   "required": {
     "approvals-questions": [
+      "approval-short-command.png",
+      "approval-short-command-pixels.json",
+      "approval-short-command-records.jsonl",
+      "approval-short-command-diff.json",
+      "approval-short-command.diff",
       "claude-command-unverified-cwd.png",
       "approval-deny.png",
       "approval-allow.png",
@@ -1008,6 +1088,9 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "approval-long-command-end.png",
       "approval-new-long-command.png",
       "question-within-request.png",
+      "question-cursor-first.png",
+      "question-cursor-second.png",
+      "question-cursor-second-cursor-pixels.json",
       "question-within-second.json",
       "approval-denied-tool.png",
       "search-target.png",
@@ -1050,7 +1133,7 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "grok-question-expired.png"
     ]
   },
-  "pairs": {}
+  "pairs": {"approvals-questions": [["question-cursor-first", "question-cursor-second"]]}
 }
 ```
 

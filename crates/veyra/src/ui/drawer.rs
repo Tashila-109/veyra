@@ -2,7 +2,9 @@
 use super::{
     Shell, actions::*, composer::labelled_button, terminal_view::TerminalView, theme::Theme,
 };
-use gpui_kit::component::StyledExt;
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::ButtonVariants;
+use gpui_kit::component::{Icon, StyledExt};
 use gpui_kit::{prelude::*, *};
 use veyra_engine::{
     commands::Command,
@@ -22,7 +24,6 @@ pub(super) struct Drawer {
     pub open: bool,
     pub height: Pixels,
     pub active: usize,
-    pub next: u64,
     pub tabs: Vec<Tab>,
 }
 #[derive(Clone, Copy)]
@@ -47,6 +48,10 @@ pub(super) struct CloseSheet {
     pub target: CloseTarget,
     pub processes: Vec<String>,
     pub drawer_focus: bool,
+}
+fn next_tab_number(numbers: impl IntoIterator<Item = u64>) -> u64 {
+    let used: std::collections::BTreeSet<_> = numbers.into_iter().collect();
+    (1..).find(|number| !used.contains(number)).unwrap()
 }
 impl Shell {
     pub(super) fn active_shell(&self) -> Option<&Tab> {
@@ -146,11 +151,9 @@ impl Shell {
             open: false,
             height,
             active: 0,
-            next: 1,
             tabs: Vec::new(),
         });
-        let number = drawer.next;
-        drawer.next += 1;
+        let number = next_tab_number(drawer.tabs.iter().map(|tab| tab.number));
         let shell = veyra_engine::platform::user_shell();
         let name = shell.file_name().unwrap_or_default().to_string_lossy();
         drawer.tabs.push(Tab {
@@ -445,8 +448,15 @@ impl Shell {
             .gap(theme.space.0[1]);
         for (index, tab) in drawer.tabs.iter().enumerate() {
             let number = tab.number;
+            let ended = tab.error.is_some()
+                || tab
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| !matches!(handle.status(), ShellStatus::Running));
+            let group: SharedString = format!("drawer-tab-{number}").into();
             tabs = tabs.child(
                 div()
+                    .group(group.clone())
                     .h_flex()
                     .min_w(theme.layout.drawer_tab)
                     .bg(if drawer.active == index {
@@ -455,26 +465,67 @@ impl Shell {
                         theme.colors.bg
                     })
                     .child(
-                        labelled_button(("shell-tab", number), tab.label.clone(), cx).on_click(
-                            cx.listener(move |shell, _, window, cx| {
+                        labelled_button(("shell-tab", number), tab.label.clone(), cx)
+                            .child(Icon::new(IconName::Terminal).size(theme.layout.small_icon))
+                            .when(ended, |button| {
+                                button.text_color(theme.colors.text_muted).child(
+                                    Icon::new(IconName::Square).size(theme.layout.small_icon),
+                                )
+                            })
+                            .on_click(cx.listener(move |shell, _, window, cx| {
                                 shell.drawers.get_mut(&thread).unwrap().active = index;
                                 shell.focus_shell(window, cx);
                                 shell.sync_drawers(cx);
                                 cx.notify();
-                            }),
-                        ),
+                            })),
                     )
-                    .child(labelled_button(("close-shell", number), "×", cx).on_click(
-                        cx.listener(move |shell, _, window, cx| {
-                            shell.ask_close_shell(thread, number, window, cx)
-                        }),
-                    )),
+                    .child(
+                        super::composer::labelled_button_with(
+                            ("close-shell", number),
+                            "Close tab",
+                            Icon::new(IconName::X).size(theme.layout.small_icon),
+                            cx,
+                        )
+                        .size(theme.layout.small_icon_button)
+                        .p_0()
+                        .opacity(if drawer.active == index { 1. } else { 0. })
+                        .group_hover(group, |style| style.opacity(1.))
+                        .focus_visible(|style| style.opacity(1.))
+                        .tooltip_with_action("Close tab", &CloseShellTab, Some("VeyraTerminal"))
+                        .on_click(cx.listener(
+                            move |shell, _, window, cx| {
+                                shell.ask_close_shell(thread, number, window, cx)
+                            },
+                        )),
+                    ),
             );
         }
-        tabs = tabs.child(
-            labelled_button("new-shell-tab", "+", cx)
+        tabs = tabs
+            .child(div().flex_1())
+            .child(
+                super::composer::labelled_button_with(
+                    "new-shell-tab",
+                    "New tab",
+                    Icon::new(IconName::Plus).size(theme.layout.small_icon),
+                    cx,
+                )
+                .size(theme.layout.small_icon_button)
+                .p_0()
+                .tooltip_with_action("New tab", &NewShellTab, Some("VeyraTerminal"))
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewShellTab), cx)),
-        );
+            )
+            .child(
+                super::composer::labelled_button_with(
+                    "hide-shell-drawer",
+                    "Hide shell drawer",
+                    Icon::new(IconName::ChevronDown).size(theme.layout.small_icon),
+                    cx,
+                )
+                .size(theme.layout.small_icon_button)
+                .p_0()
+                .tooltip_with_action("Hide shell drawer", &ToggleShellDrawer, Some("Veyra"))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleShellDrawer), cx)),
+            );
         let active = drawer.tabs.get(drawer.active)?;
         let message = active.error.clone().or_else(|| {
             active
@@ -496,12 +547,23 @@ impl Shell {
         });
         let rail = div()
             .id("drawer-resize")
-            .h(theme.space.0[1])
+            .absolute()
+            .top(-theme.layout.resize_band / 2.)
+            .h(theme.layout.resize_band)
             .w_full()
+            .group("drawer-rail")
             .cursor(CursorStyle::ResizeUpDown)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |shell, event: &MouseDownEvent, _, cx| {
+                    if event.click_count == 2 {
+                        shell.drawers.get_mut(&thread).unwrap().height =
+                            cx.global::<Theme>().layout.drawer_default;
+                        shell.drawer_resizing = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
                     shell.drawer_resizing = Some(Drag {
                         thread,
                         origin: event.position.y,
@@ -510,9 +572,20 @@ impl Shell {
                     });
                     cx.stop_propagation();
                 }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(theme.layout.resize_band / 2.)
+                    .h(theme.layout.border)
+                    .bg(theme.colors.border_strong)
+                    .opacity(0.)
+                    .group_hover("drawer-rail", |style| style.opacity(1.)),
             );
         #[cfg(debug_assertions)]
-        let rail = rail.relative().child(
+        let rail = rail.child(
             canvas(
                 {
                     let shell = cx.entity().downgrade();
@@ -528,6 +601,7 @@ impl Shell {
         );
         Some(
             div()
+                .relative()
                 .v_flex()
                 .h(self.displayed_drawer_height(thread, cx))
                 .flex_none()
@@ -538,9 +612,28 @@ impl Shell {
                 .border_color(theme.colors.border)
                 .child(rail)
                 .child(tabs)
-                .children(
-                    message.map(|message| div().text_color(theme.colors.text_muted).child(message)),
-                )
+                .children(message.map(|message| {
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .flex_none()
+                        .pl(theme.layout.terminal_padding.width)
+                        .pr(theme.layout.terminal_padding.width)
+                        .py(theme.space.0[1])
+                        .gap(theme.layout.control_gap)
+                        .text_color(theme.colors.text_muted)
+                        .child(Icon::new(IconName::Terminal).size(theme.layout.small_icon))
+                        .child(message.replace(" Press Return to restart.", ""))
+                        .child(div().flex_1())
+                        .child(
+                            labelled_button("restart-shell", "Restart", cx)
+                                .outline()
+                                .child(shortcut_chip::<RestartShellTab>(cx))
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(RestartShellTab), cx)
+                                }),
+                        )
+                }))
                 .child(active.view.clone())
                 .into_any_element(),
         )
@@ -548,6 +641,13 @@ impl Shell {
     pub(super) fn render_shell_close_sheet(&self, cx: &App) -> Option<AnyElement> {
         let sheet = self.close_sheet.as_ref()?;
         let theme = cx.global::<Theme>();
+        let (title, verb, confirm) = match sheet.target {
+            CloseTarget::Tab { .. } => ("Close tab?", "Closing", "Close tab"),
+            CloseTarget::Archive { .. } => ("Archive thread?", "Archiving", "Archive"),
+        };
+        let thread = match sheet.target {
+            CloseTarget::Tab { thread, .. } | CloseTarget::Archive { thread, .. } => thread,
+        };
         Some(
             div()
                 .absolute()
@@ -563,7 +663,11 @@ impl Shell {
                     div()
                         .absolute()
                         .inset_0()
-                        .left(self.sidebar_width + theme.layout.border)
+                        .when(
+                            theme.look.background()
+                                == veyra_engine::domain::WindowBackground::Translucent,
+                            |scrim| scrim.left(self.sidebar_width + theme.layout.border),
+                        )
                         .bg(theme.colors.scrim),
                 )
                 .child(
@@ -577,23 +681,49 @@ impl Shell {
                         .shadow(theme.shadows.floating.clone())
                         .border(theme.layout.border)
                         .border_color(theme.colors.border_strong)
-                        .child("Stop these commands?")
-                        .children(sheet.processes.iter().map(|name| div().child(name.clone())))
+                        .child(
+                            div()
+                                .text_size(theme.text.h2.size)
+                                .font_weight(theme.text.h2.weight)
+                                .child(title),
+                        )
+                        .child(format!(
+                            "{verb} stops {} shell command{}.",
+                            sheet.processes.len(),
+                            if sheet.processes.len() == 1 { "" } else { "s" }
+                        ))
+                        .children(self.state.threads.get(&thread).map(|thread| {
+                            super::composer::sheet_row(&self.thread_label(thread), cx)
+                        }))
+                        .children(sheet.processes.iter().map(|name| {
+                            div()
+                                .h_flex()
+                                .gap(theme.layout.control_gap)
+                                .child(Icon::new(IconName::Terminal).size(theme.layout.small_icon))
+                                .child(
+                                    div()
+                                        .font_family(theme.text.mono_font.clone())
+                                        .child(name.clone()),
+                                )
+                        }))
                         .child(
                             div()
                                 .h_flex()
                                 .justify_end()
                                 .gap(theme.space.0[3])
                                 .child(
-                                    labelled_button("cancel-close-shell", "Cancel", cx).on_click(
-                                        |_, window, cx| {
+                                    labelled_button("cancel-close-shell", "Cancel", cx)
+                                        .outline()
+                                        .child(shortcut_chip::<CancelCloseShellTab>(cx))
+                                        .on_click(|_, window, cx| {
                                             window
                                                 .dispatch_action(Box::new(CancelCloseShellTab), cx)
-                                        },
-                                    ),
+                                        }),
                                 )
                                 .child(
-                                    labelled_button("confirm-close-shell", "Close Tab", cx)
+                                    labelled_button("confirm-close-shell", confirm, cx)
+                                        .danger()
+                                        .child(shortcut_chip::<ConfirmCloseShellTab>(cx))
                                         .on_click(|_, window, cx| {
                                             window
                                                 .dispatch_action(Box::new(ConfirmCloseShellTab), cx)
@@ -628,5 +758,16 @@ impl Shell {
                         Some(ShellStatus::Failed { error }) => Some(error.clone()), _ => None })})
             }).collect::<Vec<_>>(),"terminal":self.active_shell().map(|tab|tab.view.read(cx).dump()),
             "close_sheet":self.close_sheet.as_ref().map(|sheet|&sheet.processes)})
+    }
+}
+
+#[cfg(test)]
+mod numbering_tests {
+    #[test]
+    fn tab_number_reuses_lowest_free() {
+        assert_eq!(super::next_tab_number([]), 1);
+        assert_eq!(super::next_tab_number([1, 3, 6]), 2);
+        assert_eq!(super::next_tab_number([2, 3]), 1);
+        assert_eq!(super::next_tab_number([1, 2, 3, 4, 5]), 6);
     }
 }

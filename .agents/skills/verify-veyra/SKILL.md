@@ -110,11 +110,13 @@ The default verification lane uses only the fake CLI.
 Its binary path deliberately starts missing, so [new-thread](features/new-thread.md) can prove installation and Check again.
 Every section imports [`bin/driver.py`](bin/driver.py), which shares logging, bounded polling, fixture staging and the one expected database-table list.
 The driver does not set application state; its writes are fixture copies, screenshots and proof.
+[`bin/pixels.py`](bin/pixels.py) reads only the fake lane's retained guarded window captures, through on-device Vision text recognition and Pillow. It asserts painted text, counts, order, absence, theme colours and alignment at the capture's backing scale, retaining match confidence and pixel receipts inside the run's proof folder.
 For an authorized live lane, export `VEYRA_VERIFY_LANE=live` before Launch.
 Launch then removes replay overrides, records to `$PROOF/rec`, and the new-thread and chat pages use their live branches.
 A live lane needs separate human authorization because it runs the installed CLI and spends its quota.
 The first launch waits in the driver's `gate()` until the screen is unlocked, the HID idle time is between 120 and 9,000 seconds and no `veyra` process has run for 10 seconds; it records the idle time in `input-idle-launch.json`.
 Every later relaunch through `start()` refuses a running `veyra` this run did not start: one that is neither an owned app pid nor marked with an owned app's `VEYRA_PARENT_PID`.
+When yabai is installed, each owned launch first adds a temporary uniquely labelled one-shot `app=^veyra$ manage=off` rule. The window must report unmanaged and floating before any scene; the recipe never floats a tiled window. Cleanup removes only labels recorded by this run, including an unconsumed rule after a failed launch. No empty desktop is needed. The owned window is centred at 960×740 points inside its display's visible frame; the initial pending-PATH handshake precedes this normalization.
 Each fake-lane launch records to its own `rec/NN-LABEL` folder, named in `rec-current`.
 The debug-only VEYRA_REAP_PIDS filter restricts startup reaping to the run's saved provider pids, including after a crash.
 An empty list permits no startup signals.
@@ -149,6 +151,26 @@ swiftc -O "$BIN/capture-window.swift" -o "$PROOF/capture-window"
 swiftc -O "$BIN/winid.swift" -o "$PROOF/winid"
 swiftc -O "$BIN/backdrop.swift" -o "$PROOF/backdrop"
 swiftc -O "$BIN/pasteboard.swift" -o "$PROOF/pasteboard"
+cat >"$PROOF/visible-frame.swift" <<'SWIFT'
+import AppKit
+import CoreGraphics
+let args = Array(CommandLine.arguments.dropFirst())
+guard args.count == 2, let pid = Int(args[0]), let number = UInt32(args[1]),
+      let rows = CGWindowListCopyWindowInfo(.optionIncludingWindow, number) as? [[String: Any]],
+      let row = rows.first(where: { ($0[kCGWindowNumber as String] as? Int) == Int(number) && ($0[kCGWindowOwnerPID as String] as? Int) == pid }),
+      let bounds = row[kCGWindowBounds as String] as? [String: Any],
+      let x = bounds["X"] as? NSNumber, let y = bounds["Y"] as? NSNumber,
+      let w = bounds["Width"] as? NSNumber, let h = bounds["Height"] as? NSNumber,
+      let primary = NSScreen.screens.first else { exit(1) }
+let point = NSPoint(x: x.doubleValue + w.doubleValue / 2, y: primary.frame.maxY - y.doubleValue - h.doubleValue / 2)
+let screens = NSScreen.screens.filter { $0.frame.contains(point) }
+guard screens.count == 1 else { exit(1) }
+let frame = screens[0].visibleFrame
+let value = ["visible_frame": [frame.minX, primary.frame.maxY - frame.maxY, frame.width, frame.height]]
+let data = try JSONSerialization.data(withJSONObject: value)
+print(String(data: data, encoding: .utf8)!)
+SWIFT
+swiftc -O "$PROOF/visible-frame.swift" -o "$PROOF/visible-frame"
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
 cp crates/engine/tests/fixtures/codex/probe-ready.jsonl "$PROOF/fixtures/probe-codex.jsonl"
 cp crates/engine/tests/fixtures/grok/probe-grok.jsonl "$PROOF/fixtures/probe-grok.jsonl"
@@ -159,14 +181,22 @@ gate()
 if LANE == 'fake': make_git_shim()
 if LANE == 'fake':
     shell = DATA/'login-shell'
-    shell.write_text('#!/bin/sh\n/bin/sleep 1.5\nexec /bin/sh "$@"\n')
+    release = DATA/'login-path-release'
+    shell.write_text('#!/bin/sh\nattempt=0\n'
+        'while [ ! -e "'+str(release)+'" ]; do\n'
+        '  [ "$attempt" -lt 600 ] || exit 124\n'
+        '  /bin/sleep 0.05\n  attempt=$((attempt+1))\ndone\nexec /bin/sh "$@"\n')
     shell.chmod(0o700)
     ENV['SHELL'] = str(shell)
-pid = start('launch')
+pid = start('launch', normalize=False)
 pending = ctl('launch-login-path','dump')
 assert pending['login_path'] in ['pending','loaded','fallback']
 if LANE == 'fake': assert pending['login_path'] == 'pending', pending['login_path']
+if LANE == 'fake':
+    release.touch()
+    poll('launch-login-path-loaded',lambda d:d['login_path']=='loaded')
 assert f'veyra ready pid={pid} data_dir={DATA}' in (PROOF/'launch.stderr').read_text()
+normalize_owned_window('launch')
 print(f"PASS launch RUN={RUN} PID={pid} PGID={(PROOF/'pgid').read_text().strip()} ID={(PROOF/'window-id').read_text().strip()}")
 PY
 ```
@@ -317,7 +347,7 @@ Done a success check, Failed a danger cross, Idle a muted dot, Held two muted pa
 Read the sidebar, header and family card separately. The row-focus sequence on multi-agent shows the inset accent
 ring apart from the selected plate; keyboard focus adds no selection wash. Provider and family marks are Veyra drawings.
 The transcript caps at 752 px, the composer at 784 px, with 40 px gutters.
-Yabai can override the requested 1280 by 800 outer bounds; use Doctor's actual bounds.
+The requested app bounds are 1280×800; when yabai is installed the owned one-shot rule prevents tiling and the recipe normalizes to the retained 960×740 geometry. Use Doctor's actual bounds.
 Do not count native typing, pointer dragging, IME or a manual theme change as driver proof.
 
 ## Cleanup
@@ -347,6 +377,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 DATA=${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN
 PROOF=target/verify-veyra/$RUN
 case "$DATA" in /tmp/veyra-*) ;; *) exit 1 ;; esac
+if PYTHONPATH=.agents/skills/verify-veyra/bin python3 .agents/skills/verify-veyra/bin/driver.py --cleanup-yabai-rules "$PROOF" "$RUN" >"$PROOF/yabai-cleanup.stdout" 2>"$PROOF/yabai-cleanup.traceback"; then rules_clean=yes; else rules_clean=no; fi
 PID=$(<"$PROOF/pid")
 PGID=$(<"$PROOF/pgid")
 test "$PID" = "$PGID"
@@ -429,6 +460,7 @@ print('PASS saved owned pids, provider groups and marker check; other marker dra
 PY
 test "$tables" != unreadable
 test "$written" = yes
+test "$rules_clean" = yes
 test "$DATA" = "${VEYRA_VERIFY_TMP:-/tmp/veyra-verify-}$RUN"
 rm -rf "$DATA"
 test ! -e "$DATA"

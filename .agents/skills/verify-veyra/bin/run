@@ -99,7 +99,7 @@ def gate_check():
         (root/'target/verify-veyra/gatecheck').mkdir(parents=True)
         (root/'target/verify-veyra/gatecheck/lane').write_text('live\n')
         try:
-            result = subprocess.run([sys.executable,'-c','import driver; driver.gate_self_test(); driver.measured_pair_self_test(); driver.backdrop_pid_self_test()'],cwd=root,
+            result = subprocess.run([sys.executable,'-c','import driver; driver.gate_self_test(); driver.measured_pair_self_test(); driver.backdrop_pid_self_test(); driver.window_rules_self_test()'],cwd=root,
                 capture_output=True,text=True,timeout=30,env=dict(os.environ,RUN='gatecheck',
                 PYTHONPATH=str(SKILL/'bin'),PYTHONDONTWRITEBYTECODE='1',VEYRA_VERIFY_TMP=str(root)+'/data-'))
         except subprocess.TimeoutExpired:
@@ -113,13 +113,13 @@ def driver_self_test_dispatch_check():
     from types import SimpleNamespace
     from unittest.mock import Mock, patch
     driver = SimpleNamespace(**{name:Mock() for name in
-        ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test')})
+        ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test','window_rules_self_test')})
     def run(command, **options):
         exec(command[2],{})
         return SimpleNamespace(returncode=0,stdout='',stderr='')
     with patch.dict(sys.modules,driver=driver), patch('subprocess.run',side_effect=run):
         gate_check()
-    for name in ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test'):
+    for name in ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test','window_rules_self_test'):
         getattr(driver,name).assert_called_once_with()
 
 def verdict(record, counted, late=False):
@@ -372,6 +372,17 @@ def attempt(found, plan, out, env, deadline, expected, record):
                 record['cleanup_exit'] = 0
         except Exception as error:
             problems.append(f'Cleanup: {type(error).__name__}: {error}')
+            record['cleanup_exit'] = 1
+        try:
+            if (proof/'owned-yabai-labels').exists():
+                command = [sys.executable,str(SKILL/'bin/driver.py'),'--cleanup-yabai-rules',str(proof),run]
+                (proof/'yabai-finally-invocation.json').write_text(json.dumps(command)+'\n')
+                cleaned = subprocess.run(command,cwd=REPO,env=env,capture_output=True,text=True)
+                (proof/'yabai-finally.stdout').write_text(cleaned.stdout)
+                (proof/'yabai-finally.traceback').write_text(cleaned.stderr)
+                if cleaned.returncode: record['cleanup_exit'] = record['cleanup_exit'] or 1
+        except Exception as error:
+            problems.append(f'owned rule cleanup: {type(error).__name__}: {error}')
             record['cleanup_exit'] = 1
         scratch = env['VEYRA_VERIFY_TMP']+run
         record['scratch_left'] = [path for path in [scratch,scratch+'-rel'] if os.path.exists(path)]

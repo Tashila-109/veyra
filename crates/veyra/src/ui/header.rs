@@ -1,11 +1,12 @@
 use super::{
     MainView, Shell,
-    actions::{SelectThread, ToggleShellDrawer},
+    actions::{OpenThreadMenu, SelectThread, ToggleShellDrawer},
     composer::labelled_button,
     icons,
     theme::Theme,
 };
-use gpui_kit::component::StyledExt;
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{Icon, StyledExt};
 use gpui_kit::{prelude::*, *};
 use std::collections::BTreeMap;
 use veyra_engine::{
@@ -74,9 +75,11 @@ pub(super) fn parent_attention(state: &super::AppState, thread: ThreadId) -> Opt
         .filter(|parent| state.status(parent.id) == Status::NeedsYou)
         .map(|parent| format!("{} needs you", parent.provider.label()))
 }
-pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
-    let t = cx.global::<Theme>();
-    let title = match shell.view {
+fn rule_visible(view: MainView, offset: Pixels) -> bool {
+    matches!(view, MainView::Chat(_)) && f32::from(offset) < 0.
+}
+pub(super) fn title_text(shell: &Shell) -> String {
+    match shell.view {
         MainView::Settings { .. } => "Settings".to_owned(),
         MainView::NewThread => "New thread".to_owned(),
         MainView::Chat(thread) => shell
@@ -85,8 +88,37 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
             .get(&thread)
             .map(|thread| thread.title.clone())
             .unwrap_or_default(),
-    };
+    }
+}
+fn observed(element: gpui::Div, _name: &'static str) -> AnyElement {
+    #[cfg(debug_assertions)]
+    let element = super::composer::observe_geometry(element.relative(), move |bounds, cx| {
+        if cx.try_global::<super::PaintedControls>().is_some() {
+            cx.global_mut::<super::PaintedControls>()
+                .0
+                .insert(format!("{:?}", ElementId::Name(_name.into())), bounds);
+        }
+    });
+    element.into_any_element()
+}
+fn status_words(text: String, color: Hsla) -> StyledText {
+    let length = text.len();
+    StyledText::new(text).with_highlights([(
+        0..length,
+        HighlightStyle {
+            color: Some(color),
+            ..Default::default()
+        },
+    )])
+}
+pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
+    let t = cx.global::<Theme>();
+    let rule = rule_visible(shell.view, shell.scroller.read(cx).scroll_offset());
+    let title = title_text(shell);
     let text = shell.view.chat().map(|thread| shell.header_status(thread));
+    let status_color = shell.view.chat().map_or(t.colors.text_muted, |thread| {
+        super::sidebar::glyph_color(&shell.state.status(thread), t)
+    });
     let parent = shell
         .view
         .chat()
@@ -100,7 +132,6 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
         .chat()
         .and_then(|id| shell.state.threads.get(&id))
         .and_then(|thread| shell.state.projects.get(&thread.project))
-        .or_else(|| shell.project.and_then(|id| shell.state.projects.get(&id)))
         .map(|project| {
             if shell.branch.is_empty() {
                 project.name.clone()
@@ -115,7 +146,7 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
         .items_center()
         .px(t.space.0[6])
         .gap(t.space.0[4])
-        .border_b(t.layout.border)
+        .when(rule, |header| header.border_b(t.layout.border))
         .border_color(t.colors.border)
         .when_some(parent, |header, parent| {
             header.child(
@@ -127,19 +158,23 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                         div().child(parent.title.clone()).into_any_element()
                     } else {
                         let id = parent.id;
-                        labelled_button("parent-breadcrumb", parent.title.clone(), cx)
-                            .on_click(move |_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(SelectThread { thread: Some(id) }),
-                                    cx,
-                                )
-                            })
-                            .into_any_element()
+                        super::composer::labelled_text_button_with(
+                            "parent-breadcrumb",
+                            parent.title.clone(),
+                            div().child(parent.title.clone()),
+                            cx,
+                        )
+                        .p_0()
+                        .underline()
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
+                        })
+                        .into_any_element()
                     })
-                    .child("/"),
+                    .child(div().text_color(t.colors.text_muted).child("/")),
             )
         })
-        .child(
+        .child(observed(
             div()
                 .debug_selector(|| "header-title".into())
                 .min_w_0()
@@ -147,18 +182,50 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                 .text_size(t.text.ui.size)
                 .line_height(t.text.ui.line_height)
                 .font_weight(t.text.title_weight)
-                .child(title),
-        )
+                .child(if let Some(thread) = shell.view.chat() {
+                    super::composer::labelled_text_button_with(
+                        "header-thread-title",
+                        title.clone(),
+                        title,
+                        cx,
+                    )
+                    .p_0()
+                    .text_size(t.text.ui.size)
+                    .font_weight(t.text.title_weight)
+                    .tooltip_with_action(
+                        "Thread actions",
+                        &OpenThreadMenu::default(),
+                        Some("Veyra"),
+                    )
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(OpenThreadMenu {
+                                thread: Some(thread),
+                            }),
+                            cx,
+                        )
+                    })
+                    .into_any_element()
+                } else {
+                    div().child(title).into_any_element()
+                }),
+            "header-title",
+        ))
         .when_some(attention, |header, attention| {
             header.child(
-                div()
+                labelled_button("parent-needs-you", attention, cx)
                     .text_size(t.text.meta.size)
-                    .text_color(t.colors.accent)
-                    .child(attention),
+                    .text_color(t.colors.warning)
+                    .on_click({
+                        let id = parent.map(|parent| parent.id);
+                        move |_, window, cx| {
+                            window.dispatch_action(Box::new(SelectThread { thread: id }), cx)
+                        }
+                    }),
             )
         })
         .when_some(text, |this, text| {
-            this.child(
+            this.child(observed(
                 div()
                     .debug_selector(|| "header-status".into())
                     .h_flex()
@@ -177,29 +244,160 @@ pub fn render(shell: &Shell, cx: &App) -> impl IntoElement {
                             super::sidebar::glyph_color(&status, t),
                         ))
                     })
-                    .child(text),
-            )
+                    .children(text.split_once(" · ").map_or_else(
+                        || vec![status_words(text.clone(), status_color).into_any_element()],
+                        |(words, elapsed)| {
+                            vec![
+                                status_words(words.to_owned(), status_color).into_any_element(),
+                                format!("· {elapsed}").into_any_element(),
+                            ]
+                        },
+                    )),
+                "header-status",
+            ))
         })
         .child(div().flex_1())
         .when_some(project, |this, project| {
             this.child(
                 div()
+                    .h_flex()
+                    .items_center()
+                    .gap(t.layout.control_gap)
+                    .pl(t.layout.row_inset)
+                    .pr(t.layout.row_inset)
+                    .rounded(t.radius.inline)
+                    .bg(t.colors.card)
                     .text_size(t.text.meta.size)
                     .text_color(t.colors.text_muted)
+                    .child(Icon::new(IconName::Folder).size(t.layout.small_icon))
+                    .when(!shell.branch.is_empty(), |chip| {
+                        chip.child(Icon::new(IconName::GitBranch).size(t.layout.small_icon))
+                    })
                     .child(project),
             )
         })
         .when(shell.view.chat().is_some(), |header| {
             header.child(
-                labelled_button("toggle-shell-drawer", "⌘J", cx).on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(ToggleShellDrawer), cx)
-                }),
+                super::composer::labelled_button_with(
+                    "toggle-shell-drawer",
+                    "Shell drawer",
+                    Icon::new(IconName::Terminal)
+                        .size(t.layout.icon)
+                        .text_color(t.colors.icon),
+                    cx,
+                )
+                .size(t.layout.icon_button)
+                .p_0()
+                .when(
+                    shell
+                        .view
+                        .chat()
+                        .and_then(|thread| shell.drawers.get(&thread))
+                        .is_some_and(|drawer| drawer.open),
+                    |button| button.bg(t.colors.card),
+                )
+                .tooltip_with_action("Shell drawer", &ToggleShellDrawer, Some("Veyra"))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleShellDrawer), cx)),
             )
         })
 }
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn status_text_without_wrapper_keeps_glyph_layout(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        struct Caption {
+            flat: bool,
+            words: String,
+            color: Hsla,
+            layout: std::rc::Rc<std::cell::RefCell<Option<TextLayout>>>,
+        }
+        impl Render for Caption {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let t = cx.global::<Theme>();
+                let text = if self.flat {
+                    status_words(self.words.clone(), self.color)
+                } else {
+                    StyledText::new(self.words.clone())
+                };
+                self.layout.replace(Some(text.layout().clone()));
+                let child = if self.flat {
+                    text.into_any_element()
+                } else {
+                    div().text_color(self.color).child(text).into_any_element()
+                };
+                div()
+                    .h_flex()
+                    .items_center()
+                    .text_size(t.text.meta.size)
+                    .line_height(t.text.ui.line_height)
+                    .text_color(t.colors.text_muted)
+                    .child(child)
+            }
+        }
+        cx.update(gpui_kit::init);
+        let (caption, cx) = cx.add_window_view(|window, cx| {
+            Theme::apply(super::super::theme::Appearance::Dark, window, cx);
+            Caption {
+                flat: false,
+                words: String::new(),
+                color: Hsla::transparent_black(),
+                layout: Default::default(),
+            }
+        });
+        for appearance in [
+            super::super::theme::Appearance::Dark,
+            super::super::theme::Appearance::Light,
+        ] {
+            cx.update(|window, cx| Theme::apply(appearance, window, cx));
+            for words in ["Working", "Done", "Needs you"] {
+                let mut snapshots = Vec::new();
+                for flat in [false, true] {
+                    caption.update(cx, |caption, cx| {
+                        caption.flat = flat;
+                        caption.words = words.into();
+                        caption.color = cx.global::<Theme>().colors.accent;
+                        cx.notify();
+                    });
+                    cx.run_until_parked();
+                    cx.update(|window, cx| {
+                        window.refresh();
+                        window.draw(cx).clear(cx);
+                    });
+                    snapshots.push(caption.read_with(cx, |caption, _| {
+                        let layout = caption.layout.borrow();
+                        let layout = layout.as_ref().unwrap();
+                        format!(
+                            "{:?}",
+                            (layout.bounds(), layout.line_height(), layout.line_layouts())
+                        )
+                    }));
+                }
+                assert_eq!(snapshots[0], snapshots[1], "{appearance:?} {words}");
+            }
+        }
+    }
+
+    #[test]
+    fn negative_zero_is_not_scrolled() {
+        assert!(!super::rule_visible(
+            super::MainView::Chat(super::ThreadId::new()),
+            -super::Pixels::ZERO,
+        ));
+    }
+    #[test]
+    fn header_rule_only_when_scrolled() {
+        use super::*;
+        let step = Theme::new(super::super::theme::Appearance::Dark)
+            .layout
+            .border;
+        let chat = MainView::Chat(ThreadId::new());
+        assert!(!rule_visible(chat, Pixels::ZERO));
+        assert!(rule_visible(chat, -step));
+        assert!(!rule_visible(MainView::NewThread, -step));
+        assert!(!rule_visible(MainView::Settings { back: None }, -step));
+    }
     #[test]
     fn needs_you_header_uses_readable_words() {
         assert_eq!(

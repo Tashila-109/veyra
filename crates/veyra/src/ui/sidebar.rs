@@ -1,7 +1,7 @@
 use super::{
     Shell,
     actions::*,
-    composer::{button_text, labelled_button_with},
+    composer::{button_text, labelled_button_with, labelled_text_button_with},
     icons,
     theme::Theme,
 };
@@ -103,8 +103,7 @@ pub(super) fn can_keep_children(state: &super::AppState, root: ThreadId) -> bool
             .any(|thread| thread.root() == root && thread.id != root && !thread.archived)
 }
 
-fn button_style(cx: &App) -> ButtonCustomVariant {
-    let t = cx.global::<Theme>();
+fn button_style(t: &Theme, cx: &App) -> ButtonCustomVariant {
     ButtonCustomVariant::new(cx)
         .foreground(t.colors.icon)
         .hover(t.sidebar_plate(t.colors.hover))
@@ -116,14 +115,14 @@ fn icon_button(
     label: impl Into<SharedString>,
     icon: Icon,
     hover_color: Hsla,
+    t: &Theme,
     cx: &App,
 ) -> Button {
-    let t = cx.global::<Theme>();
     let id = id.into();
     let label = label.into();
     Button::new(id.clone())
         .group(id.clone())
-        .custom(button_style(cx))
+        .custom(button_style(t, cx))
         .size(t.layout.icon_button)
         .p_0()
         .rounded(t.radius.control)
@@ -139,7 +138,24 @@ fn icon_button(
 }
 
 pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl IntoElement {
-    let t = cx.global::<Theme>();
+    let mut theme = std::borrow::Cow::Borrowed(cx.global::<Theme>());
+    if (shell.quit_sheet || shell.close_sheet.is_some())
+        && theme.look.background() == veyra_engine::domain::WindowBackground::Translucent
+    {
+        let theme = theme.to_mut();
+        for color in [
+            &mut theme.colors.text,
+            &mut theme.colors.text_muted,
+            &mut theme.colors.icon,
+            &mut theme.colors.accent,
+            &mut theme.colors.warning,
+            &mut theme.colors.success,
+            &mut theme.colors.danger,
+        ] {
+            color.a *= 0.5;
+        }
+    }
+    let t = theme.as_ref();
     shell.sidebar_scroll.row_focus.borrow_mut().retain(|id, _| {
         shell
             .state
@@ -153,7 +169,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
         let id = project.id;
         let group = SharedString::from(format!("project-{id}"));
         rows.push(
-            labelled_button_with(
+            labelled_text_button_with(
                 group.clone(),
                 project.name.clone(),
                 div()
@@ -179,7 +195,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
             .pl(t.layout.row_inset)
             .pr(t.layout.row_inset)
             .text_color(t.colors.text_muted)
-            .custom(button_style(cx))
+            .custom(button_style(t, cx))
             .group(group)
             .when(index > 0, |row| {
                 row.mt(t.layout.group_gap - t.layout.row_gap)
@@ -228,6 +244,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                         "Thread actions",
                         Icon::new(IconName::Ellipsis).size(t.layout.small_icon),
                         t.colors.text,
+                        t,
                         cx,
                     )
                     .size(t.layout.small_icon_button)
@@ -349,6 +366,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                                             "Stop thread",
                                             Icon::new(IconName::Square).size(t.layout.small_icon),
                                             t.colors.danger,
+                                            t,
                                             cx,
                                         )
                                         .debug_selector(|| "sidebar-thread-stop".into())
@@ -437,6 +455,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
         .h_full()
         .flex_none()
         .bg(t.sidebar_fill())
+        .text_color(t.colors.text)
         .child(div().h(t.layout.header).flex_none())
         .child(
             div()
@@ -454,35 +473,43 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                 )
                 .when(needs_you > 0, |strip| {
                     strip.child(
-                        labelled_button_with(
-                            "needs-you",
-                            "Next thread needing you",
-                            div()
-                                .h_flex()
-                                .items_center()
-                                .gap(t.layout.row_inset)
-                                .child(icons::status_mark(
-                                    &Status::NeedsYou,
-                                    0,
-                                    t.layout.small_icon,
-                                    t.colors.warning,
-                                ))
-                                .child(
-                                    button_text(
-                                        format!(
-                                            "{needs_you} {} you",
-                                            if needs_you == 1 { "needs" } else { "need" }
+                        {
+                            let button = labelled_button_with(
+                                "needs-you",
+                                "Next thread needing you",
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .gap(t.layout.row_inset)
+                                    .child(icons::status_mark(
+                                        &Status::NeedsYou,
+                                        0,
+                                        t.layout.small_icon,
+                                        t.colors.warning,
+                                    ))
+                                    .child(
+                                        button_text(
+                                            format!(
+                                                "{needs_you} {} you",
+                                                if needs_you == 1 { "needs" } else { "need" }
+                                            )
+                                            .into(),
+                                            cx,
                                         )
-                                        .into(),
-                                        cx,
-                                    )
-                                    .text_color(t.colors.text_muted),
-                                ),
-                            cx,
-                        )
+                                        .text_color(t.colors.text_muted),
+                                    ),
+                                cx,
+                            );
+                            #[cfg(debug_assertions)]
+                            let button = button.with_painted_caption(format!(
+                                "{needs_you} {} you",
+                                if needs_you == 1 { "needs" } else { "need" }
+                            ));
+                            button
+                        }
                         .pl(t.layout.row_inset)
                         .pr(t.layout.row_inset)
-                        .custom(button_style(cx))
+                        .custom(button_style(t, cx))
                         .tooltip_with_action(
                             "Next thread needing you",
                             &NextNeedsYou,
@@ -500,6 +527,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                         "Add project",
                         Icon::new(IconName::FolderPlus).size(t.layout.icon),
                         t.colors.text,
+                        t,
                         cx,
                     )
                     .tooltip_with_action("Add project", &AddProject::default(), Some("Veyra"))
@@ -513,6 +541,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                         "New thread",
                         Icon::new(IconName::SquarePen).size(t.layout.icon),
                         t.colors.text,
+                        t,
                         cx,
                     )
                     .tooltip_with_action("New thread", &NewThread, Some("Veyra"))
@@ -552,7 +581,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                     foot.border_t(t.layout.border).border_color(t.colors.border)
                 })
                 .child(
-                    labelled_button_with(
+                    labelled_text_button_with(
                         "settings",
                         "Settings",
                         div()
@@ -577,7 +606,7 @@ pub fn render(shell: &Shell, window: &mut Window, cx: &Context<Shell>) -> impl I
                         matches!(shell.view, super::MainView::Settings { .. }),
                         |button| button.bg(t.sidebar_plate(t.colors.sel)),
                     )
-                    .custom(button_style(cx))
+                    .custom(button_style(t, cx))
                     .group("sidebar-settings")
                     .tooltip_with_action("Settings", &OpenSettings, Some("Veyra"))
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx)),

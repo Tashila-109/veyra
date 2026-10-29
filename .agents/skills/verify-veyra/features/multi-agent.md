@@ -1,13 +1,13 @@
 # Child threads
 
 Status: passed, 2026-10-26, bd8a083, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 8577dad2), 7fd8f60ceebec75ea1b4edeff062de75848bbdf29ac397e960ecc73c44737c09
-Covers: crates/veyra/src/relay.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
+Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/header.rs crates/veyra/src/relay.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
 
 ## Sub-features
 
 - A production root relay calls start_thread, adding a child below its root on the sidebar guide.
 - The root shows Started N agents, with the singular Started 1 agent, each child's glyph and status, Open and Stop while that child's shared turn target exists.
-- The child opens independently, with its Task from Claude Code card and Task from the root title label.
+- The child opens independently, with one Task from parent link and provider mark, its relay note folded separately from the task bubble.
 - The breadcrumb links back to an unarchived root, and a parent request adds Claude Code needs you.
 Read the full-width child plates with content indented inside them, aligned Stop and menu icons, compact row and project-group gaps, project headers marked by weight, the foot rule while rows continue, and the lineage mark on a kept child.
 The top strip's needs-you count runs NextNeedsYou and carries that action's chord in its tooltip.
@@ -44,9 +44,11 @@ This fake-only scene uses Pillow to read the guarded window PNGs.
 It saves the stopped disposable database, seeds one family with seven children, and restores the database while stopped afterwards.
 It restores and checks the three entry display flags before the family lifecycle continues.
 Five statuses come from stored turns and a held queue; Working and NeedsYou enter through Send and the fake provider.
+Each stored child Task turn includes its first UserText item at seq 1, with StartThread's child guidance followed by Mark, as the engine stores it. The Failed child therefore shows its failure card and recovery controls.
 All children have the same title, so the header mark keeps the same position across selections.
-The comparisons use only the 16 px mark cells, with bounds and pixel hashes saved in `mark-pixels.json`.
+The comparisons normalize mark cells to 16 px, using the capture's backing scale and the dump's layout geometry, with bounds and pixel hashes saved in `mark-pixels.json`.
 Every pair of statuses must differ by foreground shape in the sidebar, header and family card.
+The Needs-you count mark must match the Needs-you shape and differ from every other status.
 The Working cells must change across captured clock steps with motion forced on, and remain identical across more than one second under Reduce Motion.
 The assertion self-test requires identical cells to fail the same distinction assertion used by the page.
 
@@ -58,7 +60,8 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYMARKS'
 from driver import *
-from PIL import Image
+capture = capture_content
+from PIL import Image, ImageDraw
 import itertools, uuid
 
 def require_distinct(left, right, label):
@@ -73,28 +76,76 @@ def mark_assertion_self_test():
     else:
         raise AssertionError('identical-region comparison accepted its negative control')
     require_distinct(identical, bytes(len(identical)), 'positive control')
+    shapes = []
+    for color in [(123,200,151),(248,138,130)]:
+        cell = Image.new('RGB',(16,16),(15,16,17))
+        ImageDraw.Draw(cell).line([(3,8),(6,11),(12,4)],fill=color,width=2)
+        shapes.append(mark_cell(cell,(0,0,16,16))[1])
+    try:
+        require_distinct(*shapes,'same shape in two colours')
+    except AssertionError as error:
+        assert str(error) == 'identical painted mark regions: same shape in two colours'
+    else:
+        raise AssertionError('recolouring a shape passed the distinction assertion')
 
 def mark_cell(image, rectangle):
-    cell = image.crop(rectangle).convert('RGB')
+    cell = image.crop(rectangle).convert('RGB').resize((16,16),Image.Resampling.LANCZOS)
     assert cell.size == (16,16), (rectangle,cell.size)
     background = cell.getpixel((0,0))
-    shape = bytes(int(max(abs(a-b) for a,b in zip(pixel,background)) > 24)
-        for pixel in cell.getdata())
+    contrasts = [max(abs(a-b) for a,b in zip(pixel,background)) for pixel in cell.getdata()]
+    peak = max(contrasts)
+    assert peak > 24, ('no mark contrast',rectangle,peak)
+    shape = bytes(int(contrast > peak/2) for contrast in contrasts)
     assert 3 < sum(shape) < 180, ('empty or contaminated mark cell',rectangle,sum(shape))
     return cell.tobytes(), shape
 
-def working_cell(image, rectangle):
+def colored_cell(image, rectangle, size, scale, warning=False):
     area = image.crop(rectangle).convert('RGB')
     points = [(x,y) for y in range(area.height) for x in range(area.width)
-        if (lambda c:c[2]-c[1]>35 and c[2]-c[0]>35)(area.getpixel((x,y)))]
-    assert points, ('no Working ink',rectangle)
-    xs,ys = zip(*points)
-    x = rectangle[0]+round((min(xs)+max(xs)+1)/2)-8
-    y = rectangle[1]+round((min(ys)+max(ys)+1)/2)-8
-    return (x,y,x+16,y+16)
+        if (lambda c:(c[0]-c[2]>35 and c[1]-c[2]>35) if warning
+            else (c[2]-c[1]>35 and c[2]-c[0]>35))(area.getpixel((x,y)))]
+    assert points, ('no Needs-you ink' if warning else 'no Working ink',rectangle)
+    remaining,components = set(points),[]
+    while remaining:
+        component,queue = set(),[remaining.pop()]
+        while queue:
+            point = queue.pop()
+            component.add(point)
+            x,y = point
+            neighbours = {(x+dx,y+dy) for dx in [-1,0,1] for dy in [-1,0,1]} & remaining
+            remaining.difference_update(neighbours)
+            queue.extend(neighbours)
+        components.append(component)
+    def area(points):
+        xs,ys = zip(*points)
+        return (max(xs)-min(xs)+1)*(max(ys)-min(ys)+1)
+    xs,ys = zip(*max(components,key=area))
+    side = round(size*scale)
+    x = rectangle[0]+round((min(xs)+max(xs)+1-side)/2)
+    y = rectangle[1]+round((min(ys)+max(ys)+1-side)/2)
+    return (x,y,x+side,y+side)
+
+def mark_geometry(image, state, bounds, sites=('sidebar','family-card','header')):
+    width,height = bounds[2:]
+    scale = image.width/width
+    assert image.height == round(height*scale), (image.size,bounds,scale)
+    sidebar = state['sidebar']['width']
+    layout = state['transcript']['layout']
+    size = layout['status_glyph']
+    column = sidebar+max(layout['gutter'],(width-sidebar-layout['column_max'])/2)
+    def box(*values): return tuple(round(value*scale) for value in values)
+    header = state['sidebar']['layout']['header']
+    searches = {'sidebar':box(26,header+76,45,min(500,height)),
+        'family-card':box(column+10,header+26,column+32,min(600,height)),
+        'header':box(sidebar+20,8,min(sidebar+460,width),header-8)}
+    regions = {site:colored_cell(image,searches[site],size,scale) for site in sites}
+    count = colored_cell(image,box(6,header,sidebar-70,header+40),
+        state['sidebar']['layout']['small_icon'],scale,warning=True)
+    return scale,regions,count
 
 mark_assertion_self_test()
-save('mark-assertion-self-test',{'identical_regions_rejected':True,'different_regions_accepted':True})
+save('mark-assertion-self-test',{'identical_regions_rejected':True,'different_regions_accepted':True,
+    'same_shape_in_two_colours_rejected':True})
 prepare()
 assert LANE == 'fake'
 saved_look = ctl('marks-options-before','dump')['look']
@@ -106,6 +157,8 @@ statuses = ['Working','NeedsYou','Done','Failed','Idle','Held','Interrupted']
 root,project,parent_turn = [str(uuid.uuid4()) for _ in range(3)]
 children = dict(zip(statuses,sorted(str(uuid.uuid4()) for _ in statuses)))
 parent_item = str(uuid.uuid4())
+child_prompt = ('Your last message is your report to the parent; Veyra delivers up to 4,000 characters '
+    'after its current turn ends. You cannot start child threads.\n\nMark')
 with sqlite3.connect(DB) as db:
     db.execute('pragma foreign_keys=off')
     for table in ['requests','grants','tasks','items','turns','threads','projects']:
@@ -133,11 +186,14 @@ with sqlite3.connect(DB) as db:
         if status in ['Done','Failed','Held','Interrupted']:
             outcome = {'Done':'Completed','Failed':{'Failed':{'message':'Mark failed'}},
                 'Interrupted':{'Interrupted':{'reason':'Mark interrupted'}},'Held':None}[status]
+            child_turn = str(uuid.uuid4())
             db.execute("""insert into turns(id,thread_id,ordinal,origin_json,state,outcome_json,
                 queued_at,started_at,ended_at) values(?,?,1,?,?,?,?,?,?)""",
-                (str(uuid.uuid4()),child,json.dumps({'Task':{'task':task}}),
+                (child_turn,child,json.dumps({'Task':{'task':task}}),
                     'queued' if status=='Held' else 'ended',json.dumps(outcome) if outcome else None,
                     1,None if status=='Held' else 1,None if status=='Held' else 2))
+            db.execute("""insert into items values(?,?,?,1,'user_text',?,1)""",
+                (str(uuid.uuid4()),child,child_turn,json.dumps({'UserText':child_prompt})))
 start('marks-seeded')
 action('marks-solid','SetWindowBackground',{'background':'solid'})
 action('marks-reduced','DebugDisplayOptions',{'reduce_motion':True})
@@ -153,18 +209,20 @@ poll('marks-family',lambda d:d['transcript']['family_card'] is not None
     and [row['status'] for row in d['transcript']['family_card']['rows']]==statuses)
 capture('marks-family-statuses')
 family_image = Image.open(PROOF/'marks-family-statuses.png').convert('RGB')
-width,height = family_image.size
-assert width >= 760 and height >= 560
-card_left = round(240+(width-240-752)/2)
-sidebar_working = working_cell(family_image,(26,120,45,500))
-family_working = working_cell(family_image,(card_left+10,70,card_left+32,600))
+geometry_state = ctl('marks-geometry','dump')
+bounds = [float(value) for value in subprocess.check_output(
+    [str(PROOF/'winid'),str(geometry_state['pid']),'--bounds'],text=True).strip().split(',')]
+scale,regions,count_region = mark_geometry(family_image,geometry_state,bounds,('sidebar','family-card'))
+save('marks-geometry',{'bounds':bounds,'scale':scale,'state':geometry_state,'regions':regions,
+    'count_region':count_region})
 for status in statuses:
     action('marks-header-select-'+status,'SelectThread',{'thread':children[status]})
     poll('marks-header-'+status,lambda d:d['selected_thread'] and d['selected_thread']['id']==children[status]
         and d['selected_thread']['status']==status)
     capture('marks-header-'+status)
 header_image = Image.open(PROOF/'marks-header-Working.png').convert('RGB')
-header_working = working_cell(header_image,(260,8,700,36))
+_,header_regions,_ = mark_geometry(header_image,geometry_state,bounds,('header',))
+header_working = header_regions['header']
 receipt = {'statuses':statuses,'captures':['marks-family-statuses']+['marks-header-'+s for s in statuses],
     'regions':{},'pairs':[],'motion':{},'self_test_passed':True,'passed':False}
 def record_cells(site, cells):
@@ -177,15 +235,37 @@ def record_cells(site, cells):
         require_distinct(cells[left][3],cells[right][3],site+' '+left+' / '+right)
         receipt['pairs'].append({'site':site,'left':left,'right':right,'different':True})
         save('mark-pixels',receipt)
-for site,origin,stride in [('sidebar',sidebar_working,34),('family-card',family_working,36)]:
+for site,pitch in [('sidebar',geometry_state['sidebar']['layout']['row_pitch']),
+        ('family-card',geometry_state['transcript']['layout']['family_row_pitch'])]:
+    origin = regions[site]
     cells = {}
     for index,status in enumerate(statuses):
-        rectangle = (origin[0],origin[1]+stride*index,origin[2],origin[3]+stride*index)
+        offset = round(pitch*index*scale)
+        rectangle = (origin[0],origin[1]+offset,origin[2],origin[3]+offset)
         raw,shape = mark_cell(family_image,rectangle)
         cells[status] = ('marks-family-statuses',rectangle,raw,shape)
     record_cells(site,cells)
 record_cells('header',{status:('marks-header-'+status,header_working,
     *mark_cell(Image.open(PROOF/('marks-header-'+status+'.png')),header_working)) for status in statuses})
+count_raw,count_shape = mark_cell(family_image,count_region)
+receipt['regions']['needs-you-count'] = {'NeedsYou':{'capture':'marks-family-statuses',
+    'rectangle':count_region,'rgb_sha256':hashlib.sha256(count_raw).hexdigest(),
+    'shape_sha256':hashlib.sha256(count_shape).hexdigest()}}
+def count_matches_statuses(image, count_rectangle, status_cells):
+    _,count_shape = mark_cell(image,count_rectangle)
+    for status,rectangle in status_cells.items():
+        _,shape = mark_cell(image,rectangle)
+        if status == 'NeedsYou':
+            overlap = sum(a and b for a,b in zip(count_shape,shape))
+            union = sum(a or b for a,b in zip(count_shape,shape))
+            assert overlap/union > .7, ('Needs-you count shape differs',overlap,union)
+        else:
+            require_distinct(count_shape,shape,'Needs-you count / '+status)
+    return True
+count_matches_statuses(family_image,count_region,
+    {status:cell['rectangle'] for status,cell in receipt['regions']['sidebar'].items()})
+receipt['count_compared_with_all_statuses'] = True
+save('mark-pixels',receipt)
 action('marks-motion-root-select','SelectThread',{'thread':root})
 poll('marks-motion-root',lambda d:d['selected_thread'] and d['selected_thread']['id']==root)
 stage('long-reply')
@@ -194,9 +274,7 @@ action('marks-motion-root-send','Send')
 poll('marks-motion-root-working',lambda d:d['selected_thread']['status']=='Working')
 capture('marks-motion-locate')
 motion_image = Image.open(PROOF/'marks-motion-locate.png').convert('RGB')
-motion_regions = {'sidebar':working_cell(motion_image,(26,120,45,500)),
-    'header':working_cell(motion_image,(260,8,700,36)),
-    'family-card':working_cell(motion_image,(card_left+10,70,card_left+32,600))}
+_,motion_regions,_ = mark_geometry(motion_image,geometry_state,bounds)
 for reduced,count in [(False,6),(True,3)]:
     label = 'reduced' if reduced else 'animated'
     action('marks-'+label,'DebugDisplayOptions',{'reduce_motion':reduced})
@@ -238,9 +316,10 @@ start('marks-restored')
 option_names = ['reduce_motion','reduce_transparency','increase_contrast']
 action('marks-display-reset','DebugDisplayOptions',{key:saved_look[key] for key in option_names})
 poll('marks-options-restored',lambda d:all(d['look'][key]==saved_look[key] for key in option_names))
-action('marks-solid-restored','SetWindowBackground',{'background':'solid'})
+action('marks-background-restored','SetWindowBackground',{'background':saved_look['background']})
+poll('marks-background-restored',lambda d:d['look']['background']==saved_look['background'])
 page_done('multi-agent-painted-marks')
-print('PASS 63 painted status pairs, three animated and three reduced-motion mark regions')
+print('PASS 63 painted status pairs, Needs-you count, three animated and three reduced-motion mark regions')
 PYMARKS
 ```
 
@@ -254,6 +333,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 prepare()
 assert LANE == 'fake'
 root,child,task = create_family('report family')
@@ -291,7 +371,8 @@ assert opened['selected_thread']['breadcrumb']=={'thread':root,'title':'report f
 assert any(item['kind']=='task_card' and item['text']=='Task from Claude Code' for item in opened['transcript']['items'])
 assert opened['transcript']['items'][0]['kind']=='task_card'
 assert any(item['turn_label']=='Task from “report family”' for item in opened['transcript']['items'])
-assert any(item['kind']=='user' and item['text'].startswith('Your last message is your report') and 'You cannot start child threads.' in item['text'] for item in opened['transcript']['items'])
+assert any(item['kind']=='user' and item['body']['UserText'].startswith('Your last message is your report') and 'You cannot start child threads.' in item['body']['UserText'] for item in opened['transcript']['items'])
+assert all(not item['text'].startswith('Your last message is your report') for item in opened['transcript']['items'] if item['kind']=='user')
 poll('multi-visible-counted',lambda d:d['perf']['visible']['thread']==child and d['perf']['visible']['applied_batches']>0)
 poll('multi-open-stamped',lambda d:d['perf']['transcript_open_ms'] is not None)
 capture('multi-child-task')
@@ -466,6 +547,7 @@ PROOF=target/verify-veyra/$RUN
 VEYRA_CLAUDE_BIN=/nonexistent/claude VEYRA_CODEX_BIN=/nonexistent/codex TMPDIR=/tmp cargo test -p veyra-engine --lib perf_snapshot_large -- --ignored --nocapture >"$PROOF/large-seed.txt" 2>&1
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYPROBE'
 from driver import *
+capture = capture_content
 prepare()
 thread = create('probe-pause','Observe the halfway pause',scenario='stream-pause')
 done = ctl('probe-pause-done','wait',thread,'Done')
@@ -510,6 +592,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYCODEX'
 from driver import *
+capture = capture_content
 prepare()
 assert LANE == 'fake'
 records = codex_records('root-tool-call')
@@ -595,6 +678,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYGROK'
 from driver import *
+capture = capture_content
 prepare()
 assert LANE == 'fake'
 thread = create_grok('grok-relay',scenario='root-tool-call',prompt='Call Veyra list_providers and report the result')
@@ -622,6 +706,10 @@ PYGROK
 ```
 
 ## Observable success
+
+On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+
+Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
 
 `sidebar.rows` retains each thread's status and SelectThread, OpenThreadMenu, StopThread, Archive and optional ArchiveKeepChildren actions.
 `multi-child-parent-needs.png` shows the needs-you count, and `multi-needs-count-target.json` proves its action reaches the requesting root.

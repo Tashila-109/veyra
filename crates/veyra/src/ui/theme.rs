@@ -201,7 +201,7 @@ impl Colors {
     }
 }
 
-fn blend(foreground: Hsla, background: Hsla) -> Hsla {
+pub(super) fn blend(foreground: Hsla, background: Hsla) -> Hsla {
     let fg = foreground.to_rgb();
     let bg = background.to_rgb();
     let alpha = fg.a;
@@ -550,6 +550,8 @@ impl Theme {
             kit.secondary_foreground = c.text;
             kit.muted = c.card;
             kit.input = c.card;
+            kit.group_box = c.card;
+            kit.group_box_foreground = c.text;
             kit.border = c.border;
             kit.accent = c.hover;
             kit.accent_foreground = c.text;
@@ -562,6 +564,7 @@ impl Theme {
             kit.selection = c.accent_selection;
             kit.link = c.text;
             kit.danger = c.danger;
+            kit.button_danger_foreground = c.on_solid;
             kit.warning = c.warning;
             kit.success = c.success;
             kit.font_family = theme.text.ui_font.clone();
@@ -682,6 +685,48 @@ pub fn register_fonts(cx: &mut App) -> anyhow::Result<()> {
         Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-SemiBold.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../../assets/fonts/GeistMono-Regular.ttf").as_slice()),
     ])
+}
+
+impl TerminalPalette {
+    pub(super) fn resolve(&self, value: Color, palette: &[Option<Rgb>]) -> Hsla {
+        let index = match value {
+            Color::Spec(value) => {
+                return rgb(value.r as u32 * 65536 + value.g as u32 * 256 + value.b as u32).into();
+            }
+            Color::Indexed(index) => index as usize,
+            Color::Named(name) => name as usize,
+        };
+        if let Some(Some(value)) = palette.get(index) {
+            return rgb(value.r as u32 * 65536 + value.g as u32 * 256 + value.b as u32).into();
+        }
+        match index {
+            0..16 => self.ansi[index],
+            16..256 => {
+                let color = veyra_engine::terminal::xterm_color(index as u8);
+                rgb(color.r as u32 * 65536 + color.g as u32 * 256 + color.b as u32).into()
+            }
+            n if n == NamedColor::Background as usize => self.bg,
+            n if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&n) => {
+                self.ansi[n - NamedColor::DimBlack as usize]
+            }
+            _ => self.fg,
+        }
+    }
+
+    pub(super) fn engine_colors(&self) -> veyra_engine::terminal::Colors {
+        let convert = |color: Hsla| {
+            let color = Rgba::from(color);
+            Rgb {
+                r: (color.r * 255.).round() as u8,
+                g: (color.g * 255.).round() as u8,
+                b: (color.b * 255.).round() as u8,
+            }
+        };
+        veyra_engine::terminal::Colors {
+            foreground: convert(self.fg),
+            background: convert(self.bg),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -970,8 +1015,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn theme_contrast() {
+    #[gpui::test]
+    fn theme_contrast(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|_, cx| gpui_kit::init(cx));
         let coverages = [Appearance::Dark, Appearance::Light].map(|appearance| {
             let theme = Theme::new(appearance);
             let coverage = (35..=50)
@@ -1027,6 +1074,16 @@ mod tests {
             let c = &t.colors;
             for theme in [&t, &high] {
                 let c = &theme.colors;
+                cx.update(|window, cx| {
+                    cx.set_global(theme.look);
+                    Theme::apply(appearance, window, cx);
+                    let kit = KitTheme::global(cx);
+                    let ratio = contrast(kit.button_danger_foreground, kit.danger, c.bg);
+                    assert!(
+                        ratio >= 4.5,
+                        "{appearance:?} button_danger_foreground/danger {ratio:.2} < 4.5"
+                    );
+                });
                 assert_eq!(c.icon, c.text_muted);
                 assert_eq!(c.placeholder, c.text_muted);
                 for background in [c.bg, c.shell, c.card, c.floating] {
@@ -1068,48 +1125,6 @@ mod tests {
                 let ratio = contrast(fg, bg, base);
                 assert!(ratio >= min, "{appearance:?} {name} {ratio:.2} < {min}");
             }
-        }
-    }
-}
-
-impl TerminalPalette {
-    pub(super) fn resolve(&self, value: Color, palette: &[Option<Rgb>]) -> Hsla {
-        let index = match value {
-            Color::Spec(value) => {
-                return rgb(value.r as u32 * 65536 + value.g as u32 * 256 + value.b as u32).into();
-            }
-            Color::Indexed(index) => index as usize,
-            Color::Named(name) => name as usize,
-        };
-        if let Some(Some(value)) = palette.get(index) {
-            return rgb(value.r as u32 * 65536 + value.g as u32 * 256 + value.b as u32).into();
-        }
-        match index {
-            0..16 => self.ansi[index],
-            16..256 => {
-                let color = veyra_engine::terminal::xterm_color(index as u8);
-                rgb(color.r as u32 * 65536 + color.g as u32 * 256 + color.b as u32).into()
-            }
-            n if n == NamedColor::Background as usize => self.bg,
-            n if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&n) => {
-                self.ansi[n - NamedColor::DimBlack as usize]
-            }
-            _ => self.fg,
-        }
-    }
-
-    pub(super) fn engine_colors(&self) -> veyra_engine::terminal::Colors {
-        let convert = |color: Hsla| {
-            let color = Rgba::from(color);
-            Rgb {
-                r: (color.r * 255.).round() as u8,
-                g: (color.g * 255.).round() as u8,
-                b: (color.b * 255.).round() as u8,
-            }
-        };
-        veyra_engine::terminal::Colors {
-            foreground: convert(self.fg),
-            background: convert(self.bg),
         }
     }
 }

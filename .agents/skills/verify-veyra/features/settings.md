@@ -1,7 +1,7 @@
 # Settings
 
 Status: passed, 2026-10-26, bd8a083, human display-settings lane not run (fake CLI RUN 8577dad2), b51396cd355f3a6eae4688e9fb0a2f32f53f3d939baac681871302d775882b71
-Covers: crates/veyra/src/ui/settings.rs crates/veyra/src/ui/new_thread.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
+Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/header.rs crates/veyra/src/ui/settings.rs crates/veyra/src/ui/new_thread.rs crates/veyra/src/ui/sidebar.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
 
 ## Sub-features
 
@@ -18,6 +18,9 @@ The forced Window background row selects Solid and disables both choices; its ac
 - `settings-header-branch`: Chat shows the run-owned branch; Settings and NewThread clear it.
 - `settings-sidebar-band`: `veyra::DebugDragSidebar` and `veyra::DebugDoubleClickSidebar` synthesize pointer events in the owned window, without moving the real cursor; `sidebar.width` proves the drag and reset.
 - `settings-glass-coverage`: `look.glass_coverage` reports the tint coverage in force, 0.80 in dark and 0.88 in light when Translucent, and 1 in Solid.
+- The close and quit sheets assert `on_solid` in their danger buttons' trailing keycaps, excluding the captions and using painted control bounds.
+
+Every placement step requires the owned window to be unmanaged and floating under the launch's temporary one-shot rule. A managed record fails with `owned window joined the tile tree` before any move or resize. The recipe never toggles floating or re-tiles a window, and needs no empty desktop.
 
 ## How to get to it (user POV)
 
@@ -46,6 +49,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 assert LANE == 'fake'
 prepare()
 assert sql('select default_mode from settings') == 'full_access'
@@ -80,6 +84,44 @@ sidebar_reset = poll('settings-sidebar-reset',lambda d:d['sidebar']['width']==24
 assert sidebar_reset['view']=='settings'
 capture('settings-sidebar-reset')
 capture('settings-full-access')
+placement_tool = shutil.which('yabai')
+assert placement_tool, 'minimum-width Settings proof needs the owned-window placement tool'
+owned_pid = int((PROOF/'pid').read_text())
+owned_window = int((PROOF/'window-id').read_text())
+def settings_frame():
+    result = subprocess.run([placement_tool,'-m','query','--windows','--window',str(owned_window)],capture_output=True,text=True)
+    (PROOF/'settings-minimum-placement.stderr').write_text(result.stderr)
+    assert result.returncode==0, 'owned Settings window unavailable'
+    row = json.loads(result.stdout)
+    assert row['id']==owned_window and row['pid']==owned_pid, 'refused a foreign Settings window'
+    return row
+before = settings_frame()
+require_unmanaged(before)
+try:
+    settings_frame()
+    result = subprocess.run([placement_tool,'-m','window',str(owned_window),'--resize','abs:760:560'],capture_output=True,text=True)
+    assert result.returncode==0
+    end = time.monotonic()+5
+    while True:
+        after = settings_frame()
+        if after['frame']['w']==760 and after['frame']['h']==560: break
+        assert time.monotonic()<end, 'owned Settings window did not reach the minimum'
+        time.sleep(.05)
+    save('settings-minimum-placement',{'pid':owned_pid,'window':owned_window,'before':before['frame'],'after':after['frame']})
+    capture('settings-minimum')
+finally:
+    settings_frame()
+    result = subprocess.run([placement_tool,'-m','window',str(owned_window),'--resize',f"abs:{int(before['frame']['w'])}:{int(before['frame']['h'])}"],capture_output=True,text=True)
+    assert result.returncode==0
+    result = subprocess.run([placement_tool,'-m','window',str(owned_window),'--move',f"abs:{int(before['frame']['x'])}:{int(before['frame']['y'])}"],capture_output=True,text=True)
+    assert result.returncode==0
+    end = time.monotonic()+5
+    while True:
+        restored = settings_frame()
+        if restored['frame']==before['frame']: break
+        assert time.monotonic()<end, 'owned Settings window did not restore its bounds'
+        time.sleep(.05)
+    save('settings-minimum-restored',restored['frame'])
 ctl('settings-invalid-mode','action','veyra::SetDefaultMode',json.dumps({'mode':'invalid'}),
     expected=1,stderr_contains='veyra ctl driver error:')
 assert 'unknown variant' in ctl('settings-command-error','dump')['notice']
@@ -162,7 +204,7 @@ PY
 The background choice is stored independently of the permission default.
 This section starts only run-owned backdrop windows and always closes them, including its deliberate occluder.
 Reduce Transparency, Increase Contrast and Reduce Motion are driven by `veyra::DebugDisplayOptions` without changing macOS settings.
-Before each glass capture and after relaunch, the recipe asks yabai only about the run's owned pid and recorded window id, floats that window if managed, and places it at 24,60 with 960×740 bounds.
+Before each glass capture and after relaunch, the recipe asks yabai only about the run's owned pid and recorded window id, requires the launch's unmanaged floating state, and places it at 24,60 with 960×740 bounds.
 Floating a tiled window lets yabai re-tile its neighbours; the recipe changes no config, rule, space or layout setting.
 An unavailable service or untracked window leaves the guards to decide.
 If the guard records intersecting windows, the recipe makes one further placement on the same backdrop display, clearing all recorded bounds and keeping 960×740 whenever it fits.
@@ -185,6 +227,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY_BACKGROUND'
 from driver import *
+capture = capture_content
 import math
 import numpy as np
 from PIL import Image
@@ -212,11 +255,8 @@ def place_glass_window(label, rectangle=(24,60,960,740)):
         save(label+'-placement',{'skipped':'yabai unavailable','pid':pid,'window':window})
         return
     before = query()
-    if before is None or (before.get('is-managed') is False and not before.get('is-floating')):
-        save(label+'-placement',{'skipped':'owned window unavailable to yabai','pid':pid,'window':window})
-        return
-    if not before['is-floating']:
-        subprocess.run([tool,'-m','window',str(window),'--toggle','float'],check=True,capture_output=True)
+    assert before is not None, 'owned window unavailable to yabai'
+    require_unmanaged(before)
     x,y,width,height = rectangle
     for operation,value in [('--resize',f'abs:{width}:{height}'),('--move',f'abs:{x}:{y}')]:
         current = query()
@@ -259,8 +299,7 @@ def retry_clear_glass(label, error, capture_again=None):
         return tuple(row['kCGWindowBounds'][key] for key in ['X','Y','Width','Height'])
     for row in windows:
         if row['kCGWindowNumber'] not in ids: continue
-        owner = subprocess.run(['ps','-p',str(row['kCGWindowOwnerPID']),'-o','comm='],
-            capture_output=True,text=True).stdout.strip()
+        owner = row.get('kCGWindowOwnerName','unreported')
         rows.append({'window':row['kCGWindowNumber'],'owner_app':pathlib.Path(owner).name,
             'layer':row['kCGWindowLayer'],'bounds':row['kCGWindowBounds']})
     save(label+'-intersections',rows)
@@ -506,6 +545,35 @@ try:
         measured_pair(labels,take_half)
         measurements.append(compare_backdrops(mode,labels,state))
     save('settings-backdrop-measurements',measurements)
+    from pixels import sidebar_dims
+    action('sheet-unforce','DebugDisplayOptions',{'reduce_motion':True})
+    action('sheet-translucent','SetWindowBackground',{'background':'translucent'})
+    poll('sheet-translucent-applied',lambda d:d['look']['background']=='translucent')
+    drawer_fixture(job=True)
+    busy = create('settings-sheet-thread','Sheet dimming',scenario='long-reply')
+    ctl('settings-sheet-working','wait',busy,'Working')
+    drawer_keys('settings-sheet-drawer','cmd-j','composer','drawer',draft='',caret=0)
+    poll('settings-sheet-running-shell',lambda d:any(tab['running'] for tab in d['drawer']['tabs']))
+    capture('settings-before-close-sheet')
+    drawer_keys('settings-close-sheet-open','cmd-w','drawer','none')
+    close_state = poll('settings-close-sheet',lambda d:d['drawer']['close_sheet'] is not None)
+    capture('settings-translucent-close-sheet')
+    sidebar_dims(PROOF,'settings-before-close-sheet','settings-translucent-close-sheet',close_state)
+    drawer_keys('settings-close-sheet-cancel','escape','none','drawer')
+    capture('settings-before-quit-sheet')
+    drawer_keys('settings-quit-sheet-open','cmd-q','drawer','none')
+    quit_state = poll('settings-quit-sheet',lambda d:d['quit_sheet']['open'])
+    capture('settings-translucent-quit-sheet')
+    sidebar_dims(PROOF,'settings-before-quit-sheet','settings-translucent-quit-sheet',quit_state)
+    drawer_keys('settings-quit-sheet-cancel','escape','none','drawer')
+    drawer_keys('settings-close-shell-again','cmd-w','drawer','none')
+    drawer_keys('settings-close-shell-confirm','cmd-enter','none','composer')
+    action('settings-sheet-stop','StopThread',{'thread':busy})
+    ctl('settings-sheet-stopped','wait',busy,'Interrupted')
+    action('settings-glass-return','SelectThread',{'thread':thread})
+    poll('settings-glass-returned',lambda d:d['selected_thread']['id']==thread and d['drawer']['open'])
+    action('settings-glass-return-focus','DebugFocusShellDrawer')
+    poll('settings-glass-return-focused',lambda d:d['focus']=='drawer')
     drawer_keys('settings-glass-drawer-close','cmd-w','drawer','composer')
     wait_gone(shell_pid)
     action('measure-restore-flags','DebugDisplayOptions',{})
@@ -522,7 +590,12 @@ PY_BACKGROUND
 
 ## Observable success
 
+On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+
+Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
+
 - `settings-first.json` has `view: settings`, `settings.default_mode: full_access` and the first thread's Full access configuration; inspect `settings-full-access.png`.
+- `settings-minimum.png` shows the label wrapping on the left and all three controls on the right at 760×560. Its placement and restoration receipts assert the owned window and original bounds. Exact wrapped text joins only consecutive OCR rows in the checked region, with each left edge aligned to the first within 0.25 of the taller row's measured height and with no vertical gap greater than one involved row's height; every joined row retains its box, text and confidence.
 - Every mode change is asserted in both dump and `select default_mode from settings`; the direct SetDefaultMode key cycles all three.
 - `settings-command-error.json` and its PNG show a rejected mode as a visible notice without changing the setting.
 - `settings-ask-first.json` and `settings.png` show Ask first, its full consequence copy and the applies-from-now hint.
@@ -546,6 +619,9 @@ PY_BACKGROUND
   "required": {
     "settings": [
       "settings-first.json",
+      "settings-minimum.png",
+      "settings-minimum-placement.json",
+      "settings-minimum-restored.json",
       "settings-ask-first.json",
       "settings-relaunch.json",
       "settings.png",
@@ -572,6 +648,10 @@ PY_BACKGROUND
       "settings-background-relaunch.json",
       "settings-background-final.png",
       "settings-backdrop-measurements.json",
+      "settings-translucent-close-sheet.png",
+      "settings-translucent-quit-sheet.png",
+      "settings-translucent-close-sheet-sidebar-dimming.json",
+      "settings-translucent-quit-sheet-sidebar-dimming.json",
       "settings-measure-translucent-coarse.png",
       "settings-measure-translucent-inverse.png",
       "settings-measure-solid-coarse.png",
@@ -624,6 +704,7 @@ The zero-thread default and offered-menu proof is in [new-thread](new-thread.md)
 Settings is not a second native window.
 The driver dispatches through the same OpenSettings action as the menu, but does not prove a native menu click.
 The helper waits for provider groups to finish before relaunch; it does not add provider reaping.
+The native drag action sends its pointer sequence in one dispatch. It cannot drive a platform release outside the window or loss of activation midway without another native input surface; the focused `resize_drag_ends_on_outside_release_and_deactivation` test covers both exits for sidebar and drawer, including unchanged geometry after reactivation and further movement.
 The default is stored, not a process-local preference.
 The run-owned git shim answers only the branch read, only while `branch-on` exists, and disappears with DATA during Cleanup.
 Update Status from candidate acceptance.

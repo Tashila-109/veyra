@@ -6,12 +6,13 @@ use super::{
     provider_text::{QuoteKind, QuotedText},
     theme::Theme,
 };
+use gpui_kit::assets::IconName;
 use gpui_kit::base::Disableable;
-use gpui_kit::component::StyledExt;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::{
     MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, markdown_ast,
 };
+use gpui_kit::component::{Icon, StyledExt};
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::*;
 pub(super) fn notice_text(notice: &veyra_engine::domain::Notice, now: i64) -> String {
@@ -99,6 +100,9 @@ impl MessageScrollerState {
     fn latest_visible(&self) -> bool {
         !self.follow && self.distance_to_bottom() > Pixels::ZERO
     }
+    pub(super) fn scroll_offset(&self) -> Pixels {
+        self.list.scroll_px_offset_for_scrollbar().y
+    }
     pub fn item_count(&self) -> usize {
         self.list.item_count()
     }
@@ -109,10 +113,6 @@ impl MessageScrollerState {
     pub fn insert(&mut self, index: usize, cx: &mut Context<Self>) {
         self.list.splice(index..index, 1);
         cx.notify();
-    }
-    #[cfg(test)]
-    pub fn prepend(&mut self, cx: &mut Context<Self>) {
-        self.insert(0, cx);
     }
     pub fn append(&mut self, count: usize, cx: &mut Context<Self>) {
         let end = self.item_count();
@@ -165,6 +165,7 @@ impl MessageScrollerState {
     pub fn dump(&self) -> serde_json::Value {
         let top = self.list.logical_scroll_top();
         serde_json::json!({"follow":self.follow, "gap":f32::from(self.distance_to_bottom()),
+            "scroll_offset":f32::from(self.scroll_offset()),
             "top_item":top.item_ix, "top_offset":f32::from(top.offset_in_item),
             "item_tops":(0..self.item_count()).map(|index|
                 self.list.bounds_for_item(index).map(|bounds| f32::from(bounds.origin.y))).collect::<Vec<_>>()})
@@ -269,6 +270,15 @@ pub(super) fn user_text(item: &Item, state: Option<&super::AppState>) -> String 
     if choice {
         veyra_engine::text::display_line(text, false).text
     } else {
+        let text = if state
+            .and_then(|state| state.turns.get(&item.turn))
+            .is_some_and(|turn| matches!(turn.origin, TurnOrigin::Task { .. }))
+        {
+            text.strip_prefix(veyra_engine::tools::CHILD_GUIDANCE.as_str())
+                .unwrap_or(text)
+        } else {
+            text
+        };
         veyra_engine::text::display_text(text)
     }
 }
@@ -313,22 +323,13 @@ pub(super) fn tool_status(item: &Item, state: Option<&super::AppState>) -> &'sta
         Some(_) => "Failed",
     }
 }
-#[cfg(test)]
-fn row(
-    item: &Item,
-    expanded: bool,
-    markdown: Option<SharedString>,
-    choices_active: bool,
-    cx: &App,
-) -> AnyElement {
-    row_with_state(item, expanded, markdown, choices_active, None, cx)
-}
 fn row_with_state(
     item: &Item,
     expanded: bool,
     markdown: Option<SharedString>,
     choices_active: bool,
     state: Option<&super::AppState>,
+    phase: u8,
     cx: &App,
 ) -> AnyElement {
     let t = cx.global::<Theme>();
@@ -378,7 +379,8 @@ fn row_with_state(
                     .child(
                         QuotedText::from_quoted(
                             QuoteKind::Question,
-                            "Question from the provider".into(),
+                            format!("{} asks", state.and_then(|state| state.threads.get(&item.thread))
+                                .map_or("Provider", |thread| thread.provider.label())),
                             display.title,
                         )
                         .render("async-question-title", cx),
@@ -397,17 +399,15 @@ fn row_with_state(
                         option: Some(option_index),
                     };
                     card = card.child(
-                        labelled_button_with(
+                        composer::option_row(
                             SharedString::from(format!(
                                 "async-{}-{question_index}-{option_index}",
                                 item.id
                             )),
-                            display.options[option_index].clone(),
-                            div()
-                                .whitespace_normal()
-                                .line_clamp(2)
-                                .text_ellipsis()
-                                .child(display.options[option_index].clone()),
+                            option_index,
+                            &question.options[option_index],
+                            question.selected == Some(option_index),
+                            false,
                             cx,
                         )
                         .h_auto()
@@ -452,13 +452,11 @@ fn row_with_state(
             let id = item.id;
             row = row
                 .child(
-                    labelled_button(
+                    disclosure_button(
                         SharedString::from(format!("reasoning-{id}")),
-                        if expanded {
-                            "▾ Reasoning"
-                        } else {
-                            "▸ Reasoning"
-                        },
+                        "Reasoning".into(),
+                        IconName::Brain,
+                        expanded,
                         cx,
                     )
                     .justify_start()
@@ -476,20 +474,37 @@ fn row_with_state(
         }
         ItemBody::Tool(tool) => {
             let id = item.id;
-            let label = format!(
-                "{} {} · {}",
-                if expanded { "▾" } else { "▸" },
-                tool_label(&tool.call),
-                tool_status(item, state)
-            );
+            let label = if expanded {
+                veyra_engine::text::display_line(&tool.call.name, false).text
+            } else {
+                tool_label(&tool.call)
+            };
+            let status = match tool_status(item, state) {
+                "Done" => Status::Done { took: 0 },
+                "Working" => Status::Working { since: 0 },
+                "Stopped" => Status::Interrupted,
+                _ => Status::Failed,
+            };
             row = row
                 .child(
-                    labelled_button(SharedString::from(format!("tool-{id}")), label, cx)
-                        .justify_start()
-                        .child(div().flex_1())
-                        .on_click(move |_, window, cx| {
-                            window.dispatch_action(Box::new(ToggleItem { item: Some(id) }), cx)
-                        }),
+                    disclosure_button(
+                        SharedString::from(format!("tool-{id}")),
+                        label,
+                        IconName::Wrench,
+                        expanded,
+                        cx,
+                    )
+                    .justify_start()
+                    .child(div().flex_1())
+                    .child(super::icons::status_mark(
+                        &status,
+                        phase,
+                        t.layout.status_glyph,
+                        super::sidebar::glyph_color(&status, t),
+                    ))
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleItem { item: Some(id) }), cx)
+                    }),
                 )
                 .when_some(failed_tool_last_line(tool), |row, line| {
                     row.child(
@@ -505,19 +520,7 @@ fn row_with_state(
                     )
                 })
                 .when(expanded, |row| {
-                    row.child(
-                        div()
-                            .font_family(t.text.mono_font.clone())
-                            .text_size(t.text.code.size)
-                            .line_height(t.text.code.line_height)
-                            .child(tool_input(&tool.call)),
-                    )
-                    .when_some(tool_output(tool), |row, text| {
-                        row.child(TextView::markdown(
-                            SharedString::from(format!("tool-output-{}", item.id)),
-                            format!("~~~text\n{text}\n~~~"),
-                        ))
-                    })
+                    row.child(plain_output(tool_block(tool), cx))
                 });
         }
         ItemBody::Notice(notice) => {
@@ -562,21 +565,100 @@ fn row_with_state(
     }
     row.into_any_element()
 }
+#[derive(IntoElement)]
+struct TurningChevron {
+    id: SharedString,
+    expanded: bool,
+}
+impl RenderOnce for TurningChevron {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let t = cx.global::<Theme>();
+        let size = t.layout.small_icon;
+        let motion = t.motion.collapse.clone();
+        let [a, b, c, d] = motion.curve;
+        let angle = gpui_kit::base::motion::transition(
+            (self.id, "chevron"),
+            if self.expanded {
+                std::f32::consts::FRAC_PI_2
+            } else {
+                0.
+            },
+            gpui_kit::base::motion::Transition::new(motion.duration)
+                .ease(gpui_kit::base::animation::cubic_bezier(a, b, c, d)),
+            window,
+            cx,
+        );
+        Icon::new(IconName::ChevronRight)
+            .size(size)
+            .rotate(radians(angle))
+    }
+}
+fn disclosure_button(
+    id: SharedString,
+    label: String,
+    icon: IconName,
+    expanded: bool,
+    cx: &App,
+) -> composer::Button {
+    let t = cx.global::<Theme>();
+    labelled_button_with(
+        id.clone(),
+        label.clone(),
+        div()
+            .h_flex()
+            .items_center()
+            .gap(t.layout.control_gap)
+            .child(Icon::new(icon).size(t.layout.small_icon))
+            .child(label)
+            .child(TurningChevron { id, expanded }),
+        cx,
+    )
+    .p_0()
+    .text_size(t.text.label.size)
+    .text_color(t.colors.text_muted)
+}
+fn tool_block(tool: &ToolItem) -> String {
+    let input = tool_input(&tool.call);
+    let command = tool.call.input_summary.is_some()
+        && (!tool.call.veyra_label || tool.call.name == "Command");
+    let input = if command { format!("$ {input}") } else { input };
+    match tool_output(tool) {
+        Some(output) if !input.is_empty() => format!("{input}\n{output}"),
+        Some(output) => output,
+        None => input,
+    }
+}
+fn plain_output(text: String, cx: &App) -> Div {
+    let t = cx.global::<Theme>();
+    div()
+        .w_full()
+        .font_family(t.text.mono_font.clone())
+        .text_size(t.text.code.size)
+        .line_height(t.text.code.line_height)
+        .bg(t.colors.code_wash)
+        .rounded(t.radius.inline)
+        .p(t.space.0[3])
+        .child(text)
+}
 struct OutcomeLine {
     words: String,
     elapsed_seconds: Option<u64>,
 }
 impl OutcomeLine {
+    fn joined_words(&self) -> String {
+        let words = self.words.trim_end();
+        if self.elapsed_seconds.is_none() || words.ends_with(" after") || words.ends_with(" in") {
+            words.into()
+        } else {
+            format!("{words} {}", if words == "Done" { "in" } else { "after" })
+        }
+    }
     fn formatted(&self) -> String {
         self.elapsed_seconds.map_or_else(
             || self.words.clone(),
-            |seconds| format!("{} · {seconds}s", self.words),
+            |seconds| format!("{} {seconds}s", self.joined_words()),
         )
     }
-}
-#[cfg(test)]
-pub fn turn_outcome_line(turn: &Turn) -> Option<String> {
-    turn_outcome_parts(turn).map(|outcome| outcome.formatted())
 }
 fn turn_outcome_parts(turn: &Turn) -> Option<OutcomeLine> {
     let TurnState::Ended {
@@ -657,10 +739,7 @@ fn row_outcome_parts(
         .failed_turn(item.thread)
         .is_some_and(|turn| turn.id == item.turn)
     {
-        return Some(OutcomeLine {
-            words: "Failed".into(),
-            elapsed_seconds: None,
-        });
+        return None;
     }
     state.turns.get(&item.turn).and_then(turn_outcome_parts)
 }
@@ -776,6 +855,9 @@ pub(super) fn family_rows(
         })
         .collect()
 }
+fn family_owns_tail(families: &[(Option<TurnId>, usize)], turn: TurnId) -> bool {
+    families.iter().any(|(owner, _)| *owner == Some(turn))
+}
 pub(super) fn family_title(count: usize) -> String {
     format!("Started {count} agent{}", if count == 1 { "" } else { "s" })
 }
@@ -802,59 +884,138 @@ fn family_card(shell: &Shell, children: &[ThreadId], cx: &App) -> AnyElement {
             let status = shell.state.status(id);
             div()
                 .h_flex()
+                .h(t.layout.icon_button)
                 .items_center()
                 .gap(t.space.0[3])
-                .child(super::icons::status_mark(
-                    &status,
-                    shell.clock.phase,
-                    t.layout.status_glyph,
-                    super::sidebar::glyph_color(&status, t),
-                ))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(super::provider_text::quoted(&child.title, false)),
-                )
-                .child(
-                    div()
-                        .text_size(t.text.meta.size)
-                        .text_color(t.colors.text_muted)
-                        .child(super::header::status_text_at(
-                            &status,
-                            shell.clock.elapsed_at,
-                        )),
-                )
-                .child(
-                    labelled_button(SharedString::from(format!("child-open-{id}")), "Open", cx)
-                        .disabled(child.archived)
-                        .on_click(move |_, window, cx| {
-                            window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
-                        }),
+                    labelled_button_with(
+                        SharedString::from(format!("child-open-{id}")),
+                        child.title.clone(),
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .w_full()
+                            .min_w_0()
+                            .gap(t.layout.control_gap)
+                            .child(super::icons::status_mark(
+                                &status,
+                                shell.clock.phase,
+                                t.layout.status_glyph,
+                                super::sidebar::glyph_color(&status, t),
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(t.text.ui.size)
+                                    .child(
+                                        veyra_engine::text::display_line(&child.title, false).text,
+                                    ),
+                            )
+                            .child(composer::provider_mark(child.provider, cx))
+                            .child(
+                                div()
+                                    .text_size(t.text.meta.size)
+                                    .text_color(t.colors.text_muted)
+                                    .child(super::header::status_text_at(
+                                        &status,
+                                        shell.clock.elapsed_at,
+                                    )),
+                            ),
+                        cx,
+                    )
+                    .p_0()
+                    .flex_1()
+                    .min_w_0()
+                    .disabled(child.archived)
+                    .tooltip(if child.archived {
+                        "Archived thread"
+                    } else {
+                        "Open child thread"
+                    })
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(SelectThread { thread: Some(id) }), cx)
+                    }),
                 )
                 .when(shell.family_stop_visible(child), |row| {
                     row.child(
-                        labelled_button(SharedString::from(format!("child-stop-{id}")), "Stop", cx)
-                            .debug_selector(|| "family-child-stop".into())
-                            .on_click(move |_, window, cx| {
-                                window
-                                    .dispatch_action(Box::new(StopThread { thread: Some(id) }), cx)
-                            }),
+                        labelled_button_with(
+                            SharedString::from(format!("child-stop-{id}")),
+                            "Stop thread",
+                            Icon::new(IconName::Square).size(t.layout.small_icon),
+                            cx,
+                        )
+                        .size(t.layout.small_icon_button)
+                        .p_0()
+                        .tooltip_with_action(
+                            "Stop thread",
+                            &StopThread { thread: Some(id) },
+                            Some("Veyra"),
+                        )
+                        .debug_selector(|| "family-child-stop".into())
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(StopThread { thread: Some(id) }), cx)
+                        }),
                     )
                 })
         }))
         .into_any_element()
 }
-fn task_card(state: &super::AppState, task: TaskId, cx: &App) -> AnyElement {
+fn task_card(shell: &Shell, task: TaskId, item: ItemId, cx: &App) -> AnyElement {
     let t = cx.global::<Theme>();
+    let parent = shell
+        .state
+        .tasks
+        .get(&task)
+        .and_then(|task| shell.state.threads.get(&task.parent));
     div()
         .debug_selector(|| "task-card".into())
-        .rounded(t.radius.card)
-        .bg(t.colors.card)
-        .border(t.layout.border)
-        .border_color(t.colors.border)
-        .p(t.space.0[4])
-        .child(task_card_text(state, task))
+        .v_flex()
+        .gap(t.space.0[3])
+        .text_size(t.text.label.size)
+        .text_color(t.colors.text_muted)
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap(t.layout.control_gap)
+                .child("Task from")
+                .when_some(parent, |row, parent| {
+                    row.child(
+                        labelled_button("task-parent", parent.title.clone(), cx)
+                            .p_0()
+                            .disabled(parent.archived)
+                            .on_click({
+                                let id = parent.id;
+                                move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(SelectThread { thread: Some(id) }),
+                                        cx,
+                                    )
+                                }
+                            }),
+                    )
+                    .child("·")
+                    .child(composer::provider_mark(parent.provider, cx))
+                    .child(parent.provider.label())
+                }),
+        )
+        .child(
+            disclosure_button(
+                format!("relay-note-{item}").into(),
+                "Relay note".into(),
+                IconName::Info,
+                shell.expanded.contains(&item),
+                cx,
+            )
+            .on_click(move |_, window, cx| {
+                window.dispatch_action(Box::new(ToggleItem { item: Some(item) }), cx)
+            }),
+        )
+        .when(shell.expanded.contains(&item), |row| {
+            row.child(veyra_engine::tools::CHILD_GUIDANCE.trim().to_owned())
+        })
         .into_any_element()
 }
 fn task_from(name: &str) -> String {
@@ -920,26 +1081,27 @@ fn failure_card(message: &str, cx: &App) -> AnyElement {
         .v_flex()
         .w_full()
         .gap(t.space.0[4])
-        .py(t.space.0[5])
+        .p(t.space.0[5])
+        .rounded(t.radius.card)
+        .bg(t.colors.danger_wash)
         .debug_selector(|| "failure-card".into())
         .child(
             div()
-                .text_size(t.text.h2.size)
-                .text_color(t.colors.danger)
-                .child("The thread failed"),
-        )
-        .child(
-            div()
+                .h_flex()
+                .items_center()
+                .gap(t.layout.control_gap)
                 .debug_selector(|| "failure-cause".into())
                 .text_size(t.text.read.size)
                 .line_height(t.text.read.line_height)
-                .child(cause.to_owned()),
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .size(t.layout.icon)
+                        .text_color(t.colors.danger),
+                )
+                .child(composer::command_spans(cause, cx)),
         )
         .when(!stderr.is_empty(), |card| {
-            card.child(TextView::markdown(
-                "failure-stderr",
-                format!("~~~text\n{stderr}\n~~~"),
-            ))
+            card.child(plain_output(stderr.to_owned(), cx))
         })
         .child(
             div()
@@ -947,19 +1109,22 @@ fn failure_card(message: &str, cx: &App) -> AnyElement {
                 .gap(t.space.0[3])
                 .child(
                     labelled_button("retry", "Retry", cx)
+                        .outline()
                         .on_click(|_, window, cx| window.dispatch_action(Box::new(Retry), cx)),
                 )
                 .child(
-                    labelled_button("terminal", "Open Terminal", cx).on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(OpenTerminal), cx)
-                    }),
+                    labelled_button("terminal", "Open shell", cx)
+                        .outline()
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(OpenTerminal), cx)
+                        }),
                 ),
         )
         .into_any_element()
 }
 fn outcome_row(outcome: OutcomeLine, cx: &App) -> Div {
     let t = cx.global::<Theme>();
-    let words = veyra_engine::text::display_text(&outcome.words);
+    let words = veyra_engine::text::display_text(&outcome.joined_words());
     let elapsed = outcome.elapsed_seconds.map(|seconds| format!("{seconds}s"));
     div()
         .h_flex()
@@ -978,6 +1143,46 @@ fn outcome_row(outcome: OutcomeLine, cx: &App) -> Div {
                     .child(elapsed.to_owned()),
             )
         })
+}
+fn working_row(shell: &Shell, turn: &Turn, cx: &App) -> Option<AnyElement> {
+    let TurnState::Running { since } = turn.state else {
+        return None;
+    };
+    let t = cx.global::<Theme>();
+    let status = Status::Working { since };
+    Some(
+        div()
+            .debug_selector(|| "transcript-working".into())
+            .h_flex()
+            .items_center()
+            .gap(t.layout.control_gap)
+            .text_size(t.text.label.size)
+            .text_color(t.colors.text_muted)
+            .child(super::icons::status_mark(
+                &status,
+                shell.clock.phase,
+                t.layout.status_glyph,
+                t.colors.accent,
+            ))
+            .child(super::header::status_text_at(
+                &status,
+                shell.clock.elapsed_at,
+            ))
+            .into_any_element(),
+    )
+}
+fn turn_tail(shell: &Shell, turn: TurnId, cx: &App) -> Option<AnyElement> {
+    let turn = shell.state.turns.get(&turn)?;
+    working_row(shell, turn, cx).or_else(|| {
+        if shell
+            .state
+            .failed_turn(turn.thread)
+            .is_some_and(|failed| failed.id == turn.id)
+        {
+            return None;
+        }
+        turn_outcome_parts(turn).map(|outcome| outcome_row(outcome, cx).into_any_element())
+    })
 }
 pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
     let wait_reason = shell
@@ -1027,7 +1232,17 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
                             families.iter().position(|(_, position)| *position == index)
                         {
                             let groups = family_cards(&shell.state, thread.unwrap());
-                            return family_card(shell, &groups[card].children, cx);
+                            let group = &groups[card];
+                            return div()
+                                .v_flex()
+                                .w_full()
+                                .gap(cx.global::<Theme>().space.0[3])
+                                .when(index == 0, |row| {
+                                    row.pt(cx.global::<Theme>().text.read.line_height)
+                                })
+                                .child(family_card(shell, &group.children, cx))
+                                .children(group.turn.and_then(|turn| turn_tail(shell, turn, cx)))
+                                .into_any_element();
                         }
                         let index = index
                             - families
@@ -1051,12 +1266,17 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
                                         .is_none_or(|previous| previous.turn != item.turn);
                                 let label = turn
                                     .filter(|_| first)
+                                    .filter(|turn| {
+                                        !matches!(turn.origin, TurnOrigin::Task { .. })
+                                            || !matches!(item.body, ItemBody::TaskCard(_))
+                                    })
                                     .and_then(|turn| turn_label(&shell.state, turn));
                                 div()
                                     .v_flex()
                                     .w_full()
                                     .pb(t.space.0[5])
                                     .gap(t.space.0[3])
+                                    .when(index == 0, |row| row.pt(t.text.read.line_height))
                                     .when_some(label, |row, label| {
                                         row.child(
                                             div()
@@ -1067,7 +1287,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
                                         )
                                     })
                                     .child(if let ItemBody::TaskCard(task) = item.body {
-                                        task_card(&shell.state, task, cx)
+                                        task_card(shell, task, item.id, cx)
                                     } else {
                                         row_with_state(
                                             item,
@@ -1083,6 +1303,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
                                                     .flat_map(|items| items.values()),
                                             ),
                                             Some(&shell.state),
+                                            shell.clock.phase,
                                             cx,
                                         )
                                     })
@@ -1115,9 +1336,19 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
                                             ))
                                         },
                                     )
-                                    .when_some(outcome, |row, outcome| {
-                                        row.child(outcome_row(outcome, cx))
-                                    })
+                                    .when_some(
+                                        outcome.filter(|_| !family_owns_tail(&families, item.turn)),
+                                        |row, outcome| row.child(outcome_row(outcome, cx)),
+                                    )
+                                    .when(
+                                        next.is_none_or(|next| next.turn != item.turn)
+                                            && !family_owns_tail(&families, item.turn),
+                                        |row| {
+                                            row.children(
+                                                turn.and_then(|turn| working_row(shell, turn, cx)),
+                                            )
+                                        },
+                                    )
                                     .into_any_element()
                             })
                             .unwrap_or_else(|| div().into_any_element())
@@ -1128,9 +1359,15 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
         )
         .when(shell.scroller.read(cx).latest_visible(), |content| {
             content.child(
-                labelled_button("latest", "Latest", cx).on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(ScrollTranscriptEnd), cx)
-                }),
+                labelled_button("latest", "Latest", cx)
+                    .absolute()
+                    .bottom(shell.composition_height + t.space.0[5])
+                    .rounded(t.radius.full)
+                    .bg(t.colors.floating)
+                    .shadow(t.shadows.floating.clone())
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ScrollTranscriptEnd), cx)
+                    }),
             )
         })
         .child(
@@ -1247,7 +1484,60 @@ pub fn dump_item(item: &Item) -> serde_json::Value {
 }
 
 #[cfg(test)]
+impl MessageScrollerState {
+    pub fn prepend(&mut self, cx: &mut Context<Self>) {
+        self.insert(0, cx);
+    }
+}
+#[cfg(test)]
+fn row(
+    item: &Item,
+    expanded: bool,
+    markdown: Option<SharedString>,
+    choices_active: bool,
+    cx: &App,
+) -> AnyElement {
+    row_with_state(item, expanded, markdown, choices_active, None, 0, cx)
+}
+#[cfg(test)]
+pub fn turn_outcome_line(turn: &Turn) -> Option<String> {
+    turn_outcome_parts(turn).map(|outcome| outcome.formatted())
+}
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn family_card_precedes_outcome() {
+        let turn = super::TurnId::new();
+        let other = super::TurnId::new();
+        assert!(super::family_owns_tail(&[(Some(turn), 2)], turn));
+        assert!(!super::family_owns_tail(&[(Some(turn), 2)], other));
+        assert!(!super::family_owns_tail(&[], turn));
+    }
+    #[test]
+    fn outcome_joins_elapsed_with_in_for_done() {
+        for (words, expected) in [
+            ("Done", "Done in 2s"),
+            ("Stopped by you", "Stopped by you after 2s"),
+            ("Stopped after", "Stopped after 2s"),
+        ] {
+            assert_eq!(
+                super::OutcomeLine {
+                    words: words.into(),
+                    elapsed_seconds: Some(2)
+                }
+                .formatted(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::OutcomeLine {
+                words: "Failed".into(),
+                elapsed_seconds: None
+            }
+            .formatted(),
+            "Failed"
+        );
+    }
     use gpui_kit::component::StyledExt;
     #[cfg(debug_assertions)]
     #[gpui::test]
@@ -2123,7 +2413,7 @@ mod tests {
             started: Some(1000),
             at: 43_000,
         };
-        assert_eq!(super::turn_outcome_line(&turn), Some("Done · 42s".into()));
+        assert_eq!(super::turn_outcome_line(&turn), Some("Done in 42s".into()));
         turn.state = TurnState::Ended {
             outcome: TurnOutcome::Interrupted {
                 reason: "Stopped by you".into(),
@@ -2133,7 +2423,7 @@ mod tests {
         };
         assert_eq!(
             super::turn_outcome_line(&turn),
-            Some("Stopped by you · 16s".into())
+            Some("Stopped by you after 16s".into())
         );
         turn.state = TurnState::Ended {
             outcome: TurnOutcome::Failed {
@@ -2284,11 +2574,11 @@ mod tests {
         assert_eq!(super::row_outcome(&items[0], items.get(1), &state), None);
         assert_eq!(
             super::row_outcome(&items[1], items.get(2), &state),
-            Some("Done · 2s".into())
+            Some("Done in 2s".into())
         );
     }
     #[test]
-    fn failure_caption_defers_to_banner_and_preserves_history() {
+    fn failure_card_shows_once() {
         let thread = ThreadId::new();
         let message =
             "Claude is signed out. Sign in from a terminal with `claude`, then send again.";
@@ -2318,10 +2608,7 @@ mod tests {
         let mut state = super::super::AppState::default();
         state.turns.insert(turn.id, turn);
         assert_eq!(state.failure(thread), Some(message));
-        assert_eq!(
-            super::row_outcome(&item, None, &state),
-            Some("Failed".into())
-        );
+        assert_eq!(super::row_outcome(&item, None, &state), None);
         let later = Turn {
             id: TurnId::new(),
             thread,
@@ -2335,6 +2622,26 @@ mod tests {
             super::row_outcome(&item, None, &state),
             Some(format!("Failed · {message}"))
         );
+    }
+    #[test]
+    fn tool_output_has_no_language_label() {
+        let tool = ToolItem {
+            approval: None,
+            interruption: None,
+            call: ToolCall {
+                name: "Command".into(),
+                veyra_label: false,
+                arguments: serde_json::json!({"command":"echo hello"}),
+                input_summary: Some("echo hello".into()),
+            },
+            output_tail: String::new(),
+            result: Some(ToolResult {
+                ok: true,
+                output_tail: Some("hello".into()),
+            }),
+        };
+        assert_eq!(super::tool_block(&tool), "$ echo hello\nhello");
+        assert!(!super::tool_block(&tool).contains("~~~text"));
     }
     #[test]
     fn failed_tool_last_line() {
@@ -2384,7 +2691,7 @@ mod question_security_tests {
         let displayed = dump_item(&item);
         assert_eq!(
             displayed["display_questions"][0]["options"][0],
-            "“Violet next”"
+            "Violet next"
         );
         assert_eq!(
             displayed["body"]["AsyncQuestions"]["questions"][0]["options"][0],

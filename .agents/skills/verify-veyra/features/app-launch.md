@@ -43,6 +43,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 pid = identity()
 dump = ctl('dump-before','dump')
 launch = json.loads((PROOF/'launch-login-path.json').read_text())
@@ -56,6 +57,7 @@ assert dump['notice'] is None and dump['view'] == 'new_thread'
 assert dump['drawer'] is None and dump['focus'] == 'composer'
 capture('window-launch')
 start = time.monotonic()
+add_window_rule('second-launch')
 second = subprocess.Popen(['target/debug/veyra'],env=ENV,stdout=(PROOF/'second-launch.txt').open('w'),
     stderr=subprocess.STDOUT,start_new_session=True)
 (PROOF/'second-pid').write_text(str(second.pid)+'\n')
@@ -118,6 +120,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 identity()
 action('persistent-project','AddProject',{'path':str(DATA/'project')})
 poll('persistent-project-added',lambda d: any(row['kind']=='project' for row in d['sidebar']['rows']))
@@ -219,6 +222,7 @@ mkdir -p "$REL_PROOF"
 test -x /usr/bin/sandbox-exec
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 stop('before-release')
 PY
 cargo build --release -p veyra
@@ -256,10 +260,12 @@ if kill -0 "$DEBUG_PID" 2>/dev/null; then
 fi
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 orphans = marked_processes()
 (PROOF/'release'/'orphan-preflight.txt').write_text(f'marked orphan count={len(orphans)}\n')
 print(f'marked orphan count={len(orphans)}')
 assert not orphans, 'release launch refused: marked orphan processes exist'
+add_window_rule('release-launch')
 PY
 test "$(ioreg -n Root -d1 -a | grep -c CGSSessionScreenIsLocked || true)" = 0
 ! pgrep -x veyra >/dev/null
@@ -294,6 +300,14 @@ for attempt in $(seq 1 100); do
     sleep .1
 done
 grep -q "^veyra ready pid=$REL_PID data_dir=$REL_DATA$" "$REL_PROOF/stderr.log"
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
+from driver import *
+release_pid = int((PROOF/'release/pid').read_text())
+release_window = int(window_id(release_pid))
+(PROOF/'release/window-id').write_text(str(release_window)+'\n')
+owned_window_record('release-launch',release_pid,release_window)
+normalize_owned_window('release-launch',release_pid,release_window)
+PY
 /bin/ls -laR "$REL_DATA" >"$REL_PROOF/data-listing.txt"
 test ! -e "$REL_DATA/control.sock"
 test -S "$REL_DATA/veyra.sock"
@@ -312,6 +326,7 @@ if grep -q 'reaper signalled orphan group' "$REL_PROOF/veyra.log"; then
 fi
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 import re
 release = PROOF/'release'
 metadata = json.loads((release/'provider-paths.json').read_text())
@@ -331,6 +346,10 @@ PY
 ```
 
 ## Observable success
+
+On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+
+Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
 
 - Window: inspect `window-launch.png` for the empty sidebar, left-aligned Add project, header, upper-third composer and Geist.
 - Identity: Doctor asserts the live pid, revision, data folder, schema_version, system appearance and window id, within two seconds.

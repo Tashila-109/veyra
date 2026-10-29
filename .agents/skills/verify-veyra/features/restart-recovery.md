@@ -1,7 +1,7 @@
 # Restart and recovery
 
 Status: passed, 2026-10-26, bd8a083, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 8577dad2), 04a7915fa1161aff46917715a373df5e42fd4cf96074c140cd91d718806bc615
-Covers: crates/engine/src/data_dir.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/veyra/src/relay.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
+Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/header.rs crates/engine/src/data_dir.rs crates/engine/src/mcp.rs crates/engine/src/tools.rs crates/veyra/src/relay.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/**
 
 ## Sub-features
 
@@ -26,6 +26,8 @@ After ConfirmQuit begins, Escape keeps the quit sheet visible until the app exit
 
 ## Driving it with veyra ctl
 
+Every `start()` below installs a fresh uniquely labelled one-shot yabai rule when available, verifies that the owned window is unmanaged and floating, and restores the proved 960×740 geometry inside its display's visible frame. The run's rule ledger covers every orderly and crash relaunch; Cleanup removes any unconsumed label.
+
 Run Launch and Doctor first, with fake CLI only; the section calls `prepare()`.
 The final section adds a child task through the production relay, then crashes and relaunches the owned app.
 The `ctl quit` and crash relaunches also run app-launch's database checks against this page's starting project row and inode.
@@ -39,6 +41,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 prepare()
 assert LANE == 'fake'
 project_row = sql('select id,path,name from projects order by id')
@@ -79,11 +82,12 @@ let before = NSBitmapImageRep(data: try Data(contentsOf: URL(fileURLWithPath: pa
 let after = NSBitmapImageRep(data: try Data(contentsOf: URL(fileURLWithPath: paths[1])))!
 let x = before.pixelsWide / 64
 let y = before.pixelsHigh / 2
-if !before.colorAt(x: x, y: y)!.isEqual(after.colorAt(x: x, y: y)!) {
-    print("FAIL quit sheet hid the sidebar")
+let equal = before.colorAt(x: x, y: y)!.isEqual(after.colorAt(x: x, y: y)!)
+if equal != (paths[2] == "translucent") {
+    print("FAIL quit sheet sidebar scrim")
     exit(1)
 }
-print("PASS quit sheet preserves the sidebar")
+print("PASS quit sheet sidebar scrim")
 """)
 
 ctl('restart-cancel-key','keys','escape')
@@ -97,7 +101,7 @@ ctl('restart-confirm-key','keys','secondary-enter')
 wait_gone(pid)
 owned_groups_gone(groups)
 checked = subprocess.run(['swift',str(checker),str(PROOF/'restart-before-sheet.png'),
-    str(PROOF/'restart-quit-sheet.png')])
+    str(PROOF/'restart-quit-sheet.png'),sheet['look']['background']])
 assert checked.returncode == 0, 'quit sheet hid the sidebar'
 
 start('restart-orderly')
@@ -240,6 +244,10 @@ PY
 ```
 
 ## Observable success
+
+On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+
+Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
 
 `restart-sheet.json` and its PNG show quit_sheet.open and the busy thread title.
 `restart-family-quit-sheet.json` and its PNG name the child's project and root title.

@@ -3,7 +3,54 @@
 Import it from the checkout root with PYTHONPATH=.agents/skills/verify-veyra/bin and RUN exported.
 It sets no application state; its writes are fixture copies, screenshots and proof.
 """
-import ctypes, errno, hashlib, json, os, pathlib, re, shutil, signal, sqlite3, struct, subprocess, sys, time
+import ctypes, errno, hashlib, json, math, os, pathlib, re, shutil, signal, sqlite3, struct, subprocess, sys, time, uuid
+def cleanup_window_rules(proof, run):
+    proof = pathlib.Path(proof)
+    assert re.fullmatch(r'[0-9a-f]{8}',run)
+    assert proof.resolve() == (pathlib.Path.cwd()/'target/verify-veyra'/run).resolve()
+    ledger = proof/'owned-yabai-labels'
+    if not ledger.exists(): return
+    rows, errors = [], []
+    tool = shutil.which('yabai')
+    for label in dict.fromkeys(ledger.read_text().splitlines()):
+        if not re.fullmatch('veyra-verify-'+run+r'-[0-9a-f]{32}',label):
+            errors.append('unowned label refused')
+            continue
+        try:
+            assert tool, 'yabai unavailable for owned-rule cleanup'
+            command = [tool,'-m','rule','--remove',label]
+            result = subprocess.run(command,capture_output=True,text=True)
+            missing = result.returncode == 1 and (result.stdout+result.stderr).strip() == f"rule with label '{label}' not found."
+            rows.append({'label':label,'exit':result.returncode,'already_consumed':missing,'invocation':command})
+            if result.returncode and not missing: errors.append('owned rule removal failed: '+label)
+        except Exception as error:
+            errors.append(str(error))
+    receipt = {'labels':rows,'errors':errors,'passed':not errors}
+    (proof/('yabai-rule-cleanup-'+str(time.time_ns())+'.json')).write_text(json.dumps(receipt,indent=2)+'\n')
+    assert not errors, errors
+def cleanup_window_rule_index(index):
+    index = pathlib.Path(index)
+    if not index.exists(): return
+    errors, records = [], set()
+    for line in index.read_text().splitlines():
+        try:
+            row = json.loads(line)
+            records.add((row['proof'],row['run']))
+        except Exception: errors.append('incomplete owned-rule index entry')
+    for proof,run in sorted(records):
+        try: cleanup_window_rules(proof,run)
+        except Exception as error: errors.append(str(error))
+    index.with_suffix('.cleanup.json').write_text(json.dumps({'proofs':len(records),'errors':errors,'passed':not errors},indent=2)+'\n')
+    assert not errors, errors
+if __name__ == '__main__':
+    if sys.argv[1:2] == ['--cleanup-yabai-rules']:
+        (pathlib.Path(sys.argv[2])/('yabai-cleanup-entry-'+str(time.time_ns())+'.json')).write_text(json.dumps(sys.argv)+'\n')
+        cleanup_window_rules(sys.argv[2],sys.argv[3])
+    else:
+        assert sys.argv[1:2] == ['--cleanup-yabai-index'] and len(sys.argv)==3
+        pathlib.Path(sys.argv[2]).with_suffix('.invocation.json').write_text(json.dumps(sys.argv)+'\n')
+        cleanup_window_rule_index(sys.argv[2])
+    raise SystemExit(0)
 assert pathlib.Path('crates/veyra/Cargo.toml').is_file(), 'run sections from the checkout root'
 RUN = os.environ['RUN']
 PROOF = pathlib.Path.cwd()/'target/verify-veyra'/RUN
@@ -157,6 +204,52 @@ def capture(name):
     except Exception:
         observe_failure(name,'capture')
         raise
+def capture_content(name):
+    if LANE != 'fake':
+        return capture(name)
+    from pixels import capture_checked
+    before = ctl(name+'-content-before','dump')
+    def focus(state):
+        return {'surface':state['focus'],'composer':state['composer']['focused'],
+            'control':state['composer']['control_focus']}
+    receipt = {'before':focus(before),'after':None,'placeholder_focus':None,
+        'focus_moved':False,'restored':None,'pixel_checks_passed':False}
+    try:
+        capture(name)
+        state = ctl(name+'-paint-state','dump')
+        capture_checked(PROOF,name,state)
+        receipt['after'] = focus(state)
+        selected = state['selected_thread']
+        settled = not state['composer']['stop_visible'] and (selected is None
+            or selected['status'] not in ['Working','NeedsYou'])
+        receipt['placeholder_settled'] = settled
+        if settled and state['composer']['focused'] and state['composer_text']=='' and state['composer']['placeholder']:
+            expected = state['composer']['placeholder']
+            receipt['focus_moved'] = True
+            receipt['restored'] = False
+            try:
+                ctl(name+'-placeholder-tab','action','root::Tab')
+                focused = poll(name+'-placeholder-focus',lambda d:
+                    not d['composer']['focused'] and bool(d['composer']['control_focus']))
+                receipt['placeholder_focus'] = focus(focused)
+                assert focused['composer']['placeholder']==expected
+                capture(name+'-placeholder')
+                painted = ctl(name+'-placeholder-paint-state','dump')
+                assert not painted['composer']['focused'] and painted['composer']['control_focus']
+                assert painted['composer']['placeholder']==expected
+                capture_checked(PROOF,name+'-placeholder',painted)
+            finally:
+                action(name+'-placeholder-restore','FocusComposer')
+                restored = poll(name+'-placeholder-restored-focus',lambda d:d['focus']=='composer')
+                receipt['after'] = focus(restored)
+                receipt['restored'] = True
+        receipt['pixel_checks_passed'] = True
+    finally:
+        try:
+            receipt['after'] = focus(ctl(name+'-content-final-focus','dump'))
+        finally:
+            (PROOF/(name+'-content-capture.json')).write_text(json.dumps(receipt,indent=2)+'\n')
+
 def cg_windows():
     """Read WindowServer metadata in memory; never retain another window's title."""
     import plistlib
@@ -456,7 +549,86 @@ def make_git_shim():
         'touch '+shlex.quote(str(DATA/'branch-finished'))+'\n'
         "printf '%s\\n' fixture-branch\n")
     git.chmod(0o700)
-def start(label):
+def add_window_rule(label):
+    tool = shutil.which('yabai')
+    if not tool:
+        save(label+'-yabai-rule',{'skipped':'yabai unavailable'})
+        return
+    name = 'veyra-verify-'+RUN+'-'+uuid.uuid4().hex
+    with (PROOF/'owned-yabai-labels').open('a') as output:
+        output.write(name+'\n')
+        output.flush()
+        os.fsync(output.fileno())
+    index = os.environ.get('VEYRA_VERIFY_RULE_INDEX')
+    if index:
+        with pathlib.Path(index).open('a') as output:
+            output.write(json.dumps({'run':RUN,'proof':str(PROOF)})+'\n')
+            output.flush()
+            os.fsync(output.fileno())
+    command = [tool,'-m','rule','--add','--one-shot','label='+name,'app=^veyra$','manage=off']
+    result = subprocess.run(command,capture_output=True,text=True)
+    save(label+'-yabai-rule',{'label':name,'app':'veyra','app_regex':'^veyra$',
+        'exit':result.returncode,'invocation':command,'stdout':result.stdout,'stderr':result.stderr})
+    assert result.returncode==0, 'owned one-shot rule could not be installed'
+def require_unmanaged(row):
+    assert (row.get('is-floating') is True and row.get('split-type')=='none'
+        and row.get('split-child')=='none' and type(row.get('stack-index')) is int
+        and row['stack-index']==0), 'owned window joined the tile tree'
+    return row
+def owned_window_record(label, pid=None, window=None):
+    tool = shutil.which('yabai')
+    if not tool: return
+    pid = int((PROOF/'pid').read_text()) if pid is None else pid
+    window = int((PROOF/'window-id').read_text()) if window is None else window
+    owned = owned_app_pids()
+    release = PROOF/'release/pid'
+    assert pid in owned or (release.exists() and int(release.read_text())==pid), 'refused an unowned app pid'
+    command = [tool,'-m','query','--windows','--window',str(window)]
+    save(label+'-owned-window-invocation',command)
+    result = subprocess.run(command,capture_output=True,text=True)
+    (PROOF/(label+'-owned-window.stderr')).write_text(result.stderr)
+    assert result.returncode==0, 'owned window record unavailable'
+    row = json.loads(result.stdout)
+    assert row['id']==window and row['pid']==pid and row['app']=='veyra', 'refused a foreign window'
+    save(label+'-owned-window',row)
+    return require_unmanaged(row)
+def normalize_owned_window(label, pid=None, window=None):
+    before = owned_window_record(label+'-normalize-before',pid,window)
+    if before is None:
+        return save(label+'-normalized-window',{'skipped':'yabai unavailable'})
+    pid,window = before['pid'],before['id']
+    command = [str(PROOF/'visible-frame'),str(pid),str(window)]
+    save(label+'-visible-frame-invocation',command)
+    result = subprocess.run(command,capture_output=True,text=True)
+    (PROOF/(label+'-visible-frame.stderr')).write_text(result.stderr)
+    assert result.returncode==0, 'owned display visible frame unavailable'
+    visible = json.loads(result.stdout)['visible_frame']
+    x,y,width,height = visible
+    assert width>=960 and height>=740, 'owned display cannot fit the proved window size'
+    left,top = math.ceil(x+(width-960)/2),math.ceil(y+(height-740)/2)
+    target = {'x':left,'y':top,'w':960,'h':740}
+    assert x<=left and y<=top and left+960<=x+width and top+740<=y+height
+    tool = shutil.which('yabai')
+    operations = []
+    for operation,value in [('--resize','abs:960:740'),('--move',f'abs:{left}:{top}')]:
+        owned_window_record(label+'-normalize-check',pid,window)
+        command = [tool,'-m','window',str(window),operation,value]
+        operations.append({'invocation':command})
+        save(label+'-normalization-operations',operations)
+        result = subprocess.run(command,capture_output=True,text=True)
+        operations[-1]['exit'] = result.returncode
+        save(label+'-normalization-operations',operations)
+        assert result.returncode==0, 'owned window normalization failed'
+    end = time.monotonic()+5
+    while True:
+        after = owned_window_record(label+'-normalize-after',pid,window)
+        if after['frame']==target: break
+        assert time.monotonic()<end, 'owned window did not reach the proved bounds'
+        time.sleep(.05)
+    assert x<=left and y<=top and left+960<=x+width and top+740<=y+height
+    return save(label+'-normalized-window',{'before':before['frame'],'after':after['frame'],
+        'visible_frame':visible,'pid':pid,'window':window})
+def start(label, normalize=True):
     assert not locked()
     foreign = foreign_veyra()
     assert not foreign, f'a veyra this run did not start is running: {foreign}'
@@ -466,6 +638,7 @@ def start(label):
         rec = PROOF/'rec'/f'{len(owned_app_pids())+1:02d}-{label}'
         ENV['VEYRA_RECORD'] = str(rec)
         (PROOF/'rec-current').write_text(str(rec)+'\n')
+    add_window_rule(label)
     app = subprocess.Popen([str(pathlib.Path('target/debug/veyra').resolve())],cwd=DATA/'appcwd',env=ENV,
         stdout=(PROOF/(label+'.stdout')).open('w'),stderr=(PROOF/(label+'.stderr')).open('w'),
         start_new_session=True)
@@ -484,7 +657,9 @@ def start(label):
     window = window_id(pid)
     assert window
     (PROOF/'window-id').write_text(window+'\n')
+    owned_window_record(label)
     identity()
+    if normalize: normalize_owned_window(label)
     return pid
 def restart(label, crash=False):
     stop(label,crash)
@@ -673,9 +848,9 @@ def stage_family(parent='waiting', child='complete'):
         for record in child_records:
             wire = record.get('line',{})
             if wire.get('type') == 'assistant':
-                record['after_ms'] = 2000
+                record['after_ms'] = 12000
                 wire['message']['content'][0]['text'] = 'First report line\n**Second report line**\nThird report line\n\n- A list item\n- Another item\n\n~~~text\ncode line one\ncode line two\n~~~'
-            if wire.get('type') == 'result': record['after_ms'] = 30000
+            if wire.get('type') == 'result': record['after_ms'] = 20000
     else:
         assert child == 'running'
         child_records = [json.loads(line) for line in (SOURCE/'long-reply.jsonl').read_text().splitlines()]
@@ -697,6 +872,14 @@ def create_family(name, parent='waiting', child='complete'):
         and int(sql('select count(*) from threads'))>=before+1)
     root = dump['selected_thread']['id']
     poll(name+'-task',lambda d:any(task['parent']==root for task in d['tasks']))
+    if parent == 'waiting':
+        poll(name+'-parent-settled',lambda d:
+            sql("select ended_at is not null from turns where thread_id='"+root+"' and ordinal=1")=='1'
+            and d['selected_thread'] is not None and d['selected_thread']['id']==root
+            and d['selected_thread']['status']=='Done'
+            and d['selected_thread']['header_status'].split(' · ')[0]=='Done'
+            and not d['composer']['stop_visible']
+            and d['look']['control_labels'].get('Name("send")')=='Send')
     row = sql("select child_thread_id||'|'||id from tasks where parent_thread_id='"+root+"'").split('|')
     assert len(row)==2
     return root,row[0],row[1]
@@ -815,3 +998,72 @@ def backdrop_pid_self_test():
         rejects(lambda: stop_owned_backdrop(pid,expected))
         kill.assert_called_once_with(pid,signal.SIGTERM)
     print('backdrop pid self-test: executable ownership, before/after reopen, dead refusal and each signal passed')
+def window_rules_self_test():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    global PROOF, RUN
+    previous = PROOF,RUN
+    RUN = '0123abcd'
+    PROOF = pathlib.Path.cwd()/'target/verify-veyra'/RUN
+    PROOF.mkdir(parents=True,exist_ok=False)
+    calls = []
+    def reject(operation):
+        try: operation()
+        except AssertionError: return
+        raise AssertionError('unsafe owned-window case passed')
+    def command(argv, **options):
+        calls.append(argv)
+        if '--add' in argv:
+            label = next(item[6:] for item in argv if item.startswith('label='))
+            assert label in (PROOF/'owned-yabai-labels').read_text().splitlines()
+            assert '--one-shot' in argv and 'app=^veyra$' in argv and 'manage=off' in argv
+            return SimpleNamespace(returncode=0,stdout='',stderr='')
+        assert argv[1:4]==['-m','rule','--remove']
+        return SimpleNamespace(returncode=1,stdout='',stderr=f"rule with label '{argv[-1]}' not found.\n")
+    try:
+        with patch('shutil.which',return_value=None),patch('subprocess.run') as run:
+            add_window_rule('absent')
+            run.assert_not_called()
+        with patch('shutil.which',return_value='/owned/yabai'),patch('subprocess.run',side_effect=command), \
+                patch.dict(os.environ,{'VEYRA_VERIFY_RULE_INDEX':str(PROOF/'index.jsonl')}):
+            add_window_rule('first')
+            add_window_rule('second')
+            labels=(PROOF/'owned-yabai-labels').read_text().splitlines()
+            assert len(set(labels))==2
+            cleanup_window_rules(PROOF,RUN)
+            assert len(calls)==4
+            with patch('subprocess.run',return_value=SimpleNamespace(returncode=1,stdout='',stderr='add refused')):
+                reject(lambda:add_window_rule('failed-add'))
+            labels=(PROOF/'owned-yabai-labels').read_text().splitlines()
+            assert len(labels)==3
+            (PROOF/'owned-yabai-labels').write_text('\n'.join([*labels,'foreign-label'])+'\n')
+            reject(lambda:cleanup_window_rules(PROOF,RUN))
+            assert all('foreign-label' not in call for call in calls)
+            (PROOF/'owned-yabai-labels').write_text('\n'.join(labels)+'\n')
+            with patch('subprocess.run',return_value=SimpleNamespace(returncode=1,stdout='',stderr='not found')):
+                reject(lambda:cleanup_window_rules(PROOF,RUN))
+            with patch('subprocess.run',return_value=SimpleNamespace(returncode=0,stdout='',stderr='')):
+                cleanup_window_rules(PROOF,RUN)
+            with (PROOF/'index.jsonl').open('a') as output: output.write('{incomplete')
+            before=len(calls)
+            reject(lambda:cleanup_window_rule_index(PROOF/'index.jsonl'))
+            assert len(calls)==before+len(labels)
+        unmanaged={'is-floating':True,'split-type':'none','split-child':'none','stack-index':0}
+        assert require_unmanaged(unmanaged)==unmanaged
+        for changed in [{'is-floating':False},{'split-type':'vertical'},{'split-child':'second_child'},{'stack-index':True}]:
+            reject(lambda changed=changed:require_unmanaged(dict(unmanaged,**changed)))
+        before=dict(unmanaged,pid=11,id=22,frame={'x':20,'y':40,'w':1280,'h':800})
+        after=dict(before,frame={'x':3360,'y':346,'w':960,'h':740})
+        def geometry(argv, **options):
+            if argv[0].endswith('visible-frame'):
+                return SimpleNamespace(returncode=0,stdout=json.dumps({'visible_frame':[2560,23,2560,1385]}),stderr='')
+            assert argv[1:4]==['-m','window','22'] and argv[4] in ['--move','--resize']
+            return SimpleNamespace(returncode=0,stdout='',stderr='')
+        with patch(__name__+'.owned_window_record',side_effect=[before,before,before,after]), \
+                patch('shutil.which',return_value='/owned/yabai'),patch('subprocess.run',side_effect=geometry):
+            measured=normalize_owned_window('geometry',11,22)
+            assert measured['after']==after['frame']
+    finally:
+        shutil.rmtree(PROOF)
+        PROOF,RUN = previous
+    print('window rule self-test: unique one-shot labels, owned cleanup, fail-closed floating and visible-frame placement passed')

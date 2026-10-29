@@ -23,6 +23,7 @@ gpui_kit::assets::icon_assets!(
         Wrench,
         CornerDownLeft,
         Command,
+        Terminal,
     ]
 );
 
@@ -146,22 +147,43 @@ mod tests {
 
     #[test]
     fn status_paths_are_distinct() {
+        use super::super::{
+            sidebar::glyph_color,
+            theme::{Appearance, Theme},
+        };
+
         let paths = [
-            (Status::Working { since: 0 }, "marks/working.svg"),
-            (Status::NeedsYou, "marks/needs-you.svg"),
-            (Status::Done { took: 0 }, "marks/done.svg"),
-            (Status::Failed, "marks/failed.svg"),
-            (Status::Idle, "marks/idle.svg"),
-            (Status::Held, "marks/held.svg"),
-            (Status::Interrupted, "marks/interrupted.svg"),
+            (Status::Working { since: 0 }, "marks/working.svg", "accent"),
+            (Status::NeedsYou, "marks/needs-you.svg", "warning"),
+            (Status::Done { took: 0 }, "marks/done.svg", "success"),
+            (Status::Failed, "marks/failed.svg", "danger"),
+            (Status::Idle, "marks/idle.svg", "text_muted"),
+            (Status::Held, "marks/held.svg", "text_muted"),
+            (Status::Interrupted, "marks/interrupted.svg", "text_muted"),
         ];
-        for (status, path) in &paths {
+        for (status, path, role) in &paths {
             assert_eq!(status_path(status), *path);
+            for appearance in [Appearance::Dark, Appearance::Light] {
+                let theme = Theme::new(appearance);
+                let expected = match *role {
+                    "accent" => theme.colors.accent,
+                    "warning" => theme.colors.warning,
+                    "success" => theme.colors.success,
+                    "danger" => theme.colors.danger,
+                    "text_muted" => theme.colors.text_muted,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    glyph_color(status, &theme),
+                    expected,
+                    "{status:?} {appearance:?}"
+                );
+            }
         }
         assert_eq!(
             paths
                 .iter()
-                .map(|(status, _)| status_path(status))
+                .map(|(status, _, _)| status_path(status))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
             paths.len()

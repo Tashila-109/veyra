@@ -560,6 +560,7 @@ Kitty keyboard mode stays disabled.
 Emulator clipboard events are discarded; clipboard access requires the human's explicit copy or paste action in the window.
 
 `ui::drawer` owns each thread's open state, height, active index and numbered tab list.
+Each new tab takes the lowest unused positive number in that thread's drawer. Tabs show a terminal mark, an ended mark and a close control, and the invisible resize band resets to the default height on double-click.
 These last only for the app session.
 `ui::terminal_view` paints the active tab's current emulator grid, with bundled mono text and a still cursor.
 Hidden tabs keep parsing while their subscriptions schedule no repaint.
@@ -684,16 +685,16 @@ Codex omits threadId, turnId, itemId, startedAtMs, kind, commandActions, availab
 commandActions describes the parsed command already shown verbatim; it is not a second command to execute. availableDecisions describes the reply choices. proposedExecpolicyAmendment proposes a persistent policy change that Veyra never selects: command approval and exact thread grants reply accept, never acceptWithExecpolicyAmendment. These fields do not alter the current command, working folder or access under that reply. Any environmentId value other than the string "local" is execution-affecting passthrough and leaves the command's location unverified, with its literal cwd retained in the preview. Actual environment, network and sandbox overrides remain execution-affecting passthrough.
 Grok leaves an unrecognized cwd in its preview and selects description before reason, retaining the other explanation.
 Every unmapped field remains in the preview, including environment, network and sandbox options, and truncated previews keep their cut notice.
-The window applies the consent projection to the received preview without decoding JSON or omitting keys.
-A newly produced empty residual object becomes empty preview text and renders no preview block. Nonempty residuals and stored previews from older codecs, including incomplete JSON and the literal {}, remain visible in full.
-The working-folder quote stays beside the consequence above the scrolling details, with its path in a vertical scroll viewport of at most three lines; the reason scrolls with the command and preview.
+The window decodes complete object previews for layout only, displaying their residual keys and values as a list and omitting no key. It lifts MCP tool_params into an Arguments group while retaining every sibling, including unknown _meta fields. Non-object, invalid or truncated JSON stays text, and a truncated preview keeps its cut notice.
+A newly produced empty residual object becomes empty preview text in the codec and renders no preview block. Nonempty residuals and stored previews from older codecs remain visible in full; an empty object left in a stored preview is labelled Empty object.
+The working-folder quote follows the scrolling command and preview, with its path in an independent vertical viewport of at most three lines. The labelled reason follows the folder in a separate bounded viewport; scrolling the command leaves both in place.
 ToolCall retains its serde-defaulted veyra_label flag for stored compatibility.
 Transcript tool titles use unquoted bounded display text for both Veyra and provider names, followed by a distinct command, search target or other main argument when present.
 Consent commands, previews, literal paths and approval tool names show Unicode controls, format and default-ignorable characters as visible ⟨U+XXXX⟩ markers.
 Commands and Veyra's pretty JSON previews retain newlines; paths and tool names mark them.
 Multiline command consequences name the line count, including blank lines, above the scrolling details.
-The shell owns ApprovalScroll, pairing the docked request id with its details and folder scroll handles.
-A changed request id, including closing the dock, replaces both handles; repainting the same request preserves its offset.
+The shell owns ApprovalScroll, pairing the docked request id with its details, folder and reason scroll handles.
+A changed request id, including closing the dock, replaces all three handles; repainting the same request preserves their offsets.
 An always-visible kit scrollbar exposes actual overflow.
 The thread-grant button shows the first line of the marked command, shortened to its available width; execution, native replies and stored grant identities retain the original bytes.
 The UI takes ProviderKind for provider-specific behavior; display labels do not select behavior.
@@ -714,7 +715,7 @@ The active session drains before the new prompt is sent; a choice deliberately c
 Card eligibility is a projection of item order: any later UserText item in the same thread closes every remaining choice, including after a typed answer.
 The engine rejects choices on such cards, and the window disables their controls; no new stored closed flag or migration is needed.
 An unnamed Command-1 through Command-9 action additionally requires a card in the thread's latest turn; explicit item actions retain their item/question/option identity.
-The question stays in the transcript with Answered beside its quoted choice and disabled option buttons after selection.
+The question stays in the transcript with Answered beside its plain choice and disabled, checked option buttons after selection.
 An MCP elicitation is classified by codex_approval_kind first, then by a message naming serverName and a quoted or unquoted tool with an optional question mark.
 It docks with the server and tool, offers no thread grant, and answers only action accept, decline or cancel without persisting provider grant metadata.
 Other MCP forms are declined with a notice, and unsupported server requests get -32601.
@@ -1151,17 +1152,19 @@ AppState::text_rows selects only a text-only pump batch's changed rows in the op
 Other batches still remeasure the list for structural, outcome and queue-label changes.
 The inline streaming caret remains part of the markdown source, so a growing assistant row still takes the kit's full-replacement parse path.
 Failed tools show their last nonempty output line, truncated to one row at its width.
+Tool and reasoning disclosures share a tool mark and a chevron driven by the collapse token. Reduced Motion snaps that transition. Expanded tool output is a plain mono block, with a command prefixed by $ exactly once and no language heading.
 The window and dump share row_outcome, which annotates only each ended turn's final item.
-The failure card follows the final item of its failed turn, whose outcome caption reads Failed because the card shows its cause.
+The failure card follows the final item of its failed turn, replacing that turn's separate outcome caption.
 Historical failed turns retain the cause in their caption.
 OutcomeLine keeps words and optional elapsed seconds separate until rendering, while the debug dump formats them as one line.
-Elapsed time renders in a separate outcome segment, and an outcome reconciled after Veyra closed has no elapsed segment.
+Elapsed time renders in a separate outcome segment, joined with in for Done and after for other outcomes, without duplicating an existing joining word. An outcome reconciled after Veyra closed has no elapsed segment.
 A user scroll detaches following; new text, requests and tool rows preserve that state.
 Scrolling within text.read.line_height of the bottom or choosing Latest reattaches.
 Latest appears only while following is detached and content remains below.
+It floats over the lane. Family rows precede the originating turn's outcome or Working row; each opens its child and carries the shared marks and an icon Stop. A child's task card combines the parent link and provider mark on one Task from line, with the relay note folded separately from its task bubble.
 Expanding a row remeasures it without moving its top anchor.
 Streamed text and tool input remain unbounded outside the 4 MiB wire-line cap.
-The failed view uses the latest nonqueued turn and places its cause, Retry and Open Terminal on the project folder after that turn's content.
+The failed view uses the latest nonqueued turn and places its cause, plain mono stderr, Retry and Open shell after that turn's content on danger_wash. OpenTerminal opens the thread's owned drawer and focuses it.
 Queued wait words sit directly below their own user bubble.
 Each transcript item has paragraph spacing, and a stored TerminalSpan uses a bordered block, terminal text and the label This turn ran in the terminal.
 It renders the provider’s failure cause and any next step in that cause without appending a generic sign-in footer.
@@ -1176,10 +1179,11 @@ The composer uses TextareaState and provider/model/effort/permission chips.
 Typed gpui action payloads reject malformed ids and enum values at dispatch, with a visible error.
 On New thread, OpenProviderPicker and its key open the provider menu through a controlled kit popover.
 An open menu rebuilds its readiness labels when probing begins and when each reply arrives.
-Not-ready providers disable Send with their repair command, which stays below the composer when its provider menu opens.
+Not-ready providers disable Send with a repair banner inside the composer card, which keeps its place when the provider menu opens. Commands in Veyra's own copy use mono spans instead of literal backticks.
 A signed-out failure card shows the provider's one sign-in instruction from its cause.
 Codex and Grok use the same picker and composer, with model labels and effort choices read from their probes.
 The selected model chip uses the catalog display name and falls back to the stored value when the catalog lacks it.
+Unset effort reads Provider default because the engine's Model projection supplies supported efforts but no default. Provider menus show marks, readiness dots and the current tick; the other picker menus show icons and ticks. After a first send the provider is a still mark. The composer uses an accent edge while focused, a raised shadow and a state-specific placeholder.
 Grok uses its initialize catalog, with Default-only model and effort menus when modelState is absent; switching providers clears both selections and resets the permission mode to the new provider’s run mode of the stored Settings default.
 Codex's commands, file changes, permissions, MCP approvals, questions and retry/limit notices use the existing dock, question card and transcript rows.
 A Claude root's Codex child uses the same task card, breadcrumb and family projection.
@@ -1192,10 +1196,17 @@ The composer renders the effective run mode and cycles only offered modes while 
 New thread resets text and applies the selected provider’s run mode to the current stored default.
 Settings occupies the main column and opens through OpenSettings, the sidebar foot, the native menu or Command-comma.
 Its three-mode default row and two-choice Window background row use actions and persist independently.
+Both rows use kit setting items in one group card, with tracked segmented controls and descriptions below their label and control row.
+The theme maps the kit group surface to card and its foreground to text. At the minimum window width, each label wraps in the flexible left column while its segmented control keeps its width on the right.
+An active sidebar or drawer resize reads window mouse events until release, so crossing an occluding child control cannot interrupt the drag. Only the resize band's mouse-down starts that state; release outside its bounds and window deactivation both clear it.
 Command-Option-B cycles SetWindowBackground.
 SetDefaultMode publishes SettingsChanged; Escape or thread/project selection leaves Settings.
 
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
+The shared content controls retain the kit button's activation, focus and tooltip behaviour. Their wrapper owns only hovered and pressed feedback, timed by the theme's hover and press tokens. A paint wrapper delegates the button's layout and paints the common inset ring after the kit's clipped caption, so the ring remains visible at scroll edges. Reduced Motion snaps feedback and disclosure transitions.
+In debug builds the wrapper records each control's painted bounds by its actual ElementId; dump exposes them under look.controls so approval outline, fill and warning checks use observed geometry.
+The matching look.control_labels map names visible captions for those controls, excluding icon-only accessibility names and preserving the text actually shown by command spans. Text assertions on these captions use only that control's bounds inset on every side by look.layout.control_radius, clipped to the captured window edge, square-padded with the mode of the captured interior fill and always upscaled2x LANCZOS. They have no full-image fallback or retry. Recognition boxes map back to the original capture for subsequent colour and geometry checks; exact text, counts and confidence thresholds stay unchanged.
+The dump's look.colors also exposes the kit's actual button_primary_foreground and button_danger_foreground, the exact fields painted by its Primary and Danger variants. Filled-keycap checks use the foreground for that button variant and project captured pixels onto the observed fill-to-foreground segment, requiring at least 0.5 coverage and at most 5 channel error; every accepted pixel's coverage and residual is retained.
 Ctrl+C is literal control in the composer and preserves its draft while interrupting the turn.
 ToggleShellDrawer is bound to secondary-j without a key context, so it remains reachable from drawer focus.
 gpui resolves key bindings before keydown listeners.
@@ -1204,14 +1215,14 @@ Command-N remains a window action while the drawer has focus; drawer tab binding
 The pure terminal_key_bytes maps Shift-Enter to ESC CR, Option-Left and Option-Right to ESC b and ESC f, Command-Left and Command-Right to Ctrl-A and Ctrl-E, and Ctrl-L to form feed.
 It also maps ordinary text, control bytes, navigation and function keys, including application-cursor arrows, directly to the PTY queue.
 Selection, paste and scrollback belong to TerminalView; IME remains unsupported.
-The approval dock (`ui/composer.rs`) renders only the codec's typed ProposedAction and does no disk work to render it.
+The approval dock (`ui/composer.rs`) renders the codec's typed ProposedAction and does no disk work to render it. Its stored bounded preview stays unchanged; a display-only recursive value projection lays out all residual names and values and lifts material MCP tool parameters beside their remaining metadata siblings. Only the codec's existing classification omits bookkeeping; the window removes no field, including duplicate fields left in older stored previews.
 The chat column bounds the composer by its available height; the transcript gives up space before the dock.
-Flex layout measures the hold row, request count, consequence, wrapped decision buttons, focus hint, input and toolbar before shrinking the details to the remaining height, capped at composer_max_height (240px).
-The command or file path, model-written reason and bounded argument preview share that details scroll area, which keeps at least one code-text line.
-The consequence, any Deny-only consent reason and any outside working folder sit above it, and Allow and Deny stay below it.
+Flex layout measures the hold row, request count, consequence, wrapped decision buttons, input and toolbar before shrinking the details to the remaining height, capped at composer_max_height (240px).
+The command or file path and bounded argument preview share that details scroll area, which keeps at least one code-text line. The provider's labelled reason follows the folder in a separate bounded viewport, retaining its own scroll handle under pressure.
+The consequence and any Deny-only consent reason sit above it. The independently scrolling outside working folder follows the command details, with Allow and Deny below it.
 The folder's viewport keeps at most three label-text lines.
 Docks, the input and toolbar share one raised surface, rim and height budget.
-The message input grows from 48px to 240px while space remains and keeps its draft scrollable under pressure.
+The message input grows from 48px to 240px while space remains and keeps its draft scrollable under pressure. DockedInputLayout caches the text and measured wrap width; one text-system measurement determines the input's natural height, while the inner editor retains a one-row minimum so it can shrink inside that viewport.
 The composition surface yields its scrolling details and input space before hiding decisions, while the transcript retains three reading lines.
 A fade at the transcript's foot draws only over the opaque content plane.
 Decision controls put Deny and Allow once before the optional thread grant, so a wide grant wraps after both decisions instead of forcing three rows.
@@ -1224,7 +1235,7 @@ Question text scrolls from one 20px line up to the 240px composer cap beneath it
 Up to four options use one column; larger lists use three columns.
 Option captions wrap to two lines with an ellipsis inside buttons of at least 28px; overflowing lists scroll in a 28–240px bounded viewport with the same overflow-only scrollbar.
 Shell owns QuestionScroll separately, keyed by the docked RequestId and question index; a changed target replaces both its text and option-list handles, and repainting the same target keeps their offsets.
-Shell owns both approval handles and replaces them when the docked request id changes, so each new request opens at the top with its full marked path available by scrolling and no elision.
+Shell owns all three approval handles and replaces them when the docked request id changes, so each new request opens at the top with its full marked path available by scrolling and no elision.
 The stable folder element id does not own that reset.
 The dock shows 1 of N for multiple pending requests and a separate Question 1 of N count within a multi-question request.
 Approval chords and number keys answer only while the dock has focus; the composer keeps Command+Return as Send.
@@ -1234,13 +1245,12 @@ Button ids contain the request and question identity, so a repaint to a differen
 Keyboard handlers retain the focused dock's rendered target.
 Respond rejects an expired or missing request, and a question choice rejects an index that has already advanced, without selecting another request.
 Because a docked request implies a running turn, composer Command+Return with an empty draft dispatches Stop, which interrupts the turn and expires the request.
-Enabled approval buttons show their answer chords only with dock focus; otherwise the dock offers Command+Shift+Y to focus it.
-A disabled thread-grant button uses Allow in this thread because its consent carries no grant.
+Approval buttons always show their answer chords, dimmed outside dock focus; Command+Shift+Y focuses the region. Unoffered decisions are hidden, with their typed consent reason retained.
 Eligible thread grants retain the command caption.
 Requests never take focus automatically, and answering an approval or question keeps dock focus while another request remains.
 After the last response, focus returns to the composer once no other pending request remains.
-Approvals and questions share the same unfocused dock prompt and FocusDock chord.
-The focused dock has an accent border.
+Approvals and questions share the FocusDock chord and an inset focus ring on the focused region.
+QuestionScroll also owns the option cursor, keyed by the same request and question target. MoveOptionUp, MoveOptionDown and AnswerFocusedOption act only from dock focus and retain that rendered target, while composer arrows and Return keep their input meaning. Docked and async options share one row with a trailing digit cap and a chosen check.
 The focused approval chords are Command+Return, Command+Option+Return and Command+period.
 Grant button captions keep whitespace in their visible first line, add an ellipsis at a newline, and truncate to their width.
 Their accessibility labels retain the whole original caption.
@@ -1349,15 +1359,20 @@ Dump drawer holds the selected thread's open state, height, active tab, tab proc
 Dump focus reports composer, drawer or none from focus-handle observations.
 A modal sheet reports none; it remembers the originating surface for Cancel. composer_caret reports the input offset.
 The debug-only DebugFocusShellDrawer action targets the same terminal focus handle as a click, for deterministic drive preconditions.
+DebugDoubleClickShellDrawer reaches the owned resize band through synthetic pointer events. The dump adds colors, layout, the rendered viewport's width and height in points, header_title and observed title/status bounds under look, input bounds and placeholder under composer, and the dock's option_cursor. These values guide capture assertions; on-device Vision reads only retained fake-lane window PNGs, with Pillow checking their sRGB pixels at the captured backing scale. All text recognition always upscales its input by two with Pillow LANCZOS, including whole captures and transcript-column crops. Short header labels keep their observed element bounds, padded to a square with their own captured background; control captions keep their inset control crops. Recognition boxes map back through captured pixels to the queried point geometry, confidence is retained unchanged, and colour checks use the original pixels. Each text source has one fixed path with exact text and unchanged count, confidence and wrap checks; full-image recognition is never a fallback for the header or control crops.
 All terminal repaint counters and flood measurement consumers are excluded from release builds with cfg(debug_assertions).
 mailbox_free is the command sender's unreserved channel capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
 The composer exposes offered_modes and permission_picker_open beside its effective mode; selected_thread.config retains the stored configuration.
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
+Its debug-only bounds measure the dock frame; content_inset, focus_inset and focus_border report the padding and ring geometry used by its renderer. Dock text stays inside that padding in both focus states, with approval detail text constrained to the available width and wrapped or ellipsized there.
+Its input_bounds are the measured textarea container, while the textarea keeps its own text and caret bounds internally. The toolbar wraps at narrow widths, keeping Send or Stop on the trailing edge of its row, and chat keeps three read lines above the composition surface. The debug control_focus records the focused button's ElementId beside the measured surface_bounds.
 Its allow_once_enabled, allow_in_thread_enabled and consent_reason use the same typed consent as the rendered controls.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.
+Source-file test helpers follow production items. Shell's TestCapture is zero-sized with a no-op command hook in ordinary builds; test builds collect sent commands there without placing test-only fields or branches ahead of production rendering code.
 The debug-only veyra::DebugDisplayOptions action overrides the three display flags without changing macOS settings.
+The debug-only veyra::DebugComposerWidth action takes an optional positive finite width in points, capped at the theme composer maximum, and changes only that column; null or an invalid width restores normal sizing. The composer dump reports width_override beside its measured surface_bounds. It never resizes or moves the native window, and the action, override state and dump field are absent from release.
 The look dump reports the stored choice, effective background, flags, forcing reason and sidebar tint coverage in force as `look.glass_coverage`.
 The debug-only `veyra::DebugAgeQuiet` action accepts a thread id and minutes, subtracts those minutes from that Working thread's quiet activity timestamp, and repaints; the next activity event replaces it with the real timestamp.
 It changes no engine status or turn timing, and `header::quiet_for` remains the display rule.
@@ -1395,7 +1410,7 @@ The following clarifications and remaining differences are checked against the c
   That fallback is not implemented: every Claude root receives the flag; refusal exits before initialize and fails the turn (`provider/claude.rs`, `provider/session.rs`).
   A live check on 2026-10-20 recorded Claude 2.1.304 accepting it.
 - Design 9.1 asks for a separate next-step line.
-  The failed view shows each failure's own cause, Retry and Open Terminal, without a separate next-step line.
+  The failed view shows each failure's own cause, Retry and Open shell, without a separate next-step line.
   The cause carries the next step when the provider supplies one (`ui/transcript.rs`).
 
 ## Source map
@@ -1422,7 +1437,7 @@ Their Veyra-authored fixtures are probe-signed-out.jsonl, probe-api-key.jsonl, p
 
 codex_root_config_sets_grace_and_tool_timeout and codex_rejected_optional_keys_retry_independently guard both optional keys and independent drop-key retries. codex_sign_in_failure_names_login_once replays sign-in-required.jsonl, whose unauthorized error shape is from Codex 0.162.1's TurnCompletedNotification schema; its message is Veyra-authored, not a recorded authentication failure. codex_unknown_error_kinds_keep_the_failure_message guards forward-compatible fallback. grok_turn_completed_ends_own_prompt_after_guard and grok_old_tail_never_ends_next_prompt run turn-completed-only.jsonl through the session timer; codec_guard_waits_once_and_ignores_late_reply and codec_untagged_tail_never_ends_next_prompt guard adverse ordering. grok_approval_deny retains the denial ending.
 
-capture_keeps_none_and_masks_other_account_values and fixtures_hold_no_secret_shapes guard recording and fixture masking. keys_dispatches_down_then_up_per_keystroke guards the debug driver. chip_lists_offered_modes checks the composer. family_card_renders_user_status_words checks rendered card text; sidebar_tooltip_uses_shared_status_display is a GPUI wiring assertion that the tooltip uses the same display function, not a native tooltip capture. failed_banner_renders_own_cause_and_one_sign_in_instruction checks rendered causes and the absence/presence of sign-in text; failure_caption_defers_to_banner_and_preserves_history guards captions. actor_shutdown_during_missing_resume_spawns_no_replacement waits on marker and exit conditions with 30-second bounds, keeping its no-replacement and recovery assertions.
+capture_keeps_none_and_masks_other_account_values and fixtures_hold_no_secret_shapes guard recording and fixture masking. keys_dispatches_down_then_up_per_keystroke guards the debug driver. chip_lists_offered_modes checks the composer. family_card_renders_user_status_words checks rendered card text; sidebar_tooltip_uses_shared_status_display is a GPUI wiring assertion that the tooltip uses the same display function, not a native tooltip capture. failed_banner_renders_own_cause_and_one_sign_in_instruction checks rendered causes and the absence/presence of sign-in text; failure_card_shows_once guards the latest failure card and historical captions. actor_shutdown_during_missing_resume_spawns_no_replacement waits on marker and exit conditions with 30-second bounds, keeping its no-replacement and recovery assertions.
 
 A live check on 2026-10-20 recorded the shapes on Claude 2.1.304, codex-cli 0.162.1 and Grok 1.0.62; the 403 frame and Codex's rejection wording rest only on Veyra-authored fixtures.
 Its Claude lifecycle ran queued, started, result, completed, so completion without started remains fixture-only.
@@ -1531,7 +1546,7 @@ Actor tests check account-error retirement before queued work; a separate probe 
 Live CLI behavior and performance need explicitly authorized checks; fake replay and structural checks cannot establish them.
 Drawer tests use a scripted SHELL and the fake CLI's shell mode.
 Ordinary tests do not open the user's shell or an installed provider TUI.
-Real provider permission behavior, native keyboard/IME/pointer delivery and Open Terminal's OS side effect are not proved by fake replay or the debug driver.
+Real provider permission behavior and native keyboard/IME/pointer delivery are not proved by fake replay or the debug driver.
 Composer Stop sends Interrupt and sidebar StopThread sends StopThread; real-provider continuation requires explicitly authorized live verification.
 
 Codex replay tests cover approvals, questions, elicitation, request cancellation order, resume errors and retries, all mode triples, early completion, foreign-thread filtering, notices and both command-output sources.

@@ -1069,7 +1069,10 @@ pub fn shell_fixture_job() -> io::Result<ShellJob> {
 #[cfg(test)]
 #[test]
 fn duplicated_descriptor_survives_original_reuse() {
-    use std::io::{Read, Seek, Write};
+    use std::{
+        io::{Read, Seek, Write},
+        os::fd::{FromRawFd, IntoRawFd},
+    };
     let root = std::env::temp_dir().join(format!("veyra-fd-{}", crate::domain::ThreadId::new()));
     std::fs::create_dir(&root).unwrap();
     let _scratch = crate::tests::Scratch(root.clone());
@@ -1080,20 +1083,17 @@ fn duplicated_descriptor_survives_original_reuse() {
     let number = original.as_raw_fd();
     let duplicate = duplicate_fd(number).unwrap();
     assert_ne!(duplicate.as_raw_fd(), number);
-    drop(original);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let replacement = loop {
-        let replacement = File::create(root.join("replacement")).unwrap();
-        if replacement.as_raw_fd() == number {
-            break replacement;
-        }
-        drop(replacement);
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the owned descriptor was not reused within two seconds"
-        );
-        std::thread::yield_now();
-    };
+    let mut temporary = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(root.join("replacement"))
+        .unwrap();
+    temporary.write_all(b"replacement").unwrap();
+    assert_eq!(unsafe { libc::dup2(temporary.as_raw_fd(), number) }, number);
+    let _ = original.into_raw_fd();
+    let mut replacement = unsafe { File::from_raw_fd(number) };
+    drop(temporary);
     let mut held = File::from(duplicate);
     held.rewind().unwrap();
     let mut contents = String::new();
@@ -1101,6 +1101,10 @@ fn duplicated_descriptor_survives_original_reuse() {
     assert_eq!(contents, "original");
     assert!(foreground_group(&held.into()).is_err());
     assert_eq!(replacement.as_raw_fd(), number);
+    contents.clear();
+    replacement.rewind().unwrap();
+    replacement.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "replacement");
 }
 
 #[cfg(test)]

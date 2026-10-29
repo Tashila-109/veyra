@@ -1,7 +1,7 @@
 # Chat send and stream
 
 Status: passed, 2026-10-26, bd8a083, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 8577dad2), 499455d2934978100f02857041ba1c059f5b96662d658046e48d8d81396074a2
-Covers: crates/veyra/src/ui/provider_text.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
+Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/header.rs crates/veyra/src/ui/provider_text.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
 
 ## Sub-features
 
@@ -21,9 +21,10 @@ The sidebar and header show Veyra's Working arc, Done check, Failed cross and Id
 The arc steps on the one shared clock and stays still under Reduce Motion; the elapsed words still advance.
 The chat centres user bubbles and assistant markdown in one column, with a still caret while text streams.
 Reasoning and tool rows start collapsed; `ToggleItem` opens their detail, retaining the last 10,000 characters of tool output.
+The wrapped Grok toolbar capture uses the debug-only `DebugComposerWidth` action to set a 440-point composer column inside the unchanged window. It checks Send's painted right edge against the card's painted right edge, without any window-manager call, then restores the original column option through the action and polls its dump and measured width. Its provider-supplied title "Execute `pwd`" keeps the provider's literal backticks; command spans apply to Veyra's own copy.
 ⌘⇧I toggles the latest reasoning/tool detail.
-On failure, read the plain cause and stderr tail, use Retry (`veyra::Retry`, ⌘R), or Open Terminal (`veyra::OpenTerminal`, ⌘⌥T).
-Open Terminal's OS side effect remains a manual check; this page proves its rendered button, not an external terminal window.
+On failure, read the plain cause and stderr tail, use Retry (`veyra::Retry`, ⌘R), or Open shell (`veyra::OpenTerminal`, ⌘⌥T).
+Open shell opens and focuses the selected thread's owned drawer.
 Selecting a thread reaches `SelectThread`; selecting a project reaches `SelectProject`.
 
 ## Driving it with veyra ctl
@@ -41,6 +42,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 prepare()
 before = ctl('chat-before','dump')
 if LANE == 'live':
@@ -117,6 +119,12 @@ assert 'claude exited unexpectedly (exit code 7)' in message
 assert 'Veyra fixture error: stream closed' in message and 'last diagnostic line' in message
 assert len(message.splitlines()) <= 9
 capture('chat-failed')
+drawer_fixture()
+action('chat-open-shell','OpenTerminal')
+poll('chat-failed-shell-open',lambda d:d['drawer']['open'] and d['focus']=='drawer'
+    and d['drawer']['terminal'] is not None and 'VEYRA_TUI_READY' in ''.join(d['drawer']['terminal']['grid']))
+capture('chat-failed-shell')
+drawer_keys('chat-failed-shell-close','cmd-w','drawer','composer')
 stage('ok-reply',slow=True)
 ctl('chat-retry-key','keys','secondary-r')
 retry = ctl('chat-retry-wait','wait',failed,'Done')
@@ -131,6 +139,49 @@ capture('chat-tool-collapsed')
 action('chat-tool-expand','ToggleItem',{'item':tool['id']})
 assert next(item for item in ctl('chat-tool-expanded','dump')['transcript']['items'] if item['id']==tool['id'])['expanded']
 capture('chat-tool-expanded')
+source = SOURCE/'bash-echo.jsonl'
+records = [json.loads(line) for line in source.read_text().splitlines()]
+changes = []
+def short_tool_command(value, path=''):
+    if isinstance(value,dict):
+        for key,child in value.items():
+            if key=='command':
+                assert isinstance(child,str)
+                changes.append({'path':path+'/'+key,'before':child,'after':'echo ok'})
+                value[key] = 'echo ok'
+            else: short_tool_command(child,path+'/'+key)
+    elif isinstance(value,list):
+        for index,child in enumerate(value): short_tool_command(child,path+'/'+str(index))
+short_tool_command(records)
+assert changes
+fragments = [record['line']['event']['delta'] for record in records
+    if record.get('type')=='emit_inbound' and record.get('line',{}).get('type')=='stream_event'
+    and record['line']['event'].get('delta',{}).get('type')=='input_json_delta']
+parsed = json.loads(''.join(delta['partial_json'] for delta in fragments))
+assert parsed['command']=='echo veyra-probe'
+parsed['command'] = 'echo ok'
+for index,delta in enumerate(fragments):
+    before = delta['partial_json']
+    delta['partial_json'] = json.dumps(parsed) if index==0 else ''
+    changes.append({'path':'input_json_delta/'+str(index),'before':before,'after':delta['partial_json']})
+derived = '\n'.join(json.dumps(record) for record in records)+'\n'
+(PROOF/'chat-short-command-records.jsonl').write_text(derived)
+save('chat-short-command-diff',{'source':str(source),
+    'source_sha256':hashlib.sha256(source.read_bytes()).hexdigest(),'changes':changes})
+import difflib
+(PROOF/'chat-short-command.diff').write_text(''.join(difflib.unified_diff(
+    source.read_text().splitlines(keepends=True),derived.splitlines(keepends=True),
+    fromfile=str(source),tofile='chat-short-command-records.jsonl')))
+stage_records(records)
+short_thread = create('chat-short-command','Show a short command',scenario=None)
+short = ctl('chat-short-command-done','wait',short_thread,'Done')
+short_tool = next(row for row in short['transcript']['items'] if row['kind']=='tool')
+assert short_tool['body']['Tool']['call']['input_summary']=='echo ok'
+action('chat-short-command-expand','ToggleItem',{'item':short_tool['id']})
+poll('chat-short-command-expanded',lambda d:next(row for row in d['transcript']['items'] if row['id']==short_tool['id'])['expanded'])
+capture('chat-short-command-expanded')
+action('chat-short-command-return','SelectThread',{'thread':tool_thread})
+poll('chat-short-command-returned',lambda d:d['selected_thread']['id']==tool_thread)
 action('chat-tool-collapse','ToggleItem',{'item':tool['id']})
 collapsed = ctl('chat-tool-collapsed-action','dump')['transcript']['items']
 assert not next(item for item in collapsed if item['id']==tool['id'])['expanded']
@@ -246,7 +297,7 @@ capture('chat-failed-tool-expanded')
 signed = create('chat-signed-out','Sign-in failure',scenario='assistant-error-signed-out')
 signed_dump = ctl('chat-signed-out-failed','wait',signed,'Failed')
 assert 'Claude is signed out. Sign in from a terminal' in signed_dump['selected_thread']['failure']
-assert [item['outcome'] for item in signed_dump['transcript']['items'] if item['outcome']] == ['Failed']
+assert [item['outcome'] for item in signed_dump['transcript']['items'] if item['outcome']] == []
 capture('chat-signed-out')
 records = [json.loads(line) for line in (SOURCE/'assistant-error-signed-out.jsonl').read_text().splitlines()]
 records[4]['after_ms']=3000
@@ -303,7 +354,7 @@ for scenario, words in [
     ctl(label+'-draft','text','Check this message')
     action(label+'-send','Send')
     failed = poll(label+'-failed',lambda d:d['selected_thread'] is not None and d['selected_thread']['status']=='Failed' and words in json.dumps(d))
-    assert [item['outcome'] for item in failed['transcript']['items'] if item['outcome']] == ['Failed']
+    assert [item['outcome'] for item in failed['transcript']['items'] if item['outcome']] == []
     thread = failed['selected_thread']['id']
     pid = sql("select live_pid from threads where id='"+thread+"'")
     assert pid and pid != '0'
@@ -355,6 +406,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYCODEX'
 from driver import *
+capture = capture_content
 prepare()
 assert LANE == 'fake'
 thread = create_codex('codex-chat',slow=True)
@@ -457,6 +509,7 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYGROK'
 from driver import *
+capture = capture_content
 prepare()
 assert LANE == 'fake'
 records = grok_records('ok-reply',slow=True)
@@ -482,7 +535,7 @@ thread = create_grok('grok-signed-out',scenario='signed-out',prompt='Show an aut
 failed = ctl('grok-signed-out','wait',thread,'Failed')
 assert failed['view']=='failed_thread'
 assert 'Sign in with `grok login`' in failed['selected_thread']['failure']
-assert [item['outcome'] for item in failed['transcript']['items'] if item['outcome']] == ['Failed']
+assert [item['outcome'] for item in failed['transcript']['items'] if item['outcome']] == []
 assert 'grok login' in sql("select outcome_json from turns where thread_id='"+thread+"'")
 capture('grok-signed-out')
 records = grok_records('background-work')
@@ -500,6 +553,7 @@ assert not background['composer']['stop_visible']
 assert sql("select count(*) from turns where thread_id='"+thread+"' and outcome_json='\"Completed\"'")=='2'
 assert sql("select count(*) from turns where thread_id='"+thread+"' and origin_json='\"Provider\"'")=='1'
 assert [item['text'] for item in background['transcript']['items'] if item['kind']=='assistant']==['foreground','background reply']
+assert background['selected_thread']['header_status']=='Done · 0s'
 capture('grok-background-done')
 records = grok_records('tool-title')
 position = next(i for i,r in enumerate(records) if r.get('type')=='emit_inbound'
@@ -515,6 +569,27 @@ assert len(tools)==1 and tools[0]['body']['Tool']['call']['name']=='Execute `pwd
 assert len([item for item in titled['transcript']['items'] if item['kind']=='assistant'])==2
 assert sql("select count(*) from items where thread_id='"+thread+"' and kind='tool'")=='1'
 capture('grok-tool-title')
+assert tools[0]['body']['Tool']['call']['input_summary'] is None
+assert tools[0]['body']['Tool']['call']['arguments']=={'variant':'Bash','command':'pwd'}
+before_toolbar = ctl('grok-toolbar-before','dump')
+original_width = before_toolbar['composer']['width_override']
+try:
+    action('grok-toolbar-column','DebugComposerWidth',{'width':440})
+    poll('grok-toolbar-column-ready',lambda d:d['composer']['width_override']==440
+        and d['composer']['surface_bounds'][2]==440)
+    action('grok-toolbar-focus','FocusComposer')
+    focused = poll('grok-toolbar-focused',lambda d:d['composer']['focused'])
+    assert focused['look']['viewport']==before_toolbar['look']['viewport']
+    capture('grok-toolbar-wrapped')
+    action('grok-tool-title-expand','ToggleItem',{'item':tools[0]['id']})
+    poll('grok-tool-title-expanded',lambda d:next(row for row in d['transcript']['items'] if row['id']==tools[0]['id'])['expanded'])
+    capture('grok-tool-title-expanded')
+    action('grok-tool-title-collapse','ToggleItem',{'item':tools[0]['id']})
+    poll('grok-tool-title-collapsed',lambda d:not next(row for row in d['transcript']['items'] if row['id']==tools[0]['id'])['expanded'])
+finally:
+    action('grok-toolbar-column-restore','DebugComposerWidth',{'width':original_width})
+    poll('grok-toolbar-column-restored',lambda d:d['composer']['width_override']==original_width
+        and d['composer']['surface_bounds'][2]==before_toolbar['composer']['surface_bounds'][2])
 poll('grok-chat-idle',lambda d:sql('select count(*) from threads where live_pgid is not null')=='0')
 action('grok-chat-return-new','NewThread')
 action('grok-chat-return-claude','PickProvider',{'provider':'claude'})
@@ -555,6 +630,10 @@ PYGROK
 
 ## Observable success
 
+On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+
+Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
+
 The Claude 403 and completed-without-started fixtures show their own failure cause with no sign-in instruction.
 Their next turn completes on the same saved process pid, with two ended turns in SQLite.
 The sign-in failure view shows the command already supplied by its cause only once.
@@ -587,11 +666,12 @@ Both names share the bounded display projection.
 - `chat-background-working.json` stays Working after its foreground turn ends and `wait Done 1` times out.
 - The ambient-only interval shows Done while the session remains alive; `chat-provider-done.json` shows Done after the separate provider turn completes.
 - The CLI-started turn stores exactly one completed assistant reply and no empty reasoning; `sql.log` and the dump assert the exact items.
-- `chat-failed.json` has `view: failed_thread`, Failed and the crash cause with both fixture stderr lines; its PNG shows the cause, next step, Retry and Open Terminal.
+- `chat-failed.json` has `view: failed_thread`, Failed and the crash cause with both fixture stderr lines; its PNG shows the cause, next step, Retry and Open shell.
 - `chat-retried.json` has Done with the retried completed `ok`.
 - `drive.log` records wait exit 0 for each state and 1 with `veyra ctl wait timed out:` for the zero-second timeout.
   Exit 2 for bad usage and 3 for a missing or archived thread are proven by `ctl_wait_exit_codes` (`crates/veyra/src/control.rs`), so this page no longer drives them.
 - `chat-tool-done.json` has a completed collapsed tool with captured output `veyra-probe`; the action and key assert its expanded state, with collapsed/expanded PNGs.
+- `chat-short-command-expanded.png` binds the projected command to exactly one painted `$ echo ok` in the plain output block, with no backticks, raw JSON or language label. Its runtime-derived records change the command and reassemble its streamed JSON fragments, with the source hash and diff retained; the tool's recorded output stays unchanged. Arbitrary tool output remains exact in `dump` and readable in the full-size capture.
 - Thread selection and transcript loading use the snapshot fence, not a UI database read.
 
 `chat-follow-25.json` remains detached at 25 px and `chat-follow-24.json` reattaches within one read line.
@@ -608,7 +688,7 @@ For stored-mode compatibility, see [stored Grok modes](permission-matrix.md#stor
 `transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
 `transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
 Items include `outcome`, queued `wait_reason`, a tool's `failed_last_line` and its rendered `tool_label`.
-The failed banner's own turn has `outcome` `["Failed"]`; historical failed turns retain their cause in the caption.
+The failure card's own turn has no separate `outcome` caption; historical failed turns retain their cause in the caption.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
 Engine commands await space in the window's gpui task, so Stop is retained when that capacity is zero.
 
@@ -624,6 +704,7 @@ Engine commands await space in the window's gpui task, so Stop is retained when 
       "chat-done.png",
       "chat-failed.json",
       "chat-failed.png",
+      "chat-failed-shell.png",
       "chat-provider-done.json",
       "chat-background-working.json",
       "chat-follow-first-bottom.png",
@@ -701,7 +782,7 @@ The codec consumes typed item frames and reads no raw events to invent one.
 Replay is not a live permission or tool proof.
 Approvals, questions and Stop are covered by their feature pages.
 A streamed row may complete before the turn ends; the header remains Working until the result.
-Open Terminal and native mouse/keyboard entry points remain manual checks.
+Native mouse/keyboard entry points remain manual checks.
 Update Status from candidate acceptance.
 
 A Codex command that runs as a later call in the same turn can arrive with no `item/*` frames.

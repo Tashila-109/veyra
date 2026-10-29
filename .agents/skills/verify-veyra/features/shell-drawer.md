@@ -1,7 +1,7 @@
 # Shell drawer
 
 Status: passed, 2026-10-26, bd8a083, human login-shell lane not run (fake CLI RUN 8577dad2), 3d89fe1f6f52c66f6084dd77f0d3435e1737a1b6ab669e6e5405354a09b9abae
-Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/terminal_view.rs crates/veyra/src/ui/header.rs crates/veyra/src/ui/actions.rs crates/engine/src/terminal.rs crates/engine/src/lib.rs crates/engine/src/platform/** crates/engine/src/provider/env.rs crates/engine/tests/fixtures/tui/**
+Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/terminal_view.rs crates/veyra/src/ui/header.rs crates/engine/src/terminal.rs crates/engine/src/lib.rs crates/engine/src/platform/** crates/engine/src/provider/env.rs crates/engine/tests/fixtures/tui/**
 
 ## Sub-features
 
@@ -21,6 +21,7 @@ Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/terminal_view.rs crate
   Drag selection and copy use the emulator selection.
 - Archive confirms running jobs and closes the reached drawers; Stop thread leaves shells alone.
   Quit names running tabs and their commands.
+  The danger buttons' keycaps inherit their foreground; pixel checks assert `on_solid` beyond each caption inside the painted control bounds.
   A crash hangs up the run's shell groups.
 - The active tab supplies `perf.flood` and one 50,000,020-byte smoke measurement.
 
@@ -41,6 +42,7 @@ The scripted shell used to load PATH remains owned too; no human shell or dotfil
 `veyra::DebugFocusShellDrawer` applies the same focus target as the terminal click, for setting a drive's focus precondition; synthetic window tests separately exercise the click.
 It does not prove native pointer delivery.
 `veyra::DebugDragShellDrawer` dispatches mouse-down on the rendered top rail, a held-left move and mouse-up through the window; its signed pixel amount grows the drawer upwards.
+`veyra::DebugDoubleClickShellDrawer` dispatches a double-click through that same owned rail and resets its height.
 It exercises the pointer handlers without establishing native pointer delivery.
 Every key below uses `keys`, with `focus` asserted before and after by `drawer_keys`.
 Draft checks also retain `composer_caret`.
@@ -57,6 +59,7 @@ set -eu
 RUN=${RUN:?export the RUN that Launch printed}
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
+capture = capture_content
 prepare()
 assert LANE == 'fake'
 for row in ctl('drawer-prior-work','dump')['sidebar']['rows']:
@@ -85,7 +88,7 @@ action('drawer-resize-drag','DebugDragShellDrawer',{'pixels':48})
 resized = poll('drawer-resize',lambda d:d['drawer']['height']==height+48)
 assert resized['focus']=='drawer'
 capture('drawer-resize')
-action('drawer-resize-restore','DebugDragShellDrawer',{'pixels':-48})
+action('drawer-resize-restore','DebugDoubleClickShellDrawer')
 poll('drawer-resize-restored',lambda d:d['drawer']['height']==height)
 for index in range(7):
     drawer_keys('drawer-new-'+str(index),'cmd-t','drawer','drawer')
@@ -297,6 +300,10 @@ PY
 ```
 
 ## Observable success
+
+On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+
+Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
 
 `drawer` reports open, height, active_tab, tab pids, running process paths and exit codes; its nested terminal reports grid, focused, columns and rows.
 `focus` and `composer_caret` accompany every key receipt.
