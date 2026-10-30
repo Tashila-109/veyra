@@ -95,7 +95,7 @@ kept = poll('restart-cancelled',lambda d: not d['quit_sheet']['open'])
 assert kept['selected_thread']['status']=='Working'
 action('restart-quit-action','Quit')
 poll('restart-sheet-again',lambda d: d['quit_sheet']['open'])
-pid = identity()
+pid = owned_instance_pid()
 groups = [int(x) for x in sql('select live_pgid from threads where live_pgid is not null').splitlines()]
 ctl('restart-confirm-key','keys','secondary-enter')
 wait_gone(pid)
@@ -120,7 +120,7 @@ ctl('restart-continued','wait',thread,'Done')
 assert sql("select count(*) from turns where thread_id='"+thread+"' and state='queued'")=='0'
 pending = create('restart-pending','touch pending',scenario='approval-allow')
 poll('restart-pending-dock',lambda d: d['composer']['dock'] is not None)
-pid = identity()
+pid = owned_instance_pid()
 groups = [int(x) for x in sql('select live_pgid from threads where live_pgid is not null').splitlines()]
 ctl('restart-direct-ctl','quit')
 wait_gone(pid)
@@ -147,7 +147,7 @@ assert stored_tool['tool_status']=='Done'
 ctl('restart-crash-working','wait',crashed,'Working')
 ctl('restart-crash-queue-text','text','queued before crash')
 action('restart-crash-queue-send','Send')
-pid = identity()
+pid = owned_instance_pid()
 groups = [int(x) for x in sql('select live_pgid from threads where live_pgid is not null').splitlines()]
 os.kill(pid,signal.SIGKILL)
 wait_gone(pid)
@@ -165,7 +165,7 @@ assert all(not re.search(r' · [0-9]+s$',item['outcome']) for item in recovered[
 capture('restart-crash-held')
 assert sql("select count(*) from threads where live_pid is not null or live_pgid is not null") == '0'
 action('restart-discard','DiscardQueued')
-pid = identity()
+pid = owned_instance_pid()
 action('restart-idle-quit','Quit')
 wait_gone(pid)
 start('restart-final-idle')
@@ -185,7 +185,7 @@ assert any(project+' · '+root_title+' / '+child_title==line for line in family_
 capture('restart-family-quit-sheet')
 ctl('restart-family-quit-cancel','keys','escape')
 select('restart-child-before-crash',child)
-pid = identity()
+pid = owned_instance_pid()
 groups = [int(x) for x in sql('select live_pgid from threads where live_pgid is not null').splitlines()]
 os.kill(pid,signal.SIGKILL)
 wait_gone(pid)
@@ -311,8 +311,7 @@ Both Archive and ArchiveKeepChildren and the top-level tasks key are named here;
       "restart-recovery-smoke-native-read.json",
       "restart-recovery-smoke-freshness.json"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

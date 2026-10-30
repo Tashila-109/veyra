@@ -631,7 +631,7 @@ for record in child:
 lane = next_lane()
 for offset,records in [(0,parent),(1,child)]:
     link_fixture('t'+str(lane+offset)+'-s1.jsonl',fixture_source(records))
-mode = sql('select default_mode from settings')
+mode = configured_default_mode()
 action('codex-family-default','SetDefaultMode',{'mode':'full_access'})
 action('codex-family-new','NewThread')
 action('codex-family-parent-provider','PickProvider',{'provider':'claude'})
@@ -877,8 +877,7 @@ The debug-only `veyra::DebugStallUi` action takes `{"milliseconds":2000}` and bl
       "multi-agent-smoke-native-read.json",
       "multi-agent-smoke-freshness.json"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

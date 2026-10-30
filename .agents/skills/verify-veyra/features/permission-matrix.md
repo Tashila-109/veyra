@@ -63,8 +63,7 @@ Replay evidence never marks a live cell passed.
 
 ```json
 {
-  "required": {},
-  "pairs": {}
+  "required": {}
 }
 ```
 

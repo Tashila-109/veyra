@@ -1,10 +1,11 @@
 """Identity and offline Tier S admission shared by every native mode."""
-import hashlib, json, os, pathlib, shutil, subprocess, time
+import contextlib, hashlib, json, os, pathlib, shutil, signal, subprocess, time
 
 BIN = pathlib.Path(__file__).resolve().parent
 REPO = BIN.parents[3]
 BINARY_NAMES = ['debug/veyra','debug/veyra-fake-cli','release/veyra']
 TOOLS = ['capture-window','winid','backdrop','pasteboard','visible-frame','front-app']
+SIGNALS = {signal.SIGTERM,signal.SIGHUP,signal.SIGINT}
 COMMANDS = {
     'build': ['cargo','build','--workspace'],
     'tests': ['cargo','test','--workspace'],
@@ -17,6 +18,36 @@ COMMANDS = {
 
 class SafetyStop(RuntimeError):
     """Ownership, cleanup, identity, restore, or unenforceable privacy failure."""
+
+def start_owned(args, **options):
+    """Block terminating signals across spawn; the caller's try restores the returned mask first."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
+    try:
+        return subprocess.Popen(args,start_new_session=True,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS),**options),previous
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK,previous)
+        raise
+
+@contextlib.contextmanager
+def owned_child(args, **options):
+    """Supervised native workers receive TERM and finish their own Cleanup on every interrupted wait."""
+    child,previous = start_owned(args,**options)
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK,previous)
+        yield child
+    except BaseException:
+        if child.poll() is None:
+            child.send_signal(signal.SIGTERM)
+            child.wait(timeout=120)
+        raise
+
+def helper_paths(tools):
+    tools = pathlib.Path(tools)
+    resolved = {name:tools/name for name in TOOLS}
+    for name,path in resolved.items():
+        assert path.is_file(), 'admitted helper missing: '+name
+    return resolved
 
 def sha(path):
     digest = hashlib.sha256()
@@ -37,7 +68,7 @@ def source_identity(repo=REPO):
         'diff_sha256':hashlib.sha256(git('diff','--binary','HEAD')).hexdigest(),
         'untracked_sha256':{name:sha(pathlib.Path(repo)/name) for name in untracked if name}}
 
-def identity(repo=REPO):
+def code_identity(repo=REPO):
     return dict(source_identity(repo),binaries={name:sha(pathlib.Path(repo)/'target'/name) for name in BINARY_NAMES})
 
 def require_tier(path, expected, now=None):
@@ -58,8 +89,8 @@ def require_tier(path, expected, now=None):
         assert sha(output) == row['sha256'], 'Tier S output changed'
     tools = receipt['tools']
     assert set(tools) == set(TOOLS), 'Tier S compiled helper set is incomplete'
-    for name in TOOLS:
-        assert sha(path.parent/'tools'/name) == tools[name], 'Tier S helper binary changed'
+    for name,helper in helper_paths(path.parent/'tools').items():
+        assert sha(helper) == tools[name], 'Tier S helper binary changed'
     return receipt
 
 def require_go(path, expected, deadline, guard=False):
@@ -109,7 +140,7 @@ def tier_s(folder):
         for marker in [b'control.sock',b'DebugDoubleClickShellDrawer']:
             assert marker in debug and marker not in release, 'release driver marker leak'
         assert source_identity() == initial, 'Tier S source changed during helper build'
-        receipt.update(identity=identity(),tools={name:sha(folder/'tools'/name) for name in TOOLS},passed=True)
+        receipt.update(identity=code_identity(),tools={name:sha(folder/'tools'/name) for name in TOOLS},passed=True)
     finally:
         receipt['finished_epoch'] = time.time()
         write(folder/'receipt.json',receipt)

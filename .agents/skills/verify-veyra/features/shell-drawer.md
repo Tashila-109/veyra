@@ -236,7 +236,7 @@ assert any('sleep' in line and project_name in line and quit_state['selected_thr
     for line in quit_state['quit_sheet']['threads'])
 capture('drawer-quit-sheet')
 drawer_keys('drawer-cancel-quit','escape','none','drawer')
-app = identity()
+app = owned_instance_pid()
 provider_groups = [int(value) for value in sql('select live_pgid from threads where live_pgid is not null').split()]
 ctl('drawer-orderly-quit','quit')
 wait_gone(app)
@@ -277,7 +277,7 @@ drawer_keys('drawer-crash-job','cmd-t','drawer','drawer')
 crash_state = poll('drawer-crash-running',lambda d:any(tab['running'] for tab in d['drawer']['tabs']))
 remember(crash_state)
 crash_pids = [tab['pid'] for tab in crash_state['drawer']['tabs']]
-pid = identity()
+pid = owned_instance_pid()
 os.kill(pid,signal.SIGKILL)
 wait_gone(pid)
 for child in crash_pids: wait_gone(child)
@@ -382,8 +382,7 @@ The bytes exclude both OSC markers; the repaint gaps use only painted frames ins
       "shell-drawer-smoke-native-read.json",
       "shell-drawer-smoke-freshness.json"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

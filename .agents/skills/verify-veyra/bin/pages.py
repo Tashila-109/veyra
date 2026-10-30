@@ -4,30 +4,28 @@
     pages.py select BASE [HEAD]          tokens a change from BASE selects; no HEAD reads the working tree
     pages.py fresh HEAD [--versions F]   pages whose Status FINGERPRINT equals their fingerprint at HEAD
     pages.py print COMMIT                each page's fingerprint at COMMIT
-    pages.py self-test                   every rule, in a scratch repository
+    pages.py self-test                   in-memory rules and an optional real-commit fixture
 """
-import hashlib, os, pathlib, re, shutil, subprocess, sys, tempfile
+import hashlib, pathlib, re, subprocess, sys
 
 SKILL = '.agents/skills/verify-veyra'
 LIVE = {'permission-matrix'}
 
 def evidence_contract(repo):
-    """Each page owns its unchanged required files and screenshot pairs."""
+    """Each page owns its required artifacts; glass pairs are judged in their own native recipe."""
     import json
-    required, pairs = {}, {}
+    required = {}
     for path in sorted((pathlib.Path(repo)/SKILL/'features').glob('*.md')):
         if path.name == 'README.md': continue
         match = re.search(r'^### Evidence contract\n\n```json\n(.*?)\n```',path.read_text(),re.S|re.M)
         assert match, 'missing evidence contract: '+path.name
         contract = json.loads(match[1])
-        assert set(contract) == {'required','pairs'}, path.name
-        for destination,key in [(required,'required'),(pairs,'pairs')]:
-            for page,entries in contract[key].items():
-                assert page == path.stem or page.startswith(path.stem+'-'), (path.name,page)
-                assert page not in destination, 'duplicate evidence token: '+page
-                destination[page] = entries
-    assert pairs.keys() <= required.keys(), 'screenshot pairs lack a required-file token'
-    return required,pairs
+        assert set(contract) == {'required'}, path.name
+        for page,entries in contract['required'].items():
+            assert page == path.stem or page.startswith(path.stem+'-'), (path.name,page)
+            assert page not in required, 'duplicate evidence token: '+page
+            required[page] = entries
+    return required
 
 def rule_lists(text):
     """The glob lists of SKILL.md's Selection block, their one owner; an indented row continues the list above it."""
@@ -355,11 +353,15 @@ def self_test():
         assert select(None,'base','head')==['beta']
     repo=pathlib.Path(__file__).resolve().parents[4]
     # Exercise the real admitted test-only commit, without depending on the current uncommitted helper diff.
-    if subprocess.run(['git','cat-file','-e','04ac4f3^{commit}'],cwd=repo,capture_output=True).returncode==0:
+    available = all(subprocess.run(['git','cat-file','-e',rev+'^{commit}'],cwd=repo,capture_output=True).returncode==0
+        for rev in ['fd4adea','04ac4f3'])
+    if available:
         assert select(repo,'fd4adea','04ac4f3')==[], 'admitted test-only diff selected native work'
+        print('PASS select-pages real commit fixture fd4adea..04ac4f3')
+    else: print('SKIPPED select-pages real commit fixture fd4adea..04ac4f3: commit unavailable')
     assert recorded_version('Claude 2.1.0,','Claude')=='2.1.0'
     print('PASS select-pages: test-hunk-first, mod ancestry, mixed production/test, debug-only release, '+
-        'fd4adea..04ac4f3 fixture and real commit, provider/shared/uncovered/no-page/Status/fingerprint rules; no Git writes')
+        'fd4adea..04ac4f3 in-memory shape, provider/shared/uncovered/no-page/Status/fingerprint rules; no Git writes')
 
 def main(argv):
     repo = pathlib.Path(__file__).resolve().parents[4]

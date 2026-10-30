@@ -5,7 +5,7 @@ def drive():
     import threading
     d.prepare()
     saved = d.ctl('glass-smoke-before','dump')['look']
-    pid = d.identity()
+    pid = d.owned_instance_pid()
     window = int((d.PROOF/'window-id').read_text())
     rectangle = (24,60,960,740)
     before = d.owned_window_record('glass-smoke-placement-before')

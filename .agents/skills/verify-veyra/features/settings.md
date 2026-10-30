@@ -242,7 +242,7 @@ capture('settings-solid')
 processes = []
 def place_glass_window(label, rectangle=(24,60,960,740)):
     tool = shutil.which('yabai')
-    pid = identity()
+    pid = owned_instance_pid()
     window = int((PROOF/'window-id').read_text())
     def query():
         result = subprocess.run([tool,'-m','query','--windows','--window',str(window)],
@@ -306,7 +306,7 @@ def retry_clear_glass(label, error, capture_again=None):
     record = {'ran':True,'repositioned':False,'intersections':rows,'guard_reason':str(error)}
     save(label+'-placement-fallback',record)
     if {row['window'] for row in rows} != ids: raise error
-    pid = identity()
+    pid = owned_instance_pid()
     window = int((PROOF/'window-id').read_text())
     current = next((row for row in windows if row['kCGWindowNumber']==window
         and row['kCGWindowOwnerPID']==pid and row['kCGWindowLayer']==0),None)
@@ -371,7 +371,7 @@ def measure_capture(label, rectangle):
     time.sleep(.25)
     def take(name):
         before = ctl(name+'-before-measurement','dump')
-        pid,window = identity(),int((PROOF/'window-id').read_text())
+        pid,window = owned_instance_pid(),int((PROOF/'window-id').read_text())
         if before['look']['background']=='translucent':
             region_capture(PROOF/(name+'.png'),pid,window)
         else:
@@ -719,8 +719,7 @@ A queued read is pending until the lead records the capture hash and verdict.
       "glass-smoke-translucent-coarse.png",
       "glass-smoke-translucent-inverse.png"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

@@ -53,7 +53,7 @@ PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 capture = capture_content
-identity()
+owned_instance_pid()
 if LANE == 'live':
     if sql('select count(*) from projects') == '0':
         action('live-project','AddProject',{'path':str(DATA/'project')})
@@ -416,8 +416,7 @@ Settings keeps all three defaults; a new Grok composer applies Accept edits as A
       "new-thread-smoke-native-read.json",
       "new-thread-smoke-freshness.json"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

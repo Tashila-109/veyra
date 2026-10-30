@@ -768,8 +768,7 @@ Engine commands await space in the window's gpui task, so Stop is retained when 
       "chat-send-stream-smoke-native-read.json",
       "chat-send-stream-smoke-freshness.json"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

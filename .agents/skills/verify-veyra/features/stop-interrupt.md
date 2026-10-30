@@ -278,8 +278,7 @@ The debug-only DebugStallUi action remains available for that lane.
       "stop-interrupt-smoke-native-read.json",
       "stop-interrupt-smoke-freshness.json"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

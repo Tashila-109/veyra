@@ -44,7 +44,7 @@ PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 capture = capture_content
-pid = identity()
+pid = owned_instance_pid()
 dump = ctl('dump-before','dump')
 launch = json.loads((PROOF/'launch-login-path.json').read_text())
 assert launch['pid'] == pid and launch['data_dir'] == str(DATA)
@@ -121,7 +121,7 @@ PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 capture = capture_content
-identity()
+owned_instance_pid()
 action('persistent-project','AddProject',{'path':str(DATA/'project')})
 poll('persistent-project-added',lambda d: any(row['kind']=='project' for row in d['sidebar']['rows']))
 row = sql('select id,path,name from projects order by id')
@@ -396,8 +396,7 @@ A queued read is pending until the lead records the capture hash and verdict.
       "release/data-listing.txt",
       "release/provider-probes.txt"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

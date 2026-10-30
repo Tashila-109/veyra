@@ -3,7 +3,7 @@
 
 See SKILL.md, section Run, for the options and the retry rule.
 """
-import argparse, ast, hashlib, json, os, pathlib, re, secrets, shutil, signal, subprocess, sys, tempfile, time
+import argparse, ast, json, os, pathlib, re, secrets, shutil, signal, subprocess, sys, tempfile, time
 
 SKILL = pathlib.Path(__file__).resolve().parent.parent
 REPO = SKILL.parent.parent.parent
@@ -16,7 +16,7 @@ FIRST = ('app-launch','Driving it with veyra ctl')
 RELEASE = ('app-launch','Release check')
 PERF_ONLY = {('multi-agent','Probe smoke measurements')}
 LIVE_PAGES = pages.LIVE
-SIGNALS = {signal.SIGTERM,signal.SIGHUP,signal.SIGINT}
+SIGNALS = orchestration.SIGNALS
 INTERRUPT = {'signal':None}
 
 class Interrupted(BaseException):
@@ -37,17 +37,7 @@ def take_pending():
     for _ in names: signal.sigwait(SIGNALS)
     return names
 
-def start_owned(args, **options):
-    """Start a process in its own session with the interrupting signals blocked across the fork, so no signal lands
-    between its start and the caller's try. The child unblocks them itself. Returns it and the mask to restore first
-    thing inside that try."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
-    try:
-        return subprocess.Popen(args,start_new_session=True,
-            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS),**options),previous
-    except BaseException:
-        signal.pthread_sigmask(signal.SIG_SETMASK,previous)
-        raise
+start_owned = orchestration.start_owned
 
 HEREDOC = re.compile(r"<<'(?P<end>PY[A-Z_]*)'\n(?P<body>.*?)\n(?P=end)(?:\n|$)",re.S)
 
@@ -129,21 +119,21 @@ def driver_self_test_dispatch_check():
     for name in ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test','window_rules_self_test'):
         getattr(driver,name).assert_called_once_with()
 
-def verdict(record, counted=0, late=False):
+def verdict(record):
     """One terminal verdict after Cleanup; section failures are collected, never whole-run retries."""
     taken = take_pending()
     record['interrupted'] = record.get('interrupted') or (taken or [None])[0]
-    if record['interrupted']: return 'FAILED: interrupted by '+record['interrupted'],counted
+    if record['interrupted']: return 'FAILED: interrupted by '+record['interrupted']
     if record.get('cleanup_exit') != 0 or record.get('scratch_left'):
-        return 'FAILED: Cleanup did not pass',counted
-    if not all(record.get('evidence',{'run':False}).values()): return 'FAILED: required evidence was not kept',counted
-    if not record.get('identity_unchanged'): return 'FAILED: the identity changed during the run',counted
-    if record.get('fatal_stop'): return 'FAILED: safety stop; see fatal_stop',counted
+        return 'FAILED: Cleanup did not pass'
+    if not all(record.get('evidence',{'run':False}).values()): return 'FAILED: required evidence was not kept'
+    if not record.get('identity_unchanged'): return 'FAILED: the identity changed during the run'
+    if record.get('fatal_stop'): return 'FAILED: safety stop; see fatal_stop'
     rows = record.get('sections',[])
-    if any(row['kind']=='failed' for row in rows): return 'FAILED: independent failures collected',counted
-    if any(row['kind']=='blocked' for row in rows): return 'BLOCKED: re-run only blocked sections with --sections',counted
-    if record.get('all_passed') and not record.get('failed'): return 'DONE',counted
-    return 'FAILED: not every planned section passed',counted
+    if any(row['kind']=='failed' for row in rows): return 'FAILED: independent failures collected'
+    if any(row['kind']=='blocked' for row in rows): return 'BLOCKED: re-run only blocked sections with --sections'
+    if record.get('all_passed') and not record.get('failed'): return 'DONE'
+    return 'FAILED: not every planned section passed'
 
 def verdict_check():
     done = {'cleanup_exit':0,'identity_unchanged':True,'all_passed':True,'failed':None,'evidence':{'run':True}}
@@ -152,7 +142,7 @@ def verdict_check():
             ({'evidence':{} ,'all_passed':False},'FAILED'),({'evidence':{'run':False}},'FAILED'),
             ({'sections':[{'kind':'blocked'}]},'BLOCKED'),
             ({'sections':[{'kind':'failed'},{'kind':'blocked'}]},'FAILED'),({'fatal_stop':True},'FAILED')]:
-        assert verdict(dict(done,**change))[0].startswith(wanted),change
+        assert verdict(dict(done,**change)).startswith(wanted),change
 
 def guards_in_place(found):
     """start()'s relaunch refusal and Cleanup's drain are read as Python structure; the stale-screenshot assert and the
@@ -208,8 +198,8 @@ def checks(found):
         'Cleanup its drain; the 30 s drain, stale-screenshot and covered-window guard texts are present; the verdict '
         'holds; '+gate_check())
 
-def identity():
-    return orchestration.identity(REPO)
+def checkout_identity():
+    return orchestration.code_identity(REPO)
 
 def plan_for(found, tokens, explicit):
     if explicit:
@@ -249,7 +239,7 @@ def smoke_plan(found, tokens, glass=False):
 
 def classify(code, observed, fatal=False, deadline=False):
     if fatal: return 'fatal'
-    if deadline or (observed or {}).get('kind') == 'capture': return 'blocked'
+    if deadline or (observed or {}).get('capture_exhausted') is True: return 'blocked'
     return 'failed' if code else 'passed'
 
 def failure_capture(env, out):
@@ -342,13 +332,13 @@ def attempt(found, plan, out, env, deadline, expected, record):
                     for remaining in plan[plan.index(key):])
                 record['failed'] = record['failed'] or {'section':'deadline','exit':None,'deadline':True}
                 break
-            if identity() != expected:
+            if checkout_identity() != expected:
                 record['fatal_stop'] = {'section':'/'.join(key),'kind':'identity'}
                 record['failed'] = {'section':'identity','exit':None,'deadline':False}
                 break
             current[0] = '/'.join(key)
             code,text = execute(key)
-            if key == ('SKILL','Launch') and not code and identity() != expected:
+            if key == ('SKILL','Launch') and not code and checkout_identity() != expected:
                 record['failed'] = {'section':'tree identity after Launch','exit':None,'deadline':False}
                 break
             if code:
@@ -380,20 +370,6 @@ def attempt(found, plan, out, env, deadline, expected, record):
                     break
             else:
                 record['sections'].append({'section':'/'.join(key),'exit':0,'kind':'passed'})
-        failed = record['failed']
-        if failed:
-            receipt = proof/'focus-failure.json'
-            try: clock = json.loads(receipt.read_text()) if receipt.exists() else {}
-            except (OSError,ValueError) as error:
-                problems.append(f'focus-failure.json: {type(error).__name__}: {error}')
-                clock = {}
-            start = timings[-1]['start_epoch'] if timings else 0
-            record['focus'] = clock
-            record['observed'] = clock if clock.get('failure') and clock.get('failure_epoch',0) >= start else None
-            owed = (proof/'pid').exists() and not failed['deadline']
-            if owed and not (record['observed'] or {}).get('human_input'):
-                record['failure_capture'] = capture = failure_capture(env,out)
-                if 'write_error' in capture: problems.append('failure-capture.json: '+capture['write_error'])
     except (Interrupted,KeyboardInterrupt) as stop:
         record['interrupted'] = record['interrupted'] or str(stop) or 'SIGINT'
     except Exception as error:
@@ -437,7 +413,7 @@ def attempt(found, plan, out, env, deadline, expected, record):
             gate = proof/'input-idle-launch.json'
             if gate.exists(): record['gate_wait_seconds'] = json.loads(gate.read_text())['gate_seconds']
         keep('gate wait',gate_wait)
-        try: record['identity_unchanged'] = identity() == expected
+        try: record['identity_unchanged'] = checkout_identity() == expected
         except Exception as error:
             problems.append(f'identity: {type(error).__name__}: {error}')
             record['identity_unchanged'] = False
@@ -485,9 +461,11 @@ def prepare(argv=None, validate=True):
     parser.add_argument('--go',type=pathlib.Path)
     parser.add_argument('--then-guard',action='store_true',help='run frame guard first, then smoke')
     parser.add_argument('--baseline',type=pathlib.Path)
+    parser.add_argument('--part',choices=['6a','6b','6c','6d'],default='6c')
     parser.add_argument('--native-mutants',type=pathlib.Path)
     parser.add_argument('--prepare-mutants',type=pathlib.Path)
     parser.add_argument('--mutant-route')
+    parser.add_argument('--mutant-read',nargs=3,metavar=('RUN','HASH','VERDICT'))
     args = parser.parse_args(argv)
     assert not args.real_quiet or args.gate, '--real-quiet requires --gate'
     assert not args.smoke or args.base, '--smoke requires --base'
@@ -500,6 +478,11 @@ def prepare(argv=None, validate=True):
     proven = checks(found) if validate else 'checks already running'
     if args.check_only:
         print('PASS '+proven+'; no launch')
+        return 0
+    if args.mutant_read:
+        from mutants import record_mutant_read
+        assert args.evidence, '--mutant-read requires the batch --evidence DIR'
+        print(json.dumps(record_mutant_read(args.evidence,*args.mutant_read),indent=2))
         return 0
     if args.mutant_route:
         routes = json.loads((SKILL/'bin/mutant-routes.json').read_text())
@@ -541,7 +524,7 @@ def prepare(argv=None, validate=True):
     else: plan = plan_for(found,args.pages,args.sections)
     assert not (args.gate or args.slice_end) or (args.pages is None and args.sections is None), 'full run requires every page'
 
-    expected = identity()
+    expected = checkout_identity()
     if args.expect_head: assert expected['head'] == args.expect_head, 'checkout is not at '+args.expect_head
     assert args.tier_s and args.go, 'native launch requires --tier-s RECEIPT and --go GO.json'
     orchestration.require_tier(args.tier_s,expected)
@@ -570,7 +553,7 @@ def main():
     if args.then_guard:
         from frame_guard import run_guard, chain
         try:
-            result = chain(lambda:run_guard(args,expected,sections),
+            result = chain(lambda:run_guard(args,expected),
                 lambda:{'passed':run_native(found,plan,args,env,expected)==0,'cleanup_passed':True})
             return 0 if result['passed'] else 1
         except Exception as error:
@@ -585,32 +568,29 @@ def main():
 def run_native(found,plan,args,env,expected):
     if args.native_mutants:
         from mutants import run_mutants
-        if not run_mutants(args,expected): return 1
-    attempts, counted, status, lost = [], 0, None, []
-    while status is None:
-        try: signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
-        except Interrupted: pass
-        if INTERRUPT['signal']:
-            status = 'FAILED: interrupted by '+INTERRUPT['signal']+' between attempts'
-            break
-        label = f'attempt-{len(attempts)+1}'
+        result = run_mutants(args,expected)
+        if not result['passed']:
+            orchestration.write(args.evidence/'outcome.json',{'status':result['state'],'mutants':result})
+            print(result['state'],flush=True)
+            return 2 if result['state']=='awaiting lead read' else 1
+    attempts, lost = [], []
+    try: signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
+    except Interrupted: pass
+    if INTERRUPT['signal']:
+        status = 'FAILED: interrupted by '+INTERRUPT['signal']+' before attempt'
+    else:
+        label = 'attempt-1'
         record = {'label':label,'run':new_run(args.scratch),'failed':None,'interrupted':None,'cleanup_exit':None,
             'problems':[]}
         attempts.append(record)
         try: attempt(found,plan,args.evidence/label,dict(env,RUN=record['run']),args.deadline,expected,record)
-        except Interrupted: pass  # raised in an except clause; the finally already ran Cleanup and filled record
-        # Cleanup has run and the signals are blocked: the verdict comes first, then the one write of attempt.json.
-        status,counted = verdict(record,counted,time.time() >= args.deadline-60)
-        record['verdict'] = status or 'another attempt'
+        except Interrupted: pass
+        status = verdict(record)
+        record['verdict'] = status
         error = receipt_error(args.evidence/label/'attempt.json',record)
         if error:
             lost.append('attempt.json')
             status = 'FAILED: attempt.json was not kept: '+error
-        if status is None:
-            try:
-                signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
-                time.sleep(min(60,max(0,args.deadline-time.time())))
-            except Interrupted as stop: status = 'FAILED: interrupted by '+str(stop)+' between attempts'
     try: signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
     except Interrupted: pass
     if receipt_error(args.evidence/'outcome.json',{'status':status,'plan':['/'.join(key) for key in plan],
@@ -631,7 +611,7 @@ def run_native(found,plan,args,env,expected):
     if late: return 128+signal.Signals[late[0]].value
     if args.gate or args.slice_end:
         import status_lines
-        status_lines.propose(args.evidence,expected,attempts,
+        status_lines.propose(args.evidence,expected,
             'FAILED: required receipt not kept' if lost else status,page_names())
     return 0 if status == 'DONE' and not lost else 1
 

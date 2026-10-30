@@ -1158,8 +1158,7 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "approvals-questions-smoke-native-read.json",
       "approvals-questions-smoke-freshness.json"
     ]
-  },
-  "pairs": {}
+  }
 }
 ```
 

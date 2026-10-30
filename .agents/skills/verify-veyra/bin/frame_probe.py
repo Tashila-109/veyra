@@ -1,4 +1,4 @@
-import hashlib, importlib, json, math, os, secrets, shutil, signal, sqlite3, subprocess, sys, tempfile, threading, time
+import hashlib, importlib, json, os, secrets, shutil, signal, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 HELPERS=Path(__file__).resolve().parent
@@ -9,11 +9,16 @@ TOOLS=Path(os.environ['VEYRA_FRAME_TOOLS']).resolve()
 sys.path.insert(0,str(HELPERS))
 BASE=Path(os.environ['VEYRA_FRAME_BASELINE']).resolve()
 import orchestration as admission
-admitted = admission.identity(V)
+from frame_guard import authenticate_baseline
+from frame_scene import require_6d_dump, assert_idle_state
+resolved_helpers = admission.helper_paths(TOOLS)
+authenticate_baseline(BASE)
+admitted = admission.code_identity(V)
 admission.require_tier(os.environ['VEYRA_VERIFY_TIER_S'],admitted)
 admission.require_go(os.environ['VEYRA_VERIFY_GO'],admitted,float(os.environ['VEYRA_VERIFY_DEADLINE']),guard=True)
 phase,side,label=sys.argv[1:4]
-profile=False
+part=sys.argv[sys.argv.index('--part')+1] if '--part' in sys.argv else '6c'
+assert part in ['6a','6b','6c','6d']
 idle_focus=sys.argv[sys.argv.index('--idle-focus')+1] if '--idle-focus' in sys.argv else 'composer'
 assert idle_focus in ['composer','drawer']
 scene=sys.argv[sys.argv.index('--scene')+1] if '--scene' in sys.argv else 'stream'
@@ -39,7 +44,7 @@ proof=workspace/'target/verify-veyra'/run
 (proof/'lane').write_text('fake\n')
 (proof/'pages-run').write_text('')
 for name in ['capture-window','winid','backdrop','front-app','visible-frame']:
-    (proof/name).symlink_to(TOOLS/name)
+    (proof/name).symlink_to(resolved_helpers[name])
 (proof/'helper-ownership.json').write_text(json.dumps({'run':run,'workspace':str(workspace),
     'scratch':str(scratch),'data':str(data),'proof':str(proof)})+'\n')
 (out/'ownership.json').write_bytes((proof/'helper-ownership.json').read_bytes())
@@ -87,7 +92,7 @@ def start_without_recording(label):
     assert window
     (proof/'window-id').write_text(window+'\n')
     d.owned_window_record(label)
-    d.identity()
+    d.owned_instance_pid()
     d.normalize_owned_window(label)
     return pid
 d.start=start_without_recording
@@ -102,7 +107,7 @@ def stage_records_without_recording(records):
         'reads_recordings':False,'fixture_sha256':hashlib.sha256(fixture.read_bytes()).hexdigest()},indent=2)+'\n')
 d.stage_records=stage_records_without_recording
 expected_rev=os.environ['VEYRA_FRAME_BASELINE_REV'] if side=='baseline' else subprocess.check_output(['git','rev-parse','HEAD'],cwd=V,text=True).strip()
-result={'phase':phase,'side':side,'profiled':profile,'label':label,'run':run,
+result={'phase':phase,'side':side,'profiled':False,'part':part,'measurement_started':False,'label':label,'run':run,
     'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),
     'fake_sha256':hashlib.sha256(fake.read_bytes()).hexdigest(),'expected_rev':expected_rev,'passed':False}
 original_ctl=d.ctl
@@ -136,14 +141,14 @@ def checked_ctl(name,*args,**kwargs):
         guarded_region(name)
     return value
 d.ctl=checked_ctl
-def identity():
+def probe_instance_pid():
     pid=int((proof/'pid').read_text())
     assert os.getpgid(pid)==pid==int((proof/'pgid').read_text())
     assert (data/'veyra.lock').read_text().strip()==str(pid)
     value=d.ctl('identity','dump')
     assert value['pid']==pid and value['data_dir']==str(data) and value['build_rev']==expected_rev
     return pid
-d.identity=identity
+d.owned_instance_pid=probe_instance_pid
 def load(): return subprocess.check_output(['sysctl','-n','vm.loadavg'],text=True).strip()
 def cpu(pid):
     row=subprocess.check_output(['ps','-o','pid=,pgid=,rss=,stat=,cputime=','-p',str(pid)],text=True).split()
@@ -175,7 +180,7 @@ def guarded_region(label):
         raise
 def start_backdrop():
     executable=data/'perf-backdrop'
-    shutil.copy2(HELPERS/'tools/backdrop',executable)
+    shutil.copy2(TOOLS/'backdrop',executable)
     log=proof/'backdrop.stdout'
     process=subprocess.Popen([str(executable)],stdout=log.open('w'),stderr=(proof/'backdrop.stderr').open('w'))
     (proof/'backdrop-owned-pids').write_text(str(process.pid)+'\n')
@@ -226,7 +231,6 @@ def place_probe_window():
     result['probe_placement']={'before':before['frame'],'after':after['frame'],'visible_frame':visible,
         'rectangle':list(PROBE_RECTANGLE),
         'note':"probe placement aligned with the s6c final's proved region rectangle; identical for both sides"}
-sampler=None
 reaper=None
 watch=None
 def interrupted(number, frame):
@@ -284,13 +288,13 @@ try:
         result['measurement_load_start']=load()
         from commit_watch import CommitWatch
         watch=CommitWatch(d.DB).start()
+        result['measurement_started']=True
         cpu0=cpu(result['pid'])
         started=time.monotonic()
         streaming=True
         d.ctl('perf-send','keys','secondary-enter')
         thread=None
         mid=False
-        captured=False
         next_active_check=started+1
         deadline=started+60
         while True:
@@ -304,17 +308,9 @@ try:
             if time.monotonic()>=next_active_check:
                 d.ctl('perf-active-'+str(int(elapsed)),'dump',log=False)
                 next_active_check=time.monotonic()+1
-            if profile and sampler is None and elapsed>=1:
-                command=['sample',str(result['pid']),'5','-file',str(proof/'sample.txt')]
-                (proof/'sample-invocation.json').write_text(json.dumps(command)+'\n')
-                sampler=subprocess.Popen(command,stdout=(proof/'sample.stdout').open('w'),stderr=(proof/'sample.stderr').open('w'))
-                result['sampler_pid']=sampler.pid
             if not mid and elapsed>=5:
                 front('midstream')
                 mid=True
-            if profile and not captured and elapsed>=7:
-                d.capture('streaming')
-                captured=True
             time.sleep(.2)
         d.ctl('perf-wait','wait',thread,'Done','30')
         after=d.ctl('perf-after','dump')
@@ -345,9 +341,6 @@ try:
         result['commits_fixed']=result['commits']-text_writes
         result['commits_10s']=result['commits_fixed']+5
         d.poll('sessions-ended',lambda value:d.sql('select count(*) from threads where live_pgid is not null')=='0')
-        if sampler is not None:
-            result['sampler_exit']=sampler.wait(timeout=20)
-            assert result['sampler_exit']==0
     else:
         threads=[]
         if scene=='idle':
@@ -361,6 +354,13 @@ try:
             d.poll('idle-shell-ready',lambda value:value['drawer']['terminal'] is not None
                 and 'VEYRA_TUI_READY' in ''.join(value['drawer']['terminal']['grid'])
                 and not value['drawer']['tabs'][0]['running'])
+            if part=='6d':
+                capabilities=d.ctl('idle-6d-capabilities','dump')
+                require_6d_dump(capabilities)
+                if capabilities['palette']['open']: d.ctl('idle-palette-close','keys','escape')
+                assert capabilities['composer_text']=='', '6d resting-toast scene needs empty composer'
+                d.action('idle-toast-notice','Send')
+                d.poll('idle-toast-present',lambda value:value['toasts'] and not value['palette']['open'])
             if idle_focus=='composer':
                 d.action('idle-composer-focus','FocusComposer')
                 d.poll('idle-focus-applied',lambda value:value['focus']=='composer')
@@ -401,12 +401,8 @@ try:
         before=d.ctl('scene-before','dump')
         front('scene-before')
         if scene=='idle':
-            assert not any(row.get('status')=='Working' for row in before['sidebar']['rows'])
-            assert before['focus']==idle_focus and before['drawer']['open']
-            assert before['selected_thread']['status']=='Done'
-            assert before['look']['background']=='translucent'
-            assert not before['drawer']['tabs'][0]['running']
-            assert before['drawer']['terminal']['focused']==(idle_focus=='drawer')
+            idle_scene = assert_idle_state(before,idle_focus,part)
+            result['idle_scene']=idle_scene
         else:
             assert sum(row.get('status')=='Working' for row in before['sidebar']['rows'])==5
             assert before['focus']=='none'
@@ -419,10 +415,7 @@ try:
             time.sleep(min(.1,max(0,10-(time.monotonic()-started))))
             observed=d.ctl('scene-sample','dump',log=False)
             if scene=='idle':
-                assert observed['focus']==idle_focus and observed['drawer']['open']
-                assert not any(row.get('status')=='Working' for row in observed['sidebar']['rows'])
-                assert observed['selected_thread']['status']=='Done'
-                assert not observed['drawer']['tabs'][0]['running']
+                assert_idle_state(observed,idle_focus,part,idle_scene)
             else:
                 assert observed['focus']=='none'
                 assert all(observed['look'][key]==flag for key,flag in override.items())
@@ -434,6 +427,7 @@ try:
                 'terminal_frame_requests':[tab['frame_requests'] for tab in observed['drawer'].get('tabs',[])],
                 'focus':observed['focus'],'window_active':observed['window_active']})
         after=d.ctl('scene-after','dump')
+        if scene=='idle': assert_idle_state(after,idle_focus,part,idle_scene)
         if scene=='working':
             assert all(after['look'][key]==flag for key,flag in override.items())
             assert after['look']['background']=='solid'
@@ -482,9 +476,6 @@ except BaseException as error:
     (proof/'traceback.txt').write_text(traceback.format_exc())
 finally:
     if watch is not None: watch.stop()
-    if sampler is not None and sampler.poll() is None:
-        sampler.terminate()
-        sampler.wait(timeout=10)
     rec_paths=[str(path.relative_to(root)) for root in [proof,data] for path in root.rglob('rec')]
     recording_proof={'recording_directories':rec_paths,'rec_current_exists':(proof/'rec-current').exists(),
         'environment_key_proof':'app-environment-keys.json','values_recorded':False}

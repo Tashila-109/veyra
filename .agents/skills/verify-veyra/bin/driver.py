@@ -187,12 +187,20 @@ def poll(name, predicate):
         time.sleep(.05)
     if 'focus' in name: observe_failure(name,'focus-timeout')
     raise AssertionError(name + ' timed out')
+def configured_default_mode():
+    mode = (PROOF/'configured-default-mode').read_text().strip()
+    assert mode in ['ask_first','accept_edits','full_access'], 'invalid configured default mode'
+    return mode
+
 def action(name, operation, data=None):
     args = ['action', 'veyra::' + operation]
     if data is not None: args.append(json.dumps(data))
     assert ctl(name, *args) == {'ok': True}
+    if operation == 'SetDefaultMode':
+        assert data['mode'] in ['ask_first','accept_edits','full_access']
+        (PROOF/'configured-default-mode').write_text(data['mode']+'\n')
 @safety_checked('identity')
-def identity():
+def owned_instance_pid():
     pid = int((PROOF/'pid').read_text())
     pgid = int((PROOF/'pgid').read_text())
     assert os.getpgid(pid) == pgid == pid
@@ -208,6 +216,16 @@ def window_id(pid):
         if found.returncode == 0: return found.stdout.strip()
         time.sleep(.05)
     raise AssertionError('no on-screen window for owned pid '+str(pid))
+def capture_observation(name, exhausted):
+    if exhausted: observe_failure(name,'capture')
+    path = PROOF/'focus-failure.json'
+    observation = json.loads(path.read_text()) if path.exists() else {}
+    if exhausted:
+        observation.update(kind='capture',capture_exhausted=True,failure_epoch=time.time())
+    elif observation.get('kind') == 'capture':
+        observation.update(capture_exhausted=False,recovered_epoch=time.time())
+    if observation: save('focus-failure',observation)
+
 def capture(name):
     from orchestration import SafetyStop
     from freshness import retry_capture
@@ -218,7 +236,12 @@ def capture(name):
             observe_failure(name,'capture')
             raise
     def discard(): (PROOF/(name+'.png')).unlink(missing_ok=True)
-    retry_capture(take,discard)
+    try: retry_capture(take,discard)
+    except SafetyStop: raise
+    except Exception:
+        capture_observation(name,True)
+        raise
+    else: capture_observation(name,False)
 def capture_content(name):
     if LANE != 'fake':
         return capture(name)
@@ -359,12 +382,15 @@ def region_capture(target, pid, window, attempts_allowed=3):
             after = region_snapshot(pid,window,backdrop,rectangle)
             assert before == after, 'region guards changed during capture'
             save(target.stem+'-region-guards',{'attempts':attempts,'before':before,'after':after})
+            capture_observation(target.stem,False)
             return
         except Exception as error:
             target.unlink(missing_ok=True)
             attempts.append({'attempt':attempt+1,'error':str(error)})
             save(target.stem+'-region-guards',{'attempts':attempts})
-            if attempt+1 == attempts_allowed: raise
+            if attempt+1 == attempts_allowed:
+                capture_observation(target.stem,True)
+                raise
             time.sleep(.1)
 def measured_pair(labels, take, rectangle=(24,60,960,740)):
     """Retake both halves at one placement if either half needed the owned-window fallback."""
@@ -475,7 +501,7 @@ def wait_gone(pid):
         time.sleep(.05)
     raise AssertionError(f'owned pid {pid} did not exit')
 def stop(label, crash=False):
-    pid = identity()
+    pid = owned_instance_pid()
     live = sql('select count(*) from threads where live_pgid is not null')
     assert live == '0', 'finish provider turns before relaunch'
     if crash: os.kill(pid,signal.SIGKILL)
@@ -651,7 +677,7 @@ def normalize_owned_window(label, pid=None, window=None):
     return save(label+'-normalized-window',{'before':before['frame'],'after':after['frame'],
         'visible_frame':visible,'pid':pid,'window':window})
 def start(label, normalize=True):
-    from orchestration import identity as code_identity, require_tier, require_go
+    from orchestration import code_identity, require_tier, require_go
     expected = code_identity()
     require_tier(os.environ['VEYRA_VERIFY_TIER_S'],expected)
     require_go(os.environ['VEYRA_VERIFY_GO'],expected,float(os.environ['VEYRA_VERIFY_DEADLINE']))
@@ -685,7 +711,7 @@ def start(label, normalize=True):
     assert window
     (PROOF/'window-id').write_text(window+'\n')
     owned_window_record(label)
-    identity()
+    owned_instance_pid()
     if normalize: normalize_owned_window(label)
     return pid
 def restart(label, crash=False):
@@ -856,7 +882,7 @@ def create(name, prompt, slow=False, scenario='ok-reply'):
         and int(sql('select count(*) from threads')) == before+1)
     return dump['selected_thread']['id']
 def stage_family(parent='waiting', child='complete'):
-    identity()
+    owned_instance_pid()
     number = next_lane()
     records = [json.loads(line) for line in (SOURCE/'parent-start-thread.jsonl').read_text().splitlines()]
     first = next(i for i,record in enumerate(records) if record.get('line',{}).get('type') == 'result')
@@ -917,7 +943,7 @@ def prepare():
     Every section after new-thread's first calls this, so it can run alone or after any earlier section.
     It creates no thread.
     """
-    identity()
+    owned_instance_pid()
     if sql('select count(*) from projects') == '0':
         action('prepare-project','AddProject',{'path':str(DATA/'project')})
         poll('prepare-project-added',lambda d: any(row['kind']=='project' for row in d['sidebar']['rows']))

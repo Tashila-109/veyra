@@ -31,9 +31,16 @@ A selected release token still runs the release section.
 `--then-guard --baseline DIR` runs the slice-6 frame-cost guard **before** that smoke in the same away window.
 A failed guard cannot enter smoke.
 The guard uses the fixed 24,60,960,740 placement on both sides, records stream `perf.repaints`, runs five pairs with the ten-pair extension rule, both idle focus states and normal/reduced Working scenes, with recording off.
-It retries a cover trip before the first pair once after 60 seconds and applies the full unfiltered guard again.
+A cover trip before the first baseline measurement discards the entire set, waits 60 seconds and starts the set once more.
+A candidate trip in pair 1, any trip after a measurement starts, or a second pre-pair trip stops the set.
+No measured baseline or candidate is reused across that restart; the full unfiltered cover guard runs again.
 Its `guard-done.json` is the lead's signal to release the arch-plan pause.
-The baseline is the retained slice-5 binary directory named by its 40-character build revision and authenticated by `identity.txt`.
+The only baseline is the primary checkout's retained `.tstack/tasks/v001/evidence/perf/bin/5397b7b936f0e69c7c24c892f3f585328681b800/`, code identity `b2357c36d7a81924d41f97d94b17dc54a0983d7785ffd5895c549c328032e708`.
+`bin/frame_guard.py` pins its approved manifest SHA-256 and all three binary hashes, and refuses another directory or a self-consistent impostor.
+`--part 6c` is the current guard scene; part 6d must use `--part 6d`.
+The 6d candidate idle variant closes the palette, creates an empty-Send notice toast and requires that toast to remain at rest in `dump` before, throughout and after both ten-second focus measurements.
+Until `dump.palette.open` and `dump.toasts` exist, it stops with `6d idle scene unavailable`; it never falls back to the 6c candidate scene.
+The retained slice-5 baseline uses its earlier surface without palette/toasts, with the same drawer/composer focus and Translucent background.
 
 `bin/run --slice-end` and `bin/run --gate` run the full fake map, including release.
 Only `--gate` permits `--real-quiet`.
@@ -42,7 +49,7 @@ No fake run stamps permission-matrix's live cells.
 A full run's native read manifest records each capture path, SHA-256 and verdict.
 Status stamping uses the candidate commit's fingerprint, so the candidate must be committed before that full run.
 
-Every native mode also requires `--go GO.json` with `launch_authorized: true`, the exact `identity` from Tier S, `issued_epoch` and `cutoff_epoch`.
+Every native launch mode also requires `--go GO.json` with `launch_authorized: true`, the exact `identity` from Tier S, `issued_epoch` and `cutoff_epoch`.
 A guard additionally requires `frame_cost_guard_authorized: true` and `arch_plan_paused: true`.
 The lead writes that file only after the human's GO; the runner never creates approval.
 `--deadline EPOCH` cannot exceed that cutoff.
@@ -55,6 +62,7 @@ The runner records `sections.json`, the transcript, the plan and required receip
 A capture has at most three attempts, discarding the image after every guard failure.
 Three tripped attempts block that section; the run then health-checks the owned process, restores a known composer and continues through independent sections.
 Ordinary assertion failures are collected too.
+Only an exhausted capture observation blocks a section; a recovered retry clears that flag, so a later assertion is FAILED.
 Use `--sections PAGE/HEADING ...` in the next armed window to run only the blocked sections, with Launch, Doctor, app-launch's first section, Evidence and Cleanup.
 Passed sections are not repeated.
 The outcome lists each section as passed, failed or blocked.
@@ -72,7 +80,7 @@ No interrupted or partial run counts as passed.
 bin/run --check-only
 bin/run --tier-s-write DIR
 bin/run --smoke --base BASE --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
-bin/run --smoke --base BASE --then-guard --baseline BASELINE --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
+bin/run --smoke --base BASE --then-guard --part 6c --baseline BASELINE --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
 bin/run --sections 'settings/Native smoke' --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
 bin/run --slice-end --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
 bin/run --gate --real-quiet --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
@@ -89,11 +97,16 @@ These tests prove the harness offline; they leave the native smoke and composito
 
 At slice end or the gate, `--native-mutants PREPARED.json` admits at most three mutants, each for a class C property.
 Prepare them offline with `bin/run --prepare-mutants MANIFEST.json --evidence DIR`.
-Each manifest case names `name`, `property`, `file`, the unique `old`/`new` replacement, `sections`, `capture`, `scene_runs_mutated_line: true` and an expected assertion or an explicit capture read.
+Each manifest case names `name`, `property`, `file`, the unique `old`/`new` replacement, `sections`, `capture`, `scene_runs_mutated_line: true` and either `judge: assertion` with `expected_assertion`, or `judge: read`.
 The reviewer checks that the scene executes the changed line.
 Preparation writes a fresh complete Tier S receipt and binary snapshots for each mutation, restoring exact original source and binary bytes in `finally` before clearing its journal.
 The lead adds each case's own `go` path to `prepared.json`, and the parent GO names that file's `mutant_manifest_sha256`.
-Native execution installs those already proved bytes, runs their routed scene, collects survivors, and restores the exact originals even after failure.
+Native execution installs those already proved bytes, runs their routed scene, collects assertion results, and restores the exact originals even after failure.
+A read-judged run seals its own run id, guarded capture hash, freshness record and native outcome, then stops at `awaiting lead read`; the full run cannot continue yet.
+After reading that fresh image, the lead records the second step with `bin/run --mutant-read RUN HASH killed|survived --evidence DIR`, where DIR is the same mutant batch evidence root.
+The command revalidates that run’s sealed capture and refuses another run’s hash, a changed image, an unknown run or a second verdict.
+Only a matching lead verdict counts toward the mutant aggregate; a queue entry or retained image from another run cannot kill it.
+After all reads, the lead keeps that aggregate for the later full run; recording a read launches nothing.
 An uncleared `mutation-in-flight.json` is a restore failure to resolve before another run.
 `bin/run --mutant-route NAME` prints each historical 6c route from `bin/mutant-routes.json`, including Grok's wrapped toolbar prerequisite, the second Codex MCP dock and Settings' sheet scene.
 Those routes do not re-admit retired draw checks as native mutants.
@@ -206,10 +219,10 @@ mkdir -p "$PROOF/fixtures" "$DATA/project" "$DATA/appcwd"
 printf '%s\n' "${VEYRA_VERIFY_LANE:-fake}" >"$PROOF/lane"
 : >"$PROOF/pages-run"
 PYTHONPATH="$BIN" python3 - <<'PYTIER'
-from orchestration import identity, require_tier
+from orchestration import code_identity, require_tier
 import os, pathlib, shutil
 receipt = pathlib.Path(os.environ['VEYRA_VERIFY_TIER_S'])
-require_tier(receipt,identity())
+require_tier(receipt,code_identity())
 proof = pathlib.Path('target/verify-veyra')/os.environ['RUN']
 for source in (receipt.parent/'tools').iterdir():
     shutil.copy2(source,proof/source.name)
@@ -221,6 +234,7 @@ printf 'RUN=%s\n' "$RUN"
 RUN="$RUN" PYTHONPATH="$BIN" python3 - <<'PY'
 from driver import *
 gate()
+(PROOF/'configured-default-mode').write_text('full_access\n')
 if LANE == 'fake': make_git_shim()
 if LANE == 'fake':
     shell = DATA/'login-shell'
@@ -258,7 +272,9 @@ Use fixture_source and link_fixture for explicit spawn files too; writing throug
 
 ## Doctor
 
-Doctor fails on a wrong process, revision, folder, window or appearance.
+Doctor uses `owned_instance_pid()` for the owned process, revision and data folder, then checks the window and appearance.
+`orchestration.code_identity()` hashes source and binaries; `run.checkout_identity()` applies it to the selected checkout.
+The frame probe uses `probe_instance_pid()` to check its candidate or pinned baseline process.
 The macOS appearance read treats a missing `AppleInterfaceStyle` key as light.
 
 ```sh
@@ -270,7 +286,7 @@ PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 start = time.monotonic()
-pid = identity()
+pid = owned_instance_pid()
 dump = ctl('doctor','dump')
 seconds = time.monotonic()-start
 (PROOF/'doctor-time.txt').write_text(f'{seconds:.3f}\n')
@@ -326,8 +342,8 @@ After another Send on an existing thread, gate `wait Done` on the new turn row o
 
 The read-only dump reports identity, the current view and the look in force.
 Each page owns the dump fields and required evidence for the behaviour it drives.
-Its `### Evidence contract` JSON block owns that page's `required` files and `pairs` comparisons.
-Evidence reads those blocks through `bin/pages.py` and applies every completed token's entries.
+Its `### Evidence contract` JSON block lists that page's required artifacts.
+Evidence checks completed tokens' required artifacts through `bin/pages.py`; the glass recipes retain and judge their own pairs.
 Before every capture, the debug-only `ActivateWindow` action activates Veyra from inside the app.
 The helper waits for two separate rendered frames and 100 ms before inspecting and capturing the window.
 Solid captures use `screencapture -x -o -l WINDOW` and keep the existing on-screen and frontmost guards.
@@ -355,7 +371,7 @@ if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYRECOVER'
 from driver import *
-identity()
+owned_instance_pid()
 ctl('recovery-escape','keys','escape')
 action('recovery-composer','FocusComposer')
 prepare()
@@ -366,6 +382,8 @@ PYRECOVER
 ## Evidence
 
 Run this after the chosen pages and the final Doctor.
+Launch initializes `configured-default-mode` to the known Full access default; each successful `SetDefaultMode` action records its requested mode there.
+Evidence compares SQLite with that independent intent ledger, and never computes its expected mode from the database query under test.
 Each passed section records its name in `pages-run`; Evidence checks only those sections.
 The required files enforce the relaunch, release and feature proofs.
 
@@ -377,17 +395,17 @@ RUN=${RUN:?export the RUN that Launch printed}
 PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
-identity()
+owned_instance_pid()
 ctl('dump-after','dump')
 pages = set((PROOF/'pages-run').read_text().split())
 assert pages, 'no completed page'
-database('final',sql('select default_mode from settings'))
+database('final',configured_default_mode())
 capture('window')
 shutil.copy2(DATA/'logs/veyra.log',PROOF/'veyra.log')
 (PROOF/'git-identity.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True)
     +subprocess.check_output(['git','status','--short'],text=True))
 import pages as page_map
-required,pairs = page_map.evidence_contract(pathlib.Path.cwd())
+required = page_map.evidence_contract(pathlib.Path.cwd())
 assert pages <= required.keys(), pages
 for name in ['drive.log','sql.log',*(name for page in pages for name in required[page])]:
     assert (PROOF/name).stat().st_size > 0, name
@@ -543,6 +561,9 @@ It does not signal an unrecorded group.
 ## Helpers
 
 - `bin/run` is the gated runner described in [Run](#run).
+- `bin/orchestration.py` owns the masked child-process helper used by run, frame_guard and mutants, plus code identity and admission.
+- `bin/repair_tests.py` supplies the offline repair regressions that check-only runs.
+- `python3 .agents/skills/verify-veyra/bin/repair_proofs.py --evidence DIR` records the Musts’ defective-scratch red runs and exact-repair green runs; it never edits the checkout or runs a native surface.
 - `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
 - `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.
 - `bin/backdrop.swift` draws its own black and white stripes and sharp text across every display, using one borderless window per screen in one process.

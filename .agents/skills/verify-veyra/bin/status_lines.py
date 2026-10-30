@@ -3,7 +3,7 @@ import datetime, json, pathlib
 import pages
 from orchestration import write
 
-def propose(folder, expected, attempts, status, names):
+def propose(folder, expected, status, names):
     write(pathlib.Path(folder)/'status-proposals.json',{'head':expected['head'],'full_run':True,
         'date':datetime.date.today().isoformat(),'pages':{
             name:('passed' if status=='DONE' else 'blocked' if status.startswith('BLOCKED') else 'failed')

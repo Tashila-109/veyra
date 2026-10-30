@@ -47,7 +47,7 @@ def admission_and_prepare(runner,root):
     argv = ['--smoke','--base','fixture','--tier-s',str(tier),'--go',str(go),
         '--evidence',str(root/'smoke'),'--deadline',str(time.time()+300)]
     # Call the real parser, selection, plan construction, receipt/GO validation and environment preparation.
-    with patch.object(runner,'identity',return_value=expected),patch.object(pages,'select',return_value=['settings']), \
+    with patch.object(runner,'checkout_identity',return_value=expected),patch.object(pages,'select',return_value=['settings']), \
             patch.object(pages,'changed',return_value=[]):
         found,plan,args,env,identity = runner.prepare(argv,validate=False)
         assert identity==expected and ('settings','Native smoke') in plan
@@ -125,7 +125,7 @@ def collect_all(runner,root):
         def communicate(self,timeout):
             calls.append(self.section)
             if self.section=='covered':
-                o.write(proof/'focus-failure.json',{'failure_epoch':time.time(),'kind':'capture'})
+                o.write(proof/'focus-failure.json',{'failure_epoch':time.time(),'kind':'capture','capture_exhausted':True})
                 self.returncode=1
             elif self.section=='broken': self.returncode=1
             return ('','AssertionError: plain message\n' if self.returncode else '')
@@ -136,12 +136,12 @@ def collect_all(runner,root):
     (proof/'pid').write_text('99999999\n')
     try:
         with patch.object(runner,'REPO',repo),patch.object(runner,'start_owned',side_effect=start), \
-                patch.object(runner,'identity',return_value={'test':'identity'}), \
+                patch.object(runner,'checkout_identity',return_value={'test':'identity'}), \
                 patch.object(runner,'failure_capture',return_value={'stubbed':True}),patch.object(runner,'INTERRUPT',{'signal':None}):
             runner.attempt(found,plan,out,env,time.time()+60,{'test':'identity'},record)
         assert 'independent' in calls and calls[-1]=='Cleanup', calls
         assert [row['kind'] for row in record['sections'] if row['exit']]==['blocked','failed'],record
-        assert runner.verdict(record)[0].startswith('FAILED: independent'),record
+        assert runner.verdict(record).startswith('FAILED: independent'),record
         assert record['evidence']['run'] and record['cleanup_exit']==0
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK,old_mask)
@@ -179,7 +179,7 @@ def routing_and_retention(runner,root):
     assert [row['path'] for row in planned['delete']]==['study.txt'],planned
     assert all((evidence/name).exists() for name in files), 'dry run deleted evidence'
     import status_lines
-    status_lines.propose(root,{'head':'a'*40},[],'DONE',runner.page_names())
+    status_lines.propose(root,{'head':'a'*40},'DONE',runner.page_names())
     proposed=json.loads((root/'status-proposals.json').read_text())
     assert proposed['full_run'] and set(proposed['pages'])==set(runner.page_names())-pages.LIVE
     assert all(state=='passed' for state in proposed['pages'].values())
@@ -209,6 +209,8 @@ def run(runner):
         admission_and_prepare(runner,root)
         collect_all(runner,root)
         routing_and_retention(runner,root)
+        import repair_tests
+        repair_tests.run_all(runner,root/'repair-regressions')
         assert frame_guard.judge([1.2]*5)=='fail'
         assert frame_guard.judge([.9,1.11,1.12,1.13,.9])=='extend'
         assert frame_guard.judge([1.01]*5)=='pass'
