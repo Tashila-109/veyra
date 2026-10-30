@@ -389,6 +389,7 @@ pub(super) struct Button {
     caption: Option<SharedString>,
     inner: KitButton,
     variant: ButtonVariant,
+    plate_base: Option<Hsla>,
     outlined: bool,
     disabled: bool,
     cursor: bool,
@@ -408,6 +409,7 @@ impl Button {
             #[cfg(debug_assertions)]
             caption: None,
             variant: ButtonVariant::Default,
+            plate_base: None,
             outlined: false,
             disabled: false,
             cursor: false,
@@ -417,6 +419,17 @@ impl Button {
     pub(super) fn outline(mut self) -> Self {
         self.outlined = true;
         self.inner = self.inner.outline();
+        self
+    }
+    pub(super) fn lit_plate(mut self, base: Hsla, cx: &App) -> Self {
+        let t = cx.global::<Theme>();
+        self.plate_base = Some(base);
+        self.inner = self
+            .inner
+            .bg(t.plate(base))
+            .border(t.layout.border)
+            .border_color(t.colors.border)
+            .shadow(t.plate_highlight());
         self
     }
     fn cursor_ring(mut self) -> Self {
@@ -643,8 +656,9 @@ impl RenderOnce for Button {
             cx,
         );
         let background = self.inner.style().background.as_ref().and_then(Fill::color);
-        let base = background
-            .and_then(|value| value.as_solid())
+        let base = self
+            .plate_base
+            .or_else(|| background.and_then(|value| value.as_solid()))
             .unwrap_or_else(|| match self.variant {
                 ButtonVariant::Primary => colors.solid,
                 ButtonVariant::Danger => colors.danger,
@@ -658,7 +672,8 @@ impl RenderOnce for Button {
         };
         self.inner = if self.disabled {
             self.inner
-        } else if background.is_some_and(|value| value.as_solid().is_none())
+        } else if self.plate_base.is_some()
+            || background.is_some_and(|value| value.as_solid().is_none())
             || matches!(self.variant, ButtonVariant::Primary | ButtonVariant::Danger)
         {
             self.inner.bg(cx.global::<Theme>().plate(color))

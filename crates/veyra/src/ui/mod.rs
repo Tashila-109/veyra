@@ -1599,13 +1599,24 @@ impl Shell {
     }
     fn busy_sheet_rows(&self) -> Vec<composer::SheetRow> {
         let work = self.engine.window_threads();
-        self.state
+        let mut rows = self
+            .state
             .threads
             .values()
             .filter(|thread| work.get(&thread.id).is_some_and(|state| state.busy))
-            .map(|thread| self.thread_sheet_row(thread))
-            .chain(self.running_shell_rows())
-            .collect()
+            .map(|thread| (thread.id, self.thread_sheet_row(thread)))
+            .collect::<BTreeMap<_, _>>();
+        for (thread, row) in self.running_shell_rows() {
+            match rows.entry(thread) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(row);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().processes.extend(row.processes);
+                }
+            }
+        }
+        rows.into_values().collect()
     }
     fn stop_target(&self) -> Option<StopTarget> {
         let thread = self.view.chat()?;
@@ -4136,9 +4147,6 @@ mod tests {
                     cx.update(|window, _| f32::from(window.viewport_size().width)),
                     width
                 );
-                println!(
-                    "composer window={width} surface={surface:?} send={submit:?} input={input:?}"
-                );
                 cx.dispatch_action(super::DebugComposerWidth::default());
                 draw(cx);
                 assert_eq!(
@@ -4503,14 +4511,27 @@ mod tests {
                         let thumbs = quads
                             .iter()
                             .filter(|quad| {
-                                quad.background == t.colors.raised.into()
+                                quad.background == t.plate(t.colors.raised)
                                     && quad.bounds.left() > track.bounds.left()
                                     && quad.bounds.right() < track.bounds.right()
                                     && quad.bounds.top() >= track.bounds.top()
                                     && quad.bounds.bottom() <= track.bounds.bottom()
                             })
-                            .count();
-                        assert_eq!(thumbs, 1, "{appearance:?}: raised thumb");
+                            .collect::<Vec<_>>();
+                        assert_eq!(thumbs.len(), 1, "{appearance:?}: raised thumb");
+                        let thumb = thumbs[0];
+                        let rim = t.layout.border.scale(scale);
+                        assert!(
+                            quads.iter().any(|quad| {
+                                quad.bounds == thumb.bounds
+                                    && quad.border_color == t.colors.border
+                                    && quad.border_widths.top == rim
+                                    && quad.border_widths.right == rim
+                                    && quad.border_widths.bottom == rim
+                                    && quad.border_widths.left == rim
+                            }),
+                            "{appearance:?}: thumb rim"
+                        );
                     }
                 });
             }
@@ -4531,6 +4552,85 @@ mod tests {
                 shell.read_with(cx, |shell, _| shell.question_scroll.cursor),
                 0
             );
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn submit_buttons_keep_their_existing_paint(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (thread, turn) = shell.update(cx, |shell, _| {
+                configure_dock_thread(shell, ProviderKind::Claude, false, false)
+            });
+            for appearance in [super::Appearance::Dark, super::Appearance::Light] {
+                cx.update(|window, cx| super::Theme::apply(appearance, window, cx));
+                for (stop, draft) in [(true, ""), (false, "Ready to send"), (false, "")] {
+                    shell.update_in(cx, |shell, window, cx| {
+                        shell.state.requests.clear();
+                        shell.providers[0].readiness = if !stop && draft.is_empty() {
+                            Readiness::NotInstalled
+                        } else {
+                            Readiness::Ready
+                        };
+                        shell.state.turns.get_mut(&turn).unwrap().state = if stop {
+                            TurnState::Running { since: 1 }
+                        } else {
+                            TurnState::Ended {
+                                outcome: TurnOutcome::Completed,
+                                started: Some(1),
+                                at: 2,
+                            }
+                        };
+                        shell.state.statuses.insert(
+                            thread,
+                            if stop {
+                                Status::Working { since: 1 }
+                            } else {
+                                Status::Done { took: 1 }
+                            },
+                        );
+                        shell
+                            .input
+                            .update(cx, |input, cx| input.set_value(draft, window, cx));
+                        cx.notify();
+                    });
+                    draw(cx);
+                    let disabled = !stop && draft.is_empty();
+                    let dump = shell.read_with(cx, |shell, cx| shell.dump_composer(cx));
+                    assert_eq!(dump["stop_visible"], stop);
+                    let bounds = cx.debug_bounds("composer-submit-button").unwrap();
+                    cx.update(|window, cx| {
+                        let t = cx.global::<super::Theme>();
+                        let scale = window.scale_factor();
+                        let bounds = bounds.scale(scale);
+                        let quads = window.painted_quads();
+                        let fills = quads
+                            .iter()
+                            .filter(|quad| {
+                                quad.bounds == bounds && !quad.background.is_transparent()
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            fills.len(),
+                            1,
+                            "{appearance:?} stop={stop} disabled={disabled}"
+                        );
+                        let expected = if disabled {
+                            t.colors.card.into()
+                        } else {
+                            t.plate(t.colors.solid)
+                        };
+                        assert_eq!(fills[0].background, expected);
+                        if !disabled {
+                            assert!(quads.iter().any(|quad| {
+                                quad.bounds == bounds
+                                    && quad.border_color == t.colors.border
+                                    && quad.border_widths.top == t.layout.border.scale(scale)
+                                    && quad.border_widths.bottom == t.layout.border.scale(scale)
+                            }));
+                        }
+                    });
+                }
+            }
         });
     }
 
@@ -6739,7 +6839,6 @@ mod tests {
             let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
             let mut failures = Vec::new();
             let mut checked = 0;
-            let mut question_failures = 0;
             for viewport in [theme.layout.window_min, theme.layout.window_default] {
                 cx.simulate_resize(viewport);
                 for provider in ProviderKind::ALL {
@@ -6831,9 +6930,6 @@ mod tests {
                                 {
                                     assert!(cx.debug_bounds(name).is_some(), "missing {name}");
                                 }
-                                if !issues.is_empty() {
-                                    question_failures += 1;
-                                }
                             }
                             checked += 1;
                             if !issues.is_empty() {
@@ -6847,10 +6943,6 @@ mod tests {
                     }
                 }
             }
-            eprintln!(
-                "all dock matrix: {checked} combinations, {} failures, {question_failures} question failures",
-                failures.len()
-            );
             assert_eq!(checked, cases.len() * ProviderKind::ALL.len() * 32);
             assert!(
                 failures.is_empty(),
@@ -6884,7 +6976,6 @@ mod tests {
                 }
             }
             assert_eq!(checked, 4);
-            eprintln!("held and queued controls: {checked} window/provider cases passed");
         });
     }
 
@@ -6941,7 +7032,6 @@ mod tests {
             }
         });
         let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
-        let mut checked = 0;
         for viewport in [theme.layout.window_min, theme.layout.window_default] {
             cx.simulate_resize(viewport);
             for text in ["Choose a route".into(), "q".repeat(400)] {
@@ -6967,10 +7057,8 @@ mod tests {
                     "one-line flex budget: quote={quote:?}, label={label:?}, \
                      text={text:?}, option={option:?}, draft={draft:?}"
                 );
-                checked += 1;
             }
         }
-        eprintln!("question minimum matrix: {checked} flex-pressure cases passed");
     }
 
     #[cfg(debug_assertions)]
@@ -7217,9 +7305,6 @@ mod tests {
             ];
             let mut failures = Vec::new();
             let mut checked = 0;
-            let mut min_details = theme.layout.composer_max_height;
-            let mut min_folder = theme.layout.composer_max_height;
-            let mut min_long_folder = theme.layout.composer_max_height;
             for viewport in [theme.layout.window_min, theme.layout.window_default] {
                 cx.simulate_resize(viewport);
                 for provider in [ProviderKind::Claude, ProviderKind::Codex] {
@@ -7315,17 +7400,12 @@ mod tests {
                                     action.origin,
                                     gpui::size(details.size.width, line),
                                 ));
-                            min_details = min_details.min(details.size.height);
                             let folder_visible = cx
                                 .debug_bounds("approval-working-folder-scroll")
                                 .is_none_or(|folder| {
-                                    min_folder = min_folder.min(folder.size.height);
                                     let long = matches!(cwd,
                                         CommandCwd::Directory(path) if path.as_os_str().len() > 2000
                                     );
-                                    if long {
-                                        min_long_folder = min_long_folder.min(folder.size.height);
-                                    }
                                     let line = cx.update(|window, _| {
                                         theme.text.label.line_height.to_pixels(window.rem_size())
                                     });
@@ -7371,13 +7451,6 @@ mod tests {
                     }
                 }
             }
-            eprintln!(
-                "approval height matrix: {checked} combinations, {} failures; \
-                 min_details={min_details:?}, min_folder={min_folder:?}, \
-                 min_long_folder={min_long_folder:?}; \
-                 flags=hold,two,focused,grant,long_command,reason,preview,draft",
-                failures.len()
-            );
             assert_eq!(checked, 6144);
             assert!(
                 failures.is_empty(),
@@ -7935,10 +8008,6 @@ mod tests {
                 super::Theme::apply(super::Appearance::Dark, window, cx);
             });
             draw(cx);
-            println!(
-                "public accessibility tree available: {}",
-                cx.update(|window, _| window.debug_a11y_tree_json().is_some())
-            );
             clicks.borrow_mut().clear();
             for selector in ["caption-Solid", "caption-Translucent"] {
                 let center = cx.debug_bounds(selector).unwrap().center();
@@ -8212,13 +8281,12 @@ mod tests {
                 shell.new_thread(window, cx);
             });
             draw(cx);
-            for index in 0..20 {
+            for _ in 0..20 {
                 cx.update(|window, cx| window.focus_next(cx));
                 draw(cx);
                 cx.simulate_keystrokes("space");
                 draw(cx);
                 if shell.read_with(cx, |shell, _| shell.permission_picker_open) {
-                    println!("permission menu opened after {} tab steps", index + 1);
                     return;
                 }
                 cx.simulate_keystrokes("escape");
@@ -9205,7 +9273,6 @@ mod tests {
                 responses.borrow().as_slice(),
                 &[(visible, Decision::AllowOnce)]
             );
-            eprintln!("unchanged-render control selected the displayed request");
             draw(cx);
             let button = cx.debug_bounds("approval-allow-button").unwrap().center();
             let next = RequestId::new();
@@ -9247,7 +9314,6 @@ mod tests {
             cx.simulate_click(button, gpui::Modifiers::none());
             cx.run_until_parked();
             let responses = responses.borrow().clone();
-            eprintln!("visible={visible} next={next} selected={responses:?}");
             assert!(
                 !responses.iter().any(|(request, _)| *request == next),
                 "clicking A's rendered Allow once button approved B from a later turn"
@@ -11411,6 +11477,223 @@ mod tests {
                     "split sheet field: {fragment}"
                 );
             }
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn quit_sheet_groups_typed_rows_and_processes(cx: &mut gpui::TestAppContext) {
+        use gpui::VisualContext;
+        use veyra_engine::commands::{Ack, Command};
+        cx.dispatcher.allow_parking();
+        struct QuitSheet(Entity<super::Shell>);
+        impl Render for QuitSheet {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    shell.render_quit_sheet(cx).into_any_element()
+                })
+            }
+        }
+        struct Shutdown {
+            engine: veyra_engine::Engine,
+            runtime: tokio::runtime::Runtime,
+        }
+        impl Drop for Shutdown {
+            fn drop(&mut self) {
+                self.runtime.block_on(self.engine.shutdown_wait());
+            }
+        }
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        with_docked_shell(&mut test, |shell, cx, _, _| {
+            let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
+            let fixtures = data.join("fixtures");
+            let project_path = data.join("Project · Notes");
+            std::fs::create_dir_all(&fixtures).unwrap();
+            std::fs::create_dir_all(&project_path).unwrap();
+            let records = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../engine/tests/fixtures/codex/approval-command.jsonl"),
+            )
+            .unwrap();
+            let staged = records
+                .lines()
+                .map(|line| {
+                    let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+                    if record["type"] == "expect_outbound"
+                        && record["line"]["method"] == "thread/start"
+                    {
+                        record["line"]["params"]["config"] = serde_json::json!("<any>");
+                    }
+                    serde_json::to_string(&record).unwrap() + "\n"
+                })
+                .collect::<String>();
+            std::fs::write(fixtures.join("t1-s1.jsonl"), staged).unwrap();
+            let target = std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let fixture = data.join("shell.jsonl");
+            std::fs::write(&fixture, concat!(
+                "{\"type\":\"transcript_start\",\"provider\":\"shell\",\"protocol\":\"terminal\",",
+                "\"cli_version\":\"fixture\",\"scenario\":\"shell-background-job\",\"source\":\"scripted\"}\n"
+            )).unwrap();
+            let script = data.join("shell");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nVEYRA_FAKE_FIXTURE='{}' exec '{}' shell\n",
+                    fixture.display(),
+                    target.join("veyra-test-cli").display()
+                ),
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .arg("700")
+                    .arg(&script)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut env = veyra_engine::provider::env::ChildEnv::isolated()
+                .with_binary(ProviderKind::Codex, target.join("veyra-fake-cli"))
+                .with_variable("SHELL", script.as_os_str());
+            env.fixtures = Some(fixtures);
+            let engine = veyra_engine::Engine::start_with_env(
+                runtime.handle(),
+                veyra_engine::data_dir::DataDir::at(data.clone()).unwrap(),
+                env,
+            )
+            .unwrap();
+            let shutdown = Shutdown { engine, runtime };
+            let (thread, events) = shutdown.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    let mut events = shutdown.engine.subscribe();
+                    let Ack::Project(project) = shutdown
+                        .engine
+                        .send(Command::AddProject {
+                            path: project_path.clone(),
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap()
+                    else {
+                        panic!("project ack")
+                    };
+                    let Ack::Thread(thread) = shutdown
+                        .engine
+                        .send(Command::CreateThread {
+                            project,
+                            provider: ProviderKind::Codex,
+                            config: ThreadConfig {
+                                model: None,
+                                effort: None,
+                                mode: PermissionMode::AskFirst,
+                            },
+                            text: "Fix A · B".into(),
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap()
+                    else {
+                        panic!("thread ack")
+                    };
+                    let mut received = Vec::new();
+                    while let Some(event) = events.recv().await {
+                        let pending = matches!(
+                            &event,
+                            UiEvent::Change {
+                                event: ChangeEvent::RequestOpened(_),
+                                ..
+                            }
+                        );
+                        received.push(event);
+                        if pending {
+                            return (thread, received);
+                        }
+                    }
+                    panic!("fake approval did not arrive")
+                })
+                .await
+                .unwrap()
+            });
+            assert!(shutdown.engine.window_threads()[&thread].busy);
+            let handle = shutdown
+                .engine
+                .open_shell(
+                    thread,
+                    project_path,
+                    veyra_engine::terminal::PtySize::default(),
+                )
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while handle.running_processes().is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fake shell job did not start"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            cx.replace_root_view(|_, _| QuitSheet(shell.clone()));
+            text.clear();
+            shell.update_in(cx, |shell, window, cx| {
+                shell.engine = shutdown.engine.clone();
+                shell.runtime = shutdown.runtime.handle().clone();
+                shell.state = super::AppState::default();
+                for event in events {
+                    shell.state.apply(event);
+                }
+                shell.state.threads.get_mut(&thread).unwrap().title = "Fix A · B".into();
+                let view = cx.new(|cx| {
+                    super::terminal_view::TerminalView::new(Some(handle.clone()), window, cx)
+                });
+                shell.drawers.insert(
+                    thread,
+                    super::drawer::Drawer {
+                        open: false,
+                        height: gpui::Pixels::from(240.),
+                        active: 0,
+                        tabs: vec![super::drawer::Tab {
+                            number: 1,
+                            label: "Quit shell".into(),
+                            handle: Some(handle.clone()),
+                            view,
+                            error: None,
+                        }],
+                    },
+                );
+                shell.quit_sheet = true;
+                cx.notify();
+            });
+            draw(cx);
+            for expected in ["Fix A · B", "Project · Notes", "Quit shell: sleep"] {
+                assert!(
+                    text.lines().contains(expected),
+                    "missing quit-sheet field: {expected}; layout text: {:?}",
+                    text.lines()
+                );
+            }
+            shell.read_with(cx, |shell, _| {
+                let rows = shell.busy_sheet_rows();
+                assert_eq!(rows.len(), 1, "one quit row per thread");
+                assert_eq!(rows[0].title, "Fix A · B");
+                assert_eq!(rows[0].project, "Project · Notes");
+                assert!(
+                    rows[0]
+                        .processes
+                        .iter()
+                        .any(|name| name == "Quit shell: sleep")
+                );
+                assert_eq!(shell.running_shells().len(), 1);
+            });
         });
     }
     #[cfg(debug_assertions)]

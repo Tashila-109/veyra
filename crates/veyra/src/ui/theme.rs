@@ -1023,22 +1023,8 @@ mod tests {
             let theme = Theme::new(appearance);
             let coverage = (35..=50)
                 .map(|step| step as f32 * 0.02)
-                .find(|coverage| {
-                    if let Some((role, background, ratio)) =
-                        sidebar_contrast_failure(&theme, *coverage)
-                    {
-                        println!(
-                            "{} coverage={coverage:.2} rejected foreground={role} \
-                             background={background} ratio={ratio:.4}",
-                            appearance.name()
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                })
+                .find(|coverage| sidebar_contrast_failure(&theme, *coverage).is_none())
                 .expect("no passing glass tint");
-            println!("{} glass_coverage={coverage:.2}", appearance.name());
             (appearance, coverage)
         });
         for (appearance, coverage) in coverages {

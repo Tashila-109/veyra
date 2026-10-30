@@ -8,6 +8,9 @@ impl RenderedText {
     pub(crate) fn lines(&self) -> std::collections::BTreeSet<String> {
         self.0.lock().unwrap().clone()
     }
+    pub(crate) fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
 }
 #[cfg(debug_assertions)]
 impl gpui::PlatformTextSystem for RenderedText {

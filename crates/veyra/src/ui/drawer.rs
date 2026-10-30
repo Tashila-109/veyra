@@ -227,7 +227,7 @@ impl Shell {
             })
             .collect()
     }
-    pub(super) fn running_shell_rows(&self) -> Vec<super::composer::SheetRow> {
+    pub(super) fn running_shell_rows(&self) -> Vec<(ThreadId, super::composer::SheetRow)> {
         self.drawers
             .keys()
             .flat_map(|thread| {
@@ -244,7 +244,7 @@ impl Shell {
                             processes: Vec::new(),
                         });
                     row.processes.push(process);
-                    row
+                    (*thread, row)
                 })
             })
             .collect()

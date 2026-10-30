@@ -58,19 +58,15 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
         let t = cx.global::<Theme>();
         let control =
             segment_track(cx).children(MODES.into_iter().enumerate().map(|(index, mode)| {
-                labelled_button(("default-mode", index), mode_label(mode), cx)
-                    .h(t.layout.segment_button)
-                    .selected(mode == settings.default_mode)
-                    .when(mode == settings.default_mode, |button| {
-                        button
-                            .bg(t.colors.raised)
-                            .border(t.layout.border)
-                            .border_color(t.colors.border)
-                            .shadow(t.plate_highlight())
-                    })
-                    .on_click(move |_, window, cx| {
-                        window.dispatch_action(Box::new(SetDefaultMode { mode: Some(mode) }), cx)
-                    })
+                segment_thumb(
+                    labelled_button(("default-mode", index), mode_label(mode), cx)
+                        .h(t.layout.segment_button),
+                    mode == settings.default_mode,
+                    cx,
+                )
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(Box::new(SetDefaultMode { mode: Some(mode) }), cx)
+                })
             }));
         setting_row(
             "settings-default-heading",
@@ -213,30 +209,30 @@ pub(super) fn background_button(
 ) -> Button {
     let t = cx.global::<Theme>();
     let selected = background == t.look.background();
-    labelled_button(label, label, cx)
-        .selected(selected)
-        .disabled(t.look.forced_by().is_some())
-        .when(selected, |button| {
-            button
-                .bg(t.colors.raised)
-                .border(t.layout.border)
-                .border_color(t.colors.border)
-                .shadow(t.plate_highlight())
-        })
-        .on_click(move |_, window, cx| {
-            window.dispatch_action(
-                Box::new(SetWindowBackground {
-                    background: Some(background),
-                }),
-                cx,
-            )
-        })
+    segment_thumb(
+        labelled_button(label, label, cx).disabled(t.look.forced_by().is_some()),
+        selected,
+        cx,
+    )
+    .on_click(move |_, window, cx| {
+        window.dispatch_action(
+            Box::new(SetWindowBackground {
+                background: Some(background),
+            }),
+            cx,
+        )
+    })
+}
+fn segment_thumb(button: Button, selected: bool, cx: &App) -> Button {
+    button.selected(selected).when(selected, |button| {
+        button.lit_plate(cx.global::<Theme>().colors.raised, cx)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Theme, background_button, segment_track};
-    use gpui_kit::{Fill, Styled};
+    use gpui_kit::{Fill, Styled, linear_color_stop, linear_gradient};
 
     #[gpui::test]
     fn segments_use_card_tracks_and_lit_thumbs(cx: &mut gpui::TestAppContext) {
@@ -256,9 +252,25 @@ mod tests {
                 let mut thumb = background_button(t.look.background(), "Selected", cx);
                 assert_eq!(
                     thumb.style().background.as_ref().and_then(Fill::color),
-                    Some(t.colors.raised.into())
+                    Some(linear_gradient(
+                        180.,
+                        linear_color_stop(
+                            super::super::theme::blend(t.colors.hover, t.colors.raised),
+                            0.
+                        ),
+                        linear_color_stop(t.colors.raised, 0.5),
+                    ))
                 );
+                assert_eq!(thumb.style().border_color, Some(t.colors.border));
                 assert_eq!(thumb.style().box_shadow, Some(t.plate_highlight()));
+                let highlight = thumb.style().box_shadow.clone().unwrap();
+                assert_eq!(highlight.len(), 1);
+                assert!(highlight[0].inset);
+                assert_eq!(highlight[0].color, t.colors.hover);
+                assert_eq!(highlight[0].offset.x, gpui_kit::Pixels::ZERO);
+                assert_eq!(highlight[0].offset.y, t.layout.border);
+                assert_eq!(highlight[0].blur_radius, gpui_kit::Pixels::ZERO);
+                assert_eq!(highlight[0].spread_radius, gpui_kit::Pixels::ZERO);
             }
         });
     }
