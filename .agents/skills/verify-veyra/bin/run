@@ -10,6 +10,7 @@ REPO = SKILL.parent.parent.parent
 sys.path.insert(0,str(SKILL/'bin'))
 sys.dont_write_bytecode = True
 import pages
+import orchestration as orchestration
 PROVIDERS = {'Codex':'codex','Grok':'grok'}
 FIRST = ('app-launch','Driving it with veyra ctl')
 RELEASE = ('app-launch','Release check')
@@ -71,6 +72,12 @@ def sections():
 
 def check_map(found):
     """The plan's fixed sections must exist, so a renamed heading fails loudly instead of dropping its step."""
+    linked = re.findall(r'^\[[^]]+\]\(([a-z0-9-]+)\.md\)',(SKILL/'features/README.md').read_text(),re.M)
+    assert len(linked)==len(set(linked)) and set(linked)==set(page_names()), 'feature index differs from sibling pages'
+    for name in page_names():
+        text = (SKILL/'features'/(name+'.md')).read_text()
+        assert re.search(r'^Status: (passed|failed|blocked|not run),',text,re.M), 'missing Status: '+name
+        assert re.search(r'^Covers: .+',text,re.M), 'missing Covers: '+name
     for key in [('SKILL','Launch'),('SKILL','Doctor'),('SKILL','Evidence'),('SKILL','Cleanup'),FIRST,RELEASE,
             *sorted(PERF_ONLY)]:
         assert key in found, 'no section '+'/'.join(key)+'; rename it in bin/run too'
@@ -92,7 +99,7 @@ def launch_gates(found):
 
 def gate_check():
     """Run driver self-tests in a scratch checkout, because the driver reads a run's records at import."""
-    root = pathlib.Path(tempfile.mkdtemp(prefix='veyra-gate-',dir='/tmp'))
+    root = pathlib.Path(tempfile.mkdtemp(prefix='veyra-mverify-gate-',dir='/tmp'))
     try:
         (root/'crates/veyra').mkdir(parents=True)
         (root/'crates/veyra/Cargo.toml').write_text('')
@@ -122,49 +129,30 @@ def driver_self_test_dispatch_check():
     for name in ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test','window_rules_self_test'):
         getattr(driver,name).assert_called_once_with()
 
-def verdict(record, counted, late=False):
-    """The only place a run's status is decided, after Cleanup has run. None asks for another attempt.
-
-    DONE needs every planned section passed, Cleanup exit 0, an unchanged tree, the proof copy kept under ATTEMPT/run
-    and no interrupting signal. A pending signal counts for every outcome and is recorded in the record, which main()
-    then writes once as attempt.json. counted is the capture failures so far, and late means the deadline is under a
-    minute away.
-    """
-    failed, seen = record['failed'], record.get('observed') or {}
+def verdict(record, counted=0, late=False):
+    """One terminal verdict after Cleanup; section failures are collected, never whole-run retries."""
     taken = take_pending()
     record['interrupted'] = record.get('interrupted') or (taken or [None])[0]
     if record['interrupted']: return 'FAILED: interrupted by '+record['interrupted'],counted
-    if record.get('cleanup_exit') not in (0,None) or record.get('scratch_left'):
+    if record.get('cleanup_exit') != 0 or record.get('scratch_left'):
         return 'FAILED: Cleanup did not pass',counted
-    missing = [name for name,kept in record.get('evidence',{'evidence check':False}).items() if not kept]
-    if missing: return 'FAILED: required evidence was not kept: '+', '.join(missing)+'; see problems',counted
-    if not record['identity_unchanged']: return 'FAILED: the tree changed during the run',counted
-    if not failed:
-        if record.get('all_passed') and record['cleanup_exit'] == 0: return 'DONE',counted
-        return 'FAILED: not every planned section passed',counted
-    if failed.get('deadline') or late: return 'BLOCKED: wall-time limit',counted
-    if seen.get('human_input'): return None,counted
-    if seen.get('kind') == 'capture':
-        if counted+1 >= 3: return 'BLOCKED: a third capture failure with no human input',counted+1
-        return None,counted+1
-    cause = ' at '+seen['kind'] if seen.get('kind') else ''
-    return 'FAILED: '+failed['section']+' failed'+cause+' with no human input',counted
+    if not all(record.get('evidence',{'run':False}).values()): return 'FAILED: required evidence was not kept',counted
+    if not record.get('identity_unchanged'): return 'FAILED: the identity changed during the run',counted
+    if record.get('fatal_stop'): return 'FAILED: safety stop; see fatal_stop',counted
+    rows = record.get('sections',[])
+    if any(row['kind']=='failed' for row in rows): return 'FAILED: independent failures collected',counted
+    if any(row['kind']=='blocked' for row in rows): return 'BLOCKED: re-run only blocked sections with --sections',counted
+    if record.get('all_passed') and not record.get('failed'): return 'DONE',counted
+    return 'FAILED: not every planned section passed',counted
 
 def verdict_check():
-    done = {'failed':None,'cleanup_exit':0,'identity_unchanged':True,'all_passed':True,'evidence':{'run':True}}
-    bad = dict(done,failed={'section':'page/section','exit':1,'deadline':False},all_passed=False)
-    def seen(kind, human): return dict(bad,observed={'failure':'step','kind':kind,'human_input':human})
-    cases = [(done,0,'DONE'),(dict(done,evidence={'run':False}),0,'FAILED: required evidence'),
-        ({key:value for key,value in done.items() if key != 'evidence'},0,'FAILED: required evidence'),
-        (dict(done,all_passed=False),0,'FAILED: not every'),(dict(done,cleanup_exit=None),0,'FAILED'),
-        (dict(done,interrupted='SIGTERM'),0,'FAILED: interrupted'),(dict(bad,cleanup_exit=1),0,'FAILED: Cleanup'),
-        (dict(bad,scratch_left=['x']),0,'FAILED'),(dict(bad,identity_unchanged=False),0,'FAILED: the tree'),
-        (dict(bad,failed=dict(bad['failed'],deadline=True)),0,'BLOCKED'),(dict(bad,late=True),0,'BLOCKED'),
-        (seen('focus-timeout',True),5,None),(seen('capture',True),5,None),(seen('capture',False),1,None),
-        (seen('capture',False),2,'BLOCKED'),(seen('focus-timeout',False),0,'FAILED'),(bad,0,'FAILED')]
-    for record,counted,expected in cases:
-        status,_ = verdict(record,counted,record.get('late',False))
-        assert (status is None) if expected is None else (status or '').startswith(expected),(record,counted,status)
+    done = {'cleanup_exit':0,'identity_unchanged':True,'all_passed':True,'failed':None,'evidence':{'run':True}}
+    for change,wanted in [({},'DONE'),({'cleanup_exit':1},'FAILED'),({'scratch_left':['x']},'FAILED'),
+            ({'identity_unchanged':False},'FAILED'),({'interrupted':'SIGTERM'},'FAILED'),
+            ({'evidence':{} ,'all_passed':False},'FAILED'),({'evidence':{'run':False}},'FAILED'),
+            ({'sections':[{'kind':'blocked'}]},'BLOCKED'),
+            ({'sections':[{'kind':'failed'},{'kind':'blocked'}]},'FAILED'),({'fatal_stop':True},'FAILED')]:
+        assert verdict(dict(done,**change))[0].startswith(wanted),change
 
 def guards_in_place(found):
     """start()'s relaunch refusal and Cleanup's drain are read as Python structure; the stale-screenshot assert and the
@@ -192,7 +180,7 @@ def guards_in_place(found):
     assert reads and refuses(before,'foreign'), 'start() no longer refuses a foreign veyra before it launches'
     swift = (SKILL/'bin/capture-window.swift').read_text()
     for where,text,needle in [('Cleanup',found[('SKILL','Cleanup')],'time.monotonic()-started >= 30'),
-            ('bin/driver.py',driver,"'stale screenshot after state change: '"),
+            ('bin/driver.py',driver,'fresh = record(target,started_ns'),
             ('bin/capture-window.swift',swift,'fail("owned window is covered')]:
         assert needle in text, where+' no longer contains the text of its guard '+needle
 
@@ -204,36 +192,39 @@ def checks(found):
         for match in HEREDOC.finditer(block):
             compile(match['body'],'/'.join(key),'exec')
             blocks += 1
-    compile((SKILL/'bin/driver.py').read_text(),'bin/driver.py','exec')
+    for path in (SKILL/'bin').iterdir():
+        if path.suffix == '.py' or path.name in ['run','prune','stamp-status']:
+            compile(path.read_text(),str(path),'exec')
     check_map(found)
+    pages.evidence_contract(REPO)
     launch_gates(found)
     guards_in_place(found)
     verdict_check()
     driver_self_test_dispatch_check()
+    import self_tests
+    self_tests.run(sys.modules[__name__])
     return (f'{len(found)} shell blocks and {blocks} Python heredocs compile across {len(page_names())} pages; '
         'the fixed sections exist; Launch calls gate() before start(); start() asserts its relaunch refusal and '
         'Cleanup its drain; the 30 s drain, stale-screenshot and covered-window guard texts are present; the verdict '
         'holds; '+gate_check())
 
 def identity():
-    status = subprocess.check_output(['git','status','--short','--untracked-files=all'],cwd=REPO,text=True)
-    untracked = {line[3:]:hashlib.sha256((REPO/line[3:]).read_bytes()).hexdigest()
-        for line in status.splitlines() if line.startswith('?? ')}
-    return {'head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),'status':status,
-        'diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff','HEAD'],cwd=REPO)).hexdigest(),
-        'untracked_sha256':untracked}
+    return orchestration.identity(REPO)
 
 def plan_for(found, tokens, explicit):
     if explicit:
         steps = [tuple(item.split('/',1)) for item in explicit]
         for step in steps: assert step in found, step
-        return [('SKILL','Launch'),*steps]
+        forbidden = {('SKILL',name) for name in ['Launch','Evidence','Cleanup','Recover section']}
+        assert not set(steps)&forbidden, 'lifecycle sections are owned by the runner'
+        steps = [step for step in steps if step not in {('SKILL','Doctor'),FIRST}]
+        return [('SKILL','Launch'),('SKILL','Doctor'),FIRST,*steps,('SKILL','Doctor'),('SKILL','Evidence')]
     selected = None if tokens is None else set(tokens)
     plan = [('SKILL','Launch'),('SKILL','Doctor')]
     for page in page_names():
         if page in LIVE_PAGES: continue
         for key in [key for key in found if key[0] == page]:
-            if key in PERF_ONLY: continue
+            if key in PERF_ONLY or key[1] in ['Native smoke','Glass smoke']: continue
             if key == RELEASE: wanted = selected is None or 'release' in selected
             elif key[1] in PROVIDERS: wanted = selected is None or page+':'+PROVIDERS[key[1]] in selected
             elif key == FIRST: wanted = True
@@ -242,6 +233,24 @@ def plan_for(found, tokens, explicit):
                 if key == RELEASE: plan.append(('SKILL','Doctor'))
                 plan.append(key)
     return plan+[('SKILL','Doctor'),('SKILL','Evidence')]
+
+def smoke_plan(found, tokens, glass=False):
+    """Each page owns one bounded capture scene. Smoke cannot run a full page or stamp its status."""
+    chosen = {token.split(':')[0] for token in tokens}-LIVE_PAGES-{'release','app-launch'}
+    plan = [('SKILL','Launch'),('SKILL','Doctor'),FIRST]
+    for page in page_names():
+        if page in chosen:
+            key = (page,'Native smoke')
+            assert key in found, 'no capture section for '+page
+            plan.append(key)
+    if 'release' in tokens: plan.append(RELEASE)
+    if glass: plan.append(('settings','Glass smoke'))
+    return plan+[('SKILL','Doctor'),('SKILL','Evidence')]
+
+def classify(code, observed, fatal=False, deadline=False):
+    if fatal: return 'fatal'
+    if deadline or (observed or {}).get('kind') == 'capture': return 'blocked'
+    return 'failed' if code else 'passed'
 
 def failure_capture(env, out):
     """One best-effort screenshot of the failed state, taken inside attempt()'s try so Cleanup follows whatever it does.
@@ -326,15 +335,51 @@ def attempt(found, plan, out, env, deadline, expected, record):
         signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
         out.mkdir(parents=True,exist_ok=True)
         keep('plan.json',lambda: (out/'plan.json').write_text(json.dumps(plan,indent=1)+'\n'))
+        record['sections'] = []
         for key in plan:
+            if time.time() >= deadline:
+                record['sections'].extend({'section':'/'.join(remaining),'exit':None,'kind':'blocked'}
+                    for remaining in plan[plan.index(key):])
+                record['failed'] = record['failed'] or {'section':'deadline','exit':None,'deadline':True}
+                break
+            if identity() != expected:
+                record['fatal_stop'] = {'section':'/'.join(key),'kind':'identity'}
+                record['failed'] = {'section':'identity','exit':None,'deadline':False}
+                break
             current[0] = '/'.join(key)
             code,text = execute(key)
             if key == ('SKILL','Launch') and not code and identity() != expected:
                 record['failed'] = {'section':'tree identity after Launch','exit':None,'deadline':False}
                 break
             if code:
-                record['failed'] = {'section':'/'.join(key),'exit':code,'deadline':'Wall-time limit reached' in text}
-                break
+                observation = proof/'focus-failure.json'
+                try: seen = json.loads(observation.read_text()) if observation.exists() else {}
+                except (OSError,ValueError): seen = {}
+                if seen.get('failure_epoch',0) < timings[-1]['start_epoch']: seen = {}
+                safety = proof/'safety-stop.json'
+                fatal = key in [('SKILL','Launch'),('SKILL','Doctor')] or safety.exists() \
+                    or bool(re.search(r'(?m)^(?:\w+\.)?SafetyStop:',text)) or 'restore failed' in text
+                kind = classify(code,seen,fatal,'Wall-time limit reached' in text)
+                row = {'section':'/'.join(key),'exit':code,'kind':kind,'observed':seen}
+                record['sections'].append(row)
+                record['failed'] = record['failed'] or {'section':'/'.join(key),'exit':code,'deadline':False}
+                if fatal:
+                    record['fatal_stop'] = row
+                    break
+                if not seen.get('human_input') and not safety.exists():
+                    record.setdefault('failure_captures',[]).append(failure_capture(env,out))
+                # A surprising drive is health-checked and reset before any independent section.
+                doctor_code,_ = execute(('SKILL','Doctor'))
+                if doctor_code:
+                    record['fatal_stop'] = {'section':'recovery Doctor','kind':'identity','exit':doctor_code}
+                    break
+                recovery = ('SKILL','Recover section')
+                reset_code,_ = execute(recovery)
+                if reset_code:
+                    record['fatal_stop'] = {'section':'recovery restore','kind':'restore','exit':reset_code}
+                    break
+            else:
+                record['sections'].append({'section':'/'.join(key),'exit':0,'kind':'passed'})
         failed = record['failed']
         if failed:
             receipt = proof/'focus-failure.json'
@@ -398,7 +443,7 @@ def attempt(found, plan, out, env, deadline, expected, record):
             record['identity_unchanged'] = False
         record['interrupted'] = record['interrupted'] or INTERRUPT['signal'] or (take_pending() or [None])[0]
         passed = {row['section'] for row in timings if row['exit'] == 0}
-        record['all_passed'] = all('/'.join(key) in passed for key in plan)
+        record['all_passed'] = all('/'.join(key) in passed for key in plan) and not record['failed']
         record['recipe_seconds'] = sum(row['seconds'] for row in timings)
         record['evidence'] = {'run':copied and (out/'run').is_dir()}
 
@@ -419,7 +464,7 @@ def receipt_error(path, data):
     print(f'{path} was not kept: {error}',file=sys.stderr,flush=True)
     return error
 
-def prepare():
+def prepare(argv=None, validate=True):
     """Everything before the first attempt: options, checks, selection and the tree's identity. Nothing is owned yet,
     so an interrupting signal here simply ends the runner. Returns an exit code, or what the attempts need."""
     parser = argparse.ArgumentParser()
@@ -432,20 +477,50 @@ def prepare():
     parser.add_argument('--deadline',type=float,default=time.time()+3*3600)
     parser.add_argument('--scratch',default='/tmp/veyra-verify-')
     parser.add_argument('--check-only',action='store_true')
-    args = parser.parse_args()
+    parser.add_argument('--smoke',action='store_true')
+    parser.add_argument('--gate',action='store_true')
+    parser.add_argument('--slice-end',action='store_true')
+    parser.add_argument('--tier-s',type=pathlib.Path)
+    parser.add_argument('--tier-s-write',type=pathlib.Path)
+    parser.add_argument('--go',type=pathlib.Path)
+    parser.add_argument('--then-guard',action='store_true',help='run frame guard first, then smoke')
+    parser.add_argument('--baseline',type=pathlib.Path)
+    parser.add_argument('--native-mutants',type=pathlib.Path)
+    parser.add_argument('--prepare-mutants',type=pathlib.Path)
+    parser.add_argument('--mutant-route')
+    args = parser.parse_args(argv)
+    assert not args.real_quiet or args.gate, '--real-quiet requires --gate'
+    assert not args.smoke or args.base, '--smoke requires --base'
+    assert not args.then_guard or args.smoke, '--then-guard requires --smoke'
+    assert not args.then_guard or args.baseline, '--then-guard requires --baseline'
+    assert sum([args.smoke,args.gate,args.slice_end]) <= 1, 'choose smoke, slice-end or gate'
+    assert not args.native_mutants or (args.gate or args.slice_end), 'native mutants belong only to slice-end/gate'
+
     found = sections()
-    proven = checks(found)
+    proven = checks(found) if validate else 'checks already running'
     if args.check_only:
         print('PASS '+proven+'; no launch')
         return 0
+    if args.mutant_route:
+        routes = json.loads((SKILL/'bin/mutant-routes.json').read_text())
+        print(json.dumps(routes[args.mutant_route],indent=2))
+        return 0
+    if args.prepare_mutants:
+        from mutants import prepare_mutants
+        assert args.evidence
+        prepare_mutants(args.prepare_mutants,args.evidence)
+        return 0
+    if args.tier_s_write:
+        orchestration.tier_s(args.tier_s_write)
+        return 0
     if args.base is not None:
-        assert args.pages is None and args.sections is None, '--base replaces --pages and --sections'
+        assert args.pages is None, '--base replaces --pages'
         try: args.pages = pages.select(REPO,args.base)
         except subprocess.CalledProcessError as error:
             print('selection from '+args.base+' failed, so nothing ran: '+error.stderr.decode().strip(),file=sys.stderr)
             return 2
         print('selected since '+args.base+': '+(' '.join(args.pages) or 'nothing'),flush=True)
-        if not set(args.pages)-LIVE_PAGES:
+        if not args.sections and not set(args.pages)-LIVE_PAGES:
             for token in sorted(set(args.pages)&LIVE_PAGES):
                 print(token+' is due and needs a consented live lane; a fake-CLI run does not drive it',flush=True)
             print('no fake-CLI page is selected since '+args.base+', so nothing launched',flush=True)
@@ -457,21 +532,34 @@ def prepare():
             assert token == 'release' or token.split(':')[0] in page_names(), token
         for token in sorted(set(args.pages)&LIVE_PAGES):
             print(token+' is due and needs a consented live lane; this fake-CLI run does not drive it',flush=True)
-    plan = plan_for(found,args.pages,args.sections)
+    if args.gate:
+        args.pages = None  # full map, including release
+    if args.smoke and not args.sections:
+        glass = any(pages.class_c_change(REPO,args.base,None,path,'glass')
+            for path in pages.changed(REPO,args.base,None))
+        plan = smoke_plan(found,args.pages,glass)
+    else: plan = plan_for(found,args.pages,args.sections)
+    assert not (args.gate or args.slice_end) or (args.pages is None and args.sections is None), 'full run requires every page'
+
     expected = identity()
     if args.expect_head: assert expected['head'] == args.expect_head, 'checkout is not at '+args.expect_head
+    assert args.tier_s and args.go, 'native launch requires --tier-s RECEIPT and --go GO.json'
+    orchestration.require_tier(args.tier_s,expected)
+    orchestration.require_go(args.go,expected,args.deadline,args.then_guard)
     args.evidence.mkdir(parents=True,exist_ok=True)
     (args.evidence/'identity.json').write_text(json.dumps(expected,indent=2)+'\n')
     env = {key:value for key,value in os.environ.items() if key not in ['RUN','DATA','DB','PROOF','PID','PGID',
         'ID','VEYRA_DATA_DIR','VEYRA_CLAUDE_BIN','VEYRA_CODEX_BIN','VEYRA_GROK_BIN','VEYRA_FAKE_FIXTURES',
         'VEYRA_FAKE_FIXTURE','VEYRA_RECORD','VEYRA_VERIFY_REAL_QUIET']}
     env.update(PATH='/opt/homebrew/opt/rustup/bin:'+env['PATH'],VEYRA_VERIFY_LANE='fake',PYTHONDONTWRITEBYTECODE='1',
-        VEYRA_VERIFY_TMP=args.scratch,VEYRA_VERIFY_DEADLINE=str(args.deadline))
+        VEYRA_VERIFY_TMP=args.scratch,VEYRA_VERIFY_DEADLINE=str(args.deadline),
+        VEYRA_VERIFY_TIER_S=str(args.tier_s.resolve()),VEYRA_VERIFY_GO=str(args.go.resolve()))
     if args.real_quiet: env['VEYRA_VERIFY_REAL_QUIET'] = '1'
     if shutil.which('sccache'): env['RUSTC_WRAPPER'] = 'sccache'
     return found,plan,args,env,expected
 
 def main():
+    os.environ['GIT_OPTIONAL_LOCKS'] = '0'
     for number in SIGNALS: signal.signal(number,interrupted)
     try: setup = prepare()
     except Interrupted as stop:
@@ -479,6 +567,25 @@ def main():
         return 128+signal.Signals[str(stop)].value
     if isinstance(setup,int): return setup
     found,plan,args,env,expected = setup
+    if args.then_guard:
+        from frame_guard import run_guard, chain
+        try:
+            result = chain(lambda:run_guard(args,expected,sections),
+                lambda:{'passed':run_native(found,plan,args,env,expected)==0,'cleanup_passed':True})
+            return 0 if result['passed'] else 1
+        except Exception as error:
+            orchestration.write(args.evidence/'outcome.json',{'status':'FAILED: frame guard safety/check failure','error':str(error)})
+            return 1
+        finally:
+            if not (args.evidence/'guard-done.json').exists():
+                orchestration.write(args.evidence/'guard-done.json',{'passed':False,'finished_epoch':time.time(),
+                    'release_arch_plan_pause':True,'identity':expected})
+    return run_native(found,plan,args,env,expected)
+
+def run_native(found,plan,args,env,expected):
+    if args.native_mutants:
+        from mutants import run_mutants
+        if not run_mutants(args,expected): return 1
     attempts, counted, status, lost = [], 0, None, []
     while status is None:
         try: signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
@@ -522,6 +629,10 @@ def main():
     for number in SIGNALS: signal.signal(number,signal.SIG_IGN)
     signal.pthread_sigmask(signal.SIG_UNBLOCK,SIGNALS)
     if late: return 128+signal.Signals[late[0]].value
+    if args.gate or args.slice_end:
+        import status_lines
+        status_lines.propose(args.evidence,expected,attempts,
+            'FAILED: required receipt not kept' if lost else status,page_names())
     return 0 if status == 'DONE' and not lost else 1
 
 if __name__ == '__main__':

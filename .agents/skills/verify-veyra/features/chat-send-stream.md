@@ -21,7 +21,7 @@ The sidebar and header show Veyra's Working arc, Done check, Failed cross and Id
 The arc steps on the one shared clock and stays still under Reduce Motion; the elapsed words still advance.
 The chat centres user bubbles and assistant markdown in one column, with a still caret while text streams.
 Reasoning and tool rows start collapsed; `ToggleItem` opens their detail, retaining the last 10,000 characters of tool output.
-The wrapped Grok toolbar capture uses the debug-only `DebugComposerWidth` action to set a 440-point composer column inside the unchanged window. It checks Send's painted right edge against the card's painted right edge, without any window-manager call, then restores the original column option through the action and polls its dump and measured width. Its provider-supplied title "Execute `pwd`" keeps the provider's literal backticks; command spans apply to Veyra's own copy.
+The wrapped Grok toolbar capture uses the debug-only `DebugComposerWidth` action to set a 440-point composer column inside the unchanged window. The lead reads Send's painted right edge against the card's painted right edge, without any window-manager call, then restores the original column option through the action and polls its dump and measured width. Its provider-supplied title "Execute `pwd`" keeps the provider's literal backticks; command spans apply to Veyra's own copy.
 ⌘⇧I toggles the latest reasoning/tool detail.
 On failure, read the plain cause and stderr tail, use Retry (`veyra::Retry`, ⌘R), or Open shell (`veyra::OpenTerminal`, ⌘⌥T).
 Open shell opens and focuses the selected thread's owned drawer.
@@ -628,11 +628,34 @@ print('PASS Grok streams ok; Default leaves both flags out; signed-out failure; 
 PYGROK
 ```
 
+### Native smoke
+
+This capture runs only in a selected-page smoke; it leaves the page's Status unchanged.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+set -eu
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYSMOKE'
+from smoke import drive
+drive('chat-send-stream')
+PYSMOKE
+```
+
 ## Observable success
 
-On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+Admitted test owners for this page: `semantic_placeholders_and_input_clipping`, `composer_accent_and_unscrolled_header_rule`.
+Their class and exact scope are in [proof ownership](../proof-ownership.md); every remaining ink, mark or clipping detail stays a native capture read.
 
-Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
+On settled states, the separate `-placeholder` capture moves focus with `root::Tab`, then restores it with `FocusComposer`.
+`semantic_placeholders_and_input_clipping` owns the admitted placeholder decisions and bounds.
+`composer_accent_and_unscrolled_header_rule` owns the active accent case; `window_active` also gates that case.
+The lead reads remaining placeholder ink, inactive borders and native clipping from the captures.
+
+Each retained PNG and its exact dump queue a `*-native-read.json` for the lead.
+Vision OCR contributes no verdict.
+The admitted ownership and remaining native reads are listed in [proof ownership](../proof-ownership.md).
+A queued read is pending until the lead records the capture hash and verdict.
 
 The Claude 403 and completed-without-started fixtures show their own failure cause with no sign-in instruction.
 Their next turn completes on the same saved process pid, with two ended turns in SQLite.
@@ -739,38 +762,14 @@ Engine commands await space in the window's gpui task, so Stop is retained when 
       "chat-done.json",
       "chat-done.png",
       "rec/probe.jsonl"
+    ],
+    "chat-send-stream-smoke": [
+      "chat-send-stream-smoke.png",
+      "chat-send-stream-smoke-native-read.json",
+      "chat-send-stream-smoke-freshness.json"
     ]
   },
-  "pairs": {
-    "chat-send-stream": [
-      [
-        "chat-working",
-        "chat-done"
-      ],
-      [
-        "chat-tool-collapsed",
-        "chat-tool-expanded"
-      ]
-    ],
-    "chat-send-stream-live": [
-      [
-        "chat-working",
-        "chat-done"
-      ]
-    ],
-    "chat-send-stream-codex": [
-      [
-        "codex-chat-working",
-        "codex-chat-done"
-      ]
-    ],
-    "chat-send-stream-grok": [
-      [
-        "grok-chat-working",
-        "grok-chat-done"
-      ]
-    ]
-  }
+  "pairs": {}
 }
 ```
 

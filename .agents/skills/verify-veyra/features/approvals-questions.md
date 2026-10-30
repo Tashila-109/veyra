@@ -22,14 +22,14 @@ The dock always shows its answer chords, dimmed until focused. ⌘⇧Y runs Focu
 Requests do not take focus automatically.
 Composer ⌘↵ sends a nonempty draft and leaves the request pending; an empty draft during a turn dispatches Stop.
 Every button's shortcut_chip reads the same bindings table as the keymap.
-Its ink inherits the button foreground. The focused Allow once capture asserts the kit's primary-button foreground in the trailing keycap region, using the painted control bounds and excluding the caption.
+Its ink inherits the button foreground. The lead reads the focused Allow once capture for the kit's primary-button foreground in the trailing keycap region, using the painted control bounds and excluding the caption.
 Buttons answer their displayed request; an expired request or a question index that already advanced sends no answer.
 A question keeps its labeled text in a bounded scroll area above its options.
 Up to four options use one column; larger lists use three columns.
 Captions wrap in their buttons, and overflowing lists scroll with the shared visible scrollbar.
 A pending dock keeps the scrollable message input between 48px and 240px within the shared flex budget; closing the dock restores its normal auto-growing layout.
 Press ⌘⇧Y to FocusDock. The region and option cursor use the inset focus ring.
-Every approval capture checks both empty padding bands between the dock's ring and its content, from measured dump geometry at the backing scale. The dock keeps that padding when focused, and approval detail text wraps or ellipsizes inside its available width. The labelled Codex MCP inset mutant removes the left inset for the second MCP scene and must fail the pixel-band check.
+The lead reads both empty padding bands in every approval capture between the dock's ring and its content, from measured dump geometry at the backing scale. The dock keeps that padding when focused, and approval detail text wraps or ellipsizes inside its available width. The labelled Codex MCP inset mutant removes the left inset for the second MCP scene and requires the second MCP scene to expose that line.
 Keys 1 to 9 choose only while the dock has focus; Escape runs FocusComposer.
 `veyra::MoveOptionUp`, `veyra::MoveOptionDown` and `veyra::AnswerFocusedOption` bind Up, Down and Return in VeyraDock.
 More than one pending request shows 1 of N.
@@ -50,7 +50,6 @@ PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PY'
 from driver import *
 capture = capture_content
-from pixels import Paint
 def raw_preview(dock):
     return json.loads(dock['request']['kind']['Approval']['action']['target']['preview']['text'] or '{}')
 prepare()
@@ -278,7 +277,7 @@ capture('question-cursor-first')
 ctl('question-within-down','keys','down')
 cursor = poll('question-within-cursor-second',lambda d:d['composer']['dock']['option_cursor']==1)
 capture('question-cursor-second')
-from pixels import option_cursor_paints
+from native_reads import option_cursor_paints
 option_cursor_paints(PROOF,'question-cursor-first','question-cursor-second',cursor,
     question_input[0]['options'][:2] if isinstance(question_input[0]['options'][0],str) else
     [option['label'] for option in question_input[0]['options'][:2]])
@@ -453,7 +452,6 @@ PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYCODEX'
 from driver import *
 capture = capture_content
-from pixels import Paint
 def raw_preview(dock):
     return json.loads(dock['request']['kind']['Approval']['action']['target']['preview']['text'] or '{}')
 prepare()
@@ -789,7 +787,6 @@ PROOF=target/verify-veyra/$RUN
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYGROK'
 from driver import *
 capture = capture_content
-from pixels import Paint
 def raw_preview(dock):
     return json.loads(dock['request']['kind']['Approval']['action']['target']['preview']['text'] or '{}')
 prepare()
@@ -938,14 +935,38 @@ print('PASS Grok approvals, disabled lasting-only consent, question answer items
 PYGROK
 ```
 
+### Native smoke
+
+This capture runs only in a selected-page smoke; it leaves the page's Status unchanged.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+set -eu
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYSMOKE'
+from smoke import drive
+drive('approvals-questions')
+PYSMOKE
+```
+
 ## Observable success
 
-The command draw binding derives `echo ok` at run time from the existing recorded approval through `stage_records`, changing only command fields and retaining the records and diff. It asserts the exact command from `dump`, exactly one painted `$ echo ok`, no backticks or raw JSON in the dock, and the same structure checks as every approval. Other captures retain their exact `dump` assertions and full-size inspection. The short command avoids an OCR identifier error: the retained `veyia` misread is diagnostic evidence, and no fuzzy matching is used.
-The codec owns approval classification. The window lays out every residual field, including unknown `_meta` siblings beside lifted Arguments, and keeps non-object, invalid or truncated previews as text with their cut notice. `codex-mcp-first.png` and its exact dump retain an unknown `extra: material` field; pixel recognition asserts those painted words. Grok's residual `variant` stays visible under the existing security classification.
+Admitted test owners for this page: `semantic_approval_projection_and_control_bounds`, `approval_command_plates_and_decision_controls`, `option_cursor_paints_only_the_current_row`.
+Their class and exact scope are in [proof ownership](../proof-ownership.md); every remaining ink, mark or clipping detail stays a native capture read.
 
-On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+The command draw binding derives `echo ok` from the recorded approval, retains the records/diff, and asserts the exact command from `dump`.
+The admitted projection/paint tests own their qualified cases; the lead reads exact visible text, order, captions and residual fields from native captures.
+The codec owns approval classification. The window lays out every residual field, including unknown `_meta` siblings beside lifted Arguments, and keeps non-object, invalid or truncated previews as text with their cut notice. `codex-mcp-first.png` and its exact dump retain an unknown `extra: material` field; the lead reads those painted words. Grok's residual `variant` stays visible under the existing security classification.
 
-Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
+On settled states, the separate `-placeholder` capture moves focus with `root::Tab`, then restores it with `FocusComposer`.
+`semantic_placeholders_and_input_clipping` owns the admitted placeholder decisions and bounds.
+`composer_accent_and_unscrolled_header_rule` owns the active accent case; `window_active` also gates that case.
+The lead reads remaining placeholder ink, inactive borders and native clipping from the captures.
+
+Each retained PNG and its exact dump queue a `*-native-read.json` for the lead.
+Vision OCR contributes no verdict.
+The admitted ownership and remaining native reads are listed in [proof ownership](../proof-ownership.md).
+A queued read is pending until the lead records the capture hash and verdict.
 
 `grok-accept-edits-inside.png` shows the in-project edit dock before any file is written.
 `grok-accept-edits-outside.png` shows the next outside edit dock with its matching rawInput path; SQLite has both human decisions, and inside.txt appears only after Allow once.
@@ -1061,7 +1082,7 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
   "required": {
     "approvals-questions": [
       "approval-short-command.png",
-      "approval-short-command-pixels.json",
+      "approval-short-command-native-read.json",
       "approval-short-command-records.jsonl",
       "approval-short-command-diff.json",
       "approval-short-command.diff",
@@ -1090,7 +1111,7 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "question-within-request.png",
       "question-cursor-first.png",
       "question-cursor-second.png",
-      "question-cursor-second-cursor-pixels.json",
+      "question-cursor-second-cursor-native-read.json",
       "question-within-second.json",
       "approval-denied-tool.png",
       "search-target.png",
@@ -1131,9 +1152,14 @@ Their quoted text scrolls within a one-line minimum and 240px maximum, independe
       "grok-questions-done.json",
       "grok-question-expired.json",
       "grok-question-expired.png"
+    ],
+    "approvals-questions-smoke": [
+      "approvals-questions-smoke.png",
+      "approvals-questions-smoke-native-read.json",
+      "approvals-questions-smoke-freshness.json"
     ]
   },
-  "pairs": {"approvals-questions": [["question-cursor-first", "question-cursor-second"]]}
+  "pairs": {}
 }
 ```
 

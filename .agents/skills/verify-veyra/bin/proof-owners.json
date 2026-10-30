@@ -1,0 +1,728 @@
+[
+  {
+    "id": "N021",
+    "old_check": "assert state['composer']['placeholder']==expected, ('placeholder decision',self.name)",
+    "class": "A",
+    "test": "semantic_placeholders_and_input_clipping"
+  },
+  {
+    "id": "N022",
+    "old_check": "assert x>=0 and y>=0 and x+width<=self.width and y+height<=self.height, ('painted editor escaped window',self.name)",
+    "class": "A",
+    "test": "semantic_placeholders_and_input_clipping"
+  },
+  {
+    "id": "N023",
+    "old_check": "self.text(state['composer']['placeholder'],(x,y-1,x+width,y+height+1))",
+    "class": "A",
+    "test": "semantic_placeholders_and_input_clipping"
+  },
+  {
+    "id": "N024",
+    "old_check": "self.color((left,top+radius,left+border,top+height-radius),'accent',minimum=(height-radius*2)*.8)",
+    "class": "B",
+    "test": "composer_accent_and_unscrolled_header_rule"
+  },
+  {
+    "id": "N036",
+    "old_check": "self.outline('deny-'+dock['request']['id'])",
+    "class": "B",
+    "test": "approval_command_plates_and_decision_controls"
+  },
+  {
+    "id": "N038",
+    "old_check": "self.color(self.control('allow-once-'+dock['request']['id']),'solid',minimum=10,background_only=True)",
+    "class": "B",
+    "test": "approval_command_plates_and_decision_controls"
+  },
+  {
+    "id": "N042",
+    "old_check": "self.outline('allow-thread-'+dock['request']['id'])",
+    "class": "B",
+    "test": "approval_command_plates_and_decision_controls"
+  },
+  {
+    "id": "N043",
+    "old_check": "self.color(self.control('allow-thread-'+dock['request']['id']),'warning',minimum=2)",
+    "class": "B",
+    "test": "approval_command_plates_and_decision_controls"
+  },
+  {
+    "id": "N045",
+    "old_check": "assert target['command']=='echo ok' and dock['action_text']=='echo ok'",
+    "class": "A",
+    "test": "semantic_approval_projection_and_control_bounds"
+  },
+  {
+    "id": "N052",
+    "old_check": "self.plate('$ echo ok','code_wash',over='card',region=region)",
+    "class": "B",
+    "test": "approval_command_plates_and_decision_controls"
+  },
+  {
+    "id": "N091",
+    "old_check": "paint.color((left-4,top,left-2,bottom),'card',minimum=bottom-top)",
+    "class": "B",
+    "test": "settings_card_tracks_and_lit_thumbs"
+  },
+  {
+    "id": "N106",
+    "old_check": "assert changed > 20*a.scale*a.scale, ('option cursor changed no row pixels',before,after,changed)",
+    "class": "B",
+    "test": "option_cursor_paints_only_the_current_row"
+  },
+  {
+    "id": "N001",
+    "old_check": "self.text(caption,(left,top,right,bottom),count=1)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N002",
+    "old_check": "assert rectangle[0]<rectangle[2], ('filled keycap has no trailing region',self.name,name,rectangle)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N003",
+    "old_check": "assert variant in ['primary','danger'], ('unknown filled button variant',variant)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N004",
+    "old_check": "assert energy>0, ('filled keycap has no foreground contrast',self.name,name)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N005",
+    "old_check": "assert len(accepted)>=self.scale*self.scale, ('painted filled keycap foreground missing',self.name,receipt)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N006",
+    "old_check": "assert self.state['composer']['focused'], ('wrapped Send scene',self.name,self.width)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N007",
+    "old_check": "assert self.state['composer']['width_override']==440, ('wrapped Send column',self.name)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N008",
+    "old_check": "assert top>=self.control('model')[3], ('Send scene did not wrap',self.name)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N009",
+    "old_check": "self.text('Send',(left,top,right,bottom),count=1)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N010",
+    "old_check": "self.text('Default model')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N011",
+    "old_check": "assert top>=model[3]/self.scale, ('Send scene did not wrap',self.name)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N012",
+    "old_check": "assert energy>0, ('card edge role has no contrast',self.name)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N013",
+    "old_check": "assert button_pixels and card_pixels, ('wrapped Send paint edges missing',self.name,edge_probe)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N014",
+    "old_check": "assert abs(card_edge-button_edge-padding)<=border, ('painted Send is not trailing',self.name,receipt)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N015",
+    "old_check": "assert state['look']['header_title']==expected, ('header title decision',self.name,expected)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N016",
+    "old_check": "paint.text(expected)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N017",
+    "old_check": "assert glyph>0 and left+glyph<right, ('invalid header mark geometry',self.name,glyph)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N018",
+    "old_check": "paint.text(words)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N019",
+    "old_check": "paint.color(tuple(value/paint.scale for value in box),role)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N020",
+    "old_check": "self.color((sidebar+header,header-1,self.width-header,header), 'border' if scrolled else 'bg',minimum=max(1,self.width-sidebar-header*2)*.9, over='bg' if scrolled else None)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N025",
+    "old_check": "self.color((left,top+radius,left+border,top+height-radius),'border',minimum=(height-radius*2)*.8,over='card')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N026",
+    "old_check": "self.text('Provider default',(state['sidebar']['width'],y,self.width,self.height))",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N027",
+    "old_check": "self.absent('Focus to use shortcuts')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N028",
+    "old_check": "self.color((left,top,left+width,bottom),'bg',minimum=width*(bottom-top)*.98)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N029",
+    "old_check": "assert inset>ring and width>inset*2 and height>radius*2, ('invalid approval inset geometry',self.name,dock['bounds'],inset,ring)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N030",
+    "old_check": "assert box[0]<box[2] and box[1]<box[3], ('empty approval inset band',self.name,side,box)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N031",
+    "old_check": "assert not unexpected, ('painted approval inset occupied',self.name,side,len(unexpected),receipt.name)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N032",
+    "old_check": "assert dock is not None",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N033",
+    "old_check": "self.approval_inset()",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N034",
+    "old_check": "assert not (dock['preview'] or '').lstrip().startswith('{'), 'complete object did not use the names-and-values layout'",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N035",
+    "old_check": "self.text('Deny')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N037",
+    "old_check": "self.text('Allow once')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N039",
+    "old_check": "self.filled_keycap('allow-once-'+dock['request']['id'],'Allow once','primary')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N040",
+    "old_check": "self.absent('Allow once')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N041",
+    "old_check": "self.absent('in this thread')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N044",
+    "old_check": "self.text('Run command')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N046",
+    "old_check": "self.text('Run command')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N047",
+    "old_check": "self.text('Deny')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N048",
+    "old_check": "self.text('$ echo ok',region,count=1)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N049",
+    "old_check": "self.absent('`',region)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N050",
+    "old_check": "self.absent('{',region)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N051",
+    "old_check": "self.absent('}',region)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N053",
+    "old_check": "self.text(tag)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N054",
+    "old_check": "self.text_color(tag,'warning')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N055",
+    "old_check": "self.text('Use tool')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N056",
+    "old_check": "assert residual['_meta']['extra']=='material'",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N057",
+    "old_check": "assert '_meta \u00b7 extra: material' in dock['preview']",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N058",
+    "old_check": "self.text('extra: material')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N059",
+    "old_check": "paint.text('Quitting stops')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N060",
+    "old_check": "paint.text('Cancel')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N061",
+    "old_check": "paint.plate('Quit','danger',region=(cancel[2]/paint.scale,cancel[1]/paint.scale-8, paint.width,cancel[3]/paint.scale+8))",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N062",
+    "old_check": "paint.filled_keycap('confirm-quit','Quit','danger')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N063",
+    "old_check": "paint.text('Cancel')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N064",
+    "old_check": "paint.text('Archive thread?' if 'archive' in name else 'Close tab?')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N065",
+    "old_check": "paint.plate('Archive' if 'archive' in name else 'Close tab','danger', region=(cancel[2]/paint.scale,cancel[1]/paint.scale-8,paint.width,cancel[3]/paint.scale+8))",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N066",
+    "old_check": "paint.filled_keycap('confirm-close-shell','Archive' if 'archive' in name else 'Close tab','danger')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N067",
+    "old_check": "paint.wrapped_send()",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N068",
+    "old_check": "assert tool['expanded'] and tool['body']['Tool']['call']['input_summary'] is None",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N069",
+    "old_check": "assert tool['body']['Tool']['call']['arguments']=={'variant':'Bash','command':'pwd'}",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N070",
+    "old_check": "paint.text('command: pwd',region,count=1)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N071",
+    "old_check": "paint.text('variant: Bash',region,count=1)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N072",
+    "old_check": "paint.absent('$ pwd',region)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N073",
+    "old_check": "assert tool['body']['Tool']['call']['input_summary']=='echo ok'",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N074",
+    "old_check": "paint.text('$ echo ok',region,count=1)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N075",
+    "old_check": "paint.plate('$ echo ok','code_wash',over='bg',region=region)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N076",
+    "old_check": "paint.absent(text,region)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N077",
+    "old_check": "paint.text(provider+' asks')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N078",
+    "old_check": "paint.text('Retry')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N079",
+    "old_check": "paint.text('Open shell')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N080",
+    "old_check": "paint.plate('Retry','danger_wash')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N081",
+    "old_check": "lane.text(family['title'])",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N082",
+    "old_check": "assert any((row['outcome'] or '').startswith('Done in') for row in state['transcript']['items']), ('family binding outcome missing from dump',name)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N083",
+    "old_check": "lane.text('Done in')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N084",
+    "old_check": "lane.text('Done in')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N085",
+    "old_check": "assert title[3] <= outcomes[0]['box'][1], ('family card follows its outcome',name,title,outcomes)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N086",
+    "old_check": "paint.text('Ask first',(sidebar,header,paint.width,paint.height))",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N087",
+    "old_check": "paint.text('Default mode for new threads',(sidebar,header,control[0]/paint.scale,paint.height))",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N088",
+    "old_check": "paint.text('Accept edits',(control[0]/paint.scale,header,paint.width,paint.height))",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N089",
+    "old_check": "paint.text('Full access',(control[0]/paint.scale,header,paint.width,paint.height))",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N090",
+    "old_check": "paint.text('Window background')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N092",
+    "old_check": "paint.text(description+' Applies to threads you create from now on.', (sidebar,header,paint.width,paint.height),count=1)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N093",
+    "old_check": "paint.text('Check again')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N094",
+    "old_check": "paint.plate('Check again','warning_wash')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N095",
+    "old_check": "paint.text_color('Send','text_muted')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N096",
+    "old_check": "assert command in state['composer']['disabled_reason']",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N097",
+    "old_check": "paint.text('Check again')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N098",
+    "old_check": "paint.color((x,y+height,check[0]/paint.scale,check[3]/paint.scale), 'code_wash',over='warning_wash',minimum=state['look']['layout']['small_icon'])",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N099",
+    "old_check": "paint.text('Restart')",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N100",
+    "old_check": "assert a.image.size==b.image.size and a.scale==b.scale, 'sheet capture rectangle changed'",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N101",
+    "old_check": "assert len(foreground)>10 and changed/len(foreground)>.8, ('sidebar foreground did not dim',before,after,len(foreground),changed)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N102",
+    "old_check": "a.text(title,region,count=1)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N103",
+    "old_check": "assert len(foreground)>10 and changed/len(foreground)>.8, ( 'sidebar title did not dim',before,after,title,len(foreground),changed)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N104",
+    "old_check": "assert a.image.size==b.image.size and a.scale==b.scale, 'cursor capture rectangle changed'",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N105",
+    "old_check": "a.text(label,region)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N107",
+    "old_check": "assert left != right, 'identical painted mark regions: '+label",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N108",
+    "old_check": "assert cell.size == (16,16), (rectangle,cell.size)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N109",
+    "old_check": "assert peak > 24, ('no mark contrast',rectangle,peak)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N110",
+    "old_check": "assert 3 < sum(shape) < 180, ('empty or contaminated mark cell',rectangle,sum(shape))",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N111",
+    "old_check": "assert points, ('no Needs-you ink' if warning else 'no Working ink',rectangle)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N112",
+    "old_check": "assert image.height == round(height*scale), (image.size,bounds,scale)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N113",
+    "old_check": "assert LANE == 'fake'",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N114",
+    "old_check": "require_distinct(cells[left][3],cells[right][3],site+' '+left+' / '+right)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N115",
+    "old_check": "record_cells(site,cells)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N116",
+    "old_check": "record_cells('header',{status:('marks-header-'+status,header_working, *mark_cell(Image.open(PROOF/('marks-header-'+status+'.png')),header_working)) for status in statuses})",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N117",
+    "old_check": "assert overlap/union > .7, ('Needs-you count shape differs',overlap,union)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N118",
+    "old_check": "require_distinct(count_shape,shape,'Needs-you count / '+status)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N119",
+    "old_check": "assert len(set(hashes))==1, 'Reduce Motion changed painted mark: '+site",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N120",
+    "old_check": "require_distinct(hashes,[hashes[0]]*len(hashes),'Working clock steps '+site)",
+    "class": "native",
+    "test": null
+  },
+  {
+    "id": "N121",
+    "old_check": "assert receipt['motion'][label]['seconds'] > 1",
+    "class": "native",
+    "test": null
+  }
+]

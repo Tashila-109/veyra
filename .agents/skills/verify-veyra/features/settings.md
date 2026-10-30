@@ -18,7 +18,7 @@ The forced Window background row selects Solid and disables both choices; its ac
 - `settings-header-branch`: Chat shows the run-owned branch; Settings and NewThread clear it.
 - `settings-sidebar-band`: `veyra::DebugDragSidebar` and `veyra::DebugDoubleClickSidebar` synthesize pointer events in the owned window, without moving the real cursor; `sidebar.width` proves the drag and reset.
 - `settings-glass-coverage`: `look.glass_coverage` reports the tint coverage in force, 0.80 in dark and 0.88 in light when Translucent, and 1 in Solid.
-- The close and quit sheets assert `on_solid` in their danger buttons' trailing keycaps, excluding the captions and using painted control bounds.
+- The close and quit sheets retain native reads of `on_solid` in their danger buttons' trailing keycaps, excluding the captions and using painted control bounds.
 
 Every placement step requires the owned window to be unmanaged and floating under the launch's temporary one-shot rule. A managed record fails with `owned window joined the tile tree` before any move or resize. The recipe never toggles floating or re-tiles a window, and needs no empty desktop.
 
@@ -545,7 +545,7 @@ try:
         measured_pair(labels,take_half)
         measurements.append(compare_backdrops(mode,labels,state))
     save('settings-backdrop-measurements',measurements)
-    from pixels import sidebar_dims
+    from native_reads import sidebar_dims
     action('sheet-unforce','DebugDisplayOptions',{'reduce_motion':True})
     action('sheet-translucent','SetWindowBackground',{'background':'translucent'})
     poll('sheet-translucent-applied',lambda d:d['look']['background']=='translucent')
@@ -588,14 +588,52 @@ print('PASS stored background, key cycle, guarded glass, occlusion rejection, di
 PY_BACKGROUND
 ```
 
+### Glass smoke
+
+Only a production hunk in a glass file selects these guarded pairs.
+The lead reads their native compositing; no OCR verdict runs.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+set -eu
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYGLASS'
+from glass_smoke import drive
+drive()
+PYGLASS
+```
+
+### Native smoke
+
+This capture runs only in a selected-page smoke; it leaves the page's Status unchanged.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+set -eu
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYSMOKE'
+from smoke import drive
+drive('settings')
+PYSMOKE
+```
+
 ## Observable success
 
-On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+Admitted test owners for this page: `settings_card_tracks_and_lit_thumbs`.
+Their class and exact scope are in [proof ownership](../proof-ownership.md); every remaining ink, mark or clipping detail stays a native capture read.
 
-Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
+On settled states, the separate `-placeholder` capture moves focus with `root::Tab`, then restores it with `FocusComposer`.
+`semantic_placeholders_and_input_clipping` owns the admitted placeholder decisions and bounds.
+`composer_accent_and_unscrolled_header_rule` owns the active accent case; `window_active` also gates that case.
+The lead reads remaining placeholder ink, inactive borders and native clipping from the captures.
+
+Each retained PNG and its exact dump queue a `*-native-read.json` for the lead.
+Vision OCR contributes no verdict.
+The admitted ownership and remaining native reads are listed in [proof ownership](../proof-ownership.md).
+A queued read is pending until the lead records the capture hash and verdict.
 
 - `settings-first.json` has `view: settings`, `settings.default_mode: full_access` and the first thread's Full access configuration; inspect `settings-full-access.png`.
-- `settings-minimum.png` shows the label wrapping on the left and all three controls on the right at 760×560. Its placement and restoration receipts assert the owned window and original bounds. Exact wrapped text joins only consecutive OCR rows in the checked region, with each left edge aligned to the first within 0.25 of the taller row's measured height and with no vertical gap greater than one involved row's height; every joined row retains its box, text and confidence.
+- `settings-minimum.png` shows the label wrapping on the left and all three controls on the right at 760×560. Its placement and restoration receipts assert the owned window and original bounds. The lead reads wrapping, clipping and control alignment from this native capture.
 - Every mode change is asserted in both dump and `select default_mode from settings`; the direct SetDefaultMode key cycles all three.
 - `settings-command-error.json` and its PNG show a rejected mode as a visible notice without changing the setting.
 - `settings-ask-first.json` and `settings.png` show Ask first, its full consequence copy and the applies-from-now hint.
@@ -650,8 +688,8 @@ Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision te
       "settings-backdrop-measurements.json",
       "settings-translucent-close-sheet.png",
       "settings-translucent-quit-sheet.png",
-      "settings-translucent-close-sheet-sidebar-dimming.json",
-      "settings-translucent-quit-sheet-sidebar-dimming.json",
+      "settings-translucent-close-sheet-sidebar-dim-native-read.json",
+      "settings-translucent-quit-sheet-sidebar-dim-native-read.json",
       "settings-measure-translucent-coarse.png",
       "settings-measure-translucent-inverse.png",
       "settings-measure-solid-coarse.png",
@@ -668,30 +706,21 @@ Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision te
       "settings-measure-reduce-transparency-inverse-region-guards.json",
       "settings-measure-increase-contrast-coarse-region-guards.json",
       "settings-measure-increase-contrast-inverse-region-guards.json"
+    ],
+    "settings-smoke": [
+      "settings-smoke.png",
+      "settings-smoke-native-read.json",
+      "settings-smoke-freshness.json"
+    ],
+    "settings-glass-smoke": [
+      "glass-smoke-pairs-native-read.json",
+      "glass-smoke-solid-coarse.png",
+      "glass-smoke-solid-inverse.png",
+      "glass-smoke-translucent-coarse.png",
+      "glass-smoke-translucent-inverse.png"
     ]
   },
-  "pairs": {
-    "settings": [
-      [
-        "settings-full-access",
-        "settings"
-      ],
-      [
-        "settings-sidebar-dragged",
-        "settings-sidebar-reset"
-      ]
-    ],
-    "settings-background": [
-      [
-        "settings-solid",
-        "settings-translucent"
-      ],
-      [
-        "settings-translucent",
-        "settings-forced-reduce-transparency"
-      ]
-    ]
-  }
+  "pairs": {}
 }
 ```
 

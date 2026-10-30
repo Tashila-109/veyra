@@ -311,11 +311,34 @@ print('PASS Grok initialize readiness, Signed out mark, per-model catalog/defaul
 PYGROK
 ```
 
+### Native smoke
+
+This capture runs only in a selected-page smoke; it leaves the page's Status unchanged.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+set -eu
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYSMOKE'
+from smoke import drive
+drive('new-thread')
+PYSMOKE
+```
+
 ## Observable success
 
-On settled states, empty-placeholder proof takes a separate `-placeholder` capture after the existing `root::Tab` action moves focus to a user-reachable button; `composer.control_focus` records that button before capture. The exact placeholder must agree in `dump` and OCR. The caret occludes the first glyph and blinks, so focused-composer captures assert the placeholder from `dump` and the accent edge from pixels instead. `FocusComposer` restores focus and a poll confirms it before the next step. Live turns keep the original capture and its assertions, and skip the extra caret-free scene.
+Admitted test owners for this page: `semantic_placeholders_and_input_clipping`, `composer_accent_and_unscrolled_header_rule`.
+Their class and exact scope are in [proof ownership](../proof-ownership.md); every remaining ink, mark or clipping detail stays a native capture read.
 
-Each retained fake-lane window PNG also runs `pixels.capture_checked`: Vision text boxes retain confidence, and Pillow checks sRGB token colours and order at the backing scale from owned-window bounds. `look.colors`, `look.layout`, `transcript.scroll_offset`, `composer.placeholder`, `composer.input_bounds` and the dock's `option_cursor` state the geometry and decisions; the `*-pixels.json` receipts bind the rendered header rule, status colour, input text, approval projection, sheets and applicable settings/banner rules to pixels. Live sections do not invoke OCR.
+On settled states, the separate `-placeholder` capture moves focus with `root::Tab`, then restores it with `FocusComposer`.
+`semantic_placeholders_and_input_clipping` owns the admitted placeholder decisions and bounds.
+`composer_accent_and_unscrolled_header_rule` owns the active accent case; `window_active` also gates that case.
+The lead reads remaining placeholder ink, inactive borders and native clipping from the captures.
+
+Each retained PNG and its exact dump queue a `*-native-read.json` for the lead.
+Vision OCR contributes no verdict.
+The admitted ownership and remaining native reads are listed in [proof ownership](../proof-ownership.md).
+A queued read is pending until the lead records the capture hash and verdict.
 
 The permission chip’s visible menu is exposed by `composer.permission_picker_open`.
 `composer.offered_modes` reports the same provider list used to build that menu.
@@ -387,26 +410,14 @@ Settings keeps all three defaults; a new Grok composer applies Accept edits as A
     "new-thread-live": [
       "new-thread-live.json",
       "new-thread-live.png"
+    ],
+    "new-thread-smoke": [
+      "new-thread-smoke.png",
+      "new-thread-smoke-native-read.json",
+      "new-thread-smoke-freshness.json"
     ]
   },
-  "pairs": {
-    "new-thread": [
-      [
-        "new-thread-missing",
-        "new-thread-ready"
-      ],
-      [
-        "new-thread-provider-menu",
-        "new-thread-provider-menu-ready"
-      ]
-    ],
-    "new-thread-codex": [
-      [
-        "codex-new-thread-missing",
-        "codex-new-thread"
-      ]
-    ]
-  }
+  "pairs": {}
 }
 ```
 

@@ -4,6 +4,15 @@ Import it from the checkout root with PYTHONPATH=.agents/skills/verify-veyra/bin
 It sets no application state; its writes are fixture copies, screenshots and proof.
 """
 import ctypes, errno, hashlib, json, math, os, pathlib, re, shutil, signal, sqlite3, struct, subprocess, sys, time, uuid
+def safety_checked(kind):
+    def decorate(operation):
+        def checked(*args,**kwargs):
+            try: return operation(*args,**kwargs)
+            except Exception as error:
+                save('safety-stop',{'kind':kind,'reason':str(error)})
+                raise
+        return checked
+    return decorate
 def cleanup_window_rules(proof, run):
     proof = pathlib.Path(proof)
     assert re.fullmatch(r'[0-9a-f]{8}',run)
@@ -182,6 +191,7 @@ def action(name, operation, data=None):
     args = ['action', 'veyra::' + operation]
     if data is not None: args.append(json.dumps(data))
     assert ctl(name, *args) == {'ok': True}
+@safety_checked('identity')
 def identity():
     pid = int((PROOF/'pid').read_text())
     pgid = int((PROOF/'pgid').read_text())
@@ -199,25 +209,30 @@ def window_id(pid):
         time.sleep(.05)
     raise AssertionError('no on-screen window for owned pid '+str(pid))
 def capture(name):
-    try:
-        guarded_capture(name)
-    except Exception:
-        observe_failure(name,'capture')
-        raise
+    from orchestration import SafetyStop
+    from freshness import retry_capture
+    def take():
+        try: guarded_capture(name)
+        except SafetyStop: raise
+        except Exception:
+            observe_failure(name,'capture')
+            raise
+    def discard(): (PROOF/(name+'.png')).unlink(missing_ok=True)
+    retry_capture(take,discard)
 def capture_content(name):
     if LANE != 'fake':
         return capture(name)
-    from pixels import capture_checked
+    from native_reads import capture_read
     before = ctl(name+'-content-before','dump')
     def focus(state):
         return {'surface':state['focus'],'composer':state['composer']['focused'],
             'control':state['composer']['control_focus']}
     receipt = {'before':focus(before),'after':None,'placeholder_focus':None,
-        'focus_moved':False,'restored':None,'pixel_checks_passed':False}
+        'focus_moved':False,'restored':None,'native_read_queued':False}
     try:
         capture(name)
         state = ctl(name+'-paint-state','dump')
-        capture_checked(PROOF,name,state)
+        capture_read(PROOF,name,state)
         receipt['after'] = focus(state)
         selected = state['selected_thread']
         settled = not state['composer']['stop_visible'] and (selected is None
@@ -237,13 +252,13 @@ def capture_content(name):
                 painted = ctl(name+'-placeholder-paint-state','dump')
                 assert not painted['composer']['focused'] and painted['composer']['control_focus']
                 assert painted['composer']['placeholder']==expected
-                capture_checked(PROOF,name+'-placeholder',painted)
+                capture_read(PROOF,name+'-placeholder',painted)
             finally:
                 action(name+'-placeholder-restore','FocusComposer')
                 restored = poll(name+'-placeholder-restored-focus',lambda d:d['focus']=='composer')
                 receipt['after'] = focus(restored)
                 receipt['restored'] = True
-        receipt['pixel_checks_passed'] = True
+        receipt['native_read_queued'] = True
     finally:
         try:
             receipt['after'] = focus(ctl(name+'-content-final-focus','dump'))
@@ -326,11 +341,15 @@ def region_snapshot(pid, window, backdrop, rectangle=None):
     return {'rectangle':frame,'window':int(window),'pid':int(pid),
         'backdrop_window':background['kCGWindowNumber'],'backdrop_bounds':bounds(background),
         'display':displays[0],'frontmost':True,'intersecting_above':0}
-def region_capture(target, pid, window):
+def region_capture(target, pid, window, attempts_allowed=3):
     """Discard a region capture when any guard changes; make at most three attempts in total."""
+    from orchestration import SafetyStop
+    if not (PROOF/'backdrop-windows.json').is_file():
+        save('safety-stop',{'kind':'privacy','reason':'missing owned backdrop'})
+        raise SafetyStop('missing owned backdrop; cannot enforce privacy')
     backdrop = json.loads((PROOF/'backdrop-windows.json').read_text())
     attempts = []
-    for attempt in range(3):
+    for attempt in range(attempts_allowed):
         target.unlink(missing_ok=True)
         try:
             before = region_snapshot(pid,window,backdrop)
@@ -345,7 +364,7 @@ def region_capture(target, pid, window):
             target.unlink(missing_ok=True)
             attempts.append({'attempt':attempt+1,'error':str(error)})
             save(target.stem+'-region-guards',{'attempts':attempts})
-            if attempt == 2: raise
+            if attempt+1 == attempts_allowed: raise
             time.sleep(.1)
 def measured_pair(labels, take, rectangle=(24,60,960,740)):
     """Retake both halves at one placement if either half needed the owned-window fallback."""
@@ -408,17 +427,20 @@ def guarded_capture(name):
     visible['providers'] = [probe['readiness'] for probe in dump['providers']]
     state = json.dumps(visible,sort_keys=True)
     target = PROOF/(name+'.png')
+    target.unlink(missing_ok=True)
+    started_ns = time.time_ns()
     if dump['look']['background'] == 'translucent':
-        region_capture(target,pid,window)
+        region_capture(target,pid,window,attempts_allowed=1)
     else:
         subprocess.run(['screencapture','-x','-o','-l',window,str(target)],check=True)
     subprocess.run([helper,pid,window],check=True)
-    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    from freshness import record
     previous = PROOF/'capture-last.json'
-    if previous.exists():
-        old = json.loads(previous.read_text())
-        assert state == old['state'] or digest != old['digest'], 'stale screenshot after state change: '+name
-    previous.write_text(json.dumps({'state':state,'digest':digest,'name':name})+'\n')
+    old = json.loads(previous.read_text()) if previous.exists() else None
+    fresh = record(target,started_ns,int(pid),dump['perf']['repaints'],old)
+    fresh.update(name=name,state=state,window_active=dump['window_active'])
+    previous.write_text(json.dumps(fresh)+'\n')
+    save(name+'-freshness',fresh)
 def foreground_ended(name, thread):
     query = "select count(*) from turns where thread_id='"+thread+"' and state='ended'"
     end = time.monotonic()+30
@@ -629,8 +651,13 @@ def normalize_owned_window(label, pid=None, window=None):
     return save(label+'-normalized-window',{'before':before['frame'],'after':after['frame'],
         'visible_frame':visible,'pid':pid,'window':window})
 def start(label, normalize=True):
+    from orchestration import identity as code_identity, require_tier, require_go
+    expected = code_identity()
+    require_tier(os.environ['VEYRA_VERIFY_TIER_S'],expected)
+    require_go(os.environ['VEYRA_VERIFY_GO'],expected,float(os.environ['VEYRA_VERIFY_DEADLINE']))
     assert not locked()
     foreign = foreign_veyra()
+    if foreign: save('safety-stop',{'kind':'ownership','foreign_pids':foreign})
     assert not foreign, f'a veyra this run did not start is running: {foreign}'
     saved = sql('select live_pid from threads where live_pid is not null') if DB.exists() else ''
     ENV['VEYRA_REAP_PIDS'] = ','.join(saved.split())

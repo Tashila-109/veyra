@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Apply a full run's status proposals after the lead has read every queued native capture.
+
+This changes page text only; the lead owns the later docs-only commit.
+"""
+import argparse, json, pathlib, re
+import orchestration as o
+import pages
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('evidence',type=pathlib.Path)
+    p.add_argument('--reads',type=pathlib.Path,required=True,help='JSON capture-path to {sha256,verdict}')
+    args = p.parse_args()
+    proposal = json.loads((args.evidence/'status-proposals.json').read_text())
+    assert proposal['full_run'] and o.source_identity()['head']==proposal['head'], 'full run head differs'
+    assert proposal['identity']['diff_sha256']==__import__('hashlib').sha256(b'').hexdigest() \
+        and not proposal['identity']['untracked_sha256'], 'status needs a committed full-run candidate'
+    outcome = json.loads((args.evidence/'outcome.json').read_text())
+    assert outcome['status']==proposal['outcome'], 'status proposal differs from full-run outcome'
+    reads = json.loads(args.reads.read_text())
+    for path in args.evidence.glob('attempt-*/run/*-native-read.json'):
+        request = json.loads(path.read_text())
+        for label,digest in request['captures'].items():
+            image = str(path.parent/(label+'.png'))
+            assert reads[image]['sha256']==digest==o.sha(image), 'unread or changed native capture'
+            if proposal['outcome']=='DONE': assert reads[image]['verdict']=='pass', 'native read did not pass'
+    for name,state in proposal['pages'].items():
+        assert name not in pages.LIVE
+        path = o.BIN.parent/'features'/(name+'.md')
+        text = path.read_text()
+        missing = 'none' if state=='passed' else 'full coverage not proven; see '+str(args.evidence)
+        fingerprint = pages.fingerprint(o.REPO,proposal['head'],name)
+        line = f'Status: {state}, {proposal["date"]}, {proposal["head"][:7]}, {missing}, {fingerprint}'
+        path.write_text(re.sub(r'^Status:.*$',lambda _:line,text,count=1,flags=re.M))
+
+if __name__=='__main__': main()

@@ -97,14 +97,118 @@ def changed(repo, base, head):
     if head is None: files += git(repo,'ls-files','--others','--exclude-standard').split('\n')
     return sorted({name for name in files if name})
 
+def rust_code(data):
+    """Mask comments and strings without moving line or brace positions (including nested block comments)."""
+    text = (data or b'').decode()
+    pattern = re.compile(r'//[^\n]*|/\*|r(\#*)"|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\'', re.S)
+    chars, end = list(text), 0
+    while match := pattern.search(text,end):
+        stop = match.end()
+        if match[0] == '/*':
+            depth = 1
+            while depth and stop < len(text):
+                token = re.search(r'/\*|\*/',text[stop:])
+                if not token: stop = len(text); break
+                depth += 1 if token[0] == '/*' else -1
+                stop += token.end()
+        elif match[0].startswith('r'):
+            closing = '"'+match[1]
+            index = text.find(closing,stop)
+            stop = len(text) if index < 0 else index+len(closing)
+        for index in range(match.start(),stop):
+            if chars[index] != '\n': chars[index] = ' '
+        end = stop
+    return ''.join(chars)
+
+def test_ranges(data):
+    """Line intervals of complete cfg(test) items, including their attributes, in this side of a Rust diff."""
+    code, ranges = rust_code(data), []
+    for match in re.finditer(r'#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]',code):
+        # Attributes can contain braces. Skip them before finding the item's body or semicolon.
+        start, cursor = match.start(), match.end()
+        while more := re.match(r'\s*#\s*\[',code[cursor:]):
+            cursor += more.end()
+            depth = 1
+            while depth and cursor < len(code):
+                depth += (code[cursor]=='[')-(code[cursor]==']'); cursor += 1
+        item = re.search(r'[;{]',code[cursor:])
+        if item is None: continue
+        stop = cursor+item.end()
+        if item[0] == '{':
+            depth = 1
+            while depth and stop < len(code):
+                depth += (code[stop]=='{')-(code[stop]=='}'); stop += 1
+            if depth: continue  # malformed input is production, never an exemption
+        ranges.append((code.count('\n',0,start)+1,code.count('\n',0,stop)+1))
+    return ranges
+
+def test_file(repo, rev, path, seen=None):
+    """Follow a file's mod declaration, rather than exempting a production file containing some tests."""
+    if re.search(r'(?:^|/)tests/',path): return True
+    if not path.endswith('.rs'): return False
+    seen = set() if seen is None else seen
+    if path in seen: return False
+    seen.add(path)
+    p = pathlib.PurePosixPath(path)
+    parent = p.parent
+    name = p.stem
+    if name == 'mod': name, parent = parent.name, parent.parent
+    candidates = [parent/'mod.rs',parent/'main.rs',parent/'lib.rs',parent.with_suffix('.rs')]
+    for candidate in dict.fromkeys(str(value) for value in candidates if str(value)!=path):
+        body = read(repo,rev,candidate)
+        if body is None: continue
+        code = rust_code(body)
+        for declaration in re.finditer(r'\bmod\s+'+re.escape(name)+r'\s*;',code):
+            number = code.count('\n',0,declaration.start())+1
+            if any(a<=number<=b for a,b in test_ranges(body)): return True
+            if test_file(repo,rev,candidate,seen): return True
+    return False
+
+def production_hunks(repo, base, head, path):
+    """Classify hunks on both sides first. Each remaining hunk selects by its whole file."""
+    before, after = read(repo,base,path), read(repo,head,path)
+    if before is None and after is None: return []
+    diff = git(repo,'diff','--no-ext-diff','--no-color','--no-renames','-U0',base,
+        *([head] if head else []),'--',path)
+    if not diff and before is None:  # untracked file
+        diff = '@@ -0,0 +1,%d @@\n'%len(after.splitlines())+'\n'.join('+'+row for row in after.decode().splitlines())
+    chunks = re.split(r'(?=^@@ )',diff,flags=re.M)[1:]
+    ranges = [test_ranges(before),test_ranges(after)] if path.endswith('.rs') else [[],[]]
+    whole = [test_file(repo,base,path) if before is not None else True,
+        test_file(repo,head,path) if after is not None else True]
+    production = []
+    for chunk in chunks:
+        header = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@',chunk)
+        assert header, 'unparsed diff hunk: '+path
+        sides = [(int(header[1]),int(header[2] or 1)),(int(header[3]),int(header[4] or 1))]
+        exempt = path.endswith('.rs') and all(whole[index] or count==0 or
+            all(any(a<=line<=b for a,b in ranges[index]) for line in range(start,start+count))
+            for index,(start,count) in enumerate(sides))
+        changed_rows = [row[1:].strip() for row in chunk.splitlines()[1:] if row[:1] in '+-']
+        # Adding/removing only the guard changes whether an existing item is production.
+        if any(re.fullmatch(r'#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]',row) for row in changed_rows) \
+                and all(row.startswith('#[') for row in changed_rows): exempt = False
+        if not exempt: production.append(chunk)
+    return production
+
+def class_c_change(repo, base, head, path, property):
+    if not matches(path,LISTS[property]) or not production_hunks(repo,base,head,path): return False
+    if path not in ['Cargo.toml','Cargo.lock']: return True
+    # Only the gpui pins own native properties; a Cargo profile or test dependency does not.
+    import tomllib
+    def pins(rev):
+        data = tomllib.loads((read(repo,rev,path) or b'').decode())
+        names = {'gpui-kit','gpui-pre','gpui-pre-platform'}
+        if path == 'Cargo.lock': return [entry for entry in data.get('package',[]) if entry['name'] in names]
+        return {key:value for key,value in data.get('workspace',{}).get('dependencies',{}).items() if key in names}
+    return pins(base) != pins(head)
+
 def release_change(repo, base, head, files):
     if any(matches(name,RELEASE) for name in files): return True
-    diff = git(repo,'diff','--no-ext-diff','--no-color','-U0',base,*([head] if head else []),'--','*.rs')
+    diff = '\n'.join(hunk for path in files if path.endswith('.rs')
+        for hunk in production_hunks(repo,base,head,path))
     if any(row[:1] in '+-' and not row.startswith(('+++','---')) and 'cfg(debug_assertions)' in row
             for row in diff.splitlines()): return True
-    if head is None:
-        for name in git(repo,'ls-files','--others','--exclude-standard').split():
-            if name.endswith('.rs') and b'cfg(debug_assertions)' in (read(repo,None,name) or b''): return True
     def profiles(data):
         kept, inside = [], False
         for row in (data or b'').decode().splitlines():
@@ -114,7 +218,7 @@ def release_change(repo, base, head, files):
     return 'Cargo.toml' in files and profiles(read(repo,base,'Cargo.toml')) != profiles(read(repo,head,'Cargo.toml'))
 
 def select(repo, base, head=None):
-    files = changed(repo,base,head)
+    files = [path for path in changed(repo,base,head) if production_hunks(repo,base,head,path)]
     texts = pages(repo,head)
     every = set(texts)|{f'{name}:{kind}' for name in texts if name not in LIVE for kind,heading in SECTIONS.items()
         if heading.search(texts[name])}
@@ -183,91 +287,79 @@ def recorded_version(text, provider):
     return None
 
 def self_test():
-    root = pathlib.Path(tempfile.mkdtemp(prefix='veyra-pages-'))
-    env = dict(os.environ,GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1')
-    def run(*args): subprocess.run(['git',*args],cwd=root,env=env,check=True,capture_output=True)
-    def write(path, text):
-        (root/path).parent.mkdir(parents=True,exist_ok=True)
-        (root/path).write_text(text)
-    def commit(message):
-        run('add','-A')
-        run('-c','user.name=self-test','-c','user.email=self-test@example.invalid','-c','commit.gpgsign=false',
-            'commit','-q','-m',message)
-        return git(root,'rev-parse','HEAD').strip()
-    def page(name, status, globs, extra=''):
-        write(f'{SKILL}/features/{name}.md',f'# {name}\n\nStatus: {status}\nCovers: {globs}\n\n## Driving\n{extra}')
-    try:
-        run('init','-q')
-        write('Cargo.toml','[workspace]\n\n[profile.dev]\nopt-level = 0\n')
-        for path in ['src/alpha.rs','src/beta.rs','src/other.rs','ARCHITECTURE.md','crates/veyra/src/main.rs',
-                'crates/engine/src/provider/codex.rs','crates/engine/src/provider/session.rs',SKILL+'/SKILL.md',
-                SKILL+'/features/README.md']:
-            write(path,'one\n')
-        page('alpha','passed, 2026-01-01, abc1234, none','src/alpha.rs crates/engine/src/provider/**','\n### Codex\n')
-        page('beta','passed, 2026-01-01, abc1234, none','src/beta.rs '+SKILL+'/SKILL.md')
-        page('permission-matrix','passed, 2026-01-01, abc1234, live cells with Claude 2.1.0, Codex 0.9.0',
-            'crates/engine/src/provider/**','\n### Codex preserved live evidence\n')
-        base = commit('base')
-        every = ['alpha','alpha:codex','beta','permission-matrix']
-        def case(label, change, expected):
-            change()
-            head = commit(label)
-            assert select(root,base,head) == expected, (label,select(root,base,head),expected)
-            run('reset','-q','--hard',base)
-        case('one page',lambda: write('src/beta.rs','two\n'),['beta'])
-        case('shared',lambda: write(SKILL+'/SKILL.md','two\n'),every)
-        case('uncovered',lambda: write('src/other.rs','two\n'),every)
-        case('no page',lambda: write('ARCHITECTURE.md','two\n'),[])
-        case('status only',lambda: page('beta','failed, 2026-02-02, def5678, all','src/beta.rs '+SKILL+'/SKILL.md'),[])
-        case('own page',lambda: page('beta','passed, 2026-01-01, abc1234, none','src/beta.rs '+SKILL+'/SKILL.md','More\n'),['beta'])
-        case('live page',lambda: page('permission-matrix','passed, 2026-01-01, abc1234, live cells',
-            'crates/engine/src/provider/**','\n### Codex preserved live evidence\nMore\n'),['permission-matrix'])
-        case('codex',lambda: write('crates/engine/src/provider/codex.rs','two\n'),['alpha:codex','permission-matrix'])
-        case('provider shared',lambda: write('crates/engine/src/provider/session.rs','two\n'),
-            ['alpha','alpha:codex','permission-matrix'])
-        case('release file',lambda: write('crates/veyra/src/main.rs','two\n'),every+['release'])
-        case('debug line',lambda: write('src/beta.rs','#[cfg(debug_assertions)]\n'),['beta','release'])
-        case('profile',lambda: write('Cargo.toml','[workspace]\n\n[profile.dev]\nopt-level = 1\n'),every+['release'])
-        write('src/other.rs','two\n')
-        assert select(root,base) == every, 'the working tree is not read'
-        run('checkout','-q','--','src/other.rs')
-        before = fingerprint(root,base,'beta')
-        page('beta','passed, 2026-03-03, '+base[:7]+', none, '+before,'src/beta.rs '+SKILL+'/SKILL.md')
-        stamped = commit('status with fingerprint')
-        assert fingerprint(root,stamped,'beta') == before, 'a Status line changed the fingerprint'
-        assert 'beta passed' in fresh(root,stamped), fresh(root,stamped)
-        write('src/other.rs','two\n')
-        assert 'beta passed' not in fresh(root,commit('uncovered change')), 'an uncovered change kept beta fresh'
-        run('reset','-q','--hard',stamped)
-        write('src/beta.rs','two\n')
-        moved = commit('covered change')
-        assert fingerprint(root,moved,'beta') != before, 'a covered change kept the fingerprint'
-        assert 'beta passed' not in fresh(root,moved)
-        write('src/alpha.rs','two\n')
-        assert fingerprint(root,commit('uncovered by beta'),'beta') == fingerprint(root,moved,'beta')
-        live = fingerprint(root,moved,'permission-matrix')
-        page('permission-matrix','passed, 2026-01-01, '+moved[:7]+', live cells with Claude 2.1.0, Codex 0.9, '
-            'Grok 1.0.62-beta.2, '+live,'crates/engine/src/provider/**','\n### Codex preserved live evidence\n')
-        stamped = commit('live fingerprint')
-        versions = root/'.git'/'versions.txt'
-        same = 'claude: 2.1.0 (Claude Code)\ncodex: codex-cli 0.9\ngrok: grok 1.0.62-beta.2 (abc123) [stable]\n'
-        def live_rows(head, lines):
-            versions.write_text(lines)
-            return [row for row in fresh(root,head,versions) if row.startswith('permission-matrix')]
-        assert live_rows(stamped,same) == ['permission-matrix/claude passed','permission-matrix/codex passed',
-            'permission-matrix/grok passed'], live_rows(stamped,same)
-        assert live_rows(stamped,'claude: 2.1.0-alpha.1\ncodex: codex-cli 0.9.1\ngrok: grok 1.0.62\n') == [], \
-            'a prerelease, a longer version or a dropped suffix kept a live row fresh'
-        assert live_rows(stamped,'claude: 2.1.0.\ncodex: codex-cli 0.9.\ngrok: grok 1.0.62-beta.2X--1\n') == [], \
-            'a trailing dot or a longer suffix on the versions line kept a live row fresh'
-        assert not [row for row in fresh(root,stamped) if row.startswith('permission-matrix')]
-        write('Cargo.lock','two\n')
-        assert live_rows(commit('shared change'),same) == [], 'a shared change kept the live rows fresh'
-    finally:
-        shutil.rmtree(root)
-    print('PASS select-pages: one page, shared and uncovered with the live page, no-page, Status-only, own page, '
-        'provider, release and working tree; fingerprint: Status-blind, covered change, uncovered change; fresh: '
-        'pages, a selecting change since COMMIT, a shared change for the live rows and whole version tokens')
+    """All fixtures are in memory. No init, index, commit, checkout or other Git write."""
+    import difflib
+    from unittest.mock import patch
+    fixtures = {
+        'base':{
+            SKILL+'/features/alpha.md':b'# Alpha\nStatus: passed, date, sha, none\nCovers: src/alpha.rs crates/engine/src/provider/**\n### Codex\n',
+            SKILL+'/features/beta.md':b'# Beta\nStatus: passed, date, sha, none\nCovers: src/beta.rs\n',
+            SKILL+'/features/permission-matrix.md':b'# Live\nCovers: crates/engine/src/provider/**\n',
+            'src/alpha.rs':b'fn alpha() {}\n','src/beta.rs':b'fn beta() {}\n',
+            'crates/veyra/src/main.rs':b'#[cfg(test)]\nmod tests;\nmod ui;\n',
+            'crates/veyra/src/tests.rs':b'#[cfg(debug_assertions)]\nfn old() {}\n',
+            'crates/veyra/src/ui/mod.rs':b'fn live() {}\n#[cfg(test)]\nmod headless;\n#[cfg(test)]\nmod checks {\nfn old() {}\n}\n',
+            'crates/veyra/src/ui/headless.rs':b'#[cfg(debug_assertions)]\nfn old() {}\n',
+            'Cargo.toml':b'[workspace]\n[profile.dev]\nopt-level = 0\n'}}
+    def fake_git(repo,*args,data=False):
+        if args[0]=='show':
+            rev,path=args[1].split(':',1)
+            if path not in fixtures[rev]: raise subprocess.CalledProcessError(1,['git','show'])
+            result=fixtures[rev][path]
+        elif args[0]=='ls-files': result=b''
+        elif args[0]=='ls-tree':
+            rev=args[-1] if '-r' in args else args[-2]
+            if '-r' in args:
+                result=''.join('100644 blob '+hashlib.sha1(b'blob %d\0'%len(body)+body).hexdigest()+'\t'+path+'\0'
+                    for path,body in sorted(fixtures[rev].items())).encode()
+            else: result=('\n'.join(path for path in fixtures[rev] if path.startswith(SKILL+'/features/'))+'\n').encode()
+        elif args[0]=='diff':
+            before,after=fixtures['base'],fixtures['head']
+            if '--name-only' in args:
+                result='\n'.join(path for path in sorted(before.keys()|after.keys()) if before.get(path)!=after.get(path)).encode()
+            else:
+                path=args[-1]
+                result=''.join(difflib.unified_diff(before.get(path,b'').decode().splitlines(True),
+                    after.get(path,b'').decode().splitlines(True),fromfile=path,tofile=path,n=0)).encode()
+        else: raise AssertionError(args)
+        return result if data else result.decode()
+    every=['alpha','alpha:codex','beta','permission-matrix']
+    cases=[
+        ('one page',{'src/beta.rs':b'fn changed() {}\n'},['beta']),
+        ('uncovered',{'src/other.rs':b'fn other() {}\n'},every),
+        ('shared helper',{SKILL+'/bin/helper.py':b'pass\n'},every),
+        ('no page',{'ARCHITECTURE.md':b'doc\n'},[]),
+        ('release file',{'crates/veyra/src/main.rs':b'fn main() {}\n'},every+['release']),
+        ('production debug',{'src/beta.rs':b'#[cfg(debug_assertions)]\nfn changed() {}\n'},['beta','release']),
+        ('test file through mod',{'crates/veyra/src/tests.rs':b'#[cfg(debug_assertions)]\nfn changed() {}\n'},[]),
+        ('fd4adea..04ac4f3 fixture shape',{'crates/veyra/src/ui/headless.rs':b'#[cfg(debug_assertions)]\nfn repaired() {}\n',
+            'crates/veyra/tests/headless.rs':b'#[cfg(debug_assertions)]\nfn changed() {}\n','ARCHITECTURE.md':b'doc\n'},[]),
+        ('shared file test hunk',{'crates/veyra/src/ui/mod.rs':fixtures['base']['crates/veyra/src/ui/mod.rs'].replace(b'fn old()',b'fn new()')},[]),
+        ('mixed shared file',{'crates/veyra/src/ui/mod.rs':fixtures['base']['crates/veyra/src/ui/mod.rs'].replace(b'fn live()',b'fn changed()').replace(b'fn old()',b'fn new()')},every),
+        ('remove cfg test',{'crates/veyra/src/ui/mod.rs':fixtures['base']['crates/veyra/src/ui/mod.rs'].replace(b'#[cfg(test)]\nmod checks',b'mod checks')},every),
+        ('crate integration tests',{'crates/example/tests/nested/test.rs':b'#[cfg(debug_assertions)]\nfn test() {}\n'},[]),
+        ('provider',{'crates/engine/src/provider/codex.rs':b'fn codec() {}\n'},['alpha:codex','permission-matrix']),
+        ('profile',{'Cargo.toml':b'[workspace]\n[profile.dev]\nopt-level = 1\n'},every+['release']),
+    ]
+    with patch(__name__+'.git',side_effect=fake_git):
+        for label,change,expected in cases:
+            fixtures['head']=dict(fixtures['base'],**change)
+            actual=select(None,'base','head')
+            assert actual==sorted(expected),(label,actual,expected)
+        fixtures['head']=dict(fixtures['base'])
+        own=SKILL+'/features/beta.md'
+        fixtures['head'][own]=fixtures['base'][own].replace(b'Status: passed',b'Status: failed')
+        assert select(None,'base','head')==[]
+        assert fingerprint(None,'base','beta')==fingerprint(None,'head','beta')
+        fixtures['head'][own]+=b'Extra recipe\n'
+        assert select(None,'base','head')==['beta']
+    repo=pathlib.Path(__file__).resolve().parents[4]
+    # Exercise the real admitted test-only commit, without depending on the current uncommitted helper diff.
+    if subprocess.run(['git','cat-file','-e','04ac4f3^{commit}'],cwd=repo,capture_output=True).returncode==0:
+        assert select(repo,'fd4adea','04ac4f3')==[], 'admitted test-only diff selected native work'
+    assert recorded_version('Claude 2.1.0,','Claude')=='2.1.0'
+    print('PASS select-pages: test-hunk-first, mod ancestry, mixed production/test, debug-only release, '+
+        'fd4adea..04ac4f3 fixture and real commit, provider/shared/uncovered/no-page/Status/fingerprint rules; no Git writes')
 
 def main(argv):
     repo = pathlib.Path(__file__).resolve().parents[4]

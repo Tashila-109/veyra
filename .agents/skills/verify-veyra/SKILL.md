@@ -15,59 +15,102 @@ External Accessibility input is not granted here; driver keys prove gpui dispatc
 
 ## Run
 
-`bin/run --evidence DIR` runs a gated fake-CLI run: every page's sections in map order, then Doctor and Evidence, and Cleanup last whatever failed.
-The pages are the [feature map](features/README.md)'s links in order, then any other `features/*.md` by name, so a new page joins the full run when its file exists.
-It waits in Launch's gate, gives each section a fresh `bash -c` with only `RUN` carried forward, times every section into `DIR/ATTEMPT/sections.json` and hard-links the kept proof to `DIR/ATTEMPT/run` after Cleanup.
-The runner chooses each attempt's `RUN` before Launch and passes it in, so the attempt's Cleanup knows its `RUN` even when Launch is interrupted.
-Everything from Launch on runs inside one `try`, and its `finally` runs Cleanup before anything else.
-SIGTERM, SIGHUP and SIGINT always raise, and the handler blocks all three before it raises.
-Before the first attempt, nothing is owned yet, so a signal ends the runner at once with exit 128 plus the signal number.
-During an attempt, a signal raises into that `try`.
-Each section's process starts with the three signals blocked across its fork, and they are unblocked as the first step inside the `try` that stops that section's group; the process unblocks them for itself.
-The `finally` runs with the signals blocked, so one that arrives during Cleanup, the proof copy or the verdict stays pending.
-After a failed section, still inside that `try`, it takes one `failure` capture, unless human input caused the failure or the deadline stopped it, and records the capture's exit, error or timeout in `DIR/ATTEMPT/failure-capture.json`.
-Each write during the attempt records its own error in the attempt's `problems` instead of raising, so no write can stop Cleanup.
-After Cleanup, one verdict decides the attempt, and it is the only place a run can become DONE:
-- The verdict reads pending signals with `sigpending()` for every outcome, and an interruption ends the attempt FAILED (interrupted) and is recorded in the attempt's record.
-- DONE needs every planned section passed, Cleanup exit 0, an unchanged tree, the proof copy kept in `DIR/ATTEMPT/run` and no interrupting signal.
-- An interruption, a failed Cleanup, scratch left behind, a proof copy that was not kept or a changed tree ends FAILED, and the recorded errors stay in `problems`.
-- The failure capture, the transcript, `sections.json` and `plan.json` are diagnostics: a write error there is listed in `problems` and changes nothing else.
-- Otherwise a failed section is classified by the observation `observe_failure` recorded in `focus-failure.json` during it, and a corrupt `focus-failure.json` counts as no observation:
-  - Reaching the deadline, or any other failure in its last minute, ends BLOCKED.
-  - With human input since launch, any observed failure gets a new attempt after 60 seconds, not counted.
-  - A `capture` failure with no human input gets a new attempt after 60 seconds, and the third such failure in a run ends BLOCKED.
-  - A `focus-timeout` failure with no human input, such as a dock-focus regression, and any failure with no observation end FAILED.
+Start with the offline receipt, then let the lead arm the native window for its exact identity.
+`bin/run --tier-s-write DIR` builds debug and release artifacts and capture helpers, runs the workspace tests (classes A and B included), debug clippy, fmt, release test compilation, asserts the named boundary/text/map and nine headless results in that workspace output, then runs `--check-only` once.
+It writes `DIR/receipt.json`, the command outputs and their hashes, helper hashes, and HEAD/diff/binary identity.
+A native mode requires `--tier-s DIR/receipt.json`; missing commands, failed commands, changed outputs/helpers/binaries, another identity or a receipt older than 24 hours refuse Launch.
+Launch copies the already compiled helpers and does no build.
+Every relaunch checks the receipt again.
 
-After the verdict, `DIR/ATTEMPT/attempt.json` is written once, with the verdict, and read back.
-Between attempts, the 60-second wait is unblocked, and a signal there ends the run FAILED.
-After the last attempt, `DIR/outcome.json` is written once, with the status, every attempt and the gate wait apart from the recipe time, and read back.
-A receipt that fails to write or read back ends the run FAILED with exit 1, and its error goes to stderr, because the receipt that would hold it was not kept.
-The runner checks for pending signals before it prints the final line, which says FAILED (interrupted) when a signal is pending and every receipt was kept, and once more after it.
-A signal still pending at the last check, which arrived after the verdict while the receipts or the final line were written, cannot be recorded in the receipts, so it ends the run with exit 128 plus its number and the reason on stderr.
-The run exits 0 only when the verdict was DONE, both receipts were written and read back, and no signal was pending at that last check.
+`bin/run --smoke --base BASE` runs Launch, Doctor, app-launch's first section, each selected fake page's `Native smoke`, Doctor, Evidence and Cleanup.
+Provider tokens select that page's smoke scene; live permission cells are reported due and remain in their separately consented lane.
+A production hunk in a glass file selects `settings/Glass smoke` as well.
+A test hunk never selects a page, release, glass or a guard.
+Smoke uses the debug quiet clock and never writes Status lines or status proposals.
+A selected release token still runs the release section.
+`--then-guard --baseline DIR` runs the slice-6 frame-cost guard **before** that smoke in the same away window.
+A failed guard cannot enter smoke.
+The guard uses the fixed 24,60,960,740 placement on both sides, records stream `perf.repaints`, runs five pairs with the ten-pair extension rule, both idle focus states and normal/reduced Working scenes, with recording off.
+It retries a cover trip before the first pair once after 60 seconds and applies the full unfiltered guard again.
+Its `guard-done.json` is the lead's signal to release the arch-plan pause.
+The baseline is the retained slice-5 binary directory named by its 40-character build revision and authenticated by `identity.txt`.
+
+`bin/run --slice-end` and `bin/run --gate` run the full fake map, including release.
+Only `--gate` permits `--real-quiet`.
+Full runs emit `status-proposals.json`; after reading every queued native image, the lead applies it with `bin/stamp-status DIR --reads READS.json` in the docs-only status change.
+No fake run stamps permission-matrix's live cells.
+A full run's native read manifest records each capture path, SHA-256 and verdict.
+Status stamping uses the candidate commit's fingerprint, so the candidate must be committed before that full run.
+
+Every native mode also requires `--go GO.json` with `launch_authorized: true`, the exact `identity` from Tier S, `issued_epoch` and `cutoff_epoch`.
+A guard additionally requires `frame_cost_guard_authorized: true` and `arch_plan_paused: true`.
+The lead writes that file only after the human's GO; the runner never creates approval.
+`--deadline EPOCH` cannot exceed that cutoff.
+HEAD, `git diff --binary HEAD`'s SHA-256, untracked helper hashes and the debug/fake/release binaries' SHA-256 form the identity.
+A helper edit therefore invalidates READY, Tier S and GO.
+`--expect-head SHA` refuses another HEAD.
+
+Each section runs in a fresh `bash -c` with exported RUN and the admission paths.
+The runner records `sections.json`, the transcript, the plan and required receipts under `DIR/attempt-1/`, and preserves proof as `DIR/attempt-1/run` after Cleanup.
+A capture has at most three attempts, discarding the image after every guard failure.
+Three tripped attempts block that section; the run then health-checks the owned process, restores a known composer and continues through independent sections.
+Ordinary assertion failures are collected too.
+Use `--sections PAGE/HEADING ...` in the next armed window to run only the blocked sections, with Launch, Doctor, app-launch's first section, Evidence and Cleanup.
+Passed sections are not repeated.
+The outcome lists each section as passed, failed or blocked.
+
+The run stops on ownership, Cleanup, identity or restore failure, or a privacy guard it cannot enforce, including a missing backdrop.
+The screen-lock guard, HID gate, frontmost/coverage guards and owned-process rules remain in force.
+A deadline leaves unstarted sections blocked and still runs Cleanup.
+SIGTERM, SIGHUP and SIGINT enter Cleanup before a verdict; pending signals also prevent DONE.
+DONE requires every planned section passed, Cleanup exit zero, no scratch residue, unchanged identity and retained proof.
+Independent failures yield FAILED after collection; blocked sections yield BLOCKED when no independent failure exists.
+Unreadable required receipts or lost proof prevent DONE.
+No interrupted or partial run counts as passed.
 
 ```text
-.agents/skills/verify-veyra/bin/run --evidence DIR                     # every page, the full run
-.agents/skills/verify-veyra/bin/run --evidence DIR --base BASE         # the pages a change from BASE selects
-.agents/skills/verify-veyra/bin/run --evidence DIR --pages multi-agent # one page alone
-.agents/skills/verify-veyra/bin/run --evidence DIR --sections 'SKILL/Doctor' 'multi-agent/Probe smoke measurements'
-.agents/skills/verify-veyra/bin/run --check-only                       # every block, the map and the gate; no launch
+bin/run --check-only
+bin/run --tier-s-write DIR
+bin/run --smoke --base BASE --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
+bin/run --smoke --base BASE --then-guard --baseline BASELINE --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
+bin/run --sections 'settings/Native smoke' --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
+bin/run --slice-end --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
+bin/run --gate --real-quiet --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
 ```
 
-`--base BASE` runs [Selection](#selection) from BASE to the working tree itself.
-A selection error ends the run with exit 2 before Launch.
-A selection with no fake-CLI token exits 0 without launching and says so, and otherwise the run drives the selected tokens.
-`--pages` takes the tokens `select-pages` prints: `PAGE` for a page's own sections, `PAGE:codex` and `PAGE:grok` for its provider sections, and `release` for app-launch's release check.
-Launch, Doctor, app-launch's first section, Evidence and Cleanup always run; a selected `permission-matrix` is reported as due and never driven, because it needs a consented live lane.
-`--sections PAGE/HEADING ...` runs exactly those sections between Launch and Cleanup, as a perf or live plan needs.
-`--real-quiet` makes multi-agent wait for the real ten-minute quiet clock, which a phase gate runs once when `ui/header.rs`, `ui/sidebar.rs` or a `ui/mod.rs` line naming `last_activity`, `quiet_minutes` or `cadence_due` changed.
-`--expect-head SHA` refuses a checkout at another commit, `--deadline EPOCH` bounds the whole run, and `--scratch PREFIX` sets the scratch prefix, `/tmp/veyra-verify-` by default.
-The tree's identity, its HEAD, `git status --short`, the diff's SHA-256 and each untracked file's SHA-256, is saved at the start and checked after Launch's build and after Cleanup.
-`--check-only` compiles every block, fails when app-launch's first section, its `Release check` or a perf-tier section is missing, and checks that Launch calls `gate()` before its first `start()`.
-It reads `start()`'s relaunch refusal (`foreign = foreign_veyra()` then `assert not foreign`, before the launch) and Cleanup's `assert not other_markers` and `retry_exiting=True` calls as Python structure, and checks only that the 30 s drain, stale-screenshot and covered-window guard texts are present.
-It tables the verdict, runs `measured_pair_self_test`, and drives `gate()` on a virtual clock with stubbed idle, lock and `pgrep` readers, failing if the self-tests run past 30 seconds.
-It also runs `backdrop_pid_self_test` with mocked executable reads, signals and time; the test starts and stops no process.
-The page and Cleanup share executable verification, refuse to reopen a dead backdrop, recheck after every open and verify the scratch executable immediately before each signal.
+Paths in this block are relative to `.agents/skills/verify-veyra/`; run them from the checkout with that prefix.
+`--check-only` compiles all shell blocks, Python heredocs and Python helpers, checks the map and guard structure, and runs the offline self-tests.
+They call the real `prepare()` through selection/admission/environment setup, exercise the actual guard-then-smoke dispatch and failed-guard refusal, collect independent failures through Cleanup, classify test hunks and verify repaint/file freshness and plain-message assertions.
+Native/process/window/capture boundaries are stubbed in those tests.
+The existing virtual HID/lock gate, measured-pair placement, backdrop ownership and unmanaged-window tests also run.
+These tests prove the harness offline; they leave the native smoke and compositor behavior for an armed window on the committed head.
+
+### Mutants and retention
+
+At slice end or the gate, `--native-mutants PREPARED.json` admits at most three mutants, each for a class C property.
+Prepare them offline with `bin/run --prepare-mutants MANIFEST.json --evidence DIR`.
+Each manifest case names `name`, `property`, `file`, the unique `old`/`new` replacement, `sections`, `capture`, `scene_runs_mutated_line: true` and an expected assertion or an explicit capture read.
+The reviewer checks that the scene executes the changed line.
+Preparation writes a fresh complete Tier S receipt and binary snapshots for each mutation, restoring exact original source and binary bytes in `finally` before clearing its journal.
+The lead adds each case's own `go` path to `prepared.json`, and the parent GO names that file's `mutant_manifest_sha256`.
+Native execution installs those already proved bytes, runs their routed scene, collects survivors, and restores the exact originals even after failure.
+An uncleared `mutation-in-flight.json` is a restore failure to resolve before another run.
+`bin/run --mutant-route NAME` prints each historical 6c route from `bin/mutant-routes.json`, including Grok's wrapped toolbar prerequisite, the second Codex MCP dock and Settings' sheet scene.
+Those routes do not re-admit retired draw checks as native mutants.
+Admitted draw defects belong to the tests in [proof ownership](proof-ownership.md).
+Plain AssertionError messages are parsed as messages; a malformed literal cannot crash routing.
+Retained-image replay is only a checker self-test and never a native mutant kill.
+
+After the lead's part-close status commit, `bin/prune ROOT --discard DISCARD.json --gate-cites GATE --close-cites CLOSE --keep KEEP --status-commit SHA` prints the dry-run JSON and its digest.
+`--apply DIGEST` applies only that unchanged plan on the lead's authorization.
+The status commit records Tier S identity, guard folder/verdict, smoke run/pages and review aggregate/head/round.
+Keep Tier S receipts; guard summaries and per-run results; smoke receipts and every capture read; one failure capture and logs per stopped attempt; all red/green receipts; and review aggregates.
+The keep manifest names every retained proof, and gate/Close citations protect their files and descendants regardless of discard requests.
+The tool also preserves baselines under `evidence/perf/bin/`, refuses symlinks and flags a part above 1 GB.
+Unknown files are kept.
+Discard entries explicitly name studies, superseded copies, staged fixtures, synthesized images or debug snapshots.
+Store study sources once by content with compact manifests.
+The lead's prune, after this pass lands, removes replaced per-part scripts; this pass edits only this skill.
 
 ## Selection
 
@@ -78,7 +121,7 @@ The page and Cleanup share executable verification, refuse to reopen a dead back
 shared    Cargo.toml Cargo.lock crates/veyra/src/ui/mod.rs crates/engine/src/actor.rs
           .agents/skills/verify-veyra/SKILL.md .agents/skills/verify-veyra/bin/**
 no-page   crates/*/tests/*.rs crates/*/tests/common/** crates/engine/src/tests/** crates/veyra/src/tests.rs
-          crates/veyra/src/verify_map.rs crates/engine/src/platform/boundary.rs crates/engine/src/provider/scripted.rs
+          crates/veyra/src/verify_map.rs crates/veyra/src/ui/headless.rs crates/engine/src/platform/boundary.rs crates/engine/src/provider/scripted.rs
           ARCHITECTURE.md AGENTS.md clippy.toml scripts/** .agents/skills/verify-veyra/features/README.md
 codex     crates/engine/src/provider/codex.rs crates/engine/src/provider/codex/** crates/engine/tests/fixtures/codex/**
 grok      crates/engine/src/provider/grok.rs crates/engine/tests/fixtures/grok/**
@@ -86,7 +129,21 @@ provider  crates/engine/src/provider/mod.rs crates/engine/src/provider/session.r
           crates/engine/src/provider/lines.rs crates/engine/src/provider/jsonrpc.rs crates/engine/src/mcp.rs
           crates/engine/src/tools.rs crates/veyra/src/relay.rs
 release   crates/veyra/src/control.rs crates/veyra/src/main.rs crates/veyra/build.rs
+glass     crates/veyra/src/ui/theme.rs crates/veyra/src/ui/mod.rs crates/veyra/src/ui/sidebar.rs
+          crates/veyra/src/ui/settings.rs crates/veyra/src/main.rs crates/engine/src/platform/macos.rs
+          Cargo.toml Cargo.lock
+frame     crates/veyra/src/** crates/engine/src/actor.rs Cargo.toml Cargo.lock
+activation crates/veyra/src/ui/mod.rs crates/veyra/src/ui/notify.rs
+clipboard  crates/veyra/src/ui/terminal_view.rs
+quit       crates/veyra/src/ui/mod.rs crates/veyra/src/main.rs crates/engine/src/lib.rs
+pty        crates/engine/src/terminal.rs crates/engine/src/platform/macos.rs
+           crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/terminal_view.rs
 ```
+
+Selection classifies both sides of every changed hunk before applying the file lists.
+A hunk wholly inside a `#[cfg(test)]` item, a file whose `mod` declaration is test-only, any crate's `tests/`, or `crates/engine/src/tests/` selects nothing, including no `release` token for a test's `cfg(debug_assertions)` line.
+A mixed production/test file still selects by its whole file when any production hunk remains.
+The offline selector test includes the admitted `fd4adea..04ac4f3` diff and its fixture shape.
 
 A `shared` file selects every page and provider section, `permission-matrix` included.
 A `no-page` file selects nothing, because it cannot change the window.
@@ -102,7 +159,7 @@ The recorded version is the whitespace token after the page's first `Claude`, `C
 `bin/fresh-pages --print COMMIT` prints each page's fingerprint at COMMIT, for the Status line.
 A FINGERPRINT is the SHA-256 over `BLOB PATH` lines, sorted by path, for the files `git ls-tree -r COMMIT` lists under the page's `Covers:` globs, plus the page's own file, whose blob id is computed without its Status line.
 So a docs-only status commit leaves every fingerprint as it was.
-`python3 .agents/skills/verify-veyra/bin/pages.py self-test` checks every selection rule, the fingerprint and the version match in a scratch repository.
+`python3 .agents/skills/verify-veyra/bin/pages.py self-test` checks selection rules, test-only hunks and Status-blind fingerprints without any Git writes.
 
 ## Launch
 
@@ -110,7 +167,9 @@ The default verification lane uses only the fake CLI.
 Its binary path deliberately starts missing, so [new-thread](features/new-thread.md) can prove installation and Check again.
 Every section imports [`bin/driver.py`](bin/driver.py), which shares logging, bounded polling, fixture staging and the one expected database-table list.
 The driver does not set application state; its writes are fixture copies, screenshots and proof.
-[`bin/pixels.py`](bin/pixels.py) reads only the fake lane's retained guarded window captures, through on-device Vision text recognition and Pillow. It asserts painted text, counts, order, absence, theme colours and alignment at the capture's backing scale, retaining match confidence and pixel receipts inside the run's proof folder.
+Each capture queues a native read through [`bin/native_reads.py`](bin/native_reads.py).
+The [proof ownership](proof-ownership.md) lists admitted class A/B tests and remaining native reads.
+Vision OCR has no pass/fail path.
 For an authorized live lane, export `VEYRA_VERIFY_LANE=live` before Launch.
 Launch then removes replay overrides, records to `$PROOF/rec`, and the new-thread and chat pages use their live branches.
 A live lane needs separate human authorization because it runs the installed CLI and spends its quota.
@@ -127,7 +186,7 @@ Its preflight and Cleanup share an in-memory marker reader and report counts onl
 Both lanes remove the caller's Claude session variables while keeping `CLAUDE_CODE_USE_*` user configuration.
 The fake lane puts a run-owned `git` first on the app's PATH; it answers `git branch --show-current` with `fixture-branch` only while `$DATA/branch-on` exists, and otherwise runs the real `git`.
 Every app launch runs from `$DATA/appcwd`; probes run in Veyra's private data folder.
-The fake lane uses an owned login-shell script with a 1.5 s delay, so the first ready line and dump prove the window opens while `login_path` is `pending`.
+The fake lane uses an owned login-shell script blocked on a run-owned release file, so the first ready line and dump prove the window opens while `login_path` is `pending`.
 Doctor sets Solid through `veyra::SetWindowBackground` before a page captures the window.
 Only a page proving Translucent starts the compiled backdrop; Launch compiles it before opening the app.
 
@@ -143,34 +202,18 @@ BIN=.agents/skills/verify-veyra/bin
 case "$DATA" in /tmp/veyra-*) ;; *) exit 1 ;; esac
 test ! -e "$DATA"
 test ! -e "$PROOF"
-cargo build --workspace
 mkdir -p "$PROOF/fixtures" "$DATA/project" "$DATA/appcwd"
 printf '%s\n' "${VEYRA_VERIFY_LANE:-fake}" >"$PROOF/lane"
 : >"$PROOF/pages-run"
-swiftc -O "$BIN/capture-window.swift" -o "$PROOF/capture-window"
-swiftc -O "$BIN/winid.swift" -o "$PROOF/winid"
-swiftc -O "$BIN/backdrop.swift" -o "$PROOF/backdrop"
-swiftc -O "$BIN/pasteboard.swift" -o "$PROOF/pasteboard"
-cat >"$PROOF/visible-frame.swift" <<'SWIFT'
-import AppKit
-import CoreGraphics
-let args = Array(CommandLine.arguments.dropFirst())
-guard args.count == 2, let pid = Int(args[0]), let number = UInt32(args[1]),
-      let rows = CGWindowListCopyWindowInfo(.optionIncludingWindow, number) as? [[String: Any]],
-      let row = rows.first(where: { ($0[kCGWindowNumber as String] as? Int) == Int(number) && ($0[kCGWindowOwnerPID as String] as? Int) == pid }),
-      let bounds = row[kCGWindowBounds as String] as? [String: Any],
-      let x = bounds["X"] as? NSNumber, let y = bounds["Y"] as? NSNumber,
-      let w = bounds["Width"] as? NSNumber, let h = bounds["Height"] as? NSNumber,
-      let primary = NSScreen.screens.first else { exit(1) }
-let point = NSPoint(x: x.doubleValue + w.doubleValue / 2, y: primary.frame.maxY - y.doubleValue - h.doubleValue / 2)
-let screens = NSScreen.screens.filter { $0.frame.contains(point) }
-guard screens.count == 1 else { exit(1) }
-let frame = screens[0].visibleFrame
-let value = ["visible_frame": [frame.minX, primary.frame.maxY - frame.maxY, frame.width, frame.height]]
-let data = try JSONSerialization.data(withJSONObject: value)
-print(String(data: data, encoding: .utf8)!)
-SWIFT
-swiftc -O "$PROOF/visible-frame.swift" -o "$PROOF/visible-frame"
+PYTHONPATH="$BIN" python3 - <<'PYTIER'
+from orchestration import identity, require_tier
+import os, pathlib, shutil
+receipt = pathlib.Path(os.environ['VEYRA_VERIFY_TIER_S'])
+require_tier(receipt,identity())
+proof = pathlib.Path('target/verify-veyra')/os.environ['RUN']
+for source in (receipt.parent/'tools').iterdir():
+    shutil.copy2(source,proof/source.name)
+PYTIER
 cp crates/engine/tests/fixtures/claude/probe-initialize.jsonl "$PROOF/fixtures/probe.jsonl"
 cp crates/engine/tests/fixtures/codex/probe-ready.jsonl "$PROOF/fixtures/probe-codex.jsonl"
 cp crates/engine/tests/fixtures/grok/probe-grok.jsonl "$PROOF/fixtures/probe-grok.jsonl"
@@ -296,9 +339,29 @@ A measured coarse and inverse pair uses one placement.
 If the owned-window fallback places either half, discard both and retake both at that rectangle within three pair attempts, keeping every guard and the exact pair check.
 The Settings page places a second run-owned backdrop above Veyra and requires the guard to reject it without retaining a PNG.
 Veyra must stay frontmost during captures.
-A changed visible state with an identical PNG fails; Evidence also compares named state pairs.
+Freshness requires an advanced `perf.repaints` counter on the owned pid and a newly written image file.
+Identical pixels are valid after a repaint; the guarded glass recipe keeps its measured pairs.
 Concurrent windows may cause a capture to fail, but cannot make a covered or off-screen frame pass.
 A dump proves state, not layout; inspect each PNG.
+
+## Recover section
+
+After a failed section, Doctor verifies identity before this reset to a known composer.
+A reset failure stops the run as a restore failure.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+set -eu
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYRECOVER'
+from driver import *
+identity()
+ctl('recovery-escape','keys','escape')
+action('recovery-composer','FocusComposer')
+prepare()
+poll('recovery-known-composer',lambda d:d['view']=='new_thread' and d['focus']=='composer')
+PYRECOVER
+```
 
 ## Evidence
 
@@ -318,7 +381,7 @@ identity()
 ctl('dump-after','dump')
 pages = set((PROOF/'pages-run').read_text().split())
 assert pages, 'no completed page'
-database('final','ask_first' if pages & {'settings','approvals-questions'} else 'full_access')
+database('final',sql('select default_mode from settings'))
 capture('window')
 shutil.copy2(DATA/'logs/veyra.log',PROOF/'veyra.log')
 (PROOF/'git-identity.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True)
@@ -332,9 +395,6 @@ if 'app-launch' in pages:
     assert len({(PROOF/(label+'-inode.txt')).read_text() for label in ['initial','after-migration']}) == 1
 for pid in (PROOF/'owned-app-pids').read_text().split():
     assert f'veyra ready pid={pid} data_dir={DATA}' in (PROOF/'veyra.log').read_text()
-for page in pages:
-    for first,second in pairs.get(page,[]):
-        assert (PROOF/(first+'.png')).read_bytes() != (PROOF/(second+'.png')).read_bytes(), (first,second)
 if 'chat-send-stream-live' in pages:
     assert list((PROOF/'rec').glob('t*-s*.jsonl')), 'missing live session recording'
 print('PASS evidence pages='+','.join(sorted(pages))+'; identity, database, relaunches, screenshots and release kept')
@@ -493,6 +553,9 @@ It does not signal an unrecorded group.
 A socket path permits 103 usable bytes; keep RUN and the scratch prefix short.
 
 ## Maintain the map
+
+Smoke never stamps a Status line.
+Only slice-end/gate full-run proposals, completed native reads and `bin/stamp-status` may set fake-page statuses.
 
 Update the matching feature page when actions, commands or dump fields change.
 `verify_map_names` checks exact action names, ctl verbs and top-level dump keys.

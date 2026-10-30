@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Print a retention plan first. Apply only its exact digest after the lead's status commit.
+
+Every deletion must be named explicitly in --discard JSON; unknown evidence is kept.
+Phase-gate and Close citation files and the retained proof list always win over a discard request.
+"""
+import argparse, hashlib, json, pathlib, re, subprocess
+from orchestration import sha, write
+
+KEEP = ['tier-s','guard','frame-guard','smoke','native-smoke','red','green','reviews','review',
+    'failure','stopped','receipt','outcome','summary','result','aggregate','identity','logs']
+DISCARD = {'study','studies','superseded','staged-fixtures','synthesized-images','debug-snapshots','preflight-studies'}
+
+def plan(root, discard, citations):
+    root = root.resolve()
+    kept, deleting, reasons = [], [], {}
+    # A cited directory protects its descendants; basename citations err on the side of retention.
+    refs = ' '.join(path.read_text() for path in citations)
+    for path in sorted(root.rglob('*')):
+        if not path.is_file() and not path.is_symlink(): continue
+        relative = path.relative_to(root).as_posix()
+        parts = relative.split('/')
+        retained = any(any(token in part.lower() for token in KEEP) for part in parts)
+        cited = any(part in refs for part in parts) or str(path) in refs
+        baseline = '/evidence/perf/bin/' in str(path)
+        requested = relative in discard
+        category = discard.get(relative)
+        safe = not path.is_symlink() and path.resolve().is_relative_to(root)
+        if requested and category in DISCARD and safe and not (retained or cited or baseline):
+            deleting.append({'path':relative,'sha256':sha(path),'category':category})
+        else:
+            kept.append(relative)
+            if requested: reasons[relative] = 'retention/citation/baseline/unknown-category/symlink protection'
+    size = sum(path.stat().st_size for path in root.rglob('*') if path.is_file() and not path.is_symlink())
+    return {'root':str(root),'kept':kept,'delete':deleting,'protected_requests':reasons,'bytes':size,
+        'over_1_GB':size>1_000_000_000,'citation_sha256':{str(path.resolve()):sha(path) for path in citations}}
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('root',type=pathlib.Path)
+    p.add_argument('--discard',required=True,type=pathlib.Path,help='JSON mapping relative file to discard category')
+    p.add_argument('--gate-cites',required=True,type=pathlib.Path)
+    p.add_argument('--close-cites',required=True,type=pathlib.Path)
+    p.add_argument('--keep',required=True,type=pathlib.Path,help='manifest of captures read and every other retained artifact/citation')
+    p.add_argument('--status-commit',required=True)
+    p.add_argument('--apply',help='SHA-256 of the prior dry-run JSON, explicitly authorized by the lead')
+    args = p.parse_args()
+    head = subprocess.check_output(['git','rev-parse',args.status_commit+'^{commit}'],text=True).strip()
+    subprocess.run(['git','merge-base','--is-ancestor',head,'HEAD'],check=True)
+    message = subprocess.check_output(['git','show','-s','--format=%B',head],text=True)
+    assert all(word in message.lower() for word in ['tier','guard','smoke','review']), 'status commit must record the part close'
+    row = plan(args.root,json.loads(args.discard.read_text()),[args.gate_cites,args.close_cites,args.keep])
+    row['status_commit'] = head
+    serialized = json.dumps(row,sort_keys=True,indent=2)+'\n'
+    digest = hashlib.sha256(serialized.encode()).hexdigest()
+    print(serialized,end='')
+    print('dry-run sha256='+digest)
+    if args.apply:
+        assert args.apply==digest, 'prune inputs changed since dry run'
+        for item in row['delete']:
+            path = args.root/item['path']
+            assert sha(path)==item['sha256'], 'prune input changed'
+            path.unlink()
+
+if __name__=='__main__': main()
