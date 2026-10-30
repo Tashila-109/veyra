@@ -95,6 +95,7 @@ Paths in this block are relative to `.agents/skills/verify-veyra/`; run them fro
 They call the real `prepare()` through selection/admission/environment setup, exercise the actual guard-then-smoke dispatch and failed-guard refusal, collect independent failures through Cleanup, classify test hunks and verify repaint/file freshness and plain-message assertions.
 Native/process/window/capture boundaries are stubbed in those tests.
 The HID/lock checks execute Launch’s real heredoc and `start()`, and capture checks execute the actual batch and driver paths.
+The raw-I/O cases also run the native frame adapter’s launch, normal/reduced motion scene, per-read identity checks and the real glass/backdrop entries.
 The test fixture supplies OS results and tiny on-disk trust inputs; guard functions and scheduling decisions are unchanged.
 These tests prove the harness offline; they leave the native smoke and compositor behavior for an armed window on the committed head.
 
@@ -571,7 +572,12 @@ It does not signal an unrecorded group.
 - `bin/orchestration.py` owns the masked child-process helper used by run, frame_guard and mutants, plus code identity and admission.
 - `bin/self_tests.py` drives admission, probe, set and batch entry points with OS fixtures during `--check-only`.
 - `bin/run --check-guards [--evidence DIR]` plants each registered guard fault in a temporary skill copy, requires a check-only failure naming that guard, restores exact bytes and requires check-only to pass.
+  It compares names with `bin/guard-plants.json`; every stop case needs a plant and the manifest names the positive cases.
+  Four workers use an independent copy per plant to run the full check-only entry, restore exact bytes and run it again; all use one immutable input snapshot.
   It saves each diff, red and green transcripts and their hashes in `matrix.json`; its default receipt stays under `/tmp/veyra-mverify-matrix-*/receipt/`.
+- `bin/negative_tests.py` restores the prior negative contracts through production entries; `bin/raw_test_io.py` supplies process, IPC, filesystem and WindowServer/libproc I/O fixtures.
+- `bin/glass_measure.py` holds the Settings pair entry and its unchanged placement/capture guards.
+- `bin/heredocs.py` supplies the shared recipe parser; `bin/backdrop_actions.py` owns notification backdrop activation.
 - `bin/frame_probe.py` owns probe admission and scene selection; `bin/frame_scene.py` owns shared dump sampling and `bin/frame_native.py` implements native window/process operations.
 - `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
 - `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.

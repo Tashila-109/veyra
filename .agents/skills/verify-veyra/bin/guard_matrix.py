@@ -4,9 +4,10 @@ Only temporary skill copies change. Each case runs the complete public check-onl
 planted red, then byte-for-byte restored green. No test case, receipt or guard is patched in the
 running checkout. AST selectors fail closed if a call site is removed, duplicated or renamed.
 """
-import ast, difflib, hashlib, os, pathlib, shutil, subprocess, sys, tempfile
+import ast, difflib, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile
 from dataclasses import dataclass
 import orchestration as o
+from heredocs import HEREDOC
 
 @dataclass(frozen=True)
 class Plant:
@@ -60,7 +61,72 @@ PLANTS = [
     Plant('owned-window-unmanaged','start-window','bin/driver.py','owned_window_record','expression','require_unmanaged(row)','row'),
     Plant('launch-hid-call','launch-hid','SKILL.md','Launch','remove-call','gate'),
     Plant('old-image-file','capture-old-image','bin/freshness.py','record','remove-assert',"metadata.st_size > 0 and metadata.st_mtime_ns >= started_ns"),
-    Plant('child-spawn-signal-mask','child-signals','bin/orchestration.py','start_owned','expression','signal.SIG_BLOCK,SIGNALS','signal.SIG_BLOCK,[]'),
+    Plant('child-spawn-signal-mask','child-signals','bin/orchestration.py','start_owned','expression','signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)','signal.pthread_sigmask(signal.SIG_BLOCK,[])'),
+]
+
+PLANTS += [
+    Plant('backdrop-kill-ownership','backdrop-kill','bin/driver.py','stop_owned_backdrop','remove-call','verify_owned_backdrop'),
+    Plant('child-own-session','child-signals','bin/orchestration.py','start_owned','keyword','Popen:start_new_session','False'),
+    Plant('probe-child-term','probe-term','bin/orchestration.py','owned_child','remove-call','send_signal'),
+    Plant('terminal-identity','end-identity','bin/run','verdict','if-test',"not record.get('identity_unchanged')",'False'),
+    Plant('discard-failure','discard-stop','bin/freshness.py','retry_capture.remove','remove-raise',''),
+    Plant('yabai-unowned-label','yabai-labels','bin/driver.py','cleanup_window_rules','if-test',"not re.fullmatch('veyra-verify-'+run+r'-[0-9a-f]{32}',label)",'False'),
+    Plant('mutant-source-restore','mutant-restore','bin/mutants.py','installed','expression','target.write_bytes(original)','None'),
+    Plant('mutant-binary-restore','mutant-restore','bin/mutants.py','installed','expression',"shutil.copy2(saved/name,o.REPO/'target'/name)",'None'),
+    Plant('cpu-five-upper','cpu-rules','bin/frame_guard.py','judge','expression','4 if len(ratios)==5 else 8','5 if len(ratios)==5 else 8'),
+    Plant('cpu-five-lower','cpu-rules','bin/frame_guard.py','judge','expression','4 if len(ratios)==5 else 8','3 if len(ratios)==5 else 8'),
+    Plant('cpu-ten-upper','cpu-rules','bin/frame_guard.py','judge','expression','4 if len(ratios)==5 else 8','4 if len(ratios)==5 else 9'),
+    Plant('cpu-ten-lower','cpu-rules','bin/frame_guard.py','judge','expression','4 if len(ratios)==5 else 8','4 if len(ratios)==5 else 7'),
+    Plant('cpu-median-threshold','cpu-rules','bin/frame_guard.py','judge','expression','1.10','1.11'),
+    Plant('cpu-extend','cpu-rules','bin/frame_guard.py','judge','expression',"'extend'","'pass'"),
+    Plant('stale-repaint','stale-repaint','bin/freshness.py','record','remove-assert',"repaint > previous['repaints']"),
+    Plant('cadence-budget','cadence','bin/frame_guard.py','run_guard.one','remove-assert',"row['batches_per_second']>=30 and row['largest_gap_ms']<=100"),
+    Plant('cadence-rate','cadence','bin/frame_guard.py','run_guard.one','expression',"row['batches_per_second']>=30",'True'),
+    Plant('cadence-gap','cadence','bin/frame_guard.py','run_guard.one','expression',"row['largest_gap_ms']<=100",'True'),
+    Plant('normal-motion','native-motion','bin/frame_native.py','working','expression',"motion=='reduced'",'True'),
+    Plant('frame-recording-off','native-recording','bin/frame_native.py','start','keyword','start:recording','True'),
+    Plant('native-read-pid','native-reads','bin/frame_native.py','read','remove-assert',"state['pid']==self.pid"),
+    Plant('native-read-group','native-reads','bin/frame_native.py','read','remove-assert',"os.getpgid(self.pid)==self.pid==int((self.proof/'pgid').read_text())"),
+    Plant('native-read-lock','native-reads','bin/frame_native.py','read','remove-assert',"(self.data/'veyra.lock').read_text().strip()==str(self.pid)"),
+    Plant('native-read-revision','native-reads','bin/frame_native.py','read','remove-assert',"state['build_rev']==self.result['expected_rev']"),
+    Plant('native-read-data','native-reads','bin/frame_native.py','read','remove-assert',"state['data_dir']==str(self.data)"),
+]
+
+PLANTS += [
+    Plant('measured-pair-rectangle','measured-pair','bin/driver.py','measured_pair','expression','take(label,rectangle)','(rectangle,take(label,rectangle)[1])'),
+    Plant('measured-pair-retake','measured-pair','bin/driver.py','measured_pair','if-test','placed','False'),
+    Plant('guard-stops-smoke','guard-stops-smoke','bin/frame_guard.py','judge','if-test','statistics.median(ratios)>1.10','False'),
+    Plant('tier-output-hash','tier-complete','bin/orchestration.py','require_tier','remove-assert',"sha(output) == row['sha256']"),
+    Plant('interrupted-verdict','interrupt-verdict','bin/run','verdict','if-test',"record['interrupted']",'False'),
+    Plant('proof-verdict','proof-verdict','bin/run','verdict','if-test',"not all(record.get('evidence',{'run':False}).values())",'False'),
+    Plant('collect-all-verdict','collect-all','bin/run','verdict','if-test',"any(row['kind']=='failed' for row in rows)",'False'),
+    Plant('yabai-rule-add','yabai-errors','bin/driver.py','add_window_rule','remove-assert',"result.returncode==0"),
+    Plant('yabai-rule-remove','yabai-removal','bin/driver.py','cleanup_window_rules','if-test','result.returncode and not missing','False'),
+    Plant('fresh-mutant-awaiting','mutant-fresh-read','bin/mutants.py','run_mutants','if-test',"judge=='read'",'False'),
+    Plant('duplicate-mutant-read','mutant-read-guards','bin/mutants.py','record_mutant_read','remove-assert',"row['state']=='awaiting lead read'"),
+    Plant('go-identity','go-variants','bin/orchestration.py','require_go','expression',"go.get('identity') == expected",'True'),
+    Plant('go-issued','go-variants','bin/orchestration.py','require_go','expression',"go['issued_epoch'] <= time.time() < go['cutoff_epoch']", "time.time() < go['cutoff_epoch']"),
+    Plant('go-cutoff','go-variants','bin/orchestration.py','require_go','expression',"go['issued_epoch'] <= time.time() < go['cutoff_epoch']", "go['issued_epoch'] <= time.time()"),
+    Plant('go-deadline','go-variants','bin/orchestration.py','require_go','remove-assert',"deadline <= go['cutoff_epoch']"),
+    Plant('go-pause','go-variants','bin/orchestration.py','require_go','expression',"go.get('arch_plan_paused') is True",'True'),
+    Plant('cover-mid-measurement','cover-extra','bin/frame_guard.py','measure_set','expression',"error.row.get('measurement_started') is False",'True'),
+    Plant('idle-palette-closed','idle-variants','bin/frame_scene.py','idle_variant','remove-assert',"palette['open'] is False"),
+    Plant('idle-resting-toast','idle-variants','bin/frame_scene.py','idle_variant','remove-assert',"toasts and all(isinstance(toast,dict) and toast.get('kind') and toast.get('text') for toast in toasts)"),
+    Plant('backdrop-activation-checks','backdrop-kill','bin/driver.py','verify_owned_backdrop','body','','return pathlib.Path(executable).resolve()'),
+    Plant('backdrop-before-reopen','backdrop-activation','bin/driver.py','reopen_owned_backdrop','call-nth','verify_owned_backdrop#1','pass'),
+    Plant('backdrop-after-reopen','backdrop-activation','bin/driver.py','reopen_owned_backdrop','call-nth','verify_owned_backdrop#2','pass'),
+    Plant('backdrop-sigterm','backdrop-signals','bin/driver.py','stop_owned_backdrop','expression','(signal.SIGTERM,signal.SIGKILL)','(signal.SIGKILL,)'),
+    Plant('backdrop-sigkill','backdrop-signals','bin/driver.py','stop_owned_backdrop','expression','(signal.SIGTERM,signal.SIGKILL)','(signal.SIGTERM,)'),
+    Plant('backdrop-escalation-ownership','backdrop-escalation','bin/driver.py','stop_owned_backdrop','call-statement','verify_owned_backdrop','if sig==signal.SIGTERM: verify_owned_backdrop(pid,executable)'),
+    Plant('backdrop-dead-refusal','backdrop-dead','bin/driver.py','stop_owned_backdrop','first-if','_backdrop_executable(pid) is None','False'),
+    Plant('probe-admission-cause','probe-admission','bin/frame_guard.py','run_guard.one','if-test','not path.is_file()','False'),
+    Plant('fixture-skip','fixture-skipped','bin/pages.py','self_test','expression',"'SKIPPED select-pages real commit fixture fd4adea..04ac4f3: commit unavailable'", "'PASS select-pages real commit fixture fd4adea..04ac4f3: commit unavailable'"),
+    Plant('prepare-glass-selection','prepare-selection','bin/run','prepare','after-assignment','glass','glass=False'),
+    Plant('prepare-quiet','prepare-quiet','bin/run','prepare','remove-assert','not args.real_quiet or args.gate'),
+    Plant('plant-list-shrink','plant-registry','bin/guard_matrix.py','','list-remove',"'awaiting-read-batch'"),
+    Plant('plant-list-rename','plant-registry','bin/guard_matrix.py','','expression',"'awaiting-read-batch'","'awaiting-read-batch-renamed'"),
+    Plant('capture-discard-all','capture-old-image','bin/freshness.py','retry_capture','handler-call','Exception:remove','pass'),
+    Plant('privacy-no-retry','backdrop-missing','bin/freshness.py','retry_capture','handler-raise','SafetyStop','continue'),
 ]
 
 def expression(source):
@@ -79,7 +145,7 @@ def function(tree, name):
 
 def apply(source, plant):
     tree=ast.parse(source)
-    target=tree if plant.file=='SKILL.md' else function(tree,plant.function)
+    target=tree if plant.file=='SKILL.md' or not plant.function else function(tree,plant.function)
     edits=[]
     lines=source.splitlines(keepends=True)
     offsets=[0]
@@ -93,24 +159,40 @@ def apply(source, plant):
         edits.append((offsets[first.lineno-1]+first.col_offset,
             offsets[last.end_lineno-1]+last.end_col_offset,plant.replacement))
     elif plant.operation=='after-assignment':
-        found=[n for n in target.body if isinstance(n,ast.Assign)
+        found=[n for n in ast.walk(target) if isinstance(n,ast.Assign)
             and any(isinstance(t,ast.Name) and t.id==plant.selector for t in n.targets)]
         assert len(found)==1
         node=found[0];edit(node,ast.get_source_segment(source,node)+'\n'+' '*node.col_offset+plant.replacement)
-    elif plant.name=='child-spawn-signal-mask':
-        calls=[n for n in nodes if isinstance(n,ast.Call) and getattr(n.func,'attr',None)=='pthread_sigmask'
-            and len(n.args)==2 and same(n.args[0],'signal.SIG_BLOCK') and same(n.args[1],'SIGNALS')]
-        assert len(calls)==1;edit(calls[0].args[1],'[]')
+    elif plant.operation=='call-nth':
+        name,index=plant.selector.split('#')
+        calls=sorted([n for n in ast.walk(target) if isinstance(n,ast.Expr) and isinstance(n.value,ast.Call)
+            and (getattr(n.value.func,'id',None) or getattr(n.value.func,'attr',None))==name],key=lambda n:n.lineno)
+        edit(calls[int(index)-1],plant.replacement)
+    elif plant.operation=='first-if':
+        found=sorted([n for n in ast.walk(target) if isinstance(n,ast.If) and same(n.test,plant.selector)],key=lambda n:n.lineno)
+        assert found;edit(found[0].test,plant.replacement)
+
     else:
         for node in nodes:
-            if plant.operation=='expression' and isinstance(node,ast.expr) and same(node,plant.selector):
+            if plant.operation=='list-remove' and isinstance(node,ast.Call) and getattr(node.func,'id',None)=='Plant' and node.args and same(node.args[0],plant.selector):
+                assert lines[node.end_lineno-1][node.end_col_offset:].strip()==','
+                edits.append((offsets[node.lineno-1],offsets[node.end_lineno],''))
+            elif plant.operation=='expression' and isinstance(node,ast.expr) and same(node,plant.selector):
                 edit(node,plant.replacement)
-            elif plant.operation in ['remove-call','remove-calls'] and isinstance(node,ast.Expr) and isinstance(node.value,ast.Call):
+            elif plant.operation in ['remove-call','remove-calls','call-statement'] and isinstance(node,ast.Expr) and isinstance(node.value,ast.Call):
                 call=node.value.func;name=getattr(call,'id',None) or getattr(call,'attr',None)
-                if name in plant.selector.split(','): edit(node,'pass')
+                if name in plant.selector.split(','): edit(node,plant.replacement or 'pass')
             elif plant.operation=='if-test' and isinstance(node,ast.If) and same(node.test,plant.selector): edit(node.test,plant.replacement)
             elif plant.operation=='remove-if' and isinstance(node,ast.If) and same(node.test,plant.selector): edit(node,'pass')
             elif plant.operation=='remove-assert' and isinstance(node,ast.Assert) and same(node.test,plant.selector): edit(node,'pass')
+            elif plant.operation in ['handler-call','handler-raise'] and isinstance(node,ast.ExceptHandler) and getattr(node.type,'id',None)==plant.selector.split(':')[0]:
+                for statement in node.body:
+                    if plant.operation=='handler-raise' and isinstance(statement,ast.Raise): edit(statement,plant.replacement)
+                    if plant.operation=='handler-call' and isinstance(statement,ast.Expr) and isinstance(statement.value,ast.Call) and getattr(statement.value.func,'id',None)==plant.selector.split(':')[1]: edit(statement,plant.replacement)
+            elif plant.operation=='remove-raise' and isinstance(node,ast.Raise): edit(node,'pass')
+            elif plant.operation=='keyword' and isinstance(node,ast.Call) and getattr(node.func,'attr',None)==plant.selector.split(':')[0]:
+                for key in node.keywords:
+                    if key.arg==plant.selector.split(':')[1]: edit(key.value,plant.replacement)
             elif plant.operation=='part-default' and isinstance(node,ast.Call) and getattr(node.func,'attr',None)=='add_argument' \
                 and node.args and isinstance(node.args[0],ast.Constant) and node.args[0].value=='--part':
                 node.keywords=[k for k in node.keywords if k.arg not in ['required','default']]
@@ -127,51 +209,74 @@ def plant_copy(skill, plant):
         heading=re.search(r'^## '+plant.function+r'\n',source,re.M);assert heading
         end=source.find('\n## ',heading.end());end=len(source) if end<0 else end
         section=source[heading.end():end]
-        heredoc=re.search(r"<<'PY'\n(.*?)\nPY(?:\n|$)",section,re.S);assert heredoc
-        body=apply(heredoc[1],plant)
-        start=heading.end()+heredoc.start(1);stop=heading.end()+heredoc.end(1)
+        heredoc=next((h for h in HEREDOC.finditer(section) if h['end']=='PY'),None);assert heredoc
+        body=apply(heredoc['body'],plant)
+        start=heading.end()+heredoc.start('body');stop=heading.end()+heredoc.end('body')
         after=source[:start]+body.rstrip('\n')+source[stop:]
     else: after=apply(source,plant)
     path.write_text(after)
     return path,before,after.encode()
 
 def run_matrix(evidence=None):
-    """The receipt is independent of stdout; failures preserve the matrix and both command transcripts."""
+    """Each independent copy runs complete check-only red, then an exact restore and complete green."""
+    from concurrent.futures import ThreadPoolExecutor
+    check_registry()
     scratch=pathlib.Path(tempfile.mkdtemp(prefix='veyra-mverify-matrix-',dir='/tmp'))
     folder=pathlib.Path(evidence).absolute() if evidence else scratch/'receipt'
     folder.mkdir(parents=True,exist_ok=False)
     result={'schema':1,'passed':False,'native_runs':0,'git_writes':0,'cases':[],
+        'manifest_sha256':o.sha(o.BIN/'guard-plants.json'),
         'source_sha256':{str(p.relative_to(o.BIN.parent)):o.sha(p) for p in sorted(o.BIN.parent.rglob('*'))
             if p.is_file() and '__pycache__' not in p.parts}}
+    snapshot=scratch/'inputs'
+    shutil.copytree(o.BIN.parent,snapshot,ignore=shutil.ignore_patterns('__pycache__'))
+    assert {str(p.relative_to(snapshot)):o.sha(p) for p in snapshot.rglob('*') if p.is_file()}==result['source_sha256'], 'matrix inputs changed while copying'
     env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1',GIT_OPTIONAL_LOCKS='0')
-    try:
-        skill=scratch/'.agents/skills/verify-veyra'
-        shutil.copytree(o.BIN.parent,skill,ignore=shutil.ignore_patterns('__pycache__'))
-        for plant in PLANTS:
-            case=folder/plant.name;case.mkdir()
+    def check(plant):
+        case=folder/plant.name;case.mkdir()
+        copy=scratch/plant.name
+        skill=copy/'.agents/skills/verify-veyra'
+        shutil.copytree(snapshot,skill)
+        try:
             path,before,after=plant_copy(skill,plant)
             (case/'plant.diff').write_text(''.join(difflib.unified_diff(before.decode().splitlines(True),after.decode().splitlines(True),fromfile=plant.file,tofile=plant.file)))
             command=[sys.executable,str(skill/'bin/run'),'--check-only']
-            try:
-                red=subprocess.run(command,cwd=scratch,env=env,capture_output=True,text=True,timeout=45)
+            try: red=subprocess.run(command,cwd=copy,env=env,capture_output=True,text=True,timeout=90)
             finally: path.write_bytes(before)
             (case/'red.txt').write_text(red.stdout+red.stderr)
-            green=subprocess.run(command,cwd=scratch,env=env,capture_output=True,text=True,timeout=45)
+            green=subprocess.run(command,cwd=copy,env=env,capture_output=True,text=True,timeout=90)
             (case/'green.txt').write_text(green.stdout+green.stderr)
             named='AssertionError: GUARD['+plant.guard+']:' in red.stdout+red.stderr
-            row={'plant':plant.name,'guard':plant.guard,'file':plant.file,'function':plant.function,
+            return {'plant':plant.name,'guard':plant.guard,'file':plant.file,'function':plant.function,
                 'red_exit':red.returncode,'red_named_guard':named,'green_exit':green.returncode,
                 'before_sha256':hashlib.sha256(before).hexdigest(),'planted_sha256':hashlib.sha256(after).hexdigest(),
                 'restored_sha256':o.sha(path),'red_sha256':o.sha(case/'red.txt'),'green_sha256':o.sha(case/'green.txt')}
-            result['cases'].append(row);o.write(folder/'matrix.json',result)
-            assert red.returncode!=0 and named, plant.name+' survived or failed without naming '+plant.guard
-            assert green.returncode==0 and path.read_bytes()==before, plant.name+' did not restore green'
-            print('PASS '+plant.name+' GUARD['+plant.guard+'] red='+str(red.returncode)+' green=0',flush=True)
+        finally: shutil.rmtree(copy,ignore_errors=True)
+    try:
+        # Copies, mutations and receipts are disjoint. Each worker's child has its own OS fixtures.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for row in pool.map(check,PLANTS):
+                result['cases'].append(row);o.write(folder/'matrix.json',result)
+                passed=row['red_exit']!=0 and row['red_named_guard'] and row['green_exit']==0 and row['restored_sha256']==row['before_sha256']
+                print(('PASS ' if passed else 'FAIL ')+row['plant']+' GUARD['+row['guard']+'] red='+str(row['red_exit'])+' green=0',flush=True)
+        bad=[r['plant'] for r in result['cases'] if not(r['red_exit']!=0 and r['red_named_guard'] and r['green_exit']==0 and r['restored_sha256']==r['before_sha256'])]
+        assert not bad, 'matrix failed plants: '+', '.join(bad)
+        assert {str(p.relative_to(o.BIN.parent)):o.sha(p) for p in o.BIN.parent.rglob('*') if p.is_file() and '__pycache__' not in p.parts}==result['source_sha256'], 'matrix source changed during checks'
         result.update(passed=True,plants_red=len(PLANTS),restores_green=len(PLANTS))
     finally:
         o.write(folder/'matrix.json',result)
         print('matrix receipt: '+str(folder/'matrix.json'),flush=True)
-        # The default receipt remains available; copied executable inputs are always discarded.
-        shutil.rmtree(scratch/'.agents',ignore_errors=True)
-        if evidence: shutil.rmtree(scratch)
+        shutil.rmtree(snapshot,ignore_errors=True)
+        if evidence: shutil.rmtree(scratch,ignore_errors=True)
     return 0
+
+
+def check_registry():
+    expected=json.loads((o.BIN/'guard-plants.json').read_text())
+    names=[p.name for p in PLANTS]
+    assert names==expected['plants'] and len(names)==len(set(names)), 'GUARD[plant-registry]: plant names differ from committed manifest'
+    from self_tests import CASES
+    covered={p.guard for p in PLANTS}
+    positives=set(expected['positive_cases'])
+    cases={name for name,case in CASES}
+    assert covered <= cases and positives <= cases and cases <= covered|positives, 'GUARD[plant-registry]: stop case lacks a plant or explicit positive classification'

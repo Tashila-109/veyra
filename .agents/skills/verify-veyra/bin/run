@@ -39,7 +39,7 @@ def take_pending():
 
 start_owned = orchestration.start_owned
 
-HEREDOC = re.compile(r"<<'(?P<end>PY[A-Z_]*)'\n(?P<body>.*?)\n(?P=end)(?:\n|$)",re.S)
+from heredocs import HEREDOC
 
 def page_names():
     """The feature map's page links in order, then any other features/*.md by name, so no page is left out."""

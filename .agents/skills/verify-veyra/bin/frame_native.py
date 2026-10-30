@@ -22,7 +22,8 @@ class NativeWindow:
         os.environ.pop('VEYRA_VERIFY_RULE_INDEX',None)
         self.scratch=pathlib.Path(tempfile.mkdtemp(prefix='veyra-frame-work-',dir='/tmp'))
         self.run=secrets.token_hex(4)
-        self.data=pathlib.Path('/tmp/veyra-frame-'+self.run);self.data.mkdir();self.data_created=True
+        self.prefix=os.environ.get('VEYRA_FRAME_TMP','/tmp/veyra-frame-')
+        self.data=pathlib.Path(self.prefix+self.run);self.data.mkdir();self.data_created=True
         self.workspace=self.scratch/'workspace'
         (self.workspace/'target/debug').mkdir(parents=True)
         for name in ['crates','.agents']: (self.workspace/name).symlink_to(o.REPO/name)
@@ -41,7 +42,7 @@ class NativeWindow:
             shutil.copyfile(o.REPO/'crates/engine/tests/fixtures'/provider/source,self.proof/'fixtures'/file)
         for name in ['project','appcwd']: (self.data/name).mkdir()
         shell=self.data/'login-shell';shell.write_text('#!/bin/sh\nexec /bin/sh "$@"\n');shell.chmod(0o700)
-        os.environ.update(RUN=self.run,VEYRA_VERIFY_TMP='/tmp/veyra-frame-')
+        os.environ.update(RUN=self.run,VEYRA_VERIFY_TMP=self.prefix)
         os.chdir(self.workspace)
         self.d=importlib.import_module('driver')
         self.d.ENV['SHELL']=str(shell);self.d.ENV.pop('VEYRA_RECORD',None)
@@ -79,9 +80,11 @@ class NativeWindow:
         if self.d.locked():
             self.d.observe_failure(name,'capture');raise AssertionError('screen is locked')
         state=self.d.ctl(name,'dump',log=False)
-        assert os.getpgid(self.pid)==self.pid==int((self.proof/'pgid').read_text())
-        assert (self.data/'veyra.lock').read_text().strip()==str(self.pid)
-        assert state['pid']==self.pid and state['data_dir']==str(self.data) and state['build_rev']==self.result['expected_rev']
+        assert os.getpgid(self.pid)==self.pid==int((self.proof/'pgid').read_text()), 'native read group identity changed'
+        assert (self.data/'veyra.lock').read_text().strip()==str(self.pid), 'native read lock identity changed'
+        assert state['pid']==self.pid, 'native read pid identity changed'
+        assert state['data_dir']==str(self.data), 'native read data identity changed'
+        assert state['build_rev']==self.result['expected_rev'], 'native read build_rev identity changed'
         if not state['window_active']:
             ownership=self.frontmost('inactive')
             if not ownership['frontmost_is_owned']: self.result['foreign_activation']={'step':name,**ownership}
@@ -268,7 +271,7 @@ class NativeWindow:
             shutil.rmtree(self.scratch);os.chdir(self.original_cwd);return empty
         loader=importlib.machinery.SourceFileLoader('frame_cleanup',str(o.BIN/'run'))
         spec=importlib.util.spec_from_loader(loader.name,loader);runner=importlib.util.module_from_spec(spec);loader.exec_module(runner)
-        env=dict(os.environ,PYTHONPATH=str(o.BIN),RUN=self.run,VEYRA_VERIFY_TMP='/tmp/veyra-frame-')
+        env=dict(os.environ,PYTHONPATH=str(o.BIN),RUN=self.run,VEYRA_VERIFY_TMP=self.prefix)
         code=0
         recording=not (self.proof/'rec-current').exists() and not list(self.proof.rglob('rec')) and not list(self.data.rglob('rec'))
         o.write(self.proof/'recording-absent.json',{'recording_directories':[str(path) for root in [self.proof,self.data] for path in root.rglob('rec')],

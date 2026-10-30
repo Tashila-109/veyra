@@ -120,6 +120,9 @@ def run_guard(args, expected):
                 quiet_machine.record_launch(root/(label+'-quiet.json'),quiet,child.pid)
                 code = child.wait(timeout=max(.01,args.deadline-time.time()))
         path = root/phase/label/'result.json'
+        if not path.is_file():
+            tail='\n'.join((root/(label+'.log')).read_text().splitlines()[-30:])
+            raise o.SafetyStop(f'probe {label} admission/worker failed (exit {code}):\n{tail}')
         row = json.loads(path.read_text())
         receipt['attempts'].append({'side':side,'label':label,'scene':scene,'receipt':str(path),'exit':code})
         assert row['cleanup_exit']==0 and row['scratch_removed'] and row['data_removed'], 'guard cleanup failure'

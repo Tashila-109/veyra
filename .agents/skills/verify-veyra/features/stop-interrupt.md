@@ -141,19 +141,8 @@ while not backdrop_output.exists() or 'backdrop ready ' not in backdrop_output.r
     assert time.monotonic()<end, 'owned backdrop was not ready'
     time.sleep(.05)
 def activate_owned_backdrop(label):
-    verify_owned_backdrop(backdrop_pid,backdrop_executable)
-    reopen_owned_backdrop(backdrop_pid,backdrop_executable,
-        lambda: backdrop_command(label+'-open',['open',str(backdrop_bundle)]))
-    source = ('import AppKit\n'
-        f'let pid: Int32 = {backdrop_pid}\n'
-        'let end = Date().addingTimeInterval(5)\n'
-        'while NSWorkspace.shared.frontmostApplication?.processIdentifier != pid && Date() < end { '
-        'RunLoop.current.run(until: Date().addingTimeInterval(0.05)) }\n'
-        'guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { exit(2) }\n'
-        'print(pid)\n')
-    result = backdrop_command(label,['swift','-e',source])
-    assert int(result.stdout.strip())==backdrop_pid
-    save(label,{'frontmost_pid':backdrop_pid,'owned_backdrop_pid':backdrop_pid})
+    from backdrop_actions import activate
+    activate(label,backdrop_pid,backdrop_executable,backdrop_bundle)
 thread = create('notifications-approval','A background approval',scenario='approval-deny')
 poll('notifications-approval-open',lambda d: d['composer']['dock'] is not None)
 action('notifications-approval-deny','Deny')

@@ -14,7 +14,7 @@ REAL_TIME=time.time
 
 def require_rejection(call, contains=''):
     try: call()
-    except (AssertionError,o.SafetyStop,FileNotFoundError,SystemExit) as error:
+    except (AssertionError,RuntimeError,FileNotFoundError,SystemExit) as error:
         assert contains in str(error), (contains,str(error))
         return
     raise AssertionError('fault accepted: '+contains)
@@ -47,8 +47,8 @@ class WindowIO:
         if self.f.cover and self.f.cover(self.args,name): raise AssertionError('owned window is covered')
     def stream(self):
         self.front('stream')
-        return {'core_fraction':self.f.cpu_ratio if self.args.side=='candidate' else 1.,
-            'batches_per_second':60.,'largest_gap_ms':20,'repaints':10}
+        return {'core_fraction':(self.f.cpu_ratios[(int(self.args.label[-2:])-1)%len(self.f.cpu_ratios)] if self.f.cpu_ratios else self.f.cpu_ratio) if self.args.side=='candidate' else 1.,
+            'batches_per_second':self.f.rate,'largest_gap_ms':self.f.gap,'repaints':10}
     def working(self,motion): self.front('working');return {'repaints_per_second':6.,'repaints':60,'seconds':10.}
     def finish(self,result): return {}
     def close(self,output):
@@ -59,9 +59,10 @@ class Fixture:
     """A disposable filesystem and OS command boundary. Runtime code is never patched by function."""
     def __init__(self,root,runner):
         self.root=root.absolute();self.runner=runner;self.clock=Clock();self.stack=contextlib.ExitStack()
-        self.calls=[];self.probes=[];self.window_starts=0;self.modern=False;self.transient_toast=False
-        self.cover=None;self.cpu_ratio=1.;self.after_probe=None;self.before_probe=None;self.capture_failures=0
-        self.failures_used=0;self.idle=200;self.lock=False;self.running=False;self.pid=99999999
+        self.end_change=False;self.leave_scratch=False;self.interrupt_target=False;self.extra_scripts={};
+        self.calls=[];self.probes=[];self.child_events=[];self.wait_masks=[];self.capture_guard_reads=0;self.interrupt_probe=False;self.window_starts=0;self.modern=False;self.transient_toast=False
+        self.cover=None;self.cpu_ratio=1.;self.cpu_ratios=[];self.rate=60.;self.gap=20;self.after_probe=None;self.before_probe=None;self.capture_failures=0
+        self.failures_used=0;self.idle=200;self.lock=False;self.busy_until=-1;self.running=False;self.pid=99999999
         self.batch_script={};self.app_launches=0;self.mode='full_access';self.background='solid';self.stale_image=False;self.cleanup_failure=False;self.yabai=False;self.window_flags={};self.frame={'x':20,'y':40,'w':1280,'h':800};self.run='0123abcd'
     def __enter__(self):
         self.cwd=pathlib.Path.cwd();self.module=sys.modules.get('driver')
@@ -158,15 +159,24 @@ class Fixture:
         return result.stdout
     def command(self,argv,**options):
         argv=[str(part) for part in argv];name=pathlib.Path(argv[0]).name;out='';code=0
-        if name=='git':
+        if name.startswith('python') and len(argv)>1 and argv[1].endswith('driver.py'):
+            import runpy
+            self.calls.append(argv)
+            try:
+                with patch.object(sys,'argv',argv[1:]): runpy.run_path(argv[1],run_name='__main__')
+            except SystemExit as error: code=error.code or 0
+            except Exception:
+                code=1;out=traceback.format_exc()
+        elif name=='git':
             if '--git-common-dir' in argv: out=str(self.repo/'git-metadata')+'\n'
+            elif 'cat-file' in argv: code=128
             elif 'rev-parse' in argv: out='1'*40+'\n'
             elif 'ls-files' in argv or 'status' in argv: out=''
             elif 'diff' in argv:
                 if '--binary' in argv:
                     content=(self.repo/'crates/veyra/src/ui/theme.rs').read_text();out='' if content=='original source\n' else content
-                elif '--name-only' in argv: out='.agents/skills/verify-veyra/bin/run\n'
-                else: out='@@ -0,0 +1 @@\n+fixture helper\n'
+                elif '--name-only' in argv: out='\n'.join(getattr(self,'changed_paths',['.agents/skills/verify-veyra/bin/run']))+'\n'
+                else: out=getattr(self,'git_hunk','@@ -0,0 +1 @@\n+fixture helper\n')
             elif 'show' in argv:
                 file=argv[-1].partition(':')[2];path=self.repo/file
                 if path.is_file(): out=path.read_text()
@@ -175,7 +185,7 @@ class Fixture:
         elif name=='ioreg':
             if 'IOHIDSystem' in argv: out='"HIDIdleTime" = '+str(self.idle*1_000_000_000)
             else: out='CGSSessionScreenIsLocked' if self.lock else ''
-        elif name=='pgrep': out=str(self.pid) if self.running else '';code=0 if out else 1
+        elif name=='pgrep': out=str(self.pid) if self.running or self.clock.now<self.busy_until else '';code=0 if out else 1
         elif name=='sysctl': out='{ 0.1 0.1 0.1 }'
         elif name=='defaults': out='Dark'
         elif name=='sqlite3':
@@ -187,7 +197,15 @@ class Fixture:
             if command[0]=='dump': out=json.dumps(self.dump())
             else: out='{"ok":true}'
         elif name=='yabai':
-            if '--add' in argv:
+            if '--remove' in argv:
+                self.calls.append(argv)
+                mode=getattr(self,'rule_remove','ok')
+                if mode!='ok':
+                    code=1;out=''
+                    err=f"rule with label '{argv[-1]}' not found.\n" if mode=='consumed' else 'not found' if mode=='bare' else 'removal refused'
+                    return SimpleNamespace(returncode=code,stdout='',stderr=err)
+            elif '--add' in argv:
+                if getattr(self,'rule_add_failure',False): return SimpleNamespace(returncode=1,stdout='',stderr='add refused')
                 label=next(p[6:] for p in argv if p.startswith('label='))
                 assert label in (self.proof/'owned-yabai-labels').read_text().splitlines()
                 assert '--one-shot' in argv and 'app=^veyra$' in argv and 'manage=off' in argv
@@ -202,6 +220,7 @@ class Fixture:
         elif name=='visible-frame': out=json.dumps({'visible_frame':[2560,23,2560,1385]})
         elif name=='winid': out='24,60,960,740' if '--bounds' in argv else '23'
         elif name=='capture-window':
+            self.capture_guard_reads+=1
             if self.failures_used<self.capture_failures: self.failures_used+=1;code=1
         elif name=='screencapture':
             image=pathlib.Path(argv[-1]);image.write_bytes(b'fresh synthetic image')
@@ -213,32 +232,45 @@ class Fixture:
         return SimpleNamespace(returncode=code,stdout=out,stderr=err)
     def popen(self,argv,**options):
         self.calls.append([str(p) for p in argv]);fixture=self
+        if pathlib.Path(str(argv[0])).name=='run':
+            from negative_tests import MutantChild
+            assert o.SIGNALS <= signal.pthread_sigmask(signal.SIG_BLOCK,[]), 'mutant spawn was not masked'
+            assert options.get('start_new_session') is True, 'mutant child needs its own session'
+            return MutantChild(self,argv)
         if str(argv[0])=='bash' or str(argv[0]).endswith('python3') or (len(argv)>1 and str(argv[1]).endswith('frame_probe.py')):
             assert o.SIGNALS <= signal.pthread_sigmask(signal.SIG_BLOCK,[]), 'child spawn signals were not blocked'
+            assert options.get('start_new_session') is True, 'child spawn needs its own session'
         class Child:
             pid=fixture.pid;returncode=None
             def __init__(self):
                 if str(argv[0])!='bash' and not pathlib.Path(str(argv[0])).name.startswith('python'):
                     self.communicate()
             def poll(self): return self.returncode
-            def send_signal(self,number): self.returncode=0
+            def send_signal(self,number): fixture.child_events.append(('signal',number));self.returncode=0
             def wait(self,timeout=None):
+                fixture.child_events.append(('wait',timeout))
+                fixture.wait_masks.append(signal.pthread_sigmask(signal.SIG_BLOCK,[]))
+                if self.returncode is not None: return self.returncode
+                if fixture.interrupt_probe and len(argv)>1 and str(argv[1]).endswith('frame_probe.py'): raise RuntimeError('fixture interrupted probe wait')
                 if pathlib.Path(str(argv[0])).name.startswith('python') and str(argv[1]).endswith('frame_probe.py'):
                     fixture.probes.append(list(argv[2:]));index=len(fixture.probes)
                     if fixture.before_probe: fixture.before_probe(index)
                     try:
                         with patch.dict(os.environ,options['env']): frame_probe.main(list(argv[2:]),WindowIO(fixture))
                         self.returncode=0
-                    except BaseException: self.returncode=1
+                    except BaseException:
+                        traceback.print_exc(file=options['stdout']);self.returncode=1
                     if fixture.after_probe: fixture.after_probe(index)
                     return self.returncode
                 if self.returncode is None: self.communicate(timeout)
                 return self.returncode
             def communicate(self,timeout=None):
+                if fixture.interrupt_target and str(argv[-1])=='TARGET': raise fixture.runner.Interrupted('SIGTERM')
                 previous=os.environ.copy()
                 try:
                     if 'env' in options: os.environ.update(options['env'])
                     if str(argv[0])=='bash':
+                        fixture.clock.sleep(.001)
                         run=os.environ['RUN'];fixture.driver=fixture.load_driver(run)
                         fixture.running=True
                         for name in ['pid','pgid']: (fixture.proof/name).write_text(str(fixture.pid))
@@ -248,7 +280,9 @@ class Fixture:
                         if key is not None: exec(key,{'__name__':'__fixture_section__'})
                         if body=='CLEANUP' or body==fixture.runner.sections()[('SKILL','Cleanup')]:
                             if fixture.cleanup_failure: self.returncode=1;return '','owned cleanup did not finish'
-                            fixture.running=False;shutil.rmtree(fixture.data)
+                            fixture.running=False
+                            if fixture.end_change: (fixture.repo/'crates/veyra/src/ui/theme.rs').write_text('end-of-run identity changed')
+                            if not fixture.leave_scratch: shutil.rmtree(fixture.data)
                         self.returncode=0;return '',''
                     if 'ctl' not in [str(p) for p in argv]:
                         fixture.app_launches+=1;fixture.running=True
@@ -266,7 +300,7 @@ class Fixture:
         self.args.gate=False;self.args.slice_end=full
         found={('SKILL','Launch'):'LAUNCH',('SKILL','Doctor'):'DOCTOR',('SKILL','Evidence'):'EVIDENCE',
             ('SKILL','Cleanup'):'CLEANUP',('SKILL','Recover section'):'RECOVER',('page','Target'):'TARGET',('page','Later'):'LATER'}
-        self.batch_script={'TARGET':script or 'pass'}
+        self.batch_script={'TARGET':script or 'pass',**self.extra_scripts}
         env=dict(os.environ,VEYRA_VERIFY_TMP=str(self.root)+'/data-')
         handlers={n:signal.getsignal(n) for n in o.SIGNALS};mask=signal.pthread_sigmask(signal.SIG_BLOCK,[])
         try: return self.runner.run_native(found,[('SKILL','Launch'),('page','Target'),('page','Later')],self.args,env,self.expected)
@@ -280,6 +314,7 @@ def probe(f,label='direct',part='6c',scene='idle'):
 
 def guard_tools_and_backdrop(f):
     result=fg.run_guard(f.args,f.expected)
+    assert all((o.BIN/(name+'.swift')).is_file() for name in o.TOOLS), 'helper source missing'
     assert result['passed'] and len(result['pairs'])==5 and len(f.probes)==16
     assert all((pathlib.Path(row['receipt']).parent/'backdrop').read_text()=='helper backdrop' for row in result['attempts'])
 
@@ -305,15 +340,17 @@ def candidate_part_matches_dump(f):
     require_rejection(lambda:probe(f,part='6c'),'requires --part 6d')
 
 def missing_6d_fields_stop_probe(f):
-    require_rejection(lambda:probe(f,part='6d'),'6d idle scene unavailable')
+    require_rejection(lambda:probe(f,part='6d',scene='stream'),'6d idle scene unavailable')
 
 def baseline_pin_stops_set(f):
-    impostor=f.root/'impostor';shutil.copytree(f.baseline,impostor);f.args.baseline=impostor
-    require_rejection(lambda:fg.run_guard(f.args,f.expected),'unapproved slice-5 baseline directory')
+    for index,name in enumerate(['impostor',fg.BASELINE_REVISION]):
+        impostor=f.root/name;shutil.copytree(f.baseline,impostor);f.args.baseline=impostor
+        f.args.evidence=f.root/('impostor-run-'+str(index));f.args.evidence.mkdir()
+        require_rejection(lambda:fg.run_guard(f.args,f.expected),'unapproved slice-5 baseline directory')
     assert not f.probes
 
 def baseline_manifest_is_pinned(f):
-    (f.baseline/'identity.txt').write_text('self-consistent impostor manifest')
+    (f.baseline/'identity.txt').write_text((f.baseline/'identity.txt').read_text()+'\n')
     require_rejection(lambda:fg.run_guard(f.args,f.expected),'unapproved slice-5 baseline manifest')
     assert not f.probes
 
@@ -364,6 +401,7 @@ def probe_go_required(f):
 def start_tier_required(f):
     receipt=json.loads(f.tier.read_text());receipt['passed']=False;o.write(f.tier,receipt)
     require_rejection(lambda:f.driver.start('invalid-tier'),'incomplete Tier S')
+    f.tier.unlink();require_rejection(lambda:f.driver.start('missing-tier'))
     assert f.app_launches==0
 
 def start_go_required(f):
@@ -401,6 +439,11 @@ def launch_hid_gate(f):
     exec(body,{'__name__':'__fixture_launch__'})
     assert f.app_launches==1
     assert json.loads((f.proof/'input-idle-launch.json').read_text())['quiet_seconds']>=10
+    for idle,busy in [(120,20),(9000,0)]:
+        f.running=False;f.idle=idle;f.busy_until=f.clock.now+busy
+        exec(body,{'__name__':'__fixture_launch__'})
+        elapsed=json.loads((f.proof/'input-idle-launch.json').read_text())['gate_seconds']
+        assert (29<=elapsed<31) if busy else (10<=elapsed<11), 'HID quiet return boundary'
 
 def safety_stop_is_fatal(f):
     assert f.batch("import orchestration as o; raise o.SafetyStop('fixture safety stop')")==1
@@ -436,6 +479,7 @@ def missing_backdrop_is_fatal(f):
     assert f.batch("from driver import *; capture('private')")==1
     row=f.outcome()['attempts'][0]
     assert row.get('fatal_stop') and not any(c[-1]=='LATER' for c in f.calls)
+    assert f.capture_guard_reads==1, 'privacy failure was retried'
     assert 'missing owned backdrop' in (f.evidence/'attempt-1/fresh-shell.txt').read_text()
 
 def evidence_checks_independent_default(f):
@@ -448,14 +492,16 @@ def evidence_checks_independent_default(f):
     assert (f.evidence/'attempt-1/run/configured-default-mode').read_text().strip()=='ask_first'
 
 def recorded_mutant(f):
-    folder=f.evidence/'mutants/1';proof=folder/'native/attempt-1/run';proof.mkdir(parents=True)
+    folder=f.evidence/'mutants/archive-1';proof=folder/'native/attempt-1/run';proof.mkdir(parents=True)
     image=proof/'scene.png';image.write_bytes(b'own fresh capture')
     o.write(proof/'scene-freshness.json',{'image':image.name,'sha256':o.sha(image)})
     outcome={'status':'DONE','attempts':[{'run':'deadbeef','cleanup_exit':0,'identity_unchanged':True}]}
     o.write(folder/'native/outcome.json',outcome)
     seal={'run':'deadbeef','capture':str(image.resolve()),'capture_name':'scene','capture_sha256':o.sha(image),
         'freshness_sha256':o.sha(proof/'scene-freshness.json'),'native_outcome_sha256':o.sha(folder/'native/outcome.json')}
-    manifest=f.root/'prepared-mutants.json';o.write(manifest,{'parent_identity':f.expected,'cases':[]})
+    manifest=f.root/'prepared-mutants.json'
+    from negative_tests import prepare_case
+    prepare_case(f,manifest)
     f.args.native_mutants=manifest;f.write_go(mutant_manifest_sha256=o.sha(manifest))
     o.write(f.evidence/'mutants/receipt.json',{'cases':[{'name':'read scene','folder':str(folder),
         'state':'awaiting lead read','killed':False,'survived':False,'read_seal':seal}],
@@ -481,8 +527,11 @@ def mutant_read_bound_to_capture(f):
 
 def decided_mutants_reused(f):
     seal=recorded_mutant(f);assert decide(f,seal)==0
-    assert f.batch(full=True)==0 and f.outcome()['status']=='DONE'
+    assert f.batch(full=True)==0 and f.outcome()['status']=='DONE', 'decided mutant did not reuse its recorded run/hash verdict'
     assert all(c[0]=='bash' for c in f.calls), 'decided mutant was launched again'
+    proposal=json.loads((f.evidence/'status-proposals.json').read_text())
+    assert proposal['full_run'] and set(proposal['pages'])==set(f.runner.page_names())-pages.LIVE
+    assert all(value=='passed' for value in proposal['pages'].values())
 
 def slice_end_reads_decided_mutants(f):
     seal=recorded_mutant(f);assert decide(f,seal,'survived')==0
@@ -533,8 +582,10 @@ def tier_receipts_fail_closed_at_start(f):
     for value in bad:
         o.write(f.tier,value);require_rejection(lambda:f.driver.start('invalid-receipt'))
     f.tier.write_bytes(original)
-    output=f.tier.parent/receipt['commands'][0]['output'];output.write_text('tampered command')
+    output=f.tier.parent/receipt['commands'][0]['output'];before=output.read_bytes();output.write_text('tampered command')
     require_rejection(lambda:f.driver.start('changed-output'),'Tier S output changed')
+    output.write_bytes(before);(f.tier.parent/'tools/backdrop').unlink()
+    require_rejection(lambda:f.driver.start('missing-helper'),'admitted helper missing: backdrop')
     assert not f.app_launches
 
 def identical_pixels_can_be_fresh(f):
@@ -548,7 +599,7 @@ def reused_old_image_is_blocked(f):
     assert f.batch("from driver import *; capture('old-image')")==1
     assert f.outcome()['status'].startswith('BLOCKED')
     assert 'old image file reused' in (f.evidence/'attempt-1/fresh-shell.txt').read_text()
-    assert not (f.evidence/'attempt-1/run/old-image.png').exists()
+    assert not (f.evidence/'attempt-1/run/old-image.png').exists(), 'old image retained after failed capture'
 
 def assertion_parser_and_retention(runner):
     # These are offline data APIs, not native guard substitutes.
@@ -558,12 +609,19 @@ def assertion_parser_and_retention(runner):
                 ("AssertionError: ('kind', 'capture', 3)\n",('kind','capture',3)),('AssertionError\n',('',)),('no failure\n',())]:
             transcript.write_text(text);assert o.assertion_from_transcript(transcript)==wanted
         routes=json.loads((o.BIN/'mutant-routes.json').read_text());found=runner.sections()
+        assert 'new-thread/Grok' in routes['wrapped-send-trailing']['sections']
+        assert 'chat-send-stream/Grok' in routes['wrapped-send-trailing']['sections']
+        assert 'approvals-questions/Codex' in routes['approval-dock-inset']['sections']
+        assert 'settings/Window background and display options' in routes['sidebar-title-dimming']['sections']
         for route in routes.values():
             owner=o.REPO/route['file']
             if owner.exists():
                 current=owner.read_text()
                 assert route['old'] in current or route['new'] in current, 'mutant line disappeared: '+route['file']
             assert all(tuple(section.split('/',1)) in found for section in route['sections'])
+            source=''.join(found[tuple(section.split('/',1))] for section in route['sections'])
+            capture=route['capture'].removesuffix('-placeholder');prefix,_,suffix=capture.rpartition('-')
+            assert capture in source or (prefix in source and suffix in source), route
         loader=importlib.machinery.SourceFileLoader('prune_data_test',str(o.BIN/'prune'))
         spec=importlib.util.spec_from_loader(loader.name,loader);prune=importlib.util.module_from_spec(spec);loader.exec_module(prune)
         evidence=root/'retention';evidence.mkdir()
@@ -580,6 +638,10 @@ def cleanup_failure_prevents_done(f):
     assert f.batch()==1
     assert f.outcome()['status']=='FAILED: Cleanup did not pass'
     assert f.outcome()['attempts'][0]['scratch_left']
+    f.cleanup_failure=False;f.leave_scratch=True
+    f.evidence=f.root/'scratch-success-exit';f.evidence.mkdir();f.args.evidence=f.evidence
+    assert f.batch()==1 and f.outcome()['status']=='FAILED: Cleanup did not pass'
+    assert f.outcome()['attempts'][0]['scratch_left']
 
 def prepare_requires_go(f):
     f.write_go(launch_authorized=False)
@@ -589,7 +651,8 @@ def prepare_requires_go(f):
     assert not f.calls
 
 def child_launches_mask_signals(f):
-    assert f.batch()==0 and f.outcome()['status']=='DONE'
+    assert f.batch()==0 and f.outcome()['status']=='DONE', 'owned child spawn contract failed'
+    assert f.runner.start_owned is o.start_owned
 
 CASES = [
     ('child-signals',child_launches_mask_signals),('cleanup-stop',cleanup_failure_prevents_done),('prepare-go',prepare_requires_go),    ('guard-tools',guard_tools_and_backdrop),('probe-part',probe_uses_requested_part),('idle-samples',idle_checks_every_sample),
@@ -606,11 +669,17 @@ CASES = [
     ('guard-stops-smoke',failed_guard_prevents_smoke),('tier-complete',tier_receipts_fail_closed_at_start),
     ('capture-fresh-pixels',identical_pixels_can_be_fresh),('capture-old-image',reused_old_image_is_blocked)]
 
+from negative_tests import CASES as RESTORED_CASES
+CASES += RESTORED_CASES
+
 def run(runner):
+    from guard_matrix import check_registry
+    check_registry()
     for name,case in CASES:
         with tempfile.TemporaryDirectory(prefix='veyra-mverify-entry-',dir='/tmp') as root:
             try:
-                with Fixture(pathlib.Path(root),runner) as fixture, contextlib.redirect_stdout(io.StringIO()): case(fixture)
+                fixture_type=getattr(case,'fixture_type',Fixture)
+                with fixture_type(pathlib.Path(root),runner) as fixture, contextlib.redirect_stdout(io.StringIO()): case(fixture)
             except BaseException as error:
                 raise AssertionError('GUARD['+name+']: '+str(error)) from error
         print('PASS GUARD['+name+']')
