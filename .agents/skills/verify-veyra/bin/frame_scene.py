@@ -27,3 +27,50 @@ def assert_idle_state(state, focus, part, previous=None):
     assert state['drawer']['terminal']['focused']==(focus=='drawer')
     assert state['look']['background']=='translucent'
     return variant
+
+def require_part(state, part, side='candidate'):
+    assert part in ['6a','6b','6c','6d'], 'guard requires explicit --part'
+    modern = 'palette' in state or 'toasts' in state
+    if side=='candidate' and modern:
+        require_6d_dump(state)
+        assert part=='6d', 'candidate tree requires --part 6d'
+    elif part=='6d':
+        require_6d_dump(state)
+    elif side=='candidate':
+        assert part=='6c', 'candidate tree requires --part 6c'
+    return part
+
+def parse_probe(argv):
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('phase',choices=['stream','scenes'])
+    parser.add_argument('side',choices=['baseline','candidate'])
+    parser.add_argument('label')
+    parser.add_argument('--scene',choices=['stream','idle','working'],default='stream')
+    parser.add_argument('--part',choices=['6a','6b','6c','6d'],required=True)
+    parser.add_argument('--idle-focus',choices=['drawer','composer'],default='composer')
+    parser.add_argument('--motion',choices=['normal','reduced'],default='normal')
+    return parser.parse_args(argv)
+
+def measure_idle(window, part, focus):
+    """Native and offline probe entries use this same before/sample/after loop."""
+    before = window.read('scene-before')
+    window.front('scene-before')
+    scene = assert_idle_state(before,focus,part)
+    started = window.clock.monotonic()
+    observations = []
+    while window.clock.monotonic()-started < 10:
+        window.clock.sleep(min(.1,max(0,10-(window.clock.monotonic()-started))))
+        observed = window.read('scene-sample')
+        assert_idle_state(observed,focus,part,scene)
+        observations.append({'seconds':window.clock.monotonic()-started,'repaints':observed['perf']['repaints'],
+            'focus':observed['focus'],'window_active':observed['window_active'],
+            'terminal_repaints':observed['drawer']['terminal'].get('repaints'),
+            'terminal_frame_requests':[tab.get('frame_requests') for tab in observed['drawer']['tabs']]})
+    after = window.read('scene-after')
+    assert_idle_state(after,focus,part,scene)
+    window.front('scene-after')
+    seconds = window.clock.monotonic()-started
+    return {'scene':'idle','seconds':seconds,'repaints':after['perf']['repaints']-before['perf']['repaints'],
+        'repaints_per_second':(after['perf']['repaints']-before['perf']['repaints'])/seconds,
+        'focus_before':before['focus'],'focus_after':after['focus'],'idle_scene':scene,'before':before,'after':after,'observations':observations,'measurement_complete':True}

@@ -112,9 +112,29 @@ def record_mutant_read(evidence, run, digest, verdict):
     assert digest==sealed['capture_sha256'], 'mutant read hash does not match this run'
     row.update(state=verdict,killed=verdict=='killed',survived=verdict=='survived',
         lead_read={'run':run,'capture_sha256':digest,'verdict':verdict,'recorded_epoch':time.time()})
-    result = summarize(receipt['cases'],receipt['expected_cases'])
+    result = dict(summarize(receipt['cases'],receipt['expected_cases']),parent_identity=receipt['parent_identity'],
+        manifest_sha256=receipt['manifest_sha256'])
     o.write(receipt_path,result)
     return result
+
+def recorded_verdicts(evidence, expected):
+    path = pathlib.Path(evidence)/'mutants/receipt.json'
+    if not path.exists(): return None
+    receipt = json.loads(path.read_text())
+    assert receipt['parent_identity']==expected, 'recorded mutants have another parent identity'
+    for row in receipt['cases']:
+        if 'read_seal' not in row: continue
+        seal = row['read_seal']
+        folder = pathlib.Path(row['folder'])
+        assert folder.resolve().is_relative_to((pathlib.Path(evidence)/'mutants').resolve()), 'unowned recorded mutant folder'
+        outcome = json.loads((folder/'native/outcome.json').read_text())
+        assert seal_capture(folder,outcome,seal['capture_name'])==seal, 'recorded mutant capture changed'
+        if row['state'] in ['killed','survived']:
+            read = row['lead_read']
+            assert read['run']==seal['run'] and read['capture_sha256']==seal['capture_sha256'] \
+                and read['verdict']==row['state'], 'recorded mutant verdict is not bound to its run and hash'
+    result = summarize(receipt['cases'],receipt['expected_cases'])
+    return dict(result,parent_identity=expected,manifest_sha256=receipt['manifest_sha256'])
 
 def run_mutants(args, expected):
     prepared = json.loads(args.native_mutants.read_text())
@@ -122,6 +142,10 @@ def run_mutants(args, expected):
     # GO names each case's complete Tier S identity. No approval is synthesized by the runner.
     go = json.loads(args.go.read_text())
     assert go.get('mutant_manifest_sha256')==o.sha(args.native_mutants), 'GO does not authorize these native mutants'
+    previous = recorded_verdicts(args.evidence,expected)
+    if previous is not None:
+        assert previous['manifest_sha256']==o.sha(args.native_mutants), 'recorded mutant manifest changed'
+        return previous
     cases = manifest(args.native_mutants)
     results = []
     for index,case in enumerate(cases):
@@ -158,5 +182,6 @@ def run_mutants(args, expected):
                 results.append(row)
         finally:
             assert o.code_identity()==expected, 'native mutant restore failed'
-            o.write(args.evidence/'mutants/receipt.json',summarize(results,len(cases)))
-    return summarize(results,len(cases))
+            o.write(args.evidence/'mutants/receipt.json',dict(summarize(results,len(cases)),parent_identity=expected,
+                manifest_sha256=o.sha(args.native_mutants)))
+    return dict(summarize(results,len(cases)),parent_identity=expected,manifest_sha256=o.sha(args.native_mutants))

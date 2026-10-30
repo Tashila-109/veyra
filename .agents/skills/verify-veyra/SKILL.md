@@ -15,8 +15,10 @@ External Accessibility input is not granted here; driver keys prove gpui dispatc
 
 ## Run
 
+Tier S of any verify-veyra change runs `--check-guards`.
+
 Start with the offline receipt, then let the lead arm the native window for its exact identity.
-`bin/run --tier-s-write DIR` builds debug and release artifacts and capture helpers, runs the workspace tests (classes A and B included), debug clippy, fmt, release test compilation, asserts the named boundary/text/map and nine headless results in that workspace output, then runs `--check-only` once.
+`bin/run --tier-s-write DIR` builds debug and release artifacts and capture helpers, runs the workspace tests (classes A and B included), debug clippy, fmt, release test compilation, asserts the named boundary/text/map and nine headless results in that workspace output, then runs `--check-only` and `--check-guards` once each.
 It writes `DIR/receipt.json`, the command outputs and their hashes, helper hashes, and HEAD/diff/binary identity.
 A native mode requires `--tier-s DIR/receipt.json`; missing commands, failed commands, changed outputs/helpers/binaries, another identity or a receipt older than 24 hours refuse Launch.
 Launch copies the already compiled helpers and does no build.
@@ -28,7 +30,7 @@ A production hunk in a glass file selects `settings/Glass smoke` as well.
 A test hunk never selects a page, release, glass or a guard.
 Smoke uses the debug quiet clock and never writes Status lines or status proposals.
 A selected release token still runs the release section.
-`--then-guard --baseline DIR` runs the slice-6 frame-cost guard **before** that smoke in the same away window.
+`--then-guard --baseline DIR --part PART` runs the slice-6 frame-cost guard **before** that smoke in the same away window.
 A failed guard cannot enter smoke.
 The guard uses the fixed 24,60,960,740 placement on both sides, records stream `perf.repaints`, runs five pairs with the ten-pair extension rule, both idle focus states and normal/reduced Working scenes, with recording off.
 A cover trip before the first baseline measurement discards the entire set, waits 60 seconds and starts the set once more.
@@ -37,7 +39,8 @@ No measured baseline or candidate is reused across that restart; the full unfilt
 Its `guard-done.json` is the lead's signal to release the arch-plan pause.
 The only baseline is the primary checkout's retained `.tstack/tasks/v001/evidence/perf/bin/5397b7b936f0e69c7c24c892f3f585328681b800/`, code identity `b2357c36d7a81924d41f97d94b17dc54a0983d7785ffd5895c549c328032e708`.
 `bin/frame_guard.py` pins its approved manifest SHA-256 and all three binary hashes, and refuses another directory or a self-consistent impostor.
-`--part 6c` is the current guard scene; part 6d must use `--part 6d`.
+`--part` is required for the guard and has no default.
+The current legacy candidate dump requires `--part 6c`; palette/toast fields require `--part 6d`, and a 6d request without those fields stops.
 The 6d candidate idle variant closes the palette, creates an empty-Send notice toast and requires that toast to remain at rest in `dump` before, throughout and after both ten-second focus measurements.
 Until `dump.palette.open` and `dump.toasts` exist, it stops with `6d idle scene unavailable`; it never falls back to the 6c candidate scene.
 The retained slice-5 baseline uses its earlier surface without palette/toasts, with the same drawer/composer focus and Translucent background.
@@ -78,6 +81,7 @@ No interrupted or partial run counts as passed.
 
 ```text
 bin/run --check-only
+bin/run --check-guards --evidence DIR
 bin/run --tier-s-write DIR
 bin/run --smoke --base BASE --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
 bin/run --smoke --base BASE --then-guard --part 6c --baseline BASELINE --tier-s TIER/receipt.json --go GO.json --deadline EPOCH --evidence DIR
@@ -90,7 +94,8 @@ Paths in this block are relative to `.agents/skills/verify-veyra/`; run them fro
 `--check-only` compiles all shell blocks, Python heredocs and Python helpers, checks the map and guard structure, and runs the offline self-tests.
 They call the real `prepare()` through selection/admission/environment setup, exercise the actual guard-then-smoke dispatch and failed-guard refusal, collect independent failures through Cleanup, classify test hunks and verify repaint/file freshness and plain-message assertions.
 Native/process/window/capture boundaries are stubbed in those tests.
-The existing virtual HID/lock gate, measured-pair placement, backdrop ownership and unmanaged-window tests also run.
+The HID/lock checks execute Launch’s real heredoc and `start()`, and capture checks execute the actual batch and driver paths.
+The test fixture supplies OS results and tiny on-disk trust inputs; guard functions and scheduling decisions are unchanged.
 These tests prove the harness offline; they leave the native smoke and compositor behavior for an armed window on the committed head.
 
 ### Mutants and retention
@@ -106,7 +111,9 @@ A read-judged run seals its own run id, guarded capture hash, freshness record a
 After reading that fresh image, the lead records the second step with `bin/run --mutant-read RUN HASH killed|survived --evidence DIR`, where DIR is the same mutant batch evidence root.
 The command revalidates that run’s sealed capture and refuses another run’s hash, a changed image, an unknown run or a second verdict.
 Only a matching lead verdict counts toward the mutant aggregate; a queue entry or retained image from another run cannot kill it.
-After all reads, the lead keeps that aggregate for the later full run; recording a read launches nothing.
+A later `--native-mutants` or slice-end full run using the same evidence directory re-reads recorded verdicts by run id and capture hash.
+Decided kills stay decided, surviving mutants stop the run, and an altered capture or verdict binding is refused.
+Recording a read launches nothing.
 An uncleared `mutation-in-flight.json` is a restore failure to resolve before another run.
 `bin/run --mutant-route NAME` prints each historical 6c route from `bin/mutant-routes.json`, including Grok's wrapped toolbar prerequisite, the second Codex MCP dock and Settings' sheet scene.
 Those routes do not re-admit retired draw checks as native mutants.
@@ -274,7 +281,7 @@ Use fixture_source and link_fixture for explicit spawn files too; writing throug
 
 Doctor uses `owned_instance_pid()` for the owned process, revision and data folder, then checks the window and appearance.
 `orchestration.code_identity()` hashes source and binaries; `run.checkout_identity()` applies it to the selected checkout.
-The frame probe uses `probe_instance_pid()` to check its candidate or pinned baseline process.
+The frame probe uses the same `owned_instance_pid()` at launch and checks its owned pid, group, data folder and expected candidate or pinned baseline revision on every measured dump.
 The macOS appearance read treats a missing `AppleInterfaceStyle` key as light.
 
 ```sh
@@ -562,8 +569,10 @@ It does not signal an unrecorded group.
 
 - `bin/run` is the gated runner described in [Run](#run).
 - `bin/orchestration.py` owns the masked child-process helper used by run, frame_guard and mutants, plus code identity and admission.
-- `bin/repair_tests.py` supplies the offline repair regressions that check-only runs.
-- `python3 .agents/skills/verify-veyra/bin/repair_proofs.py --evidence DIR` records the Musts’ defective-scratch red runs and exact-repair green runs; it never edits the checkout or runs a native surface.
+- `bin/self_tests.py` drives admission, probe, set and batch entry points with OS fixtures during `--check-only`.
+- `bin/run --check-guards [--evidence DIR]` plants each registered guard fault in a temporary skill copy, requires a check-only failure naming that guard, restores exact bytes and requires check-only to pass.
+  It saves each diff, red and green transcripts and their hashes in `matrix.json`; its default receipt stays under `/tmp/veyra-mverify-matrix-*/receipt/`.
+- `bin/frame_probe.py` owns probe admission and scene selection; `bin/frame_scene.py` owns shared dump sampling and `bin/frame_native.py` implements native window/process operations.
 - `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
 - `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.
 - `bin/backdrop.swift` draws its own black and white stripes and sharp text across every display, using one borderless window per screen in one process.

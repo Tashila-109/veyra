@@ -3,7 +3,7 @@
 
 This changes page text only; the lead owns the later docs-only commit.
 """
-import argparse, json, pathlib, re
+import argparse, hashlib, json, pathlib, re
 import orchestration as o
 import pages
 
@@ -14,10 +14,13 @@ def main():
     args = p.parse_args()
     proposal = json.loads((args.evidence/'status-proposals.json').read_text())
     assert proposal['full_run'] and o.source_identity()['head']==proposal['head'], 'full run head differs'
-    assert proposal['identity']['diff_sha256']==__import__('hashlib').sha256(b'').hexdigest() \
+    assert proposal['identity']['diff_sha256']==hashlib.sha256(b'').hexdigest() \
         and not proposal['identity']['untracked_sha256'], 'status needs a committed full-run candidate'
     outcome = json.loads((args.evidence/'outcome.json').read_text())
     assert outcome['status']==proposal['outcome'], 'status proposal differs from full-run outcome'
+    from mutants import recorded_verdicts
+    mutants = recorded_verdicts(args.evidence,proposal['identity'])
+    assert proposal['outcome']!='DONE' or mutants is None or mutants['passed'], 'mutant verdicts are not decided kills'
     reads = json.loads(args.reads.read_text())
     for path in args.evidence.glob('attempt-*/run/*-native-read.json'):
         request = json.loads(path.read_text())

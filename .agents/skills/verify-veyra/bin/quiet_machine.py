@@ -37,8 +37,11 @@ def parse_load(output):
     return values[0]
 
 
-def wait_for_quiet(path, invocation, progress=None, *, query=subprocess.run,
-                   monotonic=time.monotonic, sleep=time.sleep):
+def wait_for_quiet(path, invocation, progress=None, *, query=None,
+                   monotonic=None, sleep=None):
+    query = query or subprocess.run
+    monotonic = monotonic or time.monotonic
+    sleep = sleep or time.sleep
     started = monotonic()
     receipt = {'state': 'waiting', 'finished': False, 'launched': False,
                'invocation': invocation, 'sysctl_invocation': SYSCTL,

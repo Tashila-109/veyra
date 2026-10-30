@@ -1,5 +1,5 @@
 """Slice-6 guard: one authenticated baseline, one paired set, one pre-pair cover restart."""
-import json, pathlib, statistics, subprocess, sys, time
+import json, os, pathlib, statistics, subprocess, sys, time
 import orchestration as o
 import quiet_machine
 
@@ -44,7 +44,7 @@ def chain(guard, smoke):
     if not result['passed'] or not result.get('cleanup_passed'): return result
     return smoke()
 
-def measure_set(one, receipt, persist, deadline, wait=time.sleep):
+def measure_set(one, receipt, persist, deadline, wait=None):
     """An unsuccessful first pre-measurement cover check discards the set, never a single side of a pair."""
     receipt['sets'] = []
     for attempt in range(2):
@@ -83,9 +83,10 @@ def measure_set(one, receipt, persist, deadline, wait=time.sleep):
             receipt.update(pairs=[],idle={},working={})
             persist()
             assert deadline-time.time()>60, 'pre-pair cover restart cannot fit before cutoff'
-            wait(60)
+            (wait or time.sleep)(60)
 
 def run_guard(args, expected):
+    assert args.part is not None, 'guard requires explicit --part'
     root = args.evidence/'guard'
     root.mkdir(exist_ok=False)
     baseline = args.baseline.resolve()
@@ -109,8 +110,8 @@ def run_guard(args, expected):
         if motion: command += ['--motion',motion]
         quiet = quiet_machine.wait_for_quiet(root/(label+'-quiet.json'),command)
         frozen()
-        env = dict(__import__('os').environ,VEYRA_FRAME_GUARD_PROOF=str(root),VEYRA_FRAME_BASELINE=str(baseline),
-            VEYRA_FRAME_BASELINE_REV=BASELINE_REVISION,VEYRA_FRAME_TOOLS=str(args.tier_s.resolve().parent/'tools'),
+        env = dict(os.environ,VEYRA_FRAME_GUARD_PROOF=str(root),VEYRA_FRAME_BASELINE=str(baseline),
+            VEYRA_FRAME_BASELINE_REV=BASELINE_REVISION,VEYRA_FRAME_TOOLS=str(o.tier_tools(args.tier_s)),
             VEYRA_VERIFY_DEADLINE=str(args.deadline),PYTHONDONTWRITEBYTECODE='1',
             VEYRA_VERIFY_TIER_S=str(args.tier_s.resolve()),VEYRA_VERIFY_GO=str(args.go.resolve()))
         env.pop('VEYRA_RECORD',None)

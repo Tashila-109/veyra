@@ -1,9 +1,12 @@
 """Full-run status proposals are applied only after native reads, in the lead's docs-only change."""
-import datetime, json, pathlib
+import datetime, pathlib
 import pages
 from orchestration import write
 
 def propose(folder, expected, status, names):
+    from mutants import recorded_verdicts
+    mutants = recorded_verdicts(folder,expected)
+    assert mutants is None or mutants['passed'] or status!='DONE', 'full run has undecided or surviving mutants'
     write(pathlib.Path(folder)/'status-proposals.json',{'head':expected['head'],'full_run':True,
         'date':datetime.date.today().isoformat(),'pages':{
             name:('passed' if status=='DONE' else 'blocked' if status.startswith('BLOCKED') else 'failed')

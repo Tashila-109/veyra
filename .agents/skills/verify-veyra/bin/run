@@ -3,7 +3,7 @@
 
 See SKILL.md, section Run, for the options and the retry rule.
 """
-import argparse, ast, json, os, pathlib, re, secrets, shutil, signal, subprocess, sys, tempfile, time
+import argparse, ast, json, os, pathlib, re, secrets, shutil, signal, subprocess, sys, time
 
 SKILL = pathlib.Path(__file__).resolve().parent.parent
 REPO = SKILL.parent.parent.parent
@@ -87,38 +87,6 @@ def launch_gates(found):
         return
     raise AssertionError('Launch never calls start()')
 
-def gate_check():
-    """Run driver self-tests in a scratch checkout, because the driver reads a run's records at import."""
-    root = pathlib.Path(tempfile.mkdtemp(prefix='veyra-mverify-gate-',dir='/tmp'))
-    try:
-        (root/'crates/veyra').mkdir(parents=True)
-        (root/'crates/veyra/Cargo.toml').write_text('')
-        (root/'target/verify-veyra/gatecheck').mkdir(parents=True)
-        (root/'target/verify-veyra/gatecheck/lane').write_text('live\n')
-        try:
-            result = subprocess.run([sys.executable,'-c','import driver; driver.gate_self_test(); driver.measured_pair_self_test(); driver.backdrop_pid_self_test(); driver.window_rules_self_test()'],cwd=root,
-                capture_output=True,text=True,timeout=30,env=dict(os.environ,RUN='gatecheck',
-                PYTHONPATH=str(SKILL/'bin'),PYTHONDONTWRITEBYTECODE='1',VEYRA_VERIFY_TMP=str(root)+'/data-'))
-        except subprocess.TimeoutExpired:
-            raise AssertionError('gate self-test did not finish in 30 s; gate() can hold past its deadline') from None
-        assert result.returncode == 0, 'gate self-test failed:\n'+result.stdout+result.stderr
-        return result.stdout.strip()
-    finally:
-        shutil.rmtree(root)
-
-def driver_self_test_dispatch_check():
-    from types import SimpleNamespace
-    from unittest.mock import Mock, patch
-    driver = SimpleNamespace(**{name:Mock() for name in
-        ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test','window_rules_self_test')})
-    def run(command, **options):
-        exec(command[2],{})
-        return SimpleNamespace(returncode=0,stdout='',stderr='')
-    with patch.dict(sys.modules,driver=driver), patch('subprocess.run',side_effect=run):
-        gate_check()
-    for name in ('gate_self_test','measured_pair_self_test','backdrop_pid_self_test','window_rules_self_test'):
-        getattr(driver,name).assert_called_once_with()
-
 def verdict(record):
     """One terminal verdict after Cleanup; section failures are collected, never whole-run retries."""
     taken = take_pending()
@@ -134,15 +102,6 @@ def verdict(record):
     if any(row['kind']=='blocked' for row in rows): return 'BLOCKED: re-run only blocked sections with --sections'
     if record.get('all_passed') and not record.get('failed'): return 'DONE'
     return 'FAILED: not every planned section passed'
-
-def verdict_check():
-    done = {'cleanup_exit':0,'identity_unchanged':True,'all_passed':True,'failed':None,'evidence':{'run':True}}
-    for change,wanted in [({},'DONE'),({'cleanup_exit':1},'FAILED'),({'scratch_left':['x']},'FAILED'),
-            ({'identity_unchanged':False},'FAILED'),({'interrupted':'SIGTERM'},'FAILED'),
-            ({'evidence':{} ,'all_passed':False},'FAILED'),({'evidence':{'run':False}},'FAILED'),
-            ({'sections':[{'kind':'blocked'}]},'BLOCKED'),
-            ({'sections':[{'kind':'failed'},{'kind':'blocked'}]},'FAILED'),({'fatal_stop':True},'FAILED')]:
-        assert verdict(dict(done,**change)).startswith(wanted),change
 
 def guards_in_place(found):
     """start()'s relaunch refusal and Cleanup's drain are read as Python structure; the stale-screenshot assert and the
@@ -187,16 +146,14 @@ def checks(found):
             compile(path.read_text(),str(path),'exec')
     check_map(found)
     pages.evidence_contract(REPO)
-    launch_gates(found)
     guards_in_place(found)
-    verdict_check()
-    driver_self_test_dispatch_check()
     import self_tests
     self_tests.run(sys.modules[__name__])
+    launch_gates(found)
     return (f'{len(found)} shell blocks and {blocks} Python heredocs compile across {len(page_names())} pages; '
         'the fixed sections exist; Launch calls gate() before start(); start() asserts its relaunch refusal and '
         'Cleanup its drain; the 30 s drain, stale-screenshot and covered-window guard texts are present; the verdict '
-        'holds; '+gate_check())
+        'holds; entry-point guard checks passed; OS fixtures only')
 
 def checkout_identity():
     return orchestration.code_identity(REPO)
@@ -453,6 +410,7 @@ def prepare(argv=None, validate=True):
     parser.add_argument('--deadline',type=float,default=time.time()+3*3600)
     parser.add_argument('--scratch',default='/tmp/veyra-verify-')
     parser.add_argument('--check-only',action='store_true')
+    parser.add_argument('--check-guards',action='store_true')
     parser.add_argument('--smoke',action='store_true')
     parser.add_argument('--gate',action='store_true')
     parser.add_argument('--slice-end',action='store_true')
@@ -461,7 +419,7 @@ def prepare(argv=None, validate=True):
     parser.add_argument('--go',type=pathlib.Path)
     parser.add_argument('--then-guard',action='store_true',help='run frame guard first, then smoke')
     parser.add_argument('--baseline',type=pathlib.Path)
-    parser.add_argument('--part',choices=['6a','6b','6c','6d'],default='6c')
+    parser.add_argument('--part',choices=['6a','6b','6c','6d'])
     parser.add_argument('--native-mutants',type=pathlib.Path)
     parser.add_argument('--prepare-mutants',type=pathlib.Path)
     parser.add_argument('--mutant-route')
@@ -471,9 +429,13 @@ def prepare(argv=None, validate=True):
     assert not args.smoke or args.base, '--smoke requires --base'
     assert not args.then_guard or args.smoke, '--then-guard requires --smoke'
     assert not args.then_guard or args.baseline, '--then-guard requires --baseline'
+    assert not args.then_guard or args.part, 'guard requires explicit --part'
     assert sum([args.smoke,args.gate,args.slice_end]) <= 1, 'choose smoke, slice-end or gate'
     assert not args.native_mutants or (args.gate or args.slice_end), 'native mutants belong only to slice-end/gate'
 
+    if args.check_guards:
+        from guard_matrix import run_matrix
+        return run_matrix(args.evidence)
     found = sections()
     proven = checks(found) if validate else 'checks already running'
     if args.check_only:
@@ -541,10 +503,10 @@ def prepare(argv=None, validate=True):
     if shutil.which('sccache'): env['RUSTC_WRAPPER'] = 'sccache'
     return found,plan,args,env,expected
 
-def main():
+def main(argv=None, validate=True):
     os.environ['GIT_OPTIONAL_LOCKS'] = '0'
     for number in SIGNALS: signal.signal(number,interrupted)
-    try: setup = prepare()
+    try: setup = prepare(argv,validate)
     except Interrupted as stop:
         print(f'interrupted by {stop} before any attempt began; nothing was launched',file=sys.stderr,flush=True)
         return 128+signal.Signals[str(stop)].value
@@ -566,9 +528,14 @@ def main():
     return run_native(found,plan,args,env,expected)
 
 def run_native(found,plan,args,env,expected):
+    from mutants import recorded_verdicts
+    result = None
     if args.native_mutants:
         from mutants import run_mutants
         result = run_mutants(args,expected)
+    elif args.gate or args.slice_end:
+        result = recorded_verdicts(args.evidence,expected)
+    if result is not None:
         if not result['passed']:
             orchestration.write(args.evidence/'outcome.json',{'status':result['state'],'mutants':result})
             print(result['state'],flush=True)

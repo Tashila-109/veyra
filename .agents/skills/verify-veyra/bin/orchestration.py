@@ -13,6 +13,7 @@ COMMANDS = {
     'fmt': ['cargo','fmt','--check'],
     'release-no-run': ['cargo','test','--workspace','--release','--no-run'],
     'check-only': [str(BIN/'run'),'--check-only'],
+    'check-guards': [str(BIN/'run'),'--check-guards'],
     'release-build': ['cargo','build','--release','-p','veyra'],
 }
 
@@ -49,6 +50,12 @@ def helper_paths(tools):
         assert path.is_file(), 'admitted helper missing: '+name
     return resolved
 
+def tier_tools(receipt):
+    """The sole compiled-tools folder used by admission and every probe environment."""
+    folder = pathlib.Path(receipt).resolve().parent/'tools'
+    helper_paths(folder)
+    return folder
+
 def sha(path):
     digest = hashlib.sha256()
     with pathlib.Path(path).open('rb') as source:
@@ -59,7 +66,8 @@ def write(path, value):
     path = pathlib.Path(path)
     path.write_text(json.dumps(value,indent=2)+'\n')
 
-def source_identity(repo=REPO):
+def source_identity(repo=None):
+    repo = REPO if repo is None else repo
     def git(*args):
         return subprocess.check_output(['git','-c','core.quotepath=off',*args],cwd=repo,
             env=dict(os.environ,GIT_OPTIONAL_LOCKS='0'))
@@ -68,7 +76,8 @@ def source_identity(repo=REPO):
         'diff_sha256':hashlib.sha256(git('diff','--binary','HEAD')).hexdigest(),
         'untracked_sha256':{name:sha(pathlib.Path(repo)/name) for name in untracked if name}}
 
-def code_identity(repo=REPO):
+def code_identity(repo=None):
+    repo = REPO if repo is None else repo
     return dict(source_identity(repo),binaries={name:sha(pathlib.Path(repo)/'target'/name) for name in BINARY_NAMES})
 
 def require_tier(path, expected, now=None):
@@ -89,7 +98,7 @@ def require_tier(path, expected, now=None):
         assert sha(output) == row['sha256'], 'Tier S output changed'
     tools = receipt['tools']
     assert set(tools) == set(TOOLS), 'Tier S compiled helper set is incomplete'
-    for name,helper in helper_paths(path.parent/'tools').items():
+    for name,helper in helper_paths(tier_tools(path)).items():
         assert sha(helper) == tools[name], 'Tier S helper binary changed'
     return receipt
 

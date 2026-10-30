@@ -207,7 +207,9 @@ def owned_instance_pid():
     assert (DATA/'veyra.lock').read_text().strip() == str(pid)
     dump = ctl('identity', 'dump')
     assert dump['pid'] == pid and dump['data_dir'] == str(DATA)
-    assert dump['build_rev'] == subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+    revision = PROOF/'build-rev'
+    expected_rev = revision.read_text().strip() if revision.exists() else subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+    assert dump['build_rev'] == expected_rev
     return pid
 def window_id(pid):
     end = time.monotonic() + 30
@@ -408,26 +410,6 @@ def measured_pair(labels, take, rectangle=(24,60,960,740)):
             (PROOF/(label+'.png')).unlink(missing_ok=True)
         save(labels[0]+'-pair-placement',{'attempts':attempts,'passed':False})
         assert attempt < 2, 'measurement placement did not settle within three attempts'
-def measured_pair_self_test():
-    """Plant fallback on one half only; neither retained image may predate that placement."""
-    labels = ['pair-test-coarse','pair-test-inverse']
-    for fallback_half in labels:
-        calls, retained = [], {}
-        def take(label,rectangle):
-            calls.append((label,tuple(rectangle)))
-            placed = label == fallback_half and len(calls) <= 2
-            rectangle = (24,421,960,740) if placed else rectangle
-            retained[label] = (len(calls),tuple(rectangle))
-            (PROOF/(label+'.png')).write_bytes(bytes([len(calls)]))
-            return rectangle,placed
-        measured_pair(labels,take)
-        assert [label for label,_ in calls][-2:] == labels, calls
-        assert retained[labels[0]][0] > (1 if fallback_half == labels[0] else 2), retained
-        assert retained[labels[0]][1] == retained[labels[1]][1] == (24,421,960,740), retained
-        assert all((PROOF/(label+'.png')).read_bytes() == bytes([retained[label][0]]) for label in labels)
-        save(fallback_half+'-self-test',{'calls':calls,'retained':retained})
-        for label in labels: (PROOF/(label+'.png')).unlink()
-    print('PASS measured_pair_self_test: fallback on either half discards both and retakes one rectangle')
 def guarded_capture(name):
     assert not locked()
     window = (PROOF/'window-id').read_text().strip()
@@ -542,37 +524,6 @@ def gate():
         'failure':None}
     save('input-idle-launch',clock)
     save('focus-failure',clock)
-def gate_self_test():
-    """Drive gate() on a virtual clock with stubbed idle, lock and pgrep readers; each bound and reader must hold it."""
-    global input_idle_seconds, locked, veyra_pids, time
-    readers = input_idle_seconds, locked, veyra_pids, time
-    class Clock:
-        now = 0.0
-        def monotonic(self): return self.now
-        def time(self): return 1e9+self.now
-        def sleep(self, seconds): self.now += seconds
-    def released(idle=200, lock=False, busy_until=-1.0):
-        """The virtual second gate() let the launch go, or None when it held until the two-minute deadline."""
-        global input_idle_seconds, locked, veyra_pids, time
-        clock = time = Clock()
-        input_idle_seconds, locked = (lambda: idle), (lambda: lock)
-        veyra_pids = lambda: {1} if clock.now < busy_until else set()
-        os.environ['VEYRA_VERIFY_DEADLINE'] = str(1e9+120)
-        try: gate()
-        except AssertionError as error:
-            assert 'deadline' in str(error), error
-            return None
-        return clock.now
-    try:
-        assert released(idle=119) is None, 'gate() released at 119 s of idle'
-        assert released(idle=9001) is None, 'gate() released at 9,001 s of idle'
-        assert released(lock=True) is None, 'gate() released while the screen was locked'
-        for idle in [120,9000]:
-            assert 10 <= (released(idle=idle) or -1) < 11, f'gate() did not release 10 s into {idle} s of idle'
-        assert 29 <= (released(busy_until=20) or -1) < 31, 'gate() did not wait 10 s after the last running veyra'
-    finally:
-        input_idle_seconds, locked, veyra_pids, time = readers
-    print('PASS gate() holds below 120 s and above 9,000 s of idle, while locked, and until 10 s after the last veyra')
 def observe_failure(step, kind):
     """Record whether human input came after launch, so a supervisor retries only a failure no person caused."""
     path = PROOF/'input-idle-launch.json'
@@ -676,7 +627,7 @@ def normalize_owned_window(label, pid=None, window=None):
     assert x<=left and y<=top and left+960<=x+width and top+740<=y+height
     return save(label+'-normalized-window',{'before':before['frame'],'after':after['frame'],
         'visible_frame':visible,'pid':pid,'window':window})
-def start(label, normalize=True):
+def start(label, normalize=True, recording=True, baseline=None):
     from orchestration import code_identity, require_tier, require_go
     expected = code_identity()
     require_tier(os.environ['VEYRA_VERIFY_TIER_S'],expected)
@@ -687,10 +638,23 @@ def start(label, normalize=True):
     assert not foreign, f'a veyra this run did not start is running: {foreign}'
     saved = sql('select live_pid from threads where live_pid is not null') if DB.exists() else ''
     ENV['VEYRA_REAP_PIDS'] = ','.join(saved.split())
-    if LANE == 'fake':
+    if not recording:
+        ENV.pop('VEYRA_RECORD',None)
+        assert 'VEYRA_RECORD' not in ENV
+        (PROOF/'recording-off').touch()
+        save('app-environment-keys',{'keys':sorted(ENV),'veyra_record_absent':True,'values_recorded':False})
+    if LANE == 'fake' and recording:
         rec = PROOF/'rec'/f'{len(owned_app_pids())+1:02d}-{label}'
         ENV['VEYRA_RECORD'] = str(rec)
         (PROOF/'rec-current').write_text(str(rec)+'\n')
+    revision = expected['head']
+    if baseline is not None:
+        from frame_guard import authenticate_baseline, BASELINE_REVISION, BASELINE_BINARIES
+        from orchestration import sha
+        authenticate_baseline(baseline)
+        assert sha('target/debug/veyra') == BASELINE_BINARIES['debug/veyra'], 'probe baseline executable differs'
+        revision = BASELINE_REVISION
+    (PROOF/'build-rev').write_text(revision+'\n')
     add_window_rule(label)
     app = subprocess.Popen([str(pathlib.Path('target/debug/veyra').resolve())],cwd=DATA/'appcwd',env=ENV,
         stdout=(PROOF/(label+'.stdout')).open('w'),stderr=(PROOF/(label+'.stderr')).open('w'),
@@ -767,6 +731,11 @@ def next_lane():
     return max(lanes_used(),default=0)+1
 def stage_records(records):
     source = fixture_source(records)
+    if (PROOF/'recording-off').exists():
+        assert sql('select count(*) from threads')=='0' and sql('select count(*) from turns')=='0', 'recording-off staging needs a fresh database'
+        for epoch in range(1,9): link_fixture(f't1-s{epoch}.jsonl',source)
+        save('fixture-staging',{'reads_recordings':False,'lane':1,'epochs':list(range(1,9)),'fixture_sha256':hashlib.sha256(source.read_bytes()).hexdigest()})
+        return
     rows = sql('select threads.id,count(turns.id) from threads left join turns on turns.thread_id=threads.id group by threads.id order by threads.id')
     turns = [int(row.split('|')[1]) for row in rows.splitlines()]+[0]
     observed = lanes_used()
@@ -1001,122 +970,3 @@ def stop_owned_backdrop(pid, executable):
             if _backdrop_executable(pid) is None: return
             time.sleep(.05)
     assert _backdrop_executable(pid) is None, 'owned notification backdrop remains'
-
-def backdrop_pid_self_test():
-    from unittest.mock import patch
-    pid = 42424242
-    expected = (DATA/'notifications-backdrop.app/Contents/MacOS/backdrop').resolve()
-    foreign = (DATA/'other-executable').resolve()
-    def rejects(call):
-        try: call()
-        except AssertionError: return
-        raise AssertionError('unsafe backdrop operation was accepted')
-    with patch(__name__+'._backdrop_executable',return_value=expected), patch('os.kill') as kill:
-        verify_owned_backdrop(pid,expected)
-        kill.assert_not_called()
-    outside = (DATA.resolve().parent/'outside-backdrop.app/Contents/MacOS/backdrop').resolve()
-    with patch(__name__+'._backdrop_executable',return_value=outside), patch('os.kill') as kill:
-        rejects(lambda: verify_owned_backdrop(pid,outside))
-        opened = []
-        rejects(lambda: reopen_owned_backdrop(pid,outside,lambda: opened.append(True)))
-        assert not opened, 'backdrop outside scratch was reopened'
-        rejects(lambda: stop_owned_backdrop(pid,outside))
-        kill.assert_not_called()
-    for actual in (None,foreign):
-        with patch(__name__+'._backdrop_executable',return_value=actual), patch('os.kill') as kill:
-            rejects(lambda: verify_owned_backdrop(pid,expected))
-            opened = []
-            rejects(lambda: reopen_owned_backdrop(pid,expected,lambda: opened.append(True)))
-            assert not opened, 'dead or foreign backdrop was reopened'
-            if actual is None: stop_owned_backdrop(pid,expected)
-            else: rejects(lambda: stop_owned_backdrop(pid,expected))
-            kill.assert_not_called()
-    with patch(__name__+'._backdrop_executable',side_effect=[expected,foreign]), patch('os.kill') as kill:
-        opened = []
-        rejects(lambda: reopen_owned_backdrop(pid,expected,lambda: opened.append(True)))
-        assert opened == [True], 'live backdrop was not reopened'
-        kill.assert_not_called()
-    with patch(__name__+'._backdrop_executable',return_value=expected) as path, patch('os.kill') as kill:
-        reopened = reopen_owned_backdrop(pid,expected,lambda: 'opened')
-        assert reopened == 'opened' and path.call_count == 2
-        kill.assert_not_called()
-    with patch(__name__+'._backdrop_executable',side_effect=[expected,foreign]), patch('os.kill') as kill:
-        rejects(lambda: stop_owned_backdrop(pid,expected))
-        kill.assert_not_called()
-    with patch(__name__+'._backdrop_executable',side_effect=[expected,expected,None]), patch('os.kill') as kill:
-        stop_owned_backdrop(pid,expected)
-        kill.assert_called_once_with(pid,signal.SIGTERM)
-    with patch(__name__+'._backdrop_executable',side_effect=[expected,expected,expected,foreign]), \
-            patch('os.kill') as kill, patch('time.monotonic',side_effect=[0,6]), patch('time.sleep'):
-        rejects(lambda: stop_owned_backdrop(pid,expected))
-        kill.assert_called_once_with(pid,signal.SIGTERM)
-    print('backdrop pid self-test: executable ownership, before/after reopen, dead refusal and each signal passed')
-def window_rules_self_test():
-    from types import SimpleNamespace
-    from unittest.mock import patch
-    global PROOF, RUN
-    previous = PROOF,RUN
-    RUN = '0123abcd'
-    PROOF = pathlib.Path.cwd()/'target/verify-veyra'/RUN
-    PROOF.mkdir(parents=True,exist_ok=False)
-    calls = []
-    def reject(operation):
-        try: operation()
-        except AssertionError: return
-        raise AssertionError('unsafe owned-window case passed')
-    def command(argv, **options):
-        calls.append(argv)
-        if '--add' in argv:
-            label = next(item[6:] for item in argv if item.startswith('label='))
-            assert label in (PROOF/'owned-yabai-labels').read_text().splitlines()
-            assert '--one-shot' in argv and 'app=^veyra$' in argv and 'manage=off' in argv
-            return SimpleNamespace(returncode=0,stdout='',stderr='')
-        assert argv[1:4]==['-m','rule','--remove']
-        return SimpleNamespace(returncode=1,stdout='',stderr=f"rule with label '{argv[-1]}' not found.\n")
-    try:
-        with patch('shutil.which',return_value=None),patch('subprocess.run') as run:
-            add_window_rule('absent')
-            run.assert_not_called()
-        with patch('shutil.which',return_value='/owned/yabai'),patch('subprocess.run',side_effect=command), \
-                patch.dict(os.environ,{'VEYRA_VERIFY_RULE_INDEX':str(PROOF/'index.jsonl')}):
-            add_window_rule('first')
-            add_window_rule('second')
-            labels=(PROOF/'owned-yabai-labels').read_text().splitlines()
-            assert len(set(labels))==2
-            cleanup_window_rules(PROOF,RUN)
-            assert len(calls)==4
-            with patch('subprocess.run',return_value=SimpleNamespace(returncode=1,stdout='',stderr='add refused')):
-                reject(lambda:add_window_rule('failed-add'))
-            labels=(PROOF/'owned-yabai-labels').read_text().splitlines()
-            assert len(labels)==3
-            (PROOF/'owned-yabai-labels').write_text('\n'.join([*labels,'foreign-label'])+'\n')
-            reject(lambda:cleanup_window_rules(PROOF,RUN))
-            assert all('foreign-label' not in call for call in calls)
-            (PROOF/'owned-yabai-labels').write_text('\n'.join(labels)+'\n')
-            with patch('subprocess.run',return_value=SimpleNamespace(returncode=1,stdout='',stderr='not found')):
-                reject(lambda:cleanup_window_rules(PROOF,RUN))
-            with patch('subprocess.run',return_value=SimpleNamespace(returncode=0,stdout='',stderr='')):
-                cleanup_window_rules(PROOF,RUN)
-            with (PROOF/'index.jsonl').open('a') as output: output.write('{incomplete')
-            before=len(calls)
-            reject(lambda:cleanup_window_rule_index(PROOF/'index.jsonl'))
-            assert len(calls)==before+len(labels)
-        unmanaged={'is-floating':True,'split-type':'none','split-child':'none','stack-index':0}
-        assert require_unmanaged(unmanaged)==unmanaged
-        for changed in [{'is-floating':False},{'split-type':'vertical'},{'split-child':'second_child'},{'stack-index':True}]:
-            reject(lambda changed=changed:require_unmanaged(dict(unmanaged,**changed)))
-        before=dict(unmanaged,pid=11,id=22,frame={'x':20,'y':40,'w':1280,'h':800})
-        after=dict(before,frame={'x':3360,'y':346,'w':960,'h':740})
-        def geometry(argv, **options):
-            if argv[0].endswith('visible-frame'):
-                return SimpleNamespace(returncode=0,stdout=json.dumps({'visible_frame':[2560,23,2560,1385]}),stderr='')
-            assert argv[1:4]==['-m','window','22'] and argv[4] in ['--move','--resize']
-            return SimpleNamespace(returncode=0,stdout='',stderr='')
-        with patch(__name__+'.owned_window_record',side_effect=[before,before,before,after]), \
-                patch('shutil.which',return_value='/owned/yabai'),patch('subprocess.run',side_effect=geometry):
-            measured=normalize_owned_window('geometry',11,22)
-            assert measured['after']==after['frame']
-    finally:
-        shutil.rmtree(PROOF)
-        PROOF,RUN = previous
-    print('window rule self-test: unique one-shot labels, owned cleanup, fail-closed floating and visible-frame placement passed')
