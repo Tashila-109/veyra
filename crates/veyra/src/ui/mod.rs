@@ -3429,6 +3429,9 @@ impl TestCapture {
     fn record(&mut self, _: &Command) {}
 }
 #[cfg(test)]
+pub(crate) mod headless;
+
+#[cfg(test)]
 #[derive(Default)]
 pub struct TestCapture {
     sent_responses: std::rc::Rc<std::cell::RefCell<Vec<(RequestId, Decision)>>>,
@@ -3878,7 +3881,7 @@ mod tests {
         }
     }
 
-    fn draw(cx: &mut gpui::VisualTestContext) {
+    pub(super) fn draw(cx: &mut gpui::VisualTestContext) {
         for _ in 0..2 {
             cx.run_until_parked();
             cx.update(|window, cx| {
@@ -4336,130 +4339,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn option_cursor_paints_only_the_current_row(cx: &mut gpui::TestAppContext) {
-        with_docked_shell(cx, |shell, cx, _, _| {
-            let request = shell.update(cx, |shell, cx| {
-                shell.state.requests.truncate(1);
-                cx.notify();
-                shell.state.requests[0].id
-            });
-            let mut mismatches = Vec::new();
-            for width in [760., 960., 1950.] {
-                cx.simulate_resize(gpui::size(
-                    gpui::Pixels::from(width),
-                    gpui::Pixels::from(740.),
-                ));
-                draw(cx);
-                cx.dispatch_action(super::FocusDock);
-                cx.dispatch_action(super::MoveOptionUp);
-                draw(cx);
-                for cursor in 0..2 {
-                    if cursor == 1 {
-                        cx.dispatch_action(super::MoveOptionDown);
-                        draw(cx);
-                    }
-                    shell.read_with(cx, |shell, _| {
-                        assert!(shell.dock_focused);
-                        assert_eq!(shell.question_scroll.cursor, cursor);
-                        assert_eq!(shell.state.requests[0].id, request);
-                    });
-                    let viewport =
-                        shell.read_with(cx, |shell, _| shell.question_scroll.options.bounds());
-                    cx.update(|window, cx| {
-                        let theme = cx.global::<super::Theme>();
-                        let scale = window.scale_factor();
-                        let quads = window.painted_quads();
-                        let viewport = viewport.scale(scale);
-                        let mut rows = quads
-                            .iter()
-                            .filter(|quad| {
-                                quad.background == theme.colors.card.into()
-                                    && quad.bounds.left() >= viewport.left()
-                                    && quad.bounds.right() <= viewport.right()
-                                    && quad.bounds.top() >= viewport.top()
-                                    && quad.bounds.bottom() <= viewport.bottom()
-                            })
-                            .collect::<Vec<_>>();
-                        rows.sort_by_key(|quad| quad.bounds.top());
-                        assert_eq!(rows.len(), 2);
-                        for (option, row) in rows.into_iter().enumerate() {
-                            let row = row
-                                .bounds
-                                .map(|value| gpui::Pixels::from(value.as_f32() / scale));
-                            let cursor_bounds = row.inset(theme.layout.focus_inset);
-                            let bounds = cursor_bounds.scale(scale);
-                            let row = row.scale(scale);
-                            let plates = quads
-                                .iter()
-                                .filter(|quad| {
-                                    quad.border_color == theme.colors.accent
-                                        && row.contains(&quad.bounds.origin)
-                                        && row.contains(&quad.bounds.bottom_right())
-                                })
-                                .collect::<Vec<_>>();
-                            let expected = if option == cursor { 4 } else { 0 };
-                            if plates.len() != expected {
-                                mismatches.push((
-                                    "painted option cursor count",
-                                    width,
-                                    cursor,
-                                    option,
-                                    expected,
-                                    plates.len(),
-                                ));
-                            }
-                            for plate in &plates {
-                                assert_eq!(plate.bounds, bounds);
-                                assert!(plate.background.is_transparent());
-                                let stroke = theme.layout.focus_ring.scale(scale);
-                                assert_eq!(plate.border_widths.top, stroke);
-                                assert_eq!(plate.border_widths.right, stroke);
-                                assert_eq!(plate.border_widths.bottom, stroke);
-                                assert_eq!(plate.border_widths.left, stroke);
-                                let radius =
-                                    (theme.radius.control - theme.layout.focus_inset).scale(scale);
-                                assert_eq!(plate.corner_radii.top_left, radius);
-                                assert_eq!(plate.corner_radii.top_right, radius);
-                                assert_eq!(plate.corner_radii.bottom_left, radius);
-                                assert_eq!(plate.corner_radii.bottom_right, radius);
-                            }
-                            if option == cursor && plates.len() == expected {
-                                let half = theme.layout.focus_ring / 2.;
-                                for point in [
-                                    gpui::point(
-                                        cursor_bounds.center().x,
-                                        cursor_bounds.top() + half,
-                                    ),
-                                    gpui::point(
-                                        cursor_bounds.right() - half,
-                                        cursor_bounds.center().y,
-                                    ),
-                                    gpui::point(
-                                        cursor_bounds.center().x,
-                                        cursor_bounds.bottom() - half,
-                                    ),
-                                    gpui::point(
-                                        cursor_bounds.left() + half,
-                                        cursor_bounds.center().y,
-                                    ),
-                                ] {
-                                    assert!(plates.iter().any(|quad| {
-                                        quad.content_mask.bounds.contains(&point.scale(scale))
-                                    }));
-                                }
-                            }
-                            assert!(quads.iter().any(|quad| {
-                                quad.bounds == row && quad.background == theme.colors.card.into()
-                            }));
-                        }
-                    });
-                }
-            }
-            assert!(mismatches.is_empty(), "{mismatches:?}");
-        });
-    }
-
-    #[gpui::test]
     fn option_cursor_moves_and_answers(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let request = shell.update(cx, |shell, cx| {
@@ -4828,7 +4707,7 @@ mod tests {
         });
     }
 
-    fn with_docked_shell(
+    pub(super) fn with_docked_shell(
         cx: &mut gpui::TestAppContext,
         check: impl FnOnce(
             Entity<super::Shell>,
@@ -6300,7 +6179,7 @@ mod tests {
         ("dock-option-8", "dock-option-caption-8"),
     ];
 
-    fn configure_dock_thread(
+    pub(super) fn configure_dock_thread(
         shell: &mut super::Shell,
         provider: ProviderKind,
         hold: bool,
