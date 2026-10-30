@@ -1,8 +1,8 @@
 //! Renderer checks. Imported by the test target, never by a production build.
-#![cfg(all(test, debug_assertions))]
-#![allow(clippy::disallowed_types, dead_code)]
+#![cfg(debug_assertions)]
+#![allow(clippy::disallowed_types)] // Checks inspect debug dumps and provider wire JSON.
+#![allow(dead_code)] // Only the separate main-thread target calls these checks, not the unit-test harness.
 
-#[cfg(test)]
 #[allow(unused_imports)] // The ordinary unit-test binary does not call this runner.
 pub(crate) use checks::run;
 
@@ -77,6 +77,14 @@ mod checks {
                 .map(|i| self.rgba[i * 4..i * 4 + 3].try_into().unwrap())
                 .collect()
         }
+        fn color_pixels(&self, bounds: Bounds<Pixels>, color: Hsla) -> usize {
+            let rgba = Rgba::from(color);
+            let expected = [rgba.r, rgba.g, rgba.b].map(|v| (v * 255.).round() as u8);
+            self.region(bounds)
+                .iter()
+                .filter(|p| p.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 5))
+                .count()
+        }
         fn shape(&self, bounds: Bounds<Pixels>) -> Vec<bool> {
             let pixels = self.region(bounds);
             let bg = pixels[0];
@@ -108,53 +116,91 @@ mod checks {
     struct Mark {
         status: Status,
         phase: u8,
+        asset: Option<&'static str>,
+        background: Hsla,
+        ink: Hsla,
     }
     impl Render for Mark {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let theme = Theme::new(Appearance::Dark);
+            let glyph = if let Some(asset) = self.asset {
+                // The reference bypasses status_path and status_mark's mapping.
+                div()
+                    .size(Pixels::from(16.))
+                    .flex_none()
+                    .child(
+                        gpui_kit::component::Icon::default()
+                            .path(asset)
+                            .size(Pixels::from(16.))
+                            .text_color(self.ink),
+                    )
+                    .into_any_element()
+            } else {
+                icons::status_mark(&self.status, self.phase, Pixels::from(16.), self.ink)
+                    .into_any_element()
+            };
             div()
                 .size_full()
-                .bg(theme.colors.bg)
+                .bg(self.background)
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(icons::status_mark(
-                    &self.status,
-                    self.phase,
-                    Pixels::from(16.),
-                    theme.colors.text,
-                ))
+                .child(glyph)
         }
     }
 
-    fn statuses() -> [Status; 7] {
+    fn statuses() -> [(Status, &'static str); 7] {
         [
-            Status::Working { since: 0 },
-            Status::NeedsYou,
-            Status::Done { took: 0 },
-            Status::Failed,
-            Status::Idle,
-            Status::Held,
-            Status::Interrupted,
+            (Status::Working { since: 0 }, "marks/working.svg"),
+            (Status::NeedsYou, "marks/needs-you.svg"),
+            (Status::Done { took: 0 }, "marks/done.svg"),
+            (Status::Failed, "marks/failed.svg"),
+            (Status::Idle, "marks/idle.svg"),
+            (Status::Held, "marks/held.svg"),
+            (Status::Interrupted, "marks/interrupted.svg"),
         ]
     }
 
-    fn status_marks_have_distinct_raster_shapes_and_working_steps() {
+    fn mark_cell() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(Pixels::from(8.), Pixels::from(8.)),
+            size: size(Pixels::from(16.), Pixels::from(16.)),
+        }
+    }
+
+    fn reference_shape(asset: &'static str, background: Hsla, ink: Hsla) -> Vec<bool> {
         let mut cx = context();
         let window = cx
             .open_window(size(Pixels::from(32.), Pixels::from(32.)), |_, cx| {
                 cx.new(|_| Mark {
                     status: Status::Idle,
                     phase: 0,
+                    asset: Some(asset),
+                    background,
+                    ink,
                 })
             })
             .unwrap();
-        let cell = Bounds {
-            origin: point(Pixels::from(8.), Pixels::from(8.)),
-            size: size(Pixels::from(16.), Pixels::from(16.)),
-        };
+        draw(&mut cx, window.into());
+        Frame::capture(&mut cx, window.into()).shape(mark_cell())
+    }
+
+    fn status_marks_have_distinct_raster_shapes_and_working_steps() {
+        let mut cx = context();
+        let theme = Theme::new(Appearance::Dark);
+        let window = cx
+            .open_window(size(Pixels::from(32.), Pixels::from(32.)), |_, cx| {
+                cx.new(|_| Mark {
+                    status: Status::Idle,
+                    phase: 0,
+                    asset: None,
+                    background: theme.colors.bg,
+                    ink: theme.colors.text,
+                })
+            })
+            .unwrap();
+        let cell = mark_cell();
         let mut shapes = Vec::new();
-        for status in statuses() {
+        for (status, asset) in statuses() {
             cx.update(|cx| {
                 window.update(cx, |mark, _, cx| {
                     mark.status = status.clone();
@@ -164,6 +210,10 @@ mod checks {
             .unwrap();
             draw(&mut cx, window.into());
             let shape = Frame::capture(&mut cx, window.into()).shape(cell);
+            assert!(
+                shape == reference_shape(asset, theme.colors.bg, theme.colors.text),
+                "status raster does not match its asset: {status:?} {asset}"
+            );
             assert!(
                 !shapes.contains(&shape),
                 "status raster shape repeated: {status:?}"
@@ -198,9 +248,16 @@ mod checks {
         controls: BTreeMap<String, Bounds<Pixels>>,
         active: bool,
     }
+    fn control(controls: &BTreeMap<String, Bounds<Pixels>>, name: &str) -> Bounds<Pixels> {
+        controls
+            .get(&format!("Name(\"{name}\")"))
+            .copied()
+            .unwrap_or_else(|| panic!("control was not painted: {name}"))
+    }
+
     impl Paint {
         fn control(&self, name: &str) -> Bounds<Pixels> {
-            self.controls[&format!("Name(\"{name}\")")]
+            control(&self.controls, name)
         }
     }
 
@@ -464,18 +521,11 @@ mod checks {
                         && dock.contains(&q.bounds.bottom_right())),
                 "approval command wash {appearance:?}"
             );
-            let warning = Rgba::from(t.colors.warning);
-            let expected = [
-                (warning.r * 255.).round() as u8,
-                (warning.g * 255.).round() as u8,
-                (warning.b * 255.).round() as u8,
-            ];
             let frame = Frame::capture(&mut fixture.cx, fixture.window);
-            let ink = frame
-                .region(paint.control(&format!("allow-thread-{request}")))
-                .iter()
-                .filter(|p| p.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 5))
-                .count();
+            let ink = frame.color_pixels(
+                paint.control(&format!("allow-thread-{request}")),
+                t.colors.warning,
+            );
             assert!(
                 ink >= (2. * frame.scale * frame.scale) as usize,
                 "approval grant warning ink {appearance:?}"
@@ -501,7 +551,7 @@ mod checks {
             fixture.cx.update(|cx| {
                 let controls = &cx.global::<PaintedControls>().0;
                 for name in ["deny", "allow-once", "allow-thread"] {
-                    let bounds = controls[&format!("Name(\"{name}-{request}\")")];
+                    let bounds = control(controls, &format!("{name}-{request}"));
                     assert!(
                         bounds.left() >= Pixels::from(0.)
                             && bounds.top() >= Pixels::from(0.)
@@ -537,16 +587,11 @@ mod checks {
                     assert_eq!(state, (true, cursor, request));
                     let viewport =
                         fixture.update(|shell, _, _| shell.question_scroll.options.bounds());
-                    let (theme, scale, quads) = fixture
-                        .cx
-                        .update_window(fixture.window, |_, window, cx| {
-                            (
-                                cx.global::<Theme>().clone(),
-                                window.scale_factor(),
-                                window.painted_quads(),
-                            )
-                        })
-                        .unwrap();
+                    let paint = fixture.paint();
+                    let theme = &paint.theme;
+                    let scale = paint.scale;
+                    let quads = &paint.quads;
+                    let frame = Frame::capture(&mut fixture.cx, fixture.window);
                     let viewport = viewport.scale(scale);
                     let mut rows = quads
                         .iter()
@@ -576,7 +621,7 @@ mod checks {
                             if option == cursor { 4 } else { 0 },
                             "painted option cursor count {appearance:?} width={width} cursor={cursor} option={option}"
                         );
-                        for plate in plates {
+                        for plate in &plates {
                             assert_eq!(plate.bounds, bounds);
                             assert!(plate.background.is_transparent());
                             let stroke = theme.layout.focus_ring.scale(scale);
@@ -590,10 +635,35 @@ mod checks {
                                 assert!(viewport.contains(&point));
                             }
                         }
+                        if option == cursor {
+                            let half = theme.layout.focus_ring.scale(scale) / 2.;
+                            for point in [
+                                point(bounds.center().x, bounds.top() + half),
+                                point(bounds.right() - half, bounds.center().y),
+                                point(bounds.center().x, bounds.bottom() - half),
+                                point(bounds.left() + half, bounds.center().y),
+                            ] {
+                                assert!(
+                                    plates
+                                        .iter()
+                                        .any(|quad| quad.content_mask.bounds.contains(&point)),
+                                    "option cursor side midpoint clipped: {point:?} {appearance:?} width={width}"
+                                );
+                            }
+                        }
+                        let ink = frame.color_pixels(
+                            bounds.map(|v| Pixels::from(v.as_f32() / scale)),
+                            theme.colors.accent,
+                        );
+                        if option == cursor {
+                            assert!(
+                                ink >= (8. * scale * scale) as usize,
+                                "cursor ring pixels missing"
+                            );
+                        } else {
+                            assert_eq!(ink, 0, "cursor ring pixels on unselected option");
+                        }
                     }
-                    // Also exercise the renderer, rather than only layout/paint on TestAppContext.
-                    let image = Frame::capture(&mut fixture.cx, fixture.window);
-                    assert_eq!(image.width, (width * image.scale) as usize);
                 }
             }
         }
@@ -619,29 +689,27 @@ mod checks {
             cx.notify();
         });
         let mut shapes = Vec::new();
-        for status in statuses() {
+        for (status, asset) in statuses() {
             fixture.update(|shell, _, cx| {
                 shell.state.statuses.insert(child, status.clone());
                 cx.notify();
             });
             fixture.frame();
-            let bounds = fixture.cx.update(|cx| {
-                let control = cx
-                    .global::<PaintedControls>()
-                    .0
-                    .get(&format!("Name(\"child-open-{child}\")"))
-                    .copied()
-                    .expect("family child control painted");
-                let t = cx.global::<Theme>();
-                Bounds {
-                    origin: point(
-                        control.left() + t.space.0[3],
-                        control.center().y - t.layout.status_glyph / 2.,
-                    ),
-                    size: size(t.layout.status_glyph, t.layout.status_glyph),
-                }
-            });
+            let paint = fixture.paint();
+            let control = paint.control(&format!("child-open-{child}"));
+            let t = &paint.theme;
+            let bounds = Bounds {
+                origin: point(
+                    control.left(),
+                    control.center().y - t.layout.status_glyph / 2.,
+                ),
+                size: size(t.layout.status_glyph, t.layout.status_glyph),
+            };
             let shape = Frame::capture(&mut fixture.cx, fixture.window).shape(bounds);
+            assert!(
+                shape == reference_shape(asset, t.colors.card, sidebar::glyph_color(&status, t)),
+                "family status raster does not match its asset: {status:?} {asset}"
+            );
             assert!(
                 !shapes.contains(&shape),
                 "family card repeated a status raster: {status:?}"
@@ -674,21 +742,9 @@ mod checks {
                 origin: point(Pixels::from(320.), t.layout.header - Pixels::from(1.)),
                 size: size(Pixels::from(500.), Pixels::from(1.)),
             };
-            let bg = Rgba::from(t.colors.bg);
             let image = Frame::capture(&mut fixture.cx, fixture.window);
-            let expected = [
-                (bg.r * 255.).round() as u8,
-                (bg.g * 255.).round() as u8,
-                (bg.b * 255.).round() as u8,
-            ];
-            let samples = image.region(band);
             assert!(
-                samples
-                    .iter()
-                    .filter(|p| p.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 5))
-                    .count()
-                    * 10
-                    >= samples.len() * 9,
+                image.color_pixels(band, t.colors.bg) * 10 >= image.region(band).len() * 9,
                 "unscrolled header painted a rule {appearance:?}"
             );
         }
@@ -734,11 +790,6 @@ mod checks {
                     .collect();
                 assert_eq!(thumbs.len(), 1, "settings raised lit thumb {appearance:?}");
             }
-            assert!(
-                !Frame::capture(&mut fixture.cx, fixture.window)
-                    .rgba
-                    .is_empty()
-            );
         }
     }
 
@@ -879,6 +930,54 @@ mod checks {
         );
     }
 
+    #[derive(Default)]
+    struct Options {
+        filters: Vec<String>,
+        skips: Vec<String>,
+        exact: bool,
+        ignored: bool,
+        list: bool,
+    }
+    impl Options {
+        fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+            let mut options = Self::default();
+            let mut args = args;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--list" => options.list = true,
+                    "--exact" => options.exact = true,
+                    "--ignored" => options.ignored = true,
+                    "--nocapture" | "--show-output" => (), // This sequential runner always prints output.
+                    "--skip" => options
+                        .skips
+                        .push(args.next().ok_or("--skip requires a filter")?),
+                    "--" => {
+                        options.filters.extend(args);
+                        break;
+                    }
+                    _ if arg.starts_with("--skip=") => options.skips.push(arg[7..].to_owned()),
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("unsupported test argument: {arg}"));
+                    }
+                    _ => options.filters.push(arg),
+                }
+            }
+            Ok(options)
+        }
+        fn matches(&self, name: &str) -> bool {
+            let matches = |filter: &String| {
+                if self.exact {
+                    name == filter
+                } else {
+                    name.contains(filter)
+                }
+            };
+            !self.ignored
+                && (self.filters.is_empty() || self.filters.iter().any(matches))
+                && !self.skips.iter().any(matches)
+        }
+    }
+
     pub(crate) fn run() {
         let tests: &[(&str, fn())] = &[
             (
@@ -915,22 +1014,15 @@ mod checks {
             ),
             ("headless_stream_render_proxy", headless_stream_render_proxy),
         ];
-        let args: Vec<_> = std::env::args().skip(1).collect();
-        let filters: Vec<_> = args.iter().filter(|s| !s.starts_with('-')).collect();
+        let options = Options::parse(std::env::args().skip(1)).unwrap_or_else(|error| {
+            eprintln!("headless: {error}");
+            std::process::exit(2);
+        });
         let selected: Vec<_> = tests
             .iter()
-            .filter(|(name, _)| {
-                filters.is_empty()
-                    || filters.iter().any(|f| {
-                        if args.iter().any(|s| s == "--exact") {
-                            name == *f
-                        } else {
-                            name.contains(f.as_str())
-                        }
-                    })
-            })
+            .filter(|(name, _)| options.matches(name))
             .collect();
-        if args.iter().any(|s| s == "--list") {
+        if options.list {
             for (name, _) in selected {
                 println!("{name}: test");
             }

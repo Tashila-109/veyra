@@ -65,6 +65,7 @@ Direct versions are exact pins and `Cargo.lock` is kept.
 The engine's tokio features are `sync`, `rt-multi-thread`, `time`, `macros`, `process`, `io-util` and `net`; engine tests add `test-util`.
 Only the application crate declares gpui dependencies.
 It pins gpui-kit to =0.7.3 and gpui-pre to =0.3.9.
+Application tests add gpui-pre-platform =0.3.9 with `test-support` as the `gpui-platform` dev-dependency for its headless Metal renderer.
 The engine pins the macOS-only objc2 =0.6.5 and objc2-app-kit =0.3.2 dependencies to read NSWorkspace display options.
 The terminal window uses the alacritty_terminal cell, mode, colour and FairMutex types and portable-pty size type re-exported by the engine, so changes to those APIs also affect ui/terminal_view.rs.
 `platform_boundary` scans for libc, socket, process-group, target and listed command strings outside `platform/`; the header's `git` child is a reviewed exception.
@@ -1430,6 +1431,9 @@ The following clarifications and remaining differences are checked against the c
 - [Driver](crates/veyra/src/control.rs), [name coverage](crates/veyra/src/verify_map.rs), [verification skill](.agents/skills/verify-veyra/SKILL.md).
 
 ## Verification
+
+The `headless` test target uses `harness = false` to create the text system on the main thread and recompiles `src/ui/mod.rs` through `#[path]`.
+Plain `cargo test --workspace` runs its debug headless checks without showing a native window; its release runner prints that these checks run in debug only.
 
 The provider_options tests guard the repaired provider contract: offered_modes_and_run_mode, provider_mode_cycle_uses_only_offered_modes, list_providers_reports_offered_modes, ceiling_reads_parent_run_mode and child_requested_mode_is_checked_before_provider_run_mode cover the offered modes, requested child mode and parent's effective ceiling. claude_root_args_append_family_rules checks root-only family instructions; codex_initialize_opts_out_of_turn_diff checks both session and probe initialize.
 
