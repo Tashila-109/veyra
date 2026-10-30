@@ -136,6 +136,7 @@ The debug listener binds before the window opens.
 ## Quit and shutdown
 
 Quit opens a sheet for running, pending- or refused-admission, Starting and background-busy threads and for drawer tabs with foreground or child processes.
+Quit and shell-close sheet rows carry title, project, root and processes as separate typed fields; display punctuation is never decoded into those fields.
 Bare prompts do not require confirmation.
 Thread lines include the project and child lineage; shell lines name the thread, tab and processes.
 CancelQuit dismisses it and restores the originating composer or drawer focus until ConfirmQuit begins; afterward Escape and CancelQuit keep the sheet open.
@@ -1366,7 +1367,7 @@ actor_busy_ms is the elapsed time of the message currently being handled, or zer
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
 The composer exposes offered_modes and permission_picker_open beside its effective mode; selected_thread.config retains the stored configuration.
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
-Its debug-only bounds measure the dock frame; content_inset, focus_inset and focus_border report the padding and ring geometry used by its renderer. Dock text stays inside that padding in both focus states, with approval detail text constrained to the available width and wrapped or ellipsized there.
+Its debug-only bounds measure the padding box, the frame less its bottom border; content_inset, focus_inset and focus_border report the padding and ring geometry used by its renderer. Dock text stays inside that padding in both focus states, with approval detail text constrained to the available width and wrapped or ellipsized there.
 Its input_bounds are the measured textarea container, while the textarea keeps its own text and caret bounds internally. The toolbar wraps at narrow widths, keeping Send or Stop on the trailing edge of its row, and chat keeps three read lines above the composition surface. The debug control_focus records the focused button's ElementId beside the measured surface_bounds.
 Its allow_once_enabled, allow_in_thread_enabled and consent_reason use the same typed consent as the rendered controls.
 DebugStallUi blocks the window thread for its supplied milliseconds so the pump can be measured under a controlled stall.

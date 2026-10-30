@@ -1579,6 +1579,34 @@ impl Shell {
             .chain(self.running_shells())
             .collect()
     }
+    fn thread_sheet_row(&self, thread: &Thread) -> composer::SheetRow {
+        composer::SheetRow {
+            title: thread.title.clone(),
+            project: self
+                .state
+                .projects
+                .get(&thread.project)
+                .map(|project| project.name.clone())
+                .unwrap_or_default(),
+            root: self
+                .state
+                .threads
+                .get(&thread.root())
+                .filter(|root| root.id != thread.id)
+                .map(|root| root.title.clone()),
+            processes: Vec::new(),
+        }
+    }
+    fn busy_sheet_rows(&self) -> Vec<composer::SheetRow> {
+        let work = self.engine.window_threads();
+        self.state
+            .threads
+            .values()
+            .filter(|thread| work.get(&thread.id).is_some_and(|state| state.busy))
+            .map(|thread| self.thread_sheet_row(thread))
+            .chain(self.running_shell_rows())
+            .collect()
+    }
     fn stop_target(&self) -> Option<StopTarget> {
         let thread = self.view.chat()?;
         self.thread_stop_target(thread)
@@ -1848,9 +1876,9 @@ impl Shell {
                         )
                     })
                     .children(
-                        self.busy_threads()
+                        self.busy_sheet_rows()
                             .into_iter()
-                            .map(|title| composer::sheet_row(&title, cx)),
+                            .map(|row| composer::sheet_row(&row, cx)),
                     )
                     .child(
                         div()
@@ -3877,7 +3905,6 @@ mod tests {
                 cx.notify();
             });
             let theme = cx.update(|_, cx| cx.global::<super::Theme>().clone());
-            let mut snapshots = Vec::new();
             let mut mismatches = Vec::new();
             for width in [760., 960., 1950.] {
                 cx.simulate_resize(gpui::size(
@@ -3927,13 +3954,6 @@ mod tests {
                         values(padding)
                     ));
                 }
-                snapshots.push(serde_json::json!({
-                    "width":width,"reported":reported,"padding":values(padding),
-                    "border_box":values(frame),"input":values(input),"surface":values(surface),
-                }));
-            }
-            if let Some(path) = std::env::var_os("VEYRA_DOCK_GEOMETRY_PROOF") {
-                std::fs::write(path, serde_json::to_vec_pretty(&snapshots).unwrap()).unwrap();
             }
             assert!(mismatches.is_empty(), "{mismatches:?}");
         });
@@ -3977,7 +3997,6 @@ mod tests {
                 shell.scroller.update(cx, |state, cx| state.reset(2, cx));
                 cx.notify();
             });
-            let mut snapshots = Vec::new();
             for width in [760., 960., 1950.] {
                 cx.simulate_resize(gpui::size(
                     gpui::Pixels::from(width),
@@ -3986,55 +4005,16 @@ mod tests {
                 draw(cx);
                 let dump =
                     shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx));
-                let controls = [
-                    "header-title",
-                    "header-status",
-                    "header-thread-title",
-                    "model",
-                    "effort",
-                ]
-                .map(|name| {
-                    let key = format!("Name(\"{name}\")");
-                    (name, dump["look"]["controls"][key].clone())
-                });
-                let quads = cx.update(|window, _| {
-                    window
-                        .painted_quads()
-                        .into_iter()
-                        .map(|quad| {
-                            format!(
-                                "{:?}",
-                                (
-                                    quad.bounds,
-                                    quad.background,
-                                    quad.border_color,
-                                    quad.corner_radii,
-                                    quad.border_widths,
-                                    quad.content_mask,
-                                )
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
-                snapshots.push(serde_json::json!({
-                    "width":width,"controls":controls,"input":dump["composer"]["input_bounds"],
-                    "surface":dump["composer"]["surface_bounds"],"quads":quads,
-                }));
+                let input_bounds = dump["composer"]["input_bounds"].clone();
                 let before = shell.read_with(cx, |shell, _| shell.repaints);
                 for _ in 0..100 {
                     shell.read_with(cx, |shell, cx| {
                         let dump = shell.dump(std::path::Path::new("/tmp"), cx);
-                        assert_eq!(
-                            dump["composer"]["input_bounds"],
-                            snapshots.last().unwrap()["input"]
-                        );
+                        assert_eq!(dump["composer"]["input_bounds"], input_bounds);
                     });
                 }
                 cx.run_until_parked();
                 assert_eq!(shell.read_with(cx, |shell, _| shell.repaints), before);
-            }
-            if let Some(path) = std::env::var_os("VEYRA_LAYOUT_PROOF") {
-                std::fs::write(path, serde_json::to_vec_pretty(&snapshots).unwrap()).unwrap();
             }
         });
     }
@@ -4283,17 +4263,6 @@ mod tests {
                     );
                     #[cfg(debug_assertions)]
                     assert_eq!(dump["look"]["header_title"], expected);
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "HEADER_GEOMETRY {}",
-                        serde_json::json!({
-                            "viewport_width":width,
-                            "sidebar_width":dump["sidebar"]["width"],
-                            "view":dump["view"],
-                            "title":dump["look"]["header_title"],
-                            "bounds":dump["look"]["controls"]["Name(\"header-title\")"],
-                            "status_bounds":dump["look"]["controls"]["Name(\"header-status\")"]})
-                    );
                 }
             }
         });
@@ -4302,22 +4271,13 @@ mod tests {
     #[gpui::test]
     fn button_variant_foregrounds_match_dump(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
+            #[cfg(debug_assertions)]
             let bytes = |color| {
                 let color = gpui::Rgba::from(color);
                 [color.r, color.g, color.b, color.a].map(|channel| (channel * 255.).round() as u8)
             };
             for appearance in [super::Appearance::Dark, super::Appearance::Light] {
-                let colors = cx.update(|window, cx| {
-                    super::Theme::apply(appearance, window, cx);
-                    let kit = gpui_kit::component::Theme::global(cx);
-                    serde_json::json!({
-                        "appearance":appearance.name(),
-                        "primary_foreground":bytes(kit.primary_foreground),
-                        "button_primary_foreground":bytes(kit.button_primary_foreground),
-                        "button_danger_foreground":bytes(kit.button_danger_foreground),
-                        "on_solid":bytes(cx.global::<super::Theme>().colors.on_solid)})
-                });
-                println!("BUTTON_VARIANT_FOREGROUNDS {colors}");
+                cx.update(|window, cx| super::Theme::apply(appearance, window, cx));
                 assert_eq!(
                     shell.read_with(cx, |_, cx| cx.global::<super::Theme>().appearance),
                     appearance
@@ -4326,6 +4286,13 @@ mod tests {
                 {
                     let dump =
                         shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new(""), cx));
+                    let colors = cx.update(|_, cx| {
+                        let kit = gpui_kit::component::Theme::global(cx);
+                        serde_json::json!({
+                            "button_primary_foreground":bytes(kit.button_primary_foreground),
+                            "button_danger_foreground":bytes(kit.button_danger_foreground),
+                        })
+                    });
                     for role in ["button_primary_foreground", "button_danger_foreground"] {
                         assert_eq!(dump["look"]["colors"][role], colors[role]);
                     }
@@ -4361,6 +4328,130 @@ mod tests {
     }
 
     #[gpui::test]
+    fn option_cursor_paints_only_the_current_row(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let request = shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                cx.notify();
+                shell.state.requests[0].id
+            });
+            let mut mismatches = Vec::new();
+            for width in [760., 960., 1950.] {
+                cx.simulate_resize(gpui::size(
+                    gpui::Pixels::from(width),
+                    gpui::Pixels::from(740.),
+                ));
+                draw(cx);
+                cx.dispatch_action(super::FocusDock);
+                cx.dispatch_action(super::MoveOptionUp);
+                draw(cx);
+                for cursor in 0..2 {
+                    if cursor == 1 {
+                        cx.dispatch_action(super::MoveOptionDown);
+                        draw(cx);
+                    }
+                    shell.read_with(cx, |shell, _| {
+                        assert!(shell.dock_focused);
+                        assert_eq!(shell.question_scroll.cursor, cursor);
+                        assert_eq!(shell.state.requests[0].id, request);
+                    });
+                    let viewport =
+                        shell.read_with(cx, |shell, _| shell.question_scroll.options.bounds());
+                    cx.update(|window, cx| {
+                        let theme = cx.global::<super::Theme>();
+                        let scale = window.scale_factor();
+                        let quads = window.painted_quads();
+                        let viewport = viewport.scale(scale);
+                        let mut rows = quads
+                            .iter()
+                            .filter(|quad| {
+                                quad.background == theme.colors.card.into()
+                                    && quad.bounds.left() >= viewport.left()
+                                    && quad.bounds.right() <= viewport.right()
+                                    && quad.bounds.top() >= viewport.top()
+                                    && quad.bounds.bottom() <= viewport.bottom()
+                            })
+                            .collect::<Vec<_>>();
+                        rows.sort_by_key(|quad| quad.bounds.top());
+                        assert_eq!(rows.len(), 2);
+                        for (option, row) in rows.into_iter().enumerate() {
+                            let row = row
+                                .bounds
+                                .map(|value| gpui::Pixels::from(value.as_f32() / scale));
+                            let cursor_bounds = row.inset(theme.layout.focus_inset);
+                            let bounds = cursor_bounds.scale(scale);
+                            let row = row.scale(scale);
+                            let plates = quads
+                                .iter()
+                                .filter(|quad| {
+                                    quad.border_color == theme.colors.accent
+                                        && row.contains(&quad.bounds.origin)
+                                        && row.contains(&quad.bounds.bottom_right())
+                                })
+                                .collect::<Vec<_>>();
+                            let expected = if option == cursor { 4 } else { 0 };
+                            if plates.len() != expected {
+                                mismatches.push((
+                                    "painted option cursor count",
+                                    width,
+                                    cursor,
+                                    option,
+                                    expected,
+                                    plates.len(),
+                                ));
+                            }
+                            for plate in &plates {
+                                assert_eq!(plate.bounds, bounds);
+                                assert!(plate.background.is_transparent());
+                                let stroke = theme.layout.focus_ring.scale(scale);
+                                assert_eq!(plate.border_widths.top, stroke);
+                                assert_eq!(plate.border_widths.right, stroke);
+                                assert_eq!(plate.border_widths.bottom, stroke);
+                                assert_eq!(plate.border_widths.left, stroke);
+                                let radius =
+                                    (theme.radius.control - theme.layout.focus_inset).scale(scale);
+                                assert_eq!(plate.corner_radii.top_left, radius);
+                                assert_eq!(plate.corner_radii.top_right, radius);
+                                assert_eq!(plate.corner_radii.bottom_left, radius);
+                                assert_eq!(plate.corner_radii.bottom_right, radius);
+                            }
+                            if option == cursor && plates.len() == expected {
+                                let half = theme.layout.focus_ring / 2.;
+                                for point in [
+                                    gpui::point(
+                                        cursor_bounds.center().x,
+                                        cursor_bounds.top() + half,
+                                    ),
+                                    gpui::point(
+                                        cursor_bounds.right() - half,
+                                        cursor_bounds.center().y,
+                                    ),
+                                    gpui::point(
+                                        cursor_bounds.center().x,
+                                        cursor_bounds.bottom() - half,
+                                    ),
+                                    gpui::point(
+                                        cursor_bounds.left() + half,
+                                        cursor_bounds.center().y,
+                                    ),
+                                ] {
+                                    assert!(plates.iter().any(|quad| {
+                                        quad.content_mask.bounds.contains(&point.scale(scale))
+                                    }));
+                                }
+                            }
+                            assert!(quads.iter().any(|quad| {
+                                quad.bounds == row && quad.background == theme.colors.card.into()
+                            }));
+                        }
+                    });
+                }
+            }
+            assert!(mismatches.is_empty(), "{mismatches:?}");
+        });
+    }
+
+    #[gpui::test]
     fn option_cursor_moves_and_answers(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let request = shell.update(cx, |shell, cx| {
@@ -4383,6 +4474,46 @@ mod tests {
                 );
                 assert!(!shell.dock_focused);
             });
+        });
+    }
+    #[gpui::test]
+    fn settings_segments_paint_card_tracks_and_raised_thumbs(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                shell.show(super::MainView::Settings { back: None });
+                cx.notify();
+            });
+            for appearance in [super::Appearance::Dark, super::Appearance::Light] {
+                cx.update(|window, cx| super::Theme::apply(appearance, window, cx));
+                draw(cx);
+                cx.update(|window, cx| {
+                    let t = cx.global::<super::Theme>();
+                    let scale = window.scale_factor();
+                    let quads = window.painted_quads();
+                    let tracks = quads
+                        .iter()
+                        .filter(|quad| {
+                            quad.background == t.colors.card.into()
+                                && quad.bounds.size.height == t.layout.segment_height.scale(scale)
+                                && quad.corner_radii.top_left == t.radius.track.scale(scale)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(tracks.len(), 2, "{appearance:?}: card tracks");
+                    for track in tracks {
+                        let thumbs = quads
+                            .iter()
+                            .filter(|quad| {
+                                quad.background == t.colors.raised.into()
+                                    && quad.bounds.left() > track.bounds.left()
+                                    && quad.bounds.right() < track.bounds.right()
+                                    && quad.bounds.top() >= track.bounds.top()
+                                    && quad.bounds.bottom() <= track.bounds.bottom()
+                            })
+                            .count();
+                        assert_eq!(thumbs, 1, "{appearance:?}: raised thumb");
+                    }
+                });
+            }
         });
     }
 
@@ -11237,6 +11368,49 @@ mod tests {
                     "Project · Root title / File reporter"
                 );
             });
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn sheet_rows_preserve_middle_dots_in_titles_and_projects(cx: &mut gpui::TestAppContext) {
+        let text = std::sync::Arc::new(crate::tests::RenderedText::default());
+        let mut test =
+            gpui::TestAppContext::build_with_text_system(cx.dispatcher.clone(), None, text.clone());
+        with_docked_shell(&mut test, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                let (root, child, _) = add_family(shell, cx);
+                let project = shell.state.threads[&child].project;
+                shell.state.projects.get_mut(&project).unwrap().name = "Project · Notes".into();
+                shell.state.threads.get_mut(&root).unwrap().title = "Root · Work".into();
+                shell.state.threads.get_mut(&child).unwrap().title = "Fix A · B".into();
+                shell.close_sheet = Some(super::drawer::CloseSheet {
+                    target: super::drawer::CloseTarget::Tab {
+                        thread: child,
+                        number: 1,
+                    },
+                    processes: vec!["zsh 1: sleep · 2".into()],
+                    drawer_focus: false,
+                });
+                cx.notify();
+            });
+            draw(cx);
+            for expected in [
+                "Fix A · B",
+                "Project · Notes",
+                "Root · Work",
+                "zsh 1: sleep · 2",
+            ] {
+                assert!(
+                    text.lines().contains(expected),
+                    "missing sheet field: {expected}"
+                );
+            }
+            for fragment in ["Notes", "B", "Root", "Work"] {
+                assert!(
+                    !text.lines().contains(fragment),
+                    "split sheet field: {fragment}"
+                );
+            }
         });
     }
     #[cfg(debug_assertions)]

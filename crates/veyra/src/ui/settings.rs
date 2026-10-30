@@ -63,7 +63,7 @@ pub fn render(settings: Settings, notice: Option<SharedString>, cx: &App) -> imp
                     .selected(mode == settings.default_mode)
                     .when(mode == settings.default_mode, |button| {
                         button
-                            .bg(t.plate(t.colors.card))
+                            .bg(t.colors.raised)
                             .border(t.layout.border)
                             .border_color(t.colors.border)
                             .shadow(t.plate_highlight())
@@ -203,7 +203,7 @@ fn segment_track(cx: &App) -> Div {
         .p(t.layout.segment_padding)
         .gap(t.layout.segment_padding)
         .rounded(t.radius.track)
-        .bg(t.colors.raised)
+        .bg(t.colors.card)
 }
 
 pub(super) fn background_button(
@@ -218,7 +218,7 @@ pub(super) fn background_button(
         .disabled(t.look.forced_by().is_some())
         .when(selected, |button| {
             button
-                .bg(t.plate(t.colors.card))
+                .bg(t.colors.raised)
                 .border(t.layout.border)
                 .border_color(t.colors.border)
                 .shadow(t.plate_highlight())
@@ -231,4 +231,35 @@ pub(super) fn background_button(
                 cx,
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Theme, background_button, segment_track};
+    use gpui_kit::{Fill, Styled};
+
+    #[gpui::test]
+    fn segments_use_card_tracks_and_lit_thumbs(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for appearance in [
+                super::super::Appearance::Dark,
+                super::super::Appearance::Light,
+            ] {
+                cx.set_global(Theme::new(appearance));
+                let t = cx.global::<Theme>();
+                let mut track = segment_track(cx);
+                assert_eq!(
+                    track.style().background.as_ref().and_then(Fill::color),
+                    Some(t.colors.card.into())
+                );
+                let mut thumb = background_button(t.look.background(), "Selected", cx);
+                assert_eq!(
+                    thumb.style().background.as_ref().and_then(Fill::color),
+                    Some(t.colors.raised.into())
+                );
+                assert_eq!(thumb.style().box_shadow, Some(t.plate_highlight()));
+            }
+        });
+    }
 }

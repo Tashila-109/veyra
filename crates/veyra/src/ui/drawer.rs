@@ -227,6 +227,28 @@ impl Shell {
             })
             .collect()
     }
+    pub(super) fn running_shell_rows(&self) -> Vec<super::composer::SheetRow> {
+        self.drawers
+            .keys()
+            .flat_map(|thread| {
+                self.tab_processes(*thread).into_iter().map(|process| {
+                    let mut row = self
+                        .state
+                        .threads
+                        .get(thread)
+                        .map(|thread| self.thread_sheet_row(thread))
+                        .unwrap_or_else(|| super::composer::SheetRow {
+                            title: "Thread".into(),
+                            project: String::new(),
+                            root: None,
+                            processes: Vec::new(),
+                        });
+                    row.processes.push(process);
+                    row
+                })
+            })
+            .collect()
+    }
     pub(super) fn ask_close_shell(
         &mut self,
         thread: ThreadId,
@@ -692,20 +714,21 @@ impl Shell {
                             sheet.processes.len(),
                             if sheet.processes.len() == 1 { "" } else { "s" }
                         ))
-                        .children(self.state.threads.get(&thread).map(|thread| {
-                            super::composer::sheet_row(&self.thread_label(thread), cx)
-                        }))
-                        .children(sheet.processes.iter().map(|name| {
-                            div()
-                                .h_flex()
-                                .gap(theme.layout.control_gap)
-                                .child(Icon::new(IconName::Terminal).size(theme.layout.small_icon))
-                                .child(
-                                    div()
-                                        .font_family(theme.text.mono_font.clone())
-                                        .child(name.clone()),
-                                )
-                        }))
+                        .child({
+                            let mut row = self
+                                .state
+                                .threads
+                                .get(&thread)
+                                .map(|thread| self.thread_sheet_row(thread))
+                                .unwrap_or_else(|| super::composer::SheetRow {
+                                    title: "Thread".into(),
+                                    project: String::new(),
+                                    root: None,
+                                    processes: Vec::new(),
+                                });
+                            row.processes.clone_from(&sheet.processes);
+                            super::composer::sheet_row(&row, cx)
+                        })
                         .child(
                             div()
                                 .h_flex()

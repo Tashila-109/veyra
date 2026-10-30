@@ -894,10 +894,14 @@ fn grant_spans(caption: &str, cx: &App) -> Div {
         })
         .when(command.is_none(), |row| row.child(caption.to_owned()))
 }
-pub(super) fn sheet_row(label: &str, cx: &App) -> Div {
+pub(super) struct SheetRow {
+    pub title: String,
+    pub project: String,
+    pub root: Option<String>,
+    pub processes: Vec<String>,
+}
+pub(super) fn sheet_row(row: &SheetRow, cx: &App) -> Div {
     let t = cx.global::<Theme>();
-    let parts: Vec<_> = label.split(" · ").collect();
-    let title = parts.get(1).unwrap_or(&label);
     div()
         .v_flex()
         .gap(t.space.0[0])
@@ -905,30 +909,36 @@ pub(super) fn sheet_row(label: &str, cx: &App) -> Div {
             div()
                 .text_size(t.text.ui.size)
                 .font_weight(t.text.title_weight)
-                .child((*title).to_owned()),
+                .child(row.title.clone()),
         )
-        .when(parts.len() > 1, |row| {
-            row.child(
+        .when(!row.project.is_empty(), |element| {
+            element.child(
                 div()
                     .text_size(t.text.label.size)
                     .text_color(t.colors.text_muted)
-                    .child(parts[0].to_owned()),
+                    .child(row.project.clone()),
             )
         })
-        .when(parts.len() > 2, |row| {
-            row.child(
+        .when_some(row.root.clone(), |element, root| {
+            element.child(
                 div()
-                    .h_flex()
-                    .gap(t.layout.control_gap)
-                    .child(Icon::new(IconName::Terminal).size(t.layout.small_icon))
-                    .child(
-                        div()
-                            .font_family(t.text.mono_font.clone())
-                            .text_size(t.text.code.size)
-                            .child(parts[2..].join(" · ")),
-                    ),
+                    .text_size(t.text.label.size)
+                    .text_color(t.colors.text_muted)
+                    .child(root),
             )
         })
+        .children(row.processes.iter().map(|process| {
+            div()
+                .h_flex()
+                .gap(t.layout.control_gap)
+                .child(Icon::new(IconName::Terminal).size(t.layout.small_icon))
+                .child(
+                    div()
+                        .font_family(t.text.mono_font.clone())
+                        .text_size(t.text.code.size)
+                        .child(process.clone()),
+                )
+        }))
 }
 pub(super) fn button_text(label: SharedString, cx: &App) -> Div {
     let t = cx.global::<Theme>();
