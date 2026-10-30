@@ -108,7 +108,7 @@ def run_guard(args, expected):
             '--part',args.part if side=='candidate' else '6c']
         if focus: command += ['--idle-focus',focus]
         if motion: command += ['--motion',motion]
-        quiet = quiet_machine.wait_for_quiet(root/(label+'-quiet.json'),command)
+        quiet = o.admit_native(root/(label+'-quiet.json'),args.deadline,command)
         frozen()
         env = dict(os.environ,VEYRA_FRAME_GUARD_PROOF=str(root),VEYRA_FRAME_BASELINE=str(baseline),
             VEYRA_FRAME_BASELINE_REV=BASELINE_REVISION,VEYRA_FRAME_TOOLS=str(o.tier_tools(args.tier_s)),

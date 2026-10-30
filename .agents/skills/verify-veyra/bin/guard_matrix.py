@@ -135,6 +135,21 @@ PLANTS += [
     Plant('privacy-no-retry','backdrop-missing','bin/freshness.py','retry_capture','handler-raise','SafetyStop','continue'),
 ]
 
+PLANTS += [
+    Plant('smoke-global-drain','smoke-scoped-drain','bin/smoke.py','drained','expression',
+        '''all(d.sql("select live_pgid is null from threads where id='"+thread+"'")=='1' for thread in threads)''',
+        '''d.sql('select count(*) from threads where live_pgid is not null')=='0' '''),
+    Plant('smoke-child-still-live','smoke-scoped-drain','bin/smoke.py','drained','body','','return True'),
+    Plant('smoke-parent-state','smoke-scoped-drain','bin/smoke.py','family_stopped','expression',"parent['status']=='Held'",'True'),
+    Plant('smoke-parent-hold','smoke-scoped-drain','bin/smoke.py','family_stopped','expression',"parent['hold']=='stopped'",'True'),
+    Plant('smoke-child-outcome','smoke-scoped-drain','bin/smoke.py','family_stopped','expression',"'Interrupted' in outcome",'True'),
+    Plant('smoke-pending-wake','smoke-scoped-drain','bin/smoke.py','family_stopped','expression',"settled.get('delivery',{}).get('Pending',{}).get('wake')",'True'),
+    Plant('failure-no-hid','failure-hid','bin/run','attempt.execute','expression',"observe(proof,title,seen.get('kind','section'),'section-exit')",'{}'),
+    Plant('failure-poll-no-hid','failure-hid','bin/driver.py','poll','remove-call','observe_failure'),
+    Plant('failure-reused-name','failure-captures','bin/run','failure_capture','after-assignment','label',"label='failure'"),
+    Plant('native-skipped-quiet','quiet-native','bin/run','run_native','remove-call','admit_native'),
+]
+
 def expression(source):
     return ast.parse(source,mode='eval').body
 

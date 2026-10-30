@@ -67,6 +67,8 @@ class Fixture:
         self.calls=[];self.probes=[];self.child_events=[];self.wait_masks=[];self.capture_guard_reads=0;self.interrupt_probe=False;self.window_starts=0;self.modern=False;self.transient_toast=False;self.final_toast_change=False
         self.cover=None;self.cpu_ratio=1.;self.cpu_ratios=[];self.rate=60.;self.gap=20;self.after_probe=None;self.before_probe=None;self.capture_failures=0
         self.failures_used=0;self.idle=200;self.lock=False;self.busy_until=-1;self.running=False;self.pid=99999999
+        self.load=0.1;self.load_until=None;self.load_error=False;self.load_queries=0;self.vary_capture=False;self.capture_number=0;self.launch_times=[];self.lane='live'
+        self.capture_guard_contexts=[];self.in_failure_capture=False
         self.batch_script={};self.app_launches=0;self.mode='full_access';self.background='solid';self.stale_image=False;self.cleanup_failure=False;self.yabai=False;self.window_flags={};self.frame={'x':20,'y':40,'w':1280,'h':800};self.run='0123abcd'
     def __enter__(self):
         self.cwd=pathlib.Path.cwd();self.module=sys.modules.get('driver')
@@ -143,7 +145,7 @@ class Fixture:
     def load_driver(self,run):
         self.run=run;self.proof=self.repo/'target/verify-veyra'/run
         self.proof.mkdir(parents=True,exist_ok=True);(self.proof/'fixtures').mkdir(exist_ok=True)
-        (self.proof/'lane').write_text('live\n')
+        (self.proof/'lane').write_text(self.lane+'\n')
         if not (self.proof/'configured-default-mode').exists(): (self.proof/'configured-default-mode').write_text('full_access\n')
         (self.proof/'pages-run').write_text('app-launch-main\n')
         if not (self.proof/'input-idle-launch.json').exists():
@@ -154,6 +156,8 @@ class Fixture:
         (self.data/'logs').mkdir(exist_ok=True)
         (self.data/'logs/veyra.log').write_text(f'veyra ready pid={self.pid} data_dir={self.data}\n')
         (self.data/'veyra.db').write_text('fixture database; SQL is an OS boundary')
+        if self.lane=='fake':
+            echo=self.repo/'crates/engine/tests/fixtures/tui/echo.jsonl';echo.parent.mkdir(parents=True,exist_ok=True);echo.write_text('{}\n')
         spec=importlib.util.spec_from_file_location('driver',o.BIN/'driver.py');module=importlib.util.module_from_spec(spec)
         sys.modules['driver']=module;spec.loader.exec_module(module)
         return module
@@ -190,7 +194,10 @@ class Fixture:
             if 'IOHIDSystem' in argv: out='"HIDIdleTime" = '+str(self.idle*1_000_000_000)
             else: out='CGSSessionScreenIsLocked' if self.lock else ''
         elif name=='pgrep': out=str(self.pid) if self.running or self.clock.now<self.busy_until else '';code=0 if out else 1
-        elif name=='sysctl': out='{ 0.1 0.1 0.1 }'
+        elif name=='sysctl':
+            self.load_queries+=1;code=1 if self.load_error else 0
+            value=self.load if self.load_until is None or self.clock.now<self.load_until else 0.1
+            out='{ '+str(value)+' 0.1 0.1 }'
         elif name=='defaults': out='Dark'
         elif name=='sqlite3':
             query=argv[-1]
@@ -225,10 +232,12 @@ class Fixture:
         elif name=='visible-frame': out=json.dumps({'visible_frame':[2560,23,2560,1385]})
         elif name=='winid': out='24,60,960,740' if '--bounds' in argv else '23'
         elif name=='capture-window':
+            self.capture_guard_contexts.append(self.in_failure_capture)
             self.capture_guard_reads+=1
             if self.failures_used<self.capture_failures: self.failures_used+=1;code=1
         elif name=='screencapture':
-            image=pathlib.Path(argv[-1]);image.write_bytes(b'fresh synthetic image')
+            self.capture_number+=1
+            image=pathlib.Path(argv[-1]);image.write_bytes(b'fresh synthetic image'+(str(self.capture_number).encode() if self.vary_capture else b''))
             if self.stale_image: os.utime(image,ns=(1,1))
         else: raise AssertionError('OS command forbidden in offline fixture: '+repr(argv))
         if options.get('check') and code: raise subprocess.CalledProcessError(code,argv)
@@ -237,6 +246,7 @@ class Fixture:
         return SimpleNamespace(returncode=code,stdout=out,stderr=err)
     def popen(self,argv,**options):
         self.calls.append([str(p) for p in argv]);fixture=self
+        if str(argv[0])=='bash':self.launch_times.append(self.clock.now)
         if self.crash_target_spawn and str(argv[0])=='bash' and str(argv[-1])=='TARGET': raise RuntimeError('fixture runner spawn failed')
         if pathlib.Path(str(argv[0])).name=='run':
             from negative_tests import MutantChild
@@ -289,6 +299,11 @@ class Fixture:
                             fixture.running=False
                             if fixture.end_change: (fixture.repo/'crates/veyra/src/ui/theme.rs').write_text('end-of-run identity changed')
                             if not fixture.leave_scratch: shutil.rmtree(fixture.data)
+                        self.returncode=0;return '',''
+                    if pathlib.Path(str(argv[0])).name.startswith('python') and str(argv[1])=='-c':
+                        fixture.in_failure_capture=True
+                        try: exec(str(argv[2]),{'__name__':'__fixture_python_child__'})
+                        finally: fixture.in_failure_capture=False
                         self.returncode=0;return '',''
                     if 'ctl' not in [str(p) for p in argv]:
                         fixture.app_launches+=1;fixture.running=True
@@ -491,7 +506,7 @@ def capture_then_assertion_is_failed(f):
     fresh=json.loads((f.evidence/'attempt-1/run/recovered-freshness.json').read_text())
     assert fresh['sha256'] and f.failures_used==1
     seen=json.loads((f.evidence/'attempt-1/run/focus-failure.json').read_text())
-    assert seen['capture_exhausted'] is False and f.capture_guard_reads==3, 'recovered capture did not clear exhaustion or stop after its second attempt'
+    assert seen['capture_exhausted'] is False and f.capture_guard_contexts.count(False)==3, 'recovered capture did not clear exhaustion or stop after its second attempt'
 
 def exhausted_capture_is_blocked(f):
     f.capture_failures=3
@@ -709,6 +724,8 @@ CASES = [
 
 from negative_tests import CASES as RESTORED_CASES
 CASES += RESTORED_CASES
+from smoke_tests import CASES as SMOKE_CASES
+CASES += SMOKE_CASES
 
 def run(runner):
     from guard_matrix import check_registry

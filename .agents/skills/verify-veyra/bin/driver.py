@@ -185,7 +185,7 @@ def poll(name, predicate):
             with (PROOF/'drive.log').open('a') as out: out.write(f'$ poll {name} matched\n')
             return dump
         time.sleep(.05)
-    if 'focus' in name: observe_failure(name,'focus-timeout')
+    observe_failure(name,'focus-timeout' if 'focus' in name else 'assertion')
     raise AssertionError(name + ' timed out')
 def configured_default_mode():
     mode = (PROOF/'configured-default-mode').read_text().strip()
@@ -526,15 +526,8 @@ def gate():
     save('focus-failure',clock)
 def observe_failure(step, kind):
     """Record whether human input came after launch, so a supervisor retries only a failure no person caused."""
-    path = PROOF/'input-idle-launch.json'
-    if not path.exists(): return
-    clock = json.loads(path.read_text())
-    idle = input_idle_seconds()
-    elapsed = time.monotonic()-clock['launch_monotonic']
-    clock.update(failure=step,kind=kind,failure_idle_seconds=idle,seconds_since_launch=elapsed,
-        failure_epoch=time.time(),human_input=idle < elapsed,
-        classification='human-input' if idle < elapsed else 'no-human-input')
-    save('focus-failure',clock)
+    from failure_observation import observe
+    return observe(PROOF,step,kind)
 def make_git_shim():
     """Put a run-owned git first on the fake lane's PATH; it answers the branch read only while branch-on exists."""
     import shlex

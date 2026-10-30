@@ -1,8 +1,23 @@
 """Bounded capture scenes for selected pages. They prove only these scenes, never a full page."""
+import re
+
+def drained(d, threads):
+    assert all(re.fullmatch(r'[0-9a-f-]{36}',thread) for thread in threads), 'invalid scene thread id'
+    return all(d.sql("select live_pgid is null from threads where id='"+thread+"'")=='1' for thread in threads)
+
+def family_stopped(state, root, child, task):
+    parent=state['selected_thread']
+    row=next((row for row in state['tasks'] if row['id']==task),{})
+    settled=row.get('state',{}).get('Settled',{}) if isinstance(row.get('state'),dict) else {}
+    outcome=settled.get('outcome')
+    return bool(parent and parent['id']==root and parent['status']=='Held' and parent['hold']=='stopped'
+        and row.get('parent')==root and row.get('child')==child
+        and isinstance(outcome,dict) and 'Interrupted' in outcome and settled.get('delivery',{}).get('Pending',{}).get('wake'))
+
 def drive(page):
     import driver as d
     d.prepare()
-    threads = []
+    threads = [];family=None
     try:
         if page == 'settings':
             d.action('smoke-settings','OpenSettings')
@@ -14,7 +29,8 @@ def drive(page):
             threads.append(thread)
             d.poll('smoke-dock',lambda state:state['composer']['dock'] is not None)
         elif page == 'multi-agent':
-            root,child,_ = d.create_family('smoke-family',child='running')
+            root,child,task = d.create_family('smoke-family',child='running')
+            family=(root,child,task)
             threads += [root,child]
             d.select('smoke-family-selected',root)
             d.poll('smoke-family-card',lambda state:state['transcript']['family_card'] is not None)
@@ -38,11 +54,15 @@ def drive(page):
         if page == 'restart-recovery':
             d.ctl('smoke-quit-cancel','keys','escape')
             d.poll('smoke-quit-closed',lambda state:not state['quit_sheet']['open'])
-        for thread in threads: d.action('smoke-stop-'+thread,'StopThread',{'thread':thread})
-        d.poll('smoke-provider-groups-ended',lambda state:d.sql('select count(*) from threads where live_pgid is not null')=='0')
-        if page == 'shell-drawer':
-            d.action('smoke-drawer-focus','DebugFocusShellDrawer')
-            d.ctl('smoke-drawer-close','keys','secondary-w')
-            d.poll('smoke-drawer-hidden',lambda state:not state['drawer']['open'])
-        d.action('smoke-default-restore','SetDefaultMode',{'mode':'full_access'})
-        d.prepare()
+        try:
+            for thread in threads: d.action('smoke-stop-'+thread,'StopThread',{'thread':thread})
+            scope=[family[1]] if family else threads
+            d.poll('smoke-provider-groups-ended',lambda state:(not family or family_stopped(state,*family)) and drained(d,scope))
+        finally:
+            d.owned_instance_pid()
+            if page == 'shell-drawer':
+                d.action('smoke-drawer-focus','DebugFocusShellDrawer')
+                d.ctl('smoke-drawer-close','keys','secondary-w')
+                d.poll('smoke-drawer-hidden',lambda state:not state['drawer']['open'])
+            d.action('smoke-default-restore','SetDefaultMode',{'mode':'full_access'})
+            d.prepare()

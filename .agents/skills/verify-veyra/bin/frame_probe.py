@@ -10,8 +10,10 @@ def main(argv=None, window=None):
     authenticate_baseline(baseline)
     expected = o.code_identity()
     tier = pathlib.Path(os.environ['VEYRA_VERIFY_TIER_S'])
-    o.require_tier(tier,expected)
-    o.require_go(os.environ['VEYRA_VERIFY_GO'],expected,float(os.environ['VEYRA_VERIFY_DEADLINE']),guard=True)
+    def admission():
+        o.require_tier(tier,expected)
+        o.require_go(os.environ['VEYRA_VERIFY_GO'],expected,float(os.environ['VEYRA_VERIFY_DEADLINE']),guard=True)
+    admission()
     tools = pathlib.Path(os.environ['VEYRA_FRAME_TOOLS']).resolve()
     assert tools == o.tier_tools(tier), 'probe tools differ from admitted tools'
     o.helper_paths(tools)
@@ -21,13 +23,17 @@ def main(argv=None, window=None):
     (output/'worker-pid').write_text(str(os.getpid())+'\n')
     result = {'phase':args.phase,'side':args.side,'label':args.label,'part':args.part,'passed':False,'measurement_started':False}
     handlers = {}
-    if window is None:
+    native = window is None
+    if native:
         def interrupted(number, frame): raise KeyboardInterrupt('owned frame probe interrupted')
         for number in o.SIGNALS:
             handlers[number] = signal.signal(number,interrupted)
         from frame_native import NativeWindow
         window = NativeWindow()
     try:
+        o.admit_native(output/'quiet-machine.json',float(os.environ['VEYRA_VERIFY_DEADLINE']),['frame-probe',args.label])
+        assert o.code_identity()==expected, 'probe candidate identity changed during admission'
+        admission()
         window.start(args,tools,baseline,result)
         initial = window.read('initial')
         require_part(initial,args.part,args.side)

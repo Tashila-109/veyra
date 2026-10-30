@@ -197,7 +197,8 @@ def go_variants(f):
         f.write_go(**change)
         f.args.deadline=(change['cutoff_epoch']-1) if 'cutoff_epoch' in change else f.clock.time()+3600
         f.args.evidence=f.root/('go-negative-'+str(index));f.args.evidence.mkdir()
-        require_rejection(lambda:fg.run_guard(f.args,f.expected))
+        message='fresh GO for this identity required' if 'identity' in change else 'guard GO/pause required' if 'arch_plan_paused' in change else 'away window is not armed'
+        require_rejection(lambda:fg.run_guard(f.args,f.expected),message)
         assert not f.probes, 'invalid GO launched probe'
     f.write_go();f.args.deadline=json.loads(f.go.read_text())['cutoff_epoch']+1
     f.args.evidence=f.root/'go-deadline';f.args.evidence.mkdir()

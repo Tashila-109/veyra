@@ -104,7 +104,17 @@
     "plant-list-shrink",
     "plant-list-rename",
     "capture-discard-all",
-    "privacy-no-retry"
+    "privacy-no-retry",
+    "smoke-global-drain",
+    "smoke-child-still-live",
+    "smoke-parent-state",
+    "smoke-parent-hold",
+    "smoke-child-outcome",
+    "smoke-pending-wake",
+    "failure-no-hid",
+    "failure-poll-no-hid",
+    "failure-reused-name",
+    "native-skipped-quiet"
   ],
   "positive_cases": [
     "start-entry",

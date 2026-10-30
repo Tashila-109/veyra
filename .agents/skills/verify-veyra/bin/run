@@ -199,26 +199,33 @@ def classify(code, observed, fatal=False, deadline=False):
     if deadline or (observed or {}).get('capture_exhausted') is True: return 'blocked'
     return 'failed' if code else 'passed'
 
-def failure_capture(env, out):
+def failure_capture(env, out, section, number):
     """One best-effort screenshot of the failed state, taken inside attempt()'s try so Cleanup follows whatever it does.
 
     It returns what happened, its own write error included, and never raises.
     """
-    process, result = None, {}
+    label='failure-'+re.sub(r'[^a-z0-9]+','-',section.lower()).strip('-')+'-'+str(number)
+    process, result = None, {'section':section,'label':label}
     try:
-        process,previous = start_owned(['python3','-c',"from driver import *; capture('failure')"],cwd=REPO,
+        process,previous = start_owned(['python3','-c',"from driver import *; capture("+repr(label)+")"],cwd=REPO,
             env=dict(env,PYTHONPATH=str(SKILL/'bin')),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
         signal.pthread_sigmask(signal.SIG_SETMASK,previous)
         output,_ = process.communicate(timeout=60)
-        result = {'exit':process.returncode,'output':output[-4000:]}
+        result.update(exit=process.returncode,output=output[-4000:])
+        if process.returncode==0:
+            proof=REPO/'target/verify-veyra'/env['RUN']
+            image=proof/(label+'.png');fresh=proof/(label+'-freshness.json')
+            digest=orchestration.sha(image)
+            assert json.loads(fresh.read_text())['sha256']==digest, 'failure capture freshness changed'
+            result.update(path=str(out/'run'/image.name),sha256=digest,freshness=str(out/'run'/fresh.name))
     except Exception as error:
-        result = {'error':f'{type(error).__name__}: {error}'}
+        result['error']=f'{type(error).__name__}: {error}'
     finally:
         if process is not None and process.poll() is None:
             try: os.killpg(process.pid,signal.SIGKILL)
             except ProcessLookupError: pass
             process.wait()
-    try: (out/'failure-capture.json').write_text(json.dumps(result,indent=2)+'\n')
+    try: (out/(label+'-capture.json')).write_text(json.dumps(result,indent=2)+'\n')
     except Exception as error: result['write_error'] = f'{type(error).__name__}: {error}'
     return result
 
@@ -272,6 +279,17 @@ def attempt(found, plan, out, env, deadline, expected, record):
             raise
         timings.append({'section':title,'start_epoch':started,'end_epoch':time.time(),
             'seconds':time.time()-started,'exit':code})
+        if code:
+            from failure_observation import observe
+            path=proof/'focus-failure.json'
+            try: seen=json.loads(path.read_text()) if path.exists() else {}
+            except (OSError,ValueError): seen={}
+            if seen.get('failure_epoch',0)<started: seen={}
+            if not all(key in seen for key in ['failure_idle_seconds','screen_locked']):
+                fresh=observe(proof,title,seen.get('kind','section'),'section-exit')
+                seen={**seen,**fresh}
+                path.write_text(json.dumps(seen,indent=2)+'\n')
+            timings[-1]['observed']=seen
         keep('sections.json',lambda: (out/'sections.json').write_text(json.dumps(timings,indent=2)+'\n'))
         note(stdout+stderr+f'{title} exit={code}\n')
         keep('progress line',lambda: print(title,'exit='+str(code),f'{time.time()-started:.1f}s',flush=True))
@@ -299,10 +317,7 @@ def attempt(found, plan, out, env, deadline, expected, record):
                 record['failed'] = {'section':'tree identity after Launch','exit':None,'deadline':False}
                 break
             if code:
-                observation = proof/'focus-failure.json'
-                try: seen = json.loads(observation.read_text()) if observation.exists() else {}
-                except (OSError,ValueError): seen = {}
-                if seen.get('failure_epoch',0) < timings[-1]['start_epoch']: seen = {}
+                seen=timings[-1]['observed']
                 safety = proof/'safety-stop.json'
                 fatal = key in [('SKILL','Launch'),('SKILL','Doctor')] or safety.exists() \
                     or bool(re.search(r'(?m)^(?:\w+\.)?SafetyStop:',text)) or 'restore failed' in text
@@ -313,8 +328,9 @@ def attempt(found, plan, out, env, deadline, expected, record):
                 if fatal:
                     record['fatal_stop'] = row
                     break
-                if not seen.get('human_input') and not safety.exists():
-                    record.setdefault('failure_captures',[]).append(failure_capture(env,out))
+                if seen.get('human_input') is False and seen.get('screen_locked') is False and not safety.exists():
+                    captures=record.setdefault('failure_captures',[])
+                    captures.append(failure_capture(env,out,'/'.join(key),len(captures)+1))
                 # A surprising drive is health-checked and reset before any independent section.
                 doctor_code,_ = execute(('SKILL','Doctor'))
                 if doctor_code:
@@ -329,8 +345,12 @@ def attempt(found, plan, out, env, deadline, expected, record):
                 record['sections'].append({'section':'/'.join(key),'exit':0,'kind':'passed'})
     except (Interrupted,KeyboardInterrupt) as stop:
         record['interrupted'] = record['interrupted'] or str(stop) or 'SIGINT'
+        from failure_observation import observe
+        record['interrupted_observed']=observe(proof,current[0] or 'runner','interrupted','runner-interrupt')
     except Exception as error:
         problems.append(f'runner: {type(error).__name__}: {error}')
+        from failure_observation import observe
+        record['runner_observed']=observe(proof,current[0] or 'runner','runner','runner-exception')
         record['failed'] = record['failed'] or {'section':'runner','exit':None,'deadline':False}
     finally:
         # Inline, not a call, so no function entry lies between the finally and this try. A signal here has already
@@ -528,6 +548,16 @@ def main(argv=None, validate=True):
     return run_native(found,plan,args,env,expected)
 
 def run_native(found,plan,args,env,expected):
+    import quiet_machine
+    try:
+        orchestration.admit_native(args.evidence/'quiet-machine.json',args.deadline,['bin/run',*('/'.join(key) for key in plan)])
+    except quiet_machine.QuietMachineHold as error:
+        orchestration.write(args.evidence/'outcome.json',{'status':'BLOCKED: '+str(error),'plan':['/'.join(key) for key in plan],'attempts':[]})
+        print('BLOCKED: '+str(error),flush=True)
+        return 2
+    assert checkout_identity()==expected, 'native identity changed during quiet admission'
+    orchestration.require_tier(args.tier_s,expected)
+    orchestration.require_go(args.go,expected,args.deadline)
     from mutants import recorded_verdicts
     result = None
     if args.native_mutants:

@@ -24,6 +24,10 @@ A native mode requires `--tier-s DIR/receipt.json`; missing commands, failed com
 Launch copies the already compiled helpers and does no build.
 Every relaunch checks the receipt again.
 
+Native modes own quiet-machine admission; no external wrapper is needed.
+Before native work, the runner and each guard probe call the existing gate: one-minute load below 5.0, sampled every 15 seconds, for at most 20 minutes and never beyond the exact GO cutoff.
+After waiting they revalidate their admitted inputs; a held, unreadable or expired admission launches nothing.
+
 `bin/run --smoke --base BASE` runs Launch, Doctor, app-launch's first section, each selected fake page's `Native smoke`, Doctor, Evidence and Cleanup.
 Provider tokens select that page's smoke scene; live permission cells are reported due and remain in their separately consented lane.
 A production hunk in a glass file selects `settings/Glass smoke` as well.
@@ -69,6 +73,13 @@ Only an exhausted capture observation blocks a section; a recovered retry clears
 Use `--sections PAGE/HEADING ...` in the next armed window to run only the blocked sections, with Launch, Doctor, app-launch's first section, Evidence and Cleanup.
 Passed sections are not repeated.
 The outcome lists each section as passed, failed or blocked.
+Every section failure records fresh HID idle and screen-lock observations, including ordinary poll timeouts and assertion failures.
+A generic section-exit observation is labelled as such; unknown HID or lock state cannot authorize a failure capture.
+Each failure capture has a unique section/ordinal label, a freshness record and its own retained path and hash in the outcome.
+
+Smoke drains are scoped to the current scene's thread IDs.
+The multi-agent return path proves the child task Interrupted and its provider exited, with the parent Held/stopped and its report wake pending; that valid idle parent may remain until Cleanup.
+The shell drawer and other scenes do not wait on earlier scenes' rows, and their return paths restore owned UI state even after a failed drain.
 
 The run stops on ownership, Cleanup, identity or restore failure, or a privacy guard it cannot enforce, including a missing backdrop.
 The screen-lock guard, HID gate, frontmost/coverage guards and owned-process rules remain in force.

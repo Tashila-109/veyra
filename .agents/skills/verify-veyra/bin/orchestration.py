@@ -20,6 +20,13 @@ COMMANDS = {
 class SafetyStop(RuntimeError):
     """Ownership, cleanup, identity, restore, or unenforceable privacy failure."""
 
+def admit_native(path, deadline, invocation):
+    """The shared native admission call; callers revalidate their frozen inputs after waiting."""
+    import quiet_machine
+    receipt=quiet_machine.wait_for_quiet(path,invocation,deadline=deadline)
+    if time.time()>=deadline: raise quiet_machine.QuietMachineHold('GO cutoff reached; no native launch')
+    return receipt
+
 def start_owned(args, **options):
     """Block terminating signals across spawn; the caller's try restores the returned mask first."""
     previous = signal.pthread_sigmask(signal.SIG_BLOCK,SIGNALS)
