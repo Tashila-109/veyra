@@ -20,10 +20,13 @@ def require_rejection(call, contains=''):
     raise AssertionError('fault accepted: '+contains)
 
 class Clock:
-    def __init__(self): self.now=0.;self.epoch=REAL_TIME()
-    def monotonic(self): return self.now
-    def time(self): return self.epoch+self.now
-    def sleep(self,seconds): self.now+=seconds
+    def __init__(self): self.now=0.;self.epoch=REAL_TIME();self.reads=0
+    def tick(self):
+        self.reads+=1
+        if self.reads>20000: raise RuntimeError('offline clock I/O budget exhausted')
+    def monotonic(self): self.tick();return self.now
+    def time(self): self.tick();return self.epoch+self.now
+    def sleep(self,seconds): self.tick();self.now+=seconds
 
 class WindowIO:
     """Window/dump/clock boundary for the real probe main; no guard decision is fabricated."""
@@ -36,6 +39,7 @@ class WindowIO:
         if name=='initial':
             if not self.f.modern: state.pop('palette',None);state.pop('toasts',None)
             else: state['toasts']=[]
+        if name=='scene-after' and self.f.final_toast_change: state['toasts'][0]['text']='after-only change'
         if name=='scene-sample':
             self.samples+=1
             if self.f.transient_toast and self.samples==2: state['toasts'][0]['text']='transient defect'
@@ -59,8 +63,8 @@ class Fixture:
     """A disposable filesystem and OS command boundary. Runtime code is never patched by function."""
     def __init__(self,root,runner):
         self.root=root.absolute();self.runner=runner;self.clock=Clock();self.stack=contextlib.ExitStack()
-        self.end_change=False;self.leave_scratch=False;self.interrupt_target=False;self.extra_scripts={};
-        self.calls=[];self.probes=[];self.child_events=[];self.wait_masks=[];self.capture_guard_reads=0;self.interrupt_probe=False;self.window_starts=0;self.modern=False;self.transient_toast=False
+        self.end_change=False;self.leave_scratch=False;self.interrupt_target=False;self.crash_target_spawn=False;self.extra_scripts={};
+        self.calls=[];self.probes=[];self.child_events=[];self.wait_masks=[];self.capture_guard_reads=0;self.interrupt_probe=False;self.window_starts=0;self.modern=False;self.transient_toast=False;self.final_toast_change=False
         self.cover=None;self.cpu_ratio=1.;self.cpu_ratios=[];self.rate=60.;self.gap=20;self.after_probe=None;self.before_probe=None;self.capture_failures=0
         self.failures_used=0;self.idle=200;self.lock=False;self.busy_until=-1;self.running=False;self.pid=99999999
         self.batch_script={};self.app_launches=0;self.mode='full_access';self.background='solid';self.stale_image=False;self.cleanup_failure=False;self.yabai=False;self.window_flags={};self.frame={'x':20,'y':40,'w':1280,'h':800};self.run='0123abcd'
@@ -197,8 +201,9 @@ class Fixture:
             if command[0]=='dump': out=json.dumps(self.dump())
             else: out='{"ok":true}'
         elif name=='yabai':
+            self.calls.append(argv)
             if '--remove' in argv:
-                self.calls.append(argv)
+                assert argv[1:4]==['-m','rule','--remove'], 'cleanup command is not a rule removal'
                 mode=getattr(self,'rule_remove','ok')
                 if mode!='ok':
                     code=1;out=''
@@ -232,6 +237,7 @@ class Fixture:
         return SimpleNamespace(returncode=code,stdout=out,stderr=err)
     def popen(self,argv,**options):
         self.calls.append([str(p) for p in argv]);fixture=self
+        if self.crash_target_spawn and str(argv[0])=='bash' and str(argv[-1])=='TARGET': raise RuntimeError('fixture runner spawn failed')
         if pathlib.Path(str(argv[0])).name=='run':
             from negative_tests import MutantChild
             assert o.SIGNALS <= signal.pthread_sigmask(signal.SIG_BLOCK,[]), 'mutant spawn was not masked'
@@ -315,6 +321,7 @@ def probe(f,label='direct',part='6c',scene='idle'):
 def guard_tools_and_backdrop(f):
     result=fg.run_guard(f.args,f.expected)
     assert all((o.BIN/(name+'.swift')).is_file() for name in o.TOOLS), 'helper source missing'
+    assert result['baseline_checks']==f.pins, 'approved baseline hash catalog was not preserved'
     assert result['passed'] and len(result['pairs'])==5 and len(f.probes)==16
     assert all((pathlib.Path(row['receipt']).parent/'backdrop').read_text()=='helper backdrop' for row in result['attempts'])
 
@@ -322,10 +329,15 @@ def probe_uses_requested_part(f):
     f.modern=True
     result=probe(f,part='6d')
     assert result['part']=='6d' and result['idle_scene']['toasts'][0]['text']=='resting toast'
+    f.args.part='6d';receipt=fg.run_guard(f.args,f.expected)
+    assert receipt['passed']
+    assert all(cmd[cmd.index('--part')+1]==('6d' if cmd[1]=='candidate' else '6c') for cmd in f.probes), 'guard did not forward candidate part or preserve baseline part'
 
 def idle_checks_every_sample(f):
     f.modern=True;f.transient_toast=True
     require_rejection(lambda:probe(f,part='6d'),'toast changed')
+    f.transient_toast=False;f.final_toast_change=True
+    require_rejection(lambda:probe(f,label='after-only',part='6d'),'toast changed')
 
 def part_is_required(f):
     with contextlib.redirect_stderr(io.StringIO()):
@@ -373,20 +385,24 @@ def probe_authenticates_baseline(f):
 
 def cover_restarts_only_before_first_pair(f):
     f.cover=lambda args,name:args.label=='set-1-baseline-01' and name=='prepared'
+    starts=[];f.before_probe=lambda index:starts.append(f.clock.now)
     result=fg.run_guard(f.args,f.expected)
-    assert result['passed'] and len(f.probes)==17 and f.clock.now>=60
+    assert starts[1]-starts[0]==60, 'cover restart did not wait exactly 60 seconds'
+    assert f.probes[0][2]=='set-1-baseline-01' and f.probes[1][2]=='set-2-baseline-01'
+    assert result['passed'] and len(result['pairs'])==5 and len(f.probes)==17 and f.clock.now>=60
     assert [s['state'] for s in result['sets']]==['discarded','complete']
-    assert all(p['baseline']['label'].startswith('set-2-') for p in result['pairs'])
+    assert all(p[side]['label'].startswith('set-2-') for p in result['pairs'] for side in ['baseline','candidate'])
 
 def cover_after_pair_started_stops_set(f):
     f.cover=lambda args,name:args.side=='candidate' and name=='prepared'
     require_rejection(lambda:fg.run_guard(f.args,f.expected),'cover trip')
-    assert len(f.probes)==2 and f.clock.now<60, 'a late cover trip restarted the set'
+    assert len(f.probes)==2 and f.clock.now==0, 'a late cover trip restarted the set'
 
 def second_cover_trip_stops_set(f):
     f.cover=lambda args,name:name=='prepared'
     require_rejection(lambda:fg.run_guard(f.args,f.expected),'cover trip')
     assert len(f.probes)==2 and f.clock.now==60
+    assert [cmd[2] for cmd in f.probes]==['set-1-baseline-01','set-2-baseline-01'], 'second trip did not stop on the restarted first baseline'
 
 def guard_go_required(f):
     f.write_go(frame_cost_guard_authorized=False)
@@ -412,6 +428,7 @@ def start_go_required(f):
 def start_reaches_launch(f):
     assert f.driver.start('valid')==f.pid
     assert f.app_launches==1
+    assert not any(pathlib.Path(c[0]).name=='yabai' for c in f.calls), 'missing yabai still invoked a rule command'
 
 def start_requires_unmanaged_owned_window(f):
     f.yabai=True
@@ -424,6 +441,11 @@ def start_requires_unmanaged_owned_window(f):
     labels=(f.proof/'owned-yabai-labels').read_text().splitlines()
     assert len(labels)==len(set(labels))==6
     assert f.frame=={'x':3360,'y':346,'w':960,'h':740}
+    moves=[cmd for cmd in f.calls if '--move' in cmd or '--resize' in cmd]
+    assert moves and all(cmd[1:4]==['-m','window','23'] and cmd[4] in ['--move','--resize'] for cmd in moves), 'placement command addressed another window'
+    result=subprocess.run([sys.executable,str(o.BIN/'driver.py'),'--cleanup-yabai-rules',str(f.proof),f.run],text=True)
+    assert result.returncode==0
+    assert [cmd[-1] for cmd in f.calls if '--remove' in cmd]==labels, 'owned label cleanup did not drain each recorded label once'
 
 def launch_hid_gate(f):
     # Execute Launch's real gate/start call sites, once for each denied OS condition.
@@ -449,11 +471,14 @@ def safety_stop_is_fatal(f):
     assert f.batch("import orchestration as o; raise o.SafetyStop('fixture safety stop')")==1
     outcome=f.outcome();row=outcome['attempts'][0]
     assert row.get('fatal_stop') and not any(c[-1]=='LATER' for c in f.calls)
+    assert row['fatal_stop']['kind']=='fatal'
+    assert f.calls[-1][-1]=='CLEANUP' and row['cleanup_exit']==0
 
 def identity_checked_before_every_section(f):
     assert f.batch("from pathlib import Path; Path('crates/veyra/src/ui/theme.rs').write_text('changed identity')")==1
     row=f.outcome()['attempts'][0]
     assert row.get('fatal_stop',{}).get('kind')=='identity' and not any(c[-1]=='LATER' for c in f.calls)
+    assert f.calls[-1][-1]=='CLEANUP' and row['cleanup_exit']==0
 
 def capture_then_assertion_is_failed(f):
     f.capture_failures=1
@@ -465,6 +490,8 @@ def capture_then_assertion_is_failed(f):
     assert f.outcome()['status'].startswith('FAILED')
     fresh=json.loads((f.evidence/'attempt-1/run/recovered-freshness.json').read_text())
     assert fresh['sha256'] and f.failures_used==1
+    seen=json.loads((f.evidence/'attempt-1/run/focus-failure.json').read_text())
+    assert seen['capture_exhausted'] is False and f.capture_guard_reads==3, 'recovered capture did not clear exhaustion or stop after its second attempt'
 
 def exhausted_capture_is_blocked(f):
     f.capture_failures=3
@@ -473,6 +500,7 @@ def exhausted_capture_is_blocked(f):
     target=next(r for r in row['sections'] if r['section']=='page/Target')
     assert target['kind']=='blocked' and target['observed']['capture_exhausted'] is True, target
     assert f.outcome()['status'].startswith('BLOCKED') and f.failures_used==3
+    assert not (f.evidence/'attempt-1/run/exhausted.png').exists(), 'exhausted image retained'
 
 def missing_backdrop_is_fatal(f):
     f.background='translucent'
@@ -481,6 +509,9 @@ def missing_backdrop_is_fatal(f):
     assert row.get('fatal_stop') and not any(c[-1]=='LATER' for c in f.calls)
     assert f.capture_guard_reads==1, 'privacy failure was retried'
     assert 'missing owned backdrop' in (f.evidence/'attempt-1/fresh-shell.txt').read_text()
+    proof=f.evidence/'attempt-1/run';assert (proof/'safety-stop.json').is_file(), 'privacy stop receipt missing'
+    assert json.loads((proof/'safety-stop.json').read_text())=={'kind':'privacy','reason':'missing owned backdrop'}
+    assert not (proof/'private.png').exists(), 'privacy stop left an image'
 
 def evidence_checks_independent_default(f):
     body=f.runner.HEREDOC.search(f.runner.sections()[('SKILL','Evidence')])['body']
@@ -490,6 +521,10 @@ def evidence_checks_independent_default(f):
     transcript=(f.evidence/'attempt-1/fresh-shell.txt').read_text()
     assert "'final', ['4', 'wal'" in transcript and f.outcome()['status'].startswith('FAILED')
     assert (f.evidence/'attempt-1/run/configured-default-mode').read_text().strip()=='ask_first'
+    f.mode='ask_first';f.evidence=f.root/'matching-evidence';f.evidence.mkdir();f.args.evidence=f.evidence
+    setup="from driver import *\nimport pages as page_map\nfor name in page_map.evidence_contract(pathlib.Path.cwd())['app-launch-main']: (PROOF/name).write_text('fixture artifact')\n"
+    assert f.batch(setup+script)==0 and f.outcome()['status']=='DONE', 'matching independent default mode did not pass Evidence'
+    assert (f.evidence/'attempt-1/run/window.png').is_file()
 
 def recorded_mutant(f):
     folder=f.evidence/'mutants/archive-1';proof=folder/'native/attempt-1/run';proof.mkdir(parents=True)
@@ -553,6 +588,9 @@ def prepare_and_guard_chain(f):
     found,plan,args,env,expected=setup
     assert expected==before and plan[:3]==[('SKILL','Launch'),('SKILL','Doctor'),f.runner.FIRST]
     assert plan[-2:]==[('SKILL','Doctor'),('SKILL','Evidence')]
+    assert ('settings','Window background and display options') not in plan
+    assert ('settings','Glass smoke') not in plan
+    assert env['VEYRA_VERIFY_TIER_S']==str(f.tier.resolve())
     assert ('settings','Native smoke') in plan and not (f.evidence/'status-proposals.json').exists()
     def no_early_batch(index): assert not any(c[0]=='bash' for c in f.calls), 'smoke started before guard completed'
     f.after_probe=no_early_batch

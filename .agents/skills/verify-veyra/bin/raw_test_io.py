@@ -7,6 +7,7 @@ import ctypes, errno, json, os, pathlib, plistlib, shutil, sys, tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 from self_tests import Fixture
+import orchestration as o
 
 class Function:
     def __init__(self,call): self.call=call
@@ -138,7 +139,9 @@ class RawFixture(Fixture):
         if name=='screencapture':
             self.raw_captures+=1;self.capture_events.append((pathlib.Path(argv[-1]).name,self.raw_captures))
             if self.capture_hook: self.capture_hook()
-        return super().command(argv,**options)
+        result=super().command(argv,**options)
+        if name=='screencapture': pathlib.Path(argv[-1]).write_bytes(('raw capture '+str(self.raw_captures)).encode())
+        return result
     def popen(self,argv,**options):
         name=pathlib.Path(str(argv[0])).name
         if name.startswith('perf-backdrop') or name in ['glass-smoke-backdrop','backdrop']:
@@ -171,6 +174,8 @@ class RawFixture(Fixture):
                         self.returncode=1;return '',traceback.format_exc()
             return Child()
         if name=='veyra':
+            linked={p.name:p.resolve(strict=True) for p in self.proof.iterdir() if p.is_symlink()}
+            assert linked=={name:(self.tier.parent/'tools'/name).resolve() for name in o.TOOLS}, 'native helper links differ from admitted catalog'
             d=self.sync();self.launch_env.append(dict(options['env']));self.app_launches+=1;self.running=True
             self.data.mkdir(exist_ok=True);(self.data/'veyra.lock').write_text(str(self.pid))
             (self.data/'logs').mkdir(exist_ok=True);(self.data/'veyra.db').write_text('raw SQL fixture')

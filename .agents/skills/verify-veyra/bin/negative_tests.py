@@ -76,6 +76,9 @@ def collected_failures(f):
     assert f.batch("from driver import *; capture('blocked')")==1
     kinds=[r['kind'] for r in f.outcome()['attempts'][0]['sections']]
     assert 'blocked' in kinds and 'failed' in kinds and f.outcome()['status'].startswith('FAILED: independent')
+    row=f.outcome()['attempts'][0]
+    assert [r['kind'] for r in row['sections'] if r['exit']]==['blocked','failed']
+    assert f.calls[-1][-1]=='CLEANUP' and row['evidence']['run'] and row['cleanup_exit']==0
 
 def yabai_labels(f):
     f.yabai=True
@@ -87,11 +90,16 @@ def yabai_failures(f):
     f.yabai=True;f.rule_add_failure=True
     require_rejection(lambda:f.driver.start('add-failure'),'owned one-shot rule could not be installed')
     assert not f.app_launches
-    labels=(f.proof/'owned-yabai-labels').read_text();assert labels
+    labels=(f.proof/'owned-yabai-labels').read_text().splitlines();assert len(labels)==1, 'failed rule add lost its recorded ownership'
+    before=len([cmd for cmd in f.calls if '--remove' in cmd])
+    f.rule_add_failure=False
+    f.driver.start('valid-first');f.driver.start('valid-second')
+    labels=(f.proof/'owned-yabai-labels').read_text().splitlines();assert len(labels)==3
     index=f.root/'bad-index.jsonl';index.write_text(json.dumps({'proof':str(f.proof),'run':f.run})+'\n{incomplete')
     result=subprocess.run([sys.executable,str(o.BIN/'driver.py'),'--cleanup-yabai-index',str(index)],text=True)
     assert result.returncode!=0, 'incomplete owned rule index accepted'
-    assert any('--remove' in cmd for cmd in f.calls), 'valid owned rule was not drained after incomplete index'
+    removed=[cmd[-1] for cmd in f.calls if '--remove' in cmd][before:]
+    assert removed==labels, 'incomplete index did not drain every valid owned rule exactly once'
 
 def yabai_removal(f):
     f.yabai=True
@@ -128,8 +136,11 @@ class MutantChild:
     def poll(self): return self.returncode
     def send_signal(self,number): self.f.child_events.append(('signal',number));self.returncode=0
     def wait(self,timeout=None):
+        self.f.child_events.append(('wait',timeout))
         if self.returncode is not None:return self.returncode
         f=self.f
+        f.wait_masks.append(signal.pthread_sigmask(signal.SIG_BLOCK,[]))
+        assert (f.repo/'crates/veyra/src/ui/theme.rs').read_text()=='mutated source\n', 'mutant child did not receive the installed source'
         if getattr(f,'interrupt_mutant',False):
             (f.repo/'target/debug/veyra').write_text('interrupted child bytes')
             raise RuntimeError('fixture interrupted mutant')
@@ -142,6 +153,7 @@ class MutantChild:
 
 def mutant_restore(f):
     prepare_case(f,f.root/'fresh-mutants.json');f.interrupt_mutant=True
+    original_mask=signal.pthread_sigmask(signal.SIG_BLOCK,[])
     original={name:(f.repo/'target'/name).read_bytes() for name in o.BINARY_NAMES}
     try: mutants.run_mutants(f.args,f.expected)
     except RuntimeError as error: assert 'fixture interrupted mutant' in str(error)
@@ -149,6 +161,8 @@ def mutant_restore(f):
     assert (f.repo/'crates/veyra/src/ui/theme.rs').read_text()=='original source\n', 'mutant source not restored'
     assert all((f.repo/'target'/name).read_bytes()==data for name,data in original.items()), 'mutant binaries not restored'
     assert not (f.evidence/'mutants/1/mutation-in-flight.json').exists(), 'restore marker was not cleared'
+    assert f.child_events[-2:]==[('signal',signal.SIGTERM),('wait',120)], 'interrupted mutant child must receive SIGTERM and be reaped'
+    assert f.wait_masks[0]==original_mask, 'spawn mask was not restored inside mutant wait'
 
 def fresh_read_mutant(f):
     prepare_case(f,f.root/'fresh-mutants.json')
@@ -194,8 +208,9 @@ def cover_remaining(f):
     for name,condition,count in [('mid-baseline',lambda a,n:a.label.endswith('baseline-01') and n=='stream',1),
             ('later-pair',lambda a,n:a.label.endswith('baseline-02') and n=='prepared',3)]:
         f.args.evidence=f.root/name;f.args.evidence.mkdir();f.probes=[];f.cover=condition
+        began=f.clock.now
         require_rejection(lambda:fg.run_guard(f.args,f.expected),'cover trip')
-        assert len(f.probes)==count, name
+        assert len(f.probes)==count and f.clock.now==began, 'late cover trip waited or restarted: '+name
 
 def idle_variants(f):
     from self_tests import WindowIO
@@ -230,6 +245,7 @@ def native_recording(f):
     assert f.launch_env and all('VEYRA_RECORD' not in env for env in f.launch_env), 'frame launch recording was enabled'
     output=pathlib.Path(os.environ['VEYRA_FRAME_GUARD_PROOF'])/'scenes/raw-recording/run'
     assert all((output/name).read_bytes()==(f.tier.parent/'tools'/name).read_bytes() for name in o.TOOLS)
+    assert f.signals==[(f.backdrop_pid,signal.SIGTERM)], 'exited owned backdrop received another signal'
 
 @raw
 def native_reads(f):
@@ -279,6 +295,8 @@ def measured_pair_entry(f):
                 events=[name for name,index in io.capture_events if name in [label+'.png' for label in labels]]
                 wanted=[labels[0]+'.png']*2+[labels[1]+'.png'] if half=='coarse' else [label+'.png' for label in labels]*2
                 assert events==wanted, 'measured_pair did not retake both halves after '+half+' placement'
+                last=dict(io.capture_events)
+                assert all((io.proof/(label+'.png')).read_bytes()==('raw capture '+str(last[label+'.png'])).encode() for label in labels), 'retained image is not the last capture'
             finally:
                 for process in reversed(measure.processes):measure.stop_backdrop(process)
 
@@ -304,8 +322,10 @@ def backdrop_activation(f):
         assert len(f.opens)==(1 if variant=='after-reopen' else 0), 'backdrop was reopened without ownership: '+variant
         assert not f.signals
     f.path_hook=None;f.open_hook=None;f.backdrop_alive=True;f.backdrop_path=expected.resolve();f.opens=[];f.path_reads=0
-    activate('activation-positive',f.backdrop_pid,expected,f.data/'bundle')
+    reply=activate('activation-positive',f.backdrop_pid,expected,f.data/'bundle')
     assert len(f.opens)==1 and f.path_reads==3
+    assert not f.signals, 'activation signalled the owned backdrop'
+    assert getattr(reply,'returncode',None)==0, 'backdrop reopen command result was not preserved'
 
 @raw
 def backdrop_escalation(f):
@@ -384,3 +404,15 @@ def prepare_selection(f):
     assert not (f.evidence/'status-proposals.json').exists()
 
 CASES += [('prepare-selection',prepare_selection)]
+
+
+def incomplete_runner_verdict(f):
+    f.crash_target_spawn=True
+    assert f.batch()==1, 'runner exception was accepted as DONE'
+    outcome=f.outcome();row=outcome['attempts'][0]
+    assert outcome['status']=='FAILED: not every planned section passed', 'incomplete runner did not reach completion verdict'
+    assert row['all_passed'] is False and row['failed']['section']=='runner'
+    assert row['cleanup_exit']==0 and row['evidence']['run'] and row['identity_unchanged']
+    assert all(section['kind']=='passed' for section in row['sections']), 'test must bypass section failure verdicts'
+
+CASES += [('verdict-complete',incomplete_runner_verdict)]

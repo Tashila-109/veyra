@@ -9,7 +9,7 @@ def activate(label,pid,executable,bundle):
         assert result.returncode==0, f'owned backdrop helper failed; see {name}.stderr'
         return result
     d.verify_owned_backdrop(pid,executable)
-    d.reopen_owned_backdrop(pid,executable,lambda:command(label+'-open',['open',str(bundle)]))
+    reopened=d.reopen_owned_backdrop(pid,executable,lambda:command(label+'-open',['open',str(bundle)]))
     source=('import AppKit\n'+f'let pid: Int32 = {pid}\n'+
         'let end = Date().addingTimeInterval(5)\n'+
         'while NSWorkspace.shared.frontmostApplication?.processIdentifier != pid && Date() < end { '+
@@ -18,3 +18,4 @@ def activate(label,pid,executable,bundle):
     result=command(label,['swift','-e',source])
     assert int(result.stdout.strip())==pid
     d.save(label,{'frontmost_pid':pid,'owned_backdrop_pid':pid})
+    return reopened
