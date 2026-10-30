@@ -317,14 +317,14 @@ class Fixture:
                 finally:
                     os.environ.clear();os.environ.update(previous)
         return Child()
-    def batch(self,script=None,full=False):
+    def batch(self,script=None,full=False,steps=None):
         self.args.gate=False;self.args.slice_end=full
         found={('SKILL','Launch'):'LAUNCH',('SKILL','Doctor'):'DOCTOR',('SKILL','Evidence'):'EVIDENCE',
             ('SKILL','Cleanup'):'CLEANUP',('SKILL','Recover section'):'RECOVER',('page','Target'):'TARGET',('page','Later'):'LATER'}
         self.batch_script={'TARGET':script or 'pass',**self.extra_scripts}
         env=dict(os.environ,VEYRA_VERIFY_TMP=str(self.root)+'/data-')
         handlers={n:signal.getsignal(n) for n in o.SIGNALS};mask=signal.pthread_sigmask(signal.SIG_BLOCK,[])
-        try: return self.runner.run_native(found,[('SKILL','Launch'),('page','Target'),('page','Later')],self.args,env,self.expected)
+        try: return self.runner.run_native(found,[('SKILL','Launch'),*(steps if steps is not None else [('page','Target'),('page','Later')])],self.args,env,self.expected)
         finally:
             for n,h in handlers.items(): signal.signal(n,h)
             signal.pthread_sigmask(signal.SIG_SETMASK,mask)

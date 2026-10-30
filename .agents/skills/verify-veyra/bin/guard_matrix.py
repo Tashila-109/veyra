@@ -150,6 +150,37 @@ PLANTS += [
     Plant('native-skipped-quiet','quiet-native','bin/run','run_native','remove-call','admit_native'),
 ]
 
+PLANTS += [
+    Plant('smoke-scope-omission','smoke-scoped-drain','bin/smoke.py','drive','expression',
+        '[family[1]] if family else threads','[family[1]] if family else []'),
+    Plant('failure-capture-ordinal','capture-ordinal','bin/run','failure_capture','expression',
+        "'failure-'+re.sub(r'[^a-z0-9]+','-',section.lower()).strip('-')+'-'+str(number)",
+        "'failure-'+re.sub(r'[^a-z0-9]+','-',section.lower()).strip('-')+'-1'"),
+    Plant('quiet-limit-six','quiet-limit','bin/quiet_machine.py','','expression','5.0','6.0'),
+    Plant('quiet-limit-nine','quiet-limit','bin/quiet_machine.py','','expression','5.0','9.0'),
+    Plant('unknown-hid-capture','unknown-hid','bin/run','attempt','expression',"seen.get('human_input') is False","not seen.get('human_input')"),
+    Plant('unknown-hid-assumed-safe','unknown-hid','bin/failure_observation.py','observe','keyword','update:human_input','False'),
+    Plant('quiet-helper-cutoff','quiet-cutoff','bin/orchestration.py','admit_native','keyword','wait_for_quiet:deadline','None'),
+    Plant('quiet-wait-budget','quiet-cutoff','bin/quiet_machine.py','wait_for_quiet','expression',
+        'min(TIMEOUT_SECONDS,max(0,deadline-time.time()))','TIMEOUT_SECONDS'),
+    Plant('quiet-sleep-cutoff','quiet-cutoff','bin/quiet_machine.py','wait_for_quiet','expression',
+        'budget - (monotonic() - started)','TIMEOUT_SECONDS - (monotonic() - started)'),
+    Plant('quiet-read-cutoff','quiet-cutoff','bin/quiet_machine.py','wait_for_quiet','expression',
+        'min(5, budget - (sample_started - started))','5'),
+    Plant('quiet-runner-cutoff','quiet-cutoff','bin/run','run_native','expression',
+        "orchestration.admit_native(args.evidence/'quiet-machine.json',args.deadline,['bin/run',*('/'.join(key) for key in plan)])",
+        "orchestration.admit_native(args.evidence/'quiet-machine.json',time.time()+1200,['bin/run',*('/'.join(key) for key in plan)])"),
+    Plant('quiet-guard-cutoff','quiet-cutoff','bin/frame_guard.py','run_guard.one','expression',
+        "o.admit_native(root/(label+'-quiet.json'),args.deadline,command)",
+        "o.admit_native(root/(label+'-quiet.json'),time.time()+1200,command)"),
+    Plant('quiet-guard-without-deadline','quiet-cutoff','bin/frame_guard.py','run_guard.one','expression',
+        "o.admit_native(root/(label+'-quiet.json'),args.deadline,command)",
+        "quiet_machine.wait_for_quiet(root/(label+'-quiet.json'),command)"),
+    Plant('quiet-probe-cutoff','quiet-cutoff','bin/frame_probe.py','main','expression',
+        "o.admit_native(output/'quiet-machine.json',float(os.environ['VEYRA_VERIFY_DEADLINE']),['frame-probe',args.label])",
+        "o.admit_native(output/'quiet-machine.json',float(os.environ['VEYRA_VERIFY_DEADLINE'])+1200,['frame-probe',args.label])"),
+]
+
 def expression(source):
     return ast.parse(source,mode='eval').body
 

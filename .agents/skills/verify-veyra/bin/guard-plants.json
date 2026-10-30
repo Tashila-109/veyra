@@ -114,7 +114,21 @@
     "failure-no-hid",
     "failure-poll-no-hid",
     "failure-reused-name",
-    "native-skipped-quiet"
+    "native-skipped-quiet",
+    "smoke-scope-omission",
+    "failure-capture-ordinal",
+    "quiet-limit-six",
+    "quiet-limit-nine",
+    "unknown-hid-capture",
+    "unknown-hid-assumed-safe",
+    "quiet-helper-cutoff",
+    "quiet-wait-budget",
+    "quiet-sleep-cutoff",
+    "quiet-read-cutoff",
+    "quiet-runner-cutoff",
+    "quiet-guard-cutoff",
+    "quiet-guard-without-deadline",
+    "quiet-probe-cutoff"
   ],
   "positive_cases": [
     "start-entry",

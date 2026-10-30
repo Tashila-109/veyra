@@ -1,5 +1,5 @@
 """Smoke repair regressions. Real scene/batch/mode entries; only raw OS I/O is modelled."""
-import hashlib, json, pathlib, signal
+import hashlib, json, os, pathlib, signal, subprocess
 from types import SimpleNamespace
 import orchestration as o, frame_probe
 from raw_test_io import RawFixture
@@ -61,7 +61,7 @@ class SceneIO(RawFixture):
                             status='Done' if self.fault=='parent-state' else 'Held',hold='child_report' if self.fault=='parent-hold' else 'stopped')
                         task['state']={'Settled':{'outcome':{'Completed':{}} if self.fault=='child-outcome' else {'Interrupted':{'reason':'Thread stopped'}},
                             'delivery':{} if self.fault=='no-wake' else {'Pending':{'wake':'fixture-wake'}}}}
-                    elif not self.tasks or thread!=self.tasks[-1]['child']:self.scene_live[thread]=False
+                    elif not self.tasks or thread!=self.tasks[-1]['child']:self.scene_live[thread]=self.fault=='scene-live'
                     out='{"ok":true}'
                 elif action=='DebugFocusShellDrawer':self.focus='drawer';out='{"ok":true}'
                 elif action=='FocusComposer':self.focus='composer';out='{"ok":true}'
@@ -69,7 +69,7 @@ class SceneIO(RawFixture):
             elif cmd[:2]==['keys','secondary-enter']:
                 self.scene_number+=1;root=f'{self.scene_number:08x}-1111-2222-3333-444444444444'
                 row={'id':root,'status':'Done','header_status':'Done','hold':None,'title':self.text,'kind':'thread','lineage':'Root'}
-                self.threads.append(row);self.selected=row;self.scene_view='chat';self.text='';self.scene_live[root]=False
+                self.threads.append(row);self.selected=row;self.scene_view='chat';self.text='';self.scene_live[root]=self.fault=='scene-live'
                 if row['title']=='smoke-family':
                     child=root[:-1]+'5';self.threads.append({'id':child,'status':'Working','kind':'thread'})
                     self.scene_live[root]=self.scene_live[child]=True
@@ -85,11 +85,20 @@ def scene_drains_ignore_other_threads(f):
     import smoke
     # Every scene runs its actual driver path. The family parent and an unrelated session stay live.
     for page in ['multi-agent','shell-drawer','chat-send-stream','settings','approvals-questions','stop-interrupt','restart-recovery','new-thread']:
-        before=len(f.scene_queries)
+        before=len(f.scene_queries);known=set(f.scene_live)
         smoke.drive(page)
         queries=f.scene_queries[before:]
-        assert all(query.startswith('select live_pgid is null from threads where id=') for query in queries), 'smoke drain queried rows outside its scene'
+        expected=[f.tasks[-1]['child']] if page=='multi-agent' else sorted(set(f.scene_live)-known)
+        assert queries==["select live_pgid is null from threads where id='"+thread+"'" for thread in expected], 'smoke drain omitted or queried the wrong scene thread IDs: '+page
         assert not f.drawer_open and f.scene_view=='new_thread'
+        if expected and page!='multi-agent':
+            with SceneIO(f.root/('live-'+page),f.runner) as io:
+                io.fault='scene-live';began=io.clock.now
+                require_rejection(lambda:smoke.drive(page),'timed out')
+                created=set(io.scene_live)
+                assert len(created)==1 and all(io.scene_live.values()), 'fixture did not retain the scene provider'
+                assert io.scene_queries and set(io.scene_queries)=={"select live_pgid is null from threads where id='"+next(iter(created))+"'"}, 'live scene provider was not queried'
+                assert 30<=io.clock.now-began<31 and not io.drawer_open and io.scene_view=='new_thread', 'live scene did not stop within its existing bound and restore'
     parent,child=f.tasks[0]['parent'],f.tasks[0]['child']
     assert f.scene_live[parent] and not f.scene_live[child], 'held parent must remain valid while child exits'
     assert next(row for row in f.threads if row['id']==parent)['hold']=='stopped'
@@ -141,6 +150,43 @@ def failures_keep_separate_captures(f):
         assert path.exists() and hashlib.sha256(path.read_bytes()).hexdigest()==row['sha256']==fresh['sha256'], 'earlier failure bytes were overwritten'
         assert row['section'] in ['page/Target','page/Later']
 
+def repeated_section_keeps_capture_ordinals(f):
+    f.vary_capture=True
+    assert f.batch("raise AssertionError('same section fails twice')",steps=[('page','Target'),('page','Target')])==1
+    attempt=f.outcome()['attempts'][0]
+    assert [row['section'] for row in attempt['sections'] if row['kind']=='failed']==['page/Target','page/Target']
+    captures=attempt['failure_captures']
+    assert len(captures)==2 and all(row['section']=='page/Target' for row in captures)
+    assert len({row['path'] for row in captures})==len({row['freshness'] for row in captures})==2, 'repeated section reused its PNG or freshness ordinal'
+    assert len({row['sha256'] for row in captures})==2, 'fixture did not produce two different frames'
+    for row in captures:
+        path=pathlib.Path(row['path']);fresh=json.loads(pathlib.Path(row['freshness']).read_text())
+        assert hashlib.sha256(path.read_bytes()).hexdigest()==row['sha256']==fresh['sha256'], 'an earlier repeated-section capture was overwritten'
+
+class UnknownHIDIO(Fixture):
+    def command(self,argv,**options):
+        if pathlib.Path(str(argv[0])).name=='ioreg' and 'IOHIDSystem' in argv:
+            fault=getattr(self,'hid_fault',None)
+            if fault=='unavailable':raise OSError('fixture HID service unavailable')
+            if fault=='timeout':raise subprocess.TimeoutExpired(argv,options.get('timeout',5))
+            if fault in ['missing','malformed']:
+                out='' if fault=='missing' else '"HIDIdleTime" = unavailable'
+                return SimpleNamespace(returncode=0,stdout=out if options.get('text') else out.encode(),stderr='')
+        return super().command(argv,**options)
+
+def unknown_hid_never_authorizes_capture(f):
+    for fault in ['unavailable','timeout','missing','malformed','missing-clock']:
+        with UnknownHIDIO(f.root/fault,f.runner) as io:
+            io.hid_fault=fault
+            prefix="from driver import PROOF; (PROOF/'input-idle-launch.json').unlink(); " if fault=='missing-clock' else ''
+            assert io.batch(prefix+"raise AssertionError('unknown HID failure')")==1
+            attempt=io.outcome()['attempts'][0];row=next(row for row in attempt['sections'] if row['kind']=='failed')
+            assert row['observed']['human_input'] is None and row['observed']['classification']=='unknown', 'unknown HID was assumed safe'
+            if fault!='missing-clock':assert row['observed']['failure_idle_seconds'] is None
+            assert not attempt.get('failure_captures') and io.capture_number==0, 'unknown HID authorized a capture'
+            assert not any(len(cmd)>1 and cmd[1]=='-c' and pathlib.Path(cmd[0]).name.startswith('python') for cmd in io.calls), 'unknown HID spawned a failure capture worker'
+            assert attempt['cleanup_exit']==0 and not attempt['scratch_left'], 'unknown HID skipped Cleanup'
+
 def mode_args(f,mode):
     common=['--evidence',str(f.evidence),'--tier-s',str(f.tier),'--go',str(f.go),'--deadline',str(f.args.deadline),'--scratch',f.args.scratch]
     return common+({'smoke':['--smoke','--base','HEAD'],'sections':['--sections','settings/Native smoke'],
@@ -153,15 +199,20 @@ def main(f,argv):
         for n,h in handlers.items():signal.signal(n,h)
         signal.pthread_sigmask(signal.SIG_SETMASK,mask)
 
+def native_mode_args(f,mode):
+    argv=mode_args(f,'slice' if mode=='mutants' else mode)
+    if mode=='mutants':
+        from negative_tests import prepare_case
+        manifest=f.root/'mutants.json';prepare_case(f,manifest)
+        f.write_go(cutoff_epoch=f.args.deadline,mutant_manifest_sha256=o.sha(manifest))
+        argv += ['--native-mutants',str(manifest)]
+    return argv
+
 def native_modes_require_quiet(f):
     for mode in ['smoke','sections','gate','slice','guard','mutants']:
         with Fixture(f.root/mode,f.runner) as io:
             io.load=9
-            argv=mode_args(io,'slice' if mode=='mutants' else mode)
-            if mode=='mutants':
-                from negative_tests import prepare_case
-                manifest=io.root/'mutants.json';prepare_case(io,manifest)
-                argv += ['--native-mutants',str(manifest)]
+            argv=native_mode_args(io,mode)
             assert main(io,argv) in [1,2], 'busy machine entered native mode '+mode
             assert not io.calls and not io.probes and not io.app_launches, 'quiet gate was skipped before '+mode
             receipts=list(io.evidence.rglob('*quiet*.json'))
@@ -175,14 +226,60 @@ def native_modes_require_quiet(f):
     with Fixture(f.root/'bad-load',f.runner) as io:
         io.load_error=True
         assert main(io,mode_args(io,'smoke'))==2 and not io.calls, 'load query error admitted native work'
-    with Fixture(f.root/'cutoff',f.runner) as io:
-        io.load=9;io.args.deadline=io.clock.time()+31
-        assert main(io,mode_args(io,'smoke'))==2 and not io.calls
-        assert io.clock.now<=31, 'quiet admission extended the GO deadline'
     with RawFixture(f.root/'direct-probe',f.runner) as io:
         io.load=9
         require_rejection(lambda:frame_probe.main(['scenes','candidate','held','--part','6c','--scene','working']),'did not drop below 5.0')
         assert io.app_launches==0, 'direct native probe skipped quiet admission'
 
+def quiet_limit_is_exclusive_five(f):
+    for load in [4.99,5.0,5.5]:
+        with Fixture(f.root/str(load),f.runner) as io:
+            io.load=load
+            code=main(io,mode_args(io,'smoke'));receipt=json.loads((io.evidence/'quiet-machine.json').read_text())
+            if load==4.99:
+                assert code==0 and io.launch_times and receipt['state']=='admitted', '4.99 must admit native work'
+            else:
+                assert code==2 and not io.calls and not io.probes and not io.app_launches, 'load '+str(load)+' must hold native work'
+                assert receipt['state']=='held' and io.clock.now==1200, 'quiet boundary changed the existing timeout'
+            assert receipt['load_limit_exclusive']==5.0, 'quiet limit changed from the independent 5.0 contract'
+
+class SlowLoadIO(Fixture):
+    def command(self,argv,**options):
+        if pathlib.Path(str(argv[0])).name=='sysctl':
+            timeout=options['timeout'];self.clock.sleep(min(2,timeout))
+            if timeout<2:raise subprocess.TimeoutExpired(argv,timeout)
+        return super().command(argv,**options)
+
+def arm_short_cutoff(io):
+    io.load=9;io.args.deadline=io.clock.time()+31
+    io.write_go(cutoff_epoch=io.args.deadline)
+    os.environ['VEYRA_VERIFY_DEADLINE']=str(io.args.deadline)
+
+def quiet_wait_stops_at_go_cutoff(f):
+    for mode in ['smoke','sections','gate','slice','guard','mutants']:
+        with Fixture(f.root/mode,f.runner) as io:
+            arm_short_cutoff(io)
+            argv=native_mode_args(io,mode)
+            assert json.loads(io.go.read_text())['cutoff_epoch']==io.args.deadline, 'fixture lost the short GO cutoff'
+            assert main(io,argv)==(1 if mode=='guard' else 2), 'cutoff did not stop '+mode
+            assert io.clock.now==31 and not io.calls and not io.probes and not io.app_launches, 'quiet admission extended the GO cutoff or launched '+mode
+            outcome=io.outcome();assert 'GO cutoff reached' in outcome.get('error',outcome['status'])
+            for path in io.evidence.rglob('*quiet*.json'):
+                receipt=json.loads(path.read_text());assert receipt['state']=='held' and receipt['finished'] and receipt['elapsed_seconds']<=31
+            assert not list(io.evidence.glob('attempt-*')) and io.data.exists(), 'cutoff entered a native batch'
+            if mode=='guard':assert json.loads((io.evidence/'guard-done.json').read_text())['passed'] is False
+    with RawFixture(f.root/'direct-probe',f.runner) as io:
+        arm_short_cutoff(io)
+        require_rejection(lambda:frame_probe.main(['scenes','candidate','cutoff','--part','6c','--scene','working']),'GO cutoff reached')
+        assert io.clock.now==31 and not io.app_launches and not io.calls and not io.backdrop_alive, 'direct probe waited past cutoff or launched'
+        result=json.loads((io.root/'direct-probes/scenes/cutoff/result.json').read_text())
+        assert not result['passed'] and result['cleanup_exit']==0 and result['scratch_removed'] and result['data_removed'], 'cutoff probe did not close cleanly'
+    with SlowLoadIO(f.root/'slow-load-read',f.runner) as io:
+        arm_short_cutoff(io)
+        assert main(io,mode_args(io,'smoke'))==2 and io.clock.now==31 and not io.calls, 'load read exceeded the remaining GO budget'
+        receipt=json.loads((io.evidence/'quiet-machine.json').read_text());assert receipt['state']=='held' and receipt['finished']
+
 CASES=[('smoke-scoped-drain',scene_drains_ignore_other_threads),('failure-hid',failures_record_hid_and_lock),
-    ('failure-captures',failures_keep_separate_captures),('quiet-native',native_modes_require_quiet)]
+    ('failure-captures',failures_keep_separate_captures),('quiet-native',native_modes_require_quiet),
+    ('capture-ordinal',repeated_section_keeps_capture_ordinals),('unknown-hid',unknown_hid_never_authorizes_capture),
+    ('quiet-limit',quiet_limit_is_exclusive_five),('quiet-cutoff',quiet_wait_stops_at_go_cutoff)]
