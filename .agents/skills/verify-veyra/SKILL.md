@@ -595,9 +595,13 @@ It does not signal an unrecorded group.
   Its comparison mode is `pasteboard --audit --expect-text FILE --ready-file READY`.
   The `--audit` snapshot/restore path is mandatory; a standalone `--expect-text FILE` is refused before system-board access.
   Start it before the Copy action, wait for the private READY file, drive Copy, then close stdin and wait for restoration.
-  It prints only `match` or `no-match`, with exit 0 or 1. Clipboard text, length and hashes are never printed, logged or saved.
+  A completed comparison prints only `match` or `no-match`, with exit 0 or 1.
+  A restore or verification failure prints no stdout, writes the fixed `PASTEBOARD RESTORE FAILED` diagnostic to stderr and exits 2.
+  Other comparison errors also exit 2 with a fixed diagnostic. A mismatch never hides a failed restore.
+  Clipboard text, length and hashes are never printed, logged or saved.
   FILE contains an independently known fixture expectation, never data read back from the clipboard.
-  `--self-test` uses a stubbed board and covers match, mismatch, absent text, restoration after error and refusal outside the snapshot path; it never accesses NSPasteboard.
+  `--self-test` uses a stubbed board and covers match, mismatch, absent text, restoration after error,
+  throwing or silently failed restoration, and refusal outside the canonical audit path; it never accesses NSPasteboard.
   Compile the system helper offline; every system-board use waits for the armed away window.
 - `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
 - `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.

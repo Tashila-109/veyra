@@ -1425,6 +1425,38 @@ mod checks {
             assert_eq!(dump["notice"], dump["toasts"][0]["text"]);
         }
     }
+    fn toast_removals_leave_no_painted_controls() {
+        let mut fixture = Fixture::new(960., 740.);
+        let root = ThreadId::new();
+        let thread = fixture.thread;
+        fixture.update(|shell, _, cx| {
+            let mut row = shell.state.threads[&thread].clone();
+            row.id = root;
+            shell.state.threads.insert(root, row);
+            shell.toasts.attention(toasts::Attention {
+                root,
+                thread: root,
+                title: "Other work".into(),
+                status: Status::NeedsYou,
+            });
+            shell.notice("A temporary notice", cx);
+        });
+        fixture.frame();
+        let painted = fixture.paint();
+        painted.control("copy-notice");
+        painted.control(&format!("open-toast-{root}"));
+        fixture.action(DismissNotice);
+        let painted = fixture.paint();
+        assert!(!painted.controls.contains_key("Name(\"copy-notice\")"));
+        painted.control(&format!("open-toast-{root}"));
+        fixture.action(SelectThread { thread: Some(root) });
+        assert!(
+            !fixture
+                .paint()
+                .controls
+                .contains_key(&format!("Name(\"open-toast-{root}\")"))
+        );
+    }
     fn frame_guard_reads_palette_and_toasts() {
         use std::io::Write;
         let mut fixture = Fixture::new(960., 740.);
@@ -1512,6 +1544,10 @@ mod checks {
 
     pub(crate) fn run() {
         let tests: &[(&str, fn())] = &[
+            (
+                "toast_removals_leave_no_painted_controls",
+                toast_removals_leave_no_painted_controls,
+            ),
             (
                 "code_block_corner_paints_language_copy_and_wrap",
                 code_block_corner_paints_language_copy_and_wrap,

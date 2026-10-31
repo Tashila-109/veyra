@@ -1976,25 +1976,22 @@ impl Shell {
         for root in roots {
             let status = self.state.family_status(root);
             let old = previous.get(&root).unwrap_or(&Status::Idle);
-            if self.window_active {
-                if notify::attention_status(old, &status).is_some()
-                    && self
-                        .view
-                        .chat()
-                        .and_then(|id| self.state.threads.get(&id))
-                        .is_none_or(|row| row.root() != root)
-                    && let Some(thread) = self.banner_target(root)
-                    && let Some(row) = self.state.threads.get(&thread)
-                {
-                    self.toasts.attention(toasts::Attention {
-                        root,
-                        thread,
-                        title: row.title.clone(),
-                        status: status.clone(),
-                    });
-                }
-            } else {
-                self.toasts.selected(root);
+            if self.window_active
+                && notify::attention_status(old, &status).is_some()
+                && self
+                    .view
+                    .chat()
+                    .and_then(|id| self.state.threads.get(&id))
+                    .is_none_or(|row| row.root() != root)
+                && let Some(thread) = self.banner_target(root)
+                && let Some(row) = self.state.threads.get(&thread)
+            {
+                self.toasts.attention(toasts::Attention {
+                    root,
+                    thread,
+                    title: row.title.clone(),
+                    status: status.clone(),
+                });
             }
             if let Some(banner) = self.state.threads.get(&root).and_then(|thread| {
                 notify::banner_for(self.window_active, old, &status, root, &thread.title)
@@ -12052,6 +12049,7 @@ mod tests {
                 .collect()
         })
     }
+    #[cfg(debug_assertions)]
     fn dormant_drawer(
         shell: &mut super::Shell,
         window: &mut Window,
@@ -12107,6 +12105,41 @@ mod tests {
                 names.iter().any(|entry| entry == "MoveOptionDown"),
                 "dock context must be retained"
             );
+            assert!(
+                super::bindings()
+                    .iter()
+                    .all(|binding| !binding.label.is_empty())
+            );
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            shell.update(cx, |shell, cx| {
+                shell.state.requests.truncate(1);
+                shell.state.requests[0].kind = RequestKind::Approval {
+                    action: ProposedAction {
+                        consent: Default::default(),
+                        tool: "Bash".into(),
+                        target: ApprovalTarget::Command {
+                            command: "printf check".into(),
+                            cwd: Default::default(),
+                            reason: None,
+                            preview: ApprovalPreview::new(String::new()),
+                        },
+                    },
+                };
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            let names = palette_actions(&shell, cx);
+            for answer in ["AllowOnce", "AllowInThread", "Deny"] {
+                assert!(
+                    !names.iter().any(|name| name == answer),
+                    "approval answer listed: {answer}"
+                );
+            }
         });
     }
     #[cfg(debug_assertions)]
@@ -12262,6 +12295,7 @@ mod tests {
             );
         });
     }
+    #[cfg(debug_assertions)]
     fn attention_family(
         shell: &mut super::Shell,
         cx: &mut Context<super::Shell>,
@@ -12296,6 +12330,11 @@ mod tests {
             assert_eq!(dump[0]["text"], "Second");
             cx.update(|window, cx| window.dispatch_action(Box::new(super::DismissNotice), cx));
             draw(cx);
+            assert!(shell.read_with(cx, |_, cx| {
+                !cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key("Name(\"copy-notice\")")
+            }));
             assert!(shell.read_with(cx, |shell, _| {
                 shell.toasts_dump().as_array().unwrap().is_empty()
             }));
@@ -12345,14 +12384,64 @@ mod tests {
             }));
             shell.update(cx, |shell, cx| {
                 shell.window_active = false;
-                shell.post_banners(&BTreeMap::from([(root, Status::Working { since: 0 })]), cx);
+                shell.post_banners(&BTreeMap::from([(root, Status::NeedsYou)]), cx);
             });
             draw(cx);
-            assert!(shell.read_with(cx, |shell, _| shell.toasts.attention.is_empty()));
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key(&format!("Name(\"open-toast-{root}\")"))
+            }));
+            let retained = shell.read_with(cx, |shell, _| shell.toasts_dump());
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.notifications_posted),
+                0
+            );
+            shell.update(cx, |shell, cx| {
+                let child = shell.toasts.attention[0].thread;
+                shell.state.statuses.insert(child, Status::Failed);
+                shell.post_banners(&BTreeMap::from([(root, Status::NeedsYou)]), cx);
+                cx.notify();
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.toasts_dump()),
+                retained
+            );
             assert_eq!(
                 shell.read_with(cx, |shell, _| shell.notifications_posted),
                 1
             );
+            let fresh = ThreadId::new();
+            shell.update(cx, |shell, cx| {
+                let mut row = shell.state.threads[&root].clone();
+                row.id = fresh;
+                row.title = "New inactive attention".into();
+                shell.state.threads.insert(fresh, row);
+                shell.state.statuses.insert(fresh, Status::NeedsYou);
+                shell.post_banners(
+                    &BTreeMap::from([
+                        (root, Status::Failed),
+                        (fresh, Status::Working { since: 0 }),
+                    ]),
+                    cx,
+                );
+                cx.notify();
+            });
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.toasts_dump()),
+                retained
+            );
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.notifications_posted),
+                2
+            );
+            assert!(shell.read_with(cx, |_, cx| {
+                !cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key(&format!("Name(\"open-toast-{fresh}\")"))
+            }));
         });
     }
     #[cfg(debug_assertions)]
@@ -12382,6 +12471,11 @@ mod tests {
                 )
             });
             draw(cx);
+            assert!(shell.read_with(cx, |_, cx| {
+                !cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key(&format!("Name(\"open-toast-{root}\")"))
+            }));
             assert!(shell.read_with(cx, |shell, _| shell.toasts.attention.is_empty()));
         });
     }
@@ -12654,6 +12748,387 @@ mod tests {
                 shell.state.turns[&turn].state,
                 TurnState::Ended { .. }
             )));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn palette_restores_dock_focus_before_question_action(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
+            cx.simulate_keystrokes("down");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.question_scroll.cursor),
+                1
+            );
+            cx.simulate_keystrokes("up");
+            draw(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            assert!(!shell.read_with(cx, |shell, _| shell.dock_focused));
+            cx.simulate_input("> Next question option");
+            draw(cx);
+            assert_eq!(palette_actions(&shell, cx), vec!["MoveOptionDown"]);
+            cx.simulate_keystrokes("enter");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.dock_focused));
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.question_scroll.cursor),
+                1
+            );
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn first_escape_closes_filtered_palette(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            for query in ["Narrow", "nothing matches this query"] {
+                cx.simulate_keystrokes("secondary-k");
+                draw(cx);
+                cx.simulate_input(query);
+                draw(cx);
+                assert_eq!(
+                    shell.read_with(cx, |shell, cx| shell.palette_dump(cx)["query"].clone()),
+                    query
+                );
+                cx.simulate_keystrokes("escape");
+                draw(cx);
+                assert!(shell.read_with(cx, |shell, _| shell.palette.is_none()));
+                assert!(shell.update_in(cx, |shell, window, cx| {
+                    shell.input.focus_handle(cx).is_focused(window)
+                }));
+            }
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn final_reply_copy_refuses_unended_turn(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (_, turn, ids) = shell.update(cx, |shell, cx| {
+                display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::AssistantText {
+                        text: "Completed item in a live turn".into(),
+                        done: true,
+                    }],
+                )
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| matches!(
+                shell.state.turns[&turn].state,
+                TurnState::Running { .. }
+            )));
+            assert!(shell.read_with(cx, |_, cx| {
+                !cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key(&format!("Name(\"copy-reply-{}\")", ids[0]))
+            }));
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()))
+            });
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::CopyReply { item: Some(ids[0]) }), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "unchanged"
+            );
+            shell.update(cx, |shell, cx| {
+                shell.state.turns.get_mut(&turn).unwrap().state = TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(0),
+                    at: 1,
+                };
+                cx.notify();
+            });
+            draw(cx);
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::CopyReply { item: Some(ids[0]) }), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "Completed item in a live turn"
+            );
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn viewed_family_never_gets_attention_toast(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, child) = shell.update(cx, attention_family);
+            let outside = shell.read_with(cx, |shell, _| shell.view.chat().unwrap());
+            for selected in [root, child] {
+                shell.update(cx, |shell, cx| {
+                    shell.view = super::MainView::Chat(selected);
+                    shell.post_banners(&BTreeMap::from([(root, Status::Working { since: 0 })]), cx);
+                    cx.notify();
+                });
+                draw(cx);
+                assert!(shell.read_with(cx, |_, cx| {
+                    !cx.global::<super::PaintedControls>()
+                        .0
+                        .contains_key(&format!("Name(\"open-toast-{root}\")"))
+                }));
+                assert!(shell.read_with(cx, |shell, _| {
+                    shell.toasts_dump().as_array().unwrap().is_empty()
+                }));
+            }
+            shell.update(cx, |shell, cx| {
+                shell.view = super::MainView::Chat(outside);
+                shell.post_banners(&BTreeMap::from([(root, Status::Working { since: 0 })]), cx);
+                cx.notify();
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key(&format!("Name(\"open-toast-{root}\")"))
+            }));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn code_block_copy_refuses_stale_source(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (thread, _, ids) = shell.update(cx, |shell, cx| {
+                display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::AssistantText {
+                        text: "```rust\nold_block();\n```".into(),
+                        done: true,
+                    }],
+                )
+            });
+            draw(cx);
+            let old = shell.read_with(cx, |shell, _| {
+                shell.code_blocks_dump(ids[0])[0]["start"].as_u64().unwrap() as usize
+            });
+            shell.update(cx, |shell, cx| {
+                let mut item = shell.state.items[&thread][&ids[0]].clone();
+                item.body = ItemBody::AssistantText {
+                    text: "A changed reply.\n\n```rust\ncurrent_block();\n```".into(),
+                    done: true,
+                };
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemCompleted(item),
+                });
+                cx.notify();
+            });
+            draw(cx);
+            let current = shell.read_with(cx, |shell, _| {
+                shell.code_blocks_dump(ids[0])[0]["start"].as_u64().unwrap() as usize
+            });
+            assert_ne!(old, current);
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()))
+            });
+            cx.update(|window, cx| {
+                window.dispatch_action(
+                    Box::new(super::CopyCodeBlock {
+                        item: Some(ids[0]),
+                        start: old,
+                    }),
+                    cx,
+                )
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "unchanged"
+            );
+            cx.update(|window, cx| {
+                window.dispatch_action(
+                    Box::new(super::CopyCodeBlock {
+                        item: Some(ids[0]),
+                        start: current,
+                    }),
+                    cx,
+                )
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "current_block();"
+            );
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn code_copy_without_item_uses_current_source_or_refuses_visibly(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (thread, _, ids) = shell.update(cx, |shell, cx| {
+                display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::AssistantText {
+                        text: "```rust\nold_block();\n```".into(),
+                        done: true,
+                    }],
+                )
+            });
+            draw(cx);
+            shell.update(cx, |shell, cx| {
+                let mut item = shell.state.items[&thread][&ids[0]].clone();
+                item.body = ItemBody::AssistantText {
+                    text: "A changed reply.\n\n```rust\ncurrent_block();\n```".into(),
+                    done: true,
+                };
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemCompleted(item),
+                });
+                cx.notify();
+            });
+            draw(cx);
+            for _ in 0..32 {
+                if cx.update(|window, _| {
+                    window.context_stack().iter().any(|context| {
+                        context.get("reply_item").map(|value| value.as_ref())
+                            == Some(ids[0].to_string().as_str())
+                    })
+                }) {
+                    break;
+                }
+                cx.update(|window, cx| window.focus_next(cx));
+                draw(cx);
+            }
+            assert!(cx.update(|window, _| {
+                window.context_stack().iter().any(|context| {
+                    context.get("reply_item").map(|value| value.as_ref())
+                        == Some(ids[0].to_string().as_str())
+                })
+            }));
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()))
+            });
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::CopyCodeBlock::default()), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "current_block();"
+            );
+            shell.update(cx, |shell, cx| {
+                let mut item = shell.state.items[&thread][&ids[0]].clone();
+                item.body = ItemBody::AssistantText {
+                    text: concat!(
+                        "A changed reply.\n\n```rust\nfirst_current();\n```\n\n",
+                        "```rust\nsecond_current();\n```"
+                    )
+                    .into(),
+                    done: true,
+                };
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemCompleted(item),
+                });
+                cx.notify();
+            });
+            draw(cx);
+            let blocks = shell.read_with(cx, |shell, _| shell.code_blocks_dump(ids[0]));
+            assert_eq!(blocks.as_array().unwrap().len(), 2);
+            for _ in 0..64 {
+                if cx.update(|window, _| {
+                    let contexts = window.context_stack();
+                    contexts.iter().any(|context| {
+                        context.get("reply_item").map(|value| value.as_ref())
+                            == Some(ids[0].to_string().as_str())
+                    }) && contexts
+                        .iter()
+                        .all(|context| context.get("code_block_start").is_none())
+                }) {
+                    break;
+                }
+                cx.update(|window, cx| window.focus_next(cx));
+                draw(cx);
+            }
+            assert!(cx.update(|window, _| {
+                let contexts = window.context_stack();
+                contexts.iter().any(|context| {
+                    context.get("reply_item").map(|value| value.as_ref())
+                        == Some(ids[0].to_string().as_str())
+                }) && contexts
+                    .iter()
+                    .all(|context| context.get("code_block_start").is_none())
+            }));
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("ambiguous".into()))
+            });
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::CopyCodeBlock::default()), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "ambiguous"
+            );
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key("Name(\"copy-notice\")")
+            }));
+            cx.update(|window, cx| window.dispatch_action(Box::new(super::DismissNotice), cx));
+            draw(cx);
+            let second = blocks[1]["start"].as_u64().unwrap().to_string();
+            for _ in 0..64 {
+                if cx.update(|window, _| {
+                    window.context_stack().iter().any(|context| {
+                        context.get("code_block_start").map(|value| value.as_ref())
+                            == Some(second.as_str())
+                    })
+                }) {
+                    break;
+                }
+                cx.update(|window, cx| window.focus_next(cx));
+                draw(cx);
+            }
+            assert!(
+                cx.update(
+                    |window, _| window.context_stack().iter().any(|context| context
+                        .get("code_block_start")
+                        .map(|value| value.as_ref())
+                        == Some(second.as_str()))
+                )
+            );
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::CopyCodeBlock::default()), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "second_current();"
+            );
+            cx.update(|window, cx| window.dispatch_action(Box::new(super::FocusComposer), cx));
+            draw(cx);
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("no context".into()))
+            });
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::CopyCodeBlock::default()), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "no context"
+            );
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key("Name(\"copy-notice\")")
+            }));
         });
     }
 }

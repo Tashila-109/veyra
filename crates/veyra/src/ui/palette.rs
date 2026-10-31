@@ -24,18 +24,9 @@ struct Entry {
     chord: Option<String>,
 }
 fn chord(binding: &Binding) -> Option<String> {
-    (!binding.chord.is_empty()).then(|| {
-        binding
-            .chord
-            .replace("secondary-", "⌘")
-            .replace("ctrl-", "⌃")
-            .replace("alt-", "⌥")
-            .replace("shift-", "⇧")
-            .replace("enter", "↵")
-            .replace("backspace", "⌫")
-            .replace("escape", "Esc")
-    })
+    actions::format_chord(binding.chord)
 }
+
 impl Shell {
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
@@ -59,6 +50,9 @@ impl Shell {
             return;
         };
         window.focus(&palette.origin, cx);
+        // gpui emits focus callbacks after drawing; actions need the restored state now.
+        self.dock_focused = self.dock_focus.contains_focused(window, cx);
+        self.composer_focused = self.input.focus_handle(cx).is_focused(window);
         if palette.closing {
             return;
         }
@@ -99,11 +93,8 @@ impl Shell {
         let actions = bindings()
             .into_iter()
             .filter_map(|binding| {
-                let label = binding.label?;
-                if answers_request(binding.action)
-                    || !binding.matches_context(&palette.contexts)
-                    || !matches(label)
-                {
+                let label = binding.palette_label()?;
+                if !binding.matches_context(&palette.contexts) || !matches(label) {
                     return None;
                 }
                 Some(Entry {
@@ -157,7 +148,7 @@ impl Shell {
                 if let Some(binding) = bindings()
                     .into_iter()
                     .find(|binding| binding.action == name)
-                    && !answers_request(name)
+                    && binding.palette_label().is_some()
                     && binding.matches_context(&contexts)
                     && binding.matches_context(&window.context_stack())
                 {
@@ -259,6 +250,12 @@ impl Shell {
                         .bg(t.colors.floating)
                         .shadow(t.shadows.floating.clone())
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .capture_action(cx.listener(
+                            |shell, _: &gpui_kit::base::actions::Cancel, window, cx| {
+                                shell.close_palette(window, cx);
+                                cx.stop_propagation();
+                            },
+                        ))
                         .child(
                             KitCommand::new(&palette.state)
                                 .bordered(false)
@@ -323,5 +320,19 @@ impl Shell {
                 Target::Thread(thread) => Some(serde_json::json!({"thread":thread,"title":entry.label})),
                 _ => None,
             }).collect::<Vec<_>>()})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bindings, chord};
+    #[test]
+    fn palette_chords_keep_the_shared_shifted_paste_spelling() {
+        let mut binding = bindings()
+            .into_iter()
+            .find(|row| row.action == "PasteShell")
+            .unwrap();
+        binding.chord = "secondary-shift-v";
+        assert_eq!(chord(&binding), Some("⌘⇧V".into()));
     }
 }

@@ -220,18 +220,25 @@ pub struct DebugScrollApproval {
     pub pixels: f32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum PaletteEligibility {
+    Command,
+    RequestAnswer,
+}
 pub struct Binding {
     pub action: &'static str,
     pub chord: &'static str,
     pub context: Option<&'static str>,
-    pub label: Option<&'static str>,
+    pub label: &'static str,
+    pub(super) palette: PaletteEligibility,
     pub(super) build: fn() -> Box<dyn Action>,
 }
 macro_rules! binding {
-    ($action:ident, $chord:literal, $context:expr, $field:ident: $value:expr) => {
+    ($action:ident, $label:literal, $palette:ident, $chord:literal, $context:expr, $field:ident: $value:expr) => {
         Binding {
             action: stringify!($action),
-            label: palette_label(stringify!($action)),
+            label: $label,
+            palette: PaletteEligibility::$palette,
             chord: $chord,
             context: $context,
             build: || {
@@ -242,10 +249,11 @@ macro_rules! binding {
             },
         }
     };
-    ($action:ident, $chord:literal, $context:expr) => {
+    ($action:ident, $label:literal, $palette:ident, $chord:literal, $context:expr) => {
         Binding {
             action: stringify!($action),
-            label: palette_label(stringify!($action)),
+            label: $label,
+            palette: PaletteEligibility::$palette,
             chord: $chord,
             context: $context,
             build: || Box::new($action::default()),
@@ -254,116 +262,470 @@ macro_rules! binding {
 }
 pub fn bindings() -> Vec<Binding> {
     vec![
-        binding!(Quit, "secondary-q", None),
-        binding!(OpenPalette, "secondary-k", Some("Veyra")),
-        binding!(CopyNotice, "", Some("Veyra")),
-        binding!(CopyCodeBlock, "", Some("VeyraReply")),
-        binding!(ToggleCodeWrap, "", Some("VeyraReply")),
-        binding!(CopyReply, "", Some("VeyraReply")),
-        binding!(DismissToast, "", Some("VeyraToast")),
-        binding!(ToggleShellDrawer, "secondary-j", None),
-        binding!(NewShellTab, "secondary-t", Some("VeyraTerminal")),
-        binding!(CloseShellTab, "secondary-w", Some("VeyraTerminal")),
-        binding!(NextShellTab, "secondary-shift-]", Some("VeyraTerminal")),
-        binding!(PreviousShellTab, "secondary-shift-[", Some("VeyraTerminal")),
+        binding!(Quit, "Quit Veyra", Command, "secondary-q", None),
+        binding!(
+            OpenPalette,
+            "Command Palette…",
+            Command,
+            "secondary-k",
+            Some("Veyra")
+        ),
+        binding!(CopyNotice, "Copy notice", Command, "", Some("Veyra")),
+        binding!(
+            CopyCodeBlock,
+            "Copy code block",
+            Command,
+            "",
+            Some("VeyraReply")
+        ),
+        binding!(
+            ToggleCodeWrap,
+            "Toggle code wrapping",
+            Command,
+            "",
+            Some("VeyraReply")
+        ),
+        binding!(
+            CopyReply,
+            "Copy final reply",
+            Command,
+            "",
+            Some("VeyraReply")
+        ),
+        binding!(
+            DismissToast,
+            "Dismiss attention toast",
+            Command,
+            "",
+            Some("VeyraToast")
+        ),
+        binding!(
+            ToggleShellDrawer,
+            "Toggle shell drawer",
+            Command,
+            "secondary-j",
+            None
+        ),
+        binding!(
+            NewShellTab,
+            "New shell tab",
+            Command,
+            "secondary-t",
+            Some("VeyraTerminal")
+        ),
+        binding!(
+            CloseShellTab,
+            "Close shell tab",
+            Command,
+            "secondary-w",
+            Some("VeyraTerminal")
+        ),
+        binding!(
+            NextShellTab,
+            "Next shell tab",
+            Command,
+            "secondary-shift-]",
+            Some("VeyraTerminal")
+        ),
+        binding!(
+            PreviousShellTab,
+            "Previous shell tab",
+            Command,
+            "secondary-shift-[",
+            Some("VeyraTerminal")
+        ),
         binding!(
             ConfirmCloseShellTab,
+            "Confirm close shell tab",
+            Command,
             "secondary-enter",
             Some("VeyraShellClose")
         ),
-        binding!(CancelCloseShellTab, "escape", Some("VeyraShellClose")),
-        binding!(RestartShellTab, "enter", Some("VeyraTerminalEnded")),
-        binding!(PasteShell, "secondary-v", Some("VeyraTerminal")),
-        binding!(CopyShell, "secondary-c", Some("VeyraTerminal")),
-        binding!(ScrollShellHistoryUp, "shift-pageup", Some("VeyraTerminal")),
+        binding!(
+            CancelCloseShellTab,
+            "Cancel close shell tab",
+            Command,
+            "escape",
+            Some("VeyraShellClose")
+        ),
+        binding!(
+            RestartShellTab,
+            "Restart shell tab",
+            Command,
+            "enter",
+            Some("VeyraTerminalEnded")
+        ),
+        binding!(
+            PasteShell,
+            "Paste into shell",
+            Command,
+            "secondary-v",
+            Some("VeyraTerminal")
+        ),
+        binding!(
+            CopyShell,
+            "Copy shell selection",
+            Command,
+            "secondary-c",
+            Some("VeyraTerminal")
+        ),
+        binding!(
+            ScrollShellHistoryUp,
+            "Scroll shell history up",
+            Command,
+            "shift-pageup",
+            Some("VeyraTerminal")
+        ),
         binding!(
             ScrollShellHistoryDown,
+            "Scroll shell history down",
+            Command,
             "shift-pagedown",
             Some("VeyraTerminal")
         ),
-        binding!(ConfirmQuit, "secondary-enter", Some("VeyraQuit")),
-        binding!(CancelQuit, "escape", Some("VeyraQuit")),
-        binding!(OpenSettings, "secondary-,", Some("Veyra")),
-        binding!(AddProject, "secondary-shift-o", Some("Veyra")),
-        binding!(NewThread, "secondary-n", Some("Veyra")),
-        binding!(PickProvider, "secondary-alt-p", Some("Veyra")),
-        binding!(OpenProviderPicker, "secondary-alt-shift-p", Some("Veyra")),
-        binding!(PickModel, "secondary-alt-m", Some("Veyra")),
-        binding!(PickEffort, "secondary-alt-e", Some("Veyra")),
-        binding!(PickPermission, "secondary-alt-a", Some("Veyra")),
-        binding!(Send, "secondary-enter", Some("Veyra")),
-        binding!(Stop, "ctrl-c", Some("VeyraComposer")),
-        binding!(Continue, "secondary-shift-enter", Some("Veyra")),
-        binding!(DiscardQueued, "secondary-shift-backspace", Some("Veyra")),
-        binding!(ActivateThreadRow, "enter", Some("VeyraSidebarRow")),
-        binding!(ActivateThreadRow, "space", Some("VeyraSidebarRow")),
-        binding!(OpenThreadMenu, "secondary-alt-shift-m", Some("Veyra")),
-        binding!(Archive, "secondary-shift-a", Some("Veyra")),
-        binding!(ArchiveKeepChildren, "secondary-alt-shift-a", Some("Veyra")),
-        binding!(StopThread, "secondary-alt-shift-s", Some("Veyra")),
-        binding!(NextNeedsYou, "secondary-shift-j", Some("Veyra")),
-        binding!(AllowOnce, "secondary-enter", Some("VeyraApproval")),
-        binding!(AllowInThread, "secondary-alt-enter", Some("VeyraApproval")),
-        binding!(Deny, "secondary-.", Some("VeyraApproval")),
-        binding!(FocusDock, "secondary-shift-y", Some("Veyra")),
-        binding!(FocusComposer, "escape", Some("VeyraDock")),
-        binding!(MoveOptionUp, "up", Some("VeyraDock")),
-        binding!(MoveOptionDown, "down", Some("VeyraDock")),
-        binding!(AnswerFocusedOption, "enter", Some("VeyraDock")),
-        binding!(ScrollTranscriptUp, "pageup", Some("Veyra")),
-        binding!(ScrollTranscriptDown, "pagedown", Some("Veyra")),
-        binding!(ScrollTranscriptEnd, "secondary-end", Some("Veyra")),
-        binding!(RecheckProviders, "secondary-alt-r", Some("Veyra")),
-        binding!(SetDefaultMode, "secondary-alt-d", Some("Veyra")),
-        binding!(SetWindowBackground, "secondary-alt-b", Some("Veyra")),
-        binding!(SelectThread, "secondary-alt-1", Some("Veyra")),
-        binding!(SelectProject, "secondary-alt-shift-1", Some("Veyra")),
-        binding!(ToggleItem, "secondary-shift-i", Some("Veyra")),
-        binding!(Retry, "secondary-r", Some("Veyra")),
-        binding!(OpenTerminal, "secondary-alt-t", Some("Veyra")),
-        binding!(NarrowSidebar, "secondary-alt-left", Some("Veyra")),
-        binding!(WidenSidebar, "secondary-alt-right", Some("Veyra")),
-        binding!(ResetSidebar, "secondary-alt-0", Some("Veyra")),
-        binding!(DismissNotice, "escape", Some("Veyra")),
-        binding!(AnswerQuestion, "1", Some("VeyraDock"), option: 0),
-        binding!(AnswerQuestion, "2", Some("VeyraDock"), option: 1),
-        binding!(AnswerQuestion, "3", Some("VeyraDock"), option: 2),
-        binding!(AnswerQuestion, "4", Some("VeyraDock"), option: 3),
-        binding!(AnswerQuestion, "5", Some("VeyraDock"), option: 4),
-        binding!(AnswerQuestion, "6", Some("VeyraDock"), option: 5),
-        binding!(AnswerQuestion, "7", Some("VeyraDock"), option: 6),
-        binding!(AnswerQuestion, "8", Some("VeyraDock"), option: 7),
-        binding!(AnswerQuestion, "9", Some("VeyraDock"), option: 8),
-        binding!(ChooseAsyncOption, "secondary-1", Some("Veyra"), option: 0),
-        binding!(ChooseAsyncOption, "secondary-2", Some("Veyra"), option: 1),
-        binding!(ChooseAsyncOption, "secondary-3", Some("Veyra"), option: 2),
-        binding!(ChooseAsyncOption, "secondary-4", Some("Veyra"), option: 3),
-        binding!(ChooseAsyncOption, "secondary-5", Some("Veyra"), option: 4),
-        binding!(ChooseAsyncOption, "secondary-6", Some("Veyra"), option: 5),
-        binding!(ChooseAsyncOption, "secondary-7", Some("Veyra"), option: 6),
-        binding!(ChooseAsyncOption, "secondary-8", Some("Veyra"), option: 7),
-        binding!(ChooseAsyncOption, "secondary-9", Some("Veyra"), option: 8),
+        binding!(
+            ConfirmQuit,
+            "Confirm quit",
+            Command,
+            "secondary-enter",
+            Some("VeyraQuit")
+        ),
+        binding!(
+            CancelQuit,
+            "Cancel quit",
+            Command,
+            "escape",
+            Some("VeyraQuit")
+        ),
+        binding!(
+            OpenSettings,
+            "Settings…",
+            Command,
+            "secondary-,",
+            Some("Veyra")
+        ),
+        binding!(
+            AddProject,
+            "Add project…",
+            Command,
+            "secondary-shift-o",
+            Some("Veyra")
+        ),
+        binding!(
+            NewThread,
+            "New thread",
+            Command,
+            "secondary-n",
+            Some("Veyra")
+        ),
+        binding!(
+            PickProvider,
+            "Next provider",
+            Command,
+            "secondary-alt-p",
+            Some("Veyra")
+        ),
+        binding!(
+            OpenProviderPicker,
+            "Choose provider…",
+            Command,
+            "secondary-alt-shift-p",
+            Some("Veyra")
+        ),
+        binding!(
+            PickModel,
+            "Next model",
+            Command,
+            "secondary-alt-m",
+            Some("Veyra")
+        ),
+        binding!(
+            PickEffort,
+            "Next reasoning effort",
+            Command,
+            "secondary-alt-e",
+            Some("Veyra")
+        ),
+        binding!(
+            PickPermission,
+            "Next permission mode",
+            Command,
+            "secondary-alt-a",
+            Some("Veyra")
+        ),
+        binding!(
+            Send,
+            "Send message",
+            Command,
+            "secondary-enter",
+            Some("Veyra")
+        ),
+        binding!(Stop, "Stop turn", Command, "ctrl-c", Some("VeyraComposer")),
+        binding!(
+            Continue,
+            "Continue thread",
+            Command,
+            "secondary-shift-enter",
+            Some("Veyra")
+        ),
+        binding!(
+            DiscardQueued,
+            "Discard queued messages",
+            Command,
+            "secondary-shift-backspace",
+            Some("Veyra")
+        ),
+        binding!(
+            ActivateThreadRow,
+            "Open focused thread",
+            Command,
+            "enter",
+            Some("VeyraSidebarRow")
+        ),
+        binding!(
+            ActivateThreadRow,
+            "Open focused thread",
+            Command,
+            "space",
+            Some("VeyraSidebarRow")
+        ),
+        binding!(
+            OpenThreadMenu,
+            "Thread actions…",
+            Command,
+            "secondary-alt-shift-m",
+            Some("Veyra")
+        ),
+        binding!(
+            Archive,
+            "Archive thread",
+            Command,
+            "secondary-shift-a",
+            Some("Veyra")
+        ),
+        binding!(
+            ArchiveKeepChildren,
+            "Archive, keep child threads",
+            Command,
+            "secondary-alt-shift-a",
+            Some("Veyra")
+        ),
+        binding!(
+            StopThread,
+            "Stop thread",
+            Command,
+            "secondary-alt-shift-s",
+            Some("Veyra")
+        ),
+        binding!(
+            NextNeedsYou,
+            "Next thread needing attention",
+            Command,
+            "secondary-shift-j",
+            Some("Veyra")
+        ),
+        binding!(
+            AllowOnce,
+            "Allow once",
+            RequestAnswer,
+            "secondary-enter",
+            Some("VeyraApproval")
+        ),
+        binding!(
+            AllowInThread,
+            "Allow in this thread",
+            RequestAnswer,
+            "secondary-alt-enter",
+            Some("VeyraApproval")
+        ),
+        binding!(
+            Deny,
+            "Deny",
+            RequestAnswer,
+            "secondary-.",
+            Some("VeyraApproval")
+        ),
+        binding!(
+            FocusDock,
+            "Focus request",
+            Command,
+            "secondary-shift-y",
+            Some("Veyra")
+        ),
+        binding!(
+            FocusComposer,
+            "Focus composer",
+            Command,
+            "escape",
+            Some("VeyraDock")
+        ),
+        binding!(
+            MoveOptionUp,
+            "Previous question option",
+            Command,
+            "up",
+            Some("VeyraDock")
+        ),
+        binding!(
+            MoveOptionDown,
+            "Next question option",
+            Command,
+            "down",
+            Some("VeyraDock")
+        ),
+        binding!(
+            AnswerFocusedOption,
+            "Answer focused option",
+            RequestAnswer,
+            "enter",
+            Some("VeyraDock")
+        ),
+        binding!(
+            ScrollTranscriptUp,
+            "Scroll transcript up",
+            Command,
+            "pageup",
+            Some("Veyra")
+        ),
+        binding!(
+            ScrollTranscriptDown,
+            "Scroll transcript down",
+            Command,
+            "pagedown",
+            Some("Veyra")
+        ),
+        binding!(
+            ScrollTranscriptEnd,
+            "Latest reply",
+            Command,
+            "secondary-end",
+            Some("Veyra")
+        ),
+        binding!(
+            RecheckProviders,
+            "Check providers again",
+            Command,
+            "secondary-alt-r",
+            Some("Veyra")
+        ),
+        binding!(
+            SetDefaultMode,
+            "Next default permission mode",
+            Command,
+            "secondary-alt-d",
+            Some("Veyra")
+        ),
+        binding!(
+            SetWindowBackground,
+            "Toggle window background",
+            Command,
+            "secondary-alt-b",
+            Some("Veyra")
+        ),
+        binding!(
+            SelectThread,
+            "Next thread",
+            Command,
+            "secondary-alt-1",
+            Some("Veyra")
+        ),
+        binding!(
+            SelectProject,
+            "Next project",
+            Command,
+            "secondary-alt-shift-1",
+            Some("Veyra")
+        ),
+        binding!(
+            ToggleItem,
+            "Toggle tool or reasoning",
+            Command,
+            "secondary-shift-i",
+            Some("Veyra")
+        ),
+        binding!(
+            Retry,
+            "Retry last failed turn",
+            Command,
+            "secondary-r",
+            Some("Veyra")
+        ),
+        binding!(
+            OpenTerminal,
+            "Open shell",
+            Command,
+            "secondary-alt-t",
+            Some("Veyra")
+        ),
+        binding!(
+            NarrowSidebar,
+            "Narrow sidebar",
+            Command,
+            "secondary-alt-left",
+            Some("Veyra")
+        ),
+        binding!(
+            WidenSidebar,
+            "Widen sidebar",
+            Command,
+            "secondary-alt-right",
+            Some("Veyra")
+        ),
+        binding!(
+            ResetSidebar,
+            "Reset sidebar width",
+            Command,
+            "secondary-alt-0",
+            Some("Veyra")
+        ),
+        binding!(
+            DismissNotice,
+            "Dismiss notice",
+            Command,
+            "escape",
+            Some("Veyra")
+        ),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "1", Some("VeyraDock"), option: 0),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "2", Some("VeyraDock"), option: 1),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "3", Some("VeyraDock"), option: 2),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "4", Some("VeyraDock"), option: 3),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "5", Some("VeyraDock"), option: 4),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "6", Some("VeyraDock"), option: 5),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "7", Some("VeyraDock"), option: 6),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "8", Some("VeyraDock"), option: 7),
+        binding!(AnswerQuestion, "Answer question", RequestAnswer, "9", Some("VeyraDock"), option: 8),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-1", Some("Veyra"), option: 0),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-2", Some("Veyra"), option: 1),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-3", Some("Veyra"), option: 2),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-4", Some("Veyra"), option: 3),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-5", Some("Veyra"), option: 4),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-6", Some("Veyra"), option: 5),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-7", Some("Veyra"), option: 6),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-8", Some("Veyra"), option: 7),
+        binding!(ChooseAsyncOption, "Answer async question", RequestAnswer, "secondary-9", Some("Veyra"), option: 8),
     ]
 }
 
+pub(super) fn format_chord(chord: &str) -> Option<String> {
+    (!chord.is_empty()).then(|| {
+        chord
+            .replace("secondary-", "⌘")
+            .replace("ctrl-", "⌃")
+            .replace("alt-", "⌥")
+            .replace("shift-", "⇧")
+            .replace("⇧v", "⇧V")
+            .replace("enter", "↵")
+            .replace("backspace", "⌫")
+            .replace("escape", "Esc")
+    })
+}
 pub fn shortcut<A: Action + Default>() -> Option<String> {
     bindings()
         .iter()
         .find(|binding| {
             !binding.chord.is_empty() && (binding.build)().name() == A::default().name()
         })
-        .map(|binding| {
-            binding
-                .chord
-                .replace("secondary-", "⌘")
-                .replace("ctrl-", "⌃")
-                .replace("alt-", "⌥")
-                .replace("shift-", "⇧")
-                .replace("⇧v", "⇧V")
-                .replace("enter", "↵")
-                .replace("backspace", "⌫")
-                .replace("escape", "Esc")
-        })
+        .and_then(|binding| format_chord(binding.chord))
 }
 pub fn shortcut_chip<A: Action + Default>(cx: &App) -> impl IntoElement {
     let t = cx.global::<super::theme::Theme>();
@@ -379,6 +741,12 @@ pub fn shortcut_chip<A: Action + Default>(cx: &App) -> impl IntoElement {
         .children(shortcut::<A>())
 }
 impl Binding {
+    pub(super) fn palette_label(&self) -> Option<&'static str> {
+        match self.palette {
+            PaletteEligibility::Command => Some(self.label),
+            PaletteEligibility::RequestAnswer => None,
+        }
+    }
     pub(super) fn predicate(&self) -> Option<KeyBindingContextPredicate> {
         let binding = self;
         let key = (!binding.chord.is_empty())
@@ -413,80 +781,6 @@ impl Binding {
             (1..=contexts.len()).any(|end| predicate.eval(&contexts[..end]))
         })
     }
-}
-fn palette_label(action: &str) -> Option<&'static str> {
-    Some(match action {
-        "Quit" => "Quit Veyra",
-        "OpenPalette" => "Command Palette…",
-        "CopyNotice" => "Copy notice",
-        "CopyCodeBlock" => "Copy code block",
-        "ToggleCodeWrap" => "Toggle code wrapping",
-        "CopyReply" => "Copy final reply",
-        "DismissToast" => "Dismiss attention toast",
-        "ToggleShellDrawer" => "Toggle shell drawer",
-        "NewShellTab" => "New shell tab",
-        "CloseShellTab" => "Close shell tab",
-        "NextShellTab" => "Next shell tab",
-        "PreviousShellTab" => "Previous shell tab",
-        "RestartShellTab" => "Restart shell tab",
-        "PasteShell" => "Paste into shell",
-        "CopyShell" => "Copy shell selection",
-        "ScrollShellHistoryUp" => "Scroll shell history up",
-        "ScrollShellHistoryDown" => "Scroll shell history down",
-        "ConfirmCloseShellTab" => "Confirm close shell tab",
-        "CancelCloseShellTab" => "Cancel close shell tab",
-        "ConfirmQuit" => "Confirm quit",
-        "CancelQuit" => "Cancel quit",
-        "OpenSettings" => "Settings…",
-        "AddProject" => "Add project…",
-        "NewThread" => "New thread",
-        "PickProvider" => "Next provider",
-        "OpenProviderPicker" => "Choose provider…",
-        "PickModel" => "Next model",
-        "PickEffort" => "Next reasoning effort",
-        "PickPermission" => "Next permission mode",
-        "Send" => "Send message",
-        "Stop" => "Stop turn",
-        "Continue" => "Continue thread",
-        "DiscardQueued" => "Discard queued messages",
-        "ActivateThreadRow" => "Open focused thread",
-        "OpenThreadMenu" => "Thread actions…",
-        "Archive" => "Archive thread",
-        "ArchiveKeepChildren" => "Archive, keep child threads",
-        "StopThread" => "Stop thread",
-        "NextNeedsYou" => "Next thread needing attention",
-        "FocusDock" => "Focus request",
-        "FocusComposer" => "Focus composer",
-        "MoveOptionUp" => "Previous question option",
-        "MoveOptionDown" => "Next question option",
-        "ScrollTranscriptUp" => "Scroll transcript up",
-        "ScrollTranscriptDown" => "Scroll transcript down",
-        "ScrollTranscriptEnd" => "Latest reply",
-        "RecheckProviders" => "Check providers again",
-        "SetDefaultMode" => "Next default permission mode",
-        "SetWindowBackground" => "Toggle window background",
-        "SelectThread" => "Next thread",
-        "SelectProject" => "Next project",
-        "ToggleItem" => "Toggle tool or reasoning",
-        "Retry" => "Retry last failed turn",
-        "OpenTerminal" => "Open shell",
-        "NarrowSidebar" => "Narrow sidebar",
-        "WidenSidebar" => "Widen sidebar",
-        "ResetSidebar" => "Reset sidebar width",
-        "DismissNotice" => "Dismiss notice",
-        _ => return None,
-    })
-}
-pub(super) fn answers_request(action: &str) -> bool {
-    matches!(
-        action,
-        "AllowOnce"
-            | "AllowInThread"
-            | "Deny"
-            | "AnswerQuestion"
-            | "ChooseAsyncOption"
-            | "AnswerFocusedOption"
-    )
 }
 
 pub fn init(cx: &mut App) {
@@ -544,6 +838,21 @@ mod tests {
     use super::ActivateWindow;
     use super::{AllowOnce, Deny, Stop, bindings, shortcut};
     use gpui_kit::Keystroke;
+    #[test]
+    fn palette_metadata_is_explicit_for_every_binding() {
+        let bindings = bindings();
+        assert!(bindings.iter().all(|binding| !binding.label.is_empty()));
+        let answers: Vec<_> = bindings
+            .iter()
+            .filter(|binding| binding.palette == super::PaletteEligibility::RequestAnswer)
+            .collect();
+        assert!(!answers.is_empty());
+        assert!(
+            answers
+                .iter()
+                .all(|binding| binding.palette_label().is_none())
+        );
+    }
     #[test]
     fn shortcut_chips_match_bindings() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");

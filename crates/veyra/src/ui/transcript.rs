@@ -291,26 +291,47 @@ impl Shell {
         )
     }
     pub(super) fn copy_code_block(
-        &self,
+        &mut self,
         action: &CopyCodeBlock,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
         let Some(item) = self.reply_item(action.item, window) else {
+            self.notice("Choose a code block's Copy button to copy code", cx);
             return;
         };
         let blocks = self.code.blocks.lock().unwrap();
-        let block = if action.item.is_none() {
-            blocks
-                .iter()
-                .find_map(|((id, _), block)| (*id == item).then_some(block))
-        } else {
+        let focused_start = window.context_stack().iter().rev().find_map(|context| {
+            context
+                .get("code_block_start")
+                .and_then(|start| start.parse::<usize>().ok())
+        });
+        let block = if action.item.is_some() {
             blocks.get(&(item, action.start))
+        } else if let Some(start) = focused_start {
+            blocks.get(&(item, start))
+        } else {
+            let mut current = blocks.iter().filter_map(|((id, _), block)| {
+                (*id == item && self.state.markdown_text.get(&item) == Some(&block.source))
+                    .then_some(block)
+            });
+            match (current.next(), current.next()) {
+                (Some(block), None) => Some(block),
+                _ => None,
+            }
         };
-        if let Some(block) = block
+        let text = if let Some(block) = block
             && self.state.markdown_text.get(&item) == Some(&block.source)
         {
-            cx.write_to_clipboard(ClipboardItem::new_string(block.text.to_string()));
+            Some(block.text.clone())
+        } else {
+            None
+        };
+        drop(blocks);
+        if let Some(text) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+        } else {
+            self.notice("Choose a current code block's Copy button to copy code", cx);
         }
     }
     pub(super) fn toggle_code_wrap(
@@ -418,8 +439,11 @@ impl RenderOnce for Reply {
                         language: block.lang().unwrap_or_default(),
                     },
                 );
+                let mut context = KeyContext::default();
+                context.set("code_block_start", start.to_string());
                 div()
                     .h_flex()
+                    .key_context(context)
                     .items_center()
                     .gap(t.layout.control_gap)
                     .debug_selector(move || format!("code-corner-{id}-{start}"))
@@ -513,19 +537,20 @@ impl RenderOnce for Reply {
             })
     }
 }
-fn reply_markdown(
-    item: &Item,
-    markdown: SharedString,
-    wrapped: bool,
-    final_reply: bool,
-    blocks: CodeCache,
-) -> Reply {
-    Reply {
-        item: item.id,
-        markdown,
-        wrapped,
-        final_reply,
-        blocks,
+impl Reply {
+    fn new(
+        item: &Item,
+        markdown: SharedString,
+        final_reply: bool,
+        code: Option<&CodeState>,
+    ) -> Self {
+        Self {
+            item: item.id,
+            markdown,
+            wrapped: code.is_none_or(|code| !code.unwrapped.contains(&item.id)),
+            final_reply,
+            blocks: code.map(|code| code.blocks.clone()).unwrap_or_default(),
+        }
     }
 }
 pub(super) fn user_text(item: &Item, state: Option<&super::AppState>) -> String {
@@ -631,12 +656,11 @@ fn row_with_state(
             )
         }
         ItemBody::AssistantText { .. } => {
-            row = row.child(reply_markdown(
+            row = row.child(Reply::new(
                 item,
                 markdown.expect("markdown rows have cached text"),
-                code.is_none_or(|code| !code.unwrapped.contains(&item.id)),
                 state.is_some_and(|state| final_reply(item, state)),
-                code.map(|code| code.blocks.clone()).unwrap_or_default(),
+                code,
             ));
         }
         ItemBody::AsyncQuestions { questions, .. } => {
@@ -644,13 +668,7 @@ fn row_with_state(
                 row = row.child(
                     div()
                         .debug_selector(|| "async-question-message".into())
-                        .child(reply_markdown(
-                            item,
-                            markdown,
-                            code.is_none_or(|code| !code.unwrapped.contains(&item.id)),
-                            false,
-                            code.map(|code| code.blocks.clone()).unwrap_or_default(),
-                        )),
+                        .child(Reply::new(item, markdown, false, code)),
                 );
             }
             for (question_index, question) in questions.iter().enumerate() {

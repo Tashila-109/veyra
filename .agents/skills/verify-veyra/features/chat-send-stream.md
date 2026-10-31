@@ -782,6 +782,7 @@ For stored-mode compatibility, see [stored Grok modes](permission-matrix.md#stor
 `transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
 `transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
 Reply items add `wrapped` and the rendered `code_blocks` list (`start`, `text`, `language`). CopyCodeBlock, ToggleCodeWrap and CopyReply have no chord.
+CopyCodeBlock without an item id uses the focused code corner, or the reply's only current block. Missing, stale or ambiguous targets show a notice and leave the clipboard unchanged. CopyReply refuses a turn that has not ended.
 Items include `outcome`, queued `wait_reason`, a tool's `failed_last_line` and its rendered `tool_label`.
 The failure card's own turn has no separate `outcome` caption; historical failed turns retain their cause in the caption.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.

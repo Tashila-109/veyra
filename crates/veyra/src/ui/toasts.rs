@@ -19,7 +19,8 @@ pub(super) struct Attention {
 }
 #[derive(Clone, PartialEq)]
 enum Toast {
-    Notice { text: SharedString, blocked: bool },
+    Notice(SharedString),
+    Storage(SharedString),
     Attention(Attention),
 }
 #[derive(Default)]
@@ -43,23 +44,17 @@ impl Toasts {
 fn content(value: &Toast, cx: &App) -> Div {
     let t = cx.global::<Theme>();
     let (title, helper, status, name) = match value {
-        Toast::Notice { text, blocked } => (
-            if *blocked {
-                "Storage blocked".into()
-            } else {
-                "Notice".into()
-            },
+        Toast::Notice(text) => (
+            "Notice".into(),
             veyra_engine::text::display_text(text),
-            if *blocked {
-                Status::Failed
-            } else {
-                Status::Idle
-            },
-            if *blocked {
-                "storage".into()
-            } else {
-                "notice".into()
-            },
+            Status::Idle,
+            "notice".into(),
+        ),
+        Toast::Storage(text) => (
+            "Storage blocked".into(),
+            veyra_engine::text::display_text(text),
+            Status::Failed,
+            "storage".into(),
         ),
         Toast::Attention(value) => (
             value.title.clone(),
@@ -69,8 +64,10 @@ fn content(value: &Toast, cx: &App) -> Div {
         ),
     };
     let action = match value {
-        Toast::Notice { .. } => composer::labelled_button("copy-notice", "Copy", cx)
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(CopyNotice), cx)),
+        Toast::Notice(_) | Toast::Storage(_) => {
+            composer::labelled_button("copy-notice", "Copy", cx)
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(CopyNotice), cx))
+        }
         Toast::Attention(value) => {
             let thread = value.thread;
             composer::labelled_button(
@@ -142,9 +139,12 @@ impl Shell {
         }
     }
     fn toast_rows(&self) -> Vec<Toast> {
-        let notice = self.notice_text().map(|text| Toast::Notice {
-            text: text.clone(),
-            blocked: self.toasts.blocked.is_some(),
+        let notice = self.notice_text().map(|text| {
+            if self.toasts.blocked.is_some() {
+                Toast::Storage(text.clone())
+            } else {
+                Toast::Notice(text.clone())
+            }
         });
         let attention = self.toasts.attention.iter().cloned().map(Toast::Attention);
         if self.toasts.blocked.is_some() {
@@ -174,7 +174,7 @@ impl Shell {
         self.toasts.mounted = rows.clone();
         let list = cx.new(|cx| NotificationList::new(window, cx));
         for (index, toast) in rows.into_iter().enumerate() {
-            if matches!(toast, Toast::Notice { blocked: true, .. }) {
+            if matches!(toast, Toast::Storage(_)) {
                 continue;
             }
             let close_owner = cx.entity().downgrade();
@@ -196,7 +196,7 @@ impl Shell {
                             return;
                         }
                         match &toast {
-                            Toast::Notice { .. } => {
+                            Toast::Notice(_) | Toast::Storage(_) => {
                                 window.dispatch_action(Box::new(DismissNotice), cx)
                             }
                             Toast::Attention(value) => window.dispatch_action(
@@ -232,13 +232,13 @@ impl Shell {
                 .border_color(t.colors.border)
                 .rounded(t.radius.floating)
                 .shadow(t.shadows.floating.clone())
-                .child(div().v_flex().flex_1().overflow_hidden().child(content(
-                    &Toast::Notice {
-                        text: text.clone(),
-                        blocked: true,
-                    },
-                    cx,
-                )));
+                .child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .overflow_hidden()
+                        .child(content(&Toast::Storage(text.clone()), cx)),
+                );
             let card = composer::observe_geometry(card, move |bounds, cx| {
                 if height.replace(bounds.size.height) != bounds.size.height {
                     let _ = owner.update(cx, |_, cx| cx.notify());
@@ -266,13 +266,16 @@ impl Shell {
         serde_json::Value::Array(
             self.toast_rows()
                 .into_iter()
-                .map(|toast| match toast {
-                    Toast::Notice { text, blocked } => {
-                        serde_json::json!({"kind":"notice","text":text,"storage_blocked":blocked})
-                    }
-                    Toast::Attention(value) => {
-                        serde_json::json!({"kind":"attention","text":value.title,
-                "root":value.root,"thread":value.thread,"status":status_word(&value.status)})
+                .map(|toast| {
+                    let blocked = matches!(&toast, Toast::Storage(_));
+                    match toast {
+                        Toast::Notice(text) | Toast::Storage(text) => {
+                            serde_json::json!({"kind":"notice","text":text,"storage_blocked":blocked})
+                        }
+                        Toast::Attention(value) => {
+                            serde_json::json!({"kind":"attention","text":value.title,
+                                "root":value.root,"thread":value.thread,"status":status_word(&value.status)})
+                        }
                     }
                 })
                 .collect(),

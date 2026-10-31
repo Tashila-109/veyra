@@ -13,7 +13,7 @@ Covers: crates/veyra/src/ui/palette.rs crates/veyra/src/ui/actions.rs crates/vey
 ## How to get to it (user POV)
 
 Choose Command Palette… in the Veyra menu or press ⌘K from the composer, dock or drawer.
-Type to filter, move with Up and Down, and run with Return. Escape clears a query first, then closes.
+Type to filter, move with Up and Down, and run with Return. The first Escape closes the palette, including a filtered query or no matches.
 Clicking outside closes it; the covered window takes no click.
 Actions show their chord. Thread entries show their status mark and a child's root title.
 AllowOnce, AllowInThread, Deny, AnswerQuestion, ChooseAsyncOption and AnswerFocusedOption never appear.
@@ -41,6 +41,12 @@ ctl('palette-run','keys','enter')
 returned=poll('palette-returned',lambda d:not d['palette']['open'] and d['focus']=='composer')
 assert returned['composer_text']==before['composer_text'] and returned['composer_caret']==before['composer_caret']
 action('palette-width-restore','ResetSidebar')
+ctl('palette-escape-open','keys','secondary-k')
+poll('palette-escape-opened',lambda d:d['palette']['open'])
+ctl('palette-escape-query','text','No entry matches this query')
+poll('palette-escape-no-matches',lambda d:not d['palette']['actions'] and not d['palette']['threads'])
+ctl('palette-first-escape','keys','escape')
+poll('palette-first-escape-closed',lambda d:not d['palette']['open'] and d['focus']=='composer')
 prepare()
 action('palette-mode','SetDefaultMode',{'mode':'ask_first'})
 poll('palette-mode-ready',lambda d:d['settings']['default_mode']=='ask_first')
@@ -122,5 +128,5 @@ The six named palette tests establish the request-answer exclusion, context filt
 
 The palette searches only titles already in window memory. It makes no database search and gives no consent.
 The gpui availability list does not determine eligibility: the shared action table's original key context does.
-A cleared query needs another Escape to close. Only the owned fake provider and drawer fixture are used.
+Only the owned fake provider and drawer fixture are used.
 Native keyboard, pointer delivery and compositor appearance remain for the armed smoke.

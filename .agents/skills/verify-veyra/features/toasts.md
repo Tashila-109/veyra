@@ -7,7 +7,7 @@ Covers: crates/veyra/src/ui/toasts.rs crates/veyra/src/ui/notify.rs crates/veyra
 
 - One replaceable notice has Copy and DismissNotice; it replaces the composer's danger line.
 - One attention toast per unselected family follows the same Needs you, Done and Failed transitions as banners.
-- Attention toasts appear only for the active window. Open selects the target; selecting any family member removes its toast.
+- New attention toasts appear only for the active window. Existing toasts stay when it goes inactive; later changes post banners. Open selects the target; selecting any family member removes its toast.
 - Nothing auto-hides. At most three cards show, and a resting stack arms no clock.
 - A storage-blocked notice stays at the top until the block clears, keeps Copy and has no close control.
 

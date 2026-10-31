@@ -1323,10 +1323,11 @@ Commands and argument previews retain their code styling with visible Unicode ma
 
 `ui/palette.rs` mounts the kit Command component over the opaque content plane. Opening captures the original
 focus handle and key-context path. The single actions table supplies labels, chords and constructors and uses
-the same context predicate for key installation and palette eligibility. Request-answer actions are always
-excluded. Drawer actions require the original terminal context. Query filtering, including the actions-only
+the same context predicate for key installation and palette eligibility. Every binding row requires a label
+and typed palette eligibility; request-answer rows retain labels but are structurally excluded. Drawer actions require the original terminal context. Query filtering, including the actions-only
 `>` prefix, reads only the in-memory action and sidebar thread lists and excludes archived threads.
-An entry restores the captured focus before dispatching its action there; dismissal also restores focus.
+An entry restores the captured focus and synchronizes the derived dock/composer focus flags before dispatch.
+Dismissal also restores focus. The palette captures the kit Cancel action so the first Escape closes any query.
 Palette entry/exit uses the existing menu tokens, Reduce Motion snaps it, and changing the main view dismisses it.
 The app menu and secondary-k reach OpenPalette. The overlay consumes covered clicks and outside clicks dismiss it.
 
@@ -1334,12 +1335,13 @@ The app menu and secondary-k reach OpenPalette. The overlay consumes covered cli
 ordinary notice; its text supplies dump.notice. The kit NotificationList renders ordinary notices and attention
 with no autohide timeout. The existing notification transition rule supplies both inactive banners and active
 attention toasts; the selected family is excluded and selecting any family member removes its attention toast.
+Going inactive retains existing toasts. Later inactive transitions post banners without updating or adding toasts.
 Attention names the first family member needing the human, otherwise the root. Open dispatches SelectThread,
 and CopyNotice, DismissNotice and DismissToast are gpui actions. Toasts add no database state.
 
 The pinned kit has no non-dismissible notification, so the approved storage-only exception uses a Veyra card
 at the top of the same stack. It shares the kit toast's fill, border, radius, shadow, width, inset and content
-renderer, retains Copy and has no close button. DismissNotice cannot remove it; only StorageBlocked with no
+renderer, retains Copy and has no close button. Separate notice/storage variants carry their content roles. DismissNotice cannot remove it; only StorageBlocked with no
 error clears it. Its measured height offsets the kit list, whose shown limit falls from three to two while the
 card exists. The generic geometry observer now serves this production layout; driver observation remains debug-only.
 Neither the card nor persistent kit notifications arm a timer at rest.
@@ -1349,7 +1351,9 @@ kit Clipboard and Wrap. Code keeps Geist Mono 12/20, the card radius and neutral
 unwrapped code opts into horizontal overflow through the same style refinement. A headless wheel probe on the
 pinned 0.7.3 verified sideways scrolling before implementation. Shell owns per-item wrap choices and a render
 cache of the kit's exact parsed code, keyed by item and source span. CopyCodeBlock validates the current Markdown
-source before copying that cached block. ToggleCodeWrap remeasures its reply through the scroller. CopyReply
+source before copying that cached block. With no item id, the focused corner supplies its block span; a reply
+context with exactly one current block also resolves it. Missing or ambiguous targets refuse through a notice,
+without changing the clipboard. A single Reply constructor projects the optional code state. ToggleCodeWrap remeasures its reply through the scroller. CopyReply
 copies the original stored text only for the final completed assistant reply of an ended turn. Its control shows
 on hover and keyboard focus; reply contexts retain their item id for palette actions. Tool output stays plain.
 The code cache and wrap choices last only for the window session, without engine or schema changes.
