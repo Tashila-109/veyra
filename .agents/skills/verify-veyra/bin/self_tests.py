@@ -707,6 +707,76 @@ def child_launches_mask_signals(f):
     assert f.batch()==0 and f.outcome()['status']=='DONE', 'owned child spawn contract failed'
     assert f.runner.start_owned is o.start_owned
 
+
+def _pasteboard_recipe_safety(f,page):
+    """Run the page-owned entry and real batch classifier with only its helper/driver I/O stubbed."""
+    from heredocs import HEREDOC
+    heading='Driving it with veyra ctl' if page=='toasts' else 'Code blocks'
+    recipe=next(HEREDOC.finditer(f.runner.sections()[(page,heading)]))['body']
+    faults=[('restore','PASTEBOARD RESTORE FAILED\n',1),
+        ('expected','PASTEBOARD EXPECTED FILE UNREADABLE\n',0),
+        ('ready','PASTEBOARD READY FILE EXISTS\n',0)]
+    for fault,diagnostic,copies in faults:
+        with Fixture(f.root/(page+'-'+fault),f.runner) as entry:
+            script=r"""
+from driver import PROOF,save
+import io,json,pathlib,sys,types
+from unittest.mock import patch
+source=PROOF/'copy-source';source.mkdir()
+(source/'ok-reply.jsonl').write_text('{}\n')
+if @FAULT@=='ready': (PROOF/@READY@).write_text('leftover ready\n')
+state={'notice':'Write a message before sending','toasts':[{'kind':'notice','text':'Write a message before sending'}],
+    'transcript':{'items':[{'id':'fixture-item','wrapped':True,
+        'code_blocks':[{'start':0,'language':'rust','text':'let value = 42;'}]}]}}
+copy_calls=[]
+class Helper:
+    pid=99999998
+    def __init__(self,argv,**options):
+        self.original_stdin=io.StringIO();self.stdin=self.original_stdin
+        save('copy-fixture-helper-started',True)
+        self.returncode=2 if @FAULT@=='expected' else None
+        if @FAULT@ in ['restore','ready']: pathlib.Path(argv[-1]).write_text('ready\n')
+    def poll(self): return self.returncode
+    def communicate(self,timeout=None):
+        assert self.original_stdin.closed,'helper stdin must close before its result is read'
+        self.returncode=2
+        return '',@DIAGNOSTIC@
+def action(label,operation,*args):
+    if operation.startswith('Copy'): copy_calls.append(operation)
+    save('copy-fixture-actions',copy_calls)
+def poll(label,predicate):
+    assert predicate(state),'helper exited without a ready marker'
+    return state
+stub=types.ModuleType('driver')
+stub.__dict__.update(PROOF=PROOF,SOURCE=source,json=json,
+    subprocess=types.SimpleNamespace(Popen=Helper,PIPE=-1),prepare=lambda:None,
+    action=action,poll=poll,ctl=lambda *args:state,capture_content=lambda *args:None,
+    stage_records=lambda *args:None,create=lambda *args,**kwargs:'fixture-thread',save=save,
+    page_done=lambda *args:(_ for _ in ()).throw(AssertionError('section continued after helper failure')))
+with patch.dict(sys.modules,{'driver':stub}): exec(@RECIPE@,{'__name__':'__copy_recipe_entry__'})
+"""
+            script=script.replace('@FAULT@',repr(fault)).replace('@DIAGNOSTIC@',repr(diagnostic)).replace('@RECIPE@',repr(recipe))
+            script=script.replace('@READY@',repr('toast-copy.ready' if page=='toasts' else 'code-copy.ready'))
+            assert entry.batch(script)==1
+            outcome=entry.outcome();attempt=outcome['attempts'][0]
+            assert attempt.get('fatal_stop',{}).get('kind')=='fatal','helper failure was not a batch safety stop'
+            assert not any(call[-1] in ['LATER','DOCTOR','RECOVER'] for call in entry.calls),'safety failure continued or recovered'
+            assert entry.calls[-1][-1]=='CLEANUP' and attempt['cleanup_exit']==0
+            proof=entry.evidence/'attempt-1/run'
+            safety=json.loads((proof/'safety-stop.json').read_text())
+            assert safety=={'kind':'clipboard','reason':diagnostic.strip()},'helper diagnostic was lost or changed'
+            actions=json.loads((proof/'copy-fixture-actions.json').read_text()) if (proof/'copy-fixture-actions.json').exists() else []
+            assert len(actions)==copies,'Copy ran before the helper owned a snapshot'
+            assert (proof/'copy-fixture-helper-started.json').exists()==(fault!='ready'),'leftover readiness marker launched the helper'
+            assert not (proof/('toast-copy-result.json' if page=='toasts' else 'code-copy-result.json')).exists()
+            assert entry.app_launches==entry.window_starts==0
+
+def toast_copy_safety_reaches_recipe_entry(f):
+    _pasteboard_recipe_safety(f,'toasts')
+
+def code_copy_safety_reaches_recipe_entry(f):
+    _pasteboard_recipe_safety(f,'chat-send-stream')
+
 CASES = [
     ('child-signals',child_launches_mask_signals),('cleanup-stop',cleanup_failure_prevents_done),('prepare-go',prepare_requires_go),    ('guard-tools',guard_tools_and_backdrop),('probe-part',probe_uses_requested_part),('idle-samples',idle_checks_every_sample),
     ('part-required',part_is_required),('part-tree',candidate_part_matches_dump),('scene-6d',missing_6d_fields_stop_probe),
@@ -726,6 +796,7 @@ from negative_tests import CASES as RESTORED_CASES
 CASES += RESTORED_CASES
 from smoke_tests import CASES as SMOKE_CASES
 CASES += SMOKE_CASES
+CASES += [('toast-copy-safety',toast_copy_safety_reaches_recipe_entry),('code-copy-safety',code_copy_safety_reaches_recipe_entry)]
 
 def run(runner):
     from guard_matrix import check_registry

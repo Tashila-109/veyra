@@ -18,10 +18,23 @@ class Plant:
     operation: str
     selector: str
     replacement: str = ''
+    section: str = ''
 
 # A selector is the precise expression/statement AST inside one named runtime function.
 # Repeated historical probes remain separate plants where their call sites differ.
 PLANTS = [
+    Plant('code-copy-ready-record','code-copy-safety','features/chat-send-stream.md','compare_copy','call-nth','save#1','pass',section='Code blocks'),
+    Plant('code-copy-ready-owner','code-copy-safety','features/chat-send-stream.md','compare_copy','if-test','ready.exists()','False',section='Code blocks'),
+    Plant('toast-copy-ready-record','toast-copy-safety','features/toasts.md','','call-nth','save#1','pass',section='Driving it with veyra ctl'),
+    Plant('toast-copy-ready-owner','toast-copy-safety','features/toasts.md','','if-test','ready.exists()','False',section='Driving it with veyra ctl'),
+    Plant('code-copy-before-copy','code-copy-safety','features/chat-send-stream.md','compare_copy','if-test','helper.poll() is None','True',section='Code blocks'),
+    Plant('code-copy-reason','code-copy-safety','features/chat-send-stream.md','compare_copy','after-assignment','reason',"reason='Pasteboard comparison failed'",section='Code blocks'),
+    Plant('code-copy-record','code-copy-safety','features/chat-send-stream.md','compare_copy','call-nth','save#3','pass',section='Code blocks'),
+    Plant('code-copy-fatal','code-copy-safety','features/chat-send-stream.md','compare_copy','if-test','helper.returncode==2','False',section='Code blocks'),
+    Plant('toast-copy-before-copy','toast-copy-safety','features/toasts.md','','if-test','helper.poll() is None','True',section='Driving it with veyra ctl'),
+    Plant('toast-copy-reason','toast-copy-safety','features/toasts.md','','after-assignment','reason',"reason='Pasteboard comparison failed'",section='Driving it with veyra ctl'),
+    Plant('toast-copy-record','toast-copy-safety','features/toasts.md','','call-nth','save#3','pass',section='Driving it with veyra ctl'),
+    Plant('toast-copy-fatal','toast-copy-safety','features/toasts.md','','if-test','helper.returncode==2','False',section='Driving it with veyra ctl'),
     Plant('admission-go','prepare-go','bin/orchestration.py','require_go','body','','return {}'),
     Plant('start-tier','start-tier','bin/driver.py','start','remove-call','require_tier'),
     Plant('start-go','start-go','bin/driver.py','start','remove-call','require_go'),
@@ -256,12 +269,19 @@ def apply(source, plant):
 
 def plant_copy(skill, plant):
     path=skill/plant.file;before=path.read_bytes();source=before.decode()
-    if plant.file=='SKILL.md':
+    if plant.file=='SKILL.md' or plant.section:
         import re
-        heading=re.search(r'^## '+plant.function+r'\n',source,re.M);assert heading
-        end=source.find('\n## ',heading.end());end=len(source) if end<0 else end
-        section=source[heading.end():end]
-        heredoc=next((h for h in HEREDOC.finditer(section) if h['end']=='PY'),None);assert heredoc
+        if plant.file=='SKILL.md':
+            heading=re.search(r'^## '+plant.function+r'\n',source,re.M);assert heading
+            end=source.find('\n## ',heading.end());end=len(source) if end<0 else end
+            section=source[heading.end():end]
+            heredoc=next((h for h in HEREDOC.finditer(section) if h['end']=='PY'),None);assert heredoc
+        else:
+            heading=re.search(r'^##+ '+re.escape(plant.section)+r'\n',source,re.M);assert heading
+            next_heading=re.search(r'^##+ ',source[heading.end():],re.M)
+            end=heading.end()+next_heading.start() if next_heading else len(source)
+            section=source[heading.end():end]
+            heredoc=next(HEREDOC.finditer(section),None);assert heredoc
         body=apply(heredoc['body'],plant)
         start=heading.end()+heredoc.start('body');stop=heading.end()+heredoc.end('body')
         after=source[:start]+body.rstrip('\n')+source[stop:]

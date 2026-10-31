@@ -665,18 +665,32 @@ def compare_copy(label,expected,operation,payload):
     expectation=PROOF/(label+'.expected')
     expectation.write_text(expected)
     ready=PROOF/(label+'.ready')
+    if ready.exists():
+        from orchestration import SafetyStop
+        save('safety-stop',{'kind':'clipboard','reason':'PASTEBOARD READY FILE EXISTS'})
+        raise SafetyStop('PASTEBOARD READY FILE EXISTS')
     helper=subprocess.Popen([str(PROOF/'pasteboard'),'--audit','--expect-text',str(expectation),'--ready-file',str(ready)],
         stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
     save(label+'-helper',{'pid':helper.pid,'pgid':helper.pid})
     try:
-        poll(label+'-session-ready',lambda d:ready.exists())
-        action(label,operation,payload)
-        ctl(label+'-dispatched','dump')
+        poll(label+'-session-ready',lambda d:helper.poll() is not None or ready.exists())
+        if helper.poll() is None:
+            action(label,operation,payload)
+            ctl(label+'-dispatched','dump')
     finally:
         helper.stdin.close()
         helper.stdin=None
         output,error=helper.communicate(timeout=10)
-    assert helper.returncode==0 and output=='match\n' and not error
+        if helper.returncode==2:
+            from orchestration import SafetyStop
+            reason={
+                'PASTEBOARD RESTORE FAILED\n':'PASTEBOARD RESTORE FAILED',
+                'PASTEBOARD EXPECTED FILE UNREADABLE\n':'PASTEBOARD EXPECTED FILE UNREADABLE',
+                'PASTEBOARD READY FILE EXISTS\n':'PASTEBOARD READY FILE EXISTS',
+            }.get(error,'Pasteboard comparison failed')
+            save('safety-stop',{'kind':'clipboard','reason':reason})
+            raise SafetyStop(reason)
+    assert helper.returncode==0 and output=='match\n' and not error, 'Clipboard comparison did not match the fixture'
     save(label+'-result',{'match':True})
 compare_copy('code-copy','let value = 42;','CopyCodeBlock',{'item':item['id'],'start':block['start']})
 action('code-unwrap','ToggleCodeWrap',{'item':item['id']})

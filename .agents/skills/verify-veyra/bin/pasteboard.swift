@@ -93,25 +93,27 @@ struct SystemComparisonBoard: TextComparisonBoard {
 }
 struct PasteboardRestoreFailure: Error {}
 enum ComparisonOutcome: Equatable {
-    case matched, different, restorationFailed, comparisonFailed
+    case matched, different, restorationFailed, comparisonFailed, expectedFileUnreadable, readyFileExists
     var status: Int32 {
         switch self {
         case .matched: return 0
         case .different: return 1
-        case .restorationFailed, .comparisonFailed: return 2
+        case .restorationFailed, .comparisonFailed, .expectedFileUnreadable, .readyFileExists: return 2
         }
     }
     var output: String? {
         switch self {
         case .matched: return "match\n"
         case .different: return "no-match\n"
-        case .restorationFailed, .comparisonFailed: return nil
+        case .restorationFailed, .comparisonFailed, .expectedFileUnreadable, .readyFileExists: return nil
         }
     }
     var diagnostic: String? {
         switch self {
         case .restorationFailed: return "PASTEBOARD RESTORE FAILED\n"
         case .comparisonFailed: return "Pasteboard comparison failed\n"
+        case .expectedFileUnreadable: return "PASTEBOARD EXPECTED FILE UNREADABLE\n"
+        case .readyFileExists: return "PASTEBOARD READY FILE EXISTS\n"
         case .matched, .different: return nil
         }
     }
@@ -142,14 +144,16 @@ func comparisonPaths(_ args: [String]) -> (String, String)? {
         args[2] != args[4] else { return nil }
     return (args[2], args[4])
 }
-func compareText(_ args: [String]) -> ComparisonOutcome {
-    // The canonical audit path is the sole entry to the system-board adapter.
-    guard let (expectedPath, readyPath) = comparisonPaths(args),
-        !FileManager.default.fileExists(atPath: readyPath),
-        let data = FileManager.default.contents(atPath: expectedPath),
-        let expected = String(data: data, encoding: .utf8) else { return .different }
+func compareText(
+    _ args: [String], access: any TextComparisonBoard = SystemComparisonBoard()
+) -> ComparisonOutcome {
+    // Validate the audit setup before the adapter can capture the pasteboard.
+    guard let (expectedPath, readyPath) = comparisonPaths(args) else { return .comparisonFailed }
+    guard !FileManager.default.fileExists(atPath: readyPath) else { return .readyFileExists }
+    guard let data = FileManager.default.contents(atPath: expectedPath),
+        let expected = String(data: data, encoding: .utf8) else { return .expectedFileUnreadable }
     return comparisonOutcome {
-        try compareInSnapshotPath(SystemComparisonBoard(), expected: expected) {
+        try compareInSnapshotPath(access, expected: expected) {
             guard FileManager.default.createFile(atPath: readyPath, contents: Data("ready\n".utf8),
                 attributes: [.posixPermissions: 0o600]) else { throw PasteboardFailure() }
             _ = readLine()
@@ -161,8 +165,10 @@ func comparisonSelfTest() -> Bool {
         var value: String? = "human"
         var failRestore = false
         var skipRestore = false
+        var captures = 0
         func capture() throws -> Snapshot {
-            value.map { [[Flavor(type: "stub", data: Data($0.utf8))]] } ?? []
+            captures += 1
+            return value.map { [[Flavor(type: "stub", data: Data($0.utf8))]] } ?? []
         }
         func restoreSnapshot(_ saved: Snapshot) throws {
             if failRestore { throw PasteboardFailure() }
@@ -176,6 +182,25 @@ func comparisonSelfTest() -> Bool {
         guard comparisonPaths(["--expect-text", "fixture"]) == nil,
             comparisonPaths(["--audit", "--expect-text", "expected", "--ready-file", "ready"]) != nil
             else { return false }
+        let setup = StubBoard()
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let expectedPath = folder.appendingPathComponent("expected")
+        let readyPath = folder.appendingPathComponent("ready")
+        let args = ["--audit", "--expect-text", expectedPath.path, "--ready-file", readyPath.path]
+        let missing = compareText(args, access: setup)
+        guard missing == .expectedFileUnreadable, missing.status == 2, missing.output == nil,
+            missing.diagnostic == "PASTEBOARD EXPECTED FILE UNREADABLE\n", setup.captures == 0
+            else { return false }
+        try Data("fixture".utf8).write(to: expectedPath)
+        try Data("ready".utf8).write(to: readyPath)
+        let leftover = compareText(args, access: setup)
+        guard leftover == .readyFileExists, leftover.status == 2, leftover.output == nil,
+            leftover.diagnostic == "PASTEBOARD READY FILE EXISTS\n", setup.captures == 0
+            else { return false }
+        let outside = compareText(["--expect-text", expectedPath.path], access: setup)
+        guard outside == .comparisonFailed, outside.status == 2, setup.captures == 0 else { return false }
         let stub = StubBoard()
         for value: String? in ["fixture", "other", nil] {
             let outcome = comparisonOutcome {

@@ -1,5 +1,17 @@
 {
   "plants": [
+    "code-copy-ready-record",
+    "code-copy-ready-owner",
+    "toast-copy-ready-record",
+    "toast-copy-ready-owner",
+    "code-copy-before-copy",
+    "code-copy-reason",
+    "code-copy-record",
+    "code-copy-fatal",
+    "toast-copy-before-copy",
+    "toast-copy-reason",
+    "toast-copy-record",
+    "toast-copy-fatal",
     "admission-go",
     "start-tier",
     "start-go",

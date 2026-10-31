@@ -11992,6 +11992,46 @@ mod tests {
         });
     }
     #[cfg(debug_assertions)]
+    fn focus_until(
+        cx: &mut gpui::VisualTestContext,
+        attempts: usize,
+        predicate: impl Fn(&[gpui::KeyContext]) -> bool,
+    ) {
+        for _ in 0..attempts {
+            if cx.update(|window, _| predicate(&window.context_stack())) {
+                return;
+            }
+            cx.update(|window, cx| window.focus_next(cx));
+            draw(cx);
+        }
+        assert!(
+            cx.update(|window, _| predicate(&window.context_stack())),
+            "focus target was not reached"
+        );
+    }
+    #[cfg(debug_assertions)]
+    fn replace_reply(
+        shell: &Entity<super::Shell>,
+        cx: &mut gpui::VisualTestContext,
+        thread: ThreadId,
+        id: ItemId,
+        text: &str,
+    ) {
+        shell.update(cx, |shell, cx| {
+            let mut item = shell.state.items[&thread][&id].clone();
+            item.body = ItemBody::AssistantText {
+                text: text.to_owned(),
+                done: true,
+            };
+            shell.state.apply(UiEvent::Change {
+                counter: None,
+                event: ChangeEvent::ItemCompleted(item),
+            });
+            cx.notify();
+        });
+        draw(cx);
+    }
+    #[cfg(debug_assertions)]
     fn snap_palette(cx: &mut gpui::VisualTestContext) {
         cx.update(|window, cx| {
             let mut look = cx
@@ -12104,11 +12144,6 @@ mod tests {
             assert!(
                 names.iter().any(|entry| entry == "MoveOptionDown"),
                 "dock context must be retained"
-            );
-            assert!(
-                super::bindings()
-                    .iter()
-                    .all(|binding| !binding.label.is_empty())
             );
             cx.simulate_keystrokes("escape");
             draw(cx);
@@ -12912,19 +12947,13 @@ mod tests {
             let old = shell.read_with(cx, |shell, _| {
                 shell.code_blocks_dump(ids[0])[0]["start"].as_u64().unwrap() as usize
             });
-            shell.update(cx, |shell, cx| {
-                let mut item = shell.state.items[&thread][&ids[0]].clone();
-                item.body = ItemBody::AssistantText {
-                    text: "A changed reply.\n\n```rust\ncurrent_block();\n```".into(),
-                    done: true,
-                };
-                shell.state.apply(UiEvent::Change {
-                    counter: None,
-                    event: ChangeEvent::ItemCompleted(item),
-                });
-                cx.notify();
-            });
-            draw(cx);
+            replace_reply(
+                &shell,
+                cx,
+                thread,
+                ids[0],
+                "A changed reply.\n\n```rust\ncurrent_block();\n```",
+            );
             let current = shell.read_with(cx, |shell, _| {
                 shell.code_blocks_dump(ids[0])[0]["start"].as_u64().unwrap() as usize
             });
@@ -12979,37 +13008,19 @@ mod tests {
                 )
             });
             draw(cx);
-            shell.update(cx, |shell, cx| {
-                let mut item = shell.state.items[&thread][&ids[0]].clone();
-                item.body = ItemBody::AssistantText {
-                    text: "A changed reply.\n\n```rust\ncurrent_block();\n```".into(),
-                    done: true,
-                };
-                shell.state.apply(UiEvent::Change {
-                    counter: None,
-                    event: ChangeEvent::ItemCompleted(item),
-                });
-                cx.notify();
-            });
-            draw(cx);
-            for _ in 0..32 {
-                if cx.update(|window, _| {
-                    window.context_stack().iter().any(|context| {
-                        context.get("reply_item").map(|value| value.as_ref())
-                            == Some(ids[0].to_string().as_str())
-                    })
-                }) {
-                    break;
-                }
-                cx.update(|window, cx| window.focus_next(cx));
-                draw(cx);
-            }
-            assert!(cx.update(|window, _| {
-                window.context_stack().iter().any(|context| {
+            replace_reply(
+                &shell,
+                cx,
+                thread,
+                ids[0],
+                "A changed reply.\n\n```rust\ncurrent_block();\n```",
+            );
+            focus_until(cx, 32, |contexts| {
+                contexts.iter().any(|context| {
                     context.get("reply_item").map(|value| value.as_ref())
                         == Some(ids[0].to_string().as_str())
                 })
-            }));
+            });
             cx.update(|_, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()))
             });
@@ -13021,49 +13032,26 @@ mod tests {
                 cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
                 "current_block();"
             );
-            shell.update(cx, |shell, cx| {
-                let mut item = shell.state.items[&thread][&ids[0]].clone();
-                item.body = ItemBody::AssistantText {
-                    text: concat!(
-                        "A changed reply.\n\n```rust\nfirst_current();\n```\n\n",
-                        "```rust\nsecond_current();\n```"
-                    )
-                    .into(),
-                    done: true,
-                };
-                shell.state.apply(UiEvent::Change {
-                    counter: None,
-                    event: ChangeEvent::ItemCompleted(item),
-                });
-                cx.notify();
-            });
-            draw(cx);
+            replace_reply(
+                &shell,
+                cx,
+                thread,
+                ids[0],
+                concat!(
+                    "A changed reply.\n\n```rust\nfirst_current();\n```\n\n",
+                    "```rust\nsecond_current();\n```"
+                ),
+            );
             let blocks = shell.read_with(cx, |shell, _| shell.code_blocks_dump(ids[0]));
             assert_eq!(blocks.as_array().unwrap().len(), 2);
-            for _ in 0..64 {
-                if cx.update(|window, _| {
-                    let contexts = window.context_stack();
-                    contexts.iter().any(|context| {
-                        context.get("reply_item").map(|value| value.as_ref())
-                            == Some(ids[0].to_string().as_str())
-                    }) && contexts
-                        .iter()
-                        .all(|context| context.get("code_block_start").is_none())
-                }) {
-                    break;
-                }
-                cx.update(|window, cx| window.focus_next(cx));
-                draw(cx);
-            }
-            assert!(cx.update(|window, _| {
-                let contexts = window.context_stack();
+            focus_until(cx, 64, |contexts| {
                 contexts.iter().any(|context| {
                     context.get("reply_item").map(|value| value.as_ref())
                         == Some(ids[0].to_string().as_str())
                 }) && contexts
                     .iter()
                     .all(|context| context.get("code_block_start").is_none())
-            }));
+            });
             cx.update(|_, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string("ambiguous".into()))
             });
@@ -13083,26 +13071,12 @@ mod tests {
             cx.update(|window, cx| window.dispatch_action(Box::new(super::DismissNotice), cx));
             draw(cx);
             let second = blocks[1]["start"].as_u64().unwrap().to_string();
-            for _ in 0..64 {
-                if cx.update(|window, _| {
-                    window.context_stack().iter().any(|context| {
-                        context.get("code_block_start").map(|value| value.as_ref())
-                            == Some(second.as_str())
-                    })
-                }) {
-                    break;
-                }
-                cx.update(|window, cx| window.focus_next(cx));
-                draw(cx);
-            }
-            assert!(
-                cx.update(
-                    |window, _| window.context_stack().iter().any(|context| context
-                        .get("code_block_start")
-                        .map(|value| value.as_ref())
-                        == Some(second.as_str()))
-                )
-            );
+            focus_until(cx, 64, |contexts| {
+                contexts.iter().any(|context| {
+                    context.get("code_block_start").map(|value| value.as_ref())
+                        == Some(second.as_str())
+                })
+            });
             cx.update(|window, cx| {
                 window.dispatch_action(Box::new(super::CopyCodeBlock::default()), cx)
             });

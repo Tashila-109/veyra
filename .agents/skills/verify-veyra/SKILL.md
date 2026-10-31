@@ -587,6 +587,7 @@ It does not signal an unrecorded group.
   It compares names with `bin/guard-plants.json`; every stop case needs a plant and the manifest names the positive cases.
   Four workers use an independent copy per plant to run the full check-only entry, restore exact bytes and run it again; all use one immutable input snapshot.
   It saves each diff, red and green transcripts and their hashes in `matrix.json`; its default receipt stays under `/tmp/veyra-mverify-matrix-*/receipt/`.
+  Markdown plants name the feature section and runtime function, so the page-owned Copy safety paths are exercised through their actual recipe entries with stubbed helpers.
 - `bin/negative_tests.py` restores the prior negative contracts through production entries; `bin/raw_test_io.py` supplies process, IPC, filesystem and WindowServer/libproc I/O fixtures.
 - `bin/glass_measure.py` holds the Settings pair entry and its unchanged placement/capture guards.
 - `bin/heredocs.py` supplies the shared recipe parser; `bin/backdrop_actions.py` owns notification backdrop activation.
@@ -597,11 +598,16 @@ It does not signal an unrecorded group.
   Start it before the Copy action, wait for the private READY file, drive Copy, then close stdin and wait for restoration.
   A completed comparison prints only `match` or `no-match`, with exit 0 or 1.
   A restore or verification failure prints no stdout, writes the fixed `PASTEBOARD RESTORE FAILED` diagnostic to stderr and exits 2.
+  Unreadable expected files and leftover READY files exit 2 with fixed, distinct setup diagnostics, before snapshot access.
   Other comparison errors also exit 2 with a fixed diagnostic. A mismatch never hides a failed restore.
+  Copy recipes preserve exit 2 in a `safety-stop.json` record and raise SafetyStop; the runner stops the batch after Cleanup.
+  Recipes wait for readiness or early helper exit, skip Copy after an early exit, and check failures in finally so a poll error cannot hide restoration failure.
+  A leftover READY file is refused before helper launch, so an old marker cannot authorize Copy.
   Clipboard text, length and hashes are never printed, logged or saved.
   FILE contains an independently known fixture expectation, never data read back from the clipboard.
   `--self-test` uses a stubbed board and covers match, mismatch, absent text, restoration after error,
-  throwing or silently failed restoration, and refusal outside the canonical audit path; it never accesses NSPasteboard.
+  throwing or silently failed restoration, unreadable expectations, leftover READY files and refusal outside the canonical audit path.
+  Setup cases inject the stubbed board and assert no capture occurs; self-tests never access NSPasteboard.
   Compile the system helper offline; every system-board use waits for the armed away window.
 - `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
 - `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.

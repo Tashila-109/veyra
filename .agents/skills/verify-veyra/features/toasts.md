@@ -37,18 +37,32 @@ capture_content('toast-notice')
 expected=PROOF/'toast-copy.expected'
 expected.write_text('Write a message before sending')
 ready=PROOF/'toast-copy.ready'
+if ready.exists():
+    from orchestration import SafetyStop
+    save('safety-stop',{'kind':'clipboard','reason':'PASTEBOARD READY FILE EXISTS'})
+    raise SafetyStop('PASTEBOARD READY FILE EXISTS')
 helper=subprocess.Popen([str(PROOF/'pasteboard'),'--audit','--expect-text',str(expected),'--ready-file',str(ready)],
     stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
 save('toast-copy-helper',{'pid':helper.pid,'pgid':helper.pid})
 try:
-    poll('toast-copy-session-ready',lambda d:ready.exists())
-    action('toast-copy','CopyNotice')
-    ctl('toast-copy-dispatched','dump')
+    poll('toast-copy-session-ready',lambda d:helper.poll() is not None or ready.exists())
+    if helper.poll() is None:
+        action('toast-copy','CopyNotice')
+        ctl('toast-copy-dispatched','dump')
 finally:
     helper.stdin.close()
     helper.stdin=None
     output,error=helper.communicate(timeout=10)
-assert helper.returncode==0 and output=='match\n' and not error
+    if helper.returncode==2:
+        from orchestration import SafetyStop
+        reason={
+            'PASTEBOARD RESTORE FAILED\n':'PASTEBOARD RESTORE FAILED',
+            'PASTEBOARD EXPECTED FILE UNREADABLE\n':'PASTEBOARD EXPECTED FILE UNREADABLE',
+            'PASTEBOARD READY FILE EXISTS\n':'PASTEBOARD READY FILE EXISTS',
+        }.get(error,'Pasteboard comparison failed')
+        save('safety-stop',{'kind':'clipboard','reason':reason})
+        raise SafetyStop(reason)
+assert helper.returncode==0 and output=='match\n' and not error, 'Clipboard comparison did not match the fixture'
 save('toast-copy-result',{'match':True})
 action('toast-dismiss','DismissNotice')
 poll('toast-dismissed',lambda d:not d['toasts'] and d['notice'] is None)
@@ -96,7 +110,8 @@ PY
 
 `dump.toasts` is the current list of models. Every entry has `kind` and `text`; attention entries add `root`, `thread` and `status`, and a notice adds `storage_blocked`.
 `notice` reads the notice toast's text, including the persistent storage card. `palette.open` is false in the idle scene.
-The five named toast tests cover replacement, family identity, inactive refusal, selection and no clock. The no-clock test also covers the storage card.
+The five original toast tests cover notice replacement, family identity, retention of existing inactive toasts with later banner-only changes, family selection, and no clock. `viewed_family_never_gets_attention_toast` adds the selected-root/child rule.
+`toast_removals_leave_no_painted_controls` checks headless dismissal and selection; removal checks also assert painted Copy/Open controls in the window tests. The no-clock test covers the storage card too.
 The storage test attempts Escape, DismissNotice and the kit close-button location, then clears the block through the event path.
 The class B tests compare status rasters, the kit/storage frames in both appearances, and the three-shown cap including the storage card.
 

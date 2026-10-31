@@ -222,7 +222,6 @@ impl Shell {
             })
         };
         let run = cx.entity().downgrade();
-        let cancel = run.clone();
         let query = run.clone();
         Some(
             div()
@@ -274,11 +273,6 @@ impl Shell {
                                 )
                                 .on_query(move |_, _, cx| {
                                     let _ = query.update(cx, |_, cx| cx.notify());
-                                })
-                                .on_cancel(move |window, cx| {
-                                    let _ = cancel
-                                        .update(cx, |shell, cx| shell.close_palette(window, cx));
-                                    cx.stop_propagation();
                                 })
                                 .on_confirm(move |index, window, cx| {
                                     if let Some(entry) = entries
