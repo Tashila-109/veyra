@@ -315,7 +315,6 @@ struct Feedback {
     pressed: bool,
 }
 
-#[cfg(debug_assertions)]
 pub(super) fn observe_geometry(
     element: impl IntoElement,
     observe: impl Fn(Bounds<Pixels>, &mut App) + 'static,
@@ -325,19 +324,16 @@ pub(super) fn observe_geometry(
         observe,
     }
 }
-#[cfg(debug_assertions)]
 struct GeometryObserver<F> {
     element: AnyElement,
     observe: F,
 }
-#[cfg(debug_assertions)]
 impl<F: Fn(Bounds<Pixels>, &mut App) + 'static> IntoElement for GeometryObserver<F> {
     type Element = Self;
     fn into_element(self) -> Self {
         self
     }
 }
-#[cfg(debug_assertions)]
 impl<F: Fn(Bounds<Pixels>, &mut App) + 'static> Element for GeometryObserver<F> {
     type RequestLayoutState = ();
     type PrepaintState = ();
@@ -380,6 +376,24 @@ impl<F: Fn(Bounds<Pixels>, &mut App) + 'static> Element for GeometryObserver<F> 
     ) {
         self.element.paint(window, cx);
     }
+}
+
+pub(super) fn observed_part(
+    element: impl IntoElement,
+    name: impl Into<SharedString>,
+) -> AnyElement {
+    let name = name.into();
+    #[cfg(debug_assertions)]
+    let element = observe_geometry(element, move |bounds, cx| {
+        if cx.try_global::<super::PaintedControls>().is_some() {
+            cx.global_mut::<super::PaintedControls>()
+                .0
+                .insert(format!("{:?}", ElementId::Name(name.clone())), bounds);
+        }
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = name;
+    element.into_any_element()
 }
 
 #[derive(IntoElement)]
@@ -672,10 +686,7 @@ impl RenderOnce for Button {
         };
         self.inner = if self.disabled {
             self.inner
-        } else if self.plate_base.is_some()
-            || background.is_some_and(|value| value.as_solid().is_none())
-            || matches!(self.variant, ButtonVariant::Primary | ButtonVariant::Danger)
-        {
+        } else if self.plate_base.is_some() {
             self.inner.bg(cx.global::<Theme>().plate(color))
         } else {
             self.inner.bg(color)
@@ -922,6 +933,7 @@ pub(super) fn sheet_row(row: &SheetRow, cx: &App) -> Div {
         .gap(t.space.0[0])
         .child(
             div()
+                .debug_selector(|| "sheet-row-title".into())
                 .text_size(t.text.ui.size)
                 .font_weight(t.text.title_weight)
                 .child(row.title.clone()),
@@ -929,6 +941,7 @@ pub(super) fn sheet_row(row: &SheetRow, cx: &App) -> Div {
         .when(!row.project.is_empty(), |element| {
             element.child(
                 div()
+                    .debug_selector(|| "sheet-row-project".into())
                     .text_size(t.text.label.size)
                     .text_color(t.colors.text_muted)
                     .child(row.project.clone()),
@@ -942,8 +955,9 @@ pub(super) fn sheet_row(row: &SheetRow, cx: &App) -> Div {
                     .child(root),
             )
         })
-        .children(row.processes.iter().map(|process| {
+        .children(row.processes.iter().enumerate().map(|(index, process)| {
             div()
+                .debug_selector(move || format!("sheet-row-process-{index}"))
                 .h_flex()
                 .gap(t.layout.control_gap)
                 .child(Icon::new(IconName::Terminal).size(t.layout.small_icon))
@@ -1572,8 +1586,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                                         cx,
                                                     )
                                                     .primary()
-                                                    .bg(t.plate(t.colors.solid))
-                                                    .shadow(t.plate_highlight())
+                                                    .lit_plate(t.colors.solid, cx)
                                                     .debug_selector(|| {
                                                         "approval-allow-button".into()
                                                     }),
@@ -1832,11 +1845,7 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                                 .ml_auto()
                                 .primary()
                                 .when(stop || reason.is_none(), |button| {
-                                    button
-                                        .bg(t.plate(t.colors.solid))
-                                        .border(t.layout.border)
-                                        .border_color(t.colors.border)
-                                        .shadow(t.plate_highlight())
+                                    button.lit_plate(t.colors.solid, cx)
                                 })
                                 .when(!stop && reason.is_some(), |button| {
                                     button.bg(t.colors.card).text_color(t.colors.text_muted)
@@ -1866,15 +1875,6 @@ pub fn render(shell: &Shell, cx: &Context<Shell>) -> impl IntoElement {
                     card
                 }),
         )
-        .when_some(shell.notice.clone(), |this, notice| {
-            this.child(
-                div()
-                    .text_size(t.text.meta.size)
-                    .line_height(t.text.meta.line_height)
-                    .text_color(t.colors.danger)
-                    .child(notice),
-            )
-        })
 }
 
 #[cfg(test)]

@@ -62,6 +62,17 @@ fn verify_nested_dump_names() {
     }
     let mapped: BTreeSet<_> = identifiers(&map).collect();
     for name in [
+        "palette",
+        "toasts",
+        "query",
+        "actions",
+        "chord",
+        "kind",
+        "storage_blocked",
+        "wrapped",
+        "code_blocks",
+        "start",
+        "language",
         "follow",
         "gap",
         "top_item",

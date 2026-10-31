@@ -1,7 +1,7 @@
 # Chat send and stream
 
 Status: passed, 2026-10-26, bd8a083, live lane not rerun since RUN 8d22e59d at 2b45067 (fake CLI RUN 8577dad2), 499455d2934978100f02857041ba1c059f5b96662d658046e48d8d81396074a2
-Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/header.rs crates/veyra/src/ui/provider_text.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
+Covers: crates/veyra/src/ui/transcript.rs crates/veyra/src/ui/composer.rs crates/veyra/src/ui/actions.rs crates/veyra/src/ui/theme.rs crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/header.rs crates/veyra/src/ui/provider_text.rs crates/engine/src/provider/** crates/engine/tests/fixtures/claude/** crates/engine/tests/fixtures/codex/** crates/engine/tests/fixtures/grok/**
 
 ## Sub-features
 
@@ -10,6 +10,7 @@ Covers: crates/veyra/src/ui/drawer.rs crates/veyra/src/ui/header.rs crates/veyra
 - `chat-failure`: mid-turn exit shows Failed, Veyra's crash cause and the last stderr lines.
 - `chat-retry`: Retry probes again and completes the failed prompt on a new turn.
 - `chat-wait`: `ctl wait` returns the state it waited for and times out with exit 1 and its named stderr line.
+- `chat-code`: reply code shows its language, Copy and Wrap; the final reply offers Copy on hover and keyboard focus.
 - `chat-tools`: captured Bash wires render a collapsed tool row whose detail toggles through the action and key.
 
 ## How to get to it (user POV)
@@ -628,9 +629,72 @@ print('PASS Grok streams ok; Default leaves both flags out; signed-out failure; 
 PYGROK
 ```
 
+### Code blocks
+
+This is the shared code-block scene for the full drive and the selected-page smoke.
+The helper starts its snapshot before Copy, compares only in memory, and restores on stdin EOF.
+Only fixture expectations and a boolean result are retained; pasteboard text, length and hashes are never printed or saved.
+
+```sh
+export PATH=/opt/homebrew/opt/rustup/bin:$PATH
+if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
+set -eu
+PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYCODE'
+from driver import *
+prepare()
+fence='`'*3
+reply='A final reply.\n\n'+fence+'rust\nlet value = 42;\n'+fence+'\n'
+records=[json.loads(line) for line in (SOURCE/'ok-reply.jsonl').read_text().splitlines()]
+for record in records:
+    wire=record.get('line',{})
+    if wire.get('event',{}).get('delta',{}).get('text')=='ok':
+        wire['event']['delta']['text']=reply
+    if wire.get('type')=='assistant':
+        for block in wire.get('message',{}).get('content',[]):
+            if block.get('type')=='text': block['text']=reply
+    if wire.get('type')=='result': wire['result']=reply
+stage_records(records)
+thread=create('code-actions','Show a code block',scenario=None)
+ctl('code-actions-done','wait',thread,'Done')
+state=poll('code-actions-rendered',lambda d:any(i.get('code_blocks') for i in d['transcript']['items']))
+item=next(i for i in state['transcript']['items'] if i.get('code_blocks'))
+block=item['code_blocks'][0]
+assert block['language']=='rust' and block['text']=='let value = 42;'
+assert item['wrapped'] is True
+def compare_copy(label,expected,operation,payload):
+    expectation=PROOF/(label+'.expected')
+    expectation.write_text(expected)
+    ready=PROOF/(label+'.ready')
+    helper=subprocess.Popen([str(PROOF/'pasteboard'),'--audit','--expect-text',str(expectation),'--ready-file',str(ready)],
+        stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+    save(label+'-helper',{'pid':helper.pid,'pgid':helper.pid})
+    try:
+        poll(label+'-session-ready',lambda d:ready.exists())
+        action(label,operation,payload)
+        ctl(label+'-dispatched','dump')
+    finally:
+        helper.stdin.close()
+        helper.stdin=None
+        output,error=helper.communicate(timeout=10)
+    assert helper.returncode==0 and output=='match\n' and not error
+    save(label+'-result',{'match':True})
+compare_copy('code-copy','let value = 42;','CopyCodeBlock',{'item':item['id'],'start':block['start']})
+action('code-unwrap','ToggleCodeWrap',{'item':item['id']})
+poll('code-unwrapped',lambda d:any(i['id']==item['id'] and not i['wrapped'] for i in d['transcript']['items']))
+capture_content('code-actions-unwrapped')
+action('code-wrap','ToggleCodeWrap',{'item':item['id']})
+poll('code-wrapped',lambda d:any(i['id']==item['id'] and i['wrapped'] for i in d['transcript']['items']))
+compare_copy('reply-copy',reply,'CopyReply',{'item':item['id']})
+capture_content('code-actions')
+page_done('chat-send-stream-code-blocks')
+prepare()
+PYCODE
+```
+
 ### Native smoke
 
 This capture runs only in a selected-page smoke; it leaves the page's Status unchanged.
+Run the Code blocks section immediately after this bounded stream scene in the same armed session.
 
 ```sh
 export PATH=/opt/homebrew/opt/rustup/bin:$PATH
@@ -638,7 +702,14 @@ if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
 set -eu
 PYTHONPATH=.agents/skills/verify-veyra/bin python3 - <<'PYSMOKE'
 from smoke import drive
+import pathlib, subprocess, os
+# Execute the page-owned code recipe too, so smoke uses the same Copy readback path.
 drive('chat-send-stream')
+page=pathlib.Path('.agents/skills/verify-veyra/features/chat-send-stream.md').read_text()
+code=page.split('### Code blocks\n',1)[1].split('### Native smoke\n',1)[0]
+fence='`'*3
+recipe=code.split(fence+'sh\n',1)[1].split(fence,1)[0]
+subprocess.run(['bash','-c',recipe],env=os.environ.copy(),check=True)
 PYSMOKE
 ```
 
@@ -710,6 +781,7 @@ The signed-out, retirement and notice dumps cover account and notice window beha
 For stored-mode compatibility, see [stored Grok modes](permission-matrix.md#stored-grok-modes); dump retains the stored configuration beside the effective composer mode.
 `transcript.items` carries the rendered items and `transcript.follow` is true while attached to the bottom.
 `transcript.gap`, `top_item`, `top_offset` and `item_tops` expose the rendered ListState geometry for the follow and expansion checks.
+Reply items add `wrapped` and the rendered `code_blocks` list (`start`, `text`, `language`). CopyCodeBlock, ToggleCodeWrap and CopyReply have no chord.
 Items include `outcome`, queued `wait_reason`, a tool's `failed_last_line` and its rendered `tool_label`.
 The failure card's own turn has no separate `outcome` caption; historical failed turns retain their cause in the caption.
 Each transcript item carries `delta_count`, the actual text-stream deltas observed during this app run.
@@ -763,6 +835,7 @@ Engine commands await space in the window's gpui task, so Stop is retained when 
       "chat-done.png",
       "rec/probe.jsonl"
     ],
+    "chat-send-stream-code-blocks": ["code-actions.png","code-actions-unwrapped.png","code-copy-result.json","reply-copy-result.json"],
     "chat-send-stream-smoke": [
       "chat-send-stream-smoke.png",
       "chat-send-stream-smoke-native-read.json",

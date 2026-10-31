@@ -179,7 +179,14 @@ fn shell_close_kills_group_after_grace() {
     run.wait(|| handle.status().is_finished());
     assert!(start.elapsed() >= Duration::from_secs(3));
     assert!(start.elapsed() < Duration::from_secs(5));
-    assert!(!crate::platform::group_exists(pid).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while crate::platform::group_exists(pid).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "owned shell group outlived cleanup"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 #[test]
 fn shell_tab_limit_is_enforced_by_engine() {

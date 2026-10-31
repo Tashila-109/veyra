@@ -7,11 +7,13 @@ mod header;
 mod icons;
 mod new_thread;
 mod notify;
+mod palette;
 mod provider_text;
 mod settings;
 mod sidebar;
 mod terminal_view;
 pub mod theme;
+mod toasts;
 mod transcript;
 
 use actions::*;
@@ -734,6 +736,9 @@ struct PaintedControlLabels(BTreeMap<String, SharedString>);
 impl Global for PaintedControlLabels {}
 
 pub struct Shell {
+    palette: Option<palette::Palette>,
+    code: transcript::CodeState,
+    toasts: toasts::Toasts,
     clock: StatusClock,
     capture: TestCapture,
     #[cfg(debug_assertions)]
@@ -880,7 +885,11 @@ impl Shell {
                         for event in &batch {
                             match event {
                                 UiEvent::StorageBlocked { error } => {
-                                    shell.notice = error.clone().map(Into::into)
+                                    let was_blocked = shell.toasts.blocked.take();
+                                    shell.toasts.blocked = error.clone().map(Into::into);
+                                    if error.is_some() || shell.notice == was_blocked {
+                                        shell.notice = error.clone().map(Into::into);
+                                    }
                                 }
                                 UiEvent::RecoveryNotice(notice) => {
                                     shell.notice = Some(notice.clone().into())
@@ -963,6 +972,9 @@ impl Shell {
         })
         .detach();
         let mut shell = Self {
+            palette: None,
+            code: Default::default(),
+            toasts: Default::default(),
             clock: StatusClock::default(),
             #[cfg(debug_assertions)]
             repaints: 0,
@@ -1259,7 +1271,7 @@ impl Shell {
             let _ = this.update_in(cx, |shell, window, cx| match result {
                 Ok(Ok(Ack::Project(id))) => {
                     shell.project = Some(id);
-                    shell.notice = None;
+                    shell.dismiss_notice();
                     cx.notify();
                 }
                 Ok(Ok(Ack::Thread(id))) => {
@@ -1272,12 +1284,12 @@ impl Shell {
                     shell
                         .input
                         .update(cx, |input, cx| input.set_value("", window, cx));
-                    shell.notice = None;
+                    shell.dismiss_notice();
                     cx.notify();
                 }
                 Ok(Ok(Ack::Applied)) => {
                     shell.leave_archived_thread(window, cx);
-                    shell.notice = None;
+                    shell.dismiss_notice();
                     cx.notify();
                 }
                 Ok(Err(error)) => shell.notice(error.to_string(), cx),
@@ -1291,6 +1303,7 @@ impl Shell {
         self.branch.clear();
     }
     fn show(&mut self, view: MainView) {
+        self.palette = None;
         self.thread_menu = None;
         #[cfg(debug_assertions)]
         if self.view.chat() != view.chat() {
@@ -1353,9 +1366,12 @@ impl Shell {
         self.shell_has_focus(window, cx)
     }
     fn select_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(row) = self.state.threads.get(&thread) {
+            self.toasts.selected(row.root());
+        }
         self.show(MainView::Chat(thread));
         self.question_draft = None;
-        self.notice = None;
+        self.dismiss_notice();
         let request = self.state.begin_snapshot(thread);
         let reply = self.engine.snapshot(thread);
         self.scroller.update(cx, |state, cx| state.reset(0, cx));
@@ -1889,7 +1905,11 @@ impl Shell {
                     .children(
                         self.busy_sheet_rows()
                             .into_iter()
-                            .map(|row| composer::sheet_row(&row, cx)),
+                            .enumerate()
+                            .map(|(index, row)| {
+                                composer::sheet_row(&row, cx)
+                                    .debug_selector(move || format!("quit-row-{index}"))
+                            }),
                     )
                     .child(
                         div()
@@ -1956,6 +1976,26 @@ impl Shell {
         for root in roots {
             let status = self.state.family_status(root);
             let old = previous.get(&root).unwrap_or(&Status::Idle);
+            if self.window_active {
+                if notify::attention_status(old, &status).is_some()
+                    && self
+                        .view
+                        .chat()
+                        .and_then(|id| self.state.threads.get(&id))
+                        .is_none_or(|row| row.root() != root)
+                    && let Some(thread) = self.banner_target(root)
+                    && let Some(row) = self.state.threads.get(&thread)
+                {
+                    self.toasts.attention(toasts::Attention {
+                        root,
+                        thread,
+                        title: row.title.clone(),
+                        status: status.clone(),
+                    });
+                }
+            } else {
+                self.toasts.selected(root);
+            }
             if let Some(banner) = self.state.threads.get(&root).and_then(|thread| {
                 notify::banner_for(self.window_active, old, &status, root, &thread.title)
             }) {
@@ -1994,7 +2034,7 @@ impl Shell {
         self.show(MainView::NewThread);
         self.provider_picker = None;
         self.config.mode = self.default_run_mode();
-        self.notice = None;
+        self.dismiss_notice();
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -2296,6 +2336,8 @@ impl Shell {
             .map(|(index, item)| {
                 let mut row = transcript::dump_item(item);
                 row["expanded"] = serde_json::json!(self.expanded.contains(&item.id));
+                row["wrapped"] = serde_json::json!(!self.code.unwrapped.contains(&item.id));
+                row["code_blocks"] = self.code_blocks_dump(item.id);
                 let first = index == 0 || items[index - 1].turn != item.turn;
                 row["turn_label"] = self
                     .state
@@ -2526,7 +2568,10 @@ impl Shell {
                 "glass_coverage":cx.global::<Theme>().sidebar_fill().a,
                 "forced_by":cx.global::<Theme>().look.forced_by(), "colors":colors},
             "header_branch":self.branch, "drawer":self.drawer_dump(cx),
-            "focus":if self.active_shell().is_some_and(|tab|tab.view.read(cx).focused()) {
+            "palette":self.palette_dump(cx), "toasts":self.toasts_dump(),
+            "focus":if self.palette.is_some() {
+                "palette"
+            } else if self.active_shell().is_some_and(|tab|tab.view.read(cx).focused()) {
                 "drawer"
             } else if self.composer_focused { "composer" } else { "none" },
             "sidebar":{"width":f32::from(self.sidebar_width),
@@ -2553,7 +2598,7 @@ impl Shell {
             "quit_sheet":{"open":self.quit_sheet, "threads":self.busy_threads()},
             "requests":self.state.requests,
             "tasks":self.state.tasks.values().collect::<Vec<_>>(),
-            "notice":self.notice.as_ref().map(|notice| notice.as_ref())
+            "notice":self.notice_text().map(|notice| notice.as_ref())
         })
     }
     #[cfg(debug_assertions)]
@@ -2575,6 +2620,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_clock(cx);
         self.sync_drawers(cx);
+        self.sync_toasts(window, cx);
         self.composer_focused = self.input.focus_handle(cx).is_focused(window);
         self.drawer_viewport = window.viewport_size().height;
         self.cancel_changed_drawer_drag(cx);
@@ -2799,7 +2845,7 @@ impl Render for Shell {
                 shell.show(MainView::Settings {
                     back: shell.view.selected(),
                 });
-                shell.notice = None;
+                shell.dismiss_notice();
                 window.focus(&shell.focus, cx);
                 cx.notify();
             }))
@@ -2981,8 +3027,39 @@ impl Render for Shell {
                 });
                 cx.notify();
             }))
+            .on_action(
+                cx.listener(|shell, _: &OpenPalette, window, cx| shell.open_palette(window, cx)),
+            )
+            .on_action(cx.listener(|shell, action: &CopyCodeBlock, window, cx| {
+                shell.copy_code_block(action, window, cx)
+            }))
+            .on_action(cx.listener(|shell, action: &CopyReply, window, cx| {
+                shell.copy_reply(action, window, cx)
+            }))
+            .on_action(cx.listener(|shell, action: &ToggleCodeWrap, window, cx| {
+                shell.toggle_code_wrap(action, window, cx)
+            }))
+            .on_action(cx.listener(|shell, _: &CopyNotice, _, cx| {
+                if let Some(text) = shell.notice_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                }
+            }))
+            .on_action(cx.listener(|shell, action: &DismissToast, window, cx| {
+                let root = action.root.or_else(|| {
+                    window.context_stack().iter().rev().find_map(|context| {
+                        context
+                            .get("toast_root")
+                            .and_then(|id| id.parse().ok())
+                            .map(ThreadId)
+                    })
+                });
+                if let Some(root) = root {
+                    shell.toasts.selected(root);
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|shell, _: &DismissNotice, window, cx| {
-                shell.notice = None;
+                shell.dismiss_notice();
                 shell.provider_picker = None;
                 if matches!(shell.view, MainView::Settings { .. }) {
                     if let Some(thread) = shell.view.selected() {
@@ -3130,6 +3207,7 @@ impl Render for Shell {
                         MainView::Chat(_) => transcript::render(self, cx).into_any_element(),
                     })
                     .children(self.render_drawer(window, cx))
+                    .children(self.render_toasts(cx))
                     .child(
                         div()
                             .absolute()
@@ -3170,6 +3248,7 @@ impl Render for Shell {
         let root = root.when(self.quit_sheet, |root| {
             root.child(self.render_quit_sheet(cx))
         });
+        let root = root.children(self.render_palette(cx));
         #[cfg(debug_assertions)]
         let root = root.on_action(cx.listener(|shell, action: &DebugComposerWidth, _, cx| {
             let maximum = cx.global::<Theme>().layout.composer_max;
@@ -4595,7 +4674,10 @@ mod tests {
     fn reduce_motion_keeps_working_clock_phase_still(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
             let epoch = shell.update(cx, |shell, cx| {
-                let mut look = cx.global::<super::theme::Look>().to_owned();
+                let mut look = cx
+                    .try_global::<super::theme::Look>()
+                    .copied()
+                    .unwrap_or_default();
                 look.options.reduce_motion = true;
                 cx.set_global(super::Theme::with_look(super::Appearance::Dark, look));
                 let (thread, _) = configure_dock_thread(shell, ProviderKind::Claude, false, false);
@@ -4632,7 +4714,10 @@ mod tests {
             cx.run_until_parked();
             assert_eq!(shell.read_with(cx, |shell, _| shell.clock.phase), 1);
             shell.update(cx, |shell, cx| {
-                let mut look = cx.global::<super::theme::Look>().to_owned();
+                let mut look = cx
+                    .try_global::<super::theme::Look>()
+                    .copied()
+                    .unwrap_or_default();
                 look.options.reduce_motion = true;
                 cx.set_global(super::Theme::with_look(super::Appearance::Dark, look));
                 shell.sync_clock(cx);
@@ -11560,19 +11645,32 @@ mod tests {
                     text.lines()
                 );
             }
-            shell.read_with(cx, |shell, _| {
-                let rows = shell.busy_sheet_rows();
-                assert_eq!(rows.len(), 1, "one quit row per thread");
-                assert_eq!(rows[0].title, "Fix A · B");
-                assert_eq!(rows[0].project, "Project · Notes");
+            let row = cx.debug_bounds("quit-row-0").expect("first quit row drawn");
+            assert!(
+                cx.debug_bounds("quit-row-1").is_none(),
+                "one drawn row per busy thread"
+            );
+            let title = cx
+                .debug_bounds("sheet-row-title")
+                .expect("thread title drawn");
+            let project = cx.debug_bounds("sheet-row-project").expect("project drawn");
+            let process = cx
+                .debug_bounds("sheet-row-process-0")
+                .expect("shell process drawn");
+            for field in [title, project, process] {
                 assert!(
-                    rows[0]
-                        .processes
-                        .iter()
-                        .any(|name| name == "Quit shell: sleep")
+                    field.left() >= row.left()
+                        && field.right() <= row.right() + gpui::Pixels::from(1.)
+                        && field.top() >= row.top()
+                        && field.bottom() <= row.bottom() + gpui::Pixels::from(1.),
+                    "row {row:?}, field {field:?}"
                 );
-                assert_eq!(shell.running_shells().len(), 1);
-            });
+            }
+            assert!(project.top() >= title.bottom());
+            assert!(
+                process.top() >= project.bottom(),
+                "shell processes must be under their thread"
+            );
         });
     }
     #[cfg(debug_assertions)]
@@ -11894,6 +11992,668 @@ mod tests {
                     && !veyra_engine::platform::is_alive(pid).unwrap()
                     && !veyra_engine::platform::group_exists(pid).unwrap()
             });
+        });
+    }
+    #[cfg(debug_assertions)]
+    fn snap_palette(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            let mut look = cx
+                .try_global::<super::theme::Look>()
+                .copied()
+                .unwrap_or_default();
+            look.options.reduce_motion = true;
+            cx.set_global(look);
+            super::Theme::apply(super::Appearance::Dark, window, cx);
+        });
+        draw(cx);
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn palette_exit_uses_menu_out_and_restores_focus(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        let dispatcher = cx.dispatcher.clone();
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let duration = cx.update(|window, cx| {
+                let mut look = cx
+                    .try_global::<super::theme::Look>()
+                    .copied()
+                    .unwrap_or_default();
+                look.options.reduce_motion = false;
+                look.overridden = true;
+                cx.set_global(look);
+                super::Theme::apply(super::Appearance::Dark, window, cx);
+                cx.global::<super::Theme>().motion.menu[1].duration
+            });
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_some()));
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_some()));
+            dispatcher.advance_clock(duration - std::time::Duration::from_nanos(1));
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_some()));
+            dispatcher.advance_clock(std::time::Duration::from_nanos(1));
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_none()));
+        });
+    }
+    #[cfg(debug_assertions)]
+    fn palette_actions(shell: &Entity<super::Shell>, cx: &gpui::VisualTestContext) -> Vec<String> {
+        shell.read_with(cx, |shell, cx| {
+            shell.palette_dump(cx)["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["action"].as_str().unwrap().to_owned())
+                .collect()
+        })
+    }
+    fn dormant_drawer(
+        shell: &mut super::Shell,
+        window: &mut Window,
+        cx: &mut Context<super::Shell>,
+    ) {
+        configure_dock_thread(shell, ProviderKind::Claude, false, false);
+        shell.state.requests.clear();
+        let thread = shell.view.chat().unwrap();
+        let view = cx.new(|cx| super::terminal_view::TerminalView::new(None, window, cx));
+        shell.drawers.insert(
+            thread,
+            super::drawer::Drawer {
+                open: true,
+                height: gpui::Pixels::from(236.),
+                active: 0,
+                tabs: vec![super::drawer::Tab {
+                    number: 1,
+                    label: "Shell 1".into(),
+                    handle: None,
+                    view,
+                    error: None,
+                }],
+            },
+        );
+        shell.focus_shell(window, cx);
+        cx.notify();
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn palette_never_lists_request_answers(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            cx.simulate_keystrokes("secondary-shift-y");
+            draw(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_some()));
+            let names = palette_actions(&shell, cx);
+            for name in [
+                "AllowOnce",
+                "AllowInThread",
+                "Deny",
+                "AnswerQuestion",
+                "ChooseAsyncOption",
+                "AnswerFocusedOption",
+            ] {
+                assert!(
+                    !names.iter().any(|entry| entry == name),
+                    "request answer listed: {name}"
+                );
+            }
+            assert!(
+                names.iter().any(|entry| entry == "MoveOptionDown"),
+                "dock context must be retained"
+            );
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn palette_lists_drawer_actions_only_from_drawer(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            assert!(!palette_actions(&shell, cx).contains(&"NewShellTab".into()));
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            shell.update_in(cx, dormant_drawer);
+            draw(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            assert!(palette_actions(&shell, cx).contains(&"NewShellTab".into()));
+            assert!(!palette_actions(&shell, cx).contains(&"MoveOptionDown".into()));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn palette_entry_acts_as_its_chord(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            let initial = shell.read_with(cx, |shell, _| shell.sidebar_width);
+            cx.simulate_keystrokes("secondary-alt-left");
+            draw(cx);
+            let by_chord = shell.read_with(cx, |shell, _| shell.sidebar_width);
+            shell.update(cx, |shell, cx| {
+                shell.sidebar_width = initial;
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            cx.simulate_input("> Narrow sidebar");
+            draw(cx);
+            let dump = shell.read_with(cx, |shell, cx| shell.palette_dump(cx));
+            assert!(dump["threads"].as_array().unwrap().is_empty());
+            assert_eq!(dump["actions"].as_array().unwrap().len(), 1);
+            cx.simulate_keystrokes("enter");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.sidebar_width),
+                by_chord
+            );
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_none()));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn palette_returns_focus_to_drawer(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            shell.update_in(cx, dormant_drawer);
+            draw(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx)
+                    ["focus"]
+                    .clone()),
+                "palette"
+            );
+            cx.simulate_input("Narrow sidebar");
+            draw(cx);
+            cx.simulate_keystrokes("enter");
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            assert!(shell.update_in(cx, |shell, window, cx| shell.shell_has_focus(window, cx)));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn palette_keeps_draft_and_caret(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            cx.simulate_input("Keep this draft");
+            cx.simulate_keystrokes("left left");
+            draw(cx);
+            let before = shell.read_with(cx, |shell, cx| {
+                (shell.input.read(cx).value(), shell.input.read(cx).cursor())
+            });
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_some()));
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            let after = shell.read_with(cx, |shell, cx| {
+                (shell.input.read(cx).value(), shell.input.read(cx).cursor())
+            });
+            assert_eq!(after, before);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            cx.simulate_keystrokes("secondary-n");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_none()));
+            assert!(shell.read_with(cx, |shell, _| matches!(
+                shell.view,
+                super::MainView::NewThread
+            )));
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn palette_skips_archived_threads(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            let (root, child, _) = shell.update(cx, add_family);
+            let target = ThreadId::new();
+            shell.update(cx, |shell, cx| {
+                shell.state.threads.get_mut(&child).unwrap().archived = true;
+                let mut row = shell.state.threads[&root].clone();
+                row.id = target;
+                row.title = "Unique destination".into();
+                shell.state.threads.insert(target, row);
+                cx.notify();
+            });
+            draw(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            let dump = shell.read_with(cx, |shell, cx| shell.palette_dump(cx));
+            let threads = dump["threads"].as_array().unwrap();
+            assert_eq!(threads.len(), 2);
+            assert!(
+                threads
+                    .iter()
+                    .any(|entry| entry["thread"] == root.to_string())
+            );
+            assert!(
+                !threads
+                    .iter()
+                    .any(|entry| entry["thread"] == child.to_string())
+            );
+            cx.simulate_input("Unique destination");
+            draw(cx);
+            let filtered = shell.read_with(cx, |shell, cx| shell.palette_dump(cx));
+            assert!(filtered["actions"].as_array().unwrap().is_empty());
+            cx.simulate_keystrokes("enter");
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.view.chat()),
+                Some(target)
+            );
+        });
+    }
+    fn attention_family(
+        shell: &mut super::Shell,
+        cx: &mut Context<super::Shell>,
+    ) -> (ThreadId, ThreadId) {
+        let (root, child, _) = add_family(shell, cx);
+        let outside = ThreadId::new();
+        let mut row = shell.state.threads[&root].clone();
+        row.id = outside;
+        row.title = "Other work".into();
+        shell.state.threads.insert(outside, row);
+        shell.view = super::MainView::Chat(outside);
+        shell.state.statuses.insert(child, Status::NeedsYou);
+        shell.window_active = true;
+        (root, child)
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn notice_toast_replaces_older_notice(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            shell.update(cx, |shell, cx| {
+                shell.notice("First", cx);
+                shell.notice("Second", cx);
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key("Name(\"copy-notice\")")
+            }));
+            let dump = shell.read_with(cx, |shell, _| shell.toasts_dump());
+            assert_eq!(dump.as_array().unwrap().len(), 1);
+            assert_eq!(dump[0]["text"], "Second");
+            cx.update(|window, cx| window.dispatch_action(Box::new(super::DismissNotice), cx));
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| {
+                shell.toasts_dump().as_array().unwrap().is_empty()
+            }));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn attention_toast_one_per_family(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, child) = shell.update(cx, attention_family);
+            shell.update(cx, |shell, cx| {
+                shell.post_banners(&BTreeMap::from([(root, Status::Working { since: 0 })]), cx)
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key(&format!("Name(\"open-toast-{root}\")"))
+            }));
+            let first = shell.read_with(cx, |shell, _| shell.toasts_dump());
+            assert_eq!(first[0]["thread"], child.to_string());
+            shell.update(cx, |shell, cx| {
+                shell.state.statuses.insert(child, Status::Failed);
+                shell.post_banners(&BTreeMap::from([(root, Status::NeedsYou)]), cx);
+                cx.notify();
+            });
+            draw(cx);
+            let next = shell.read_with(cx, |shell, _| shell.toasts_dump());
+            assert_eq!(next.as_array().unwrap().len(), 1);
+            assert_eq!(next[0]["root"], root.to_string());
+            assert_eq!(next[0]["status"], "Failed");
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn no_toast_while_window_inactive(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, _) = shell.update(cx, attention_family);
+            shell.update(cx, |shell, cx| {
+                shell.post_banners(&BTreeMap::from([(root, Status::Working { since: 0 })]), cx)
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key(&format!("Name(\"open-toast-{root}\")"))
+            }));
+            shell.update(cx, |shell, cx| {
+                shell.window_active = false;
+                shell.post_banners(&BTreeMap::from([(root, Status::Working { since: 0 })]), cx);
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.toasts.attention.is_empty()));
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.notifications_posted),
+                1
+            );
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn selecting_family_removes_its_toast(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (root, child) = shell.update(cx, attention_family);
+            shell.update(cx, |shell, cx| {
+                shell.post_banners(&BTreeMap::from([(root, Status::Working { since: 0 })]), cx)
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .contains_key(&format!("Name(\"open-toast-{root}\")"))
+            }));
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.toasts.attention.len()),
+                1
+            );
+            cx.update(|window, cx| {
+                window.dispatch_action(
+                    Box::new(super::SelectThread {
+                        thread: Some(child),
+                    }),
+                    cx,
+                )
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.toasts.attention.is_empty()));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn toasts_arm_no_clock_at_rest(cx: &mut gpui::TestAppContext) {
+        let dispatcher = cx.dispatcher.clone();
+        with_docked_shell(cx, |shell, cx, _, _| {
+            for blocked in [false, true] {
+                shell.update_in(cx, |shell, window, cx| {
+                    shell.state.turns.clear();
+                    shell.state.statuses.clear();
+                    shell.state.requests.clear();
+                    window.focus(&shell.focus, cx);
+                    shell.notice("At rest", cx);
+                    shell.toasts.blocked = blocked.then(|| "At rest".into());
+                });
+                draw(cx);
+                assert!(shell.read_with(cx, |_, cx| {
+                    cx.global::<super::PaintedControls>()
+                        .0
+                        .contains_key("Name(\"copy-notice\")")
+                }));
+                dispatcher.advance_clock(std::time::Duration::from_secs(2));
+                draw(cx);
+                dispatcher.advance_clock(std::time::Duration::from_secs(2));
+                draw(cx);
+                assert!(
+                    !dispatcher.advance_clock_to_next_timer(),
+                    "toast/card clock at rest; storage={blocked}"
+                );
+                let dump =
+                    shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx));
+                assert_eq!(dump["toasts"][0]["text"], "At rest");
+                assert_eq!(dump["notice"], dump["toasts"][0]["text"]);
+            }
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn storage_blocked_notice_survives_dismissal_until_clear(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, events| {
+            events
+                .send(UiEvent::StorageBlocked {
+                    error: Some("Storage is blocked".into()),
+                })
+                .unwrap();
+            draw(cx);
+            let before =
+                shell.read_with(cx, |shell, cx| shell.dump(std::path::Path::new("/tmp"), cx));
+            assert_eq!(before["notice"], before["toasts"][0]["text"]);
+            assert_eq!(before["toasts"][0]["storage_blocked"], true);
+            let card = shell.read_with(
+                cx,
+                |_, cx| cx.global::<super::PaintedControls>().0["Name(\"storage-toast\")"],
+            );
+            // This is where the kit's close control would be. The storage card has no such control.
+            cx.simulate_click(
+                gpui::point(
+                    card.right() - gpui::Pixels::from(8.),
+                    card.top() + gpui::Pixels::from(8.),
+                ),
+                gpui::Modifiers::none(),
+            );
+            draw(cx);
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            cx.update(|window, cx| window.dispatch_action(Box::new(super::DismissNotice), cx));
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.toasts_dump()),
+                before["toasts"]
+            );
+            assert_eq!(
+                shell.read_with(
+                    cx,
+                    |_, cx| cx.global::<super::PaintedControls>().0["Name(\"storage-toast\")"]
+                ),
+                card
+            );
+            events
+                .send(UiEvent::StorageBlocked { error: None })
+                .unwrap();
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| {
+                shell.toasts_dump().as_array().unwrap().is_empty()
+            }));
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn code_block_copy_writes_exact_text(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let expected = "let text = \"é\";\n\tprintln!(\"{text}\");  ";
+            let (_, _, ids) = shell.update(cx, |shell, cx| {
+                display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![ItemBody::AssistantText {
+                        text: format!(
+                            concat!(
+                                "```rust\n{expected}\n```\n\n",
+                                "- Intro line\n  continued\n\n  ```rust\n  let nested = 1;\n  ```"
+                            ),
+                            expected = expected
+                        ),
+                        done: true,
+                    }],
+                )
+            });
+            draw(cx);
+            let blocks = shell.read_with(cx, |shell, _| shell.code_blocks_dump(ids[0]));
+            assert_eq!(
+                blocks.as_array().unwrap().len(),
+                2,
+                "nested code must keep its action corner"
+            );
+            assert_eq!(blocks[0]["text"], expected);
+            assert_eq!(blocks[1]["text"], "let nested = 1;");
+            let start = blocks[0]["start"].as_u64().unwrap() as usize;
+            cx.update(|window, cx| {
+                window.dispatch_action(
+                    Box::new(super::CopyCodeBlock {
+                        item: Some(ids[0]),
+                        start,
+                    }),
+                    cx,
+                )
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                expected
+            );
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("before click".into()))
+            });
+            let copy = shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>().0
+                    [&format!("Name(\"code-copy-{}-{start}\")", ids[0])]
+            });
+            cx.simulate_click(copy.center(), gpui::Modifiers::none());
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                expected
+            );
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn wrap_toggles_reply_code_style(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let (_, _, ids) = shell.update(cx, |shell, cx| {
+                display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![
+                        ItemBody::AssistantText {
+                            text: format!("```rust\n{}\n```", "long_code ".repeat(40)),
+                            done: true,
+                        },
+                        ItemBody::AssistantText {
+                            text: "```text\nOther reply\n```".into(),
+                            done: true,
+                        },
+                    ],
+                )
+            });
+            draw(cx);
+            assert!(shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .keys()
+                    .any(|name| name.starts_with("Name(\"wrap-code-"))
+            }));
+            let selector: &'static str =
+                Box::leak(format!("transcript-body-{}", ids[0]).into_boxed_str());
+            let wrapped = cx.debug_bounds(selector).unwrap().size.height;
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::ToggleCodeWrap { item: Some(ids[0]) }), cx)
+            });
+            draw(cx);
+            let unwrapped = cx.debug_bounds(selector).unwrap().size.height;
+            assert!(
+                unwrapped < wrapped,
+                "rendered code did not unwrap: {wrapped:?}, {unwrapped:?}"
+            );
+            assert!(
+                shell.read_with(cx, |shell, _| shell.code.unwrapped.contains(&ids[0])
+                    && !shell.code.unwrapped.contains(&ids[1]))
+            );
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::ToggleCodeWrap { item: Some(ids[0]) }), cx)
+            });
+            draw(cx);
+            assert_eq!(cx.debug_bounds(selector).unwrap().size.height, wrapped);
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn final_reply_copy_writes_its_text(cx: &mut gpui::TestAppContext) {
+        with_docked_shell(cx, |shell, cx, _, _| {
+            let text = "First **bold**.\nSecond line.\n";
+            let (_, turn, ids) = shell.update(cx, |shell, cx| {
+                let rows = display_fixture_rows(
+                    shell,
+                    cx,
+                    vec![
+                        ItemBody::AssistantText {
+                            text: "Earlier reply".into(),
+                            done: true,
+                        },
+                        ItemBody::AssistantText {
+                            text: text.into(),
+                            done: true,
+                        },
+                    ],
+                );
+                shell.state.turns.get_mut(&rows.1).unwrap().state = TurnState::Ended {
+                    outcome: TurnOutcome::Completed,
+                    started: Some(0),
+                    at: 1,
+                };
+                rows
+            });
+            draw(cx);
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()))
+            });
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::CopyReply { item: Some(ids[0]) }), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                "unchanged"
+            );
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(super::CopyReply { item: Some(ids[1]) }), cx)
+            });
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                text
+            );
+
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("before hover".into()))
+            });
+            let selector: &'static str =
+                Box::leak(format!("transcript-body-{}", ids[1]).into_boxed_str());
+            let position = cx.debug_bounds(selector).unwrap().center();
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position,
+                ..Default::default()
+            });
+            draw(cx);
+            let copy = shell.read_with(cx, |_, cx| {
+                cx.global::<super::PaintedControls>().0[&format!("Name(\"copy-reply-{}\")", ids[1])]
+            });
+            cx.simulate_click(copy.center(), gpui::Modifiers::none());
+            draw(cx);
+            assert_eq!(
+                cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+                text
+            );
+            assert!(shell.read_with(cx, |shell, _| matches!(
+                shell.state.turns[&turn].state,
+                TurnState::Ended { .. }
+            )));
         });
     }
 }

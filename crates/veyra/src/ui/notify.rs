@@ -20,21 +20,28 @@ pub fn banner_for(
     root: ThreadId,
     title: &str,
 ) -> Option<SystemNotification> {
-    if active || std::mem::discriminant(previous) == std::mem::discriminant(current) {
+    if active {
         return None;
     }
-    let body = match current {
-        Status::NeedsYou => "Needs you",
-        Status::Done { .. } => "Done",
-        Status::Failed => "Failed",
-        _ => return None,
-    };
+    let body = attention_status(previous, current)?;
     Some(SystemNotification {
         tag: root.to_string().into(),
         title: title.to_owned().into(),
         body: body.into(),
         actions: vec![],
     })
+}
+
+pub(super) fn attention_status(previous: &Status, current: &Status) -> Option<&'static str> {
+    if std::mem::discriminant(previous) == std::mem::discriminant(current) {
+        return None;
+    }
+    match current {
+        Status::NeedsYou => Some("Needs you"),
+        Status::Done { .. } => Some("Done"),
+        Status::Failed => Some("Failed"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

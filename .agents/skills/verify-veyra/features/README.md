@@ -3,6 +3,8 @@
 [app-launch](app-launch.md) covers the native window, debug CLI, instance lock, migrated database, log, release exclusion, and cleanup.
 [new-thread](new-thread.md) covers project selection, startup readiness, Check again, the no-account probe and the live composer choices without creating a thread, including Codex's CLI models and efforts and Grok's Default-only menus.
 [chat-send-stream](chat-send-stream.md) covers fake-CLI streaming, Working → Done, failure cause and stderr, Retry and ctl wait, plus Codex's foreign-thread filtering and retry/limit notices and Grok's session authentication failure naming `grok login`.
+[command-palette](command-palette.md) covers action/context filtering, request-answer refusal, title search and focus return.
+[toasts](toasts.md) covers persistent notices, per-family attention, Copy and the storage-only card.
 [settings](settings.md) covers OpenSettings, all defaults, existing-versus-new thread modes and default persistence after relaunch.
 
 [approvals-questions](approvals-questions.md) covers approval decisions, exact grants, question keys and NextNeedsYou, plus Codex directory-aware command grants and MCP approvals without grants, and Grok Deny-only consent, question answers and expiry after Stop.
@@ -31,7 +33,7 @@ Preserve the app log and proof after Cleanup.
 Report a skipped native entry point as skipped.
 The driver does not prove external keyboard delivery, IME, or pointer input.
 `view`, `sidebar.rows`, `selected_thread`, `transcript`, `composer_text`, `composer`, `providers`, `settings`, `drawer`, `focus`, `composer_caret` and `perf` are live state.
-Use their assertions alongside identity, appearance, sidebar width and notice, and inspect the PNG for layout.
+Use their assertions alongside identity, appearance, sidebar width and notice, palette and toasts, and inspect the PNG for layout.
 Each key check must reset to a state that its key changes.
 The sidebar recipe checks the theme's 240 px default, 200 to 448 px bounds, and 16 px key step.
 Inspect the 44 px header and the composer capped at 784 px in the PNG.

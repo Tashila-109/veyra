@@ -1,5 +1,6 @@
 //! Main-thread runner for the production views' headless Metal checks.
-#![allow(dead_code, unused_imports)] // Imported production modules also contain tests for the unit-test harness.
+// The imported production modules and their unit-test helpers have no callers in this separate runner.
+#![allow(dead_code, unused_imports)]
 
 #[cfg(debug_assertions)]
 #[path = "../src/control.rs"]

@@ -567,6 +567,12 @@ impl Theme {
             kit.button_danger_foreground = c.on_solid;
             kit.warning = c.warning;
             kit.success = c.success;
+            kit.notification.width = theme.layout.toast_width;
+            kit.notification.max_items = theme.layout.toasts_shown;
+            kit.notification.margins.right = theme.layout.toast_inset;
+            kit.notification.margins.bottom = theme.layout.toast_inset;
+            kit.notification.margins.left = theme.layout.toast_inset;
+            kit.notification.margins.top = theme.layout.header + theme.layout.toast_inset;
             kit.font_family = theme.text.ui_font.clone();
             kit.mono_font_family = theme.text.mono_font.clone();
             kit.font_size = theme.text.base;

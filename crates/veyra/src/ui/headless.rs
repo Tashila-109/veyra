@@ -6,6 +6,7 @@
 #[allow(unused_imports)] // The ordinary unit-test binary does not call this runner.
 pub(crate) use checks::run;
 
+// Keep this boundary: composer's dock scan reads each source only up to its first test module.
 #[cfg(test)]
 mod checks {
     use super::super::*;
@@ -113,30 +114,35 @@ mod checks {
         .unwrap();
     }
 
+    enum MarkGlyph {
+        Status { status: Status, phase: u8 },
+        Asset(&'static str),
+    }
     struct Mark {
-        status: Status,
-        phase: u8,
-        asset: Option<&'static str>,
+        glyph: MarkGlyph,
         background: Hsla,
         ink: Hsla,
     }
     impl Render for Mark {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let glyph = if let Some(asset) = self.asset {
-                // The reference bypasses status_path and status_mark's mapping.
-                div()
-                    .size(Pixels::from(16.))
-                    .flex_none()
-                    .child(
-                        gpui_kit::component::Icon::default()
-                            .path(asset)
-                            .size(Pixels::from(16.))
-                            .text_color(self.ink),
-                    )
-                    .into_any_element()
-            } else {
-                icons::status_mark(&self.status, self.phase, Pixels::from(16.), self.ink)
-                    .into_any_element()
+            let glyph = match &self.glyph {
+                MarkGlyph::Asset(asset) => {
+                    // The reference bypasses status_path and status_mark's mapping.
+                    div()
+                        .size(Pixels::from(16.))
+                        .flex_none()
+                        .child(
+                            gpui_kit::component::Icon::default()
+                                .path(*asset)
+                                .size(Pixels::from(16.))
+                                .text_color(self.ink),
+                        )
+                        .into_any_element()
+                }
+                MarkGlyph::Status { status, phase } => {
+                    icons::status_mark(status, *phase, Pixels::from(16.), self.ink)
+                        .into_any_element()
+                }
             };
             div()
                 .size_full()
@@ -172,9 +178,7 @@ mod checks {
         let window = cx
             .open_window(size(Pixels::from(32.), Pixels::from(32.)), |_, cx| {
                 cx.new(|_| Mark {
-                    status: Status::Idle,
-                    phase: 0,
-                    asset: Some(asset),
+                    glyph: MarkGlyph::Asset(asset),
                     background,
                     ink,
                 })
@@ -190,9 +194,10 @@ mod checks {
         let window = cx
             .open_window(size(Pixels::from(32.), Pixels::from(32.)), |_, cx| {
                 cx.new(|_| Mark {
-                    status: Status::Idle,
-                    phase: 0,
-                    asset: None,
+                    glyph: MarkGlyph::Status {
+                        status: Status::Idle,
+                        phase: 0,
+                    },
                     background: theme.colors.bg,
                     ink: theme.colors.text,
                 })
@@ -203,7 +208,10 @@ mod checks {
         for (status, asset) in statuses() {
             cx.update(|cx| {
                 window.update(cx, |mark, _, cx| {
-                    mark.status = status.clone();
+                    mark.glyph = MarkGlyph::Status {
+                        status: status.clone(),
+                        phase: 0,
+                    };
                     cx.notify();
                 })
             })
@@ -224,8 +232,10 @@ mod checks {
         for phase in 0..icons::WORKING_STEPS_PER_TURN as u8 {
             cx.update(|cx| {
                 window.update(cx, |mark, _, cx| {
-                    mark.status = Status::Working { since: 0 };
-                    mark.phase = phase;
+                    mark.glyph = MarkGlyph::Status {
+                        status: Status::Working { since: 0 },
+                        phase,
+                    };
                     cx.notify();
                 })
             })
@@ -481,6 +491,143 @@ mod checks {
             self.frame();
             id
         }
+    }
+
+    fn buttons_light_only_explicit_plates() {
+        fn check(fixture: &mut Fixture, name: &str, fill: Option<Hsla>) {
+            let paint = fixture.paint();
+            let bounds = paint.control(name).scale(paint.scale);
+            let gradients: Vec<_> = paint
+                .quads
+                .iter()
+                .filter(|q| q.bounds == bounds && q.background.as_solid().is_none())
+                .collect();
+            match fill {
+                Some(fill) => {
+                    assert_eq!(gradients.len(), 1, "{name} must paint one lit plate");
+                    assert_eq!(
+                        gradients[0].background,
+                        paint.theme.plate(fill),
+                        "{name} fill"
+                    );
+                    assert!(
+                        paint.quads.iter().any(|quad| quad.bounds == bounds
+                            && quad.border_color == paint.theme.colors.border
+                            && quad.border_widths.top
+                                == paint.theme.layout.border.scale(paint.scale)),
+                        "{name} must paint the one-pixel rim"
+                    );
+                }
+                None => assert!(gradients.is_empty(), "{name} must paint flat"),
+            }
+        }
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let mut fixture = Fixture::new(960., 740.);
+            fixture.appearance(appearance);
+            let request = fixture.approval();
+            let solid = fixture.paint().theme.colors.solid;
+            check(&mut fixture, &format!("allow-once-{request}"), Some(solid));
+            check(&mut fixture, &format!("deny-{request}"), None);
+            check(&mut fixture, &format!("allow-thread-{request}"), None);
+            fixture.update(|shell, _, cx| {
+                shell.state.requests.clear();
+                cx.notify();
+            });
+            fixture.frame();
+            let stop = format!("stop-{}-{}", fixture.thread, fixture.turn);
+            check(&mut fixture, &stop, Some(solid));
+            fixture.update(|shell, window, cx| {
+                shell
+                    .input
+                    .update(cx, |input, cx| input.set_value("A draft", window, cx));
+                cx.notify();
+            });
+            fixture.frame();
+            check(&mut fixture, "send", Some(solid));
+            fixture.update(|shell, _, cx| {
+                shell.quit_sheet = true;
+                cx.notify();
+            });
+            fixture.frame();
+            check(&mut fixture, "confirm-quit", None);
+            let thread = fixture.thread;
+            fixture.update(|shell, _, cx| {
+                shell.quit_sheet = false;
+                shell.close_sheet = Some(drawer::CloseSheet {
+                    target: drawer::CloseTarget::Tab { thread, number: 1 },
+                    processes: vec!["Owned shell: sleep".into()],
+                    drawer_focus: false,
+                });
+                cx.notify();
+            });
+            fixture.frame();
+            check(&mut fixture, "confirm-close-shell", None);
+        }
+    }
+
+    fn reply_code_unwrapped_sideways_scroll_probe() {
+        struct Probe;
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                use gpui_kit::component::text::{TextView, TextViewStyle};
+                let t = cx.global::<Theme>();
+                let mut code = StyleRefinement::default()
+                    .whitespace_nowrap()
+                    .font_family(t.text.mono_font.clone())
+                    .text_size(t.text.code.size)
+                    .line_height(t.text.code.line_height)
+                    .pt(Pixels::from(48.));
+                code.overflow.x = Some(Overflow::Scroll);
+                div().size_full().bg(t.colors.bg).child(
+                    TextView::markdown(
+                        "wrap-prerequisite",
+                        format!("```rust\nLEFT_{}RIGHT\n```", "abcdefghij".repeat(50)),
+                    )
+                    .style(TextViewStyle::default().code_block(code))
+                    .code_block_actions(|_, _, _| div().child("Probe")),
+                )
+            }
+        }
+        let mut cx = context();
+        let window = cx
+            .open_window(
+                size(Pixels::from(360.), Pixels::from(160.)),
+                |window, cx| {
+                    Theme::apply(Appearance::Dark, window, cx);
+                    cx.new(|_| Probe)
+                },
+            )
+            .unwrap();
+        draw(&mut cx, window.into());
+        let region = Bounds {
+            origin: point(Pixels::from(20.), Pixels::from(48.)),
+            size: size(Pixels::from(320.), Pixels::from(20.)),
+        };
+        let before = Frame::capture(&mut cx, window.into()).region(region);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position: point(Pixels::from(180.), Pixels::from(58.)),
+                    delta: gpui::ScrollDelta::Pixels(point(Pixels::from(-144.), Pixels::ZERO)),
+                    touch_phase: gpui::TouchPhase::Moved,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        draw(&mut cx, window.into());
+        let after = Frame::capture(&mut cx, window.into()).region(region);
+        let changed = before
+            .iter()
+            .zip(&after)
+            .filter(|(left, right)| left != right)
+            .count();
+        println!("WRAP_CHECK unwrapped=true horizontal_wheel=-144 changed_code_pixels={changed}");
+        assert!(
+            changed > 100,
+            "gpui-kit 0.7.3 unwrapped reply code did not scroll sideways"
+        );
     }
 
     fn approval_command_plates_and_decision_controls() {
@@ -930,6 +1077,391 @@ mod checks {
         );
     }
 
+    fn reference_icon_shape(
+        asset: &'static str,
+        extent: Pixels,
+        background: Hsla,
+        ink: Hsla,
+    ) -> Vec<bool> {
+        struct IconReference {
+            asset: &'static str,
+            extent: Pixels,
+            background: Hsla,
+            ink: Hsla,
+        }
+        impl Render for IconReference {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .bg(self.background)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        gpui_kit::component::Icon::default()
+                            .path(self.asset)
+                            .size(self.extent)
+                            .text_color(self.ink),
+                    )
+            }
+        }
+        let mut cx = context();
+        let window = cx
+            .open_window(size(Pixels::from(32.), Pixels::from(32.)), |_, cx| {
+                cx.new(|_| IconReference {
+                    asset,
+                    extent,
+                    background,
+                    ink,
+                })
+            })
+            .unwrap();
+        draw(&mut cx, window.into());
+        Frame::capture(&mut cx, window.into()).shape(Bounds {
+            origin: point(
+                (Pixels::from(32.) - extent) / 2.,
+                (Pixels::from(32.) - extent) / 2.,
+            ),
+            size: size(extent, extent),
+        })
+    }
+    fn reference_text(
+        text: &'static str,
+        role: theme::TypeRole,
+        t: &Theme,
+        ink: Hsla,
+        background: Hsla,
+        bounds: Bounds<Pixels>,
+    ) -> Vec<[u8; 3]> {
+        struct Label {
+            text: &'static str,
+            role: theme::TypeRole,
+            theme: Theme,
+            ink: Hsla,
+            background: Hsla,
+            bounds: Bounds<Pixels>,
+        }
+        impl Render for Label {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().relative().bg(self.theme.colors.bg).child(
+                    div()
+                        .absolute()
+                        .left(self.bounds.left())
+                        .top(self.bounds.top())
+                        .w(self.bounds.size.width)
+                        .h(self.bounds.size.height)
+                        .bg(self.background)
+                        .font_family(self.theme.text.ui_font.clone())
+                        .text_size(self.role.size)
+                        .line_height(self.role.line_height)
+                        .font_weight(self.role.weight)
+                        .text_color(self.ink)
+                        .child(self.text),
+                )
+            }
+        }
+        let mut cx = context();
+        let window = cx
+            .open_window(
+                size(
+                    bounds.right() + Pixels::from(4.),
+                    bounds.bottom() + Pixels::from(4.),
+                ),
+                |window, cx| {
+                    Theme::apply(t.appearance, window, cx);
+                    cx.new(|_| Label {
+                        text,
+                        role,
+                        theme: t.clone(),
+                        ink,
+                        background,
+                        bounds,
+                    })
+                },
+            )
+            .unwrap();
+        draw(&mut cx, window.into());
+        Frame::capture(&mut cx, window.into()).region(bounds)
+    }
+    fn code_block_corner_paints_language_copy_and_wrap() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let mut fixture = Fixture::new(960., 740.);
+            fixture.appearance(appearance);
+            let thread = fixture.thread;
+            let turn = fixture.turn;
+            let item = ItemId::new();
+            fixture.update(|shell, _, cx| {
+                shell.state.apply(UiEvent::Change {
+                    counter: None,
+                    event: ChangeEvent::ItemAdded(Item {
+                        id: item,
+                        thread,
+                        turn,
+                        seq: 1,
+                        body: ItemBody::AssistantText {
+                            text: "```rust\nlet value = 42;\n```".into(),
+                            done: true,
+                        },
+                    }),
+                });
+                shell.scroller.update(cx, |state, cx| {
+                    state.reset(shell.state.transcript_rows(thread), cx)
+                });
+                cx.notify();
+            });
+            fixture.frame();
+            let blocks = fixture.update(|shell, _, _| shell.code_blocks_dump(item));
+            let start = blocks[0]["start"].as_u64().unwrap();
+            let paint = fixture.paint();
+            let language = paint.control(&format!("code-language-{item}-{start}"));
+            let copy = paint.control(&format!("code-copy-{item}-{start}"));
+            let wrap = paint.control(&format!("code-wrap-caption-{item}-{start}"));
+            let frame = Frame::capture(&mut fixture.cx, fixture.window);
+            for (text, role, ink, bounds) in [
+                (
+                    "rust",
+                    paint.theme.text.micro,
+                    paint.theme.colors.text_muted,
+                    language,
+                ),
+                (
+                    "Wrap",
+                    paint.theme.text.label,
+                    paint.theme.colors.text,
+                    wrap,
+                ),
+            ] {
+                let actual = frame.region(bounds);
+                let [r, g, b] = actual[0];
+                let background = Rgba {
+                    r: f32::from(r) / 255.,
+                    g: f32::from(g) / 255.,
+                    b: f32::from(b) / 255.,
+                    a: 1.,
+                }
+                .into();
+                let expected = reference_text(text, role, &paint.theme, ink, background, bounds);
+                assert_eq!(actual.len(), expected.len());
+                let levels = |pixels: &[[u8; 3]]| {
+                    let bg = pixels[0];
+                    let contrast: Vec<_> = pixels
+                        .iter()
+                        .map(|p| p.iter().zip(bg).map(|(a, b)| a.abs_diff(b)).max().unwrap())
+                        .collect();
+                    let peak = *contrast.iter().max().unwrap();
+                    assert!(peak > 24, "caption has no painted ink");
+                    (
+                        peak,
+                        contrast
+                            .into_iter()
+                            .map(|value| f32::from(value) / f32::from(peak))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let (actual_peak, actual) = levels(&actual);
+                let (expected_peak, expected) = levels(&expected);
+                assert!(
+                    actual_peak.abs_diff(expected_peak) <= 5,
+                    "{text} caption ink {appearance:?}"
+                );
+                // Subpixel compositing can move an edge pixel across half coverage. Every
+                // definite foreground/background pixel must still match the independent text.
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(actual, expected)| !(*actual > 0.6 && expected < 0.4
+                            || *actual < 0.4 && expected > 0.6)),
+                    "{text} raster {appearance:?}"
+                );
+            }
+            let glyph = Bounds {
+                origin: copy.center()
+                    - point(
+                        paint.theme.layout.small_icon / 2.,
+                        paint.theme.layout.small_icon / 2.,
+                    ),
+                size: size(paint.theme.layout.small_icon, paint.theme.layout.small_icon),
+            };
+            assert!(
+                frame.shape(glyph)
+                    == reference_icon_shape(
+                        "icons/copy.svg",
+                        paint.theme.layout.small_icon,
+                        paint.theme.colors.code_wash,
+                        paint.theme.colors.icon
+                    ),
+                "Copy glyph raster {appearance:?}"
+            );
+            assert!(language.right() <= copy.left() && copy.right() <= wrap.left());
+        }
+    }
+    fn toast_marks_paint_their_status_shapes() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let mut fixture = Fixture::new(960., 740.);
+            fixture.appearance(appearance);
+            let thread = fixture.thread;
+            for (status, asset) in statuses().into_iter().filter(|(status, _)| {
+                matches!(
+                    status,
+                    Status::NeedsYou | Status::Done { .. } | Status::Failed
+                )
+            }) {
+                fixture.update(|shell, _, cx| {
+                    shell.toasts.attention(toasts::Attention {
+                        root: thread,
+                        thread,
+                        title: "Other work".into(),
+                        status: status.clone(),
+                    });
+                    cx.notify();
+                });
+                fixture.frame();
+                let paint = fixture.paint();
+                let bounds = paint.control(&format!("toast-mark-{thread}"));
+                assert!(
+                    Frame::capture(&mut fixture.cx, fixture.window).shape(bounds)
+                        == reference_shape(
+                            asset,
+                            paint.theme.colors.floating,
+                            sidebar::glyph_color(&status, &paint.theme)
+                        ),
+                    "toast mark {status:?} {appearance:?}"
+                );
+            }
+            fixture.update(|shell, _, cx| {
+                shell.toasts.attention.clear();
+                shell.notice("A notice", cx);
+            });
+            fixture.frame();
+            let paint = fixture.paint();
+            assert!(
+                Frame::capture(&mut fixture.cx, fixture.window)
+                    .shape(paint.control("toast-mark-notice"))
+                    == reference_shape(
+                        "marks/idle.svg",
+                        paint.theme.colors.floating,
+                        paint.theme.colors.text_muted
+                    )
+            );
+        }
+    }
+    fn storage_card_matches_kit_toast_frame_and_stack_cap() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let mut fixture = Fixture::new(960., 740.);
+            fixture.appearance(appearance);
+            fixture.update(|shell, _, cx| shell.notice("Storage is blocked", cx));
+            fixture.frame();
+            let kit = fixture.paint();
+            let width = kit.theme.layout.toast_width.scale(kit.scale);
+            let kit_frame = *kit
+                .quads
+                .iter()
+                .find(|q| {
+                    q.bounds.size.width == width && q.background == kit.theme.colors.floating.into()
+                })
+                .expect("kit toast frame painted");
+            let thread = fixture.thread;
+            fixture.update(|shell, _, cx| {
+                shell.toasts.blocked = Some("Storage is blocked".into());
+                for index in 0..4 {
+                    let id = ThreadId::new();
+                    let mut row = shell.state.threads[&thread].clone();
+                    row.id = id;
+                    shell.state.threads.insert(id, row);
+                    shell.toasts.attention(toasts::Attention {
+                        root: id,
+                        thread: id,
+                        title: format!("Attention {index}"),
+                        status: Status::NeedsYou,
+                    });
+                }
+                cx.notify();
+            });
+            fixture.frame();
+            fixture.frame();
+            let storage = fixture.paint();
+            let bounds = storage.control("storage-toast").scale(storage.scale);
+            let card = storage
+                .quads
+                .iter()
+                .find(|q| {
+                    q.bounds == bounds && q.background == storage.theme.colors.floating.into()
+                })
+                .expect("storage card painted");
+            assert_eq!(
+                card.bounds.size, kit_frame.bounds.size,
+                "kit/storage frame size {appearance:?}"
+            );
+            assert_eq!(card.corner_radii, kit_frame.corner_radii);
+            assert_eq!(card.background, kit_frame.background);
+            assert!(storage.quads.iter().any(|q| q.bounds == bounds
+                && q.border_color == storage.theme.colors.border
+                && q.border_widths.top == storage.theme.layout.border.scale(storage.scale)));
+            let marks = storage
+                .controls
+                .keys()
+                .filter(|name| name.starts_with("Name(\"toast-mark-"))
+                .count();
+            assert_eq!(
+                marks, 3,
+                "storage card must reserve one of three shown slots"
+            );
+            let frame = Frame::capture(&mut fixture.cx, fixture.window);
+            assert!(
+                frame.shape(storage.control("toast-mark-storage"))
+                    == reference_shape(
+                        "marks/failed.svg",
+                        storage.theme.colors.floating,
+                        storage.theme.colors.danger
+                    )
+            );
+            let copy = storage.control("copy-notice");
+            assert!(
+                copy.top().scale(storage.scale) >= bounds.top()
+                    && copy.bottom().scale(storage.scale) <= bounds.bottom()
+            );
+            let dump = fixture.dump();
+            assert_eq!(dump["notice"], dump["toasts"][0]["text"]);
+        }
+    }
+    fn frame_guard_reads_palette_and_toasts() {
+        use std::io::Write;
+        let mut fixture = Fixture::new(960., 740.);
+        fixture.update(|shell, _, cx| shell.notice("At rest", cx));
+        fixture.frame();
+        let dump = fixture.dump();
+        let script = concat!(
+            "import json,sys; from frame_scene import require_part,idle_variant; ",
+            "d=json.load(sys.stdin); assert require_part(d,'6d')=='6d'; idle_variant(d,'6d')"
+        );
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .env(
+                "PYTHONPATH",
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.agents/skills/verify-veyra/bin"),
+            )
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&dump).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "frame_scene rejected actual dump: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     #[derive(Default)]
     struct Options {
         filters: Vec<String>,
@@ -980,6 +1512,30 @@ mod checks {
 
     pub(crate) fn run() {
         let tests: &[(&str, fn())] = &[
+            (
+                "code_block_corner_paints_language_copy_and_wrap",
+                code_block_corner_paints_language_copy_and_wrap,
+            ),
+            (
+                "toast_marks_paint_their_status_shapes",
+                toast_marks_paint_their_status_shapes,
+            ),
+            (
+                "storage_card_matches_kit_toast_frame_and_stack_cap",
+                storage_card_matches_kit_toast_frame_and_stack_cap,
+            ),
+            (
+                "frame_guard_reads_palette_and_toasts",
+                frame_guard_reads_palette_and_toasts,
+            ),
+            (
+                "reply_code_unwrapped_sideways_scroll_probe",
+                reply_code_unwrapped_sideways_scroll_probe,
+            ),
+            (
+                "buttons_light_only_explicit_plates",
+                buttons_light_only_explicit_plates,
+            ),
             (
                 "status_marks_have_distinct_raster_shapes_and_working_steps",
                 status_marks_have_distinct_raster_shapes_and_working_steps,

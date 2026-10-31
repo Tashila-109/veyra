@@ -78,8 +78,8 @@
     "legacy_assertion": "painted color missing",
     "legacy_expected": "solid",
     "classification": "historical route, not a new native mutant admission",
-    "old": ".bg(t.plate(t.colors.solid))\n                                                    .shadow(t.plate_highlight())\n                                                    .debug_selector(|| {\n                                                        \"approval-allow-button\".into()",
-    "new": ".bg(t.colors.accent)\n                                                    .shadow(t.plate_highlight())\n                                                    .debug_selector(|| {\n                                                        \"approval-allow-button\".into()"
+    "old": ".lit_plate(t.colors.solid, cx)\n                                                    .debug_selector(|| {\n                                                        \"approval-allow-button\".into()",
+    "new": ".lit_plate(t.colors.accent, cx)\n                                                    .debug_selector(|| {\n                                                        \"approval-allow-button\".into()"
   },
   "approval-grant-outline": {
     "file": "crates/veyra/src/ui/composer.rs",

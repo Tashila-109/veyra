@@ -1071,7 +1071,8 @@ impl Codec {
         use super::ApprovalField::*;
         match field {
             field if shown.contains(&field) => Shown,
-            "description" | "reason" | "timeout" | "variant" => Passthrough {
+            "variant" => Metadata,
+            "description" | "reason" | "timeout" => Passthrough {
                 affects_execution: false,
             },
             "is_background" => Passthrough {
@@ -1657,6 +1658,25 @@ mod wire_tests {
         )));
     }
     #[test]
+    fn grok_variant_is_metadata_in_approval_dock() {
+        let (mut codec, turn) = boundary_codec();
+        let mut frame = fixture_frame(
+            include_str!("../../tests/fixtures/grok/approval-deny.jsonl"),
+            |frame| frame["method"] == "session/request_permission",
+            turn,
+        );
+        frame["params"]["toolCall"]["rawInput"] = json!({
+            "variant":"Bash", "command":"printf check", "is_background":false
+        });
+        let action = super::super::approval_test_action(codec.value(frame).unwrap());
+        assert!(action.consent.grant_key().is_some());
+        super::super::assert_approval_preview(
+            &action,
+            json!({"is_background":false}),
+            "dock metadata",
+        );
+    }
+    #[test]
     fn grok_explanation_source_and_residual_are_codec_owned() {
         for (description, reason, selected, source) in [
             (
@@ -1706,9 +1726,9 @@ mod wire_tests {
             assert_eq!(
                 residual,
                 if source == "description" {
-                    json!({"variant":"Bash", "reason":reason})
+                    json!({"reason":reason})
                 } else {
-                    json!({"variant":"Bash", "description":description})
+                    json!({"description":description})
                 }
             );
         }
@@ -1811,7 +1831,7 @@ mod wire_tests {
         );
         assert_eq!(
             preview.text,
-            serde_json::to_string_pretty(&json!({"variant":"Bash","is_background":false})).unwrap()
+            serde_json::to_string_pretty(&json!({"is_background":false})).unwrap()
         );
         frame["id"] = json!("recorded-background");
         frame["params"]["toolCall"]["rawInput"]["is_background"] = json!(true);
@@ -1825,7 +1845,7 @@ mod wire_tests {
         };
         assert_eq!(
             preview.text,
-            serde_json::to_string_pretty(&json!({"variant":"Bash","is_background":true})).unwrap()
+            serde_json::to_string_pretty(&json!({"is_background":true})).unwrap()
         );
     }
     #[test]
@@ -1892,7 +1912,7 @@ mod wire_tests {
         super::super::assert_approval_preview(
             &action,
             json!({
-                "variant":"SearchReplace", "file_path":"<cwd>/permission-project.txt",
+                "file_path":"<cwd>/permission-project.txt",
                 "old_string":"", "new_string":"veyra permission probe\n", "replace_all":false
             }),
             "recorded SearchReplace",
@@ -1928,7 +1948,7 @@ mod wire_tests {
             assert_eq!(cwd, &CommandCwd::NotVerified);
             super::super::assert_approval_preview(
                 &action,
-                json!({"variant":"Bash", "is_background":background}),
+                json!({"is_background":background}),
                 "is_background",
             );
         }
@@ -2023,7 +2043,7 @@ mod wire_tests {
                     expected
                         .as_object_mut()
                         .unwrap()
-                        .retain(|key, _| key != "command" && key != selected);
+                        .retain(|key, _| key != "variant" && key != "command" && key != selected);
                     super::super::assert_approval_preview(&action, expected, field);
                 }
             }
@@ -2046,6 +2066,10 @@ mod wire_tests {
             assert_eq!(action.tool, variant);
             assert!(action.consent.grant_key().is_none());
             let mut expected = input;
+            expected
+                .as_object_mut()
+                .unwrap()
+                .retain(|field, _| field != "variant");
             let preview = match &action.target {
                 ApprovalTarget::Command {
                     command,
@@ -2125,6 +2149,7 @@ mod wire_tests {
         let mut expected = input;
         expected.as_object_mut().unwrap().remove("command");
         expected.as_object_mut().unwrap().remove("description");
+        expected.as_object_mut().unwrap().remove("variant");
         assert_eq!(
             serde_json::from_str::<Value>(&preview.text).unwrap(),
             expected

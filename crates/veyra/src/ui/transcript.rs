@@ -7,12 +7,12 @@ use super::{
     theme::Theme,
 };
 use gpui_kit::assets::IconName;
-use gpui_kit::base::Disableable;
+use gpui_kit::base::{Disableable, Selectable};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::text::{
     MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, markdown_ast,
 };
-use gpui_kit::component::{Icon, StyledExt};
+use gpui_kit::component::{Icon, Sizable, StyledExt};
 use gpui_kit::{prelude::*, *};
 use veyra_engine::domain::*;
 pub(super) fn notice_text(notice: &veyra_engine::domain::Notice, now: i64) -> String {
@@ -219,6 +219,10 @@ impl MarkdownPlugin for ReplyLineBreaks {
         node: &markdown_ast::Node,
         cx: &MarkdownParseContext<'_>,
     ) -> Option<MarkdownNode> {
+        // Leave container nodes to the kit so nested code keeps its action corner.
+        if !matches!(node, markdown_ast::Node::Paragraph(_)) {
+            return None;
+        }
         let mut offsets = Vec::new();
         soft_break_offsets(node, cx.source(), &mut offsets);
         if offsets.is_empty() {
@@ -245,12 +249,284 @@ impl MarkdownPlugin for ReplyLineBreaks {
         )
     }
 }
-fn reply_markdown(item: &Item, markdown: SharedString) -> impl IntoElement {
-    TextView::markdown(
-        SharedString::from(format!("assistant-{}", item.id)),
+struct CodeBlockSource {
+    source: SharedString,
+    text: SharedString,
+    #[cfg(debug_assertions)]
+    language: SharedString,
+}
+type CodeCache =
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(ItemId, usize), CodeBlockSource>>>;
+#[derive(Default)]
+pub(super) struct CodeState {
+    pub unwrapped: std::collections::BTreeSet<ItemId>,
+    blocks: CodeCache,
+}
+impl Shell {
+    fn reply_item(&self, item: Option<ItemId>, window: &Window) -> Option<ItemId> {
+        item.or_else(|| {
+            window.context_stack().iter().rev().find_map(|context| {
+                context
+                    .get("reply_item")
+                    .and_then(|id| id.parse().ok())
+                    .map(ItemId)
+            })
+        })
+    }
+    #[cfg(debug_assertions)]
+    pub(super) fn code_blocks_dump(&self, item: ItemId) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.code
+                .blocks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&((id, _), block)| {
+                    *id == item && self.state.markdown_text.get(id) == Some(&block.source)
+                })
+                .map(|((_, start), block)| {
+                    serde_json::json!({"start":start,"text":block.text,"language":block.language})
+                })
+                .collect(),
+        )
+    }
+    pub(super) fn copy_code_block(
+        &self,
+        action: &CopyCodeBlock,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.reply_item(action.item, window) else {
+            return;
+        };
+        let blocks = self.code.blocks.lock().unwrap();
+        let block = if action.item.is_none() {
+            blocks
+                .iter()
+                .find_map(|((id, _), block)| (*id == item).then_some(block))
+        } else {
+            blocks.get(&(item, action.start))
+        };
+        if let Some(block) = block
+            && self.state.markdown_text.get(&item) == Some(&block.source)
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(block.text.to_string()));
+        }
+    }
+    pub(super) fn toggle_code_wrap(
+        &mut self,
+        action: &ToggleCodeWrap,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.reply_item(action.item, window) else {
+            return;
+        };
+        if !self.state.markdown_text.contains_key(&item) {
+            return;
+        }
+        if !self.code.unwrapped.remove(&item) {
+            self.code.unwrapped.insert(item);
+        }
+        if let Some(index) = self
+            .view
+            .chat()
+            .and_then(|thread| self.state.transcript_position(thread, item))
+        {
+            self.scroller
+                .update(cx, |state, cx| state.expand(index, cx));
+        }
+        cx.notify();
+    }
+    pub(super) fn copy_reply(&self, action: &CopyReply, window: &Window, cx: &mut Context<Self>) {
+        let Some(item) = self
+            .reply_item(action.item, window)
+            .and_then(|id| self.state.items.values().find_map(|items| items.get(&id)))
+        else {
+            return;
+        };
+        if final_reply(item, &self.state)
+            && let ItemBody::AssistantText { text, .. } = &item.body
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        }
+    }
+}
+fn final_reply(item: &Item, state: &super::AppState) -> bool {
+    matches!(item.body, ItemBody::AssistantText { done: true, .. })
+        && state
+            .turns
+            .get(&item.turn)
+            .is_some_and(|turn| matches!(turn.state, TurnState::Ended { .. }))
+        && !state
+            .items
+            .get(&item.thread)
+            .into_iter()
+            .flat_map(|items| items.values())
+            .any(|other| {
+                other.turn == item.turn
+                    && other.seq > item.seq
+                    && matches!(other.body, ItemBody::AssistantText { .. })
+            })
+}
+#[derive(IntoElement)]
+struct Reply {
+    item: ItemId,
+    markdown: SharedString,
+    wrapped: bool,
+    final_reply: bool,
+    blocks: CodeCache,
+}
+impl RenderOnce for Reply {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        use gpui_kit::component::{clipboard::Clipboard, text::TextViewStyle};
+        let t = cx.global::<Theme>().clone();
+        let mut style = StyleRefinement::default()
+            .font_family(t.text.mono_font.clone())
+            .text_size(t.text.code.size)
+            .line_height(t.text.code.line_height)
+            .rounded(t.radius.card)
+            .bg(t.colors.code_wash)
+            .pt(t.layout.icon_button + t.layout.floating_inset * 2.);
+        style.text.white_space = Some(if self.wrapped {
+            WhiteSpace::Normal
+        } else {
+            WhiteSpace::Nowrap
+        });
+        style.overflow.x = Some(if self.wrapped {
+            Overflow::Hidden
+        } else {
+            Overflow::Scroll
+        });
+        let id = self.item;
+        let wrapped = self.wrapped;
+        let blocks = self.blocks;
+        let source = self.markdown.clone();
+        let view = TextView::markdown(SharedString::from(format!("assistant-{id}")), self.markdown)
+            .plugin(ReplyLineBreaks)
+            .style(TextViewStyle::default().code_block(style))
+            .code_block_actions(move |block, _, cx| {
+                let t = cx.global::<Theme>();
+                let start = block.span.map_or(0, |span| span.start);
+                let code = block.code();
+                blocks.lock().unwrap().insert(
+                    (id, start),
+                    CodeBlockSource {
+                        source: source.clone(),
+                        text: code.clone(),
+                        #[cfg(debug_assertions)]
+                        language: block.lang().unwrap_or_default(),
+                    },
+                );
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap(t.layout.control_gap)
+                    .debug_selector(move || format!("code-corner-{id}-{start}"))
+                    .font_family(t.text.ui_font.clone())
+                    .child(composer::observed_part(
+                        div()
+                            .text_size(t.text.micro.size)
+                            .font_weight(t.text.micro.weight)
+                            .line_height(t.text.micro.line_height)
+                            .text_color(t.colors.text_muted)
+                            .child(block.lang().unwrap_or_default()),
+                        format!("code-language-{id}-{start}"),
+                    ))
+                    .child(composer::observed_part(
+                        div().child(
+                            Clipboard::new(SharedString::from(format!("copy-code-{id}-{start}")))
+                                .small()
+                                .tooltip("Copy code")
+                                .accessibility_label("Copy code")
+                                .value(code)
+                                .on_copied(move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(CopyCodeBlock {
+                                            item: Some(id),
+                                            start,
+                                        }),
+                                        cx,
+                                    );
+                                }),
+                        ),
+                        format!("code-copy-{id}-{start}"),
+                    ))
+                    .child(
+                        labelled_button_with(
+                            SharedString::from(format!("wrap-code-{id}-{start}")),
+                            "Wrap",
+                            composer::observed_part(
+                                composer::button_text("Wrap".into(), cx),
+                                format!("code-wrap-caption-{id}-{start}"),
+                            ),
+                            cx,
+                        )
+                        .selected(wrapped)
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(ToggleCodeWrap { item: Some(id) }), cx);
+                        }),
+                    )
+            });
+        let focus = window
+            .use_keyed_state(
+                SharedString::from(format!("reply-focus-{id}")),
+                cx,
+                |_, cx| cx.focus_handle().tab_stop(true),
+            )
+            .read(cx)
+            .clone();
+        let focused = focus.contains_focused(window, cx);
+        let group = SharedString::from(format!("reply-{id}"));
+        let mut context = KeyContext::default();
+        context.add("VeyraReply");
+        context.set("reply_item", id.to_string());
+        div()
+            .relative()
+            .group(group.clone())
+            .key_context(context)
+            .track_focus(&focus)
+            .tab_index(0)
+            .child(view)
+            .when(self.final_reply, |reply| {
+                reply.child(
+                    div()
+                        .h_flex()
+                        .justify_end()
+                        .invisible()
+                        .when(focused, |row| row.visible())
+                        .group_hover(group, |row| row.visible())
+                        .child(
+                            labelled_button(
+                                SharedString::from(format!("copy-reply-{id}")),
+                                "Copy",
+                                cx,
+                            )
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(Box::new(CopyReply { item: Some(id) }), cx)
+                            }),
+                        ),
+                )
+            })
+            .when(focused && window.last_input_was_keyboard(), |reply| {
+                reply.child(t.focus_ring())
+            })
+    }
+}
+fn reply_markdown(
+    item: &Item,
+    markdown: SharedString,
+    wrapped: bool,
+    final_reply: bool,
+    blocks: CodeCache,
+) -> Reply {
+    Reply {
+        item: item.id,
         markdown,
-    )
-    .plugin(ReplyLineBreaks)
+        wrapped,
+        final_reply,
+        blocks,
+    }
 }
 pub(super) fn user_text(item: &Item, state: Option<&super::AppState>) -> String {
     let ItemBody::UserText(text) = &item.body else {
@@ -328,10 +604,11 @@ fn row_with_state(
     expanded: bool,
     markdown: Option<SharedString>,
     choices_active: bool,
-    state: Option<&super::AppState>,
+    projection: Option<(&super::AppState, &CodeState)>,
     phase: u8,
     cx: &App,
 ) -> AnyElement {
+    let (state, code) = projection.map_or((None, None), |(state, code)| (Some(state), Some(code)));
     let t = cx.global::<Theme>();
     let row_id = item.id;
     let mut row = div()
@@ -357,6 +634,9 @@ fn row_with_state(
             row = row.child(reply_markdown(
                 item,
                 markdown.expect("markdown rows have cached text"),
+                code.is_none_or(|code| !code.unwrapped.contains(&item.id)),
+                state.is_some_and(|state| final_reply(item, state)),
+                code.map(|code| code.blocks.clone()).unwrap_or_default(),
             ));
         }
         ItemBody::AsyncQuestions { questions, .. } => {
@@ -364,7 +644,13 @@ fn row_with_state(
                 row = row.child(
                     div()
                         .debug_selector(|| "async-question-message".into())
-                        .child(reply_markdown(item, markdown)),
+                        .child(reply_markdown(
+                            item,
+                            markdown,
+                            code.is_none_or(|code| !code.unwrapped.contains(&item.id)),
+                            false,
+                            code.map(|code| code.blocks.clone()).unwrap_or_default(),
+                        )),
                 );
             }
             for (question_index, question) in questions.iter().enumerate() {
@@ -1302,7 +1588,7 @@ pub fn render(shell: &mut Shell, cx: &Context<Shell>) -> AnyElement {
                                                     .into_iter()
                                                     .flat_map(|items| items.values()),
                                             ),
-                                            Some(&shell.state),
+                                            Some((&shell.state, &shell.code)),
                                             shell.clock.phase,
                                             cx,
                                         )

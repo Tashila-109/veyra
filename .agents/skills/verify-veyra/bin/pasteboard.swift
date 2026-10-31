@@ -11,7 +11,7 @@ struct Flavor: Equatable {
     let data: Data
 }
 typealias Snapshot = [[Flavor]]
-let board = NSPasteboard.general
+var board: NSPasteboard { NSPasteboard.general }
 
 func snapshot() throws -> Snapshot {
     let generation = board.changeCount
@@ -79,6 +79,91 @@ func plantedItems() throws -> Snapshot {
     ]
 }
 
+// The text-comparison lane owns a snapshot before its caller performs Copy.
+// Its stdout carries only the result; the snapshot never leaves memory.
+protocol TextComparisonBoard {
+    func capture() throws -> Snapshot
+    func restoreSnapshot(_ saved: Snapshot) throws
+    func currentText() -> String?
+}
+struct SystemComparisonBoard: TextComparisonBoard {
+    func capture() throws -> Snapshot { try snapshot() }
+    func restoreSnapshot(_ saved: Snapshot) throws { try restore(saved) }
+    func currentText() -> String? { board.string(forType: .string) }
+}
+func compareInSnapshotPath<B: TextComparisonBoard>(
+    _ access: B, expected: String, active: Bool, readyAndWait: () throws -> Void
+) throws -> Bool {
+    guard active else { return false }
+    let saved = try access.capture()
+    var restored = false
+    defer { if !restored { try? access.restoreSnapshot(saved) } }
+    try readyAndWait()
+    let matches = access.currentText().map { Array($0.utf8) } == Array(expected.utf8)
+    try access.restoreSnapshot(saved)
+    guard try access.capture() == saved else { throw PasteboardFailure() }
+    restored = true
+    return matches
+}
+func comparisonPaths(_ args: [String]) -> (String, String)? {
+    guard args.count == 5, args[0] == "--audit", args[1] == "--expect-text",
+        args[3] == "--ready-file", !args[2].isEmpty, !args[4].isEmpty,
+        args[2] != args[4] else { return nil }
+    return (args[2], args[4])
+}
+func compareText(_ args: [String]) -> Bool {
+    // Refuse before creating a system-board adapter or reading the pasteboard.
+    guard let (expectedPath, readyPath) = comparisonPaths(args),
+        !FileManager.default.fileExists(atPath: readyPath),
+        let data = FileManager.default.contents(atPath: expectedPath),
+        let expected = String(data: data, encoding: .utf8) else { return false }
+    do {
+        return try compareInSnapshotPath(SystemComparisonBoard(), expected: expected, active: true) {
+            guard FileManager.default.createFile(atPath: readyPath, contents: Data("ready\n".utf8),
+                attributes: [.posixPermissions: 0o600]) else { throw PasteboardFailure() }
+            _ = readLine()
+        }
+    } catch { return false }
+}
+func comparisonSelfTest() -> Bool {
+    final class StubBoard: TextComparisonBoard {
+        var value: String? = "human"
+        var captures = 0
+        func capture() throws -> Snapshot {
+            captures += 1
+            return value.map { [[Flavor(type: "stub", data: Data($0.utf8))]] } ?? []
+        }
+        func restoreSnapshot(_ saved: Snapshot) throws {
+            value = saved.first?.first.flatMap { String(data: $0.data, encoding: .utf8) }
+        }
+        func currentText() -> String? { value }
+    }
+    do {
+        let stub = StubBoard()
+        guard try !compareInSnapshotPath(stub, expected: "fixture", active: false,
+            readyAndWait: { throw PasteboardFailure() }), stub.captures == 0,
+            comparisonPaths(["--expect-text", "fixture"]) == nil else { return false }
+        for value: String? in ["fixture", "other", nil] {
+            let matches = try compareInSnapshotPath(stub, expected: "fixture", active: true) {
+                stub.value = value
+            }
+            guard matches == (value == "fixture"), stub.value == "human" else { return false }
+        }
+        let canonical = try compareInSnapshotPath(stub, expected: "é", active: true) {
+            stub.value = "e\u{301}"
+        }
+        guard !canonical, stub.value == "human" else { return false }
+        do {
+            _ = try compareInSnapshotPath(stub, expected: "fixture", active: true) {
+                stub.value = "changed"
+                throw PasteboardFailure()
+            }
+            return false
+        } catch { guard stub.value == "human" else { return false } }
+        return comparisonPaths(["--audit", "--expect-text", "expected", "--ready-file", "ready"]) != nil
+    } catch { return false }
+}
+
 func run() throws -> Int32 {
     let original = try snapshot()
     var restored = false
@@ -120,6 +205,17 @@ func run() throws -> Int32 {
     return matches ? 0 : 1
 }
 
+let arguments = Array(CommandLine.arguments.dropFirst())
+if arguments == ["--self-test"] {
+    let matches = comparisonSelfTest()
+    print(matches ? "match" : "no-match")
+    exit(matches ? 0 : 1)
+}
+if arguments.contains("--expect-text") {
+    let matches = compareText(arguments)
+    print(matches ? "match" : "no-match")
+    exit(matches ? 0 : 1)
+}
 do {
     exit(try run())
 } catch {

@@ -16,7 +16,8 @@ Human decisions and exact thread grants are persisted before their provider cont
 Codec cancellation on provider completion, and cancellation on storage-blocked or blocked-shutdown paths, can precede stored request expiry.
 Startup reaps marked orphan CLI groups, and the actor owns keep-awake, commit counts and actor timing.
 The window owns render and event-batch counters.
-Inactive-window family changes post system banners, and busy Quit opens a sheet.
+Inactive-window family changes post system banners; active-window attention uses persistent per-family toasts.
+The window owns a command palette, per-reply code wrapping and Copy controls, and busy Quit opens a sheet.
 Chat is the only agent surface.
 Each thread has a separate in-memory shell drawer; the engine owns its PTYs and emulators, and ui::drawer owns its tabs and focus.
 Engine startup binds the MCP socket server, and root Claude, Codex and Grok sessions receive its five actor-owned tools through the relay.
@@ -682,7 +683,7 @@ A command approval with a known folder shows it in a separate labeled, muted quo
 CommandCwd::NotVerified instead shows the unverified-location consequence and no folder quote.
 A command explanation is an ApprovalReason: a flattened ApprovalPreview plus optional ApprovalExplanation provenance and a nonserialized legacy hydration flag. File and Tool previews contain only text and truncation. ApprovalExplanation distinguishes Reason from Description. Each codec chooses the field and its priority through the shared provider selector: Claude and Grok prefer description, while Codex prefers reason and falls back to description. New ProposedAction construction never promotes preview JSON into an explanation.
 Reasons keep the provider's “reason (model-written)” label; descriptions use “Claude Code's description”, “Codex's description” or “Grok's description”. Older explicit reasons lack the optional metadata and retain their existing reason label. Only deserialization hydrates a missing legacy reason from description or reason in the stored preview, with the same historical priority and label. A nonserialized hydrated flag suppresses that derived field when serializing, so a previously absent reason stays absent and stored preview bytes remain unchanged.
-Each codec classifies approval fields as shown, wire metadata or passthrough. The same classification filters the preview and withholds a thread grant when passthrough fields can change what runs. Unknown arguments withhold grants; explanation text and timeout do not change the granted command identity. Grok keeps variant and is_background visible; an explicit is_background:false preserves the foreground grant, while true or an invalid background value withholds it so a foreground grant cannot authorize background execution.
+Each codec classifies approval fields as shown, wire metadata or passthrough. The same classification filters the preview and withholds a thread grant when passthrough fields can change what runs. Unknown arguments withhold grants; explanation text and timeout do not change the granted command identity. Grok classifies variant as wire metadata and keeps is_background visible; an explicit is_background:false preserves the foreground grant, while true or an invalid background value withholds it so a foreground grant cannot authorize background execution.
 Codex omits threadId, turnId, itemId, startedAtMs, kind, commandActions, availableDecisions and proposedExecpolicyAmendment, and environmentId only when its value is the string "local". It removes cwd only when CommandCwd names a shown folder, and maps an MCP serverName into the tool title. In MCP _meta, codex_approval_kind, persist and tool_description are wire metadata; tool_params, tool_params_display and unknown fields remain visible in the preview. Wire metadata never withholds a grant. Claude and Grok take their previews from tool input, outside the wrapper that carries their invocation ids, routing fields and consent options.
 commandActions describes the parsed command already shown verbatim; it is not a second command to execute. availableDecisions describes the reply choices. proposedExecpolicyAmendment proposes a persistent policy change that Veyra never selects: command approval and exact thread grants reply accept, never acceptWithExecpolicyAmendment. These fields do not alter the current command, working folder or access under that reply. Any environmentId value other than the string "local" is execution-affecting passthrough and leaves the command's location unverified, with its literal cwd retained in the preview. Actual environment, network and sandbox overrides remain execution-affecting passthrough.
 Grok leaves an unrecognized cwd in its preview and selects description before reason, retaining the other explanation.
@@ -1205,7 +1206,10 @@ Command-Option-B cycles SetWindowBackground.
 SetDefaultMode publishes SettingsChanged; Escape or thread/project selection leaves Settings.
 
 `ui/actions.rs` owns actions, the native menu and one bindings table used by both key installation and shortcut_chip.
-The shared content controls retain the kit button's activation, focus and tooltip behaviour. Their wrapper owns only hovered and pressed feedback, timed by the theme's hover and press tokens. A paint wrapper delegates the button's layout and paints the common inset ring after the kit's clipped caption, so the ring remains visible at scroll edges. Reduced Motion snaps feedback and disclosure transitions.
+The shared content controls retain the kit button's activation, focus and tooltip behaviour.
+A Button lights its plate only through an explicit lit_plate request. Send and Stop keep their solid-fill recipe,
+Allow once explicitly lights the primary fill, and the segmented thumb keeps its existing plate.
+Deny and the thread grant stay outlined; Quit, Close tab and every other primary or danger control stay flat. Their wrapper owns only hovered and pressed feedback, timed by the theme's hover and press tokens. A paint wrapper delegates the button's layout and paints the common inset ring after the kit's clipped caption, so the ring remains visible at scroll edges. Reduced Motion snaps feedback and disclosure transitions.
 In debug builds the wrapper records each control's painted bounds by its actual ElementId; dump exposes them under look.controls so approval outline, fill and warning checks use observed geometry.
 The matching look.control_labels map names visible captions for those controls, excluding icon-only accessibility names and preserving the text actually shown by command spans. Text assertions on these captions use only that control's bounds inset on every side by look.layout.control_radius, clipped to the captured window edge, square-padded with the mode of the captured interior fill and always upscaled2x LANCZOS. They have no full-image fallback or retry. Recognition boxes map back to the original capture for subsequent colour and geometry checks; exact text, counts and confidence thresholds stay unchanged.
 The dump's look.colors also exposes the kit's actual button_primary_foreground and button_danger_foreground, the exact fields painted by its Primary and Danger variants. Filled-keycap checks use the foreground for that button variant and project captured pixels onto the observed fill-to-foreground segment, requiring at least 0.5 coverage and at most 5 channel error; every accepted pixel's coverage and residual is retained.
@@ -1315,6 +1319,41 @@ Raw option strings remain in the stored card and are selected by validated indic
 The answer bubble uses the card's cleaned one-line option text while storage and outbound protocol bytes remain exact.
 Commands and argument previews retain their code styling with visible Unicode markers; their underlying consent identities keep the exact bytes.
 
+### Palette, notifications and reply code
+
+`ui/palette.rs` mounts the kit Command component over the opaque content plane. Opening captures the original
+focus handle and key-context path. The single actions table supplies labels, chords and constructors and uses
+the same context predicate for key installation and palette eligibility. Request-answer actions are always
+excluded. Drawer actions require the original terminal context. Query filtering, including the actions-only
+`>` prefix, reads only the in-memory action and sidebar thread lists and excludes archived threads.
+An entry restores the captured focus before dispatching its action there; dismissal also restores focus.
+Palette entry/exit uses the existing menu tokens, Reduce Motion snaps it, and changing the main view dismisses it.
+The app menu and secondary-k reach OpenPalette. The overlay consumes covered clicks and outside clicks dismiss it.
+
+`Shell` owns its notice text; `ui/toasts.rs` owns the blocked notice, mounting cache and an ordered attention model keyed by family root. Shell::notice replaces the
+ordinary notice; its text supplies dump.notice. The kit NotificationList renders ordinary notices and attention
+with no autohide timeout. The existing notification transition rule supplies both inactive banners and active
+attention toasts; the selected family is excluded and selecting any family member removes its attention toast.
+Attention names the first family member needing the human, otherwise the root. Open dispatches SelectThread,
+and CopyNotice, DismissNotice and DismissToast are gpui actions. Toasts add no database state.
+
+The pinned kit has no non-dismissible notification, so the approved storage-only exception uses a Veyra card
+at the top of the same stack. It shares the kit toast's fill, border, radius, shadow, width, inset and content
+renderer, retains Copy and has no close button. DismissNotice cannot remove it; only StorageBlocked with no
+error clears it. Its measured height offsets the kit list, whose shown limit falls from three to two while the
+card exists. The generic geometry observer now serves this production layout; driver observation remains debug-only.
+Neither the card nor persistent kit notifications arm a timer at rest.
+
+`ui/transcript.rs` gives every reply TextView a kit code_block_actions corner with its micro language label,
+kit Clipboard and Wrap. Code keeps Geist Mono 12/20, the card radius and neutral code wash. The default wraps;
+unwrapped code opts into horizontal overflow through the same style refinement. A headless wheel probe on the
+pinned 0.7.3 verified sideways scrolling before implementation. Shell owns per-item wrap choices and a render
+cache of the kit's exact parsed code, keyed by item and source span. CopyCodeBlock validates the current Markdown
+source before copying that cached block. ToggleCodeWrap remeasures its reply through the scroller. CopyReply
+copies the original stored text only for the final completed assistant reply of an ended turn. Its control shows
+on hover and keyboard focus; reply contexts retain their item id for palette actions. Tool output stays plain.
+The code cache and wrap choices last only for the window session, without engine or schema changes.
+
 ## Debug protocol and verification trust
 
 The control module, ctl argument, driver socket references and UI dump/input methods exist only under cfg(debug_assertions).
@@ -1365,6 +1404,7 @@ DebugDoubleClickShellDrawer reaches the owned resize band through synthetic poin
 All terminal repaint counters and flood measurement consumers are excluded from release builds with cfg(debug_assertions).
 mailbox_free is the command sender's unreserved channel capacity; slots assigned to waiting sends count as used, so it reads 0 while any send waits.
 actor_busy_ms is the elapsed time of the message currently being handled, or zero when idle.
+Dump adds palette (open, query, actions and threads), toasts (kind and text, with family identity or storage-blocked state), and per-item wrapped/code_blocks fields. The 6d frame scene reads palette.open=false and the stable toasts array.
 Dump includes every request row the window has received, including its state, plus quit_sheet, window_active, notifications.posted and transcript.items with transcript.follow.
 The composer exposes offered_modes and permission_picker_open beside its effective mode; selected_thread.config retains the stored configuration.
 The composer dock adds action_text, consequence and preview from the same formatter the window renders.
@@ -1432,6 +1472,7 @@ The following clarifications and remaining differences are checked against the c
 
 ## Verification
 
+The code-corner and toast-mark checks exercise actual headless paint; a storage-card check compares its kit frame and counts the three shown slots in both appearances. A separate check feeds the actual headless dump to frame_scene.py.
 The `headless` test target uses `harness = false` to create the text system on the main thread and recompiles `src/ui/mod.rs` through `#[path]`.
 Plain `cargo test --workspace` runs its debug headless checks without showing a native window; its release runner prints that these checks run in debug only.
 

@@ -19,6 +19,8 @@ actions!(
     veyra,
     [
         Quit,
+        OpenPalette,
+        CopyNotice,
         ToggleShellDrawer,
         NewShellTab,
         CloseShellTab,
@@ -103,6 +105,20 @@ choice_action!(PickPermission, mode, PermissionMode);
 choice_action!(SetDefaultMode, mode, PermissionMode);
 choice_action!(SetWindowBackground, background, WindowBackground);
 choice_action!(SelectThread, thread, ThreadId);
+choice_action!(DismissToast, root, ThreadId);
+choice_action!(ToggleCodeWrap, item, ItemId);
+choice_action!(CopyReply, item, ItemId);
+#[derive(
+    Clone, Default, PartialEq, serde::Deserialize, ::gpui::private::schemars::JsonSchema, Action,
+)]
+#[serde(default)]
+#[schemars(crate = "::gpui::private::schemars")]
+#[action(namespace = veyra)]
+pub struct CopyCodeBlock {
+    #[schemars(with = "Option<String>")]
+    pub item: Option<ItemId>,
+    pub start: usize,
+}
 choice_action!(StopThread, thread, ThreadId);
 choice_action!(OpenThreadMenu, thread, ThreadId);
 choice_action!(Archive, thread, ThreadId);
@@ -208,12 +224,14 @@ pub struct Binding {
     pub action: &'static str,
     pub chord: &'static str,
     pub context: Option<&'static str>,
-    build: fn() -> Box<dyn Action>,
+    pub label: Option<&'static str>,
+    pub(super) build: fn() -> Box<dyn Action>,
 }
 macro_rules! binding {
     ($action:ident, $chord:literal, $context:expr, $field:ident: $value:expr) => {
         Binding {
             action: stringify!($action),
+            label: palette_label(stringify!($action)),
             chord: $chord,
             context: $context,
             build: || {
@@ -227,6 +245,7 @@ macro_rules! binding {
     ($action:ident, $chord:literal, $context:expr) => {
         Binding {
             action: stringify!($action),
+            label: palette_label(stringify!($action)),
             chord: $chord,
             context: $context,
             build: || Box::new($action::default()),
@@ -236,6 +255,12 @@ macro_rules! binding {
 pub fn bindings() -> Vec<Binding> {
     vec![
         binding!(Quit, "secondary-q", None),
+        binding!(OpenPalette, "secondary-k", Some("Veyra")),
+        binding!(CopyNotice, "", Some("Veyra")),
+        binding!(CopyCodeBlock, "", Some("VeyraReply")),
+        binding!(ToggleCodeWrap, "", Some("VeyraReply")),
+        binding!(CopyReply, "", Some("VeyraReply")),
+        binding!(DismissToast, "", Some("VeyraToast")),
         binding!(ToggleShellDrawer, "secondary-j", None),
         binding!(NewShellTab, "secondary-t", Some("VeyraTerminal")),
         binding!(CloseShellTab, "secondary-w", Some("VeyraTerminal")),
@@ -324,7 +349,9 @@ pub fn bindings() -> Vec<Binding> {
 pub fn shortcut<A: Action + Default>() -> Option<String> {
     bindings()
         .iter()
-        .find(|binding| (binding.build)().name() == A::default().name())
+        .find(|binding| {
+            !binding.chord.is_empty() && (binding.build)().name() == A::default().name()
+        })
         .map(|binding| {
             binding
                 .chord
@@ -351,21 +378,24 @@ pub fn shortcut_chip<A: Action + Default>(cx: &App) -> impl IntoElement {
         .border_color(t.colors.border)
         .children(shortcut::<A>())
 }
-pub fn init(cx: &mut App) {
-    cx.bind_keys(bindings().into_iter().map(|binding| {
-        let key = Keystroke::parse(binding.chord).expect("valid window binding");
+impl Binding {
+    pub(super) fn predicate(&self) -> Option<KeyBindingContextPredicate> {
+        let binding = self;
+        let key = (!binding.chord.is_empty())
+            .then(|| Keystroke::parse(binding.chord).expect("valid window binding"));
         let mut context = binding
             .context
             .map(|context| KeyBindingContextPredicate::parse(context).unwrap());
         if !matches!(
             binding.context,
             Some("VeyraTerminal" | "VeyraTerminalEnded")
-        ) && (!key.modifiers.platform
-            || (matches!(key.key.as_str(), "left" | "right")
-                && !key.modifiers.shift
-                && !key.modifiers.alt
-                && !key.modifiers.control))
-        {
+        ) && key.as_ref().is_some_and(|key| {
+            !key.modifiers.platform
+                || (matches!(key.key.as_str(), "left" | "right")
+                    && !key.modifiers.shift
+                    && !key.modifiers.alt
+                    && !key.modifiers.control)
+        }) {
             let outside_terminal = KeyBindingContextPredicate::Not(Box::new(
                 KeyBindingContextPredicate::Identifier("VeyraTerminal".into()),
             ));
@@ -376,16 +406,107 @@ pub fn init(cx: &mut App) {
                 None => outside_terminal,
             });
         }
-        KeyBinding::load(
-            binding.chord,
-            (binding.build)(),
-            context.map(Into::into),
-            false,
-            None,
-            &DummyKeyboardMapper,
-        )
-        .unwrap()
-    }));
+        context
+    }
+    pub(super) fn matches_context(&self, contexts: &[KeyContext]) -> bool {
+        self.predicate().is_none_or(|predicate| {
+            (1..=contexts.len()).any(|end| predicate.eval(&contexts[..end]))
+        })
+    }
+}
+fn palette_label(action: &str) -> Option<&'static str> {
+    Some(match action {
+        "Quit" => "Quit Veyra",
+        "OpenPalette" => "Command Palette…",
+        "CopyNotice" => "Copy notice",
+        "CopyCodeBlock" => "Copy code block",
+        "ToggleCodeWrap" => "Toggle code wrapping",
+        "CopyReply" => "Copy final reply",
+        "DismissToast" => "Dismiss attention toast",
+        "ToggleShellDrawer" => "Toggle shell drawer",
+        "NewShellTab" => "New shell tab",
+        "CloseShellTab" => "Close shell tab",
+        "NextShellTab" => "Next shell tab",
+        "PreviousShellTab" => "Previous shell tab",
+        "RestartShellTab" => "Restart shell tab",
+        "PasteShell" => "Paste into shell",
+        "CopyShell" => "Copy shell selection",
+        "ScrollShellHistoryUp" => "Scroll shell history up",
+        "ScrollShellHistoryDown" => "Scroll shell history down",
+        "ConfirmCloseShellTab" => "Confirm close shell tab",
+        "CancelCloseShellTab" => "Cancel close shell tab",
+        "ConfirmQuit" => "Confirm quit",
+        "CancelQuit" => "Cancel quit",
+        "OpenSettings" => "Settings…",
+        "AddProject" => "Add project…",
+        "NewThread" => "New thread",
+        "PickProvider" => "Next provider",
+        "OpenProviderPicker" => "Choose provider…",
+        "PickModel" => "Next model",
+        "PickEffort" => "Next reasoning effort",
+        "PickPermission" => "Next permission mode",
+        "Send" => "Send message",
+        "Stop" => "Stop turn",
+        "Continue" => "Continue thread",
+        "DiscardQueued" => "Discard queued messages",
+        "ActivateThreadRow" => "Open focused thread",
+        "OpenThreadMenu" => "Thread actions…",
+        "Archive" => "Archive thread",
+        "ArchiveKeepChildren" => "Archive, keep child threads",
+        "StopThread" => "Stop thread",
+        "NextNeedsYou" => "Next thread needing attention",
+        "FocusDock" => "Focus request",
+        "FocusComposer" => "Focus composer",
+        "MoveOptionUp" => "Previous question option",
+        "MoveOptionDown" => "Next question option",
+        "ScrollTranscriptUp" => "Scroll transcript up",
+        "ScrollTranscriptDown" => "Scroll transcript down",
+        "ScrollTranscriptEnd" => "Latest reply",
+        "RecheckProviders" => "Check providers again",
+        "SetDefaultMode" => "Next default permission mode",
+        "SetWindowBackground" => "Toggle window background",
+        "SelectThread" => "Next thread",
+        "SelectProject" => "Next project",
+        "ToggleItem" => "Toggle tool or reasoning",
+        "Retry" => "Retry last failed turn",
+        "OpenTerminal" => "Open shell",
+        "NarrowSidebar" => "Narrow sidebar",
+        "WidenSidebar" => "Widen sidebar",
+        "ResetSidebar" => "Reset sidebar width",
+        "DismissNotice" => "Dismiss notice",
+        _ => return None,
+    })
+}
+pub(super) fn answers_request(action: &str) -> bool {
+    matches!(
+        action,
+        "AllowOnce"
+            | "AllowInThread"
+            | "Deny"
+            | "AnswerQuestion"
+            | "ChooseAsyncOption"
+            | "AnswerFocusedOption"
+    )
+}
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys(
+        bindings()
+            .into_iter()
+            .filter(|binding| !binding.chord.is_empty())
+            .map(|binding| {
+                let context = binding.predicate();
+                KeyBinding::load(
+                    binding.chord,
+                    (binding.build)(),
+                    context.map(Into::into),
+                    false,
+                    None,
+                    &DummyKeyboardMapper,
+                )
+                .unwrap()
+            }),
+    );
     cx.set_menus(vec![Menu {
         name: "Veyra".into(),
         disabled: false,
@@ -393,6 +514,7 @@ pub fn init(cx: &mut App) {
             MenuItem::action("New Thread", NewThread),
             MenuItem::action("Add Project…", AddProject::default()),
             MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action("Command Palette…", OpenPalette),
             MenuItem::action("Toggle Window Background", SetWindowBackground::default()),
             MenuItem::separator(),
             MenuItem::action("Quit Veyra", Quit),

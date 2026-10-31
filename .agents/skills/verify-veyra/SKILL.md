@@ -46,7 +46,7 @@ The only baseline is the primary checkout's retained `.tstack/tasks/v001/evidenc
 `--part` is required for the guard and has no default.
 The current legacy candidate dump requires `--part 6c`; palette/toast fields require `--part 6d`, and a 6d request without those fields stops.
 The 6d candidate idle variant closes the palette, creates an empty-Send notice toast and requires that toast to remain at rest in `dump` before, throughout and after both ten-second focus measurements.
-Until `dump.palette.open` and `dump.toasts` exist, it stops with `6d idle scene unavailable`; it never falls back to the 6c candidate scene.
+The candidate exposes `dump.palette.open` and `dump.toasts`; an older candidate without them stops with `6d idle scene unavailable`; it never falls back to the 6c candidate scene.
 The retained slice-5 baseline uses its earlier surface without palette/toasts, with the same drawer/composer focus and Translucent background.
 
 `bin/run --slice-end` and `bin/run --gate` run the full fake map, including release.
@@ -334,6 +334,7 @@ Before any provider drive, wait with `poll('login-path-ready', lambda d: d['logi
 After a relaunch, wait again before checking providers.
 `login_path` reads `pending`, `loaded` or `fallback`; Checking remains until the first probe answers.
 Then run [multi-agent](features/multi-agent.md) for the thread tree, family actions, report delivery and quiet hint.
+Run [command-palette](features/command-palette.md) for context filtering and focus return, and [toasts](features/toasts.md) for notices and family attention.
 Run [shell-drawer](features/shell-drawer.md) for owned shell fixtures, tab keys, focus, shutdown and one flood.
 The fake lane runs those pages without a provider login.
 [permission-matrix](features/permission-matrix.md) requires separately authorized live providers.
@@ -590,6 +591,14 @@ It does not signal an unrecorded group.
 - `bin/glass_measure.py` holds the Settings pair entry and its unchanged placement/capture guards.
 - `bin/heredocs.py` supplies the shared recipe parser; `bin/backdrop_actions.py` owns notification backdrop activation.
 - `bin/frame_probe.py` owns probe admission and scene selection; `bin/frame_scene.py` owns shared dump sampling and `bin/frame_native.py` implements native window/process operations.
+- `bin/pasteboard.swift` keeps every clipboard snapshot in memory and restores it on pipe EOF.
+  Its comparison mode is `pasteboard --audit --expect-text FILE --ready-file READY`.
+  The `--audit` snapshot/restore path is mandatory; a standalone `--expect-text FILE` is refused before system-board access.
+  Start it before the Copy action, wait for the private READY file, drive Copy, then close stdin and wait for restoration.
+  It prints only `match` or `no-match`, with exit 0 or 1. Clipboard text, length and hashes are never printed, logged or saved.
+  FILE contains an independently known fixture expectation, never data read back from the clipboard.
+  `--self-test` uses a stubbed board and covers match, mismatch, absent text, restoration after error and refusal outside the snapshot path; it never accesses NSPasteboard.
+  Compile the system helper offline; every system-board use waits for the armed away window.
 - `bin/driver.py` is the module every section imports with `PYTHONPATH=.agents/skills/verify-veyra/bin`.
 - `bin/capture-window.swift PID WINDOW` and `bin/winid.swift PID [--bounds]` are compiled by Launch into the proof folder; `winid` finds the on-screen window by owner pid and normal window layer, and `--bounds` prints `x,y,w,h`.
 - `bin/backdrop.swift` draws its own black and white stripes and sharp text across every display, using one borderless window per screen in one process.
