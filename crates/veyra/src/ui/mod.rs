@@ -12046,6 +12046,80 @@ mod tests {
     }
     #[cfg(debug_assertions)]
     #[gpui::test]
+    fn palette_rows_stay_inside_the_card_and_scroll_to_last(cx: &mut gpui::TestAppContext) {
+        use gpui::{Bounds, Pixels};
+        fn contained(outer: Bounds<Pixels>, inner: Bounds<Pixels>) -> bool {
+            inner.left() >= outer.left()
+                && inner.right() <= outer.right()
+                && inner.top() >= outer.top()
+                && inner.bottom() <= outer.bottom()
+        }
+        fn check(cx: &mut gpui::VisualTestContext) -> Bounds<Pixels> {
+            let card = cx.debug_bounds("palette-card").expect("palette card drawn");
+            let maximum = cx.update(|_, cx| cx.global::<super::Theme>().layout.palette_max_height);
+            assert!(
+                card.size.height <= maximum,
+                "palette card exceeds its maximum"
+            );
+            let rows = cx.update(|_, cx| {
+                cx.global::<super::PaintedControls>()
+                    .0
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("Name(\"palette-row-"))
+                    .map(|(_, bounds)| *bounds)
+                    .collect::<Vec<_>>()
+            });
+            assert!(!rows.is_empty(), "palette rows were not painted");
+            for row in rows {
+                assert!(
+                    contained(card, row),
+                    "painted palette row escapes card: {row:?} / {card:?}"
+                );
+            }
+            card
+        }
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            let (label, count) = shell.read_with(cx, |shell, cx| {
+                let dump = shell.palette_dump(cx);
+                let actions = dump["actions"].as_array().unwrap();
+                let threads = dump["threads"].as_array().unwrap();
+                let (section, entries) = if threads.is_empty() {
+                    (0, actions)
+                } else {
+                    (1, threads)
+                };
+                let last = entries.last().expect("full palette has entries");
+                let label = last[if section == 0 { "label" } else { "title" }]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                (label, actions.len() + threads.len())
+            });
+            assert!(
+                count > 12,
+                "fixture must overflow a single palette viewport"
+            );
+            check(cx);
+            for _ in 1..count {
+                cx.simulate_keystrokes("down");
+                draw(cx);
+            }
+            let card = check(cx);
+            let selector = Box::leak(format!("palette-row-{label}").into_boxed_str());
+            let last = cx
+                .debug_bounds(selector)
+                .expect("last selected row drawn after scrolling");
+            assert!(
+                contained(card, last),
+                "last selected row must be fully visible inside the card"
+            );
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
     fn palette_exit_uses_menu_out_and_restores_focus(cx: &mut gpui::TestAppContext) {
         use gpui::Focusable;
         let dispatcher = cx.dispatcher.clone();

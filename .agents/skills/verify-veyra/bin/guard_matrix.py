@@ -194,6 +194,19 @@ PLANTS += [
         "o.admit_native(output/'quiet-machine.json',float(os.environ['VEYRA_VERIFY_DEADLINE'])+1200,['frame-probe',args.label])"),
 ]
 
+PLANTS += [
+    Plant('smoke-release-last','smoke-release-first','bin/run','smoke_plan','expression',
+        'plan.index(FIRST)+1','len(plan)'),
+]
+
+PLANTS += [
+    Plant('grok-preview-restores-metadata','grok-edit-preview','features/approvals-questions.md','',
+        'expression',"preview=={key:value for key,value in edit_input.items() if key!='variant'}",
+        'preview==edit_input',section='Grok'),
+    Plant('grok-payload-variant-unchecked','grok-edit-preview','features/approvals-questions.md','',
+        'remove-assert',"stored_input==edit_input and stored_input.get('variant')=='SearchReplace'",section='Grok'),
+]
+
 def expression(source):
     return ast.parse(source,mode='eval').body
 

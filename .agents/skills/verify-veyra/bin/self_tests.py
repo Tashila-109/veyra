@@ -777,6 +777,61 @@ def toast_copy_safety_reaches_recipe_entry(f):
 def code_copy_safety_reaches_recipe_entry(f):
     _pasteboard_recipe_safety(f,'chat-send-stream')
 
+
+def smoke_release_precedes_every_page_scene(f):
+    found=f.runner.sections()
+    for glass in [False,True]:
+        plan=f.runner.smoke_plan(found,['release','multi-agent','new-thread'],glass)
+        release=plan.index(f.runner.RELEASE)
+        assert release==plan.index(f.runner.FIRST)+1, 'release must immediately follow the initial app check'
+        assert all(release<index for index,key in enumerate(plan) if key[1]=='Native smoke'), 'warm family must not precede release'
+        assert plan.count(f.runner.RELEASE)==1
+        if glass:
+            assert plan.index(('settings','Glass smoke'))>max(index for index,key in enumerate(plan) if key[1]=='Native smoke')
+    assert f.runner.RELEASE not in f.runner.smoke_plan(found,['multi-agent'])
+
+
+
+def grok_edit_preview_keeps_metadata_only_in_payload(f):
+    from heredocs import HEREDOC
+    source=next(HEREDOC.finditer(f.runner.sections()[('approvals-questions','Grok')]))['body']
+    start=source.rindex("records = grok_records('approval-deny')\npermission =",0,source.index("edit_input ="))
+    finish=source.index("\naction('grok-search-replace-answer'",start)
+    branch=source[start:finish]
+    helper=source[source.index('def raw_preview('):source.index('prepare()')]
+    for fault in ['none','visible-variant','lost-payload-variant']:
+        state={};saved=[];captured=[]
+        def create(name,records,**options):
+            payload=next(row['line']['params']['toolCall']['rawInput'] for row in records
+                if row.get('line',{}).get('method')=='session/request_permission')
+            staged=f.driver.fixture_source(records);saved.append((staged,staged.read_bytes()))
+            visible={key:value for key,value in payload.items() if key!='variant'}
+            if fault=='visible-variant': visible['variant']=payload['variant']
+            if fault=='lost-payload-variant':
+                changed=json.loads(json.dumps(records))
+                next(row['line']['params']['toolCall']['rawInput'] for row in changed
+                    if row.get('line',{}).get('method')=='session/request_permission').pop('variant')
+                staged.write_text('\n'.join(json.dumps(row) for row in changed)+'\n')
+            state['composer']={'dock':{'action_text':'Edit permission-project.txt',
+                'request':{'kind':{'Approval':{'action':{'target':{'preview':{'text':json.dumps(visible)}}}}}},
+                'allow_once_enabled':True,'allow_in_thread_enabled':False,'grant_caption':None}}
+            return 'fixture-thread'
+        def poll(name,predicate):
+            assert predicate(state)
+            return state
+        namespace={'json':json,'DATA':f.data,'fixture_source':f.driver.fixture_source,
+            'grok_records':lambda scenario:[{'type':'emit_inbound','line':{'method':'session/request_permission',
+                'params':{'toolCall':{}}}}], 'create_grok':create,'poll':poll,'capture':captured.append}
+        rejected=False
+        try:
+            exec(helper+branch,namespace)
+        except AssertionError: rejected=True
+        finally:
+            for path,original in saved:path.write_bytes(original)
+        assert rejected==(fault!='none'), 'Grok preview/persisted-payload contract failed: '+fault
+        assert bool(captured)==(fault=='none'), 'rejected Grok contract reached capture'
+
+
 CASES = [
     ('child-signals',child_launches_mask_signals),('cleanup-stop',cleanup_failure_prevents_done),('prepare-go',prepare_requires_go),    ('guard-tools',guard_tools_and_backdrop),('probe-part',probe_uses_requested_part),('idle-samples',idle_checks_every_sample),
     ('part-required',part_is_required),('part-tree',candidate_part_matches_dump),('scene-6d',missing_6d_fields_stop_probe),
@@ -796,6 +851,8 @@ from negative_tests import CASES as RESTORED_CASES
 CASES += RESTORED_CASES
 from smoke_tests import CASES as SMOKE_CASES
 CASES += SMOKE_CASES
+CASES += [('smoke-release-first',smoke_release_precedes_every_page_scene),
+    ('grok-edit-preview',grok_edit_preview_keeps_metadata_only_in_payload)]
 CASES += [('toast-copy-safety',toast_copy_safety_reaches_recipe_entry),('code-copy-safety',code_copy_safety_reaches_recipe_entry)]
 
 def run(runner):

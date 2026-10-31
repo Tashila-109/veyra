@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(debug_assertions)]
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::{
     Icon,
     command::{Command as KitCommand, CommandGroup, CommandItem, CommandState},
@@ -190,7 +192,7 @@ impl Shell {
             let label = entry.label.clone();
             CommandItem::new().label(label).child(move |_, cx| {
                 let t = cx.global::<Theme>();
-                div()
+                let content = div()
                     .h_flex()
                     .items_center()
                     .h(t.layout.thread_row)
@@ -218,7 +220,26 @@ impl Shell {
                             .line_height(t.text.micro.line_height)
                             .text_color(t.colors.text_muted)
                             .child(chord)
-                    }))
+                    }));
+                #[cfg(debug_assertions)]
+                let content = {
+                    let selector = format!("palette-row-{}", entry.label);
+                    let observed = selector.clone();
+                    content
+                        .debug_selector(move || selector.clone())
+                        .on_prepaint(move |bounds, window, cx| {
+                            let visible = bounds.intersect(&window.content_mask().bounds);
+                            if visible.size.width > gpui::Pixels::ZERO
+                                && visible.size.height > gpui::Pixels::ZERO
+                            {
+                                cx.global_mut::<PaintedControls>().0.insert(
+                                    format!("{:?}", ElementId::Name(observed.clone().into())),
+                                    visible,
+                                );
+                            }
+                        })
+                };
+                content
             })
         };
         let run = cx.entity().downgrade();
@@ -240,6 +261,7 @@ impl Shell {
                 .child(
                     div()
                         .id("command-palette")
+                        .debug_selector(|| "palette-card".into())
                         .occlude()
                         .w(t.layout.palette_width)
                         .max_w_full()
@@ -260,6 +282,13 @@ impl Shell {
                                 .bordered(false)
                                 .filterable(false)
                                 .max_h(t.layout.palette_max_height - t.layout.floating_inset * 2.)
+                                .map(|command| {
+                                    // Command::max_h caps the list only; bound its search/list flex root too.
+                                    gpui::Styled::max_h(
+                                        command,
+                                        t.layout.palette_max_height - t.layout.floating_inset * 2.,
+                                    )
+                                })
                                 .placeholder("Search actions and threads")
                                 .group(
                                     CommandGroup::new()

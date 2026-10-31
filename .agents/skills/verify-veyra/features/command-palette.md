@@ -116,7 +116,7 @@ PY
 
 `dump.palette` has `open`, `query`, `actions` and `threads`. Each action has `action`, `label` and `chord`; each thread has `thread` and `title`.
 `focus` reads `palette` while it is open. The returned `composer_text` and `composer_caret` equal the saved origin.
-Nine palette window tests establish request-answer exclusion in question/approval contexts, drawer-only eligibility, chord behavior, drawer focus, draft/caret, archived-thread exclusion, menu-out timing, restored dock focus before dispatch, and first-Escape closure for filtered/no-match queries.
+Ten palette window tests establish request-answer exclusion in question/approval contexts, drawer-only eligibility, chord behavior, drawer focus, draft/caret, archived-thread exclusion, menu-out timing, restored dock focus before dispatch, first-Escape closure for filtered/no-match queries, and card containment with keyboard scrolling to the final entry.
 `palette_metadata_is_explicit_for_every_binding` and `palette_chords_keep_the_shared_shifted_paste_spelling` check the shared table and chord formatter.
 
 ### Evidence contract

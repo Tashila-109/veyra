@@ -190,7 +190,7 @@ def smoke_plan(found, tokens, glass=False):
             key = (page,'Native smoke')
             assert key in found, 'no capture section for '+page
             plan.append(key)
-    if 'release' in tokens: plan.append(RELEASE)
+    if 'release' in tokens: plan.insert(plan.index(FIRST)+1,RELEASE)
     if glass: plan.append(('settings','Glass smoke'))
     return plan+[('SKILL','Doctor'),('SKILL','Evidence')]
 

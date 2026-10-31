@@ -843,7 +843,13 @@ permission.update(kind='edit',title='Edit permission-project.txt',rawInput=edit_
 thread = create_grok('grok-search-replace',records=records,prompt='Review every edit argument')
 dock = poll('grok-search-replace',lambda d:d['composer']['dock'] is not None)['composer']['dock']
 assert dock['action_text']=='Edit permission-project.txt'
-assert raw_preview(dock)==edit_input
+preview = raw_preview(dock)
+assert 'variant' not in preview
+assert preview=={key:value for key,value in edit_input.items() if key!='variant'}
+stored_records = [json.loads(line) for line in fixture_source(records).read_text().splitlines()]
+stored_input = next(record['line']['params']['toolCall']['rawInput'] for record in stored_records
+    if record.get('line',{}).get('method')=='session/request_permission')
+assert stored_input==edit_input and stored_input.get('variant')=='SearchReplace'
 assert dock['request']['kind']['Approval']['action'].get('consent') is None
 assert dock['allow_once_enabled'] and not dock['allow_in_thread_enabled'] and dock['grant_caption'] is None
 capture('grok-search-replace')
@@ -956,7 +962,7 @@ Their class and exact scope are in [proof ownership](../proof-ownership.md); eve
 
 The command draw binding derives `echo ok` from the recorded approval, retains the records/diff, and asserts the exact command from `dump`.
 The admitted projection/paint tests own their qualified cases; the lead reads exact visible text, order, captions and residual fields from native captures.
-The codec owns approval classification. The window lays out every residual field, including unknown `_meta` siblings beside lifted Arguments, and keeps non-object, invalid or truncated previews as text with their cut notice. `codex-mcp-first.png` and its exact dump retain an unknown `extra: material` field; the lead reads those painted words. Grok's residual `variant` stays visible under the existing security classification.
+The codec owns approval classification. The window lays out every residual field, including unknown `_meta` siblings beside lifted Arguments, and keeps non-object, invalid or truncated previews as text with their cut notice. `codex-mcp-first.png` and its exact dump retain an unknown `extra: material` field; the lead reads those painted words. Grok classifies `variant` as metadata and omits it from the preview; the staged replay payload retains it unchanged.
 
 On settled states, the separate `-placeholder` capture moves focus with `root::Tab`, then restores it with `FocusComposer`.
 `semantic_placeholders_and_input_clipping` owns the admitted placeholder decisions and bounds.
@@ -1017,7 +1023,7 @@ Description labels are “Claude Code's description”, “Codex's description�
 The Codex extra-fields PNG keeps its environment, network and sandbox values visible with the thread-grant button absent.
 `codex-grant-in-project.png` shows the normal project-folder thread-grant offer with wire timestamps absent from the preview.
 `codex-command-nonlocal-environment.png` keeps the non-local environment and literal cwd visible, says the location is not verified, and has no working-folder quote or thread-grant control.
-`grok-search-replace.png` retains the edit's old and new strings and replace_all value, while its typed path appears once and variant stays in the stored payload; it has no thread-grant control.
+`grok-search-replace.png` retains the edit's old and new strings and replace_all value, while its typed path appears once and variant stays in the stored replay payload, read back from the same staged source used by create_grok; it has no thread-grant control.
 The async-question PNG shows the complete two-paragraph markdown reply above the sanitized title, option controls and choice consequence; its stored UserText preserves the option's exact bidi-bearing bytes while its bubble displays Violet.
 The chosen PNG retains the question, shows Answered beside Violet and disables both controls.
 Command-1 chooses the latest-turn card.
