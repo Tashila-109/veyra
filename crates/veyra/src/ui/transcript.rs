@@ -957,6 +957,7 @@ impl OutcomeLine {
             format!("{words} {}", if words == "Done" { "in" } else { "after" })
         }
     }
+    #[cfg(any(test, debug_assertions))]
     fn formatted(&self) -> String {
         self.elapsed_seconds.map_or_else(
             || self.words.clone(),
@@ -1024,6 +1025,7 @@ fn tool_output(tool: &ToolItem) -> Option<String> {
         projected.as_deref().unwrap_or(raw),
     ))
 }
+#[cfg(any(test, debug_assertions))]
 pub(super) fn row_outcome(
     item: &Item,
     next: Option<&Item>,
@@ -1325,6 +1327,7 @@ fn task_card(shell: &Shell, task: TaskId, item: ItemId, cx: &App) -> AnyElement 
 fn task_from(name: &str) -> String {
     format!("Task from {name}")
 }
+#[cfg(debug_assertions)]
 pub(super) fn task_card_text(state: &super::AppState, task: TaskId) -> String {
     let parent = state
         .tasks
@@ -1793,7 +1796,7 @@ impl MessageScrollerState {
         self.insert(0, cx);
     }
 }
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 fn row(
     item: &Item,
     expanded: bool,
@@ -1842,6 +1845,7 @@ mod tests {
             "Failed"
         );
     }
+    #[cfg(debug_assertions)]
     use gpui_kit::component::StyledExt;
     #[cfg(debug_assertions)]
     #[gpui::test]

@@ -858,6 +858,7 @@ fn grok_foreign_content_is_logged_and_dropped_only_during_veyra_work() {
     use crate::{domain::*, provider::*};
     use serde_json::json;
     let logs = super::logs::CapturedLogs::default();
+    let _interest_guard = tracing::Dispatch::new(logs.clone());
     tracing::subscriber::with_default(logs.clone(), || {
         let mut codec = ready_codec();
         let turn = TurnId::new();

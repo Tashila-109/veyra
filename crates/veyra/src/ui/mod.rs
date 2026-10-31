@@ -3722,6 +3722,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     fn opaque_sidebar_plate(theme: &super::Theme, wash: gpui::Hsla) -> gpui::Hsla {
         let foreground = gpui::Rgba::from(wash);
         let background = gpui::Rgba::from(theme.colors.shell);
@@ -4723,6 +4724,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[gpui::test]
     fn row_focus_differs_from_selection(cx: &mut gpui::TestAppContext) {
         with_docked_shell(cx, |shell, cx, _, _| {
@@ -11830,7 +11832,11 @@ mod tests {
                     self.runtime.block_on(self.engine.shutdown_wait());
                 }
             }
-            let data = shell.read_with(cx, |shell, _| shell.probe_cwd.clone());
+            let scratch = Scratch(
+                std::path::PathBuf::from("/tmp").join(format!("veyra-shell-{}", ThreadId::new())),
+            );
+            std::fs::create_dir(&scratch.0).unwrap();
+            let data = scratch.0.clone();
             let fixture = data.join("shell.jsonl");
             std::fs::write(&fixture, concat!(
                 "{\"type\":\"transcript_start\",\"provider\":\"shell\",\"protocol\":\"terminal\",",

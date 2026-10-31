@@ -842,7 +842,8 @@ mod tests {
                             increase_contrast,
                             reduce_motion: true,
                         },
-                        ..Default::default()
+                        #[cfg(debug_assertions)]
+                        overridden: false,
                     };
                     assert_eq!(
                         look.background(),
