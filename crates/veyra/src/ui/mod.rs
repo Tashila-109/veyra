@@ -2115,6 +2115,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        if self.insert_palette_text(text, window, cx) {
+            return Ok(());
+        }
         if matches!(self.view, MainView::Settings { .. })
             || !self.input.focus_handle(cx).is_focused(window)
         {
@@ -12365,6 +12368,43 @@ mod tests {
             assert!(shell.update_in(cx, |shell, window, cx| {
                 shell.input.focus_handle(cx).is_focused(window)
             }));
+        });
+    }
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn driver_text_types_into_the_open_palette(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        with_docked_shell(cx, |shell, cx, _, _| {
+            snap_palette(cx);
+            cx.simulate_input("Keep this draft");
+            draw(cx);
+            cx.simulate_keystrokes("secondary-k");
+            draw(cx);
+            shell
+                .update_in(cx, |shell, window, cx| {
+                    shell.insert_text("> Narrow sidebar", window, cx)
+                })
+                .unwrap();
+            draw(cx);
+            assert_eq!(palette_actions(&shell, cx), ["NarrowSidebar"]);
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.input.read(cx).value()),
+                "Keep this draft"
+            );
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+            assert!(shell.read_with(cx, |shell, _| shell.palette.is_none()));
+            assert!(shell.update_in(cx, |shell, window, cx| {
+                shell.input.focus_handle(cx).is_focused(window)
+            }));
+            shell
+                .update_in(cx, |shell, window, cx| shell.insert_text("!", window, cx))
+                .unwrap();
+            draw(cx);
+            assert_eq!(
+                shell.read_with(cx, |shell, cx| shell.input.read(cx).value()),
+                "Keep this draft!"
+            );
         });
     }
     #[cfg(debug_assertions)]

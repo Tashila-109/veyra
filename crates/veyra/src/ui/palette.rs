@@ -327,6 +327,25 @@ impl Shell {
                 .into_any_element(),
         )
     }
+    /// Driver text while the palette is open: it owns keyboard focus, so the
+    /// text extends its query as if typed. Returns false when no palette takes it.
+    #[cfg(debug_assertions)]
+    pub(super) fn insert_palette_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(palette) = self.palette.as_ref().filter(|palette| !palette.closing) else {
+            return false;
+        };
+        palette.state.update(cx, |state, cx| {
+            let query = format!("{}{text}", state.query(cx));
+            state.set_query(query, window, cx);
+        });
+        cx.notify();
+        true
+    }
     #[cfg(debug_assertions)]
     #[allow(clippy::disallowed_types)] // The driver exposes the rendered palette model as wire JSON.
     pub(super) fn palette_dump(&self, cx: &App) -> serde_json::Value {
